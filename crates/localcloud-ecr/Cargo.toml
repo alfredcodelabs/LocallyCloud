@@ -1,0 +1,25 @@
+[package]
+name = "localcloud-ecr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "localcloud AWS ECR service (JSON 1.1), registered Native; minimal registry/repository control plane for deployment-tool compatibility"
+
+[dependencies]
+localcloud-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
