@@ -1,0 +1,146 @@
+# localcloud — Rust workspace manifest
+#
+# localcloud is a standalone Rust AWS emulator. Unsupported services can be
+# forwarded to an optional external backend.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/localcloud",
+    "crates/localcloud-core",
+    "crates/localcloud-state",
+    "crates/localcloud-compute",
+    "crates/localcloud-lambda",
+    "crates/localcloud-iam-sts",
+    "crates/localcloud-dynamodb",
+    "crates/localcloud-s3",
+    "crates/localcloud-sqs",
+    "crates/localcloud-sns",
+    "crates/localcloud-eventbridge",
+    "crates/localcloud-stepfunctions",
+    "crates/localcloud-apigateway",
+    "crates/localcloud-cloudformation",
+    "crates/localcloud-ecr",
+    "crates/localcloud-ecs",
+    "crates/localcloud-ec2",
+    "crates/localcloud-elbv2",
+    "crates/localcloud-kms",
+    "crates/localcloud-ssm",
+    "crates/localcloud-secretsmanager",
+    "crates/localcloud-cloudwatch-monitoring",
+    "crates/localcloud-cloudwatch-logs",
+    "crates/localcloud-rds-data",
+    "crates/localcloud-rds",
+    "crates/localcloud-analytics",
+    "crates/localcloud-kinesis",
+    "crates/localcloud-firehose",
+    "crates/localcloud-xray",
+    "crates/localcloud-cloudtrail",
+    "crates/localcloud-route53",
+    "crates/localcloud-arc",
+    "crates/localcloud-region-switch",
+    "crates/localcloud-wafv2",
+    "crates/localcloud-cognito",
+    "crates/localcloud-acm",
+    "crates/localcloud-cloudfront",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+authors = ["Alfred Rodriguez G"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# HTTP server / routing
+axum = { version = "=0.8.9", features = ["ws"] }
+tower-http = { version = "=0.6.11", features = ["trace", "cors"] }
+
+# Low-level HTTP client for the SigV4-preserving reverse proxy (host-header control)
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Concurrency
+dashmap = "6"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["column_metadata"] }
+
+# Errors
+thiserror = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hmac = "=0.12.1"
+sha1 = "=0.10.6"
+md-5 = "=0.10.6"
+jsonata-core = { version = "=2.2.10", default-features = false }
+aws-lc-rs = "=1.18.1"
+base64 = "0.22"
+flate2 = "=1.1.9"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+zeroize = "=1.9.0"
+# Zip package handling for Lambda code (deflate only; no bzip2/zstd to keep the footprint small)
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# JWT / OIDC token validation (real RSA signature verification + JWKS)
+jsonwebtoken = "=11.1.0"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+
+# Internal crates
+localcloud-core = { path = "crates/localcloud-core" }
+localcloud-state = { path = "crates/localcloud-state" }
+localcloud-compute = { path = "crates/localcloud-compute" }
+localcloud-lambda = { path = "crates/localcloud-lambda" }
+localcloud-iam-sts = { path = "crates/localcloud-iam-sts" }
+localcloud-dynamodb = { path = "crates/localcloud-dynamodb" }
+localcloud-s3 = { path = "crates/localcloud-s3" }
+localcloud-sqs = { path = "crates/localcloud-sqs" }
+localcloud-sns = { path = "crates/localcloud-sns" }
+localcloud-eventbridge = { path = "crates/localcloud-eventbridge" }
+localcloud-stepfunctions = { path = "crates/localcloud-stepfunctions" }
+localcloud-apigateway = { path = "crates/localcloud-apigateway" }
+localcloud-cloudformation = { path = "crates/localcloud-cloudformation" }
+localcloud-ecr = { path = "crates/localcloud-ecr" }
+localcloud-ecs = { path = "crates/localcloud-ecs" }
+localcloud-ec2 = { path = "crates/localcloud-ec2" }
+localcloud-elbv2 = { path = "crates/localcloud-elbv2" }
+localcloud-kms = { path = "crates/localcloud-kms" }
+localcloud-ssm = { path = "crates/localcloud-ssm" }
+localcloud-secretsmanager = { path = "crates/localcloud-secretsmanager" }
+localcloud-cloudwatch-monitoring = { path = "crates/localcloud-cloudwatch-monitoring" }
+localcloud-cloudwatch-logs = { path = "crates/localcloud-cloudwatch-logs" }
+localcloud-rds-data = { path = "crates/localcloud-rds-data" }
+localcloud-rds = { path = "crates/localcloud-rds" }
+localcloud-analytics = { path = "crates/localcloud-analytics" }
+localcloud-kinesis = { path = "crates/localcloud-kinesis" }
+localcloud-firehose = { path = "crates/localcloud-firehose" }
+localcloud-xray = { path = "crates/localcloud-xray" }
+localcloud-cloudtrail = { path = "crates/localcloud-cloudtrail" }
+localcloud-route53 = { path = "crates/localcloud-route53" }
+localcloud-arc = { path = "crates/localcloud-arc" }
+localcloud-region-switch = { path = "crates/localcloud-region-switch" }
+localcloud-wafv2 = { path = "crates/localcloud-wafv2" }
+localcloud-cognito = { path = "crates/localcloud-cognito" }
+localcloud-acm = { path = "crates/localcloud-acm" }
+localcloud-cloudfront = { path = "crates/localcloud-cloudfront" }
+
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
