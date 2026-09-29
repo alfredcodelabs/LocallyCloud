@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>localcloud — status</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0d1117; color: #e6edf3;
+    }
+    header {
+      display: flex; align-items: center; gap: 16px; padding: 18px 24px;
+      border-bottom: 1px solid #21262d; background: #161b22;
+    }
+    header h1 { font-size: 18px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .ok { background: #3fb950; box-shadow: 0 0 8px #3fb95066; }
+    .bad { background: #f85149; box-shadow: 0 0 8px #f8514966; }
+    .meta { margin-left: auto; font-size: 13px; color: #8b949e; display: flex; gap: 18px; align-items: center; }
+    .meta b { color: #e6edf3; }
+    main { padding: 24px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+    .card {
+      background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 14px 16px;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .card .name { font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+    .badge { font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid #30363d; color: #c9d1d9; }
+    .native { background: #1f6f3f33; border-color: #3fb95066; color: #7ee787; }
+    .proxied { background: #6e768166; border-color: #484f58; color: #adbac7; }
+    .proto { background: #1f6feb22; border-color: #1f6feb66; color: #79c0ff; }
+    .usage { display: flex; justify-content: space-between; font-size: 12px; color: #8b949e; border-top: 1px solid #21262d; padding-top: 8px; }
+    .usage span:last-child { color: #d29922; font-variant-numeric: tabular-nums; }
+    footer { padding: 16px 24px; color: #6e7681; font-size: 12px; border-top: 1px solid #21262d; }
+    .err { color: #f85149; padding: 24px; }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="health" class="dot bad" title="status"></span>
+    <h1>localcloud</h1>
+    <div class="meta">
+      <span>version <b id="version">—</b></span>
+      <span><b id="nativeCount">0</b> native</span>
+      <span><b id="serviceCount">0</b> services</span>
+      <span><b id="totalRequests">0</b> reqs</span>
+      <span>est. cost <b id="cost">$0.00</b></span>
+      <span>updated <b id="updated">—</b></span>
+    </div>
+  </header>
+  <main>
+    <div id="grid" class="grid"></div>
+    <div id="error" class="err" hidden></div>
+  </main>
+  <footer>Read-only view of the service registry · request counts metered at the dispatcher · cost is a first-order estimate by request count (approx. us-east-1) · polling <code>/_localcloud/status</code> every 3s</footer>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function render(doc) {
+      $("error").hidden = true;
+      $("health").className = "dot " + (doc.ready ? "ok" : "bad");
+      $("version").textContent = doc.version || "—";
+      $("serviceCount").textContent = doc.serviceCount ?? 0;
+      $("nativeCount").textContent = doc.nativeCount ?? 0;
+      $("totalRequests").textContent = doc.totalRequests ?? 0;
+      $("cost").textContent = "$" + (doc.estimatedCostUsd ?? 0).toFixed(4);
+      $("updated").textContent = new Date().toLocaleTimeString();
+
+      const grid = $("grid");
+      grid.innerHTML = "";
+      for (const svc of doc.services || []) {
+        const native = svc.disposition === "Native";
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML =
+          '<div class="name"><span class="dot" style="' +
+          (native ? "background:#3fb950;box-shadow:0 0 8px #3fb95066;" : "background:#6e7681;box-shadow:none;") + '"></span>' + escapeHtml(svc.name) + '</div>' +
+          '<div class="badges">' +
+            '<span class="badge proto">' + escapeHtml(svc.protocol) + '</span>' +
+            '<span class="badge ' + (native ? "native" : "proxied") + '">' + escapeHtml(svc.disposition) + '</span>' +
+          '</div>' +
+          '<div class="usage"><span>' + (svc.requests ?? 0) + ' reqs</span><span>$' + (svc.estimatedUsd ?? 0).toFixed(4) + '</span></div>';
+        grid.appendChild(card);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch("/_localcloud/status", { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        render(await res.json());
+      } catch (e) {
+        $("health").className = "dot bad";
+        $("error").hidden = false;
+        $("error").textContent = "Cannot reach localcloud: " + e.message;
+      }
+    }
+
+    poll();
+    setInterval(poll, 3000);
+  </script>
+</body>
+</html>

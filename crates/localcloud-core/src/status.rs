@@ -1,0 +1,131 @@
+//! Status reporting and the built-in dashboard.
+//!
+//! A read-only view over the [`ServiceRegistry`](crate::registry::ServiceRegistry) (the single
+//! source of truth for which services are enabled and how they are handled). `status_json`
+//! powers both programmatic checks and the embedded dashboard; the dashboard is a single
+//! self-contained HTML page (no build step, no framework) served from the binary.
+
+use serde_json::json;
+
+use crate::cost::CostReport;
+use crate::metering::ServiceMetrics;
+use crate::registry::{Disposition, ServiceRegistry};
+
+/// The built-in dashboard page, polling `/_localcloud/status`.
+pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+/// Build the status document: product/version/readiness, every registered service with its
+/// protocol and disposition (`Native` = handled in-process, `Proxied` = forwarded), plus
+/// metered request counts and a first-order estimated cost (see [`crate::cost`]).
+pub fn status_json(
+    registry: &ServiceRegistry,
+    metrics: &[ServiceMetrics],
+    cost: &CostReport,
+    ready: bool,
+    version: &str,
+) -> String {
+    let statuses = registry.statuses();
+    let native = statuses
+        .iter()
+        .filter(|s| s.disposition == Disposition::Native)
+        .count();
+    let services: Vec<_> = statuses
+        .iter()
+        .map(|s| {
+            let requests = metrics
+                .iter()
+                .find(|m| m.service == s.name)
+                .map(|m| m.requests)
+                .unwrap_or(0);
+            let estimated_usd = cost
+                .services
+                .iter()
+                .find(|c| c.service == s.name)
+                .map(|c| c.estimated_usd)
+                .unwrap_or(0.0);
+            json!({
+                "name": s.name,
+                "protocol": s.protocol.as_str(),
+                "disposition": s.disposition.as_str(),
+                "requests": requests,
+                "estimatedUsd": estimated_usd,
+            })
+        })
+        .collect();
+    json!({
+        "product": "localcloud",
+        "version": version,
+        "ready": ready,
+        "serviceCount": services.len(),
+        "nativeCount": native,
+        "totalRequests": metrics.iter().map(|m| m.requests).sum::<u64>(),
+        "estimatedCostUsd": cost.total_usd,
+        "costNote": "first-order estimate by request count, approximate us-east-1 pricing",
+        "services": services,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::estimate;
+    use crate::handler::{NativeHandler, ServiceRequest};
+    use crate::metering::ServiceMetrics;
+    use crate::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
+    use axum::body::Body;
+    use axum::response::Response;
+    use std::sync::Arc;
+
+    struct TestHandler;
+
+    #[async_trait::async_trait]
+    impl NativeHandler for TestHandler {
+        async fn handle(&self, _request: ServiceRequest) -> Response {
+            Response::new(Body::empty())
+        }
+    }
+
+    #[test]
+    fn status_lists_services_metrics_and_cost() {
+        let reg = ServiceRegistry::with_known_services();
+        reg.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            Arc::new(TestHandler),
+        );
+        let metrics = vec![ServiceMetrics {
+            service: "sqs".into(),
+            requests: 1_000_000,
+            bytes_in: 0,
+        }];
+        let cost = estimate(&metrics);
+        let doc: serde_json::Value =
+            serde_json::from_str(&status_json(&reg, &metrics, &cost, true, "0.1.0")).unwrap();
+        assert_eq!(doc["product"], "localcloud");
+        assert_eq!(doc["ready"], true);
+        assert_eq!(doc["totalRequests"], 1_000_000);
+        assert!((doc["estimatedCostUsd"].as_f64().unwrap() - 0.40).abs() < 1e-9);
+        let s3 = doc["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "s3")
+            .unwrap();
+        assert_eq!(s3["disposition"], "Native");
+        assert_eq!(s3["protocol"], "REST-XML");
+        let sqs = doc["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "sqs")
+            .unwrap();
+        assert_eq!(sqs["requests"], 1_000_000);
+    }
+
+    #[test]
+    fn dashboard_html_is_embedded() {
+        assert!(DASHBOARD_HTML.contains("localcloud"));
+        assert!(DASHBOARD_HTML.contains("/_localcloud/status"));
+    }
+}
