@@ -1,0 +1,25 @@
+[package]
+name = "localcloud-iam-sts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "localcloud AWS IAM and STS services (Query/XML), registered Native in the Core ServiceRegistry"
+
+[dependencies]
+localcloud-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+proptest = "1"
