@@ -1,0 +1,18 @@
+[package]
+name = "localcloud-elbv2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Scoped native ELBv2 target group control plane"
+
+[dependencies]
+localcloud-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
