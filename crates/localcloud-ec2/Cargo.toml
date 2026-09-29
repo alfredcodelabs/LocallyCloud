@@ -1,0 +1,16 @@
+[package]
+name = "localcloud-ec2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "LocalCloud EC2 Query API: VPC and subnet control plane"
+
+[dependencies]
+localcloud-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+form_urlencoded = "=1.2.2"
+ipnet = "=2.12.0"
+uuid.workspace = true
+tokio.workspace = true
