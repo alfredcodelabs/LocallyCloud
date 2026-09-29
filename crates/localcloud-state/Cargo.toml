@@ -1,0 +1,12 @@
+[package]
+name = "localcloud-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Shared durable SQLite state for small LocalCloud control planes"
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+libc = "0.2"
