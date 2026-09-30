@@ -131,6 +131,52 @@ enum Stmt {
     },
 }
 
+/// Parse once for IAM before any statement in a batch can mutate data.
+pub(crate) fn authorization_targets(
+    op: &str,
+    request: &Value,
+) -> Result<Vec<(String, String)>, DdbError> {
+    let entries: Vec<&Value> = match op {
+        "ExecuteStatement" => vec![request],
+        "ExecuteTransaction" => request
+            .get("TransactStatements")
+            .and_then(Value::as_array)
+            .ok_or_else(|| DdbError::Validation("TransactStatements is required".into()))?
+            .iter()
+            .collect(),
+        "BatchExecuteStatement" => request
+            .get("Statements")
+            .and_then(Value::as_array)
+            .ok_or_else(|| DdbError::Validation("Statements is required".into()))?
+            .iter()
+            .collect(),
+        _ => return Ok(Vec::new()),
+    };
+    let mut targets = Vec::new();
+    for entry in entries {
+        let Some(statement) = entry.get("Statement").and_then(Value::as_str) else {
+            if op == "BatchExecuteStatement" {
+                continue; // The batch handler reports this as a per-statement error.
+            }
+            return Err(DdbError::Validation("Statement is required".into()));
+        };
+        let params = parse_parameters(entry)?;
+        let parsed = match parse(statement, &params) {
+            Ok(parsed) => parsed,
+            Err(_) if op == "BatchExecuteStatement" => continue,
+            Err(error) => return Err(error),
+        };
+        let target = match parsed {
+            Stmt::Insert { table, .. } => ("PartiQLInsert", table),
+            Stmt::Delete { table, .. } => ("PartiQLDelete", table),
+            Stmt::Update { table, .. } => ("PartiQLUpdate", table),
+            Stmt::Select { table, .. } => ("PartiQLSelect", table),
+        };
+        targets.push((target.0.to_string(), target.1));
+    }
+    Ok(targets)
+}
+
 impl Stmt {
     fn into_transact_action(self) -> Result<Value, DdbError> {
         match self {

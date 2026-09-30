@@ -13,6 +13,8 @@ const TYPE_PREFIX: &str = "com.amazonaws.dynamodb.v20120810#";
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DdbError {
     #[error("{0}")]
+    AccessDenied(String),
+    #[error("{0}")]
     ResourceNotFound(String),
     #[error("{0}")]
     ResourceInUse(String),
@@ -61,6 +63,7 @@ impl CancellationReason {
 impl DdbError {
     fn exception(&self) -> &'static str {
         match self {
+            DdbError::AccessDenied(_) => "AccessDeniedException",
             DdbError::ResourceNotFound(_) => "ResourceNotFoundException",
             DdbError::ResourceInUse(_) => "ResourceInUseException",
             DdbError::ConditionalCheckFailed(_) => "ConditionalCheckFailedException",
@@ -78,6 +81,7 @@ impl DdbError {
     pub fn http_status(&self) -> u16 {
         match self {
             DdbError::ResourceNotFound(_)
+            | DdbError::AccessDenied(_)
             | DdbError::ResourceInUse(_)
             | DdbError::ConditionalCheckFailed(_)
             | DdbError::Validation(_)
@@ -98,6 +102,7 @@ impl DdbError {
     /// Short error code used in `BatchExecuteStatement` per-statement error entries.
     pub fn batch_code(&self) -> &'static str {
         match self {
+            DdbError::AccessDenied(_) => "AccessDenied",
             DdbError::ResourceNotFound(_) => "ResourceNotFound",
             DdbError::ConditionalCheckFailed(_) => "ConditionalCheckFailed",
             DdbError::ProvisionedThroughputExceeded(_) => "ProvisionedThroughputExceeded",

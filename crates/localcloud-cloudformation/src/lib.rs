@@ -14,6 +14,7 @@ pub mod error;
 pub mod model;
 pub mod proto;
 pub mod provision;
+pub mod sam;
 pub mod service;
 pub mod store;
 pub mod template;

@@ -16,6 +16,9 @@ pub enum CfnError {
     /// A resource failed to provision during a stack operation.
     #[error("{0}")]
     ResourceFailed(String),
+    /// The caller did not acknowledge IAM resources in the template.
+    #[error("{0}")]
+    InsufficientCapabilities(String),
     /// An unsupported operation was requested.
     #[error("{0}")]
     Unsupported(String),
@@ -29,6 +32,7 @@ impl CfnError {
             CfnError::Validation(_) => "ValidationError",
             CfnError::AlreadyExists(_) => "AlreadyExistsException",
             CfnError::ResourceFailed(_) => "ResourceFailed",
+            CfnError::InsufficientCapabilities(_) => "InsufficientCapabilities",
             CfnError::Unsupported(_) => "UnsupportedOperation",
             CfnError::Internal => "InternalFailure",
         }
@@ -40,6 +44,7 @@ impl CfnError {
             CfnError::Validation(_) => 400,
             CfnError::Unsupported(_) => 400,
             CfnError::ResourceFailed(_) => 400,
+            CfnError::InsufficientCapabilities(_) => 400,
             CfnError::Internal => 500,
         }
     }

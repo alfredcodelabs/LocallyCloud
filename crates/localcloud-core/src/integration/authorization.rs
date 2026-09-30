@@ -16,6 +16,14 @@ pub struct SigningCredentials {
     pub session_token: Option<String>,
 }
 
+/// Short-lived credentials issued to a service for an existing execution role.
+#[derive(Clone)]
+pub struct ServiceRoleCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationRequest {
     pub request_identity: RequestIdentity,
@@ -84,6 +92,16 @@ pub trait AuthorizationEvaluator: Send + Sync {
         &self,
         _request: ServiceRoleAuthorizationRequest,
     ) -> Result<(), AuthorizationError> {
+        Err(AuthorizationError::Denied)
+    }
+
+    /// Issue credentials bound to a role trusted by the named service.
+    fn issue_service_role_credentials(
+        &self,
+        _account: &str,
+        _role_arn: &str,
+        _service_principal: &str,
+    ) -> Result<ServiceRoleCredentials, AuthorizationError> {
         Err(AuthorizationError::Denied)
     }
 

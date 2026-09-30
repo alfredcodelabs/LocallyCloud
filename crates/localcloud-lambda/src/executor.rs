@@ -853,6 +853,23 @@ impl Executor {
 
         let runtime_api = format!("{}/e/{}", self.runtime_api_base, env_key);
         let log_stream = format!("{}/[{}]{}", today(), func.version, Uuid::new_v4().simple());
+        let role_credentials = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+            .filter(|evaluator| evaluator.strict_sigv4_required())
+            .map(|evaluator| {
+                evaluator.issue_service_role_credentials(
+                    account,
+                    &func.role,
+                    "lambda.amazonaws.com",
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                self.cleanup_owned_rootfs(&env_key);
+                format!("Lambda execution role credentials unavailable: {error}")
+            })?;
         let env_map = build_execution_env(&ExecEnvInputs {
             function_name: &func.function_name,
             function_version: &func.version,
@@ -863,9 +880,17 @@ impl Executor {
             log_stream: &log_stream,
             runtime_api: &runtime_api,
             aws_endpoint_url: &self.aws_endpoint_url,
-            access_key_id: &self.access_key_id,
-            secret_access_key: &self.secret_access_key,
-            session_token: None,
+            access_key_id: role_credentials
+                .as_ref()
+                .map(|credentials| credentials.access_key_id.as_str())
+                .unwrap_or(&self.access_key_id),
+            secret_access_key: role_credentials
+                .as_ref()
+                .map(|credentials| credentials.secret_access_key.as_str())
+                .unwrap_or(&self.secret_access_key),
+            session_token: role_credentials
+                .as_ref()
+                .map(|credentials| credentials.session_token.as_str()),
             user_env: &func.environment,
         });
         let spec = TaskSpec {

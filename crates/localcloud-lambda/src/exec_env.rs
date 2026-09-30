@@ -59,7 +59,7 @@ pub struct ExecEnvInputs<'a> {
     pub runtime_api: &'a str,
     /// localcloud endpoint URL for in-guest AWS SDK calls, e.g. `http://127.0.0.1:4566`.
     pub aws_endpoint_url: &'a str,
-    /// Credentials injected for in-guest SDK calls (the local fixed test identity).
+    /// Credentials injected for in-guest SDK calls.
     pub access_key_id: &'a str,
     pub secret_access_key: &'a str,
     pub session_token: Option<&'a str>,

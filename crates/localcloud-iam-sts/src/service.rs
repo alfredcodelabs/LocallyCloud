@@ -11,7 +11,7 @@ use axum::response::Response;
 use localcloud_core::handler::{NativeHandler, ServiceRequest};
 use localcloud_core::integration::authorization::{
     AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
-    ServiceRoleAuthorizationRequest, SigningCredentials,
+    ServiceRoleAuthorizationRequest, ServiceRoleCredentials, SigningCredentials,
 };
 use localcloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 
@@ -116,6 +116,33 @@ impl IamStsState {
 }
 
 impl AuthorizationEvaluator for IamStsState {
+    fn issue_service_role_credentials(
+        &self,
+        account: &str,
+        role_arn: &str,
+        service_principal: &str,
+    ) -> Result<ServiceRoleCredentials, AuthorizationError> {
+        self.validate_service_role(&ServiceRoleAuthorizationRequest {
+            caller: RequestIdentity {
+                account_id: account.to_string(),
+                access_key_id: None,
+                arn: None,
+            },
+            role_arn: role_arn.to_string(),
+            service_principal: service_principal.to_string(),
+            action: "sts:AssumeRole".into(),
+            resource: role_arn.to_string(),
+        })?;
+        let creds =
+            sts::issue_service_role_credentials(&self.store, &self.sessions, account, role_arn)
+                .map_err(|_| AuthorizationError::Denied)?;
+        Ok(ServiceRoleCredentials {
+            access_key_id: creds.access_key_id,
+            secret_access_key: creds.secret_access_key,
+            session_token: creds.session_token,
+        })
+    }
+
     fn strict_sigv4_required(&self) -> bool {
         self.mode == EnforcementMode::Strict
     }

@@ -18,7 +18,7 @@ use crate::error::CfnError;
 use crate::model::{Output, Stack, StackEvent, StackResource, StackStatus};
 use crate::proto::Query;
 use crate::provision::{Provisioner, Replacement};
-use crate::store::CfnStore;
+use crate::store::{CfnStore, ChangeSet, ChangeSetChange};
 use crate::template::{resolve, ResolveCtx, ResolvedResource, Template};
 use crate::xml::{query_envelope, text_el, xml_escape};
 
@@ -53,7 +53,11 @@ impl CfnHandler {
         account: &str,
     ) -> Result<String, CfnError> {
         match op {
-            "CreateStack" => self.create_stack(q, region, account).await,
+            "CreateStack" => self.create_stack(q, region, account, None).await,
+            "CreateChangeSet" => self.create_change_set(q, region, account).await,
+            "DescribeChangeSet" => self.describe_change_set(q, region, account),
+            "ExecuteChangeSet" => self.execute_change_set(q, region, account).await,
+            "DeleteChangeSet" => self.delete_change_set(q, region, account),
             "UpdateStack" => self.update_stack(q, region, account).await,
             "DeleteStack" => self.delete_stack(q, region, account).await,
             "DescribeStacks" => self.describe_stacks(q, region, account),
@@ -63,6 +67,7 @@ impl CfnHandler {
             "ListStackResources" => self.list_stack_resources(q, region, account),
             "GetTemplate" => self.get_template(q, region, account),
             "ValidateTemplate" => self.validate_template(q, region, account).await,
+            "GetTemplateSummary" => self.get_template_summary(q, region, account).await,
             "ListStacks" => Ok(self.list_stacks(region, account)),
             other => Err(CfnError::Unsupported(format!(
                 "operation {other} is not supported"
@@ -116,11 +121,190 @@ impl CfnHandler {
         ))
     }
 
+    async fn create_change_set(
+        &self,
+        q: &Query,
+        region: &str,
+        account: &str,
+    ) -> Result<String, CfnError> {
+        let name = q
+            .get("ChangeSetName")
+            .ok_or_else(|| CfnError::Validation("ChangeSetName is required".into()))?;
+        let stack = q
+            .get("StackName")
+            .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
+        let change_type = q.get("ChangeSetType").unwrap_or_else(|| "UPDATE".into());
+        if !matches!(change_type.as_str(), "CREATE" | "UPDATE") {
+            return Err(CfnError::Validation(
+                "ChangeSetType must be CREATE or UPDATE".into(),
+            ));
+        }
+        if self
+            .store
+            .find_change_set(account, region, &stack, &name)
+            .is_some()
+        {
+            return Err(CfnError::AlreadyExists(format!(
+                "ChangeSet [{name}] already exists"
+            )));
+        }
+        let existing = self.store.find(account, region, &stack);
+        if (change_type == "CREATE") == existing.is_some() {
+            return Err(CfnError::Validation(format!(
+                "ChangeSetType {change_type} is invalid for stack {stack}"
+            )));
+        }
+        let body = self.resolve_template_body(q, region, account).await?;
+        let template = Template::parse(&body)?;
+        check_capabilities(q, &template)?;
+        let params = q.parameters();
+        let conditions = template.evaluate_conditions(region, account, &params)?;
+        let active = template.active_resources(&conditions)?;
+        let changes = change_set_changes(existing.as_ref(), &active, region, account, &params)?;
+        let unchanged = existing
+            .as_ref()
+            .is_some_and(|old| old.template_body == body && old.parameters == params);
+        let id = format!(
+            "arn:aws:cloudformation:{region}:{account}:changeSet/{name}/{}",
+            uuid::Uuid::new_v4()
+        );
+        let stack_id = existing
+            .as_ref()
+            .map(|old| old.stack_id.clone())
+            .unwrap_or_else(|| make_stack_id(region, account, &stack));
+        let mut request = q.clone();
+        request.params.insert("TemplateBody".into(), body);
+        request.params.remove("TemplateURL");
+        let inserted = self.store.insert_change_set(
+            account,
+            region,
+            ChangeSet {
+                id: id.clone(),
+                name: name.clone(),
+                stack_name: stack,
+                stack_id: stack_id.clone(),
+                change_type,
+                status: if unchanged {
+                    "FAILED"
+                } else {
+                    "CREATE_COMPLETE"
+                }
+                .into(),
+                reason: unchanged
+                    .then(|| "The submitted information didn't contain changes.".into()),
+                executed: false,
+                request,
+                changes,
+            },
+        );
+        if !inserted {
+            return Err(CfnError::AlreadyExists(format!(
+                "ChangeSet [{name}] already exists"
+            )));
+        }
+        Ok(format!(
+            "{}{}",
+            text_el("Id", &id),
+            text_el("StackId", &stack_id)
+        ))
+    }
+
+    fn lookup_change_set(
+        &self,
+        q: &Query,
+        region: &str,
+        account: &str,
+    ) -> Result<ChangeSet, CfnError> {
+        let name = q
+            .get("ChangeSetName")
+            .ok_or_else(|| CfnError::Validation("ChangeSetName is required".into()))?;
+        let stack = q.get("StackName").unwrap_or_default();
+        self.store
+            .find_change_set(account, region, &stack, &name)
+            .ok_or_else(|| CfnError::Validation(format!("ChangeSet [{name}] does not exist")))
+    }
+
+    fn describe_change_set(
+        &self,
+        q: &Query,
+        region: &str,
+        account: &str,
+    ) -> Result<String, CfnError> {
+        let cs = self.lookup_change_set(q, region, account)?;
+        let reason = cs
+            .reason
+            .as_deref()
+            .map(|s| text_el("StatusReason", s))
+            .unwrap_or_default();
+        let changes = cs.changes.iter().map(|change| {
+            let physical = change.physical_id.as_deref()
+                .map(|id| text_el("PhysicalResourceId", id)).unwrap_or_default();
+            format!("<member><Type>Resource</Type><ResourceChange>{}{}{}<Action>{}</Action></ResourceChange></member>",
+                text_el("LogicalResourceId", &change.logical_id),
+                text_el("ResourceType", &change.resource_type), physical, change.action)
+        }).collect::<String>();
+        Ok(format!(
+            "{}{}{}{}{}{}{}{}{}<Changes>{changes}</Changes>",
+            text_el("ChangeSetId", &cs.id),
+            text_el("ChangeSetName", &cs.name),
+            text_el("StackId", &cs.stack_id),
+            text_el("StackName", &cs.stack_name),
+            text_el("Status", &cs.status),
+            text_el(
+                "ExecutionStatus",
+                if cs.executed {
+                    "EXECUTE_COMPLETE"
+                } else if cs.status == "FAILED" {
+                    "UNAVAILABLE"
+                } else {
+                    "AVAILABLE"
+                }
+            ),
+            text_el("ChangeSetType", &cs.change_type),
+            reason,
+            text_el("CreationTime", &now_iso())
+        ))
+    }
+
+    async fn execute_change_set(
+        &self,
+        q: &Query,
+        region: &str,
+        account: &str,
+    ) -> Result<String, CfnError> {
+        let cs = self.lookup_change_set(q, region, account)?;
+        if !self.store.claim_change_set(account, region, &cs) {
+            return Err(CfnError::Validation(format!(
+                "ChangeSet [{}] is not executable",
+                cs.name
+            )));
+        }
+        if cs.change_type == "CREATE" {
+            self.create_stack(&cs.request, region, account, Some(&cs.stack_id))
+                .await?;
+        } else {
+            self.update_stack(&cs.request, region, account).await?;
+        }
+        Ok(String::new())
+    }
+
+    fn delete_change_set(
+        &self,
+        q: &Query,
+        region: &str,
+        account: &str,
+    ) -> Result<String, CfnError> {
+        let cs = self.lookup_change_set(q, region, account)?;
+        self.store.remove_change_set(account, region, &cs);
+        Ok(String::new())
+    }
+
     async fn create_stack(
         &self,
         q: &Query,
         region: &str,
         account: &str,
+        change_set_stack_id: Option<&str>,
     ) -> Result<String, CfnError> {
         let name = q
             .get("StackName")
@@ -132,11 +316,14 @@ impl CfnHandler {
         }
         let body = self.resolve_template_body(q, region, account).await?;
         let template = Template::parse(&body)?;
+        check_capabilities(q, &template)?;
         let parameters = q.parameters();
         let conditions = template.evaluate_conditions(region, account, &parameters)?;
         let active = template.active_resources(&conditions)?;
         let outputs = template.active_outputs(&conditions, &active)?;
-        let stack_id = make_stack_id(region, account, &name);
+        let stack_id = change_set_stack_id
+            .map(str::to_string)
+            .unwrap_or_else(|| make_stack_id(region, account, &name));
 
         let (status, resources, outputs, events) = self
             .provision(
@@ -188,6 +375,7 @@ impl CfnHandler {
             .ok_or_else(|| CfnError::Validation(format!("Stack [{name}] does not exist")))?;
         let body = self.resolve_template_body(q, region, account).await?;
         let template = Template::parse(&body)?;
+        check_capabilities(q, &template)?;
         let previous_template = Template::parse(&existing.template_body)?;
         let parameters = q.parameters();
         let conditions = template.evaluate_conditions(region, account, &parameters)?;
@@ -816,9 +1004,17 @@ impl CfnHandler {
 
     fn describe_stacks(&self, q: &Query, region: &str, account: &str) -> Result<String, CfnError> {
         let members = if let Some(name) = q.get("StackName") {
-            let stack = self.store.find(account, region, &name).ok_or_else(|| {
-                CfnError::Validation(format!("Stack with id {name} does not exist"))
-            })?;
+            let stack = self
+                .store
+                .find(account, region, &name)
+                .or_else(|| {
+                    self.store
+                        .review_change_set(account, region, &name)
+                        .map(|cs| review_stack(&cs))
+                })
+                .ok_or_else(|| {
+                    CfnError::Validation(format!("Stack with id {name} does not exist"))
+                })?;
             render_stack(&stack)
         } else {
             self.store
@@ -842,6 +1038,11 @@ impl CfnHandler {
         let stack = self
             .store
             .find(account, region, &name)
+            .or_else(|| {
+                self.store
+                    .review_change_set(account, region, &name)
+                    .map(|cs| review_stack(&cs))
+            })
             .ok_or_else(|| CfnError::Validation(format!("Stack with id {name} does not exist")))?;
         // Newest first, as AWS returns.
         let members: String = stack
@@ -941,7 +1142,16 @@ impl CfnHandler {
             .store
             .find(account, region, &name)
             .ok_or_else(|| CfnError::Validation(format!("Stack with id {name} does not exist")))?;
-        Ok(text_el("TemplateBody", &stack.template_body))
+        match q.get("TemplateStage").as_deref() {
+            None | Some("Original") => Ok(text_el("TemplateBody", &stack.template_body)),
+            Some("Processed") => Ok(text_el(
+                "TemplateBody",
+                &Template::parse(&stack.template_body)?.processed_body()?,
+            )),
+            Some(other) => Err(CfnError::Validation(format!(
+                "Invalid TemplateStage {other}"
+            ))),
+        }
     }
 
     async fn validate_template(
@@ -951,8 +1161,28 @@ impl CfnHandler {
         account: &str,
     ) -> Result<String, CfnError> {
         let body = self.resolve_template_body(q, region, account).await?;
-        Template::parse(&body)?;
-        Ok("<Parameters/><Capabilities/><CapabilitiesReason/>".to_string())
+        let template = Template::parse(&body)?;
+        Ok(render_template_summary(&template, false))
+    }
+
+    async fn get_template_summary(
+        &self,
+        q: &Query,
+        region: &str,
+        account: &str,
+    ) -> Result<String, CfnError> {
+        let body = if let Some(name) = q.get("StackName") {
+            self.store
+                .find(account, region, &name)
+                .ok_or_else(|| {
+                    CfnError::Validation(format!("Stack with id {name} does not exist"))
+                })?
+                .template_body
+        } else {
+            self.resolve_template_body(q, region, account).await?
+        };
+        let template = Template::parse(&body)?;
+        Ok(render_template_summary(&template, true))
     }
 
     fn list_stacks(&self, region: &str, account: &str) -> String {
@@ -1011,6 +1241,231 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
         ServiceMetadata::new(AwsProtocol::Query, None),
         handler,
     );
+}
+
+fn check_capabilities(q: &Query, template: &Template) -> Result<(), CfnError> {
+    let iam: Vec<_> = template
+        .resources()
+        .into_iter()
+        .filter(|resource| resource.resource_type.starts_with("AWS::IAM::"))
+        .collect();
+    if iam.is_empty() {
+        return Ok(());
+    }
+    let named = iam.iter().any(|resource| {
+        [
+            "RoleName",
+            "PolicyName",
+            "UserName",
+            "GroupName",
+            "InstanceProfileName",
+        ]
+        .iter()
+        .any(|key| resource.properties.get(*key).is_some())
+    });
+    let capabilities: Vec<_> = (1..)
+        .map(|index| q.get(&format!("Capabilities.member.{index}")))
+        .take_while(Option::is_some)
+        .flatten()
+        .collect();
+    let acknowledged = if named {
+        capabilities
+            .iter()
+            .any(|value| value == "CAPABILITY_NAMED_IAM")
+    } else {
+        capabilities
+            .iter()
+            .any(|value| value == "CAPABILITY_IAM" || value == "CAPABILITY_NAMED_IAM")
+    };
+    if acknowledged {
+        Ok(())
+    } else {
+        let required = if named {
+            "CAPABILITY_NAMED_IAM"
+        } else {
+            "CAPABILITY_IAM"
+        };
+        Err(CfnError::InsufficientCapabilities(format!(
+            "Requires capabilities : [{required}]"
+        )))
+    }
+}
+
+fn render_template_summary(template: &Template, include_types: bool) -> String {
+    let resources = template.resources();
+    let params = template
+        .parameter_declarations()
+        .iter()
+        .map(|(name, definition)| {
+            let default = definition
+                .get("Default")
+                .map(|value| text_el("DefaultValue", &value_to_text(value)))
+                .unwrap_or_default();
+            let description = definition
+                .get("Description")
+                .and_then(Value::as_str)
+                .map(|value| text_el("Description", value))
+                .unwrap_or_default();
+            let parameter_type = if include_types {
+                definition
+                    .get("Type")
+                    .and_then(Value::as_str)
+                    .map(|value| text_el("ParameterType", value))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            format!(
+                "<member>{}{}{}{}<NoEcho>{}</NoEcho></member>",
+                text_el("ParameterKey", name),
+                parameter_type,
+                description,
+                default,
+                definition
+                    .get("NoEcho")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            )
+        })
+        .collect::<String>();
+    let iam = resources
+        .iter()
+        .filter(|r| r.resource_type == "AWS::IAM::Role")
+        .collect::<Vec<_>>();
+    let capabilities = if iam.is_empty() {
+        String::new()
+    } else if iam.iter().any(|r| r.properties.get("RoleName").is_some()) {
+        "<member>CAPABILITY_NAMED_IAM</member>".to_string()
+    } else {
+        "<member>CAPABILITY_IAM</member>".to_string()
+    };
+    let reason = if iam.is_empty() {
+        String::new()
+    } else {
+        text_el(
+            "CapabilitiesReason",
+            &format!(
+                "The following resource(s) require capabilities: [{}]",
+                iam.iter()
+                    .map(|r| r.logical_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    };
+    let transforms = template
+        .declared_transform()
+        .map(|name| format!("<member>{}</member>", xml_escape(name)))
+        .unwrap_or_default();
+    let description = template
+        .description()
+        .map(|value| text_el("Description", value))
+        .unwrap_or_default();
+    let types = if include_types {
+        format!(
+            "<ResourceTypes>{}</ResourceTypes>",
+            resources
+                .iter()
+                .map(|r| format!("<member>{}</member>", xml_escape(&r.resource_type)))
+                .collect::<String>()
+        )
+    } else {
+        String::new()
+    };
+    format!("{description}<Parameters>{params}</Parameters><Capabilities>{capabilities}</Capabilities>{reason}<DeclaredTransforms>{transforms}</DeclaredTransforms>{types}")
+}
+
+fn value_to_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn change_set_changes(
+    existing: Option<&Stack>,
+    next: &[crate::template::ResourceDecl],
+    region: &str,
+    account: &str,
+    params: &BTreeMap<String, String>,
+) -> Result<Vec<ChangeSetChange>, CfnError> {
+    let previous = if let Some(stack) = existing {
+        let template = Template::parse(&stack.template_body)?;
+        let conditions = template.evaluate_conditions(region, account, &stack.parameters)?;
+        template.active_resources(&conditions)?
+    } else {
+        Vec::new()
+    };
+    let old = previous
+        .iter()
+        .map(|r| (r.logical_id.as_str(), r))
+        .collect::<BTreeMap<_, _>>();
+    let new = next
+        .iter()
+        .map(|r| (r.logical_id.as_str(), r))
+        .collect::<BTreeMap<_, _>>();
+    let params_changed = existing.is_some_and(|stack| stack.parameters != *params);
+    let mut changes = Vec::new();
+    for resource in next {
+        let action = match old.get(resource.logical_id.as_str()) {
+            None => Some("Add"),
+            Some(previous)
+                if params_changed
+                    || previous.resource_type != resource.resource_type
+                    || previous.properties != resource.properties
+                    || previous.depends_on != resource.depends_on
+                    || previous.deletion_policy != resource.deletion_policy
+                    || previous.update_replace_policy != resource.update_replace_policy =>
+            {
+                Some("Modify")
+            }
+            _ => None,
+        };
+        if let Some(action) = action {
+            changes.push(ChangeSetChange {
+                logical_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type.clone(),
+                action,
+                physical_id: existing
+                    .and_then(|stack| stack.resource(&resource.logical_id))
+                    .map(|resource| resource.physical_id.clone()),
+            });
+        }
+    }
+    for resource in previous {
+        if !new.contains_key(resource.logical_id.as_str()) {
+            changes.push(ChangeSetChange {
+                logical_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type,
+                action: "Remove",
+                physical_id: existing
+                    .and_then(|stack| stack.resource(&resource.logical_id))
+                    .map(|resource| resource.physical_id.clone()),
+            });
+        }
+    }
+    Ok(changes)
+}
+
+fn review_stack(cs: &ChangeSet) -> Stack {
+    Stack {
+        stack_id: cs.stack_id.clone(),
+        stack_name: cs.stack_name.clone(),
+        status: StackStatus::ReviewInProgress,
+        template_body: String::new(),
+        parameters: Default::default(),
+        resources: Vec::new(),
+        outputs: Vec::new(),
+        events: vec![event(
+            &cs.stack_name,
+            STACK_TYPE,
+            "REVIEW_IN_PROGRESS",
+            None,
+        )],
+        tags: Vec::new(),
+        creation_time: now_iso(),
+        last_updated_time: None,
+    }
 }
 
 fn render_stack(stack: &Stack) -> String {
@@ -1077,12 +1532,21 @@ fn render_event(stack: &Stack, e: &StackEvent) -> String {
         .as_ref()
         .map(|r| text_el("ResourceStatusReason", r))
         .unwrap_or_default();
+    let physical_id = if e.resource_type == STACK_TYPE {
+        stack.stack_id.as_str()
+    } else {
+        stack
+            .resource(&e.logical_id)
+            .map(|r| r.physical_id.as_str())
+            .unwrap_or(e.logical_id.as_str())
+    };
     format!(
-        "<member>{}{}{}{}{}{}<Timestamp>{}</Timestamp>{}</member>",
+        "<member>{}{}{}{}{}{}{}<Timestamp>{}</Timestamp>{}</member>",
         text_el("StackId", &stack.stack_id),
         text_el("StackName", &stack.stack_name),
         text_el("EventId", &e.event_id),
         text_el("LogicalResourceId", &e.logical_id),
+        text_el("PhysicalResourceId", physical_id),
         text_el("ResourceType", &e.resource_type),
         text_el("ResourceStatus", &e.status),
         xml_escape(&e.timestamp),

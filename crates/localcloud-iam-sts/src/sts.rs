@@ -148,6 +148,34 @@ fn resolve_role(store: &IamStore, account: &str, role_arn: &str) -> Result<IamRo
     Ok(role)
 }
 
+/// Internal service execution session; caller authorization and trust are checked by IAM first.
+pub fn issue_service_role_credentials(
+    store: &IamStore,
+    sessions: &SessionStore,
+    account: &str,
+    role_arn: &str,
+) -> Result<Credentials, IamStsError> {
+    let role = resolve_role(store, account, role_arn)?;
+    let role_name = role_name_from_arn(role_arn);
+    let session_name = format!("localcloud-lambda-{}", uuid::Uuid::new_v4().simple());
+    let creds = Credentials::generate(ASSUME_ROLE_DEFAULT);
+    let assumed_arn = format!("arn:aws:sts::{account}:assumed-role/{role_name}/{session_name}");
+    let user_id = format!("{}:{session_name}", role.role_id);
+    register_session(
+        sessions,
+        &creds,
+        SessionRegistration {
+            account,
+            arn: &assumed_arn,
+            user_id: &user_id,
+            duration: ASSUME_ROLE_DEFAULT,
+            role_arn: Some(role_arn),
+            session_policy: None,
+        },
+    );
+    Ok(creds)
+}
+
 fn session_policy(q: &QueryRequest) -> Result<Option<&str>, IamStsError> {
     let policy = q.get("Policy");
     if let Some(document) = policy {

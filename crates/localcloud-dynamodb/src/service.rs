@@ -10,6 +10,8 @@ use axum::response::Response;
 use serde_json::Value;
 
 use localcloud_core::handler::{NativeHandler, ServiceRequest};
+use localcloud_core::integration::authorization::AuthorizationRequest;
+use localcloud_core::integration::RequestIdentity;
 use localcloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use localcloud_state::StateDb;
 
@@ -157,6 +159,128 @@ fn context<'a>(store: &'a TableStore, request: &'a ServiceRequest) -> Ctx<'a> {
     }
 }
 
+fn authorize(
+    registry: &Weak<ServiceRegistry>,
+    request: &ServiceRequest,
+    op: &str,
+    body: &Value,
+) -> Result<(), DdbError> {
+    let Some(registry) = registry.upgrade() else {
+        return Ok(());
+    };
+    let Some(evaluator) = registry.authorization_evaluator(&ServiceName::new("iam")) else {
+        return Ok(());
+    };
+    if !evaluator.strict_sigv4_required() {
+        return Ok(());
+    }
+    // Core rejects unsigned external requests in strict mode. Requests that reach
+    // this handler without a signature are internal service calls.
+    let Some(access_key) = request
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(RequestIdentity::access_key_from_authorization)
+    else {
+        return Ok(());
+    };
+    for (action, table) in authorization_targets(op, body)? {
+        let resource = if table == "*" {
+            table
+        } else {
+            let table_arn = if table.starts_with("arn:") {
+                table
+            } else {
+                format!(
+                    "arn:aws:dynamodb:{}:{}:table/{table}",
+                    request.region, request.account_id
+                )
+            };
+            if matches!(op, "Query" | "Scan") {
+                body.get("IndexName")
+                    .and_then(Value::as_str)
+                    .map(|index| format!("{table_arn}/index/{index}"))
+                    .unwrap_or(table_arn)
+            } else {
+                table_arn
+            }
+        };
+        evaluator
+            .authorize(AuthorizationRequest {
+                request_identity: RequestIdentity {
+                    account_id: request.account_id.clone(),
+                    access_key_id: Some(access_key.clone()),
+                    arn: None,
+                },
+                delegated_identity: None,
+                source_service: "dynamodb".into(),
+                action: format!("dynamodb:{action}"),
+                resource,
+                context: Default::default(),
+            })
+            .map_err(|_| {
+                DdbError::AccessDenied(format!("not authorized to perform dynamodb:{action}"))
+            })?;
+    }
+    Ok(())
+}
+
+fn authorization_targets(op: &str, body: &Value) -> Result<Vec<(String, String)>, DdbError> {
+    let mut targets = Vec::new();
+    match op {
+        "BatchGetItem" | "BatchWriteItem" => {
+            let items = body
+                .get("RequestItems")
+                .and_then(Value::as_object)
+                .ok_or_else(|| DdbError::Validation("RequestItems is required".into()))?;
+            targets.extend(items.keys().map(|table| (op.to_string(), table.clone())));
+        }
+        "TransactGetItems" | "TransactWriteItems" => {
+            let items = body
+                .get("TransactItems")
+                .and_then(Value::as_array)
+                .ok_or_else(|| DdbError::Validation("TransactItems is required".into()))?;
+            for item in items {
+                let action = if op == "TransactGetItems" {
+                    "Get"
+                } else {
+                    ["Put", "Update", "Delete", "ConditionCheck"]
+                        .iter()
+                        .find(|action| item.get(**action).is_some())
+                        .copied()
+                        .ok_or_else(|| DdbError::Validation("invalid transaction action".into()))?
+                };
+                let table = item
+                    .get(action)
+                    .and_then(|value| value.get("TableName"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DdbError::Validation("TableName is required".into()))?;
+                let iam_action = match action {
+                    "Get" => "GetItem",
+                    "Put" => "PutItem",
+                    "Update" => "UpdateItem",
+                    "Delete" => "DeleteItem",
+                    _ => "ConditionCheckItem",
+                };
+                targets.push((iam_action.into(), table.into()));
+            }
+        }
+        "ExecuteStatement" | "ExecuteTransaction" | "BatchExecuteStatement" => {
+            targets = partiql::authorization_targets(op, body)?;
+        }
+        _ => {
+            let table = body
+                .get("TableName")
+                .or_else(|| body.get("ResourceArn"))
+                .or_else(|| body.get("TableArn"))
+                .and_then(Value::as_str)
+                .unwrap_or("*");
+            targets.push((op.into(), table.into()));
+        }
+    }
+    Ok(targets)
+}
+
 #[async_trait]
 impl NativeHandler for DynamoHandler {
     async fn handle(&self, request: ServiceRequest) -> Response {
@@ -174,6 +298,9 @@ impl NativeHandler for DynamoHandler {
             Ok(body) => body,
             Err(err) => return err.into_response(&request.request_id),
         };
+        if let Err(error) = authorize(&self.registry, &request, &op, &body) {
+            return error.into_response(&request.request_id);
+        }
         let _gate = self.store.operation_gate.lock().await;
         if self.store.has_uncommitted() {
             if let Err(err) = self.store.persist().await {

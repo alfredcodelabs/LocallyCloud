@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 /// Lifecycle status of a stack (subset of the AWS status set that this engine drives).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackStatus {
+    ReviewInProgress,
     CreateComplete,
     UpdateComplete,
     DeleteComplete,
@@ -16,6 +17,7 @@ pub enum StackStatus {
 impl StackStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            StackStatus::ReviewInProgress => "REVIEW_IN_PROGRESS",
             StackStatus::CreateComplete => "CREATE_COMPLETE",
             StackStatus::UpdateComplete => "UPDATE_COMPLETE",
             StackStatus::DeleteComplete => "DELETE_COMPLETE",

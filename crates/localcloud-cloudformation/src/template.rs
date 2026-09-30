@@ -11,6 +11,7 @@ use crate::provision::is_supported_resource_type;
 #[derive(Debug, Clone)]
 pub struct Template {
     raw: Value,
+    declared_transform: Option<String>,
 }
 
 /// A resource declaration from the template (properties unresolved).
@@ -145,21 +146,53 @@ fn validate_resources(raw: &Value) -> Result<(), CfnError> {
 
 impl Template {
     pub fn parse(body: &str) -> Result<Template, CfnError> {
-        let raw: Value = serde_json::from_str(body)
-            .map_err(|e| CfnError::Validation(format!("Template format error: {e}")))?;
+        let mut raw: Value = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(_) => yaml_to_json(
+                serde_yaml_ng::from_str(body)
+                    .map_err(|e| CfnError::Validation(format!("Template format error: {e}")))?,
+            )?,
+        };
         if !raw.is_object() {
             return Err(CfnError::Validation(
                 "Template must be a JSON object".into(),
             ));
         }
+        let declared_transform = raw
+            .get("Transform")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        crate::sam::transform(&mut raw)?;
         validate_resources(&raw)?;
-        let template = Template { raw };
+        if let Some(params) = raw.get("Parameters") {
+            let definitions = params
+                .as_object()
+                .ok_or_else(|| CfnError::Validation("Parameters must be an object".into()))?;
+            for (name, definition) in definitions {
+                let valid = definition
+                    .as_object()
+                    .is_some_and(|d| d.get("Type").and_then(Value::as_str).is_some());
+                if !valid {
+                    return Err(CfnError::Validation(format!(
+                        "Parameter {name} requires a Type"
+                    )));
+                }
+            }
+        }
+        let template = Template {
+            raw,
+            declared_transform,
+        };
         template.validate_condition_names()?;
         template.validate_dependency_names()?;
         if template.raw.get("Conditions").is_none() {
             template.ordered_resources()?;
         }
         Ok(template)
+    }
+
+    pub fn processed_body(&self) -> Result<String, CfnError> {
+        serde_json::to_string(&self.raw).map_err(|_| CfnError::Internal)
     }
 
     fn validate_dependency_names(&self) -> Result<(), CfnError> {
@@ -270,6 +303,26 @@ impl Template {
 
     pub fn body(&self) -> String {
         self.raw.to_string()
+    }
+
+    pub fn declared_transform(&self) -> Option<&str> {
+        self.declared_transform.as_deref()
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.raw.get("Description").and_then(Value::as_str)
+    }
+
+    pub fn parameter_declarations(&self) -> Vec<(String, Value)> {
+        self.raw
+            .get("Parameters")
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// All resource declarations.
@@ -1192,6 +1245,47 @@ fn resolve_sub_token(name: &str, vars: &BTreeMap<String, String>, ctx: &ResolveC
             .unwrap_or_default();
     }
     value_to_string(&resolve_ref(name, ctx))
+}
+
+fn yaml_to_json(value: serde_yaml_ng::Value) -> Result<Value, CfnError> {
+    use serde_yaml_ng::Value as Yaml;
+    match value {
+        Yaml::Null => Ok(Value::Null),
+        Yaml::Bool(value) => Ok(Value::Bool(value)),
+        Yaml::Number(value) => serde_json::to_value(value)
+            .map_err(|_| CfnError::Validation("Invalid YAML number".into())),
+        Yaml::String(value) => Ok(Value::String(value)),
+        Yaml::Sequence(values) => values
+            .into_iter()
+            .map(yaml_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Yaml::Mapping(values) => {
+            let mut result = serde_json::Map::new();
+            for (key, value) in values {
+                let Yaml::String(key) = key else {
+                    return Err(CfnError::Validation(
+                        "YAML template keys must be strings".into(),
+                    ));
+                };
+                result.insert(key, yaml_to_json(value)?);
+            }
+            Ok(Value::Object(result))
+        }
+        Yaml::Tagged(tagged) => {
+            let tag = tagged.tag.to_string();
+            let name = match tag.trim_start_matches('!') {
+                "Ref" => "Ref".to_string(),
+                "GetAtt" | "Sub" | "Join" | "If" | "Select" | "Split" => {
+                    format!("Fn::{}", tag.trim_start_matches('!'))
+                }
+                _ => return Err(CfnError::Validation(format!("Unsupported YAML tag {tag}"))),
+            };
+            let mut result = serde_json::Map::new();
+            result.insert(name, yaml_to_json(tagged.value)?);
+            Ok(Value::Object(result))
+        }
+    }
 }
 
 #[cfg(test)]

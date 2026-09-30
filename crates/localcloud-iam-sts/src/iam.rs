@@ -674,17 +674,26 @@ fn strip_member(xml: &str) -> String {
 /// Seed the read-only AWS-managed policy catalog under `arn:aws:iam::aws:policy` (account
 /// key `aws`), idempotently. Includes the common Lambda execution-role policies.
 pub fn seed_aws_managed_policies(store: &IamStore) {
-    const MANAGED: &[&str] = &[
-        "AWSLambdaBasicExecutionRole",
-        "AWSLambdaVPCAccessExecutionRole",
-        "AWSLambdaSQSQueueExecutionRole",
-        "AWSLambdaDynamoDBExecutionRole",
-        "AWSLambdaKinesisExecutionRole",
+    // A wildcard action here lets a basic Lambda role access unrelated services.
+    const MANAGED: &[(&str, &str, &str)] = &[
+        ("AWSLambdaBasicExecutionRole", "v1", "logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents"),
+        ("AWSLambdaVPCAccessExecutionRole", "v3", "logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents,ec2:CreateNetworkInterface,ec2:DescribeNetworkInterfaces,ec2:DescribeSubnets,ec2:DeleteNetworkInterface,ec2:AssignPrivateIpAddresses,ec2:UnassignPrivateIpAddresses"),
+        ("AWSLambdaSQSQueueExecutionRole", "v1", "sqs:ReceiveMessage,sqs:DeleteMessage,sqs:GetQueueAttributes,logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents"),
+        ("AWSLambdaDynamoDBExecutionRole", "v1", "dynamodb:DescribeStream,dynamodb:GetRecords,dynamodb:GetShardIterator,dynamodb:ListStreams,logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents"),
+        ("AWSLambdaKinesisExecutionRole", "v2", "kinesis:DescribeStream,kinesis:DescribeStreamSummary,kinesis:GetRecords,kinesis:GetShardIterator,kinesis:ListShards,kinesis:ListStreams,kinesis:SubscribeToShard,logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents"),
     ];
     let now = now_iso8601();
-    for name in MANAGED {
+    for (name, version, actions) in MANAGED {
         let arn = format!("arn:aws:iam::aws:policy/service-role/{name}");
-        let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
+        let document = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": actions.split(',').collect::<Vec<_>>(),
+                "Resource": "*"
+            }]
+        })
+        .to_string();
         store.seed_policy(
             "aws",
             IamPolicy {
@@ -693,10 +702,10 @@ pub fn seed_aws_managed_policies(store: &IamStore) {
                 arn: arn.clone(),
                 path: "/service-role/".to_string(),
                 create_date: now.clone(),
-                default_version_id: "v1".to_string(),
+                default_version_id: version.to_string(),
                 versions: vec![PolicyVersion {
-                    version_id: "v1".to_string(),
-                    document: document.to_string(),
+                    version_id: version.to_string(),
+                    document,
                     is_default: true,
                     create_date: now.clone(),
                 }],
@@ -1344,4 +1353,40 @@ fn principal_policy_documents(
         }
     }
     Ok(documents)
+}
+
+#[cfg(test)]
+mod managed_policy_tests {
+    use super::*;
+
+    #[test]
+    fn lambda_basic_role_grants_logs_but_not_dynamodb_writes() {
+        let store = IamStore::new();
+        seed_aws_managed_policies(&store);
+        let policy = store
+            .get_policy(
+                "aws",
+                "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            )
+            .unwrap();
+        let document = PolicyDocument::parse(&policy.default_version().unwrap().document).unwrap();
+        let request = |action: &str| EvalRequest {
+            action: action.into(),
+            resource: "*".into(),
+            context: BTreeMap::new(),
+        };
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&document),
+                None,
+                None,
+                &request("logs:PutLogEvents")
+            ),
+            Decision::Allowed
+        );
+        assert_eq!(
+            evaluate(&[document], None, None, &request("dynamodb:PutItem")),
+            Decision::ImplicitDeny
+        );
+    }
 }

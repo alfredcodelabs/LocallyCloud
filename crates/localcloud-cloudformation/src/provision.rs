@@ -3488,6 +3488,16 @@ impl Provisioner {
         logical_id: &str,
         props: &Value,
     ) -> Result<ResolvedResource, CfnError> {
+        if props.get("Body").is_some()
+            && props
+                .get("ProtocolType")
+                .is_some_and(|value| value != "HTTP")
+        {
+            return Err(CfnError::Validation(
+                "HTTP API Body requires ProtocolType HTTP".into(),
+            ));
+        }
+        let routes = props.get("Body").map(api_routes_from_body).transpose()?;
         let mut body = mapped_properties(
             props,
             &[
@@ -3500,13 +3510,110 @@ impl Provisioner {
         if let Some(cors) = props.get("CorsConfiguration") {
             body["corsConfiguration"] = apigateway_v2_cors(cors, logical_id)?;
         }
+        if let Some(definition) = props.get("Body") {
+            body["name"] = definition
+                .pointer("/info/title")
+                .cloned()
+                .unwrap_or_else(|| json!(logical_id));
+            body["protocolType"] = json!("HTTP");
+        }
         let response = self
             .call_json("apigatewayv2", Method::POST, "/v2/apis", body, logical_id)
             .await?;
+        let api_id = required_response_string(&response, "apiId", logical_id)?;
+        if let Some(routes) = routes {
+            if let Err(error) = self
+                .create_api_body_routes(logical_id, &api_id, &routes)
+                .await
+            {
+                let _ = self.delete_apigateway_v2_api(&api_id).await;
+                return Err(error);
+            }
+        }
         Ok(ResolvedResource {
-            ref_value: required_response_string(&response, "apiId", logical_id)?,
+            ref_value: api_id,
             attributes: Default::default(),
         })
+    }
+
+    async fn create_api_body_routes(
+        &self,
+        logical_id: &str,
+        api_id: &str,
+        routes: &[(String, String, String)],
+    ) -> Result<(), CfnError> {
+        for (route_key, uri, payload_version) in routes {
+            let integration = self
+                .call_json(
+                    "apigatewayv2",
+                    Method::POST,
+                    &format!("/v2/apis/{api_id}/integrations"),
+                    json!({
+                        "integrationType":"AWS_PROXY",
+                        "integrationUri":uri,
+                        "integrationMethod":"POST",
+                        "payloadFormatVersion":payload_version
+                    }),
+                    logical_id,
+                )
+                .await?;
+            let integration_id =
+                required_response_string(&integration, "integrationId", logical_id)?;
+            self.call_json(
+                "apigatewayv2",
+                Method::POST,
+                &format!("/v2/apis/{api_id}/routes"),
+                json!({"routeKey":route_key,"target":format!("integrations/{integration_id}")}),
+                logical_id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn clear_api_body_routes(&self, logical_id: &str, api_id: &str) -> Result<(), CfnError> {
+        let routes = self
+            .call_json(
+                "apigatewayv2",
+                Method::GET,
+                &format!("/v2/apis/{api_id}/routes"),
+                json!({}),
+                logical_id,
+            )
+            .await?;
+        for route in routes["items"].as_array().into_iter().flatten() {
+            let route_id = required_response_string(route, "routeId", logical_id)?;
+            self.call_json(
+                "apigatewayv2",
+                Method::DELETE,
+                &format!("/v2/apis/{api_id}/routes/{route_id}"),
+                json!({}),
+                logical_id,
+            )
+            .await?;
+        }
+        let integrations = self
+            .call_json(
+                "apigatewayv2",
+                Method::GET,
+                &format!("/v2/apis/{api_id}/integrations"),
+                json!({}),
+                logical_id,
+            )
+            .await?;
+        for integration in integrations["items"].as_array().into_iter().flatten() {
+            let integration_id =
+                required_response_string(integration, "integrationId", logical_id)?;
+            self.call_json(
+                "apigatewayv2",
+                Method::DELETE,
+                &format!("/v2/apis/{api_id}/integrations/{integration_id}"),
+                json!({}),
+                logical_id,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn apigateway_v2_integration(
@@ -3709,6 +3816,7 @@ impl Provisioner {
                 "Description",
                 "RouteSelectionExpression",
                 "CorsConfiguration",
+                "Body",
             ],
         )?;
         if previous.get("ProtocolType") != props.get("ProtocolType") {
@@ -3716,6 +3824,17 @@ impl Provisioner {
                 "AWS::ApiGatewayV2::Api ProtocolType cannot be updated for {logical_id}"
             )));
         }
+        if props.get("Body").is_some()
+            && props
+                .get("ProtocolType")
+                .is_some_and(|value| value != "HTTP")
+        {
+            return Err(CfnError::Validation(
+                "HTTP API Body requires ProtocolType HTTP".into(),
+            ));
+        }
+        let new_routes = props.get("Body").map(api_routes_from_body).transpose()?;
+        let old_routes = previous.get("Body").map(api_routes_from_body).transpose()?;
         let mut body = mapped_properties(
             props,
             &[
@@ -3726,6 +3845,12 @@ impl Provisioner {
         );
         if let Some(cors) = props.get("CorsConfiguration") {
             body["corsConfiguration"] = apigateway_v2_cors(cors, logical_id)?;
+        }
+        if let Some(title) = props
+            .get("Body")
+            .and_then(|value| value.pointer("/info/title"))
+        {
+            body["name"] = title.clone();
         }
         reset_removed_property(&mut body, previous, props, "Name", "name", Value::Null);
         reset_removed_property(
@@ -3766,6 +3891,23 @@ impl Provisioner {
             logical_id,
         )
         .await?;
+        if previous.get("Body") != props.get("Body") {
+            self.clear_api_body_routes(logical_id, api_id).await?;
+            if let Some(routes) = new_routes {
+                if let Err(error) = self
+                    .create_api_body_routes(logical_id, api_id, &routes)
+                    .await
+                {
+                    let _ = self.clear_api_body_routes(logical_id, api_id).await;
+                    if let Some(routes) = old_routes {
+                        let _ = self
+                            .create_api_body_routes(logical_id, api_id, &routes)
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5857,6 +5999,133 @@ fn apigateway_v2_access_log_settings(value: &Value, logical_id: &str) -> Result<
         "AccessLogSettings",
         &[("DestinationArn", "destinationArn"), ("Format", "format")],
     )
+}
+
+fn api_routes_from_body(body: &Value) -> Result<Vec<(String, String, String)>, CfnError> {
+    let root = body
+        .as_object()
+        .ok_or_else(|| CfnError::Validation("HTTP API Body must be an object".into()))?;
+    if root
+        .keys()
+        .any(|key| !matches!(key.as_str(), "openapi" | "info" | "paths" | "tags"))
+    {
+        return Err(CfnError::Validation(
+            "unsupported HTTP API Body field".into(),
+        ));
+    }
+    if body.get("openapi").and_then(Value::as_str) != Some("3.0.1") {
+        return Err(CfnError::Validation(
+            "HTTP API Body requires OpenAPI 3.0.1".into(),
+        ));
+    }
+    let paths = body
+        .get("paths")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CfnError::Validation("HTTP API Body.paths must be an object".into()))?;
+    let mut routes = Vec::new();
+    for (path, methods) in paths {
+        if !path.starts_with('/') && path != "$default" {
+            return Err(CfnError::Validation(
+                "HTTP API path must start with /".into(),
+            ));
+        }
+        let methods = methods
+            .as_object()
+            .ok_or_else(|| CfnError::Validation("HTTP API methods must be an object".into()))?;
+        for (method, operation) in methods {
+            if !matches!(
+                method.as_str(),
+                "get"
+                    | "post"
+                    | "put"
+                    | "patch"
+                    | "delete"
+                    | "head"
+                    | "options"
+                    | "x-amazon-apigateway-any-method"
+            ) {
+                return Err(CfnError::Validation(format!(
+                    "unsupported HTTP API method {method}"
+                )));
+            }
+            let fields = operation.as_object().ok_or_else(|| {
+                CfnError::Validation("HTTP API operation must be an object".into())
+            })?;
+            if fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "responses" | "x-amazon-apigateway-integration" | "isDefaultRoute"
+                )
+            }) || operation.get("responses") != Some(&json!({}))
+            {
+                return Err(CfnError::Validation(
+                    "unsupported HTTP API operation field".into(),
+                ));
+            }
+            if operation.get("isDefaultRoute").is_some()
+                && (path != "$default" || operation.get("isDefaultRoute") != Some(&json!(true)))
+            {
+                return Err(CfnError::Validation(
+                    "invalid HTTP API default route".into(),
+                ));
+            }
+            let integration = operation
+                .get("x-amazon-apigateway-integration")
+                .ok_or_else(|| {
+                    CfnError::Validation("HTTP API route requires Lambda integration".into())
+                })?;
+            let integration_fields = integration.as_object().ok_or_else(|| {
+                CfnError::Validation("HTTP API integration must be an object".into())
+            })?;
+            if integration_fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "type" | "httpMethod" | "uri" | "payloadFormatVersion"
+                )
+            }) {
+                return Err(CfnError::Validation(
+                    "unsupported HTTP API integration field".into(),
+                ));
+            }
+            if integration.get("type").and_then(Value::as_str) != Some("aws_proxy")
+                || integration.get("httpMethod").and_then(Value::as_str) != Some("POST")
+            {
+                return Err(CfnError::Validation(
+                    "unsupported HTTP API integration".into(),
+                ));
+            }
+            let uri = integration
+                .get("uri")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CfnError::Validation("HTTP API integration uri is required".into())
+                })?;
+            if !uri.contains(":apigateway:")
+                || !uri.contains(":lambda:path/2015-03-31/functions/")
+                || !uri.ends_with("/invocations")
+            {
+                return Err(CfnError::Validation(
+                    "unsupported HTTP API Lambda integration uri".into(),
+                ));
+            }
+            let payload = integration
+                .get("payloadFormatVersion")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "1.0" | "2.0"))
+                .ok_or_else(|| {
+                    CfnError::Validation("unsupported HTTP API payload format".into())
+                })?;
+            let route_key = if path == "$default" {
+                "$default".to_string()
+            } else if method == "x-amazon-apigateway-any-method" {
+                format!("ANY {path}")
+            } else {
+                format!("{} {path}", method.to_ascii_uppercase())
+            };
+            routes.push((route_key, uri.into(), payload.into()));
+        }
+    }
+    Ok(routes)
 }
 
 fn apigateway_v2_cors(value: &Value, logical_id: &str) -> Result<Value, CfnError> {

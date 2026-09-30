@@ -25,11 +25,7 @@ pub fn text_el(name: &str, value: &str) -> String {
 
 /// Wrap a result body in the CloudFormation Query response envelope.
 pub fn query_envelope(operation: &str, inner: &str, request_id: &str) -> String {
-    let result = if inner.is_empty() {
-        String::new()
-    } else {
-        format!("<{operation}Result>{inner}</{operation}Result>")
-    };
+    let result = format!("<{operation}Result>{inner}</{operation}Result>");
     format!(
         "<{operation}Response xmlns=\"{CFN_XMLNS}\">{result}<ResponseMetadata><RequestId>{}</RequestId></ResponseMetadata></{operation}Response>",
         xml_escape(request_id),
