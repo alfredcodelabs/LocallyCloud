@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license-file.workspace = true
 description = "localcloud compute: ComputeRuntime trait with Firecracker (primary) and youki (fallback) backends"
 
 # Hard constraint (Requirement 1.4 / 16.3): no Docker daemon, no bollard.

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license-file.workspace = true
 description = "localcloud AWS CloudFormation service (Query/XML), registered Native; provisions stack resources through the native service registry"
 
 [dependencies]

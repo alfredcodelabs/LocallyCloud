@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license-file.workspace = true
 description = "Partial native AWS WAFv2 REGIONAL control plane and request evaluator"
 
 [dependencies]
