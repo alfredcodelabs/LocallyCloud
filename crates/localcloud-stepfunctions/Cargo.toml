@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "localcloud AWS Step Functions service (JSON 1.0), registered Native in the Core ServiceRegistry"
 
 [dependencies]

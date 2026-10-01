@@ -13,9 +13,21 @@ pub(crate) enum KmsError {
     AccessDenied,
     Unsupported,
     Internal,
+    MissingMasterKey,
+    InvalidMasterKey,
+    StoredKeyUnavailable,
 }
 
 impl KmsError {
+    pub(crate) fn startup_message(self) -> &'static str {
+        match self {
+            Self::MissingMasterKey => "LOCALCLOUD_KMS_MASTER_KEY is required",
+            Self::InvalidMasterKey => "LOCALCLOUD_KMS_MASTER_KEY must be base64 for exactly 32 bytes",
+            Self::StoredKeyUnavailable => "stored KMS key cannot be decrypted; restore the original master key or check the state database",
+            _ => "KMS state could not be loaded; check the state database",
+        }
+    }
+
     pub(crate) fn into_aws(self) -> AwsError {
         let (code, message, status) = match self {
             Self::Serialization => (
@@ -64,7 +76,10 @@ impl KmsError {
                 "This KMS operation or parameter is not supported by this milestone",
                 400,
             ),
-            Self::Internal => (
+            Self::Internal
+            | Self::MissingMasterKey
+            | Self::InvalidMasterKey
+            | Self::StoredKeyUnavailable => (
                 "KMSInternalException",
                 "The request could not be completed",
                 500,

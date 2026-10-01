@@ -284,7 +284,10 @@ async fn main() {
         Arc::new(Ec2AlbNetworkPreflight(ec2.clone())),
         Arc::new(localcloud_elbv2::LoopbackAlbEndpointAllocator::default()),
     );
-    localcloud_kms::register_with_state(&registry, state.clone());
+    if let Err(error) = localcloud_kms::register_with_state(&registry, state.clone()) {
+        tracing::error!(%error, "failed to register KMS");
+        std::process::exit(4);
+    }
     if let Err(error) = localcloud_ssm::register_with_state(&registry, state.clone()) {
         tracing::error!(%error, "failed to register SSM");
         std::process::exit(4);

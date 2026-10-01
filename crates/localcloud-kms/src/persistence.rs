@@ -35,28 +35,30 @@ struct SavedKey {
 impl KmsPersistence {
     pub(crate) fn new(db: Arc<StateDb>) -> Result<Self, KmsError> {
         let encoded = Zeroizing::new(
-            std::env::var("LOCALCLOUD_KMS_MASTER_KEY").map_err(|_| KmsError::Internal)?,
+            std::env::var("LOCALCLOUD_KMS_MASTER_KEY").map_err(|_| KmsError::MissingMasterKey)?,
         );
         let mut decoded = Zeroizing::new(
             STANDARD
                 .decode(encoded.as_bytes())
-                .map_err(|_| KmsError::Internal)?,
+                .map_err(|_| KmsError::InvalidMasterKey)?,
         );
         let master: [u8; 32] = decoded
             .as_slice()
             .try_into()
-            .map_err(|_| KmsError::Internal)?;
+            .map_err(|_| KmsError::InvalidMasterKey)?;
         decoded.zeroize();
         Self::with_master(db, SecretMaterial::new(master))
     }
 
     fn with_master(db: Arc<StateDb>, master: SecretMaterial) -> Result<Self, KmsError> {
         let store = Self { db, master };
-        store.connection()?.execute_batch(
+        let mut conn = store.connection()?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS kms_keys (account TEXT NOT NULL, region TEXT NOT NULL, key_id TEXT NOT NULL, record BLOB NOT NULL, PRIMARY KEY(account,region,key_id));
              CREATE TABLE IF NOT EXISTS kms_aliases (account TEXT NOT NULL, region TEXT NOT NULL, name TEXT NOT NULL, target TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, PRIMARY KEY(account,region,name));
              CREATE TABLE IF NOT EXISTS kms_defaults (account TEXT NOT NULL, region TEXT NOT NULL, service TEXT NOT NULL, key_id TEXT NOT NULL, PRIMARY KEY(account,region,service));"
         ).map_err(|_| KmsError::Internal)?;
+        migrate_aliases(&mut conn)?;
         // Decrypt all existing keys at startup so a wrong master key fails before requests are served.
         store.load_keys()?;
         Ok(store)
@@ -275,10 +277,39 @@ impl KmsPersistence {
                 Aad::from(material_aad(scope, key_id)),
                 &mut data,
             )
-            .map_err(|_| KmsError::Internal)?;
+            .map_err(|_| KmsError::StoredKeyUnavailable)?;
         let material: [u8; 32] = plain.try_into().map_err(|_| KmsError::Internal)?;
         Ok(SecretMaterial::new(material))
     }
+}
+
+fn migrate_aliases(conn: &mut Connection) -> Result<(), KmsError> {
+    let columns = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(kms_aliases)")
+            .map_err(|_| KmsError::Internal)?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|_| KmsError::Internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| KmsError::Internal)?;
+        columns
+    };
+    if columns.iter().any(|column| column == "name") {
+        return Ok(());
+    }
+    if !columns.iter().any(|column| column == "alias_name") {
+        return Err(KmsError::Internal);
+    }
+    let tx = conn.transaction().map_err(|_| KmsError::Internal)?;
+    tx.execute_batch(
+        "ALTER TABLE kms_aliases RENAME COLUMN alias_name TO name;
+         ALTER TABLE kms_aliases RENAME COLUMN target_key_id TO target;
+         ALTER TABLE kms_aliases RENAME COLUMN creation_date TO created;
+         ALTER TABLE kms_aliases RENAME COLUMN last_updated_date TO updated;",
+    )
+    .map_err(|_| KmsError::Internal)?;
+    tx.commit().map_err(|_| KmsError::Internal)
 }
 
 fn material_aad(scope: &Scope, key_id: &str) -> Vec<u8> {
@@ -298,6 +329,31 @@ fn save_alias(conn: &Connection, scope: &Scope, alias: &AliasRecord) -> Result<(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn migrates_legacy_aliases_without_losing_rows() {
+        let path = std::env::temp_dir()
+            .join(format!("localcloud-kms-legacy-{}", Uuid::new_v4()))
+            .join("state.sqlite3");
+        let db = Arc::new(StateDb::open(path).expect("state"));
+        db.connection()
+            .expect("db")
+            .execute_batch(
+                "CREATE TABLE kms_aliases (account TEXT NOT NULL, region TEXT NOT NULL, alias_name TEXT NOT NULL, target_key_id TEXT NOT NULL, creation_date REAL NOT NULL, last_updated_date REAL NOT NULL, PRIMARY KEY(account,region,alias_name));
+                 INSERT INTO kms_aliases VALUES ('000000000000','us-east-1','alias/example','key-id',1.0,2.0);",
+            )
+            .expect("legacy schema");
+        let store = KmsPersistence::with_master(db.clone(), SecretMaterial::new([0x11; 32]))
+            .expect("migrate");
+        let aliases = store.load_aliases().expect("load aliases");
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].1.alias_name, "alias/example");
+        assert_eq!(aliases[0].1.target_key_id, "key-id");
+        assert_eq!(aliases[0].1.creation_date, 1.0);
+        assert_eq!(aliases[0].1.last_updated_date, 2.0);
+        KmsPersistence::with_master(db, SecretMaterial::new([0x11; 32]))
+            .expect("migration is idempotent");
+    }
 
     #[test]
     fn encrypted_material_survives_restart_and_rejects_wrong_master() {

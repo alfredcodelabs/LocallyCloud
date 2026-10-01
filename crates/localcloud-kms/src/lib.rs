@@ -52,21 +52,18 @@ enum InternalFault {
 }
 
 impl KmsHandler {
-    fn new(db: Arc<StateDb>) -> Self {
-        Self {
-            service: Arc::new(
-                KmsService::new(db)
-                    .expect("KMS state initialization failed; check LOCALCLOUD_KMS_MASTER_KEY"),
-            ),
+    fn new(db: Arc<StateDb>) -> Result<Self, KmsError> {
+        Ok(Self {
+            service: Arc::new(KmsService::new(db)?),
             registry: Weak::new(),
             internal_fault: InternalFault::from_env(),
             internal_call_count: AtomicU64::new(0),
-        }
+        })
     }
-    fn with_registry(registry: &Arc<ServiceRegistry>, db: Arc<StateDb>) -> Self {
-        let mut handler = Self::new(db);
+    fn with_registry(registry: &Arc<ServiceRegistry>, db: Arc<StateDb>) -> Result<Self, KmsError> {
+        let mut handler = Self::new(db)?;
         handler.registry = Arc::downgrade(registry);
-        handler
+        Ok(handler)
     }
 
     fn authorize_put_key_policy(
@@ -261,7 +258,10 @@ fn map_internal_error(error: KmsError) -> KmsInternalError {
         KmsError::InvalidState => KmsInternalError::InvalidState,
         KmsError::InvalidCiphertext => KmsInternalError::InvalidCiphertext,
         KmsError::AccessDenied => KmsInternalError::AccessDenied,
-        KmsError::Internal => KmsInternalError::Internal,
+        KmsError::Internal
+        | KmsError::MissingMasterKey
+        | KmsError::InvalidMasterKey
+        | KmsError::StoredKeyUnavailable => KmsInternalError::Internal,
     }
 }
 
@@ -271,11 +271,15 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
         StateDb::open(StateDb::default_path().expect("KMS state path unavailable"))
             .expect("KMS state database unavailable"),
     );
-    register_with_state(registry, db);
+    register_with_state(registry, db).expect("KMS state initialization failed");
 }
 
-pub fn register_with_state(registry: &Arc<ServiceRegistry>, db: Arc<StateDb>) {
-    let handler = Arc::new(KmsHandler::with_registry(registry, db));
+pub fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    db: Arc<StateDb>,
+) -> Result<(), &'static str> {
+    let handler =
+        Arc::new(KmsHandler::with_registry(registry, db).map_err(KmsError::startup_message)?);
     let native_handler: Arc<dyn NativeHandler> = handler.clone();
     let kms_api: Arc<dyn KmsInternalApi> = handler;
     registry.register_native_with_kms_api(
@@ -284,6 +288,7 @@ pub fn register_with_state(registry: &Arc<ServiceRegistry>, db: Arc<StateDb>) {
         native_handler,
         kms_api,
     );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -348,7 +353,7 @@ mod tests {
             "us-east-1".into(),
             "000000000000".into(),
         )));
-        let handler = KmsHandler::with_registry(&registry, test_db());
+        let handler = KmsHandler::with_registry(&registry, test_db()).unwrap();
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-target", "TrentService.PutKeyPolicy".parse().unwrap());
         let response = handler
@@ -374,7 +379,7 @@ mod tests {
     #[test]
     fn register_publishes_current_kms_internal_api() {
         let registry = Arc::new(ServiceRegistry::new());
-        register_with_state(&registry, test_db());
+        register_with_state(&registry, test_db()).unwrap();
 
         let api = registry
             .kms_api(&ServiceName::new("kms"))

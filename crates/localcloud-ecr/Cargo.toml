@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "localcloud AWS ECR service (JSON 1.1), registered Native; minimal registry/repository control plane for deployment-tool compatibility"
 
 [dependencies]
