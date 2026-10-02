@@ -10,14 +10,20 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::response::Response;
 use ipnet::Ipv4Net;
-use localcloud_core::error_mapping::AwsError;
 use localcloud_core::handler::{NativeHandler, ServiceRequest};
 use localcloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use uuid::Uuid;
 
 const XMLNS: &str = "http://ec2.amazonaws.com/doc/2016-11-15/";
 
-#[derive(Clone)]
+mod endpoints;
+mod nat;
+mod private_tcp;
+mod security_group_egress;
+use endpoints::VpcEndpoint;
+use security_group_egress::default_egress;
+
+#[derive(Clone, Debug)]
 struct Vpc {
     id: String,
     cidr: Ipv4Net,
@@ -51,6 +57,7 @@ struct SecurityGroup {
     owner: String,
     is_default: bool,
     ingress: Vec<IngressRule>,
+    egress: Vec<IngressRule>,
     guard: Arc<()>,
 }
 
@@ -131,13 +138,47 @@ struct RouteTable {
     vpc_id: String,
     owner: String,
     main: bool,
-    routes: BTreeMap<Ipv4Net, Option<String>>,
+    routes: BTreeMap<Ipv4Net, RouteTarget>,
+    endpoint_routes: BTreeMap<String, String>,
     associations: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone)]
+enum RouteTarget {
+    Local,
+    NetworkInterface(String),
+    InternetGateway(String),
+    NatGateway(String),
+    BlackholeNatGateway(String),
+}
+
+#[derive(Clone)]
+struct InternetGateway {
+    id: String,
+    vpc_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct ElasticIp {
+    allocation_id: String,
+    public_ip: Ipv4Addr,
+    nat_gateway_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct NatGateway {
+    id: String,
+    vpc_id: String,
+    subnet_id: Option<String>,
+    allocation_id: Option<String>,
+    private_ip: Option<Ipv4Addr>,
+    regional: bool,
 }
 
 #[derive(Default)]
 struct ScopeState {
     vpcs: BTreeMap<String, Arc<Vpc>>,
+    vpc_dns: BTreeMap<String, (bool, bool)>,
     subnets: BTreeMap<String, Subnet>,
     security_groups: BTreeMap<String, SecurityGroup>,
     network_interfaces: BTreeMap<String, NetworkInterface>,
@@ -145,8 +186,15 @@ struct ScopeState {
     instances: BTreeMap<String, Instance>,
     instance_tokens: BTreeMap<String, IdempotentInstance>,
     route_tables: BTreeMap<String, RouteTable>,
+    internet_gateways: BTreeMap<String, InternetGateway>,
+    elastic_ips: BTreeMap<String, ElasticIp>,
+    nat_gateways: BTreeMap<String, NatGateway>,
+    nat_gateway_tokens: BTreeMap<String, (BTreeMap<String, String>, String)>,
     route_table_tokens: BTreeMap<String, (String, String)>,
+    vpc_endpoints: BTreeMap<String, VpcEndpoint>,
+    vpc_endpoint_tokens: BTreeMap<String, (BTreeMap<String, String>, String)>,
     task_networks: BTreeMap<String, String>,
+    task_dns: BTreeMap<String, String>,
     task_endpoints: BTreeMap<(Ipv4Addr, u16), (String, SocketAddr)>,
 }
 
@@ -176,6 +224,36 @@ pub struct TaskNetworkLease {
 }
 
 impl TaskNetworkLease {
+    pub fn set_dns_name(&self, name: &str) -> bool {
+        if name.len() > 253
+            || name.is_empty()
+            || name.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return false;
+        }
+        let Ok(mut state) = self.scopes.lock() else {
+            return false;
+        };
+        let Some(scope) = state.get_mut(&self.key) else {
+            return false;
+        };
+        if scope.task_networks.get(&self.eni_id) != Some(&self.task_id) {
+            return false;
+        }
+        scope
+            .task_dns
+            .insert(self.eni_id.clone(), name.to_ascii_lowercase());
+        true
+    }
+
     pub fn set_endpoint(&self, port: u16, endpoint: SocketAddr) -> bool {
         if endpoint.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return false;
@@ -202,6 +280,7 @@ impl Drop for TaskNetworkLease {
             if let Some(scope) = state.get_mut(&self.key) {
                 if scope.task_networks.get(&self.eni_id) == Some(&self.task_id) {
                     scope.task_networks.remove(&self.eni_id);
+                    scope.task_dns.remove(&self.eni_id);
                     scope.network_interfaces.remove(&self.eni_id);
                     scope
                         .task_endpoints
@@ -210,6 +289,17 @@ impl Drop for TaskNetworkLease {
             }
         }
     }
+}
+
+/// Retains Lambda VPC dependencies until the function or its versions are removed.
+#[derive(Clone, Debug)]
+pub struct LambdaNetworkLease {
+    pub vpc_id: String,
+    pub subnet_ids: Vec<String>,
+    pub security_group_ids: Vec<String>,
+    _vpc: Arc<Vpc>,
+    _subnet_guards: Vec<Arc<()>>,
+    _group_guards: Vec<Arc<()>>,
 }
 
 /// Atomic reference to an ALB network selection. Dropping all clones releases its dependencies.
@@ -248,28 +338,7 @@ impl Ec2Handler {
     ) -> Option<SocketAddr> {
         let state = self.scopes.lock().unwrap();
         let scope = state.get(&(account.to_owned(), region.to_owned()))?;
-        scope
-            .instances
-            .values()
-            .find(|instance| {
-                instance.state == InstanceState::Running
-                    && instance.spec.vpc_id == vpc_id
-                    && instance.spec.private_ip == private_ip
-                    && instance.spec.guest_port == port
-            })
-            .and_then(|instance| instance.endpoint)
-            .or_else(|| {
-                let (task_id, endpoint) = scope.task_endpoints.get(&(private_ip, port))?;
-                scope
-                    .network_interfaces
-                    .values()
-                    .any(|eni| {
-                        eni.vpc_id == vpc_id
-                            && eni.private_ip == private_ip
-                            && scope.task_networks.get(&eni.id) == Some(task_id)
-                    })
-                    .then_some(*endpoint)
-            })
+        scope.resolve_target(vpc_id, private_ip, port)
     }
 
     /// Whether at least one ALB subnet has a direct route to the target ENI.
@@ -330,7 +399,7 @@ impl Ec2Handler {
                     .filter(|(cidr, _)| cidr.contains(&target_ip))
                     .max_by_key(|(cidr, _)| cidr.prefix_len())
                     .is_some_and(|(_, next_hop)| {
-                        next_hop.as_ref().is_none_or(|eni_id| eni_id == &target.id)
+                        matches!(next_hop, RouteTarget::Local) || matches!(next_hop, RouteTarget::NetworkInterface(eni_id) if eni_id == &target.id)
                     })
             })
     }
@@ -405,7 +474,7 @@ impl Ec2Handler {
                 vpc_id: subnet.vpc_id.clone(),
                 zone: subnet.zone,
                 private_ip,
-                description: format!("Primary network interface for ECS task {task_id}"),
+                description: format!("Primary network interface for managed service {task_id}"),
                 owner: account.into(),
                 group_ids: group_ids.to_vec(),
             },
@@ -421,6 +490,52 @@ impl Ec2Handler {
             key,
             scopes: self.scopes.clone(),
         })
+    }
+
+    /// Read-only scoped metadata for VPC-aware service adapters.
+    pub fn subnet_description(
+        &self,
+        account: &str,
+        region: &str,
+        subnet_id: &str,
+    ) -> Option<(String, String, Ipv4Net)> {
+        let state = self.scopes.lock().ok()?;
+        let subnet = state
+            .get(&(account.to_owned(), region.to_owned()))?
+            .subnets
+            .get(subnet_id)?;
+        Some((subnet.vpc_id.clone(), subnet.zone.clone(), subnet.cidr))
+    }
+
+    pub fn security_group_vpc_id(
+        &self,
+        account: &str,
+        region: &str,
+        group_id: &str,
+    ) -> Option<String> {
+        self.scopes
+            .lock()
+            .ok()?
+            .get(&(account.to_owned(), region.to_owned()))?
+            .security_groups
+            .get(group_id)
+            .map(|group| group.vpc_id.clone())
+    }
+
+    pub fn default_security_group_id(
+        &self,
+        account: &str,
+        region: &str,
+        vpc_id: &str,
+    ) -> Option<String> {
+        self.scopes
+            .lock()
+            .ok()?
+            .get(&(account.to_owned(), region.to_owned()))?
+            .security_groups
+            .values()
+            .find(|group| group.vpc_id == vpc_id && group.is_default)
+            .map(|group| group.id.clone())
     }
 
     /// Snapshot of a scoped subnet and security-group selection for future runtimes.
@@ -449,6 +564,52 @@ impl Ec2Handler {
             subnet_cidr: subnet.cidr,
             availability_zone: subnet.zone.clone(),
             security_group_ids: group_ids.to_vec(),
+        })
+    }
+
+    /// Validate Lambda's VPC selection and retain every network dependency atomically.
+    pub fn network_selection_lease(
+        &self,
+        account: &str,
+        region: &str,
+        subnet_ids: &[String],
+        group_ids: &[String],
+    ) -> Option<LambdaNetworkLease> {
+        if subnet_ids.is_empty() || group_ids.is_empty() {
+            return None;
+        }
+        let unique = |ids: &[String]| {
+            ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len()
+        };
+        if !unique(subnet_ids) || !unique(group_ids) {
+            return None;
+        }
+        let state = self.scopes.lock().ok()?;
+        let scope = state.get(&(account.to_owned(), region.to_owned()))?;
+        let first = scope.subnets.get(&subnet_ids[0])?;
+        let vpc_id = first.vpc_id.clone();
+        let vpc = scope.vpcs.get(&vpc_id)?.clone();
+        let subnet_guards = subnet_ids
+            .iter()
+            .map(|id| {
+                let subnet = scope.subnets.get(id)?;
+                (subnet.vpc_id == vpc_id).then(|| subnet.guard.clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let group_guards = group_ids
+            .iter()
+            .map(|id| {
+                let group = scope.security_groups.get(id)?;
+                (group.vpc_id == vpc_id).then(|| group.guard.clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(LambdaNetworkLease {
+            vpc_id,
+            subnet_ids: subnet_ids.to_vec(),
+            security_group_ids: group_ids.to_vec(),
+            _vpc: vpc,
+            _subnet_guards: subnet_guards,
+            _group_guards: group_guards,
         })
     }
 
@@ -560,8 +721,21 @@ impl Ec2Handler {
                     "CidrBlock",
                     "DryRun",
                     "InstanceTenancy",
+                    "AmazonProvidedIpv6CidrBlock",
                 ])?;
                 input.dry_run()?;
+                match input.one("AmazonProvidedIpv6CidrBlock")? {
+                    None | Some("false") => {}
+                    Some("true") => {
+                        return Err(Ec2Error::unsupported("AmazonProvidedIpv6CidrBlock"))
+                    }
+                    Some(_) => {
+                        return Err(Ec2Error::new(
+                            "InvalidParameterValue",
+                            "AmazonProvidedIpv6CidrBlock must be boolean",
+                        ))
+                    }
+                }
                 let tenancy = input.one("InstanceTenancy")?.unwrap_or("default");
                 if tenancy != "default" {
                     return Err(Ec2Error::unsupported("InstanceTenancy"));
@@ -576,12 +750,14 @@ impl Ec2Handler {
                 let mut state = self.scopes.lock().unwrap();
                 let scope = state.entry(key).or_default();
                 scope.vpcs.insert(id.clone(), Arc::new(vpc.clone()));
+                scope.vpc_dns.insert(id.clone(), (true, false));
                 let main_table = RouteTable {
                     id: resource_id("rtb"),
                     vpc_id: id.clone(),
                     owner: req.account_id.clone(),
                     main: true,
-                    routes: BTreeMap::from([(cidr, None)]),
+                    routes: BTreeMap::from([(cidr, RouteTarget::Local)]),
+                    endpoint_routes: BTreeMap::new(),
                     associations: BTreeMap::from([(resource_id("rtbassoc"), None)]),
                 };
                 scope.route_tables.insert(main_table.id.clone(), main_table);
@@ -596,11 +772,14 @@ impl Ec2Handler {
                         owner: req.account_id.clone(),
                         is_default: true,
                         ingress: Vec::new(),
+                        egress: default_egress(),
                         guard: Arc::new(()),
                     },
                 );
                 Ok(format!("<vpc>{}</vpc>", vpc_xml(&vpc)))
             }
+            "ModifyVpcAttribute" => self.modify_vpc_attribute(key, input),
+            "DescribeVpcAttribute" => self.describe_vpc_attribute(key, input),
             "DescribeVpcs" => {
                 input.allow_describe("VpcId", &["vpc-id", "cidr", "state", "owner-id"])?;
                 let ids = input.indexed("VpcId")?;
@@ -661,6 +840,18 @@ impl Ec2Handler {
                         .values()
                         .any(|eni| eni.vpc_id == id)
                     || scope
+                        .internet_gateways
+                        .values()
+                        .any(|gateway| gateway.vpc_id.as_deref() == Some(id))
+                    || scope
+                        .nat_gateways
+                        .values()
+                        .any(|gateway| gateway.vpc_id == id)
+                    || scope
+                        .vpc_endpoints
+                        .values()
+                        .any(|endpoint| endpoint.vpc_id == id)
+                    || scope
                         .vpcs
                         .get(id)
                         .is_some_and(|vpc| Arc::strong_count(vpc) > 1)
@@ -671,6 +862,7 @@ impl Ec2Handler {
                     ));
                 }
                 scope.vpcs.remove(id);
+                scope.vpc_dns.remove(id);
                 scope.route_tables.retain(|_, table| table.vpc_id != id);
                 scope.security_groups.retain(|_, group| group.vpc_id != id);
                 Ok("<return>true</return>".into())
@@ -800,15 +992,24 @@ impl Ec2Handler {
                         format!("The subnet ID '{id}' does not exist"),
                     ));
                 }
-                if scope.route_tables.values().any(|table| {
-                    table
-                        .associations
-                        .values()
-                        .any(|subnet| subnet.as_deref() == Some(id))
-                }) || scope
-                    .network_interfaces
+                if scope
+                    .nat_gateways
                     .values()
-                    .any(|eni| eni.subnet_id == id)
+                    .any(|gateway| gateway.subnet_id.as_deref() == Some(id))
+                    || scope.route_tables.values().any(|table| {
+                        table
+                            .associations
+                            .values()
+                            .any(|subnet| subnet.as_deref() == Some(id))
+                    })
+                    || scope
+                        .network_interfaces
+                        .values()
+                        .any(|eni| eni.subnet_id == id)
+                    || scope
+                        .vpc_endpoints
+                        .values()
+                        .any(|endpoint| endpoint.subnet_ids.iter().any(|subnet| subnet == id))
                     || scope
                         .subnets
                         .get(id)
@@ -834,6 +1035,8 @@ impl Ec2Handler {
             "DeleteSecurityGroup" => self.delete_security_group(key, input),
             "AuthorizeSecurityGroupIngress" => self.authorize_security_group_ingress(key, input),
             "RevokeSecurityGroupIngress" => self.revoke_security_group_ingress(key, input),
+            "AuthorizeSecurityGroupEgress" => self.authorize_security_group_egress(key, input),
+            "RevokeSecurityGroupEgress" => self.revoke_security_group_egress(key, input),
             "CreateNetworkInterface" => {
                 self.create_network_interface(key, &req.account_id, &req.region, input)
             }
@@ -841,6 +1044,18 @@ impl Ec2Handler {
                 self.describe_network_interfaces(key, &req.region, input)
             }
             "DeleteNetworkInterface" => self.delete_network_interface(key, input),
+            "CreateInternetGateway" => self.create_internet_gateway(key, input),
+            "DescribeInternetGateways" => self.describe_internet_gateways(key, input),
+            "AttachInternetGateway" => self.attach_internet_gateway(key, input),
+            "DetachInternetGateway" => self.detach_internet_gateway(key, input),
+            "DeleteInternetGateway" => self.delete_internet_gateway(key, input),
+            "AllocateAddress" => self.allocate_address(key, input),
+            "DescribeAddresses" => self.describe_addresses(key, input),
+            "DescribeAddressesAttribute" => self.describe_addresses_attribute(key, input),
+            "ReleaseAddress" => self.release_address(key, input),
+            "CreateNatGateway" => self.create_nat_gateway(key, input),
+            "DescribeNatGateways" => self.describe_nat_gateways(key, input),
+            "DeleteNatGateway" => self.delete_nat_gateway(key, input),
             "CreateRouteTable" => self.create_route_table(key, &req.account_id, input),
             "DescribeRouteTables" => self.describe_route_tables(key, input),
             "DeleteRouteTable" => self.delete_route_table(key, input),
@@ -848,6 +1063,10 @@ impl Ec2Handler {
             "DeleteRoute" => self.delete_route(key, input),
             "AssociateRouteTable" => self.associate_route_table(key, input),
             "DisassociateRouteTable" => self.disassociate_route_table(key, input),
+            "CreateVpcEndpoint" => self.create_vpc_endpoint(key, &req.region, input),
+            "DescribeVpcEndpoints" => self.describe_vpc_endpoints(key, input),
+            "DescribePrefixLists" => self.describe_prefix_lists(&req.region, input),
+            "DeleteVpcEndpoints" => self.delete_vpc_endpoints(key, input),
             _ => Err(Ec2Error::new(
                 "InvalidAction",
                 format!("The action {action} is not valid for this endpoint"),
@@ -916,6 +1135,7 @@ impl Ec2Handler {
                 owner: account.into(),
                 is_default: false,
                 ingress: Vec::new(),
+                egress: default_egress(),
                 guard: Arc::new(()),
             },
         );
@@ -996,6 +1216,10 @@ impl Ec2Handler {
             .network_interfaces
             .values()
             .any(|eni| eni.group_ids.iter().any(|group_id| group_id == id))
+            || scope
+                .vpc_endpoints
+                .values()
+                .any(|endpoint| endpoint.group_ids.iter().any(|group| group == id))
             || Arc::strong_count(&group.guard) > 1
         {
             return Err(Ec2Error::new(
@@ -1338,10 +1562,9 @@ impl Ec2Handler {
             ));
         }
         if scope.route_tables.values().any(|table| {
-            table
-                .routes
-                .values()
-                .any(|target| target.as_deref() == Some(id))
+            table.routes.values().any(
+                |target| matches!(target, RouteTarget::NetworkInterface(eni_id) if eni_id == id),
+            )
         }) {
             return Err(Ec2Error::new(
                 "DependencyViolation",
@@ -1401,7 +1624,8 @@ impl Ec2Handler {
             vpc_id: vpc_id.into(),
             owner: account.into(),
             main: false,
-            routes: BTreeMap::from([(vpc.cidr, None)]),
+            routes: BTreeMap::from([(vpc.cidr, RouteTarget::Local)]),
+            endpoint_routes: BTreeMap::new(),
             associations: BTreeMap::new(),
         };
         let xml = route_table_xml(&table);
@@ -1432,6 +1656,8 @@ impl Ec2Handler {
                 "association.route-table-association-id",
                 "route.destination-cidr-block",
                 "route.network-interface-id",
+                "route.gateway-id",
+                "route.nat-gateway-id",
             ],
         )?;
         let ids = input.indexed("RouteTableId")?;
@@ -1469,9 +1695,9 @@ impl Ec2Handler {
                         .routes
                         .keys()
                         .any(|cidr| vals.contains(&cidr.to_string())),
-                    "route.network-interface-id" => {
-                        table.routes.values().flatten().any(|id| vals.contains(id))
-                    }
+                    "route.network-interface-id" => table.routes.values().any(|target| matches!(target, RouteTarget::NetworkInterface(id) if vals.contains(id))),
+                    "route.gateway-id" => table.routes.values().any(|target| matches!(target, RouteTarget::InternetGateway(id) if vals.contains(id))),
+                    "route.nat-gateway-id" => table.routes.values().any(|target| matches!(target, RouteTarget::NatGateway(id) | RouteTarget::BlackholeNatGateway(id) if vals.contains(id))),
                     _ => false,
                 })
             })
@@ -1492,7 +1718,7 @@ impl Ec2Handler {
                 format!("The route table ID '{id}' does not exist"),
             )
         })?;
-        if table.main || !table.associations.is_empty() {
+        if table.main || !table.associations.is_empty() || !table.endpoint_routes.is_empty() {
             return Err(Ec2Error::new(
                 "DependencyViolation",
                 "The route table has associations or is the main route table",
@@ -1513,6 +1739,8 @@ impl Ec2Handler {
             "RouteTableId",
             "DestinationCidrBlock",
             "NetworkInterfaceId",
+            "GatewayId",
+            "NatGatewayId",
         ])?;
         input.dry_run()?;
         let id = input.required("RouteTableId")?;
@@ -1520,34 +1748,77 @@ impl Ec2Handler {
             input.required("DestinationCidrBlock")?,
             "DestinationCidrBlock",
         )?;
-        let eni_id = input.required("NetworkInterfaceId")?;
+        let targets = [
+            input.one("NetworkInterfaceId")?,
+            input.one("GatewayId")?,
+            input.one("NatGatewayId")?,
+        ];
+        if targets.iter().filter(|target| target.is_some()).count() != 1 {
+            return Err(Ec2Error::new(
+                "InvalidParameterCombination",
+                "Exactly one route target is required",
+            ));
+        }
         let mut state = self.scopes.lock().unwrap();
         let scope = state.entry(key).or_default();
-        let eni = scope.network_interfaces.get(eni_id).ok_or_else(|| {
-            Ec2Error::new(
-                "InvalidNetworkInterfaceID.NotFound",
-                format!("The network interface '{eni_id}' does not exist"),
-            )
-        })?;
-        let table = scope.route_tables.get_mut(id).ok_or_else(|| {
+        let table = scope.route_tables.get(id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidRouteTableID.NotFound",
                 format!("The route table ID '{id}' does not exist"),
             )
         })?;
-        if eni.vpc_id != table.vpc_id {
-            return Err(Ec2Error::new(
-                "InvalidParameterValue",
-                "Route target must be in the route table VPC",
-            ));
-        }
+        let target = if let Some(eni_id) = targets[0] {
+            let eni = scope.network_interfaces.get(eni_id).ok_or_else(|| {
+                Ec2Error::new(
+                    "InvalidNetworkInterfaceID.NotFound",
+                    format!("The network interface '{eni_id}' does not exist"),
+                )
+            })?;
+            if eni.vpc_id != table.vpc_id {
+                return Err(Ec2Error::new(
+                    "InvalidParameterValue",
+                    "Route target must be in the route table VPC",
+                ));
+            }
+            RouteTarget::NetworkInterface(eni_id.into())
+        } else if let Some(gateway_id) = targets[1] {
+            let gateway = scope.internet_gateways.get(gateway_id).ok_or_else(|| {
+                Ec2Error::new(
+                    "InvalidInternetGatewayID.NotFound",
+                    format!("The internet gateway ID '{gateway_id}' does not exist"),
+                )
+            })?;
+            if gateway.vpc_id.as_deref() != Some(&table.vpc_id) {
+                return Err(Ec2Error::new(
+                    "InvalidParameterValue",
+                    "Internet gateway must be attached to the route table VPC",
+                ));
+            }
+            RouteTarget::InternetGateway(gateway_id.into())
+        } else {
+            let nat_id = targets[2].unwrap();
+            let nat = scope.nat_gateways.get(nat_id).ok_or_else(|| {
+                Ec2Error::new(
+                    "NatGatewayNotFound",
+                    format!("The NAT gateway ID '{nat_id}' does not exist"),
+                )
+            })?;
+            if nat.vpc_id != table.vpc_id {
+                return Err(Ec2Error::new(
+                    "InvalidParameterValue",
+                    "NAT gateway must be in the route table VPC",
+                ));
+            }
+            RouteTarget::NatGateway(nat_id.into())
+        };
+        let table = scope.route_tables.get_mut(id).unwrap();
         if table.routes.contains_key(&destination) {
             return Err(Ec2Error::new(
                 "RouteAlreadyExists",
                 "The route already exists",
             ));
         }
-        table.routes.insert(destination, Some(eni_id.into()));
+        table.routes.insert(destination, target);
         Ok("<return>true</return>".into())
     }
 
@@ -1580,13 +1851,13 @@ impl Ec2Handler {
                     "The route does not exist",
                 ))
             }
-            Some(None) => {
+            Some(RouteTarget::Local) => {
                 return Err(Ec2Error::new(
                     "InvalidParameterValue",
                     "The local route cannot be deleted",
                 ))
             }
-            Some(Some(_)) => {}
+            Some(_) => {}
         }
         table.routes.remove(&destination);
         Ok("<return>true</return>".into())
@@ -1673,15 +1944,25 @@ impl Ec2Handler {
 }
 
 fn route_table_xml(table: &RouteTable) -> String {
-    let routes = table.routes.iter().map(|(cidr, target)| match target {
-        None => format!("<item><destinationCidrBlock>{cidr}</destinationCidrBlock><gatewayId>local</gatewayId><state>active</state><origin>CreateRouteTable</origin></item>"),
-        Some(eni) => format!("<item><destinationCidrBlock>{cidr}</destinationCidrBlock><networkInterfaceId>{}</networkInterfaceId><state>active</state><origin>CreateRoute</origin></item>", escape(eni)),
+    let routes = table.routes.iter().map(|(cidr, target)| {
+        let (tag, id, origin, state) = match target {
+            RouteTarget::Local => ("gatewayId", "local", "CreateRouteTable", "active"),
+            RouteTarget::NetworkInterface(id) => ("networkInterfaceId", id.as_str(), "CreateRoute", "active"),
+            RouteTarget::InternetGateway(id) => ("gatewayId", id.as_str(), "CreateRoute", "active"),
+            RouteTarget::NatGateway(id) => ("natGatewayId", id.as_str(), "CreateRoute", "active"),
+            RouteTarget::BlackholeNatGateway(id) => ("natGatewayId", id.as_str(), "CreateRoute", "blackhole"),
+        };
+        format!("<item><destinationCidrBlock>{cidr}</destinationCidrBlock><{tag}>{}</{tag}><state>{state}</state><origin>{origin}</origin></item>", escape(id))
+    }).collect::<String>();
+    let endpoint_routes = table.endpoint_routes.iter().map(|(service, endpoint_id)| {
+        let prefix = match service.as_str() { "s3" => "pl-00000001", "dynamodb" => "pl-00000002", _ => unreachable!("validated gateway service") };
+        format!("<item><destinationPrefixListId>{prefix}</destinationPrefixListId><vpcEndpointId>{}</vpcEndpointId><state>active</state><origin>CreateRoute</origin></item>", escape(endpoint_id))
     }).collect::<String>();
     let associations = table.associations.iter().map(|(id, subnet)| {
         let subnet_xml = subnet.as_ref().map(|id| format!("<subnetId>{}</subnetId>", escape(id))).unwrap_or_default();
         format!("<item><routeTableAssociationId>{}</routeTableAssociationId><routeTableId>{}</routeTableId>{subnet_xml}<main>{}</main><associationState><state>associated</state></associationState></item>", escape(id), escape(&table.id), subnet.is_none())
     }).collect::<String>();
-    format!("<routeTableId>{}</routeTableId><vpcId>{}</vpcId><ownerId>{}</ownerId><routeSet>{routes}</routeSet><associationSet>{associations}</associationSet><propagatingVgwSet/><tagSet/>", escape(&table.id), escape(&table.vpc_id), escape(&table.owner))
+    format!("<routeTableId>{}</routeTableId><vpcId>{}</vpcId><ownerId>{}</ownerId><routeSet>{routes}{endpoint_routes}</routeSet><associationSet>{associations}</associationSet><propagatingVgwSet/><tagSet/>", escape(&table.id), escape(&table.vpc_id), escape(&table.owner))
 }
 impl Ec2Handler {
     async fn run_instances(&self, req: &ServiceRequest, input: &Input) -> Result<String, Ec2Error> {
@@ -2284,6 +2565,8 @@ fn register_handler(registry: &ServiceRegistry, handler: Arc<Ec2Handler>) -> Arc
         "TerminateInstances",
         "CreateVpc",
         "DescribeVpcs",
+        "ModifyVpcAttribute",
+        "DescribeVpcAttribute",
         "DeleteVpc",
         "CreateSubnet",
         "DescribeSubnets",
@@ -2293,9 +2576,23 @@ fn register_handler(registry: &ServiceRegistry, handler: Arc<Ec2Handler>) -> Arc
         "DeleteSecurityGroup",
         "AuthorizeSecurityGroupIngress",
         "RevokeSecurityGroupIngress",
+        "AuthorizeSecurityGroupEgress",
+        "RevokeSecurityGroupEgress",
         "CreateNetworkInterface",
         "DescribeNetworkInterfaces",
         "DeleteNetworkInterface",
+        "CreateInternetGateway",
+        "DescribeInternetGateways",
+        "AttachInternetGateway",
+        "DetachInternetGateway",
+        "DeleteInternetGateway",
+        "AllocateAddress",
+        "DescribeAddresses",
+        "DescribeAddressesAttribute",
+        "ReleaseAddress",
+        "CreateNatGateway",
+        "DescribeNatGateways",
+        "DeleteNatGateway",
         "CreateRouteTable",
         "DescribeRouteTables",
         "DeleteRouteTable",
@@ -2303,6 +2600,10 @@ fn register_handler(registry: &ServiceRegistry, handler: Arc<Ec2Handler>) -> Arc
         "DeleteRoute",
         "AssociateRouteTable",
         "DisassociateRouteTable",
+        "CreateVpcEndpoint",
+        "DescribeVpcEndpoints",
+        "DescribePrefixLists",
+        "DeleteVpcEndpoints",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -2328,10 +2629,20 @@ impl Ec2Error {
         Self::new("UnsupportedOperation", format!("{field} is not supported"))
     }
     fn into_response(self, request_id: &str) -> Response {
-        AwsError::new(self.code, self.message, 400)
-            .with_request_id(request_id.to_owned())
-            .render(AwsProtocol::Query)
-            .into_response()
+        // EC2 Query errors use a different envelope from the generic AWS Query
+        // protocol. The EC2 SDK reads Code only below Response/Errors/Error.
+        let body = format!(
+            "<Response><Errors><Error><Code>{}</Code><Message>{}</Message></Error></Errors><RequestID>{}</RequestID></Response>",
+            escape(self.code),
+            escape(&self.message),
+            escape(request_id),
+        );
+        Response::builder()
+            .status(400)
+            .header("content-type", "text/xml")
+            .header("x-amzn-RequestId", request_id)
+            .body(Body::from(body))
+            .expect("valid EC2 error response")
     }
 }
 
@@ -2525,10 +2836,12 @@ impl Input {
         let from_key = format!("{prefix}FromPort");
         let to_key = format!("{prefix}ToPort");
         let (from_port, to_port) = if protocol == "-1" {
-            if self.one(&from_key)?.is_some() || self.one(&to_key)?.is_some() {
+            if self.one(&from_key)?.is_some_and(|port| port != "0")
+                || self.one(&to_key)?.is_some_and(|port| port != "0")
+            {
                 return Err(Ec2Error::new(
                     "InvalidParameterValue",
-                    "Ports are not valid for protocol -1",
+                    "Ports must be zero for protocol -1",
                 ));
             }
             (None, None)
@@ -2617,7 +2930,8 @@ fn group_xml(group: &SecurityGroup) -> String {
         "<item><ipProtocol>{}</ipProtocol>{}<groups/><ipRanges><item><cidrIp>{}</cidrIp></item></ipRanges><ipv6Ranges/><prefixListIds/></item>",
         escape(&rule.protocol), ports_xml(rule.from_port, rule.to_port), rule.cidr
     )).collect::<String>());
-    format!("<ownerId>{}</ownerId><groupId>{}</groupId><groupName>{}</groupName><groupDescription>{}</groupDescription><vpcId>{}</vpcId><ipPermissions>{ingress}</ipPermissions><ipPermissionsEgress><item><ipProtocol>-1</ipProtocol><groups/><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges><ipv6Ranges/><prefixListIds/></item></ipPermissionsEgress><tagSet/>",
+    let egress = group.egress.iter().map(|rule| format!("<item><ipProtocol>{}</ipProtocol>{}<groups/><ipRanges><item><cidrIp>{}</cidrIp></item></ipRanges><ipv6Ranges/><prefixListIds/></item>", escape(&rule.protocol), ports_xml(rule.from_port, rule.to_port), rule.cidr)).collect::<String>();
+    format!("<ownerId>{}</ownerId><groupId>{}</groupId><groupName>{}</groupName><groupDescription>{}</groupDescription><vpcId>{}</vpcId><ipPermissions>{ingress}</ipPermissions><ipPermissionsEgress>{egress}</ipPermissionsEgress><tagSet/>",
         escape(&group.owner), escape(&group.id), escape(&group.name), escape(&group.description), escape(&group.vpc_id))
 }
 
@@ -2695,11 +3009,16 @@ fn vpc_xml(vpc: &Vpc) -> String {
 }
 
 fn subnet_xml(subnet: &Subnet, region: &str, scope: &ScopeState) -> String {
-    let used = scope
+    let used = (scope
         .network_interfaces
         .values()
         .filter(|eni| eni.subnet_id == subnet.id)
-        .count() as u32;
+        .count()
+        + scope
+            .nat_gateways
+            .values()
+            .filter(|nat| nat.subnet_id.as_deref() == Some(&subnet.id))
+            .count()) as u32;
     let available = (1_u32 << (32 - subnet.cidr.prefix_len())) - 5 - used;
     format!("<subnetId>{}</subnetId><subnetArn>arn:aws:ec2:{}:{}:subnet/{}</subnetArn><state>available</state><ownerId>{}</ownerId><vpcId>{}</vpcId><cidrBlock>{}</cidrBlock><availableIpAddressCount>{available}</availableIpAddressCount><availabilityZone>{}</availabilityZone><defaultForAz>false</defaultForAz><mapPublicIpOnLaunch>false</mapPublicIpOnLaunch><assignIpv6AddressOnCreation>false</assignIpv6AddressOnCreation><ipv6CidrBlockAssociationSet/><tagSet/>",
         escape(&subnet.id), escape(region), escape(&subnet.owner), escape(&subnet.id), escape(&subnet.owner), escape(&subnet.vpc_id), subnet.cidr, escape(&subnet.zone))
@@ -2743,6 +3062,33 @@ mod tests {
             .next()
             .unwrap()
             .to_owned()
+    }
+
+    #[tokio::test]
+    async fn ec2_errors_use_the_service_specific_query_envelope() {
+        let handler = Ec2Handler::default();
+        let (status, vpc) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.0.0.0%2F16",
+        )
+        .await;
+        assert_eq!(status, 200, "{vpc}");
+        let (status, group) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            &format!(
+                "Action=CreateSecurityGroup&VpcId={}&GroupName=app&GroupDescription=app",
+                id(&vpc, "vpcId")
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{group}");
+        let (status, body) = call(&handler, "111", "us-east-1", &format!("Action=RevokeSecurityGroupEgress&GroupId={}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.FromPort=0&IpPermissions.1.ToPort=0&IpPermissions.1.Ipv6Ranges.1.CidrIpv6=%3A%3A%2F0", id(&group, "groupId"))).await;
+        assert_eq!(status, 400);
+        assert_eq!(body, "<Response><Errors><Error><Code>InvalidPermission.NotFound</Code><Message>The specified IPv6 rule does not exist</Message></Error></Errors><RequestID>rid</RequestID></Response>");
     }
 
     #[tokio::test]
@@ -2851,6 +3197,15 @@ mod tests {
         assert!(body.contains("DryRunOperation"));
         let (_, listed) = call(&h, "111", "us-east-1", "Action=DescribeVpcs").await;
         assert!(listed.contains("<vpcSet></vpcSet>"));
+        let (status, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.0.0.0%2F16&AmazonProvidedIpv6CidrBlock=false",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("<vpcId>vpc-"));
     }
 
     #[tokio::test]
@@ -3746,7 +4101,7 @@ mod tests {
         assert_eq!(status, 400, "{body}");
         let (status, body) = call(&h, "111", "us-east-1", &format!("Action=CreateRoute&RouteTableId={table}&DestinationCidrBlock=0.0.0.0%2F0&GatewayId=igw-fake")).await;
         assert_eq!(status, 400, "{body}");
-        assert!(body.contains("UnsupportedOperation"));
+        assert!(body.contains("InvalidInternetGatewayID.NotFound"));
         let (status, body) = call(&h, "111", "us-east-1", &format!("Action=CreateRoute&RouteTableId={table}&DestinationCidrBlock=0.0.0.0%2F0&NetworkInterfaceId={eni}&DryRun=true")).await;
         assert_eq!(status, 400, "{body}");
         assert!(body.contains("DryRunOperation"));
@@ -3987,6 +4342,207 @@ mod tests {
                 "111",
                 "us-east-1",
                 &format!("Action=DeleteSubnet&SubnetId={subnet}")
+            )
+            .await
+            .0,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn public_nat_routes_require_igw_eip_and_egress_then_clean_up() {
+        let h = Ec2Handler::default();
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.50.0.0%2F16",
+        )
+        .await;
+        let vpc = id(&body, "vpcId");
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.50.1.0%2F24"),
+        )
+        .await;
+        let public_subnet = id(&body, "subnetId");
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.50.2.0%2F24"),
+        )
+        .await;
+        let private_subnet = id(&body, "subnetId");
+        let (_, body) = call(&h, "111", "us-east-1", "Action=CreateInternetGateway").await;
+        let igw = id(&body, "internetGatewayId");
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=AttachInternetGateway&InternetGatewayId={igw}&VpcId={vpc}")
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, body) = call(&h, "111", "us-east-1", "Action=AllocateAddress&Domain=vpc").await;
+        let eip = id(&body, "allocationId");
+        let create_nat = format!("Action=CreateNatGateway&SubnetId={public_subnet}&AllocationId={eip}&ClientToken=nat-once");
+        let (_, body) = call(&h, "111", "us-east-1", &create_nat).await;
+        let nat = id(&body, "natGatewayId");
+        assert!(body.contains("<availabilityMode>zonal</availabilityMode>"));
+        let (_, retry) = call(&h, "111", "us-east-1", &create_nat).await;
+        assert_eq!(id(&retry, "natGatewayId"), nat);
+        let (_, mismatch) = call(&h, "111", "us-east-1", &format!("Action=CreateNatGateway&SubnetId={private_subnet}&AllocationId={eip}&ClientToken=nat-once")).await;
+        assert!(mismatch.contains("IdempotentParameterMismatch"));
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=CreateRouteTable&VpcId={vpc}"),
+        )
+        .await;
+        let public_table = id(&body, "routeTableId");
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=CreateRouteTable&VpcId={vpc}"),
+        )
+        .await;
+        let private_table = id(&body, "routeTableId");
+        assert_eq!(call(&h, "111", "us-east-1", &format!("Action=AssociateRouteTable&RouteTableId={public_table}&SubnetId={public_subnet}")).await.0, 200);
+        assert_eq!(call(&h, "111", "us-east-1", &format!("Action=AssociateRouteTable&RouteTableId={private_table}&SubnetId={private_subnet}")).await.0, 200);
+        assert_eq!(call(&h, "111", "us-east-1", &format!("Action=CreateRoute&RouteTableId={private_table}&DestinationCidrBlock=0.0.0.0%2F0&NatGatewayId={nat}")).await.0, 200);
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=CreateNetworkInterface&SubnetId={private_subnet}"),
+        )
+        .await;
+        let eni = id(&body, "networkInterfaceId");
+        let destination = "1.1.1.1".parse().unwrap();
+        assert!(!h.public_tcp_access("111", "us-east-1", &eni, destination, 443));
+        assert_eq!(call(&h, "111", "us-east-1", &format!("Action=CreateRoute&RouteTableId={public_table}&DestinationCidrBlock=0.0.0.0%2F0&GatewayId={igw}")).await.0, 200);
+        assert!(h.public_tcp_access("111", "us-east-1", &eni, destination, 443));
+        assert!(!h.public_tcp_access("111", "us-east-1", &eni, "127.0.0.1".parse().unwrap(), 443));
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=ReleaseAddress&AllocationId={eip}")
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=DeleteNatGateway&NatGatewayId={nat}")
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, routes) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=DescribeRouteTables&RouteTableId.1={private_table}"),
+        )
+        .await;
+        assert!(routes.contains(&format!(
+            "<natGatewayId>{nat}</natGatewayId><state>blackhole</state>"
+        )));
+        assert!(!h.public_tcp_access("111", "us-east-1", &eni, destination, 443));
+        assert!(!h.public_nat_route("111", "us-east-1", &eni));
+        assert_eq!(call(&h, "111", "us-east-1", &format!("Action=DeleteRoute&RouteTableId={private_table}&DestinationCidrBlock=0.0.0.0%2F0")).await.0, 200);
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=ReleaseAddress&AllocationId={eip}")
+            )
+            .await
+            .0,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn regional_nat_uses_vpc_and_automatic_addressing() {
+        let h = Ec2Handler::default();
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.60.0.0%2F16",
+        )
+        .await;
+        let vpc = id(&body, "vpcId");
+        let (_, body) = call(&h, "111", "us-east-1", "Action=CreateInternetGateway").await;
+        let igw = id(&body, "internetGatewayId");
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=AttachInternetGateway&InternetGatewayId={igw}&VpcId={vpc}")
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=CreateNatGateway&AvailabilityMode=regional&VpcId={vpc}"),
+        )
+        .await;
+        assert!(body.contains("<availabilityMode>regional</availabilityMode>"));
+        let nat = id(&body, "natGatewayId");
+        let (status, body) = call(&h, "111", "us-east-1", &format!("Action=CreateNatGateway&AvailabilityMode=regional&VpcId={vpc}&SubnetId=subnet-fake")).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("InvalidParameterCombination"));
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=DetachInternetGateway&InternetGatewayId={igw}&VpcId={vpc}")
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=DeleteNatGateway&NatGatewayId={nat}")
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=DetachInternetGateway&InternetGatewayId={igw}&VpcId={vpc}")
             )
             .await
             .0,
