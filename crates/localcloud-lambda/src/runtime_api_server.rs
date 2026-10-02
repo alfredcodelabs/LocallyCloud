@@ -64,6 +64,7 @@ async fn next(State(broker): State<Arc<InvocationBroker>>, Path(key): Path<Strin
                 inv.invoked_function_arn.clone(),
             )
             .header("Lambda-Runtime-Deadline-Ms", inv.deadline_ms.to_string())
+            .header("Lambda-Runtime-Trace-Id", inv.trace_id.clone())
             .header("content-type", "application/json")
             .body(Body::from(inv.payload))
             .expect("runtime next response is valid"),
@@ -196,6 +197,9 @@ mod tests {
             rid
         );
         assert!(next.headers().get("Lambda-Runtime-Deadline-Ms").is_some());
+        let trace = next.headers()["Lambda-Runtime-Trace-Id"].to_str().unwrap();
+        assert!(trace.starts_with("Root=1-"), "{trace}");
+        assert!(trace.ends_with(";Sampled=0"), "{trace}");
         let event = next.text().await.unwrap();
         assert_eq!(event, "{\"n\":1}");
 
@@ -214,6 +218,22 @@ mod tests {
             rx.await.unwrap(),
             Outcome::Success(b"{\"ok\":true}".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn next_returns_the_submitted_trace_header() {
+        let broker = Arc::new(InvocationBroker::new());
+        let base = serve(broker.clone()).await;
+        let trace = "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=0";
+        let (_rid, _rx) =
+            broker.submit_traced("envT", b"{}".to_vec(), "arn", 5000, trace.to_owned());
+        let next = reqwest::Client::new()
+            .get(format!("{base}/e/envT/2018-06-01/runtime/invocation/next"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(next.status(), 200);
+        assert_eq!(next.headers()["Lambda-Runtime-Trace-Id"], trace);
     }
 
     #[tokio::test]
@@ -453,6 +473,10 @@ mod extension_tests {
             let event: serde_json::Value = response.json().await.unwrap();
             assert_eq!(event["eventType"], "INVOKE");
             assert_eq!(event["requestId"], rid);
+            assert!(event["tracing"]["value"]
+                .as_str()
+                .unwrap()
+                .starts_with("Root=1-"));
         }
         assert_eq!(runtime_poll.await.unwrap().status(), 200);
         assert!(broker

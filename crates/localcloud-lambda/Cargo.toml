@@ -10,6 +10,7 @@ description = "localcloud AWS Lambda service (REST-JSON), registered Native in t
 [dependencies]
 localcloud-core.workspace = true
 localcloud-compute.workspace = true
+localcloud-ec2.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 axum.workspace = true

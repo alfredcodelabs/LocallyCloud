@@ -56,6 +56,8 @@ pub struct PendingInvocation {
     pub invoked_function_arn: String,
     /// Absolute invocation deadline in epoch milliseconds.
     pub deadline_ms: i64,
+    /// X-Ray trace header delivered as `Lambda-Runtime-Trace-Id`.
+    pub trace_id: String,
 }
 
 fn now_ms() -> i64 {
@@ -116,6 +118,24 @@ impl InvocationBroker {
         invoked_function_arn: &str,
         timeout_ms: i64,
     ) -> (String, oneshot::Receiver<Outcome>) {
+        self.submit_traced(
+            key,
+            payload,
+            invoked_function_arn,
+            timeout_ms,
+            crate::trace_header::invocation_trace_header(None),
+        )
+    }
+
+    /// [`submit`](Self::submit) with an explicit X-Ray trace header for the invocation.
+    pub fn submit_traced(
+        &self,
+        key: &str,
+        payload: Vec<u8>,
+        invoked_function_arn: &str,
+        timeout_ms: i64,
+        trace_id: String,
+    ) -> (String, oneshot::Receiver<Outcome>) {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.inflight.insert(request_id.clone(), tx);
@@ -140,6 +160,7 @@ impl InvocationBroker {
             payload,
             invoked_function_arn: invoked_function_arn.to_string(),
             deadline_ms: now_ms() + timeout_ms.max(0),
+            trace_id,
         };
         // Publish to extensions before the runtime can consume and respond. Otherwise a
         // fast runtime could finish while an extension still appears rearmed from Init.
@@ -747,7 +768,7 @@ impl InvocationBroker {
                             "eventType":"INVOKE", "deadlineMs":invocation.deadline_ms,
                             "requestId":invocation.request_id,
                             "invokedFunctionArn":invocation.invoked_function_arn,
-                            "tracing":{"type":"X-Amzn-Trace-Id","value":""},
+                            "tracing":{"type":"X-Amzn-Trace-Id","value":invocation.trace_id},
                         }),
                     });
                     r.ready = false;

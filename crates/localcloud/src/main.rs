@@ -275,6 +275,9 @@ async fn main() {
         &registry,
         Arc::new(ec2_runtime::Ec2OciRuntime::default()),
     );
+    if let Some(handler) = &lambda_handler {
+        handler.attach_ec2(ec2.clone());
+    }
     let ecs_runtime = Arc::new(ecs_runtime::EcsOciRuntime::new(ecr, ec2.clone()));
     localcloud_ecs::register_with_runtime(&registry, Some(ecs_runtime.clone()));
     localcloud_elbv2::register_with_alb_integrations(

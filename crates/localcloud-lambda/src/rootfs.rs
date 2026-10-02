@@ -73,6 +73,12 @@ while (true) {
   const requestId = next.headers.get('lambda-runtime-aws-request-id');
   const invokedFunctionArn = next.headers.get('lambda-runtime-invoked-function-arn');
   const deadlineMs = Number(next.headers.get('lambda-runtime-deadline-ms'));
+  const traceId = next.headers.get('lambda-runtime-trace-id');
+  if (traceId) {
+    process.env._X_AMZN_TRACE_ID = traceId;
+  } else {
+    delete process.env._X_AMZN_TRACE_ID;
+  }
   invocationLogs = [];
   let outcomePath;
   let outcomeBody;
@@ -81,6 +87,12 @@ while (true) {
     const event = JSON.parse(await next.text());
     const fn = await loadHandler();
     const context = {
+      callbackWaitsForEmptyEventLoop: true,
+      functionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+      functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION,
+      memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE,
+      logGroupName: process.env.AWS_LAMBDA_LOG_GROUP_NAME,
+      logStreamName: process.env.AWS_LAMBDA_LOG_STREAM_NAME,
       awsRequestId: requestId,
       invokedFunctionArn,
       getRemainingTimeInMillis: () => Math.max(0, deadlineMs - Date.now()),
@@ -107,7 +119,6 @@ while (true) {
 
 const PYTHON_RIC: &str = r#"#!__PYTHON__
 import importlib
-import io
 import json
 import os
 import sys
@@ -120,11 +131,65 @@ sys.path[:0] = ["/var/task", "/opt/python"]
 API = "http://{}/2018-06-01/runtime".format(os.environ["AWS_LAMBDA_RUNTIME_API"])
 module_name, function_name = os.environ["_HANDLER"].rsplit(".", 1)
 handler = None
+invocation_logs = None
+
+class InvocationTee:
+    """A persistent stdout/stderr that also records output of the active invocation.
+
+    Handler modules (and logging handlers they configure) may keep a reference to the stream
+    they saw at import time, so the stream object itself must never be swapped.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    @property
+    def encoding(self):
+        return self._stream.encoding
+
+    def write(self, data):
+        written = self._stream.write(data)
+        # Read the global once: another thread may end the invocation concurrently.
+        logs = invocation_logs
+        if logs is not None:
+            logs.append(data)
+        return written
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+sys.stdout = InvocationTee(sys.stdout)
+sys.stderr = InvocationTee(sys.stderr)
+
+class CognitoIdentity:
+    def __init__(self):
+        self.cognito_identity_id = None
+        self.cognito_identity_pool_id = None
 
 class LambdaContext:
     def __init__(self, request_id, invoked_function_arn, deadline_ms):
         self.aws_request_id = request_id
         self.invoked_function_arn = invoked_function_arn
+        self.function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        self.function_version = os.environ.get("AWS_LAMBDA_FUNCTION_VERSION")
+        self.memory_limit_in_mb = os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
+        self.log_group_name = os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME")
+        self.log_stream_name = os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME")
+        self.identity = CognitoIdentity()
+        self.client_context = None
         self._deadline_ms = deadline_ms
 
     def get_remaining_time_in_millis(self):
@@ -154,13 +219,14 @@ while True:
         request_id = response.headers["lambda-runtime-aws-request-id"]
         invoked_function_arn = response.headers["lambda-runtime-invoked-function-arn"]
         deadline_ms = int(response.headers["lambda-runtime-deadline-ms"])
+        trace_id = response.headers.get("lambda-runtime-trace-id")
         body = response.read()
 
-    captured = io.StringIO()
-    stdout = sys.stdout
-    stderr = sys.stderr
-    sys.stdout = captured
-    sys.stderr = captured
+    if trace_id:
+        os.environ["_X_AMZN_TRACE_ID"] = trace_id
+    else:
+        os.environ.pop("_X_AMZN_TRACE_ID", None)
+    invocation_logs = []
     error_type = None
     try:
         if handler is None:
@@ -179,13 +245,15 @@ while True:
         }
         error_type = "Handled"
     finally:
-        sys.stdout = stdout
-        sys.stderr = stderr
+        captured = "".join(invocation_logs)
+        invocation_logs = None
+        sys.stdout.flush()
+        sys.stderr.flush()
 
     try:
         post(
             "/invocation/{}/logs".format(request_id),
-            captured.getvalue().splitlines(keepends=True),
+            captured.splitlines(keepends=True),
         )
     except Exception as error:
         outcome_path = "/invocation/{}/error".format(request_id)
@@ -390,6 +458,27 @@ fn install_extension_supervisor(dest: &Path) -> Result<(), LambdaError> {
     Ok(())
 }
 
+/// Install the minimal guest tools needed to wait for a VPC network proxy before
+/// starting a runtime. This also covers custom runtimes with no bundled shell.
+pub(crate) fn install_vpc_wait_tools(dest: &Path) -> Result<(), LambdaError> {
+    if !dest.join("bin/bash").exists() {
+        let bash = find_host_executable("bash")
+            .ok_or_else(|| LambdaError::NotImplemented("VPC Lambda requires host bash".into()))?;
+        copy_host_file(&bash, &dest.join("bin/bash"))?;
+        copy_dynamic_dependencies(&bash, dest, &mut Default::default())?;
+    }
+    if !dest.join("bin/sh").exists() {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("bash", dest.join("bin/sh"))
+            .map_err(io("link VPC wait shell"))?;
+    }
+    let sleep = find_host_executable("sleep")
+        .ok_or_else(|| LambdaError::NotImplemented("VPC Lambda requires host sleep".into()))?;
+    copy_host_file(&sleep, &dest.join("bin/sleep"))?;
+    copy_dynamic_dependencies(&sleep, dest, &mut Default::default())?;
+    Ok(())
+}
+
 /// The launch argv for a runtime: the custom `bootstrap` or the managed RIC.
 pub fn entrypoint(runtime: Option<&str>) -> Vec<String> {
     if is_custom(runtime) {
@@ -523,6 +612,7 @@ fn install_python_runtime_inner(
 
     let mut copied = std::collections::HashSet::new();
     copy_dynamic_dependencies(&python, dest, &mut copied)?;
+    install_python_compat_libraries(dest, &mut copied)?;
     if extensions.is_dir() {
         let mut shared_objects = Vec::new();
         collect_shared_objects(&extensions, &mut shared_objects)
@@ -792,6 +882,36 @@ fn link_cached_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The host Python may compile libraries into the interpreter, while binary wheels
+/// still link these standard Lambda runtime libraries dynamically.
+fn install_python_compat_libraries(
+    dest: &Path,
+    copied: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), LambdaError> {
+    for name in ["libz.so.1", "libresolv.so.2"] {
+        let library = [
+            "/usr/lib",
+            "/usr/lib64",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/aarch64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+        ]
+        .into_iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            LambdaError::NotImplemented(format!("Python binary wheels require host {name}"))
+        })?;
+        copy_host_file(
+            &library,
+            &dest.join(library.strip_prefix("/").expect("absolute library path")),
+        )?;
+        copy_dynamic_dependencies(&library, dest, copied)?;
+    }
+    Ok(())
+}
+
 fn find_host_executable(name: &str) -> Option<PathBuf> {
     ["/usr/bin", "/usr/local/bin"]
         .into_iter()
@@ -869,10 +989,17 @@ fn copy_dynamic_dependencies(
         .output()
         .map_err(io("inspect managed runtime shared libraries"))?;
     if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        if detail.contains("cannot open shared object file") {
+            return Err(LambdaError::NotImplemented(format!(
+                "managed runtime dependency is unavailable: {}",
+                detail.trim()
+            )));
+        }
         return Err(LambdaError::InternalError(format!(
             "inspect managed runtime shared libraries for {}: {}",
             source.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            detail.trim()
         )));
     }
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -958,10 +1085,31 @@ fn make_executable(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_api::{FunctionErrorType, Outcome};
     use std::io::Write;
 
     fn temp() -> PathBuf {
         std::env::temp_dir().join(format!("lc-rootfs-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn python_compat_libraries_include_wheel_runtime_dependencies() {
+        let dest = temp();
+        fs::create_dir_all(&dest).unwrap();
+        install_python_compat_libraries(&dest, &mut Default::default()).unwrap();
+        for name in ["libz.so.1", "libresolv.so.2"] {
+            assert!([
+                "usr/lib",
+                "usr/lib64",
+                "lib/x86_64-linux-gnu",
+                "usr/lib/x86_64-linux-gnu",
+                "lib/aarch64-linux-gnu",
+                "usr/lib/aarch64-linux-gnu",
+            ]
+            .iter()
+            .any(|dir| dest.join(dir).join(name).is_file()));
+        }
+        fs::remove_dir_all(dest).unwrap();
     }
 
     fn write_file(path: &Path, contents: &[u8]) {
@@ -1173,6 +1321,250 @@ mod tests {
                 assert!(base.join(loader.trim_start_matches('/')).is_file());
             }
         }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    const RIC_KEY: &str = "ric-env";
+    const RIC_ARN: &str = "arn:aws:lambda:us-east-1:000000000000:function:fn";
+    const RIC_TRACES: [&str; 3] = [
+        "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=0",
+        "Root=1-5759e989-0123456789abcdef01234567;Parent=0123456789abcdef;Sampled=0",
+        "Root=1-5759e98a-fedcba9876543210fedcba98;Parent=fedcba9876543210;Sampled=0",
+    ];
+
+    const PYTHON_HANDLER: &str = r#"import logging
+import os
+import sys
+
+import_time_stdout = sys.stdout
+structured = logging.getLogger("structured")
+structured.addHandler(logging.StreamHandler(sys.stdout))
+structured.setLevel(logging.INFO)
+structured.propagate = False
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+def handler(event, context):
+    n = event["n"]
+    import_time_stdout.write("import-time stream {}\n".format(n))
+    structured.info("structured logger %d", n)
+    logging.getLogger().info("root logger %d", n)
+    print("print {}".format(n))
+    if n == 3:
+        raise ValueError("boom {}".format(n))
+    return {
+        "function_name": context.function_name,
+        "function_version": context.function_version,
+        "memory_limit_in_mb": context.memory_limit_in_mb,
+        "invoked_function_arn": context.invoked_function_arn,
+        "aws_request_id": context.aws_request_id,
+        "log_group_name": context.log_group_name,
+        "log_stream_name": context.log_stream_name,
+        "cognito_identity_id": context.identity.cognito_identity_id,
+        "client_context": context.client_context,
+        "remaining_positive": context.get_remaining_time_in_millis() > 0,
+        "trace": os.environ.get("_X_AMZN_TRACE_ID"),
+        "encoding": sys.stdout.encoding,
+        "isatty": sys.stdout.isatty(),
+        "fileno": sys.stdout.fileno(),
+    }
+"#;
+
+    const NODE_HANDLER: &str = r#"const importTimeStdout = process.stdout;
+exports.handler = async (event, context) => {
+  importTimeStdout.write(`import-time stream ${event.n}\n`);
+  console.log(`console ${event.n}`);
+  if (event.n === 3) throw new Error(`boom ${event.n}`);
+  return {
+    functionName: context.functionName,
+    functionVersion: context.functionVersion,
+    memoryLimitInMB: context.memoryLimitInMB,
+    logGroupName: context.logGroupName,
+    logStreamName: context.logStreamName,
+    callbackWaitsForEmptyEventLoop: context.callbackWaitsForEmptyEventLoop,
+    awsRequestId: context.awsRequestId,
+    invokedFunctionArn: context.invokedFunctionArn,
+    remainingPositive: context.getRemainingTimeInMillis() > 0,
+    trace: process.env._X_AMZN_TRACE_ID ?? null,
+  };
+};
+"#;
+
+    struct RicRun {
+        responses: Vec<serde_json::Value>,
+        request_ids: Vec<String>,
+        logs: Vec<String>,
+        error: Outcome,
+    }
+
+    /// Run a Runtime Interface Client on the host against a real Runtime API server: two
+    /// successful (cold, then warm) invocations followed by a handler error.
+    async fn run_ric(interpreter: &Path, script: &Path, handler: &str, task: &Path) -> RicRun {
+        use crate::runtime_api::InvocationBroker;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let broker = Arc::new(InvocationBroker::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = crate::runtime_api_server::router(broker.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut child = Command::new(interpreter)
+            .arg(script)
+            .env_clear()
+            .env("AWS_LAMBDA_RUNTIME_API", format!("{addr}/e/{RIC_KEY}"))
+            .env("_HANDLER", handler)
+            .env("AWS_LAMBDA_FUNCTION_NAME", "fn")
+            .env("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST")
+            .env("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "256")
+            .env("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/fn")
+            .env("AWS_LAMBDA_LOG_STREAM_NAME", "2024/01/01/[$LATEST]abc")
+            .env("PYTHONPATH", task)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut outcomes = Vec::new();
+        let mut request_ids = Vec::new();
+        let mut logs = Vec::new();
+        for (index, trace) in RIC_TRACES.iter().enumerate() {
+            let payload = format!("{{\"n\":{}}}", index + 1).into_bytes();
+            let (request_id, rx) =
+                broker.submit_traced(RIC_KEY, payload, RIC_ARN, 30_000, trace.to_string());
+            let outcome = tokio::time::timeout(Duration::from_secs(30), rx)
+                .await
+                .expect("runtime responded")
+                .unwrap();
+            logs.push(broker.take_logs(&request_id).unwrap_or_default().concat());
+            outcomes.push(outcome);
+            request_ids.push(request_id);
+        }
+        broker.stop(RIC_KEY);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let error = outcomes.pop().unwrap();
+        let responses = outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                Outcome::Success(body) => serde_json::from_slice(&body).unwrap(),
+                other => panic!("expected success, got {other:?}"),
+            })
+            .collect();
+        RicRun {
+            responses,
+            request_ids,
+            logs,
+            error,
+        }
+    }
+
+    fn assert_handled_error(outcome: &Outcome, message: &str) {
+        match outcome {
+            Outcome::Error {
+                error_type,
+                payload,
+            } => {
+                assert_eq!(*error_type, FunctionErrorType::Handled);
+                let body: serde_json::Value = serde_json::from_slice(payload).unwrap();
+                assert_eq!(body["errorMessage"], message);
+            }
+            other => panic!("expected handled error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn python_ric_provides_aws_context_trace_and_warm_log_capture() {
+        let Some(python) = find_host_executable("python3") else {
+            return;
+        };
+        let base = temp();
+        let task = base.join("task");
+        write_file(&task.join("app.py"), PYTHON_HANDLER.as_bytes());
+        let script = base.join("bootstrap");
+        let ric = PYTHON_RIC.replacen("__PYTHON__", python.to_str().unwrap(), 1);
+        write_file(&script, ric.as_bytes());
+
+        let run = run_ric(&python, &script, "app.handler", &task).await;
+        for (index, response) in run.responses.iter().enumerate() {
+            assert_eq!(response["function_name"], "fn");
+            assert_eq!(response["function_version"], "$LATEST");
+            assert_eq!(response["memory_limit_in_mb"], "256");
+            assert_eq!(response["invoked_function_arn"], RIC_ARN);
+            assert_eq!(response["aws_request_id"], run.request_ids[index]);
+            assert_eq!(response["log_group_name"], "/aws/lambda/fn");
+            assert_eq!(response["log_stream_name"], "2024/01/01/[$LATEST]abc");
+            assert_eq!(response["cognito_identity_id"], serde_json::Value::Null);
+            assert_eq!(response["client_context"], serde_json::Value::Null);
+            assert_eq!(response["remaining_positive"], true);
+            assert_eq!(response["trace"], RIC_TRACES[index]);
+            assert_eq!(response["isatty"], false);
+            assert!(response["encoding"].is_string());
+            assert!(response["fileno"].as_i64().unwrap() >= 0);
+        }
+        for (index, logs) in run.logs.iter().enumerate() {
+            let n = index + 1;
+            for line in [
+                format!("import-time stream {n}\n"),
+                format!("structured logger {n}\n"),
+                format!("root logger {n}\n"),
+                format!("print {n}\n"),
+            ] {
+                assert!(
+                    logs.contains(&line),
+                    "invocation {n} missing {line:?}: {logs:?}"
+                );
+            }
+            assert!(!logs.contains(&format!("print {}", n + 1)), "{logs:?}");
+        }
+        assert_handled_error(&run.error, "boom 3");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn node_ric_provides_aws_context_trace_and_warm_log_capture() {
+        let Some(node) = find_host_executable("node") else {
+            return;
+        };
+        let base = temp();
+        let task = base.join("task");
+        write_file(&task.join("app.js"), NODE_HANDLER.as_bytes());
+        let script = base.join("bootstrap");
+        let ric = NODE_RIC.replace(
+            "file:///var/task/",
+            &format!("file://{}/", task.to_str().unwrap()),
+        );
+        assert_ne!(ric, NODE_RIC, "test must redirect the task root");
+        write_file(&script, ric.as_bytes());
+
+        let run = run_ric(&node, &script, "app.handler", &task).await;
+        for (index, response) in run.responses.iter().enumerate() {
+            assert_eq!(response["functionName"], "fn");
+            assert_eq!(response["functionVersion"], "$LATEST");
+            assert_eq!(response["memoryLimitInMB"], "256");
+            assert_eq!(response["logGroupName"], "/aws/lambda/fn");
+            assert_eq!(response["logStreamName"], "2024/01/01/[$LATEST]abc");
+            assert_eq!(response["callbackWaitsForEmptyEventLoop"], true);
+            assert_eq!(response["awsRequestId"], run.request_ids[index]);
+            assert_eq!(response["invokedFunctionArn"], RIC_ARN);
+            assert_eq!(response["remainingPositive"], true);
+            assert_eq!(response["trace"], RIC_TRACES[index]);
+        }
+        for (index, logs) in run.logs.iter().enumerate() {
+            let n = index + 1;
+            for line in [
+                format!("import-time stream {n}\n"),
+                format!("console {n}\n"),
+            ] {
+                assert!(
+                    logs.contains(&line),
+                    "invocation {n} missing {line:?}: {logs:?}"
+                );
+            }
+        }
+        assert_handled_error(&run.error, "boom 3");
         let _ = fs::remove_dir_all(&base);
     }
 

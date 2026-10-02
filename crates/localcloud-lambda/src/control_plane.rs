@@ -11,7 +11,7 @@ use crate::error::LambdaError;
 use crate::model::{
     compute_zip_code, function_arn, function_url_id, is_supported_runtime, layer_arn,
     resolve_function_name, Alias, EventInvokeConfig, FunctionStore, FunctionUrlConfig,
-    LambdaFunction, LayerStore, LayerVersion, DEFAULT_EPHEMERAL_MB, DEFAULT_MEMORY_MB,
+    LambdaFunction, LayerStore, LayerVersion, VpcConfig, DEFAULT_EPHEMERAL_MB, DEFAULT_MEMORY_MB,
     DEFAULT_TIMEOUT_SECS, MAX_EPHEMERAL_MB, MAX_MEMORY_MB, MAX_TIMEOUT_SECS, MIN_EPHEMERAL_MB,
     MIN_MEMORY_MB, MIN_TIMEOUT_SECS,
 };
@@ -24,7 +24,13 @@ pub fn create_function(
     region: &str,
     account: &str,
     input: &Value,
+    vpc_config: Option<Option<VpcConfig>>,
 ) -> OpResult {
+    if input.get("VpcConfig").is_some() && vpc_config.is_none() {
+        return Err(LambdaError::InvalidParameterValue(
+            "VpcConfig requires a valid EC2 network selection".into(),
+        ));
+    }
     let name = resolve_function_name(require_str(input, "FunctionName")?, region)?;
     let role = require_str(input, "Role")?;
 
@@ -143,6 +149,7 @@ pub fn create_function(
         state: "Active".to_string(),
         code_zip,
         dead_letter_arn,
+        vpc_config: vpc_config.flatten(),
     };
     store.create(account, region, func.clone())?;
     Ok((201, Some(func.to_configuration_json())))
@@ -412,7 +419,13 @@ pub fn update_function_configuration(
     account: &str,
     name: &str,
     input: &Value,
+    vpc_config: Option<Option<VpcConfig>>,
 ) -> OpResult {
+    if input.get("VpcConfig").is_some() && vpc_config.is_none() {
+        return Err(LambdaError::InvalidParameterValue(
+            "VpcConfig requires a valid EC2 network selection".into(),
+        ));
+    }
     let name = resolve_function_name(name, region)?;
     validate_env(input)?;
 
@@ -490,6 +503,9 @@ pub fn update_function_configuration(
             }
             if let Some(v) = layers {
                 f.layers = v;
+            }
+            if let Some(v) = vpc_config {
+                f.vpc_config = v;
             }
             f.last_modified = now_iso8601();
             f.revision_id = Uuid::new_v4().to_string();
@@ -1380,8 +1396,14 @@ mod tests {
     #[test]
     fn create_then_get_round_trips() {
         let store = FunctionStore::new();
-        let (status, body) =
-            create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        let (status, body) = create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         assert_eq!(status, 201);
         let cfg = body.unwrap();
         assert_eq!(
@@ -1402,17 +1424,36 @@ mod tests {
     #[test]
     fn create_duplicate_is_conflict() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
-        let err =
-            create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap_err();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
+        let err = create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, LambdaError::ResourceConflict(_)));
     }
 
     #[test]
     fn create_missing_required_fields() {
         let store = FunctionStore::new();
-        let err = create_function(&store, "us-east-1", "000000000000", &serde_json::json!({}))
-            .unwrap_err();
+        let err = create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, LambdaError::InvalidParameterValue(_)));
     }
 
@@ -1422,7 +1463,7 @@ mod tests {
         let mut input = create_input("fn");
         input["Code"]["ZipFile"] =
             serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b"not a zip"));
-        let err = create_function(&store, "us-east-1", "000000000000", &input).unwrap_err();
+        let err = create_function(&store, "us-east-1", "000000000000", &input, None).unwrap_err();
         assert!(matches!(err, LambdaError::InvalidParameterValue(_)));
         assert!(store.get("000000000000", "us-east-1", "fn").is_none());
     }
@@ -1432,7 +1473,7 @@ mod tests {
         let store = FunctionStore::new();
         let mut input = create_input("fn");
         input["Runtime"] = serde_json::json!("go1.x");
-        let err = create_function(&store, "us-east-1", "000000000000", &input).unwrap_err();
+        let err = create_function(&store, "us-east-1", "000000000000", &input, None).unwrap_err();
         assert!(matches!(err, LambdaError::InvalidParameterValue(_)));
     }
 
@@ -1446,7 +1487,7 @@ mod tests {
             "Code": { "ImageUri": "repo/img:latest" },
             "ImageConfig": { "Command": ["app.handler"] }
         });
-        let err = create_function(&store, "us-east-1", "000000000000", &input).unwrap_err();
+        let err = create_function(&store, "us-east-1", "000000000000", &input, None).unwrap_err();
         assert!(matches!(err, LambdaError::NotImplemented(_)));
         assert!(store.get("000000000000", "us-east-1", "img").is_none());
 
@@ -1458,7 +1499,7 @@ mod tests {
             "Runtime": "nodejs22.x",
             "Code": { "ImageUri": "repo/img:latest" }
         });
-        let err = create_function(&store, "us-east-1", "000000000000", &bad).unwrap_err();
+        let err = create_function(&store, "us-east-1", "000000000000", &bad, None).unwrap_err();
         assert!(matches!(err, LambdaError::InvalidParameterValue(_)));
 
         // ImageUri is required and remains a validation error.
@@ -1468,7 +1509,7 @@ mod tests {
             "PackageType": "Image",
             "Code": {}
         });
-        let err = create_function(&store, "us-east-1", "000000000000", &missing).unwrap_err();
+        let err = create_function(&store, "us-east-1", "000000000000", &missing, None).unwrap_err();
         assert!(matches!(err, LambdaError::InvalidParameterValue(_)));
     }
 
@@ -1482,7 +1523,14 @@ mod tests {
     #[test]
     fn delete_then_get_is_not_found() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let (status, _) = delete_function(&store, "us-east-1", "000000000000", "fn").unwrap();
         assert_eq!(status, 204);
         assert!(get_function(&store, "us-east-1", "000000000000", "fn").is_err());
@@ -1495,21 +1543,64 @@ mod tests {
         let store = FunctionStore::new();
         let mut input = create_input("fn");
         input["MemorySize"] = serde_json::json!(64);
-        let err = create_function(&store, "us-east-1", "000000000000", &input).unwrap_err();
+        let err = create_function(&store, "us-east-1", "000000000000", &input, None).unwrap_err();
         assert!(matches!(err, LambdaError::InvalidParameterValue(_)));
+    }
+
+    #[test]
+    fn vpc_configuration_round_trips_and_versions_are_immutable() {
+        let store = FunctionStore::new();
+        let mut input = create_input("fn");
+        input["VpcConfig"] = serde_json::json!({
+            "SubnetIds": ["subnet-a"], "SecurityGroupIds": ["sg-a"]
+        });
+        let vpc = VpcConfig {
+            subnet_ids: vec!["subnet-a".into()],
+            security_group_ids: vec!["sg-a".into()],
+            vpc_id: "vpc-a".into(),
+            ipv6_allowed_for_dual_stack: false,
+            lease: None,
+        };
+        let (_, created) =
+            create_function(&store, "us-east-1", "000000000000", &input, Some(Some(vpc))).unwrap();
+        assert_eq!(created.unwrap()["VpcConfig"]["VpcId"], "vpc-a");
+        let (_, published) = publish_version(&store, "us-east-1", "000000000000", "fn").unwrap();
+        assert_eq!(published.unwrap()["VpcConfig"]["VpcId"], "vpc-a");
+        let patch = serde_json::json!({"VpcConfig": {"SubnetIds": [], "SecurityGroupIds": []}});
+        let (_, updated) = update_function_configuration(
+            &store,
+            "us-east-1",
+            "000000000000",
+            "fn",
+            &patch,
+            Some(None),
+        )
+        .unwrap();
+        assert!(updated.unwrap().get("VpcConfig").is_none());
+        assert!(store
+            .get_version("000000000000", "us-east-1", "fn", 1)
+            .unwrap()
+            .vpc_config
+            .is_some());
     }
 
     #[test]
     fn update_configuration_changes_fields_and_revision() {
         let store = FunctionStore::new();
-        let (_, body) =
-            create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        let (_, body) = create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let rev0 = body.unwrap()["RevisionId"].as_str().unwrap().to_string();
 
         let patch =
             serde_json::json!({ "Timeout": 60, "MemorySize": 256, "Description": "updated" });
         let (status, body) =
-            update_function_configuration(&store, "us-east-1", "000000000000", "fn", &patch)
+            update_function_configuration(&store, "us-east-1", "000000000000", "fn", &patch, None)
                 .unwrap();
         assert_eq!(status, 200);
         let cfg = body.unwrap();
@@ -1524,10 +1615,18 @@ mod tests {
     #[test]
     fn update_configuration_rejects_bad_runtime_without_mutating() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let patch = serde_json::json!({ "Runtime": "go1.x" });
-        let err = update_function_configuration(&store, "us-east-1", "000000000000", "fn", &patch)
-            .unwrap_err();
+        let err =
+            update_function_configuration(&store, "us-east-1", "000000000000", "fn", &patch, None)
+                .unwrap_err();
         assert!(matches!(err, LambdaError::InvalidParameterValue(_)));
         // original runtime intact
         let (_, body) = get_function(&store, "us-east-1", "000000000000", "fn").unwrap();
@@ -1537,8 +1636,14 @@ mod tests {
     #[test]
     fn update_code_recomputes_sha_and_size() {
         let store = FunctionStore::new();
-        let (_, body) =
-            create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        let (_, body) = create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let sha0 = body.unwrap()["CodeSha256"].as_str().unwrap().to_string();
         let patch = serde_json::json!({
             "ZipFile": zip_base64(b"exports.handler=async()=>({updated:true})")
@@ -1554,7 +1659,14 @@ mod tests {
     #[test]
     fn get_resolves_full_arn() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let (status, _) = get_function(
             &store,
             "us-east-1",
@@ -1568,7 +1680,14 @@ mod tests {
     #[test]
     fn publish_and_list_versions() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let (status, body) = publish_version(&store, "us-east-1", "000000000000", "fn").unwrap();
         assert_eq!(status, 201);
         let v = body.unwrap();
@@ -1593,7 +1712,14 @@ mod tests {
     #[test]
     fn alias_lifecycle() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         publish_version(&store, "us-east-1", "000000000000", "fn").unwrap();
 
         let create =
@@ -1628,7 +1754,14 @@ mod tests {
     #[test]
     fn tag_round_trip() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let arn = "arn:aws:lambda:us-east-1:000000000000:function:fn";
         let tags = serde_json::json!({ "Tags": { "team": "core", "env": "dev" } });
         let (status, _) = tag_resource(&store, "us-east-1", "000000000000", arn, &tags).unwrap();
@@ -1657,8 +1790,22 @@ mod tests {
     #[test]
     fn list_returns_created_functions_sorted() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("b")).unwrap();
-        create_function(&store, "us-east-1", "000000000000", &create_input("a")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("b"),
+            None,
+        )
+        .unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("a"),
+            None,
+        )
+        .unwrap();
         let (_, body) = list_functions(&store, "us-east-1", "000000000000").unwrap();
         let body = body.unwrap();
         let names: Vec<&str> = body["Functions"]
@@ -1675,7 +1822,14 @@ mod tests {
     #[test]
     fn concurrency_put_get_delete_round_trip() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
 
         // unset -> {}
         let (status, body) =
@@ -1721,7 +1875,14 @@ mod tests {
     #[test]
     fn url_config_lifecycle() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
 
         let create = serde_json::json!({ "AuthType": "NONE" });
         let (status, body) =
@@ -1769,7 +1930,14 @@ mod tests {
     #[test]
     fn url_config_rejects_bad_auth_type() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let create = serde_json::json!({ "AuthType": "BOGUS" });
         let err = create_function_url_config(&store, "us-east-1", "000000000000", "fn", &create)
             .unwrap_err();
@@ -1790,7 +1958,14 @@ mod tests {
     #[test]
     fn event_invoke_config_lifecycle() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
 
         let put = serde_json::json!({ "MaximumRetryAttempts": 1, "MaximumEventAgeInSeconds": 120 });
         let (status, body) =
@@ -1847,7 +2022,14 @@ mod tests {
     #[test]
     fn event_invoke_config_validates_ranges() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
 
         let bad_retry = serde_json::json!({ "MaximumRetryAttempts": 3 });
         let err =
@@ -1865,7 +2047,14 @@ mod tests {
     #[test]
     fn event_invoke_update_without_existing_is_not_found() {
         let store = FunctionStore::new();
-        create_function(&store, "us-east-1", "000000000000", &create_input("fn")).unwrap();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("fn"),
+            None,
+        )
+        .unwrap();
         let update = serde_json::json!({ "MaximumRetryAttempts": 1 });
         let err =
             update_function_event_invoke_config(&store, "us-east-1", "000000000000", "fn", &update)

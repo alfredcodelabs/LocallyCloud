@@ -3,6 +3,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use dashmap::DashMap;
+use localcloud_ec2::LambdaNetworkLease;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -33,6 +34,27 @@ pub const MIN_EPHEMERAL_MB: u32 = 512;
 pub const MAX_EPHEMERAL_MB: u32 = 10240;
 
 #[derive(Debug, Clone)]
+pub struct VpcConfig {
+    pub subnet_ids: Vec<String>,
+    pub security_group_ids: Vec<String>,
+    pub vpc_id: String,
+    pub ipv6_allowed_for_dual_stack: bool,
+    // Retains EC2 dependencies for $LATEST and every published version.
+    pub lease: Option<LambdaNetworkLease>,
+}
+
+impl VpcConfig {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "SubnetIds": self.subnet_ids,
+            "SecurityGroupIds": self.security_group_ids,
+            "VpcId": self.vpc_id,
+            "Ipv6AllowedForDualStack": self.ipv6_allowed_for_dual_stack,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct LambdaFunction {
     pub function_name: String,
     pub function_arn: String,
@@ -59,12 +81,13 @@ pub struct LambdaFunction {
     pub code_zip: Option<Vec<u8>>,
     /// `DeadLetterConfig.TargetArn` for asynchronous invocation failures, if configured.
     pub dead_letter_arn: Option<String>,
+    pub vpc_config: Option<VpcConfig>,
 }
 
 impl LambdaFunction {
     /// The `FunctionConfiguration` JSON returned by control-plane operations.
     pub fn to_configuration_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "FunctionName": self.function_name,
             "FunctionArn": self.function_arn,
             "Runtime": self.runtime,
@@ -84,7 +107,11 @@ impl LambdaFunction {
             "LastModified": self.last_modified,
             "RevisionId": self.revision_id,
             "State": self.state,
-        })
+        });
+        if let Some(config) = &self.vpc_config {
+            json["VpcConfig"] = config.to_json();
+        }
+        json
     }
 }
 
@@ -1055,6 +1082,7 @@ mod tests {
             state: "Active".into(),
             code_zip: None,
             dead_letter_arn: None,
+            vpc_config: None,
         };
         store.create("000000000000", "us-east-1", f("a")).unwrap();
         // same name, different region is a distinct function

@@ -2,7 +2,7 @@
 
 mod authorization;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ use localcloud_core::integration::lambda::{
 };
 use localcloud_core::integration::pattern::IntegrationPatternId;
 use localcloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
+use localcloud_ec2::Ec2Handler;
 
 use crate::concurrency::{ConcurrencyLimiter, DEFAULT_REGION_LIMIT};
 use crate::control_plane::{
@@ -50,7 +51,7 @@ use crate::esm::{
     SqsBatchSource,
 };
 use crate::executor::{DestinationRouter, Executor};
-use crate::model::{function_arn, resolve_function_name, FunctionStore, LayerStore};
+use crate::model::{function_arn, resolve_function_name, FunctionStore, LayerStore, VpcConfig};
 use crate::runtime_api::{FunctionErrorType, Outcome};
 
 /// The natively-implemented Lambda service.
@@ -61,6 +62,7 @@ pub struct LambdaHandler {
     /// Weak access to sibling native services, used to resolve local S3 deployment artifacts
     /// without creating a registry → handler → registry ownership cycle.
     registry: Weak<ServiceRegistry>,
+    ec2: Mutex<Option<Arc<Ec2Handler>>>,
     /// Present when the data plane is wired; absent handlers reject invoke with 501.
     executor: Option<Arc<Executor>>,
     concurrency: Arc<ConcurrencyLimiter>,
@@ -88,10 +90,103 @@ impl LambdaHandler {
             layers,
             esm: Arc::new(EsmStore::new()),
             registry,
+            ec2: Mutex::new(None),
             executor,
             concurrency: ConcurrencyLimiter::new(DEFAULT_REGION_LIMIT),
             esm_workers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Inject the EC2 control plane used to validate Lambda VPC selections.
+    pub fn attach_ec2(&self, ec2: Arc<Ec2Handler>) {
+        if let Some(executor) = &self.executor {
+            executor.attach_ec2(ec2.clone());
+        }
+        *self.ec2.lock().unwrap() = Some(ec2);
+    }
+
+    fn validate_vpc_config(
+        &self,
+        account: &str,
+        region: &str,
+        input: &Value,
+    ) -> Result<Option<Option<VpcConfig>>, LambdaError> {
+        let Some(raw) = input.get("VpcConfig") else {
+            return Ok(None);
+        };
+        let object = raw.as_object().ok_or_else(|| {
+            LambdaError::InvalidParameterValue("VpcConfig must be an object".into())
+        })?;
+        let ids = |field: &str, max: usize| -> Result<Vec<String>, LambdaError> {
+            let Some(value) = object.get(field) else {
+                return Ok(Vec::new());
+            };
+            let entries = value.as_array().ok_or_else(|| {
+                LambdaError::InvalidParameterValue(format!("VpcConfig.{field} must be an array"))
+            })?;
+            if entries.len() > max {
+                return Err(LambdaError::InvalidParameterValue(format!(
+                    "VpcConfig.{field} exceeds the limit of {max}"
+                )));
+            }
+            let mut unique = HashSet::new();
+            let mut output = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let id = entry.as_str().filter(|id| !id.is_empty()).ok_or_else(|| {
+                    LambdaError::InvalidParameterValue(format!(
+                        "VpcConfig.{field} must contain nonempty resource IDs"
+                    ))
+                })?;
+                if !unique.insert(id) {
+                    return Err(LambdaError::InvalidParameterValue(format!(
+                        "VpcConfig.{field} contains duplicate ID {id}"
+                    )));
+                }
+                output.push(id.to_string());
+            }
+            Ok(output)
+        };
+        let subnet_ids = ids("SubnetIds", 16)?;
+        let security_group_ids = ids("SecurityGroupIds", 5)?;
+        let ipv6 = match object.get("Ipv6AllowedForDualStack") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                LambdaError::InvalidParameterValue(
+                    "VpcConfig.Ipv6AllowedForDualStack must be a boolean".into(),
+                )
+            })?,
+        };
+        if ipv6 {
+            return Err(LambdaError::InvalidParameterValue(
+                "IPv6 VPC networking is not supported by the IPv4-only EC2 network".into(),
+            ));
+        }
+        if subnet_ids.is_empty() && security_group_ids.is_empty() {
+            return Ok(Some(None));
+        }
+        if subnet_ids.is_empty() || security_group_ids.is_empty() {
+            return Err(LambdaError::InvalidParameterValue(
+                "VpcConfig requires both SubnetIds and SecurityGroupIds".into(),
+            ));
+        }
+        let ec2 = self.ec2.lock().unwrap().clone().ok_or_else(|| {
+            LambdaError::InvalidParameterValue("EC2 VPC service is unavailable".into())
+        })?;
+        let lease = ec2
+            .network_selection_lease(account, region, &subnet_ids, &security_group_ids)
+            .ok_or_else(|| {
+                LambdaError::InvalidParameterValue(
+                    "VPC subnets and security groups must exist in one VPC in this account and region"
+                        .into(),
+                )
+            })?;
+        Ok(Some(Some(VpcConfig {
+            subnet_ids,
+            security_group_ids,
+            vpc_id: lease.vpc_id.clone(),
+            ipv6_allowed_for_dual_stack: false,
+            lease: Some(lease),
+        })))
     }
 
     /// Build a handler with the data plane wired to `executor`.
@@ -300,7 +395,8 @@ impl LambdaHandler {
                     let input = parse_json(&req.body)?;
                     let input = self.materialize_s3_zip(req, &input, Some("Code")).await?;
                     self.validate_layer_references(region, account, &input)?;
-                    create_function(&self.store, region, account, &input)
+                    let vpc = self.validate_vpc_config(account, region, &input)?;
+                    create_function(&self.store, region, account, &input, vpc)
                 }
                 Method::GET => list_functions(&self.store, region, account),
                 _ => Err(unsupported()),
@@ -342,8 +438,15 @@ impl LambdaHandler {
                 Method::PUT => {
                     let input = parse_json(&req.body)?;
                     self.validate_layer_references(region, account, &input)?;
-                    let result =
-                        update_function_configuration(&self.store, region, account, name, &input)?;
+                    let vpc = self.validate_vpc_config(account, region, &input)?;
+                    let result = update_function_configuration(
+                        &self.store,
+                        region,
+                        account,
+                        name,
+                        &input,
+                        vpc,
+                    )?;
                     self.invalidate_warm(region, account, name).await;
                     Ok(result)
                 }
@@ -884,14 +987,22 @@ impl LambdaHandler {
                 let _slot = match self.concurrency.acquire(&func.function_arn) {
                     Some(guard) => guard,
                     None => {
+                        executor.publish_throttle_metric(account, region, &func, &req.request_id);
                         return LambdaError::TooManyRequests(
                             "Rate Exceeded: concurrent execution limit reached".into(),
                         )
-                        .into_response(&req.request_id)
+                        .into_response(&req.request_id);
                     }
                 };
                 let payload = req.body.to_vec();
-                match executor.invoke_sync(account, region, &func, payload).await {
+                let trace = req
+                    .headers
+                    .get("x-amzn-trace-id")
+                    .and_then(|v| v.to_str().ok());
+                match executor
+                    .invoke_sync_traced(account, region, &func, payload, trace)
+                    .await
+                {
                     Ok(result) => {
                         invoke_response(&func.version, &req.request_id, result, tail_logs)
                     }
@@ -1018,10 +1129,15 @@ impl LambdaInternalApi for LambdaHandler {
         if function.state != "Active" {
             return Err(LambdaInternalError::InvalidState);
         }
-        let _slot = self
-            .concurrency
-            .acquire(&function.function_arn)
-            .ok_or(LambdaInternalError::Throttled)?;
+        let Some(_slot) = self.concurrency.acquire(&function.function_arn) else {
+            executor.publish_throttle_metric(
+                &call.account_id,
+                &call.region,
+                &function,
+                &call.request_id,
+            );
+            return Err(LambdaInternalError::Throttled);
+        };
         let executed_version = function.version.clone();
         let result = executor
             .invoke_sync(
@@ -1473,6 +1589,121 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn vpc_selection_rejects_partial_invalid_and_unavailable_networks() {
+        let handler = LambdaHandler::new();
+        let scope = ("000000000000", "us-east-1");
+        let invalid = serde_json::json!({"VpcConfig": {"SubnetIds": ["subnet-a"]}});
+        assert!(matches!(
+            handler.validate_vpc_config(scope.0, scope.1, &invalid),
+            Err(LambdaError::InvalidParameterValue(_))
+        ));
+        let malformed = serde_json::json!({"VpcConfig": {"SubnetIds": "subnet-a"}});
+        assert!(matches!(
+            handler.validate_vpc_config(scope.0, scope.1, &malformed),
+            Err(LambdaError::InvalidParameterValue(_))
+        ));
+        let unsupported = serde_json::json!({"VpcConfig": {
+            "SubnetIds": ["subnet-a"], "SecurityGroupIds": ["sg-a"],
+            "Ipv6AllowedForDualStack": true
+        }});
+        assert!(matches!(
+            handler.validate_vpc_config(scope.0, scope.1, &unsupported),
+            Err(LambdaError::InvalidParameterValue(_))
+        ));
+        let selected = serde_json::json!({"VpcConfig": {
+            "SubnetIds": ["subnet-a"], "SecurityGroupIds": ["sg-a"]
+        }});
+        assert!(matches!(
+            handler.validate_vpc_config(scope.0, scope.1, &selected),
+            Err(LambdaError::InvalidParameterValue(_))
+        ));
+        let detached = serde_json::json!({"VpcConfig": {"SubnetIds": [], "SecurityGroupIds": []}});
+        assert!(matches!(
+            handler.validate_vpc_config(scope.0, scope.1, &detached),
+            Ok(Some(None))
+        ));
+    }
+
+    #[tokio::test]
+    async fn vpc_selection_checks_real_ec2_scope() {
+        use axum::body::to_bytes;
+        let ec2 = Arc::new(Ec2Handler::default());
+        let call = |form: String| {
+            let ec2 = ec2.clone();
+            async move {
+                let response = ec2
+                    .handle(ServiceRequest {
+                        method: Method::POST,
+                        uri: "/".parse().unwrap(),
+                        headers: http::HeaderMap::new(),
+                        body: Bytes::from(form),
+                        account_id: "000000000000".into(),
+                        region: "us-east-1".into(),
+                        request_id: "vpc-test".into(),
+                    })
+                    .await;
+                assert_eq!(response.status(), http::StatusCode::OK);
+                String::from_utf8(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap()
+            }
+        };
+        let id = |xml: &str, tag: &str| {
+            xml.split(&format!("<{tag}>"))
+                .nth(1)
+                .unwrap()
+                .split(&format!("</{tag}>"))
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let vpc = id(
+            &call("Action=CreateVpc&CidrBlock=10.7.0.0%2F16".into()).await,
+            "vpcId",
+        );
+        let subnet = id(
+            &call(format!(
+                "Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.7.1.0%2F24"
+            ))
+            .await,
+            "subnetId",
+        );
+        let group = id(
+            &call(format!(
+                "Action=CreateSecurityGroup&VpcId={vpc}&GroupName=lambda&GroupDescription=lambda"
+            ))
+            .await,
+            "groupId",
+        );
+        let handler = LambdaHandler::new();
+        handler.attach_ec2(ec2);
+        let request = serde_json::json!({"VpcConfig": {
+            "SubnetIds": [subnet], "SecurityGroupIds": [group]
+        }});
+        let selected = handler
+            .validate_vpc_config("000000000000", "us-east-1", &request)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.vpc_id, vpc);
+        let mut missing_group = request.clone();
+        missing_group["VpcConfig"]["SecurityGroupIds"] = serde_json::json!(["sg-missing"]);
+        assert!(handler
+            .validate_vpc_config("000000000000", "us-east-1", &missing_group)
+            .is_err());
+        assert!(handler
+            .validate_vpc_config("000000000000", "eu-west-1", &request)
+            .is_err());
+        assert!(handler
+            .validate_vpc_config("other", "us-east-1", &request)
+            .is_err());
+    }
 
     fn zip_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();

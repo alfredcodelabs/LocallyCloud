@@ -2621,6 +2621,7 @@ dependencies = [
  "libc",
  "localcloud-compute",
  "localcloud-core",
+ "localcloud-ec2",
  "localcloud-sqs",
  "proptest",
  "reqwest",

@@ -7,9 +7,10 @@
 //! bounded by the function timeout. The environment is ephemeral (stopped after the invoke);
 //! warm pooling and snapshot reuse layer on top later (task 12).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -17,14 +18,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use axum::{
+    body::{to_bytes, Body},
+    extract::Request,
+    routing::any,
+    Router,
+};
 use dashmap::DashMap;
-use localcloud_compute::runtime::{ComputeRuntime, TaskSpec};
+use http::{StatusCode, Uri};
+use localcloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec};
 use localcloud_core::integration::correlation::CorrelationContext;
 use localcloud_core::integration::identity::CallerIdentity;
 use localcloud_core::integration::logs::{
     LogScope, ProducerContext, ProducerGroupSpec, ProducerLogEvent, ProducerStreamSpec,
 };
+use localcloud_core::integration::metrics::{
+    EmitOutcome, MetricObservation, MetricOrigin, MetricUnit,
+};
+use localcloud_core::proxy::{forward_to_legacy, ProxyConfig};
 use localcloud_core::registry::{ServiceName, ServiceRegistry};
+use localcloud_core::router::extract_service_from_credential_scope;
+use localcloud_ec2::{Ec2Handler, TaskNetworkLease};
 use uuid::Uuid;
 
 use crate::code_store::CodeStore;
@@ -33,6 +47,257 @@ use crate::exec_env::{build_execution_env, ExecEnvInputs};
 use crate::model::{LambdaFunction, LayerStore};
 use crate::rootfs::build_rootfs;
 use crate::runtime_api::{FunctionErrorType, InvocationBroker, Outcome};
+
+#[derive(Clone)]
+struct VpcProxyPolicy {
+    ec2: Arc<Ec2Handler>,
+    account: String,
+    region: String,
+    subnet_id: String,
+    source_ip: Ipv4Addr,
+    source_group_ids: Vec<String>,
+}
+
+fn loopback_port(url: &str) -> Result<u16, String> {
+    let uri: Uri = url
+        .parse()
+        .map_err(|_| format!("invalid guest URL: {url}"))?;
+    if uri.scheme_str() != Some("http") || !matches!(uri.host(), Some("127.0.0.1" | "localhost")) {
+        return Err(format!("VPC guest URL must be HTTP on loopback: {url}"));
+    }
+    uri.port_u16()
+        .ok_or_else(|| format!("VPC guest URL needs an explicit port: {url}"))
+}
+
+fn proxy_listener(
+    listener: tokio::net::TcpListener,
+    backend_url: String,
+    policy: Option<VpcProxyPolicy>,
+    runtime_prefix: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let app = Router::new().fallback(any(move |request: Request| {
+            let backend_url = backend_url.clone();
+            let policy = policy.clone();
+            let runtime_prefix = runtime_prefix.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                if let Some(prefix) = &runtime_prefix {
+                    if !parts.uri.path().starts_with(prefix) {
+                        return http::Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                }
+                if let Some(policy) = &policy {
+                    let service = parts
+                        .headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|auth| extract_service_from_credential_scope(Some(auth), None));
+                    if !service.as_ref().is_some_and(|service| {
+                        policy.ec2.vpc_endpoint_access(
+                            &policy.account,
+                            &policy.region,
+                            &policy.subnet_id,
+                            policy.source_ip,
+                            &policy.source_group_ids,
+                            service.as_str(),
+                        )
+                    }) {
+                        // Keep the guest SDK error parseable. AWS would normally
+                        // surface a connection failure when there is no route;
+                        // this explicit local error identifies the missing endpoint.
+                        let name = service.as_ref().map(|name| name.as_str()).unwrap_or("unknown");
+                        let message = format!("VPC endpoint or security group egress unavailable for AWS service {name}");
+                        if name == "s3" {
+                            // S3 uses REST-XML; its SDK would reject a JSON error.
+                            return http::Response::builder()
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .header(http::header::CONTENT_TYPE, "application/xml")
+                                .body(Body::from(format!(
+                                    "<Error><Code>VpcEndpointUnavailable</Code><Message>{message}</Message></Error>"
+                                )))
+                                .unwrap();
+                        }
+                        let payload = serde_json::json!({
+                            "__type": "VpcEndpointUnavailableException",
+                            "message": message,
+                        });
+                        return http::Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header(http::header::CONTENT_TYPE, "application/x-amz-json-1.1")
+                            .header("x-amzn-errortype", "VpcEndpointUnavailableException")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap();
+                    }
+                }
+                // A guest is untrusted input to the host proxy. Bound buffering until
+                // the shared proxy supports streaming bodies end to end.
+                let body = match to_bytes(body, 32 * 1024 * 1024).await {
+                    Ok(body) => body,
+                    Err(_) => {
+                        return http::Response::builder()
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                };
+                let config = ProxyConfig {
+                    backend_url,
+                    upstream_timeout: Duration::from_secs(30),
+                };
+                forward_to_legacy(&parts.method, &parts.uri, &parts.headers, body, &config)
+                    .await
+                    .unwrap_or_else(|error| {
+                        http::Response::builder()
+                            .status(error.http_status())
+                            .body(Body::from(error.to_string()))
+                            .unwrap()
+                    })
+            }
+        }));
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::warn!(%error, "VPC Lambda proxy stopped");
+        }
+    })
+}
+
+fn private_tcp_listener(
+    listener: tokio::net::TcpListener,
+    ec2: Arc<Ec2Handler>,
+    account: String,
+    region: String,
+    source_eni_id: String,
+    target_ip: Ipv4Addr,
+    port: u16,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let slots = Arc::new(tokio::sync::Semaphore::new(64));
+        loop {
+            let (mut guest, _) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!(%error, %target_ip, port, "private TCP listener stopped");
+                    break;
+                }
+            };
+            let Some(backend) =
+                ec2.private_tcp_access(&account, &region, &source_eni_id, target_ip, port)
+            else {
+                continue;
+            };
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let _slot = slot;
+                if let Ok(mut server) = tokio::net::TcpStream::connect(backend).await {
+                    let _ = tokio::io::copy_bidirectional(&mut guest, &mut server).await;
+                }
+            });
+        }
+    })
+}
+
+fn public_egress_tools_available() -> bool {
+    [("ip", "-Version"), ("nft", "--version")]
+        .into_iter()
+        .all(|(program, version)| {
+            std::process::Command::new(program)
+                .arg(version)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+}
+
+fn original_tcp_destination(stream: &tokio::net::TcpStream) -> io::Result<std::net::SocketAddrV4> {
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: getsockopt writes no more than the provided sockaddr_in buffer.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_IP,
+            80, // SO_ORIGINAL_DST
+            (&mut address as *mut libc::sockaddr_in).cast(),
+            &mut size,
+        )
+    } != 0
+        || size as usize != std::mem::size_of::<libc::sockaddr_in>()
+        || address.sin_family != libc::AF_INET as u16
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std::net::SocketAddrV4::new(
+        Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
+        u16::from_be(address.sin_port),
+    ))
+}
+
+fn public_tcp_listener(
+    listener: tokio::net::TcpListener,
+    ec2: Arc<Ec2Handler>,
+    account: String,
+    region: String,
+    source_eni_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let slots = Arc::new(tokio::sync::Semaphore::new(64));
+        loop {
+            let (mut guest, _) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!(%error, "public TCP listener stopped");
+                    break;
+                }
+            };
+            let Ok(destination) = original_tcp_destination(&guest) else {
+                continue;
+            };
+            if !ec2.public_tcp_access(
+                &account,
+                &region,
+                &source_eni_id,
+                *destination.ip(),
+                destination.port(),
+            ) {
+                continue;
+            }
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
+            let ec2 = ec2.clone();
+            let account = account.clone();
+            let region = region.clone();
+            let source_eni_id = source_eni_id.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                if let Ok(Ok(mut server)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::net::TcpStream::connect(destination),
+                )
+                .await
+                {
+                    let mut policy_tick = tokio::time::interval(Duration::from_millis(250));
+                    let copy = tokio::io::copy_bidirectional(&mut guest, &mut server);
+                    tokio::pin!(copy);
+                    loop {
+                        tokio::select! {
+                            _ = policy_tick.tick() => {
+                                if !ec2.public_tcp_access(&account, &region, &source_eni_id, *destination.ip(), destination.port()) {
+                                    break;
+                                }
+                            }
+                            _ = &mut copy => break,
+                        }
+                    }
+                }
+            });
+        }
+    })
+}
 
 fn unix_ms() -> i64 {
     std::time::SystemTime::now()
@@ -44,6 +309,19 @@ fn unix_ms() -> i64 {
 const ROOTFS_BUILDING: &[u8] = b"localcloud-rootfs-v1 building\n";
 const ROOTFS_STARTING: &[u8] = b"localcloud-rootfs-v1 starting\n";
 const ROOTFS_RUNNING: &[u8] = b"localcloud-rootfs-v1 running\n";
+const VPC_WAIT_SCRIPT: &str = r#"#!/bin/bash
+set -eu
+for ((attempt=0; attempt<500; attempt++)); do
+    if [[ -e /tmp/localcloud-vpc-ready ]] &&
+       (: > "/dev/tcp/127.0.0.1/$LOCALCLOUD_VPC_RUNTIME_PORT") 2>/dev/null &&
+       (: > "/dev/tcp/127.0.0.1/$LOCALCLOUD_VPC_AWS_PORT") 2>/dev/null; then
+        exec "$@"
+    fi
+    /bin/sleep 0.02
+done
+printf 'LocalCloud VPC endpoint readiness timed out\n' >&2
+exit 111
+"#;
 
 fn flock(file: &File, flags: libc::c_int) -> io::Result<()> {
     loop {
@@ -100,6 +378,10 @@ pub struct Executor {
     layers: Arc<LayerStore>,
     rootfs_root: PathBuf,
     runtime: Arc<dyn ComputeRuntime>,
+    ec2: Mutex<Option<Arc<Ec2Handler>>>,
+    vpc_networks: DashMap<String, TaskNetworkLease>,
+    vpc_public_egress: DashMap<String, bool>,
+    vpc_proxies: DashMap<String, Vec<tokio::task::JoinHandle<()>>>,
     /// Host `host:port[/prefix]` a guest reaches the Runtime API on (no scheme).
     runtime_api_base: String,
     /// localcloud endpoint URL injected for in-guest SDK calls.
@@ -199,6 +481,10 @@ impl Executor {
             layers: Arc::new(LayerStore::new()),
             rootfs_root: rootfs_root.into(),
             runtime,
+            ec2: Mutex::new(None),
+            vpc_networks: DashMap::new(),
+            vpc_public_egress: DashMap::new(),
+            vpc_proxies: DashMap::new(),
             runtime_api_base: runtime_api_base.into(),
             aws_endpoint_url: aws_endpoint_url.into(),
             access_key_id: access_key_id.into(),
@@ -218,6 +504,11 @@ impl Executor {
             max_warm_per_key: 10,
             max_warm_total: 16,
         }
+    }
+
+    /// Attach the EC2 control plane used for real VPC ENI and endpoint policy.
+    pub fn attach_ec2(&self, ec2: Arc<Ec2Handler>) {
+        *self.ec2.lock().unwrap() = Some(ec2);
     }
 
     pub(crate) fn bind_arc(self: &Arc<Self>) {
@@ -277,6 +568,20 @@ impl Executor {
         func: &LambdaFunction,
         payload: Vec<u8>,
     ) -> Result<InvokeResult, LambdaError> {
+        self.invoke_sync_traced(account, region, func, payload, None)
+            .await
+    }
+
+    /// [`invoke_sync`](Self::invoke_sync) continuing the caller's `X-Amzn-Trace-Id` when it
+    /// carries a valid X-Ray root.
+    pub async fn invoke_sync_traced(
+        &self,
+        account: &str,
+        region: &str,
+        func: &LambdaFunction,
+        payload: Vec<u8>,
+        incoming_trace: Option<&str>,
+    ) -> Result<InvokeResult, LambdaError> {
         let _admitted = self.invocations.read().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(LambdaError::InternalError(
@@ -302,7 +607,19 @@ impl Executor {
             self.stop_env(&expired_key).await;
         }
         let warm_env = if let Some(key) = warm_env {
-            if self.broker.environment_healthy(&key) {
+            let missing_public_transport =
+                self.vpc_public_egress.get(&key).is_some_and(|enabled| {
+                    !*enabled
+                        && self.vpc_networks.get(&key).is_some_and(|lease| {
+                            self.ec2.lock().unwrap().as_ref().is_some_and(|ec2| {
+                                ec2.public_nat_route(account, region, &lease.eni_id)
+                            })
+                        })
+                });
+            if missing_public_transport {
+                self.stop_env(&key).await;
+                None
+            } else if self.broker.environment_healthy(&key) {
                 Some(key)
             } else {
                 self.stop_env_reason(&key, "FAILURE").await;
@@ -316,6 +633,14 @@ impl Executor {
             None => match self.cold_start(account, region, func, code).await {
                 Ok(key) => key,
                 Err(e) => {
+                    self.publish_invocation_metrics(
+                        account,
+                        region,
+                        func,
+                        &Uuid::new_v4().to_string(),
+                        true,
+                        None,
+                    );
                     return Ok(InvokeResult {
                         outcome: Outcome::Error {
                             error_type: FunctionErrorType::Unhandled,
@@ -325,16 +650,20 @@ impl Executor {
                         request_id: None,
                         log_stream_name: None,
                         billed_duration_ms: 0,
-                    })
+                    });
                 }
             },
         };
 
         let timeout_ms = (func.timeout as i64) * 1000;
         let started = Instant::now();
-        let (request_id, rx) =
-            self.broker
-                .submit(&env_key, payload, &func.function_arn, timeout_ms);
+        let (request_id, rx) = self.broker.submit_traced(
+            &env_key,
+            payload,
+            &func.function_arn,
+            timeout_ms,
+            crate::trace_header::invocation_trace_header(incoming_trace),
+        );
 
         let mut timed_out = false;
         let outcome =
@@ -359,7 +688,16 @@ impl Executor {
                 }
             };
         // Billed duration covers the invoke phase only (no accrual while frozen).
-        let billed_duration_ms = started.elapsed().as_millis() as u64;
+        let invoke_elapsed = started.elapsed();
+        let billed_duration_ms = invoke_elapsed.as_millis() as u64;
+        self.publish_invocation_metrics(
+            account,
+            region,
+            func,
+            &request_id,
+            matches!(outcome, Outcome::Error { .. }),
+            Some(invoke_elapsed.as_secs_f64() * 1000.0),
+        );
         let broker_logs = self.broker.take_logs(&request_id);
         let captured = self.runtime.get_output(&env_key).await.unwrap_or_default();
         let (fallback_logs, log_stream_name) = match self.log_state.get_mut(&env_key) {
@@ -560,6 +898,86 @@ impl Executor {
         Ok(())
     }
 
+    /// Publish the vended `AWS/Lambda` Invocations, Errors, and Duration metrics for one
+    /// invocation. Delivery is best effort and never affects the invocation result.
+    fn publish_invocation_metrics(
+        &self,
+        account: &str,
+        region: &str,
+        func: &LambdaFunction,
+        correlation_id: &str,
+        errored: bool,
+        duration_ms: Option<f64>,
+    ) {
+        let mut metrics = vec![
+            ("Invocations", 1.0, MetricUnit::Count),
+            ("Errors", if errored { 1.0 } else { 0.0 }, MetricUnit::Count),
+        ];
+        if let Some(duration_ms) = duration_ms {
+            metrics.push(("Duration", duration_ms, MetricUnit::Milliseconds));
+        }
+        self.emit_lambda_metrics(account, region, func, correlation_id, &metrics);
+    }
+
+    /// Publish the vended `AWS/Lambda` Throttles metric for a rejected invocation.
+    pub(crate) fn publish_throttle_metric(
+        &self,
+        account: &str,
+        region: &str,
+        func: &LambdaFunction,
+        correlation_id: &str,
+    ) {
+        self.emit_lambda_metrics(
+            account,
+            region,
+            func,
+            correlation_id,
+            &[("Throttles", 1.0, MetricUnit::Count)],
+        );
+    }
+
+    fn emit_lambda_metrics(
+        &self,
+        account: &str,
+        region: &str,
+        func: &LambdaFunction,
+        correlation_id: &str,
+        metrics: &[(&str, f64, MetricUnit)],
+    ) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let Some(sink) = registry.metric_sink(&ServiceName::new("monitoring")) else {
+            tracing::debug!("CloudWatch Monitoring unavailable; Lambda metrics skipped");
+            return;
+        };
+        let timestamp_ms = now_ms();
+        let dimensions = BTreeMap::from([("FunctionName".to_string(), func.function_name.clone())]);
+        let observations = metrics
+            .iter()
+            .map(|(name, value, unit)| MetricObservation {
+                account_id: account.to_string(),
+                region: region.to_string(),
+                namespace: "AWS/Lambda".into(),
+                metric_name: (*name).to_string(),
+                dimensions: dimensions.clone(),
+                timestamp_ms,
+                value: *value,
+                unit: Some(*unit),
+                storage_resolution: 60,
+                origin: MetricOrigin::AwsService,
+                correlation_id: correlation_id.to_string(),
+            })
+            .collect();
+        let outcome = sink.try_emit(observations);
+        if outcome != EmitOutcome::Accepted {
+            tracing::debug!(
+                ?outcome,
+                "Lambda metrics not accepted by CloudWatch Monitoring"
+            );
+        }
+    }
+
     /// The global lock serializes registration with recovery across localcloud processes.
     /// A marker is published only while this lock is held; its per-environment lock stays
     /// open throughout construction, invocation, and warm retention.
@@ -685,7 +1103,10 @@ impl Executor {
         };
         for (env_key, marker) in candidates {
             match self.runtime.reconcile_orphaned_task(&env_key).await {
-                Ok(true) => self.cleanup_rootfs_with_marker(&env_key, marker),
+                Ok(true) => {
+                    self.release_vpc_runtime(&env_key);
+                    self.cleanup_rootfs_with_marker(&env_key, marker);
+                }
                 Ok(false) => {}
                 Err(error) => tracing::warn!(%env_key, %error, "OCI orphan recovery deferred"),
             }
@@ -840,6 +1261,73 @@ impl Executor {
             }
         }
 
+        let vpc_launch = if let Some(vpc) = &func.vpc_config {
+            let prepared = (|| -> Result<_, String> {
+                let ec2 = self
+                    .ec2
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or("Lambda VPC requires the EC2 control plane")?;
+                let subnet_id = vpc
+                    .subnet_ids
+                    .first()
+                    .ok_or("Lambda VPC needs at least one subnet")?;
+                let lease = ec2
+                    .reserve_task_network(
+                        account,
+                        region,
+                        subnet_id,
+                        &vpc.security_group_ids,
+                        &env_key,
+                    )
+                    .ok_or("Lambda VPC could not reserve a private network interface")?;
+                let destinations = ec2.private_tcp_destinations(account, region, &lease.eni_id);
+                let dns = ec2.private_tcp_dns(account, region, &lease.eni_id);
+                let mut hosts = String::from("127.0.0.1 localhost\n");
+                for (hostname, address) in dns {
+                    if hostname
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-')
+                    {
+                        hosts.push_str(&format!("{address} {hostname}\n"));
+                    }
+                }
+                let etc = rootfs.path.join("etc");
+                std::fs::create_dir_all(&etc)
+                    .map_err(|e| format!("creating VPC guest DNS directory: {e}"))?;
+                std::fs::write(etc.join("hosts"), hosts)
+                    .map_err(|e| format!("writing VPC guest DNS hosts: {e}"))?;
+                std::fs::write(
+                    etc.join("resolv.conf"),
+                    "nameserver 169.254.169.253\noptions timeout:2 attempts:1\n",
+                )
+                .map_err(|e| format!("writing VPC guest resolver configuration: {e}"))?;
+                let runtime_port = loopback_port(&format!("http://{}", self.runtime_api_base))?;
+                let aws_port = loopback_port(&self.aws_endpoint_url)?;
+                if runtime_port == aws_port {
+                    return Err("Runtime API and AWS endpoint must use different ports".into());
+                }
+                crate::rootfs::install_vpc_wait_tools(&rootfs.path).map_err(|e| e.to_string())?;
+                let script = rootfs.path.join("var/runtime/vpc-wait");
+                std::fs::write(&script, VPC_WAIT_SCRIPT)
+                    .map_err(|e| format!("writing VPC guest bootstrap: {e}"))?;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| format!("setting VPC bootstrap permissions: {e}"))?;
+                Ok((ec2, lease, runtime_port, aws_port, destinations))
+            })();
+            match prepared {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    self.cleanup_owned_rootfs(&env_key);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
         if let Err(error) = self.broker.discover_expected_extensions(
             &env_key,
             rootfs.extension_names.clone(),
@@ -870,7 +1358,7 @@ impl Executor {
                 self.cleanup_owned_rootfs(&env_key);
                 format!("Lambda execution role credentials unavailable: {error}")
             })?;
-        let env_map = build_execution_env(&ExecEnvInputs {
+        let mut env_map = build_execution_env(&ExecEnvInputs {
             function_name: &func.function_name,
             function_version: &func.version,
             runtime: func.runtime.as_deref(),
@@ -893,10 +1381,19 @@ impl Executor {
                 .map(|credentials| credentials.session_token.as_str()),
             user_env: &func.environment,
         });
+        let mut command = rootfs.entrypoint.clone();
+        if let Some((_, _, runtime_port, aws_port, _)) = &vpc_launch {
+            env_map.insert(
+                "LOCALCLOUD_VPC_RUNTIME_PORT".into(),
+                runtime_port.to_string(),
+            );
+            env_map.insert("LOCALCLOUD_VPC_AWS_PORT".into(), aws_port.to_string());
+            command.splice(0..0, ["/bin/bash".into(), "/var/runtime/vpc-wait".into()]);
+        }
         let spec = TaskSpec {
             name: func.function_name.clone(),
             image: rootfs.path.display().to_string(),
-            command: rootfs.entrypoint.clone(),
+            command,
             env: env_map.into_iter().collect::<HashMap<_, _>>(),
             memory_mb: func.memory_size,
             vcpu_count: 1,
@@ -905,14 +1402,172 @@ impl Executor {
             self.cleanup_owned_rootfs(&env_key);
             return Err(format!("rootfs ownership transition failed: {error}"));
         }
-        if let Err(error) = self.runtime.start_task(&env_key, &spec).await {
+        if let Some((ec2, lease, runtime_port, aws_port, destinations)) = vpc_launch {
+            let (handle, mut listeners) = match self
+                .runtime
+                .start_task_isolated_with_loopback(&env_key, &spec, &[runtime_port, aws_port])
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    self.owned_envs.remove(&env_key);
+                    self.broker.cleanup_extensions(&env_key);
+                    return Err(format!("isolated VPC guest start failed: {error}"));
+                }
+            };
+            debug_assert_eq!(
+                handle.state,
+                localcloud_compute::runtime::TaskState::Running
+            );
+            let runtime_listener = listeners.remove(0);
+            let aws_listener = listeners.remove(0);
+            let mut private_listeners = Vec::with_capacity(destinations.len());
+            for (address, port) in destinations {
+                match self
+                    .runtime
+                    .bind_isolated_private_tcp(&env_key, address, port)
+                    .await
+                {
+                    Ok(listener) => private_listeners.push((listener, address, port)),
+                    Err(error) => {
+                        let _ = self.runtime.stop_task(&env_key).await;
+                        self.owned_envs.remove(&env_key);
+                        self.broker.cleanup_extensions(&env_key);
+                        return Err(format!("private VPC listener failed: {error}"));
+                    }
+                }
+            }
+            let public_tcp = if public_egress_tools_available() {
+                let private_addresses = private_listeners
+                    .iter()
+                    .map(|(_, address, _)| *address)
+                    .collect::<Vec<_>>();
+                match self
+                    .runtime
+                    .bind_isolated_public_egress(&env_key, &private_addresses)
+                    .await
+                {
+                    Ok(listener) => Some(listener),
+                    Err(error) => {
+                        let _ = self.runtime.stop_task(&env_key).await;
+                        self.owned_envs.remove(&env_key);
+                        self.broker.cleanup_extensions(&env_key);
+                        return Err(format!("public VPC egress setup failed: {error}"));
+                    }
+                }
+            } else if ec2.public_nat_route(account, region, &lease.eni_id) {
+                let _ = self.runtime.stop_task(&env_key).await;
+                self.owned_envs.remove(&env_key);
+                self.broker.cleanup_extensions(&env_key);
+                return Err("public VPC egress requires host ip and nft".into());
+            } else {
+                None
+            };
+            let upstream = match crate::vpc_dns::system_resolver() {
+                Ok(resolver) => resolver,
+                Err(error) => {
+                    let _ = self.runtime.stop_task(&env_key).await;
+                    self.owned_envs.remove(&env_key);
+                    self.broker.cleanup_extensions(&env_key);
+                    return Err(format!("VPC DNS system resolver unavailable: {error}"));
+                }
+            };
+            let (dns_udp, dns_tcp) = match self.runtime.bind_isolated_dns(&env_key).await {
+                Ok(sockets) => sockets,
+                Err(error) => {
+                    let _ = self.runtime.stop_task(&env_key).await;
+                    self.owned_envs.remove(&env_key);
+                    self.broker.cleanup_extensions(&env_key);
+                    return Err(format!("VPC DNS setup failed: {error}"));
+                }
+            };
+            let public_egress_enabled = public_tcp.is_some();
+            let mut proxies = private_listeners
+                .into_iter()
+                .map(|(listener, address, port)| {
+                    private_tcp_listener(
+                        listener,
+                        ec2.clone(),
+                        account.to_string(),
+                        region.to_string(),
+                        lease.eni_id.clone(),
+                        address,
+                        port,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some(listener) = public_tcp {
+                proxies.push(public_tcp_listener(
+                    listener,
+                    ec2.clone(),
+                    account.to_string(),
+                    region.to_string(),
+                    lease.eni_id.clone(),
+                ));
+            }
+            proxies.extend(crate::vpc_dns::serve(
+                dns_udp,
+                dns_tcp,
+                upstream,
+                ec2.clone(),
+                account.to_string(),
+                region.to_string(),
+                lease.eni_id.clone(),
+            ));
+            let policy = VpcProxyPolicy {
+                ec2,
+                account: account.to_string(),
+                region: region.to_string(),
+                subnet_id: lease.subnet_id.clone(),
+                source_ip: lease.private_ip,
+                source_group_ids: lease.security_group_ids.clone(),
+            };
+            proxies.extend([
+                proxy_listener(
+                    runtime_listener,
+                    format!("http://{}", self.runtime_api_base),
+                    None,
+                    Some(format!("/e/{env_key}/")),
+                ),
+                proxy_listener(
+                    aws_listener,
+                    self.aws_endpoint_url.clone(),
+                    Some(policy),
+                    None,
+                ),
+            ]);
+            if let Err(error) =
+                std::fs::write(rootfs.path.join("tmp/localcloud-vpc-ready"), b"ready")
+            {
+                for proxy in proxies {
+                    proxy.abort();
+                }
+                let _ = self.runtime.stop_task(&env_key).await;
+                self.owned_envs.remove(&env_key);
+                self.broker.cleanup_extensions(&env_key);
+                return Err(format!("VPC guest readiness marker failed: {error}"));
+            }
+            self.vpc_proxies.insert(env_key.clone(), proxies);
+            self.vpc_networks.insert(env_key.clone(), lease);
+            self.vpc_public_egress
+                .insert(env_key.clone(), public_egress_enabled);
+        } else if let Err(error) = self.runtime.start_task(&env_key, &spec).await {
             self.owned_envs.remove(&env_key);
             self.broker.cleanup_extensions(&env_key);
             return Err(format!("guest start failed: {error}"));
         }
         if let Err(error) = self.mark_rootfs_running(&env_key) {
             match self.runtime.stop_task(&env_key).await {
-                Ok(_) => self.cleanup_owned_rootfs(&env_key),
+                Ok(_) => {
+                    if let Some((_, proxies)) = self.vpc_proxies.remove(&env_key) {
+                        for proxy in proxies {
+                            proxy.abort();
+                        }
+                    }
+                    self.vpc_networks.remove(&env_key);
+                    self.vpc_public_egress.remove(&env_key);
+                    self.cleanup_owned_rootfs(&env_key)
+                }
                 Err(stop_error) => {
                     self.owned_envs.remove(&env_key);
                     tracing::warn!(%env_key, %stop_error, "guest may remain after owner marker failure");
@@ -1070,6 +1725,16 @@ impl Executor {
         }
     }
 
+    fn release_vpc_runtime(&self, env_key: &str) {
+        if let Some((_, proxies)) = self.vpc_proxies.remove(env_key) {
+            for proxy in proxies {
+                proxy.abort();
+            }
+        }
+        self.vpc_networks.remove(env_key);
+        self.vpc_public_egress.remove(env_key);
+    }
+
     /// Stop an environment and free its resources.
     async fn stop_env(&self, env_key: &str) {
         self.stop_env_reason(env_key, "SPINDOWN").await;
@@ -1098,13 +1763,23 @@ impl Executor {
         self.broker.stop(env_key);
         self.broker.cleanup_extensions(env_key);
         self.log_state.remove(env_key);
-        match self.runtime.stop_task(env_key).await {
-            Ok(_) => self.cleanup_rootfs_with_marker(env_key, marker),
-            Err(error) => {
-                // A failed stop may leave an OCI guest alive. Keep its marker and rootfs.
-                drop(marker);
-                tracing::warn!(%env_key, %error, "guest stop failed; rootfs retained");
-            }
+        let stopped = match self.runtime.stop_task(env_key).await {
+            Ok(_) | Err(RuntimeError::TaskAlreadyCompleted { .. }) => true,
+            Err(error) => match self.runtime.reconcile_orphaned_task(env_key).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::warn!(%env_key, %error, "guest stop could not be confirmed; rootfs retained");
+                    false
+                }
+                Err(reconcile_error) => {
+                    tracing::warn!(%env_key, %error, %reconcile_error, "guest stop could not be confirmed; rootfs retained");
+                    false
+                }
+            },
+        };
+        if stopped {
+            self.release_vpc_runtime(env_key);
+            self.cleanup_rootfs_with_marker(env_key, marker);
         }
     }
 
@@ -1286,6 +1961,10 @@ mod tests {
     use crate::runtime_api_server::router;
     use async_trait::async_trait;
     use localcloud_compute::runtime::{RuntimeError, TaskHandle, TaskState};
+    use localcloud_core::integration::logs::{
+        AppendOutcome, GroupRef, InternalLogSink, SinkError, StreamRef,
+    };
+    use localcloud_core::integration::metrics::MetricSink;
     use std::io::Write;
 
     /// A test `ComputeRuntime` that launches a real in-process guest: it reads the injected
@@ -1440,6 +2119,7 @@ mod tests {
             state: "Active".into(),
             code_zip: Some(code),
             dead_letter_arn: None,
+            vpc_config: None,
         }
     }
 
@@ -1501,6 +2181,66 @@ mod tests {
         assert!(unknown.exists());
         second.cleanup_owned_rootfs("other");
         second.cleanup_owned_rootfs("trigger");
+    }
+
+    struct StopRace {
+        absent: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ComputeRuntime for StopRace {
+        async fn start_task(&self, _: &str, _: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
+            unreachable!()
+        }
+
+        async fn stop_task(&self, _: &str) -> Result<TaskHandle, RuntimeError> {
+            Err(RuntimeError::ExecutionFailed {
+                reason: "crun container does not exist".into(),
+            })
+        }
+
+        async fn reconcile_orphaned_task(&self, _: &str) -> Result<bool, RuntimeError> {
+            Ok(self.absent.load(Ordering::Acquire))
+        }
+
+        async fn get_output(&self, _: &str) -> Result<String, RuntimeError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_guest_releases_vpc_only_after_absence_is_confirmed() {
+        let tmp = std::env::temp_dir().join(format!("lc-stop-race-{}", Uuid::new_v4()));
+        let absent = Arc::new(AtomicBool::new(false));
+        let exec = Executor::new(
+            Arc::new(InvocationBroker::new()),
+            Arc::new(CodeStore::new(tmp.join("code"))),
+            tmp.join("rootfs"),
+            Arc::new(StopRace {
+                absent: absent.clone(),
+            }),
+            "127.0.0.1:4566",
+            "http://127.0.0.1:4566",
+            "test",
+            "test",
+        );
+        for env in ["late", "immediate"] {
+            exec.reserve_rootfs(env).unwrap();
+            std::fs::create_dir_all(exec.rootfs_root.join(env)).unwrap();
+            exec.mark_rootfs_starting(env).unwrap();
+            exec.mark_rootfs_running(env).unwrap();
+            exec.vpc_public_egress.insert(env.into(), true);
+            if env == "immediate" {
+                absent.store(true, Ordering::Release);
+            }
+            exec.stop_env(env).await;
+            assert_eq!(exec.rootfs_root.join(env).exists(), env == "late");
+            assert_eq!(exec.vpc_public_egress.contains_key(env), env == "late");
+        }
+        exec.recover_orphaned_guests().await;
+        assert!(!exec.rootfs_root.join("late").exists());
+        assert!(!exec.vpc_public_egress.contains_key("late"));
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     struct ConfirmedOrphan;
@@ -1854,6 +2594,354 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingMetrics {
+        observations: Mutex<Vec<MetricObservation>>,
+    }
+
+    impl MetricSink for RecordingMetrics {
+        fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
+            self.observations.lock().unwrap().extend(observations);
+            EmitOutcome::Accepted
+        }
+    }
+
+    struct RejectingMetrics;
+
+    impl MetricSink for RejectingMetrics {
+        fn try_emit(&self, _observations: Vec<MetricObservation>) -> EmitOutcome {
+            EmitOutcome::Full
+        }
+    }
+
+    struct AcceptingLogs;
+
+    #[async_trait]
+    impl InternalLogSink for AcceptingLogs {
+        async fn resolve_group(
+            &self,
+            _scope: LogScope,
+            spec: ProducerGroupSpec,
+            _context: ProducerContext,
+        ) -> Result<GroupRef, SinkError> {
+            Ok(GroupRef { name: spec.name })
+        }
+        async fn ensure_group(
+            &self,
+            _scope: LogScope,
+            spec: ProducerGroupSpec,
+            _context: ProducerContext,
+        ) -> Result<GroupRef, SinkError> {
+            Ok(GroupRef { name: spec.name })
+        }
+        async fn ensure_stream(
+            &self,
+            _scope: LogScope,
+            group: GroupRef,
+            spec: ProducerStreamSpec,
+            _context: ProducerContext,
+        ) -> Result<StreamRef, SinkError> {
+            Ok(StreamRef {
+                group_name: group.name,
+                stream_name: spec.name,
+            })
+        }
+        async fn append(
+            &self,
+            _scope: LogScope,
+            _target: StreamRef,
+            events: Vec<ProducerLogEvent>,
+            _context: ProducerContext,
+        ) -> Result<AppendOutcome, SinkError> {
+            Ok(AppendOutcome {
+                stored_events: events.len(),
+            })
+        }
+    }
+
+    struct StubHandler;
+
+    #[async_trait]
+    impl localcloud_core::handler::NativeHandler for StubHandler {
+        async fn handle(
+            &self,
+            _request: localcloud_core::handler::ServiceRequest,
+        ) -> axum::response::Response {
+            axum::response::IntoResponse::into_response(http::StatusCode::OK)
+        }
+    }
+
+    fn observability_registry(metrics: Arc<dyn MetricSink>) -> Arc<ServiceRegistry> {
+        use localcloud_core::registry::{AwsProtocol, ServiceMetadata};
+        let registry = ServiceRegistry::with_known_services();
+        registry.register_native_with_log_sink(
+            ServiceName::new("logs"),
+            ServiceMetadata::new(AwsProtocol::Json11, None),
+            Arc::new(StubHandler),
+            Arc::new(AcceptingLogs),
+        );
+        registry.register_native_with_metric_sink(
+            ServiceName::new("monitoring"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(StubHandler),
+            metrics,
+        );
+        registry
+    }
+
+    fn metric_values(observations: &[MetricObservation]) -> Vec<(String, f64)> {
+        observations
+            .iter()
+            .map(|observation| (observation.metric_name.clone(), observation.value))
+            .collect()
+    }
+
+    fn assert_lambda_metric_shape(observations: &[MetricObservation], request_id: &str) {
+        for observation in observations {
+            assert_eq!(observation.namespace, "AWS/Lambda");
+            assert_eq!(observation.account_id, "000000000000");
+            assert_eq!(observation.region, "us-east-1");
+            assert_eq!(
+                observation.dimensions,
+                BTreeMap::from([("FunctionName".to_string(), "fn".to_string())])
+            );
+            assert_eq!(observation.correlation_id, request_id);
+            assert_eq!(observation.storage_resolution, 60);
+            assert_ne!(observation.origin, MetricOrigin::PublicPutMetricData);
+            let expected_unit = if observation.metric_name == "Duration" {
+                MetricUnit::Milliseconds
+            } else {
+                MetricUnit::Count
+            };
+            assert_eq!(observation.unit, Some(expected_unit));
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_invoke_emits_vended_lambda_metrics() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(result.outcome, Outcome::Success(_)));
+        let observations = metrics.observations.lock().unwrap().clone();
+        let values = metric_values(&observations);
+        assert_eq!(values[0], ("Invocations".to_string(), 1.0));
+        assert_eq!(values[1], ("Errors".to_string(), 0.0));
+        assert_eq!(values[2].0, "Duration");
+        assert!(values[2].1 >= 0.0);
+        assert_eq!(values.len(), 3);
+        assert_lambda_metric_shape(&observations, result.request_id.as_deref().unwrap());
+    }
+
+    #[tokio::test]
+    async fn function_error_emits_error_metric() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::ReportError)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(result.outcome, Outcome::Error { .. }));
+        let observations = metrics.observations.lock().unwrap().clone();
+        let values = metric_values(&observations);
+        assert_eq!(values[0], ("Invocations".to_string(), 1.0));
+        assert_eq!(values[1], ("Errors".to_string(), 1.0));
+        assert_eq!(values[2].0, "Duration");
+        assert_lambda_metric_shape(&observations, result.request_id.as_deref().unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejected_metrics_do_not_fail_the_invocation() {
+        let registry = observability_registry(Arc::new(RejectingMetrics));
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, Outcome::Success(b"{\"len\":2}".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn throttled_invoke_emits_throttle_metric() {
+        use crate::service::LambdaHandler;
+        use base64::Engine as _;
+        use localcloud_core::handler::{NativeHandler, ServiceRequest};
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        let handler = LambdaHandler::with_executor(Arc::new(exec));
+        let request = |method: http::Method, path: &str, body: Vec<u8>| ServiceRequest {
+            method,
+            uri: path.parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            body: bytes::Bytes::from(body),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            request_id: "throttled-rid".into(),
+        };
+        let zip = zip_with(&[("index.js", b"x")]);
+        let create = serde_json::json!({
+            "FunctionName": "fn",
+            "Role": "arn:aws:iam::000000000000:role/r",
+            "Runtime": "nodejs22.x",
+            "Handler": "index.handler",
+            "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&zip) }
+        });
+        let created = handler
+            .handle(request(
+                http::Method::POST,
+                "/2015-03-31/functions",
+                create.to_string().into_bytes(),
+            ))
+            .await;
+        assert_eq!(created.status(), 201);
+        let reserved = handler
+            .handle(request(
+                http::Method::PUT,
+                "/2017-10-31/functions/fn/concurrency",
+                br#"{"ReservedConcurrentExecutions":0}"#.to_vec(),
+            ))
+            .await;
+        assert_eq!(reserved.status(), 200);
+        let throttled = handler
+            .handle(request(
+                http::Method::POST,
+                "/2015-03-31/functions/fn/invocations",
+                b"{}".to_vec(),
+            ))
+            .await;
+        assert_eq!(throttled.status(), 429);
+        let observations = metrics.observations.lock().unwrap().clone();
+        assert_eq!(
+            metric_values(&observations),
+            vec![("Throttles".to_string(), 1.0)]
+        );
+        assert_lambda_metric_shape(&observations, "throttled-rid");
+    }
+
+    #[tokio::test]
+    async fn sync_invoke_continues_caller_trace_root() {
+        let broker = Arc::new(InvocationBroker::new());
+        let base = serve_runtime_api(broker.clone()).await;
+        let tmp = std::env::temp_dir().join(format!("lc-exec-{}", Uuid::new_v4()));
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let exec = Executor::new(
+            broker,
+            Arc::new(CodeStore::new(tmp.join("code"))),
+            tmp.join("rootfs"),
+            Arc::new(TraceRecordingGuest {
+                traces: traces.clone(),
+            }),
+            base,
+            "http://127.0.0.1:4566",
+            "test",
+            "test",
+        );
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let root = "Root=1-5759e988-bd862e3fe1be46a994272793";
+        exec.invoke_sync_traced(
+            "000000000000",
+            "us-east-1",
+            &f,
+            b"{}".to_vec(),
+            Some(&format!("{root};Parent=53995c3f42cd8ad8;Sampled=1")),
+        )
+        .await
+        .unwrap();
+        exec.invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        let traces = traces.lock().unwrap().clone();
+        assert_eq!(traces.len(), 2);
+        assert!(traces[0].starts_with(&format!("{root};Parent=")));
+        assert!(traces[0].ends_with(";Sampled=0"));
+        assert!(!traces[1].starts_with(root));
+        assert!(traces[1].starts_with("Root=1-"));
+        exec.shutdown().await;
+    }
+
+    /// A guest that records each invocation's `Lambda-Runtime-Trace-Id` header.
+    struct TraceRecordingGuest {
+        traces: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ComputeRuntime for TraceRecordingGuest {
+        async fn start_task(&self, id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
+            let api = spec.env.get("AWS_LAMBDA_RUNTIME_API").cloned().unwrap();
+            let traces = self.traces.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                loop {
+                    let Ok(next) = client
+                        .get(format!("http://{api}/2018-06-01/runtime/invocation/next"))
+                        .send()
+                        .await
+                    else {
+                        break;
+                    };
+                    if next.status() == 204 {
+                        break;
+                    }
+                    let header = |name: &str| {
+                        next.headers()
+                            .get(name)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    };
+                    let rid = header("Lambda-Runtime-Aws-Request-Id");
+                    traces
+                        .lock()
+                        .unwrap()
+                        .push(header("Lambda-Runtime-Trace-Id"));
+                    let _ = client
+                        .post(format!(
+                            "http://{api}/2018-06-01/runtime/invocation/{rid}/response"
+                        ))
+                        .body("null")
+                        .send()
+                        .await;
+                }
+            });
+            Ok(TaskHandle {
+                task_id: id.to_string(),
+                state: TaskState::Running,
+            })
+        }
+        async fn stop_task(&self, id: &str) -> Result<TaskHandle, RuntimeError> {
+            Ok(TaskHandle {
+                task_id: id.to_string(),
+                state: TaskState::Stopped,
+            })
+        }
+        async fn get_output(&self, _id: &str) -> Result<String, RuntimeError> {
+            Ok(String::new())
+        }
+    }
+
     /// Records async destination deliveries for assertions.
     #[derive(Default)]
     struct RecordingRouter {
@@ -2055,5 +3143,72 @@ mod tests {
             ))
             .await;
         assert_eq!(too_big.status(), 413);
+    }
+    #[tokio::test]
+    async fn isolated_public_tcp_without_eni_route_is_closed() {
+        use localcloud_compute::youki::YoukiRuntime;
+        let Some(runtime) = YoukiRuntime::discover() else {
+            return;
+        };
+        if !std::process::Command::new("cc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let rootfs =
+            std::env::temp_dir().join(format!("localcloud-egress-deny-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../localcloud-compute/tests/fixtures/isolated_client.c");
+        assert!(std::process::Command::new("cc")
+            .args(["-static", "-O2"])
+            .arg(source)
+            .arg("-o")
+            .arg(rootfs.join("bin/client"))
+            .status()
+            .unwrap()
+            .success());
+        let task_id = format!("public-deny-{}", Uuid::new_v4().simple());
+        let port = 39000;
+        let spec = TaskSpec {
+            name: task_id.clone(),
+            image: rootfs.display().to_string(),
+            command: vec!["/bin/client".into(), port.to_string(), "8.8.8.8".into()],
+            env: HashMap::new(),
+            memory_mb: 128,
+            vcpu_count: 1,
+        };
+        let (_, _loopback) = runtime
+            .start_task_isolated_with_loopback(&task_id, &spec, &[port])
+            .await
+            .unwrap();
+        let listener = runtime
+            .bind_isolated_public_egress(&task_id, &[])
+            .await
+            .unwrap();
+        let proxy = public_tcp_listener(
+            listener,
+            Arc::new(Ec2Handler::default()),
+            "111111111111".into(),
+            "us-east-1".into(),
+            "eni-missing".into(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while runtime.task_state(&task_id).await.unwrap() == TaskState::Running {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "denied guest did not exit"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!runtime
+            .get_output(&task_id)
+            .await
+            .unwrap()
+            .contains("isolated-loopback-ok"));
+        proxy.abort();
+        std::fs::remove_dir_all(rootfs).unwrap();
     }
 }

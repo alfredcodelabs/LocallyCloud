@@ -45,6 +45,8 @@ impl fmt::Debug for MetricObservation {
 pub enum MetricOrigin {
     CloudWatchLogs,
     PublicPutMetricData,
+    /// Vended metrics published by a native service into its own `AWS/<Service>` namespace.
+    AwsService,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
