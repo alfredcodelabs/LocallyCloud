@@ -406,3 +406,23 @@ fn keys_aliases_defaults_and_policy_survive_restart() {
         policy
     );
 }
+
+#[test]
+fn rotation_status_is_disabled_for_new_keys_and_scoped() {
+    let service = test_service();
+    let (key_id, _) = create_key(&service, ACCOUNT, REGION);
+    assert_eq!(
+        call_ok(&service, "GetKeyRotationStatus", json!({ "KeyId": key_id })),
+        json!({ "KeyRotationEnabled": false })
+    );
+    assert!(matches!(
+        call(
+            &service,
+            "GetKeyRotationStatus",
+            json!({ "KeyId": key_id }),
+            ACCOUNT,
+            "eu-west-1"
+        ),
+        Err(KmsError::NotFound)
+    ));
+}

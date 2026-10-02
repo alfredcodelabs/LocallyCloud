@@ -115,6 +115,34 @@ impl KmsService {
         Ok(json!({ "Keys": keys, "Truncated": false }))
     }
 
+    pub(super) fn list_resource_tags(
+        &self,
+        body: &Map<String, Value>,
+        scope: &Scope,
+    ) -> Result<Value, KmsError> {
+        require_known_fields(body, &["KeyId", "Limit", "Marker"])?;
+        let key_id = self.resolve_key_id(required_string(body, "KeyId")?, scope)?;
+        self.store
+            .with_key(
+                scope,
+                &key_id,
+                |_| json!({ "Tags": [], "Truncated": false }),
+            )
+            .ok_or(KmsError::NotFound)
+    }
+
+    pub(super) fn get_key_rotation_status(
+        &self,
+        body: &Map<String, Value>,
+        scope: &Scope,
+    ) -> Result<Value, KmsError> {
+        require_known_fields(body, &["KeyId"])?;
+        let key_id = self.resolve_key_id(required_string(body, "KeyId")?, scope)?;
+        self.store
+            .with_key(scope, &key_id, |_| json!({ "KeyRotationEnabled": false }))
+            .ok_or(KmsError::NotFound)
+    }
+
     pub(super) fn get_key_policy(
         &self,
         body: &Map<String, Value>,

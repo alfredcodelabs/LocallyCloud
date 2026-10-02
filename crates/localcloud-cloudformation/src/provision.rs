@@ -876,6 +876,9 @@ impl Provisioner {
                 body.insert(property.to_string(), value.clone());
             }
         }
+        if let Some(policy) = props.get("KeyPolicy") {
+            body.insert("Policy".into(), Value::String(policy.to_string()));
+        }
         let response = self
             .call_aws_json_11(
                 "kms",
@@ -4795,6 +4798,7 @@ fn validate_kms_key_properties(logical_id: &str, props: &Value) -> Result<(), Cf
         props,
         &[
             "Description",
+            "KeyPolicy",
             "KeySpec",
             "KeyUsage",
             "Origin",
@@ -4802,6 +4806,14 @@ fn validate_kms_key_properties(logical_id: &str, props: &Value) -> Result<(), Cf
             "PendingWindowInDays",
         ],
     )?;
+    if props
+        .get("KeyPolicy")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(CfnError::Validation(format!(
+            "AWS::KMS::Key resource {logical_id} requires KeyPolicy to be an object"
+        )));
+    }
     if props.get("Description").is_some_and(|value| {
         value
             .as_str()
