@@ -21,6 +21,7 @@ use localcloud_core::integration::{InternalDispatcher, RequestIdentity};
 use localcloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 
 use crate::error::SqsError;
+use crate::metrics::SqsMetrics;
 use crate::model::QueueArn;
 use crate::ops::{self, Ctx};
 use crate::policy::{self, Decision};
@@ -33,6 +34,7 @@ const TARGET_PREFIX: &str = "AmazonSQS";
 pub struct SqsHandler {
     store: Arc<SqsStore>,
     registry: Weak<ServiceRegistry>,
+    metrics: SqsMetrics,
 }
 
 impl Default for SqsHandler {
@@ -43,24 +45,38 @@ impl Default for SqsHandler {
 
 impl SqsHandler {
     pub fn new() -> Self {
-        SqsHandler {
-            store: Arc::new(SqsStore::new()),
-            registry: Weak::new(),
-        }
+        Self::from_parts(Arc::new(SqsStore::new()), Weak::new())
     }
 
     fn with_registry(registry: &Arc<ServiceRegistry>) -> Self {
-        Self {
-            store: Arc::new(SqsStore::new()),
-            registry: Arc::downgrade(registry),
-        }
+        Self::from_parts(Arc::new(SqsStore::new()), Arc::downgrade(registry))
     }
 
     fn with_state(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) -> Result<Self, SqsError> {
-        Ok(Self {
-            store: Arc::new(SqsStore::with_state(state)?),
+        Ok(Self::from_parts(
+            Arc::new(SqsStore::with_state(state)?),
+            Arc::downgrade(registry),
+        ))
+    }
+
+    #[cfg(test)]
+    fn with_metrics_period(registry: &Arc<ServiceRegistry>, period: std::time::Duration) -> Self {
+        let store = Arc::new(SqsStore::new());
+        let metrics = SqsMetrics::with_period(store.clone(), Arc::downgrade(registry), period);
+        Self {
+            store,
             registry: Arc::downgrade(registry),
-        })
+            metrics,
+        }
+    }
+
+    fn from_parts(store: Arc<SqsStore>, registry: Weak<ServiceRegistry>) -> Self {
+        let metrics = SqsMetrics::new(store.clone(), registry.clone());
+        Self {
+            store,
+            registry,
+            metrics,
+        }
     }
 
     async fn authorize_queue_operation(
@@ -215,6 +231,7 @@ impl NativeHandler for SqsHandler {
                 .get(http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned),
+            metrics: self.metrics.recorder(),
         };
         if let Err(error) = self
             .authorize_queue_operation(&op, &body, &request, ctx.dispatcher.as_ref())
@@ -223,7 +240,12 @@ impl NativeHandler for SqsHandler {
             return error_response(error, &request, protocol);
         }
         match self.dispatch(&op, &ctx, &body).await {
-            Ok(value) => success_response(&op, value, protocol, &request.request_id),
+            Ok(value) => {
+                if !matches!(op.as_str(), "ListQueues" | "DeleteQueue") {
+                    ctx.metrics.touch();
+                }
+                success_response(&op, value, protocol, &request.request_id)
+            }
             Err(err) => error_response(err, &request, protocol),
         }
     }
@@ -922,5 +944,313 @@ mod tests {
             .unwrap();
         let body = String::from_utf8_lossy(&bytes);
         assert!(body.contains("<Code>AWS.SimpleQueueService.NonExistentQueue</Code>"));
+    }
+
+    mod vended_metrics {
+        use super::*;
+        use localcloud_core::integration::metrics::{
+            EmitOutcome, MetricObservation, MetricSink, MetricUnit,
+        };
+        use std::sync::Mutex;
+
+        struct RecordingSink {
+            outcome: EmitOutcome,
+            observations: Mutex<Vec<MetricObservation>>,
+        }
+
+        impl MetricSink for RecordingSink {
+            fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
+                self.observations.lock().unwrap().extend(observations);
+                self.outcome
+            }
+        }
+
+        struct NoopHandler;
+
+        #[async_trait]
+        impl NativeHandler for NoopHandler {
+            async fn handle(&self, _request: ServiceRequest) -> Response {
+                Response::new(Body::empty())
+            }
+        }
+
+        fn registry_with_sink(outcome: EmitOutcome) -> (Arc<ServiceRegistry>, Arc<RecordingSink>) {
+            let registry = Arc::new(ServiceRegistry::new());
+            let sink = Arc::new(RecordingSink {
+                outcome,
+                observations: Mutex::new(Vec::new()),
+            });
+            registry.register_native_with_metric_sink(
+                ServiceName::new("monitoring"),
+                ServiceMetadata::new(AwsProtocol::Query, None),
+                Arc::new(NoopHandler),
+                sink.clone(),
+            );
+            (registry, sink)
+        }
+
+        fn points(sink: &RecordingSink, queue: &str, name: &str) -> Vec<MetricObservation> {
+            sink.observations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.metric_name == name && o.dimensions["QueueName"] == queue)
+                .cloned()
+                .collect()
+        }
+
+        fn sum(sink: &RecordingSink, queue: &str, name: &str) -> f64 {
+            points(sink, queue, name).iter().map(|o| o.value).sum()
+        }
+
+        #[tokio::test]
+        async fn fifo_deduplicated_sends_are_not_counted_as_sent() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h = SqsHandler::with_metrics_period(&registry, Duration::from_secs(3600));
+            let (status, created) = call(
+                &h,
+                "CreateQueue",
+                json!({ "QueueName": "dedup.fifo", "Attributes": { "FifoQueue": "true" } }),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let url = created["QueueUrl"].as_str().unwrap().to_string();
+            for _ in 0..2 {
+                let (status, _) = call(
+                    &h,
+                    "SendMessage",
+                    json!({ "QueueUrl": url, "MessageBody": "same", "MessageGroupId": "g",
+                            "MessageDeduplicationId": "d1" }),
+                )
+                .await;
+                assert_eq!(status, 200);
+            }
+            h.metrics.recorder().tick().await;
+            assert_eq!(sum(&sink, "dedup.fifo", "NumberOfMessagesSent"), 1.0);
+            assert_eq!(points(&sink, "dedup.fifo", "SentMessageSize").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn operation_counters_are_aggregated_and_emitted() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h = SqsHandler::with_metrics_period(&registry, Duration::from_secs(3600));
+            let url = create(&h, "metered").await;
+            for body in ["hello", "abc"] {
+                let (status, _) = call(
+                    &h,
+                    "SendMessage",
+                    json!({ "QueueUrl": url, "MessageBody": body }),
+                )
+                .await;
+                assert_eq!(status, 200);
+            }
+            let (status, batch) = call(
+                &h,
+                "SendMessageBatch",
+                json!({ "QueueUrl": url, "Entries": [
+                    { "Id": "a", "MessageBody": "four" },
+                    { "Id": "b", "MessageBody": "x", "DelaySeconds": 5000 },
+                    { "Id": "c", "MessageBody": "sz", "MessageAttributes": {
+                        "k": { "DataType": "String", "StringValue": "vv" } } }
+                ] }),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(batch["Failed"].as_array().unwrap().len(), 1);
+            let (_, received) = call(
+                &h,
+                "ReceiveMessage",
+                json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
+            )
+            .await;
+            let handles: Vec<String> = received["Messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["ReceiptHandle"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(handles.len(), 4);
+            let (_, empty) = call(&h, "ReceiveMessage", json!({ "QueueUrl": url })).await;
+            assert!(empty.get("Messages").is_none());
+            let (status, _) = call(
+                &h,
+                "DeleteMessage",
+                json!({ "QueueUrl": url, "ReceiptHandle": handles[0] }),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let (_, deleted) = call(
+                &h,
+                "DeleteMessageBatch",
+                json!({ "QueueUrl": url, "Entries": [
+                    { "Id": "a", "ReceiptHandle": handles[1] },
+                    { "Id": "b", "ReceiptHandle": "garbage" }
+                ] }),
+            )
+            .await;
+            assert_eq!(deleted["Successful"].as_array().unwrap().len(), 1);
+            assert!(
+                sink.observations.lock().unwrap().is_empty(),
+                "counters are buffered until the sampler flushes"
+            );
+
+            h.metrics.recorder().tick().await;
+
+            assert_eq!(sum(&sink, "metered", "NumberOfMessagesSent"), 4.0);
+            assert_eq!(sum(&sink, "metered", "NumberOfMessagesReceived"), 4.0);
+            assert_eq!(sum(&sink, "metered", "NumberOfEmptyReceives"), 1.0);
+            assert_eq!(sum(&sink, "metered", "NumberOfMessagesDeleted"), 2.0);
+            let mut sizes: Vec<f64> = points(&sink, "metered", "SentMessageSize")
+                .iter()
+                .map(|o| o.value)
+                .collect();
+            sizes.sort_by(f64::total_cmp);
+            // "sz" + attribute name "k" + data type "String" + value "vv".
+            assert_eq!(sizes, vec![3.0, 4.0, 5.0, 11.0]);
+            let observations = sink.observations.lock().unwrap().clone();
+            assert!(observations.iter().all(|o| o.namespace == "AWS/SQS"
+                && o.account_id == "000000000000"
+                && o.region == "us-east-1"
+                && o.dimensions.len() == 1
+                && o.storage_resolution == 60));
+            let sent = observations
+                .iter()
+                .find(|o| o.metric_name == "NumberOfMessagesSent")
+                .unwrap();
+            assert_eq!(sent.unit, Some(MetricUnit::Count));
+            assert_eq!(sent.timestamp_ms % 60_000, 0);
+            assert!(observations
+                .iter()
+                .filter(|o| o.metric_name == "SentMessageSize")
+                .all(|o| o.unit == Some(MetricUnit::Bytes)));
+
+            sink.observations.lock().unwrap().clear();
+            h.metrics.recorder().tick().await;
+            assert_eq!(sum(&sink, "metered", "NumberOfMessagesSent"), 0.0);
+        }
+
+        #[tokio::test]
+        async fn gauges_sample_queue_depth_and_age() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h = SqsHandler::with_metrics_period(&registry, Duration::from_secs(3600));
+            let url = create(&h, "depth").await;
+            let idle = create(&h, "idle").await;
+            for (body, delay) in [("in-flight", 0), ("visible", 0), ("delayed", 600)] {
+                call(
+                    &h,
+                    "SendMessage",
+                    json!({ "QueueUrl": url, "MessageBody": body, "DelaySeconds": delay }),
+                )
+                .await;
+            }
+            call(&h, "ReceiveMessage", json!({ "QueueUrl": url })).await;
+            assert!(!idle.is_empty());
+            sink.observations.lock().unwrap().clear();
+
+            h.metrics.recorder().tick().await;
+
+            let gauge = |queue: &str, name: &str| {
+                let samples = points(&sink, queue, name);
+                assert_eq!(samples.len(), 1, "{queue} {name}");
+                samples[0].clone()
+            };
+            assert_eq!(
+                gauge("depth", "ApproximateNumberOfMessagesVisible").value,
+                1.0
+            );
+            assert_eq!(
+                gauge("depth", "ApproximateNumberOfMessagesNotVisible").value,
+                1.0
+            );
+            assert_eq!(
+                gauge("depth", "ApproximateNumberOfMessagesDelayed").value,
+                1.0
+            );
+            let age = gauge("depth", "ApproximateAgeOfOldestMessage");
+            assert_eq!(age.unit, Some(MetricUnit::Seconds));
+            assert!((0.0..5.0).contains(&age.value));
+            for name in [
+                "ApproximateNumberOfMessagesVisible",
+                "ApproximateNumberOfMessagesNotVisible",
+                "ApproximateNumberOfMessagesDelayed",
+                "ApproximateAgeOfOldestMessage",
+            ] {
+                assert_eq!(gauge("idle", name).value, 0.0);
+            }
+        }
+
+        #[tokio::test]
+        async fn sampler_starts_lazily_and_stops_without_queues() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h = SqsHandler::with_metrics_period(&registry, Duration::from_millis(50));
+            let recorder = h.metrics.recorder();
+            assert!(!recorder.sampler_running());
+            call(&h, "ListQueues", json!({})).await;
+            assert!(!recorder.sampler_running());
+
+            let url = create(&h, "lazy").await;
+            assert!(recorder.sampler_running());
+            call(
+                &h,
+                "SendMessage",
+                json!({ "QueueUrl": url, "MessageBody": "tick" }),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(sum(&sink, "lazy", "NumberOfMessagesSent"), 1.0);
+            assert!(!points(&sink, "lazy", "ApproximateNumberOfMessagesVisible").is_empty());
+
+            call(&h, "DeleteQueue", json!({ "QueueUrl": url })).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!recorder.sampler_running());
+        }
+
+        #[tokio::test]
+        async fn no_sampler_or_buffer_without_monitoring() {
+            let registry = Arc::new(ServiceRegistry::new());
+            let h = SqsHandler::with_metrics_period(&registry, Duration::from_millis(50));
+            let url = create(&h, "unmetered").await;
+            let (status, _) = call(
+                &h,
+                "SendMessage",
+                json!({ "QueueUrl": url, "MessageBody": "x" }),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert!(!h.metrics.recorder().sampler_running());
+            // Monitoring appearing later receives gauges only: nothing was buffered.
+            let sink = Arc::new(RecordingSink {
+                outcome: EmitOutcome::Accepted,
+                observations: Mutex::new(Vec::new()),
+            });
+            registry.register_native_with_metric_sink(
+                ServiceName::new("monitoring"),
+                ServiceMetadata::new(AwsProtocol::Query, None),
+                Arc::new(NoopHandler),
+                sink.clone(),
+            );
+            assert_eq!(h.metrics.recorder().tick().await, 4);
+            assert!(points(&sink, "unmetered", "NumberOfMessagesSent").is_empty());
+        }
+
+        #[tokio::test]
+        async fn rejected_emission_never_fails_the_api_call() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Full);
+            let h = SqsHandler::with_metrics_period(&registry, Duration::from_millis(20));
+            let url = create(&h, "full").await;
+            for _ in 0..3 {
+                let (status, _) = call(
+                    &h,
+                    "SendMessage",
+                    json!({ "QueueUrl": url, "MessageBody": "x" }),
+                )
+                .await;
+                assert_eq!(status, 200);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            let (status, _) = call(&h, "ReceiveMessage", json!({ "QueueUrl": url })).await;
+            assert_eq!(status, 200);
+            assert!(!sink.observations.lock().unwrap().is_empty());
+        }
     }
 }

@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::error::SqsError;
 use crate::md5::{attributes_md5, body_md5};
+use crate::metrics::{message_counts, MetricsRecorder};
 use crate::model::{AttributeValue, EncryptedBody, Message, MessageAttribute, QueueArn};
 use crate::store::{
     GuardedQueue, InsertResult, QueueState, ReceiveAttempt, SqsStore, DEFAULT_DELAY_SECONDS,
@@ -41,6 +42,7 @@ pub struct Ctx<'a> {
     pub request_id: &'a str,
     pub dispatcher: Option<Arc<InternalDispatcher>>,
     pub authorization: Option<String>,
+    pub metrics: Arc<MetricsRecorder>,
 }
 
 // ============================ request helpers ==================================
@@ -786,19 +788,7 @@ fn expire_messages(
 
 /// Build the full attribute map (stored + computed) for a queue.
 fn computed_attributes(q: &GuardedQueue, state: &QueueState) -> BTreeMap<String, String> {
-    let now = Instant::now();
-    let mut visible = 0u64;
-    let mut not_visible = 0u64;
-    let mut delayed = 0u64;
-    for m in &state.messages {
-        if m.is_visible(now) {
-            visible += 1;
-        } else if m.receipt_handle.is_some() {
-            not_visible += 1;
-        } else {
-            delayed += 1;
-        }
-    }
+    let (visible, not_visible, delayed) = message_counts(state, Instant::now());
     let mut attrs = state.attributes.clone();
     attrs.insert("QueueArn".into(), q.arn.to_arn());
     attrs.insert("ApproximateNumberOfMessages".into(), visible.to_string());
@@ -909,6 +899,10 @@ struct SendResult {
     sequence_number: Option<u128>,
     md5_body: String,
     md5_attributes: Option<String>,
+    /// Body plus message attribute bytes, reported as `SentMessageSize`.
+    size: usize,
+    /// False when FIFO deduplication returned an earlier message instead of adding one.
+    added: bool,
 }
 
 /// Parse a single send request (or a batch entry) into a `SendInput`.
@@ -1052,6 +1046,8 @@ fn enqueue(
                 sequence_number: Some(*original_sequence),
                 md5_body,
                 md5_attributes,
+                size: total,
+                added: false,
             });
         }
     }
@@ -1120,6 +1116,8 @@ fn enqueue(
         sequence_number,
         md5_body,
         md5_attributes,
+        size: total,
+        added: true,
     })
 }
 
@@ -1381,6 +1379,9 @@ pub async fn send_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let result = enqueue(&q, ctx.store.persistence(), &mut state, input, encrypted)?;
     drop(state);
     q.notify.notify_one();
+    if result.added {
+        ctx.metrics.record_sent(&q.arn, result.size);
+    }
     Ok(send_result_json(&result))
 }
 
@@ -1469,6 +1470,9 @@ pub async fn send_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsEr
             enqueue(&q, ctx.store.persistence(), &mut state, input, encrypted)
         }) {
             Ok(result) => {
+                if result.added {
+                    ctx.metrics.record_sent(&q.arn, result.size);
+                }
                 let mut success = send_result_json(&result);
                 success
                     .as_object_mut()
@@ -1814,6 +1818,7 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
                 let messages =
                     messages_json(ctx, &q.arn.to_arn(), &selected, &want_attr, &want_msg_attr)
                         .await?;
+                ctx.metrics.record_received(&q.arn, messages.len());
                 return Ok(json!({ "Messages": messages }));
             }
         }
@@ -1866,7 +1871,10 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
         };
         if !selected.is_empty() {
             match messages_json(ctx, &q.arn.to_arn(), &selected, &want_attr, &want_msg_attr).await {
-                Ok(messages) => return Ok(json!({ "Messages": messages })),
+                Ok(messages) => {
+                    ctx.metrics.record_received(&q.arn, messages.len());
+                    return Ok(json!({ "Messages": messages }));
+                }
                 Err(error) => {
                     let mut state = q.state.lock().await;
                     restore_selection(&mut state, &selected);
@@ -1888,6 +1896,7 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
         }
         let elapsed = start.elapsed().as_secs() as i64;
         if elapsed >= wait_secs {
+            ctx.metrics.record_received(&q.arn, 0);
             return Ok(json!({}));
         }
         let remaining = Duration::from_secs((wait_secs - elapsed) as u64);
@@ -1938,6 +1947,8 @@ pub async fn delete_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError>
     let handle = req_str(v, "ReceiptHandle")?;
     let mut state = q.state.lock().await;
     delete_by_handle(&q, ctx.store.persistence(), &mut state, handle)?;
+    drop(state);
+    ctx.metrics.record_deleted(&q.arn, 1);
     Ok(json!({}))
 }
 
@@ -1962,6 +1973,8 @@ pub async fn delete_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sqs
             None => failed.push(batch_error(&id, &SqsError::ReceiptHandleIsInvalid)),
         }
     }
+    drop(state);
+    ctx.metrics.record_deleted(&q.arn, successful.len());
     Ok(json!({ "Successful": successful, "Failed": failed }))
 }
 
@@ -2593,6 +2606,7 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
     let request_id = ctx.request_id.to_string();
     let dispatcher = ctx.dispatcher.clone();
     let authorization = ctx.authorization.clone();
+    let metrics = ctx.metrics.clone();
     tokio::spawn(async move {
         let _lifecycle = lifecycle;
         let worker_ctx = Ctx {
@@ -2602,6 +2616,7 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
             request_id: &request_id,
             dispatcher,
             authorization,
+            metrics,
         };
         let interval = Duration::from_secs_f64(1.0 / rate as f64);
         let mut retry_delay = Duration::from_millis(100);

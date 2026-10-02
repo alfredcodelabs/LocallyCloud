@@ -7,6 +7,7 @@
 
 pub mod error;
 pub mod md5;
+pub mod metrics;
 pub mod model;
 pub mod ops;
 mod persistence;

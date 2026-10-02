@@ -238,6 +238,15 @@ impl SqsStore {
         out
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.queues.is_empty()
+    }
+
+    /// Every queue across accounts and regions.
+    pub fn all(&self) -> Vec<Arc<GuardedQueue>> {
+        self.queues.iter().map(|e| e.value().clone()).collect()
+    }
+
     pub fn insert_move_task(&self, task: MoveTask) -> Result<(), SqsError> {
         if let Some(db) = self.persistence() {
             db.save_task(&task)?;
