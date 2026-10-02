@@ -4,12 +4,13 @@ use std::sync::RwLock;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::emf;
 use crate::error::LogsError;
 use crate::insights::{InsightsQuery, QueryPlan, QuerySnapshotEvent, QueryStatus};
 use crate::metric_filters::effects_for_events;
 use crate::model::{
-    GroupKey, LogClass, LogGroup, LogStream, MetricEffectStatus, MetricFilter, PagedEvent,
-    PendingLogEvent, PendingMetricEffect, PendingSubscriptionDelivery, PutEventsResult,
+    GroupKey, LogClass, LogGroup, LogStream, MetricEffectSource, MetricEffectStatus, MetricFilter,
+    PagedEvent, PendingLogEvent, PendingMetricEffect, PendingSubscriptionDelivery, PutEventsResult,
     RejectedEventIndexes, ScopeKey, StoredEvent, SubscriptionDeliveryStatus, SubscriptionFilter,
 };
 use crate::protocol::PUT_LOG_EVENTS_MAX_SPAN_MS;
@@ -300,7 +301,7 @@ impl LogsStore {
         group.revision = revision;
         state
             .metric_effects
-            .retain(|_, effect| &effect.group_key != key || effect.filter_name != filter_name);
+            .retain(|_, effect| &effect.group_key != key || !effect.source.is_filter(&filter_name));
         state
             .metric_default_minutes
             .retain(|(group_key, name, _, _)| group_key != key || name != &filter_name);
@@ -336,7 +337,7 @@ impl LogsStore {
         group.revision = revision;
         state
             .metric_effects
-            .retain(|_, effect| &effect.group_key != key || effect.filter_name != filter_name);
+            .retain(|_, effect| &effect.group_key != key || !effect.source.is_filter(filter_name));
         state
             .metric_default_minutes
             .retain(|(group_key, name, _, _)| group_key != key || name != filter_name);
@@ -475,12 +476,13 @@ impl LogsStore {
             .metric_effects
             .values()
             .filter(|effect| effect.status == MetricEffectStatus::Pending)
-            .filter(|effect| {
-                state
+            .filter(|effect| match &effect.source {
+                MetricEffectSource::Filter { name, revision } => state
                     .groups
                     .get(&effect.group_key)
-                    .and_then(|group| group.metric_filters.get(&effect.filter_name))
-                    .is_some_and(|filter| filter.revision == effect.filter_revision)
+                    .and_then(|group| group.metric_filters.get(name))
+                    .is_some_and(|filter| filter.revision == *revision),
+                MetricEffectSource::EmbeddedMetricFormat => true,
             })
             .take(limit)
             .cloned()
@@ -495,7 +497,14 @@ impl LogsStore {
             }
         } else {
             for id in ids {
-                if let Some(effect) = state.metric_effects.get_mut(id) {
+                let Some(effect) = state.metric_effects.get_mut(id) else {
+                    continue;
+                };
+                // EMF effects are never redelivered and nothing references them once failed,
+                // so retaining them would only grow memory with every undelivered EMF line.
+                if effect.source == MetricEffectSource::EmbeddedMetricFormat {
+                    state.metric_effects.remove(id);
+                } else {
                     effect.status = MetricEffectStatus::Failed;
                 }
             }
@@ -625,9 +634,11 @@ impl LogsStore {
                 })
             })
             .collect();
+        let embedded_observations = emf::observations_for_events(key, &accepted, now_ms);
         let final_effect_id = state
             .next_metric_effect_id
             .checked_add(metric_candidates.len() as u64)
+            .and_then(|id| id.checked_add(embedded_observations.len() as u64))
             .ok_or_else(|| {
                 LogsError::ServiceUnavailable(
                     "CloudWatch Logs metric effect id space is exhausted".into(),
@@ -668,6 +679,7 @@ impl LogsStore {
             .next_put_ordinals
             .insert(key.scope.clone(), put_ordinal);
         let first_effect_id = state.next_metric_effect_id;
+        let filter_effect_count = metric_candidates.len();
         for (offset, candidate) in metric_candidates.into_iter().enumerate() {
             let id = first_effect_id + offset as u64 + 1;
             if let Some(minute) = candidate.default_minute {
@@ -683,9 +695,25 @@ impl LogsStore {
                 PendingMetricEffect {
                     id,
                     group_key: key.clone(),
-                    filter_name: candidate.filter_name,
-                    filter_revision: candidate.filter_revision,
+                    source: MetricEffectSource::Filter {
+                        name: candidate.filter_name,
+                        revision: candidate.filter_revision,
+                    },
                     observation: candidate.observation,
+                    status: MetricEffectStatus::Pending,
+                },
+            );
+        }
+        let first_embedded_id = first_effect_id + filter_effect_count as u64;
+        for (offset, observation) in embedded_observations.into_iter().enumerate() {
+            let id = first_embedded_id + offset as u64 + 1;
+            state.metric_effects.insert(
+                id,
+                PendingMetricEffect {
+                    id,
+                    group_key: key.clone(),
+                    source: MetricEffectSource::EmbeddedMetricFormat,
+                    observation,
                     status: MetricEffectStatus::Pending,
                 },
             );
@@ -1242,5 +1270,56 @@ mod tests {
             Err(LogsError::ServiceUnavailable(_))
         ));
         assert_eq!(store.describe_groups(&scope, None).unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn failed_emf_effects_are_dropped_while_failed_filter_effects_are_kept() {
+        use localcloud_core::integration::metrics::{MetricObservation, MetricOrigin};
+        let key = GroupKey {
+            scope: ScopeKey::new("account", "region"),
+            name: "group".into(),
+        };
+        let effect = |id, source| PendingMetricEffect {
+            id,
+            group_key: key.clone(),
+            source,
+            observation: MetricObservation {
+                account_id: "account".into(),
+                region: "region".into(),
+                namespace: "App".into(),
+                metric_name: "m".into(),
+                dimensions: BTreeMap::new(),
+                timestamp_ms: 1,
+                value: 1.0,
+                unit: None,
+                storage_resolution: 60,
+                origin: MetricOrigin::CloudWatchLogs,
+                correlation_id: "c".into(),
+            },
+            status: MetricEffectStatus::Pending,
+        };
+        let store = LogsStore::default();
+        {
+            let mut state = store.state.write().unwrap();
+            state
+                .metric_effects
+                .insert(1, effect(1, MetricEffectSource::EmbeddedMetricFormat));
+            state.metric_effects.insert(
+                2,
+                effect(
+                    2,
+                    MetricEffectSource::Filter {
+                        name: "f".into(),
+                        revision: 1,
+                    },
+                ),
+            );
+        }
+
+        store.finish_metric_effects(&[1, 2], false).unwrap();
+
+        let state = store.state.read().unwrap();
+        assert!(!state.metric_effects.contains_key(&1));
+        assert_eq!(state.metric_effects[&2].status, MetricEffectStatus::Failed);
     }
 }

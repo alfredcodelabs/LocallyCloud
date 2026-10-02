@@ -1,6 +1,7 @@
 //! Fail-closed AWS CloudWatch Logs protocol entry point.
 
 mod clock;
+mod emf;
 mod error;
 mod events;
 mod groups;

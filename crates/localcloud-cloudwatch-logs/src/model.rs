@@ -95,10 +95,21 @@ pub struct MetricFilter {
 pub struct PendingMetricEffect {
     pub id: u64,
     pub group_key: GroupKey,
-    pub filter_name: String,
-    pub filter_revision: u64,
+    pub source: MetricEffectSource,
     pub observation: MetricObservation,
     pub status: MetricEffectStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricEffectSource {
+    Filter { name: String, revision: u64 },
+    EmbeddedMetricFormat,
+}
+
+impl MetricEffectSource {
+    pub fn is_filter(&self, filter_name: &str) -> bool {
+        matches!(self, Self::Filter { name, .. } if name == filter_name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
