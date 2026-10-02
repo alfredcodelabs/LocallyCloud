@@ -20,6 +20,8 @@ use localcloud_core::registry::{ServiceName, ServiceRegistry};
 use crate::error::CfnError;
 use crate::template::{ResolvedResource, ResourcePolicy};
 
+mod ec2;
+
 /// How an update that changes a resource's physical identity must handle the old instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replacement {
@@ -57,6 +59,12 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::Lambda::Version",
     "AWS::Lambda::Permission",
     "AWS::Lambda::EventSourceMapping",
+    "AWS::EC2::VPC",
+    "AWS::EC2::Subnet",
+    "AWS::EC2::SecurityGroup",
+    "AWS::EC2::RouteTable",
+    "AWS::EC2::SubnetRouteTableAssociation",
+    "AWS::EC2::VPCEndpoint",
     "AWS::ApiGateway::RestApi",
     "AWS::ApiGateway::Resource",
     "AWS::ApiGateway::Method",
@@ -142,6 +150,17 @@ impl Provisioner {
                 self.lambda_event_source_mapping(logical_id, properties)
                     .await
             }
+            "AWS::EC2::VPC" => self.ec2_vpc(logical_id, properties).await,
+            "AWS::EC2::Subnet" => self.ec2_subnet(logical_id, properties).await,
+            "AWS::EC2::SecurityGroup" => {
+                self.ec2_security_group(logical_id, stack_name, properties)
+                    .await
+            }
+            "AWS::EC2::RouteTable" => self.ec2_route_table(logical_id, properties).await,
+            "AWS::EC2::SubnetRouteTableAssociation" => {
+                self.ec2_route_association(logical_id, properties).await
+            }
+            "AWS::EC2::VPCEndpoint" => self.ec2_vpc_endpoint(logical_id, properties).await,
             "AWS::ApiGateway::RestApi" => self.apigateway_rest_api(logical_id, properties).await,
             "AWS::ApiGateway::Resource" => self.apigateway_resource(logical_id, properties).await,
             "AWS::ApiGateway::Method" => self.apigateway_method(logical_id, properties).await,
@@ -548,6 +567,27 @@ impl Provisioner {
             "AWS::Lambda::Permission" => self.delete_lambda_permission(physical_id).await,
             "AWS::Lambda::EventSourceMapping" => {
                 self.delete_lambda_event_source_mapping(physical_id).await
+            }
+            "AWS::EC2::VPC" => self.delete_ec2("DeleteVpc", "VpcId", physical_id).await,
+            "AWS::EC2::Subnet" => {
+                self.delete_ec2("DeleteSubnet", "SubnetId", physical_id)
+                    .await
+            }
+            "AWS::EC2::SecurityGroup" => {
+                self.delete_ec2("DeleteSecurityGroup", "GroupId", physical_id)
+                    .await
+            }
+            "AWS::EC2::RouteTable" => {
+                self.delete_ec2("DeleteRouteTable", "RouteTableId", physical_id)
+                    .await
+            }
+            "AWS::EC2::SubnetRouteTableAssociation" => {
+                self.delete_ec2("DisassociateRouteTable", "AssociationId", physical_id)
+                    .await
+            }
+            "AWS::EC2::VPCEndpoint" => {
+                self.delete_ec2("DeleteVpcEndpoints", "VpcEndpointId.1", physical_id)
+                    .await
             }
             "AWS::ApiGateway::RestApi" => self.delete_apigateway_rest_api(physical_id).await,
             "AWS::ApiGateway::Resource" => {
@@ -3129,6 +3169,9 @@ impl Provisioner {
         if let Some(env) = props.get("Environment") {
             obj.insert("Environment".into(), env.clone());
         }
+        if let Some(vpc) = props.get("VpcConfig") {
+            obj.insert("VpcConfig".into(), vpc.clone());
+        }
 
         let (status, resp) = self
             .call(
@@ -3189,6 +3232,7 @@ impl Provisioner {
                 ("Role", "Role"),
                 ("Description", "Description"),
                 ("Environment", "Environment"),
+                ("VpcConfig", "VpcConfig"),
             ],
         );
         if let Some(memory) = props.get("MemorySize") {
