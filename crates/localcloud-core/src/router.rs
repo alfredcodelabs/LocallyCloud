@@ -110,6 +110,12 @@ pub fn resolve(
             return Ok(decide(registry, name, ResolutionSource::HostPath));
         }
     }
+    if lambda_control_plane_path(input.path) {
+        let name = ServiceName::new("lambda");
+        if registry.lookup(&name).is_some() {
+            return Ok(decide(registry, name, ResolutionSource::RestJsonPath));
+        }
+    }
     if cognito_public_region(input.path).is_some() {
         let name = ServiceName::new("cognito-idp");
         if registry.lookup(&name).is_some() {
@@ -269,6 +275,26 @@ fn resolve_execute_api_from_host(host: Option<&str>) -> Option<ServiceName> {
     } else {
         None
     }
+}
+
+/// The unsigned Lambda path fallback exists for read-only callers such as the dashboard. Any
+/// web page can send simple cross-site POSTs to localhost, so mutating methods (CreateFunction,
+/// Invoke, …) keep requiring a credential scope.
+pub fn permits_method(decision: &RoutingDecision, method: &http::Method) -> bool {
+    let unsigned_lambda = decision.resolution_source == ResolutionSource::RestJsonPath
+        && decision.service_name.as_str() == "lambda";
+    !unsigned_lambda || matches!(*method, http::Method::GET | http::Method::HEAD)
+}
+
+/// Lambda's REST control plane (`/2015-03-31/functions…`, `/2015-03-31/event-source-mappings…`)
+/// for unsigned callers such as the built-in dashboard. Signed requests resolve by scope first.
+fn lambda_control_plane_path(path: &str) -> bool {
+    ["/2015-03-31/functions", "/2015-03-31/event-source-mappings"]
+        .iter()
+        .any(|prefix| {
+            path.strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
 }
 
 /// Local CloudFront viewer domain. Distribution ownership is checked by the Native handler.
@@ -445,6 +471,68 @@ mod tests {
         assert_eq!(
             cognito_public_region("/us-east-1_ok/.well-known/other"),
             None
+        );
+    }
+
+    #[test]
+    fn unsigned_lambda_control_plane_routes_by_path() {
+        let reg = ServiceRegistry::with_known_services();
+        reg.register_native(
+            ServiceName::new("lambda"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            Arc::new(TestHandler),
+        );
+        for path in [
+            "/2015-03-31/functions",
+            "/2015-03-31/functions/",
+            "/2015-03-31/functions/demo/configuration",
+            "/2015-03-31/event-source-mappings/",
+        ] {
+            let input = RouteInput {
+                authorization: None,
+                x_amz_credential: None,
+                x_amz_target: None,
+                host: Some("localhost:4566"),
+                path,
+                body: b"",
+            };
+            let decision = resolve(&reg, &input).unwrap();
+            assert_eq!(decision.service_name, ServiceName::new("lambda"), "{path}");
+            assert_eq!(decision.resolution_source, ResolutionSource::RestJsonPath);
+        }
+        let unsigned = resolve(
+            &reg,
+            &RouteInput {
+                authorization: None,
+                x_amz_credential: None,
+                x_amz_target: None,
+                host: Some("localhost:4566"),
+                path: "/2015-03-31/functions/demo/invocations",
+                body: b"",
+            },
+        )
+        .unwrap();
+        assert!(permits_method(&unsigned, &http::Method::GET));
+        assert!(permits_method(&unsigned, &http::Method::HEAD));
+        assert!(!permits_method(&unsigned, &http::Method::POST));
+        assert!(!permits_method(&unsigned, &http::Method::PUT));
+        assert!(!permits_method(&unsigned, &http::Method::DELETE));
+        assert!(!lambda_control_plane_path("/2015-03-31/functionsx"));
+        assert!(!lambda_control_plane_path("/2015-03-31/"));
+        // A signed request keeps its credential scope even on a Lambda-looking path.
+        let signed = RouteInput {
+            authorization: Some(
+                "AWS4-HMAC-SHA256 Credential=AKID/20250101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=x",
+            ),
+            x_amz_credential: None,
+            x_amz_target: None,
+            host: Some("localhost:4566"),
+            path: "/2015-03-31/functions",
+            body: b"",
+        };
+        assert_eq!(
+            resolve(&reg, &signed).unwrap().service_name,
+            ServiceName::new("s3")
         );
     }
 

@@ -465,7 +465,10 @@ impl InternalDispatcher {
                 .with_request_id(request_id.to_string());
             return render(err.render(AwsProtocol::RestJson));
         };
-        let Ok(decision) = resolve(&registry, &input) else {
+        let Some(decision) = resolve(&registry, &input)
+            .ok()
+            .filter(|decision| crate::router::permits_method(decision, method))
+        else {
             tracing::warn!(request_id, path = %path, "unresolved request");
             let err = AwsError::new(
                 "InvalidRequest",
