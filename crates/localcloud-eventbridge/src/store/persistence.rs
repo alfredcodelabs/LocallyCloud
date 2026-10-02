@@ -1,5 +1,5 @@
 use super::*;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
@@ -364,7 +364,7 @@ impl EbStore {
             tokio::task::spawn_blocking(move || {
                 let mut connection = db.connection().map_err(|error| error.to_string())?;
                 let transaction = connection
-                    .transaction()
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| error.to_string())?;
                 let old: Option<Vec<u8>> = transaction.query_row(
                     "SELECT payload FROM events_scheduler WHERE account=?1 AND region=?2",
@@ -669,7 +669,7 @@ impl EbStore {
             tokio::task::spawn_blocking(move || {
                 let mut connection = db.connection().map_err(|error| error.to_string())?;
                 let transaction = connection
-                    .transaction()
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| error.to_string())?;
                 let old: Option<Vec<u8>> = transaction.query_row(
                     "SELECT payload FROM events_buses WHERE account=?1 AND region=?2",

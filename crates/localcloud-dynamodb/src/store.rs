@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use localcloud_state::StateDb;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
@@ -627,7 +627,9 @@ impl TableStore {
             locked.push((account, region, table.write().await));
         }
         let mut connection = state.connection().map_err(persist_error)?;
-        let transaction = connection.transaction().map_err(persist_error)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(persist_error)?;
         let mut present = std::collections::BTreeSet::new();
         for (account, region, table) in &locked {
             let name = &table.def.name;
