@@ -12,6 +12,7 @@
 //! Runtime-footprint principle: the runtime binary is resolved lazily (explicit path or
 //! [`YoukiRuntime::discover`] on `PATH`); nothing is installed eagerly.
 
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -353,6 +354,220 @@ impl YoukiRuntime {
         guest_port: u16,
         timeout: Duration,
     ) -> Result<tokio::net::TcpStream, RuntimeError> {
+        let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
+        let stream = tokio::task::spawn_blocking(move || {
+            crate::netns_socket::connect(user_ns, net_ns, guest_port, timeout)
+        })
+        .await
+        .map_err(|e| exec_failed(format!("OCI connector worker failed: {e}")))?
+        .map_err(|e| exec_failed(format!("connecting to isolated OCI service: {e}")))?;
+        tokio::net::TcpStream::from_std(stream)
+            .map_err(|e| exec_failed(format!("adopting OCI TCP socket: {e}")))
+    }
+
+    /// Bind a TCP listener on isolated guest loopback without exposing a host port.
+    /// The returned listener can be serviced by the host's Tokio runtime.
+    pub async fn bind_isolated_tcp(
+        &self,
+        task_id: &str,
+        guest_port: u16,
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        if guest_port == 0 {
+            return Err(exec_failed("guest TCP port must be nonzero"));
+        }
+        let (user_ns, net_ns) = self.isolated_namespace_files(task_id, true).await?;
+        let listener = tokio::task::spawn_blocking(move || {
+            crate::netns_socket::bind_listener(
+                user_ns,
+                net_ns,
+                std::net::Ipv4Addr::LOCALHOST,
+                guest_port,
+            )
+        })
+        .await
+        .map_err(|e| exec_failed(format!("OCI listener worker failed: {e}")))?
+        .map_err(|e| exec_failed(format!("binding isolated OCI listener: {e}")))?;
+        tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| exec_failed(format!("adopting OCI TCP listener: {e}")))
+    }
+
+    /// Bind a private IPv4 address in the guest netns while retaining the accepted
+    /// socket in the host process. The address is assigned only to guest loopback.
+    pub async fn bind_isolated_private_tcp(
+        &self,
+        task_id: &str,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        if port == 0 || address.is_loopback() || address.is_unspecified() {
+            return Err(exec_failed(
+                "private guest listener needs a non-loopback IPv4 address and port",
+            ));
+        }
+        let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
+        let listener = tokio::task::spawn_blocking(move || {
+            crate::netns_socket::bind_listener(user_ns, net_ns, address, port)
+        })
+        .await
+        .map_err(|e| exec_failed(format!("private listener worker failed: {e}")))?
+        .map_err(|e| exec_failed(format!("binding private OCI listener: {e}")))?;
+        tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| exec_failed(format!("adopting private OCI listener: {e}")))
+    }
+
+    pub async fn bind_isolated_dns(
+        &self,
+        task_id: &str,
+    ) -> Result<(tokio::net::UdpSocket, tokio::net::TcpListener), RuntimeError> {
+        let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
+        let tcp_user = user_ns
+            .try_clone()
+            .map_err(|e| exec_failed(e.to_string()))?;
+        let tcp_net = net_ns.try_clone().map_err(|e| exec_failed(e.to_string()))?;
+        let address = std::net::Ipv4Addr::new(169, 254, 169, 253);
+        let udp = tokio::task::spawn_blocking(move || {
+            crate::netns_socket::bind_udp(user_ns, net_ns, address, 53)
+        })
+        .await
+        .map_err(|e| exec_failed(format!("OCI DNS UDP worker failed: {e}")))?
+        .map_err(|e| exec_failed(format!("binding isolated OCI DNS UDP: {e}")))?;
+        let tcp = tokio::task::spawn_blocking(move || {
+            crate::netns_socket::bind_listener(tcp_user, tcp_net, address, 53)
+        })
+        .await
+        .map_err(|e| exec_failed(format!("OCI DNS TCP worker failed: {e}")))?
+        .map_err(|e| exec_failed(format!("binding isolated OCI DNS TCP: {e}")))?;
+        Ok((
+            tokio::net::UdpSocket::from_std(udp)
+                .map_err(|e| exec_failed(format!("adopting isolated OCI DNS UDP: {e}")))?,
+            tokio::net::TcpListener::from_std(tcp)
+                .map_err(|e| exec_failed(format!("adopting isolated OCI DNS TCP: {e}")))?,
+        ))
+    }
+
+    pub async fn bind_isolated_public_egress(
+        &self,
+        task_id: &str,
+        private_addresses: &[std::net::Ipv4Addr],
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        const EGRESS_PORT: u16 = 49152;
+        let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
+        let user_for_tcp = user_ns
+            .try_clone()
+            .map_err(|e| exec_failed(e.to_string()))?;
+        let net_for_tcp = net_ns.try_clone().map_err(|e| exec_failed(e.to_string()))?;
+        let tcp = tokio::task::spawn_blocking(move || {
+            crate::netns_socket::bind_listener(
+                user_for_tcp,
+                net_for_tcp,
+                std::net::Ipv4Addr::LOCALHOST,
+                EGRESS_PORT,
+            )
+        })
+        .await
+        .map_err(|e| exec_failed(format!("public listener worker failed: {e}")))?
+        .map_err(|e| exec_failed(format!("binding public OCI listener: {e}")))?;
+        let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
+        let excluded = private_addresses.to_vec();
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::process::CommandExt;
+            fn run(
+                user_ns: &std::fs::File,
+                net_ns: &std::fs::File,
+                program: &str,
+                args: &[&str],
+            ) -> std::io::Result<()> {
+                let mut command = std::process::Command::new(program);
+                command.args(args);
+                let user_fd = user_ns.as_raw_fd();
+                let net_fd = net_ns.as_raw_fd();
+                // SAFETY: pre_exec invokes only async-signal-safe setns calls.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::setns(user_fd, libc::CLONE_NEWUSER) != 0
+                            || libc::setns(net_fd, libc::CLONE_NEWNET) != 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let output = command.output()?;
+                if !output.status.success() {
+                    return Err(std::io::Error::other(format!(
+                        "{program}: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+                Ok(())
+            }
+            run(
+                &user_ns,
+                &net_ns,
+                "nft",
+                &["add", "table", "ip", "localcloud"],
+            )?;
+            run(
+                &user_ns,
+                &net_ns,
+                "nft",
+                &[
+                    "add",
+                    "chain",
+                    "ip",
+                    "localcloud",
+                    "output",
+                    "{ type nat hook output priority dstnat; policy accept; }",
+                ],
+            )?;
+            let mut excluded = excluded.iter().map(ToString::to_string).collect::<Vec<_>>();
+            excluded.extend(
+                [
+                    "127.0.0.0/8",
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "169.254.0.0/16",
+                    "100.64.0.0/10",
+                ]
+                .map(str::to_owned),
+            );
+            let rule = format!(
+                "ip daddr != {{ {} }} meta l4proto tcp redirect to :{EGRESS_PORT}",
+                excluded.join(", ")
+            );
+            run(
+                &user_ns,
+                &net_ns,
+                "nft",
+                &["add", "rule", "ip", "localcloud", "output", &rule],
+            )?;
+            run(
+                &user_ns,
+                &net_ns,
+                "ip",
+                &[
+                    "route", "add", "local", "default", "dev", "lo", "table", "local",
+                ],
+            )
+        })
+        .await
+        .map_err(|e| exec_failed(format!("public egress setup worker failed: {e}")))?
+        .map_err(|e| {
+            exec_failed(format!(
+                "isolated public egress requires rootless ip and nft: {e}"
+            ))
+        })?;
+        let tcp = tokio::net::TcpListener::from_std(tcp)
+            .map_err(|e| exec_failed(format!("adopting public OCI listener: {e}")))?;
+        Ok(tcp)
+    }
+
+    async fn isolated_namespace_files(
+        &self,
+        task_id: &str,
+        allow_created: bool,
+    ) -> Result<(std::fs::File, std::fs::File), RuntimeError> {
         let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
             RuntimeError::TaskNotFound {
                 task_id: task_id.to_string(),
@@ -375,7 +590,8 @@ impl YoukiRuntime {
             .map_err(|e| exec_failed(format!("parsing OCI service state: {e}")))?;
         if state["id"].as_str() != Some(task_id)
             || state["bundle"].as_str() != expected_bundle.to_str()
-            || state["status"].as_str() != Some("running")
+            || !(state["status"].as_str() == Some("running")
+                || allow_created && state["status"].as_str() == Some("created"))
         {
             return Err(exec_failed("OCI service state does not match running task"));
         }
@@ -387,14 +603,7 @@ impl YoukiRuntime {
             .map_err(|e| exec_failed(format!("opening OCI user namespace: {e}")))?;
         let net_ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
             .map_err(|e| exec_failed(format!("opening OCI network namespace: {e}")))?;
-        let stream = tokio::task::spawn_blocking(move || {
-            crate::netns_socket::connect(user_ns, net_ns, guest_port, timeout)
-        })
-        .await
-        .map_err(|e| exec_failed(format!("OCI connector worker failed: {e}")))?
-        .map_err(|e| exec_failed(format!("connecting to isolated OCI service: {e}")))?;
-        tokio::net::TcpStream::from_std(stream)
-            .map_err(|e| exec_failed(format!("adopting OCI TCP socket: {e}")))
+        Ok((user_ns, net_ns))
     }
 }
 
@@ -402,6 +611,68 @@ impl YoukiRuntime {
 impl ComputeRuntime for YoukiRuntime {
     async fn start_task(&self, task_id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
         self.start_task_with_network(task_id, spec, false).await
+    }
+
+    async fn start_task_isolated_with_loopback(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+        ports: &[u16],
+    ) -> Result<(TaskHandle, Vec<tokio::net::TcpListener>), RuntimeError> {
+        if ports.is_empty() {
+            return Err(exec_failed(
+                "isolated task requires at least one loopback listener",
+            ));
+        }
+        let handle = self.start_task_with_network(task_id, spec, true).await?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut listeners = Vec::with_capacity(ports.len());
+        for &port in ports {
+            loop {
+                match self.bind_isolated_tcp(task_id, port).await {
+                    Ok(listener) => {
+                        listeners.push(listener);
+                        break;
+                    }
+                    Err(error)
+                        if Instant::now() < deadline
+                            && self.task_state(task_id).await? == TaskState::Running =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        tracing::trace!(%error, "waiting for OCI guest namespace");
+                    }
+                    Err(error) => {
+                        let _ = self.stop_task(task_id).await;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok((handle, listeners))
+    }
+
+    async fn bind_isolated_private_tcp(
+        &self,
+        task_id: &str,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        YoukiRuntime::bind_isolated_private_tcp(self, task_id, address, port).await
+    }
+
+    async fn bind_isolated_public_egress(
+        &self,
+        task_id: &str,
+        private_addresses: &[std::net::Ipv4Addr],
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        YoukiRuntime::bind_isolated_public_egress(self, task_id, private_addresses).await
+    }
+
+    async fn bind_isolated_dns(
+        &self,
+        task_id: &str,
+    ) -> Result<(tokio::net::UdpSocket, tokio::net::TcpListener), RuntimeError> {
+        YoukiRuntime::bind_isolated_dns(self, task_id).await
     }
 
     async fn stop_task(&self, task_id: &str) -> Result<TaskHandle, RuntimeError> {

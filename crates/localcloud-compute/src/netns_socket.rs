@@ -4,6 +4,7 @@
 //! the connected descriptor through SCM_RIGHTS.
 use std::io;
 use std::mem::{size_of, zeroed};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -68,6 +69,279 @@ pub(crate) fn connect(
     let stream = std::net::TcpStream::from(fd);
     stream.set_nonblocking(true)?;
     Ok(stream)
+}
+
+/// Bind a loopback listener in a task's network namespace and pass its socket
+/// back to the host. Accepted sockets retain the namespace's network identity.
+pub(crate) fn bind_listener(
+    user_ns: std::fs::File,
+    net_ns: std::fs::File,
+    address: Ipv4Addr,
+    port: u16,
+) -> io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::from(bind_socket(
+        user_ns,
+        net_ns,
+        address,
+        port,
+        libc::SOCK_STREAM,
+    )?);
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+pub(crate) fn bind_udp(
+    user_ns: std::fs::File,
+    net_ns: std::fs::File,
+    address: Ipv4Addr,
+    port: u16,
+) -> io::Result<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::from(bind_socket(
+        user_ns,
+        net_ns,
+        address,
+        port,
+        libc::SOCK_DGRAM,
+    )?);
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+fn bind_socket(
+    user_ns: std::fs::File,
+    net_ns: std::fs::File,
+    address: Ipv4Addr,
+    port: u16,
+    socket_type: i32,
+) -> io::Result<OwnedFd> {
+    let mut pair = [-1; 2];
+    // SAFETY: pair points to storage for two descriptors.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: socketpair returned two owned descriptors.
+    let parent = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+    let child = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+    // SAFETY: child performs only libc calls and exits without unwinding.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        let status = unsafe {
+            bind_child_main(
+                parent.as_raw_fd(),
+                child.as_raw_fd(),
+                user_ns.as_raw_fd(),
+                net_ns.as_raw_fd(),
+                address,
+                port,
+                socket_type,
+            )
+        };
+        // SAFETY: don't run inherited Tokio state in the forked child.
+        unsafe { libc::_exit(status) };
+    }
+    drop(child);
+    let received = receive_fd(parent.as_raw_fd()).map(|fd| {
+        // SAFETY: SCM_RIGHTS delivered one owned descriptor.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    });
+    let mut status = 0;
+    loop {
+        // SAFETY: pid is our child; status has valid storage.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } >= 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    received
+}
+
+unsafe fn bind_child_main(
+    parent: i32,
+    channel: i32,
+    user_ns: i32,
+    net_ns: i32,
+    address: Ipv4Addr,
+    port: u16,
+    socket_type: i32,
+) -> i32 {
+    libc::close(parent);
+    if !close_inherited_fds(channel, user_ns, net_ns) {
+        send_error(channel, 8);
+        return 8;
+    }
+    if libc::setns(user_ns, libc::CLONE_NEWUSER) != 0 {
+        send_error(channel, 1);
+        return 1;
+    }
+    if libc::setns(net_ns, libc::CLONE_NEWNET) != 0 {
+        send_error(channel, 2);
+        return 2;
+    }
+    if address != Ipv4Addr::LOCALHOST && !add_loopback_address(address) {
+        send_error(channel, 11);
+        return 11;
+    }
+    let socket = libc::socket(libc::AF_INET, socket_type | libc::SOCK_CLOEXEC, 0);
+    if socket < 0 {
+        send_error(channel, 3);
+        return 3;
+    }
+    let one: i32 = 1;
+    if libc::setsockopt(
+        socket,
+        libc::SOL_SOCKET,
+        libc::SO_REUSEADDR,
+        (&one as *const i32).cast(),
+        size_of::<i32>() as u32,
+    ) != 0
+    {
+        send_error(channel, 9);
+        libc::close(socket);
+        return 9;
+    }
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(address.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    if libc::bind(
+        socket,
+        (&address as *const libc::sockaddr_in).cast(),
+        size_of::<libc::sockaddr_in>() as u32,
+    ) != 0
+        || (socket_type == libc::SOCK_STREAM && libc::listen(socket, 128) != 0)
+    {
+        send_error(channel, 10);
+        libc::close(socket);
+        return 10;
+    }
+    let sent = send_fd(channel, socket);
+    libc::close(socket);
+    if sent {
+        0
+    } else {
+        7
+    }
+}
+
+#[repr(C)]
+struct IfAddrMessage {
+    family: u8,
+    prefix_len: u8,
+    flags: u8,
+    scope: u8,
+    index: u32,
+}
+
+#[repr(C)]
+struct RouteAttribute {
+    len: u16,
+    kind: u16,
+}
+
+#[repr(C)]
+struct AddAddress {
+    header: libc::nlmsghdr,
+    body: IfAddrMessage,
+    attr: RouteAttribute,
+    address: [u8; 4],
+}
+
+/// Add a /32 alias to loopback in the already-entered guest namespace.
+/// Netlink avoids a dependency on `ip` or a shell inside the OCI guest.
+unsafe fn add_loopback_address(address: Ipv4Addr) -> bool {
+    let index = libc::if_nametoindex(c"lo".as_ptr());
+    if index == 0 {
+        return false;
+    }
+    let fd = libc::socket(
+        libc::AF_NETLINK,
+        libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+        libc::NETLINK_ROUTE,
+    );
+    if fd < 0 {
+        return false;
+    }
+    let timeout = libc::timeval {
+        tv_sec: 2,
+        tv_usec: 0,
+    };
+    if libc::setsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_RCVTIMEO,
+        (&timeout as *const libc::timeval).cast(),
+        size_of::<libc::timeval>() as u32,
+    ) != 0
+    {
+        libc::close(fd);
+        return false;
+    }
+    let request = AddAddress {
+        header: libc::nlmsghdr {
+            nlmsg_len: size_of::<AddAddress>() as u32,
+            nlmsg_type: libc::RTM_NEWADDR,
+            nlmsg_flags: (libc::NLM_F_REQUEST
+                | libc::NLM_F_ACK
+                | libc::NLM_F_CREATE
+                | libc::NLM_F_EXCL) as u16,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        },
+        body: IfAddrMessage {
+            family: libc::AF_INET as u8,
+            prefix_len: 32,
+            flags: 0,
+            scope: 0,
+            index,
+        },
+        attr: RouteAttribute {
+            len: (size_of::<RouteAttribute>() + 4) as u16,
+            kind: 2, // IFA_LOCAL
+        },
+        address: address.octets(),
+    };
+    let mut kernel: libc::sockaddr_nl = zeroed();
+    kernel.nl_family = libc::AF_NETLINK as u16;
+    let sent = libc::sendto(
+        fd,
+        (&request as *const AddAddress).cast(),
+        size_of::<AddAddress>(),
+        0,
+        (&kernel as *const libc::sockaddr_nl).cast(),
+        size_of::<libc::sockaddr_nl>() as u32,
+    );
+    let mut reply = [0u8; 256];
+    let received = if sent == size_of::<AddAddress>() as isize {
+        libc::recv(fd, reply.as_mut_ptr().cast(), reply.len(), 0)
+    } else {
+        -1
+    };
+    libc::close(fd);
+    if received < (size_of::<libc::nlmsghdr>() + size_of::<i32>()) as isize {
+        return false;
+    }
+    let header = std::ptr::read_unaligned(reply.as_ptr().cast::<libc::nlmsghdr>());
+    let error =
+        std::ptr::read_unaligned(reply[size_of::<libc::nlmsghdr>()..].as_ptr().cast::<i32>());
+    header.nlmsg_type == libc::NLMSG_ERROR as u16 && (error == 0 || error == -libc::EEXIST)
 }
 
 unsafe fn child_main(

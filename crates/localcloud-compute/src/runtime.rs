@@ -64,6 +64,54 @@ pub trait ComputeRuntime: Send + Sync {
     /// Start a task. On success the returned handle is in [`TaskState::Running`].
     async fn start_task(&self, task_id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError>;
 
+    /// Start a network-isolated task after binding guest-loopback listeners.
+    /// Unsupported backends fail closed; callers operate the returned listeners
+    /// as the only explicitly allowed paths back to host services.
+    async fn start_task_isolated_with_loopback(
+        &self,
+        _task_id: &str,
+        _spec: &TaskSpec,
+        _ports: &[u16],
+    ) -> Result<(TaskHandle, Vec<tokio::net::TcpListener>), RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "isolated task loopback is unavailable for this backend".into(),
+        })
+    }
+
+    /// Add a private IPv4 listener inside an already-running isolated task.
+    async fn bind_isolated_private_tcp(
+        &self,
+        _task_id: &str,
+        _address: std::net::Ipv4Addr,
+        _port: u16,
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "private TCP is unavailable for this backend".into(),
+        })
+    }
+
+    /// Capture outbound IPv4 TCP in a rootless network namespace.
+    /// The caller must check each original destination before forwarding.
+    async fn bind_isolated_public_egress(
+        &self,
+        _task_id: &str,
+        _private_addresses: &[std::net::Ipv4Addr],
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "isolated public egress is unavailable for this backend".into(),
+        })
+    }
+
+    /// Bind AmazonProvidedDNS in the isolated guest; host code answers only DNS packets.
+    async fn bind_isolated_dns(
+        &self,
+        _task_id: &str,
+    ) -> Result<(tokio::net::UdpSocket, tokio::net::TcpListener), RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "isolated DNS is unavailable for this backend".into(),
+        })
+    }
+
     /// Stop a running task. Returns [`RuntimeError::TaskNotFound`] for an identifier that
     /// was never started and [`RuntimeError::TaskAlreadyCompleted`] for one that already
     /// finished naturally (Req 13.4, 13.5).
