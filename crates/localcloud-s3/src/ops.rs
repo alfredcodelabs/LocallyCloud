@@ -276,6 +276,17 @@ fn parse_xml(body: &[u8]) -> Result<XmlNode, S3Error> {
                 }
                 None
             }
+            Ok(Event::GeneralRef(reference)) => {
+                let encoded = format!("&{};", reference.as_ref());
+                let value =
+                    quick_xml::escape::unescape(&encoded).map_err(|_| S3Error::MalformedXML)?;
+                if let Some(node) = stack.last_mut() {
+                    node.text.push_str(&value);
+                } else {
+                    return Err(S3Error::MalformedXML);
+                }
+                None
+            }
             Ok(Event::End(element)) => {
                 let node = stack.pop().ok_or(S3Error::MalformedXML)?;
                 if node.name != element.local_name().as_ref() {
@@ -2900,119 +2911,55 @@ pub async fn upload_part_copy(
     .expect("upload part copy response is valid"))
 }
 
-fn parse_complete_parts(body: &[u8]) -> Result<Vec<(u16, String)>, S3Error> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
+type CompletionPart = (u16, String, BTreeMap<ChecksumAlgorithm, String>);
 
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    let mut depth = 0;
-    let mut root_seen = false;
-    let mut root_closed = false;
-    let mut in_part = false;
-    let mut field = None;
-    let mut number_seen = false;
-    let mut etag_seen = false;
-    let mut number = None;
-    let mut part_etag = None;
-    let mut parts = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(event)) => {
-                if root_closed {
-                    return Err(S3Error::MalformedXML);
-                }
-                match depth {
-                    0 if !root_seen && event.local_name().as_ref() == "CompleteMultipartUpload" => {
-                        root_seen = true;
-                    }
-                    1 if event.local_name().as_ref() == "Part" => {
-                        in_part = true;
-                        number_seen = false;
-                        etag_seen = false;
-                        number = None;
-                        part_etag = None;
-                    }
-                    2 if in_part && event.local_name().as_ref() == "PartNumber" => {
-                        if number_seen {
-                            return Err(S3Error::MalformedXML);
-                        }
-                        number_seen = true;
-                        field = Some(0);
-                    }
-                    2 if in_part && event.local_name().as_ref() == "ETag" => {
-                        if etag_seen {
-                            return Err(S3Error::MalformedXML);
-                        }
-                        etag_seen = true;
-                        field = Some(1);
-                    }
-                    _ => return Err(S3Error::MalformedXML),
-                }
-                depth += 1;
-            }
-            Ok(Event::Text(text)) => {
-                let text = quick_xml::escape::unescape(text.as_ref())
-                    .map_err(|_| S3Error::MalformedXML)?;
-                if text.is_empty() {
-                    buf.clear();
-                    continue;
-                }
-                if depth != 3 {
-                    return Err(S3Error::MalformedXML);
-                }
-                match field {
-                    Some(0) if number.is_none() => {
-                        number = Some(text.parse::<u16>().map_err(|_| S3Error::MalformedXML)?);
-                    }
-                    Some(1) => part_etag.get_or_insert_with(String::new).push_str(&text),
-                    _ => return Err(S3Error::MalformedXML),
-                }
-            }
-            Ok(Event::GeneralRef(reference)) => {
-                if depth != 3 || field != Some(1) {
-                    return Err(S3Error::MalformedXML);
-                }
-                let encoded = format!("&{};", reference.as_ref());
-                let value =
-                    quick_xml::escape::unescape(&encoded).map_err(|_| S3Error::MalformedXML)?;
-                part_etag.get_or_insert_with(String::new).push_str(&value);
-            }
-            Ok(Event::End(event)) => {
-                match depth {
-                    3 if field == Some(0) && event.local_name().as_ref() == "PartNumber" => {
-                        field = None;
-                    }
-                    3 if field == Some(1) && event.local_name().as_ref() == "ETag" => {
-                        field = None;
-                    }
-                    2 if in_part && event.local_name().as_ref() == "Part" => {
-                        if !number_seen || !etag_seen {
-                            return Err(S3Error::MalformedXML);
-                        }
-                        parts.push((
-                            number.take().ok_or(S3Error::MalformedXML)?,
-                            part_etag.take().ok_or(S3Error::MalformedXML)?,
-                        ));
-                        in_part = false;
-                    }
-                    1 if root_seen && event.local_name().as_ref() == "CompleteMultipartUpload" => {
-                        root_closed = true;
-                    }
-                    _ => return Err(S3Error::MalformedXML),
-                }
-                depth -= 1;
-            }
-            Ok(Event::Empty(_)) => return Err(S3Error::MalformedXML),
-            Ok(Event::Eof) => break,
-            Err(_) => return Err(S3Error::MalformedXML),
-            _ => {}
-        }
-        buf.clear();
-    }
-    if !root_seen || !root_closed || depth != 0 || parts.is_empty() {
+fn parse_complete_parts(body: &[u8]) -> Result<Vec<CompletionPart>, S3Error> {
+    let root = parse_xml(body)?;
+    if root.name != "CompleteMultipartUpload" || !root.text.is_empty() || root.children.is_empty() {
         return Err(S3Error::MalformedXML);
+    }
+    let mut parts = Vec::with_capacity(root.children.len());
+    for part in root.children {
+        if part.name != "Part" || !part.text.is_empty() {
+            return Err(S3Error::MalformedXML);
+        }
+        let mut number = None;
+        let mut etag = None;
+        let mut checksums = BTreeMap::new();
+        for field in part.children {
+            if !field.children.is_empty() || field.text.is_empty() {
+                return Err(S3Error::MalformedXML);
+            }
+            match field.name.as_str() {
+                "PartNumber" if number.is_none() => {
+                    number = Some(
+                        field
+                            .text
+                            .parse::<u16>()
+                            .map_err(|_| S3Error::MalformedXML)?,
+                    );
+                }
+                "ETag" if etag.is_none() => etag = Some(field.text),
+                name => {
+                    let algorithm = match name {
+                        "ChecksumCRC32" => ChecksumAlgorithm::Crc32,
+                        "ChecksumCRC32C" => ChecksumAlgorithm::Crc32c,
+                        "ChecksumCRC64NVME" => ChecksumAlgorithm::Crc64Nvme,
+                        "ChecksumSHA1" => ChecksumAlgorithm::Sha1,
+                        "ChecksumSHA256" => ChecksumAlgorithm::Sha256,
+                        _ => return Err(S3Error::MalformedXML),
+                    };
+                    if checksums.insert(algorithm, field.text).is_some() {
+                        return Err(S3Error::MalformedXML);
+                    }
+                }
+            }
+        }
+        parts.push((
+            number.ok_or(S3Error::MalformedXML)?,
+            etag.ok_or(S3Error::MalformedXML)?,
+            checksums,
+        ));
     }
     Ok(parts)
 }
@@ -3040,10 +2987,13 @@ pub async fn complete_multipart_upload(
         return Err(S3Error::InvalidPartOrder);
     }
     let mut selected = Vec::with_capacity(requested.len());
-    for (number, expected_etag) in &requested {
+    for (number, expected_etag, checksums) in &requested {
         let part = upload.parts.get(number).ok_or(S3Error::InvalidPart)?;
         if part.etag != *expected_etag {
             return Err(S3Error::InvalidPart);
+        }
+        for (algorithm, expected) in checksums {
+            validate_checksum(*algorithm, expected, &part.body)?;
         }
         selected.push((*number, part.clone()));
     }
@@ -3594,4 +3544,25 @@ pub(crate) fn parse_delete_request(body: &[u8]) -> Result<(Vec<DeleteTarget>, bo
         }
     }
     Ok((objects, quiet))
+}
+
+#[cfg(test)]
+mod multipart_checksum_tests {
+    use super::*;
+
+    #[test]
+    fn completion_accepts_part_checksum_and_rejects_duplicate_field() {
+        let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;abc&quot;</ETag><ChecksumCRC32>AAAAAA==</ChecksumCRC32></Part></CompleteMultipartUpload>";
+        let parts = parse_complete_parts(body).unwrap();
+        assert_eq!(parts[0].0, 1);
+        assert_eq!(parts[0].1, "\"abc\"");
+        assert_eq!(parts[0].2[&ChecksumAlgorithm::Crc32], "AAAAAA==");
+        let duplicate = String::from_utf8(body.to_vec())
+            .unwrap()
+            .replace("</Part>", "<ChecksumCRC32>AAAAAA==</ChecksumCRC32></Part>");
+        assert!(matches!(
+            parse_complete_parts(duplicate.as_bytes()),
+            Err(S3Error::MalformedXML)
+        ));
+    }
 }
