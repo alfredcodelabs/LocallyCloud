@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
-use std::os::unix::fs::PermissionsExt;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use axum::response::Response;
 use localcloud_core::error_mapping::AwsError;
 use localcloud_core::handler::{NativeHandler, ServiceRequest};
 use localcloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
+use localcloud_ec2::{Ec2Handler, TaskNetworkLease};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -42,6 +44,31 @@ struct Instance {
     replica_source: Option<String>,
     #[serde(default)]
     cluster_id: Option<String>,
+    #[serde(default)]
+    vpc: Option<VpcAttachment>,
+    #[serde(default)]
+    socket_token: String,
+    #[serde(default)]
+    dbi_resource_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct VpcAttachment {
+    subnet_group: String,
+    subnet_id: String,
+    security_group_ids: Vec<String>,
+    private_ip: Ipv4Addr,
+    client_port: u16,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DbSubnetGroup {
+    name: String,
+    description: String,
+    account: String,
+    region: String,
+    vpc_id: String,
+    subnets: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +119,9 @@ pub struct RdsHandler {
     instances: Arc<Mutex<HashMap<Key, Instance>>>,
     snapshots: Arc<Mutex<HashMap<Key, Snapshot>>>,
     clusters: Arc<Mutex<HashMap<Key, Cluster>>>,
+    subnet_groups: Mutex<HashMap<Key, DbSubnetGroup>>,
+    network_leases: Arc<Mutex<HashMap<Key, TaskNetworkLease>>>,
+    ec2: RwLock<Option<Arc<Ec2Handler>>>,
     jobs: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -122,7 +152,7 @@ impl RdsHandler {
             id: instance.id.clone(),
             db_name: instance.db_name.clone(),
             username: instance.username.clone(),
-            socket_dir: self.directory(&instance).join("socket"),
+            socket_dir: socket_dir(&instance),
             port: instance.port,
         })
     }
@@ -169,6 +199,22 @@ impl RdsHandler {
                                                 "Operation interrupted by server restart"
                                                     .to_owned(),
                                             );
+                                            if let Ok(serialized) = serde_json::to_vec(&instance) {
+                                                let _ = std::fs::write(
+                                                    entry.path().join("meta.json"),
+                                                    serialized,
+                                                );
+                                            }
+                                        }
+                                        if !valid_socket_token(&instance.socket_token)
+                                            || instance.dbi_resource_id.is_empty()
+                                        {
+                                            if !valid_socket_token(&instance.socket_token) {
+                                                instance.socket_token = new_socket_token();
+                                            }
+                                            if instance.dbi_resource_id.is_empty() {
+                                                instance.dbi_resource_id = new_dbi_resource_id();
+                                            }
                                             if let Ok(serialized) = serde_json::to_vec(&instance) {
                                                 let _ = std::fs::write(
                                                     entry.path().join("meta.json"),
@@ -279,13 +325,231 @@ impl RdsHandler {
                 }
             }
         }
+        let subnet_groups = load_subnet_groups(&root);
         Self {
             root,
             instances: Arc::new(Mutex::new(instances)),
             snapshots: Arc::new(Mutex::new(snapshots)),
             clusters: Arc::new(Mutex::new(clusters)),
+            subnet_groups: Mutex::new(subnet_groups),
+            network_leases: Arc::new(Mutex::new(HashMap::new())),
+            ec2: RwLock::new(None),
             jobs: Mutex::new(Vec::new()),
         }
+    }
+
+    pub async fn attach_ec2(&self, ec2: Arc<Ec2Handler>) {
+        *self.ec2.write().expect("RDS EC2 lock") = Some(ec2.clone());
+        let instances: Vec<_> = self.instances.lock().await.values().cloned().collect();
+        for mut instance in instances {
+            let Some(vpc) = instance.vpc.as_mut() else {
+                continue;
+            };
+            let Some(lease) = ec2.reserve_task_network(
+                &instance.account,
+                &instance.region,
+                &vpc.subnet_id,
+                &vpc.security_group_ids,
+                &instance.id,
+            ) else {
+                continue;
+            };
+            vpc.private_ip = lease.private_ip;
+            let _ = lease.set_dns_name(&rds_hostname(&instance));
+            let key = (
+                instance.account.clone(),
+                instance.region.clone(),
+                instance.id.clone(),
+            );
+            if persist(&self.directory(&instance), &instance).await.is_ok() {
+                self.instances.lock().await.insert(key.clone(), instance);
+                self.network_leases.lock().await.insert(key, lease);
+            }
+        }
+    }
+
+    fn ec2(&self) -> Result<Arc<Ec2Handler>, Error> {
+        self.ec2
+            .read()
+            .expect("RDS EC2 lock")
+            .clone()
+            .ok_or_else(|| Error::internal("EC2 VPC service unavailable"))
+    }
+
+    async fn create_subnet_group(
+        &self,
+        req: &ServiceRequest,
+        input: &Input,
+    ) -> Result<String, Error> {
+        let name = input.required("DBSubnetGroupName")?;
+        validate_id(name)?;
+        let description = input.required("DBSubnetGroupDescription")?;
+        let subnet_ids = input.rds_members("SubnetIds", "SubnetIdentifier");
+        if subnet_ids.len() < 2 {
+            return Err(Error::invalid(
+                "DB subnet group requires subnets in at least two Availability Zones",
+            ));
+        }
+        let ec2 = self.ec2()?;
+        let mut vpc_id = None;
+        let mut subnets = Vec::new();
+        for subnet_id in subnet_ids {
+            let (subnet_vpc, zone, _) = ec2
+                .subnet_description(&req.account_id, &req.region, &subnet_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        "DBSubnetGroupDoesNotCoverEnoughAZs",
+                        "Subnet not found",
+                        400,
+                    )
+                })?;
+            if vpc_id.as_ref().is_some_and(|id| id != &subnet_vpc)
+                || subnets.iter().any(|(id, _)| id == &subnet_id)
+            {
+                return Err(Error::invalid(
+                    "DB subnet group subnets must be unique and in one VPC",
+                ));
+            }
+            vpc_id = Some(subnet_vpc);
+            subnets.push((subnet_id, zone));
+        }
+        if subnets
+            .iter()
+            .map(|(_, zone)| zone)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            < 2
+        {
+            return Err(Error::new(
+                "DBSubnetGroupDoesNotCoverEnoughAZs",
+                "DB subnet group requires two Availability Zones",
+                400,
+            ));
+        }
+        let group = DbSubnetGroup {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            account: req.account_id.clone(),
+            region: req.region.clone(),
+            vpc_id: vpc_id.expect("nonempty subnets"),
+            subnets,
+        };
+        let key = (req.account_id.clone(), req.region.clone(), name.to_owned());
+        let mut groups = self.subnet_groups.lock().await;
+        if groups.contains_key(&key) {
+            return Err(Error::new(
+                "DBSubnetGroupAlreadyExists",
+                "DB subnet group already exists",
+                400,
+            ));
+        }
+        persist_subnet_group(&self.root, &group)
+            .await
+            .map_err(Error::internal)?;
+        let xml = subnet_group_xml(&group);
+        groups.insert(key, group);
+        Ok(format!("<DBSubnetGroup>{xml}</DBSubnetGroup>"))
+    }
+
+    async fn describe_subnet_groups(
+        &self,
+        req: &ServiceRequest,
+        input: &Input,
+    ) -> Result<String, Error> {
+        let wanted = input.get("DBSubnetGroupName");
+        let groups = self.subnet_groups.lock().await;
+        let selected: Vec<_> = groups
+            .values()
+            .filter(|group| {
+                group.account == req.account_id
+                    && group.region == req.region
+                    && wanted.is_none_or(|name| name == group.name)
+            })
+            .collect();
+        if selected.is_empty() && wanted.is_some() {
+            return Err(Error::new(
+                "DBSubnetGroupNotFoundFault",
+                "DB subnet group not found",
+                404,
+            ));
+        }
+        let mut xml = String::from("<DBSubnetGroups>");
+        for group in selected {
+            xml.push_str(&format!(
+                "<DBSubnetGroup>{}</DBSubnetGroup>",
+                subnet_group_xml(group)
+            ));
+        }
+        xml.push_str("</DBSubnetGroups>");
+        Ok(xml)
+    }
+
+    async fn delete_subnet_group(
+        &self,
+        req: &ServiceRequest,
+        input: &Input,
+    ) -> Result<String, Error> {
+        let name = input.required("DBSubnetGroupName")?;
+        let key = (req.account_id.clone(), req.region.clone(), name.to_owned());
+        if self.instances.lock().await.values().any(|instance| {
+            instance.account == req.account_id
+                && instance.region == req.region
+                && instance
+                    .vpc
+                    .as_ref()
+                    .is_some_and(|vpc| vpc.subnet_group == name)
+        }) {
+            return Err(Error::new(
+                "InvalidDBSubnetGroupStateFault",
+                "DB subnet group is in use",
+                400,
+            ));
+        }
+        let mut groups = self.subnet_groups.lock().await;
+        let group = groups.get(&key).ok_or_else(|| {
+            Error::new(
+                "DBSubnetGroupNotFoundFault",
+                "DB subnet group not found",
+                404,
+            )
+        })?;
+        tokio::fs::remove_file(subnet_group_path(&self.root, group))
+            .await
+            .map_err(|error| Error::internal(error.to_string()))?;
+        groups.remove(&key);
+        Ok(String::new())
+    }
+
+    async fn list_tags(&self, req: &ServiceRequest, input: &Input) -> Result<String, Error> {
+        let arn = input.required("ResourceName")?;
+        let prefix = format!("arn:aws:rds:{}:{}:", req.region, req.account_id);
+        let resource = arn.strip_prefix(&prefix).ok_or_else(|| {
+            Error::invalid("ResourceName must be an RDS ARN in the request account and Region")
+        })?;
+        if let Some(name) = resource.strip_prefix("subgrp:") {
+            let key = (req.account_id.clone(), req.region.clone(), name.to_owned());
+            if !self.subnet_groups.lock().await.contains_key(&key) {
+                return Err(Error::new(
+                    "DBSubnetGroupNotFoundFault",
+                    "DB subnet group not found",
+                    404,
+                ));
+            }
+        } else if let Some(name) = resource.strip_prefix("db:") {
+            let key = (req.account_id.clone(), req.region.clone(), name.to_owned());
+            if !self.instances.lock().await.contains_key(&key) {
+                return Err(Error::new(
+                    "DBInstanceNotFound",
+                    "DB instance not found",
+                    404,
+                ));
+            }
+        } else {
+            return Err(Error::invalid(
+                "ResourceName must identify a DB instance or DB subnet group",
+            ));
+        }
+        Ok("<TagList/>".to_owned())
     }
 
     fn directory(&self, instance: &Instance) -> PathBuf {
@@ -318,7 +582,7 @@ impl RdsHandler {
         let writer = self.refresh_instance(&writer_key, false).await?;
         let status = writer.status.clone();
         Some(RdsClusterEndpoint {
-            socket_dir: self.directory(&writer).join("socket"),
+            socket_dir: socket_dir(&writer),
             port: writer.port,
             database: cluster.db_name,
             username: cluster.username,
@@ -578,6 +842,9 @@ impl RdsHandler {
             error: None,
             replica_source: None,
             cluster_id: Some(cluster_id.to_owned()),
+            vpc: None,
+            socket_token: new_socket_token(),
+            dbi_resource_id: new_dbi_resource_id(),
         };
         let directory = self.directory(&instance);
         {
@@ -666,12 +933,7 @@ impl RdsHandler {
         if engine != "postgres" {
             return Err(Error::invalid("Only Engine=postgres is supported"));
         }
-        for field in [
-            "DBSubnetGroupName",
-            "VpcSecurityGroupIds.member.1",
-            "KmsKeyId",
-            "DBClusterIdentifier",
-        ] {
+        for field in ["KmsKeyId", "DBClusterIdentifier"] {
             if input.get(field).is_some() {
                 return Err(Error::invalid(format!("{field} is unsupported")));
             }
@@ -707,6 +969,90 @@ impl RdsHandler {
         if !(20..=100).contains(&storage) {
             return Err(Error::invalid("AllocatedStorage must be 20..100 GiB"));
         }
+        if input.get("PubliclyAccessible") == Some("true") {
+            return Err(Error::invalid(
+                "PubliclyAccessible=true is unsupported for private RDS",
+            ));
+        }
+        let client_port = input
+            .get("Port")
+            .unwrap_or("5432")
+            .parse::<u16>()
+            .map_err(|_| Error::invalid("Port must be 1..65535"))?;
+        if client_port == 0 {
+            return Err(Error::invalid("Port must be 1..65535"));
+        }
+        let mut lease = None;
+        let mut vpc = None;
+        if let Some(group_name) = input.get("DBSubnetGroupName") {
+            let group_key = (
+                req.account_id.clone(),
+                req.region.clone(),
+                group_name.to_owned(),
+            );
+            let group = self
+                .subnet_groups
+                .lock()
+                .await
+                .get(&group_key)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        "DBSubnetGroupNotFoundFault",
+                        "DB subnet group not found",
+                        404,
+                    )
+                })?;
+            let ec2 = self.ec2()?;
+            let security_group_ids = input.rds_members("VpcSecurityGroupIds", "VpcSecurityGroupId");
+            let security_group_ids = if security_group_ids.is_empty() {
+                vec![ec2
+                    .default_security_group_id(&req.account_id, &req.region, &group.vpc_id)
+                    .ok_or_else(|| Error::invalid("Default VPC security group is unavailable"))?]
+            } else {
+                security_group_ids
+            };
+            if security_group_ids.iter().any(|id| {
+                ec2.security_group_vpc_id(&req.account_id, &req.region, id)
+                    .as_deref()
+                    != Some(&group.vpc_id)
+            }) {
+                return Err(Error::invalid(
+                    "VpcSecurityGroupIds must belong to the DB subnet group VPC",
+                ));
+            }
+            let subnet_id = group.subnets[0].0.clone();
+            let reserved = ec2
+                .reserve_task_network(
+                    &req.account_id,
+                    &req.region,
+                    &subnet_id,
+                    &security_group_ids,
+                    id,
+                )
+                .ok_or_else(|| {
+                    Error::new(
+                        "InvalidVPCNetworkStateFault",
+                        "Unable to reserve private RDS network interface",
+                        400,
+                    )
+                })?;
+            vpc = Some(VpcAttachment {
+                subnet_group: group_name.to_owned(),
+                subnet_id,
+                security_group_ids,
+                private_ip: reserved.private_ip,
+                client_port,
+            });
+            lease = Some(reserved);
+        } else if !input
+            .rds_members("VpcSecurityGroupIds", "VpcSecurityGroupId")
+            .is_empty()
+        {
+            return Err(Error::invalid(
+                "VpcSecurityGroupIds requires DBSubnetGroupName",
+            ));
+        }
         let runtime = runtime::resolve_from_env()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
@@ -726,6 +1072,9 @@ impl RdsHandler {
             error: None,
             replica_source: None,
             cluster_id: None,
+            vpc,
+            socket_token: new_socket_token(),
+            dbi_resource_id: new_dbi_resource_id(),
         };
         {
             let mut state = self.instances.lock().await;
@@ -748,6 +1097,15 @@ impl RdsHandler {
             let _ = tokio::fs::remove_dir_all(&directory).await;
             return Err(Error::internal(reason));
         }
+        if let Some(lease) = lease {
+            if !lease.set_dns_name(&rds_hostname(&instance)) {
+                self.instances.lock().await.remove(&key);
+                let _ = tokio::fs::remove_dir_all(&directory).await;
+                return Err(Error::internal("Unable to register RDS private DNS"));
+            }
+            self.network_leases.lock().await.insert(key.clone(), lease);
+        }
+        let network_leases = self.network_leases.clone();
         let state = self.instances.clone();
         let response = format!("<DBInstance>{}</DBInstance>", instance_xml(&instance));
         let password = password.to_owned();
@@ -758,13 +1116,30 @@ impl RdsHandler {
             let mut completed = instance;
             match result {
                 Ok(()) => {
-                    completed.status = "available".to_owned();
-                    if let Err(reason) = persist(&directory, &completed).await {
+                    let published = if let Some(vpc) = &completed.vpc {
+                        let backend = SocketAddr::from(([127, 0, 0, 1], completed.port));
+                        network_leases
+                            .lock()
+                            .await
+                            .get(&key)
+                            .is_some_and(|lease| lease.set_endpoint(vpc.client_port, backend))
+                    } else {
+                        true
+                    };
+                    if !published {
                         stop_instance(&runtime, &directory).await;
                         completed.status = "failed".to_owned();
-                        completed.error =
-                            Some(format!("Unable to persist instance metadata: {reason}"));
+                        completed.error = Some("Unable to publish private RDS endpoint".to_owned());
                         let _ = persist(&directory, &completed).await;
+                    } else {
+                        completed.status = "available".to_owned();
+                        if let Err(reason) = persist(&directory, &completed).await {
+                            stop_instance(&runtime, &directory).await;
+                            completed.status = "failed".to_owned();
+                            completed.error =
+                                Some(format!("Unable to persist instance metadata: {reason}"));
+                            let _ = persist(&directory, &completed).await;
+                        }
                     }
                 }
                 Err(reason) => {
@@ -773,6 +1148,9 @@ impl RdsHandler {
                     completed.error = Some(reason);
                     let _ = persist(&directory, &completed).await;
                 }
+            }
+            if completed.status == "failed" {
+                network_leases.lock().await.remove(&key);
             }
             state.lock().await.insert(key, completed);
         }));
@@ -815,9 +1193,9 @@ impl RdsHandler {
             let source = state.get(&source_key).cloned().ok_or_else(|| {
                 Error::new("DBInstanceNotFound", "Source DB instance not found", 404)
             })?;
-            if source.cluster_id.is_some() {
+            if source.cluster_id.is_some() || source.vpc.is_some() {
                 return Err(Error::invalid(
-                    "Aurora cluster members cannot use CreateDBInstanceReadReplica",
+                    "VPC and Aurora read replicas require dedicated network provisioning",
                 ));
             }
             if source.status != "available" || source.replica_source.is_some() {
@@ -830,6 +1208,8 @@ impl RdsHandler {
             let mut replica = source.clone();
             replica.id = id.to_owned();
             replica.port = port;
+            replica.socket_token = new_socket_token();
+            replica.dbi_resource_id = new_dbi_resource_id();
             replica.status = "creating".to_owned();
             replica.error = None;
             replica.replica_source = Some(source_id.to_owned());
@@ -844,7 +1224,6 @@ impl RdsHandler {
             (replica, source.clone())
         };
         let directory = self.directory(&instance);
-        let source_dir = self.directory(&source);
         if let Err(error) = tokio::fs::create_dir_all(&directory).await {
             self.instances.lock().await.remove(&key);
             return Err(Error::internal(error.to_string()));
@@ -859,8 +1238,7 @@ impl RdsHandler {
         let mut jobs = self.jobs.lock().await;
         jobs.retain(|job| !job.is_finished());
         jobs.push(tokio::spawn(async move {
-            let result =
-                provision_replica(&runtime, &source_dir, source.port, &directory, &instance).await;
+            let result = provision_replica(&runtime, &source, &directory, &instance).await;
             let mut completed = instance;
             match result {
                 Ok(()) => {
@@ -965,6 +1343,25 @@ impl RdsHandler {
         }
         .to_owned();
         instance.error = result.err();
+        if let Some(vpc) = &instance.vpc {
+            if instance.status == "available" {
+                let backend = SocketAddr::from(([127, 0, 0, 1], instance.port));
+                let published = self
+                    .network_leases
+                    .lock()
+                    .await
+                    .get(key)
+                    .is_some_and(|lease| lease.set_endpoint(vpc.client_port, backend));
+                if !published {
+                    instance.status = "failed".to_owned();
+                    instance.error =
+                        Some("Private RDS network interface is unavailable".to_owned());
+                }
+            }
+            if instance.status == "failed" {
+                self.network_leases.lock().await.remove(key);
+            }
+        }
         if let Err(error) = persist(&directory, instance).await {
             instance.status = "failed".to_owned();
             instance.error = Some(format!("Unable to persist DB instance status: {error}"));
@@ -974,6 +1371,23 @@ impl RdsHandler {
 
     async fn describe(&self, req: &ServiceRequest, input: &Input) -> Result<String, Error> {
         let wanted = input.get("DBInstanceIdentifier");
+        let resource_ids = match input
+            .get("Filters.Filter.1.Name")
+            .or_else(|| input.get("Filters.member.1.Name"))
+        {
+            Some("dbi-resource-id") => {
+                let mut values = input.members("Filters.Filter.1.Values.Value.");
+                if values.is_empty() {
+                    values = input.members("Filters.Filter.1.Values.member.");
+                }
+                if values.is_empty() {
+                    values = input.members("Filters.Filter.1.Value.");
+                }
+                Some(values)
+            }
+            Some(_) => return Err(Error::invalid("Unsupported DB instance filter")),
+            None => None,
+        };
         let instances: Vec<Instance> = self
             .instances
             .lock()
@@ -982,7 +1396,18 @@ impl RdsHandler {
             .filter(|instance| {
                 instance.account == req.account_id
                     && instance.region == req.region
-                    && wanted.is_none_or(|id| id == instance.id)
+                    && wanted.is_none_or(|id| {
+                        id == instance.id
+                            || id == instance.dbi_resource_id
+                            || id
+                                == format!(
+                                    "arn:aws:rds:{}:{}:db:{}",
+                                    instance.region, instance.account, instance.id
+                                )
+                    })
+                    && resource_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&instance.dbi_resource_id))
             })
             .cloned()
             .collect();
@@ -1131,6 +1556,7 @@ impl RdsHandler {
                 return Err(Error::internal(error));
             }
             self.instances.lock().await.remove(&key);
+            let _ = cleanup_socket_dir(&instance).await;
             return Ok(format!(
                 "<DBInstance>{}</DBInstance>",
                 instance_xml(&Instance {
@@ -1147,6 +1573,8 @@ impl RdsHandler {
             return Err(Error::internal(error.to_string()));
         }
         self.instances.lock().await.remove(&key);
+        self.network_leases.lock().await.remove(&key);
+        let _ = cleanup_socket_dir(&instance).await;
         Ok(format!(
             "<DBInstance>{}</DBInstance>",
             instance_xml(&Instance {
@@ -1362,6 +1790,11 @@ impl RdsHandler {
                 400,
             ));
         }
+        if snapshot.source.vpc.is_some() {
+            return Err(Error::invalid(
+                "Restoring a VPC DB snapshot requires private network provisioning",
+            ));
+        }
         for field in [
             "DBSubnetGroupName",
             "VpcSecurityGroupIds.member.1",
@@ -1384,6 +1817,8 @@ impl RdsHandler {
         let mut instance = snapshot.source.clone();
         instance.id = id.to_owned();
         instance.class = class.to_owned();
+        instance.socket_token = new_socket_token();
+        instance.dbi_resource_id = new_dbi_resource_id();
         instance.port = free_port().await.map_err(Error::internal)?;
         instance.status = "restoring".to_owned();
         instance.error = None;
@@ -1458,7 +1893,7 @@ impl RdsHandler {
                 Err(reason) => {
                     stop_instance(&runtime, &directory).await;
                     let _ = tokio::fs::remove_dir_all(directory.join("data")).await;
-                    let _ = tokio::fs::remove_dir_all(directory.join("socket")).await;
+                    let _ = cleanup_socket_dir(&completed).await;
                     completed.status = "failed".to_owned();
                     completed.error = Some(reason);
                     let _ = persist(&directory, &completed).await;
@@ -1596,8 +2031,10 @@ impl RdsHandler {
             }
         }
         for instance in &instances {
+            let _ = cleanup_socket_dir(instance).await;
             let _ = persist(&self.directory(instance), instance).await;
         }
+        self.network_leases.lock().await.clear();
         let snapshots: Vec<Snapshot> = {
             let mut state = self.snapshots.lock().await;
             state
@@ -1638,6 +2075,10 @@ impl NativeHandler for RdsHandler {
             "CreateDBCluster" => self.create_cluster(&request, &input).await,
             "DescribeDBClusters" => self.describe_clusters(&request, &input).await,
             "DeleteDBCluster" => self.delete_cluster(&request, &input).await,
+            "ListTagsForResource" => self.list_tags(&request, &input).await,
+            "CreateDBSubnetGroup" => self.create_subnet_group(&request, &input).await,
+            "DescribeDBSubnetGroups" => self.describe_subnet_groups(&request, &input).await,
+            "DeleteDBSubnetGroup" => self.delete_subnet_group(&request, &input).await,
             "CreateDBInstance" => self.create(&request, &input).await,
             "DescribeDBInstances" => self.describe(&request, &input).await,
             "CreateDBInstanceReadReplica" => self.create_replica(&request, &input).await,
@@ -1690,6 +2131,10 @@ pub fn register(
         "CreateDBCluster",
         "DescribeDBClusters",
         "DeleteDBCluster",
+        "ListTagsForResource",
+        "CreateDBSubnetGroup",
+        "DescribeDBSubnetGroups",
+        "DeleteDBSubnetGroup",
         "CreateDBInstance",
         "DescribeDBInstances",
         "CreateDBInstanceReadReplica",
@@ -1719,7 +2164,7 @@ async fn backup_snapshot(
     let mut cmd = Command::new(runtime.bin_dir.join("pg_basebackup"));
     cmd.args([
         "-h",
-        &source_dir.join("socket").to_string_lossy(),
+        &socket_dir(source).to_string_lossy(),
         "-p",
         &source.port.to_string(),
         "-U",
@@ -1759,13 +2204,7 @@ async fn restore(
     tokio::fs::create_dir_all(directory)
         .await
         .map_err(|error| error.to_string())?;
-    let socket = directory.join("socket");
-    tokio::fs::create_dir_all(&socket)
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|error| error.to_string())?;
+    let socket = prepare_socket_dir(instance).await?;
     copy_tree(&snapshot.join("data"), &directory.join("data")).await?;
     let settings = format!(
         "\nlisten_addresses = '127.0.0.1'\nport = {}\nunix_socket_directories = '{}'\n",
@@ -1840,13 +2279,7 @@ async fn reopen_cluster_writer(
     directory: &Path,
     instance: &Instance,
 ) -> Result<(), String> {
-    let socket = directory.join("socket");
-    tokio::fs::create_dir_all(&socket)
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|error| error.to_string())?;
+    let socket = prepare_socket_dir(instance).await?;
     tokio::fs::rename(cluster_dir.join("data"), directory.join("data"))
         .await
         .map_err(|error| error.to_string())?;
@@ -1878,13 +2311,7 @@ async fn provision(
         .await
         .map_err(|error| error.to_string())?;
     let data = directory.join("data");
-    let socket_dir = directory.join("socket");
-    tokio::fs::create_dir_all(&socket_dir)
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|error| error.to_string())?;
+    let socket_dir = prepare_socket_dir(instance).await?;
     let pwfile = directory.join("password");
     let password_file_guard = PasswordFile(pwfile.clone());
     use tokio::io::AsyncWriteExt;
@@ -1961,25 +2388,18 @@ async fn provision(
 
 async fn provision_replica(
     runtime: &PostgresRuntime,
-    source_dir: &Path,
-    source_port: u16,
+    source: &Instance,
     directory: &Path,
     instance: &Instance,
 ) -> Result<(), String> {
-    let socket = directory.join("socket");
-    tokio::fs::create_dir_all(&socket)
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|error| error.to_string())?;
+    let socket = prepare_socket_dir(instance).await?;
     let data = directory.join("data");
     let mut cmd = Command::new(runtime.bin_dir.join("pg_basebackup"));
     cmd.args([
         "-h",
-        &source_dir.join("socket").to_string_lossy(),
+        &socket_dir(source).to_string_lossy(),
         "-p",
-        &source_port.to_string(),
+        &source.port.to_string(),
         "-U",
         &instance.username,
         "-D",
@@ -2019,7 +2439,7 @@ async fn sql_query(
     runtime: &PostgresRuntime,
     instance: &Instance,
     sql: &str,
-    directory: &Path,
+    _directory: &Path,
 ) -> Result<String, String> {
     let mut cmd = Command::new(runtime.bin_dir.join("psql"));
     cmd.args([
@@ -2029,7 +2449,7 @@ async fn sql_query(
         "-v",
         "ON_ERROR_STOP=1",
         "-h",
-        &directory.join("socket").to_string_lossy(),
+        &socket_dir(instance).to_string_lossy(),
         "-p",
         &instance.port.to_string(),
         "-U",
@@ -2122,10 +2542,10 @@ async fn sql_command(
     db: &str,
     password: Option<&str>,
     sql: &str,
-    directory: &Path,
+    _directory: &Path,
 ) -> Result<(), String> {
     let port = instance.port.to_string();
-    let socket = directory.join("socket");
+    let socket = socket_dir(instance);
     let host = if password.is_some() {
         "127.0.0.1"
     } else {
@@ -2232,6 +2652,141 @@ fn cluster_xml(cluster: &Cluster, writer: Option<&Instance>) -> String {
     xml
 }
 
+fn new_dbi_resource_id() -> String {
+    format!(
+        "db-{}",
+        uuid::Uuid::new_v4().simple().to_string()[..26].to_ascii_uppercase()
+    )
+}
+
+fn new_socket_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn valid_socket_token(token: &str) -> bool {
+    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn socket_dir(instance: &Instance) -> PathBuf {
+    PathBuf::from(format!("/tmp/lc-rds-{}", instance.socket_token))
+}
+
+async fn prepare_socket_dir(instance: &Instance) -> Result<PathBuf, String> {
+    if !valid_socket_token(&instance.socket_token) {
+        return Err("Invalid RDS socket token".to_owned());
+    }
+    let path = socket_dir(instance);
+    match tokio::fs::DirBuilder::new().mode(0o700).create(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let metadata = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let owner = tokio::fs::metadata("/proc/self")
+        .await
+        .map_err(|error| error.to_string())?
+        .uid();
+    if !metadata.file_type().is_dir() || metadata.uid() != owner || metadata.mode() & 0o077 != 0 {
+        return Err("RDS socket directory is not private to this user".to_owned());
+    }
+    Ok(path)
+}
+
+async fn cleanup_socket_dir(instance: &Instance) -> Result<(), String> {
+    if !valid_socket_token(&instance.socket_token) {
+        return Err("Invalid RDS socket token".to_owned());
+    }
+    let path = socket_dir(instance);
+    let owner = tokio::fs::metadata("/proc/self")
+        .await
+        .map_err(|error| error.to_string())?
+        .uid();
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata)
+            if metadata.file_type().is_dir()
+                && metadata.uid() == owner
+                && metadata.mode() & 0o077 == 0 =>
+        {
+            tokio::fs::remove_dir_all(path)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        Ok(_) => Err("RDS socket directory is not private".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn rds_hostname(instance: &Instance) -> String {
+    format!("{}.{}.rds.amazonaws.com", instance.id, instance.region)
+}
+
+fn subnet_group_path(root: &Path, group: &DbSubnetGroup) -> PathBuf {
+    root.join(&group.account)
+        .join(&group.region)
+        .join("subnet-groups")
+        .join(format!("{}.json", group.name))
+}
+
+async fn persist_subnet_group(root: &Path, group: &DbSubnetGroup) -> Result<(), String> {
+    let path = subnet_group_path(root, group);
+    tokio::fs::create_dir_all(path.parent().expect("subnet group parent"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(group).map_err(|error| error.to_string())?;
+    let temp = path.with_extension("json.tmp");
+    tokio::fs::write(&temp, bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::rename(temp, path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn load_subnet_groups(root: &Path) -> HashMap<Key, DbSubnetGroup> {
+    let mut groups = HashMap::new();
+    if let Ok(accounts) = std::fs::read_dir(root) {
+        for account in accounts.flatten() {
+            if let Ok(regions) = std::fs::read_dir(account.path()) {
+                for region in regions.flatten() {
+                    if let Ok(entries) = std::fs::read_dir(region.path().join("subnet-groups")) {
+                        for entry in entries.flatten() {
+                            if let Ok(bytes) = std::fs::read(entry.path()) {
+                                if let Ok(group) = serde_json::from_slice::<DbSubnetGroup>(&bytes) {
+                                    groups.insert(
+                                        (
+                                            group.account.clone(),
+                                            group.region.clone(),
+                                            group.name.clone(),
+                                        ),
+                                        group,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    groups
+}
+
+fn subnet_group_xml(group: &DbSubnetGroup) -> String {
+    let mut xml = format!(
+        "<DBSubnetGroupName>{}</DBSubnetGroupName><DBSubnetGroupDescription>{}</DBSubnetGroupDescription><SubnetGroupStatus>Complete</SubnetGroupStatus><VpcId>{}</VpcId><DBSubnetGroupArn>arn:aws:rds:{}:{}:subgrp:{}</DBSubnetGroupArn><SupportedNetworkTypes><member>IPV4</member></SupportedNetworkTypes><Subnets>",
+        escape(&group.name), escape(&group.description), escape(&group.vpc_id),
+        escape(&group.region), escape(&group.account), escape(&group.name)
+    );
+    for (id, zone) in &group.subnets {
+        xml.push_str(&format!("<Subnet><SubnetIdentifier>{}</SubnetIdentifier><SubnetAvailabilityZone><Name>{}</Name></SubnetAvailabilityZone><SubnetStatus>Active</SubnetStatus></Subnet>", escape(id), escape(zone)));
+    }
+    xml.push_str("</Subnets>");
+    xml
+}
+
 fn instance_xml(instance: &Instance) -> String {
     let visible_status = if instance.status == "restarting" {
         "creating"
@@ -2243,7 +2798,18 @@ fn instance_xml(instance: &Instance) -> String {
     } else {
         "postgres"
     };
-    let mut xml = format!("<DBInstanceIdentifier>{}</DBInstanceIdentifier><DBInstanceClass>{}</DBInstanceClass><Engine>{}</Engine><DBInstanceStatus>{}</DBInstanceStatus><MasterUsername>{}</MasterUsername><AllocatedStorage>{}</AllocatedStorage><DBName>{}</DBName><Port>{}</Port>", escape(&instance.id), escape(&instance.class), engine, escape(visible_status), escape(&instance.username), instance.storage, escape(&instance.db_name), instance.port);
+    let visible_port = instance
+        .vpc
+        .as_ref()
+        .map_or(instance.port, |vpc| vpc.client_port);
+    let mut xml = format!("<DBInstanceIdentifier>{}</DBInstanceIdentifier><DBInstanceClass>{}</DBInstanceClass><Engine>{}</Engine><DBInstanceStatus>{}</DBInstanceStatus><MasterUsername>{}</MasterUsername><AllocatedStorage>{}</AllocatedStorage><DBName>{}</DBName><Port>{}</Port>", escape(&instance.id), escape(&instance.class), engine, escape(visible_status), escape(&instance.username), instance.storage, escape(&instance.db_name), visible_port);
+    if let Some(vpc) = &instance.vpc {
+        xml.push_str(&format!("<DBSubnetGroup><DBSubnetGroupName>{}</DBSubnetGroupName><SubnetGroupStatus>Complete</SubnetGroupStatus></DBSubnetGroup><VpcSecurityGroups>", escape(&vpc.subnet_group)));
+        for id in &vpc.security_group_ids {
+            xml.push_str(&format!("<VpcSecurityGroupMembership><VpcSecurityGroupId>{}</VpcSecurityGroupId><Status>active</Status></VpcSecurityGroupMembership>", escape(id)));
+        }
+        xml.push_str("</VpcSecurityGroups><PubliclyAccessible>false</PubliclyAccessible>");
+    }
     if let Some(cluster_id) = &instance.cluster_id {
         xml.push_str(&format!(
             "<DBClusterIdentifier>{}</DBClusterIdentifier>",
@@ -2252,10 +2818,19 @@ fn instance_xml(instance: &Instance) -> String {
     }
     if instance.status == "available" || instance.status == "backing-up" {
         xml.push_str(&format!(
-            "<Endpoint><Address>127.0.0.1</Address><Port>{}</Port></Endpoint>",
-            instance.port
+            "<Endpoint><Address>{}</Address><Port>{}</Port></Endpoint>",
+            if instance.vpc.is_some() {
+                rds_hostname(instance)
+            } else {
+                "127.0.0.1".to_owned()
+            },
+            visible_port
         ));
     }
+    xml.push_str(&format!(
+        "<DbiResourceId>{}</DbiResourceId>",
+        escape(&instance.dbi_resource_id)
+    ));
     xml.push_str(&format!(
         "<DBInstanceArn>arn:aws:rds:{}:{}:db:{}</DBInstanceArn>",
         escape(&instance.region),
@@ -2342,6 +2917,29 @@ impl Input {
     }
     fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key)?.first().map(String::as_str)
+    }
+    fn members(&self, prefix: &str) -> Vec<String> {
+        let mut members: Vec<_> = self
+            .0
+            .iter()
+            .filter_map(|(key, values)| {
+                let index = key.strip_prefix(prefix)?.parse::<usize>().ok()?;
+                if index == 0 {
+                    return None;
+                }
+                Some((index, values.first()?.clone()))
+            })
+            .collect();
+        members.sort_by_key(|(index, _)| *index);
+        members.into_iter().map(|(_, value)| value).collect()
+    }
+    fn rds_members(&self, name: &str, member: &str) -> Vec<String> {
+        let named = self.members(&format!("{name}.{member}."));
+        if named.is_empty() {
+            self.members(&format!("{name}.member."))
+        } else {
+            named
+        }
     }
     fn required(&self, key: &str) -> Result<&str, Error> {
         self.get(key)
@@ -2530,6 +3128,184 @@ mod replica_tests {
             .await
             .is_some());
         handler.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+}
+
+#[cfg(test)]
+mod vpc_tests {
+    use super::*;
+    use axum::body::{to_bytes, Bytes};
+    use axum::http::{HeaderMap, Method, Uri};
+
+    fn request(body: String) -> ServiceRequest {
+        ServiceRequest {
+            method: Method::POST,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            body: Bytes::from(body),
+            region: "us-east-1".to_owned(),
+            account_id: "000000000000".to_owned(),
+            request_id: "test".to_owned(),
+        }
+    }
+
+    async fn call_ec2(ec2: &Ec2Handler, body: String) -> String {
+        let response = ec2.handle(request(body)).await;
+        assert_eq!(response.status(), 200);
+        String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn xml_value<'a>(xml: &'a str, name: &str) -> &'a str {
+        xml.split_once(&format!("<{name}>"))
+            .unwrap()
+            .1
+            .split_once(&format!("</{name}>"))
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn deep_state_path_uses_private_short_socket_and_stable_resource_id() {
+        let root = std::env::temp_dir()
+            .join(format!("lcr-deep-{}", uuid::Uuid::new_v4()))
+            .join("x".repeat(90))
+            .join("y".repeat(90));
+        let handler = RdsHandler::new(root.clone());
+        let instance = Instance {
+            id: "orders-db".to_owned(),
+            account: "000000000000".to_owned(),
+            region: "us-east-1".to_owned(),
+            username: "orders".to_owned(),
+            db_name: "orders".to_owned(),
+            class: "db.t3.micro".to_owned(),
+            storage: 20,
+            port: 5432,
+            status: "creating".to_owned(),
+            error: None,
+            replica_source: None,
+            cluster_id: None,
+            vpc: None,
+            socket_token: new_socket_token(),
+            dbi_resource_id: new_dbi_resource_id(),
+        };
+        let socket = prepare_socket_dir(&instance).await.unwrap();
+        assert!(socket.as_os_str().len() < 80);
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket.join(".s.PGSQL.65535")).unwrap();
+        drop(listener);
+        let key = (
+            instance.account.clone(),
+            instance.region.clone(),
+            instance.id.clone(),
+        );
+        handler.instances.lock().await.insert(key, instance.clone());
+        let arn = "arn%3Aaws%3Ards%3Aus-east-1%3A000000000000%3Adb%3Aorders-db";
+        let response = handler
+            .handle(request(format!(
+                "Action=DescribeDBInstances&DBInstanceIdentifier={arn}"
+            )))
+            .await;
+        assert_eq!(response.status(), 200);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains(&format!(
+            "<DbiResourceId>{}</DbiResourceId>",
+            instance.dbi_resource_id
+        )));
+        let response = handler.handle(request(format!("Action=DescribeDBInstances&Filters.Filter.1.Name=dbi-resource-id&Filters.Filter.1.Values.Value.1={}", instance.dbi_resource_id))).await;
+        assert_eq!(response.status(), 200);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("<DBInstanceIdentifier>orders-db</DBInstanceIdentifier>"));
+        let response = handler.handle(request("Action=DescribeDBInstances&Filters.Filter.1.Name=dbi-resource-id&Filters.Filter.1.Values.Value.1=db-NOTFOUND".to_owned())).await;
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains("<DBInstanceIdentifier>"));
+        cleanup_socket_dir(&instance).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subnet_group_roundtrip_and_az_validation() {
+        let root = std::env::temp_dir().join(format!("lcr-vpc-{}", uuid::Uuid::new_v4()));
+        let ec2 = Arc::new(Ec2Handler::default());
+        let vpc_xml = call_ec2(&ec2, "Action=CreateVpc&CidrBlock=10.42.0.0%2F16".to_owned()).await;
+        let vpc = xml_value(&vpc_xml, "vpcId");
+        let subnet_a = call_ec2(&ec2, format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.42.1.0%2F24&AvailabilityZone=us-east-1a")).await;
+        let subnet_b = call_ec2(&ec2, format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.42.2.0%2F24&AvailabilityZone=us-east-1b")).await;
+        let a = xml_value(&subnet_a, "subnetId");
+        let b = xml_value(&subnet_b, "subnetId");
+        let handler = RdsHandler::new(root.clone());
+        handler.attach_ec2(ec2.clone()).await;
+        let invalid = handler.handle(request(format!("Action=CreateDBSubnetGroup&DBSubnetGroupName=orders&DBSubnetGroupDescription=orders&SubnetIds.member.1={a}"))).await;
+        assert_eq!(invalid.status(), 400);
+        let created = handler.handle(request(format!("Action=CreateDBSubnetGroup&DBSubnetGroupName=orders&DBSubnetGroupDescription=orders&SubnetIds.SubnetIdentifier.1={a}&SubnetIds.SubnetIdentifier.2={b}"))).await;
+        assert_eq!(created.status(), 200);
+        let body = String::from_utf8(
+            to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains(&format!("<VpcId>{vpc}</VpcId>")));
+        assert!(body.contains("<SubnetGroupStatus>Complete</SubnetGroupStatus>"));
+        let arn = "arn:aws:rds:us-east-1:000000000000:subgrp:orders";
+        let tags = handler
+            .handle(request(format!(
+                "Action=ListTagsForResource&ResourceName={arn}"
+            )))
+            .await;
+        assert_eq!(tags.status(), 200);
+        let body = String::from_utf8(
+            to_bytes(tags.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("<TagList/>") && body.contains("<ListTagsForResourceResult>"));
+        let foreign = handler.handle(request("Action=ListTagsForResource&ResourceName=arn:aws:rds:us-west-2:000000000000:subgrp:orders".to_owned())).await;
+        assert_eq!(foreign.status(), 400);
+        let restarted = RdsHandler::new(root.clone());
+        let described = restarted
+            .handle(request(
+                "Action=DescribeDBSubnetGroups&DBSubnetGroupName=orders".to_owned(),
+            ))
+            .await;
+        assert_eq!(described.status(), 200);
+        let deleted = restarted
+            .handle(request(
+                "Action=DeleteDBSubnetGroup&DBSubnetGroupName=orders".to_owned(),
+            ))
+            .await;
+        assert_eq!(deleted.status(), 200);
+        restarted.attach_ec2(ec2).await;
+        let legacy = restarted.handle(request(format!(
+            "Action=CreateDBSubnetGroup&DBSubnetGroupName=orders&DBSubnetGroupDescription=orders&SubnetIds.member.1={a}&SubnetIds.member.2={b}"
+        ))).await;
+        assert_eq!(legacy.status(), 200);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

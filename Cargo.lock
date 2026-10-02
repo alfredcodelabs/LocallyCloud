@@ -2643,6 +2643,7 @@ dependencies = [
  "axum",
  "form_urlencoded",
  "localcloud-core",
+ "localcloud-ec2",
  "localcloud-state",
  "serde",
  "serde_json",

@@ -381,6 +381,7 @@ async fn main() {
             std::process::exit(4);
         }
     };
+    rds.attach_ec2(ec2.clone()).await;
     let cluster_resolver = {
         let rds = rds.clone();
         move |account: String, region: String, arn: String| {
