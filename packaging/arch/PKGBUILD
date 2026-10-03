@@ -1,10 +1,10 @@
 # Local checkout package for validating Arch before the first tagged release.
-pkgname=localcloud
+pkgname=locallycloud
 pkgver=$(bash "$startdir/../../scripts/package-version.sh" arch)
 pkgrel=1
 pkgdesc='Local AWS service emulator for serverless and data workflows'
 arch=('x86_64')
-url='https://github.com/AlfredRodriguez2042/localcloud'
+url='https://github.com/AlfredRodriguez2042/locallycloud'
 license=('Apache-2.0')
 depends=('glibc' 'gcc-libs' 'sqlite>=3.53.4')
 makedepends=('cargo' 'git')
@@ -12,16 +12,16 @@ optdepends=('crun: daemonless compute runtime'
             'postgresql: local RDS runtime'
             'xdg-utils: open the dashboard from the application menu')
 # GCC LTO objects from aws-lc-sys do not link with Rust's lld invocation.
-options=('!lto')
+options=('!lto' '!debug')
 
 build() {
   cd "$startdir/../.."
-  cargo build --release --locked -p localcloud
+  cargo build --release --locked -p locallycloud
 }
 
 package() {
-  install -Dm755 "$startdir/../../target/release/localcloud" "$pkgdir/usr/bin/localcloud"
-  install -Dm644 "$startdir/../../LICENSE.md" "$pkgdir/usr/share/licenses/localcloud/LICENSE.md"
+  install -Dm755 "$startdir/../../target/release/locallycloud" "$pkgdir/usr/bin/locallycloud"
+  install -Dm644 "$startdir/../../LICENSE.md" "$pkgdir/usr/share/licenses/locallycloud/LICENSE.md"
   install -Dm644 "$startdir/../assets/locallycloud.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/locallycloud.svg"
   for size in 16 24 32 48 64 128 256 512; do
     install -Dm644 "$startdir/../assets/locallycloud-$size.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/locallycloud.png"

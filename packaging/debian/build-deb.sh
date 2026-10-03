@@ -27,8 +27,8 @@ fi
 export SQLITE3_LIB_DIR="$SQLITE_PREFIX/lib"
 export SQLITE3_INCLUDE_DIR="$SQLITE_PREFIX/include"
 export SQLITE3_STATIC=1
-cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked -p localcloud
-BIN="$ROOT/target/release/localcloud"
+cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked -p locallycloud
+BIN="$ROOT/target/release/locallycloud"
 if readelf -d "$BIN" | grep -q 'libsqlite3'; then
   echo 'SQLite is still dynamically linked' >&2
   exit 1
@@ -36,19 +36,19 @@ fi
 
 STAGE="$BUILD_DIR/stage"
 rm -rf "$STAGE"
-install -Dm755 "$BIN" "$STAGE/usr/bin/localcloud"
+install -Dm755 "$BIN" "$STAGE/usr/bin/locallycloud"
 install -Dm644 "$ROOT/packaging/assets/locallycloud.desktop" "$STAGE/usr/share/applications/locallycloud.desktop"
 install -Dm644 "$ROOT/packaging/assets/locallycloud.svg" "$STAGE/usr/share/icons/hicolor/scalable/apps/locallycloud.svg"
 for size in 16 24 32 48 64 128 256 512; do
   install -Dm644 "$ROOT/packaging/assets/locallycloud-$size.png" "$STAGE/usr/share/icons/hicolor/${size}x${size}/apps/locallycloud.png"
 done
-mkdir -p "$STAGE/usr/share/doc/localcloud" "$STAGE/DEBIAN"
+mkdir -p "$STAGE/usr/share/doc/locallycloud" "$STAGE/DEBIAN"
 {
   printf 'Copyright 2026 Alfred Rodriguez G\nLicense: Apache-2.0\n\n'
   cat "$ROOT/LICENSE.md"
-} > "$STAGE/usr/share/doc/localcloud/copyright"
+} > "$STAGE/usr/share/doc/locallycloud/copyright"
 cat > "$STAGE/DEBIAN/control" <<CONTROL
-Package: localcloud
+Package: locallycloud
 Version: $PACKAGE_VERSION
 Section: devel
 Priority: optional
@@ -57,7 +57,7 @@ Maintainer: Alfred Rodriguez G <alfredcode.dev@gmail.com>
 Depends: libc6 (>= 2.41), libgcc-s1
 Suggests: crun, postgresql, xdg-utils
 Description: Local AWS service emulator
- LocalCloud runs AWS-compatible development services on one local endpoint.
+ LocallyCloud runs AWS-compatible development services on one local endpoint.
 CONTROL
 mkdir -p "$BUILD_DIR/dist"
-dpkg-deb --build --root-owner-group "$STAGE" "$BUILD_DIR/dist/localcloud_${PACKAGE_VERSION}_amd64.deb"
+dpkg-deb --build --root-owner-group "$STAGE" "$BUILD_DIR/dist/locallycloud_${PACKAGE_VERSION}_amd64.deb"

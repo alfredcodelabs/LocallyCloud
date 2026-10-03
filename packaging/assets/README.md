@@ -25,4 +25,4 @@ bash packaging/assets/export-logos.sh
 
 The symbols and horizontal versions have transparency. The application icon and social card have an intentional background. The name's typography is derived from Geist; its license is in `Geist-OFL.txt`.
 
-The Debian and Arch scripts use the `locallycloud-*` assets directly. `export-logos.sh` regenerates only these versions. The launcher opens the product's current endpoint, `/_localcloud/ui`.
+The Debian and Arch scripts use the `locallycloud-*` assets directly. `export-logos.sh` regenerates only these versions. The launcher opens the product's current endpoint, `/_locallycloud/ui`.

@@ -42,9 +42,9 @@ References: [SemVer](https://semver.org/), [Debian](https://www.debian.org/doc/d
 
 The `.github/workflows/packages.yml` workflow runs on pull requests, pushes to `main`, `master`, `develop`, and `stage`, and `v*` tags. It can also be run manually to check a branch without publishing.
 
-It validates version formats, tag matching, and the versions of all crates. It checks `cargo fmt`, builds and installs both packages, and runs library tests for `localcloud-core` and `localcloud-state`. It does not yet cover all service integrations, PostgreSQL, or OCI runtimes.
+It validates version formats, tag matching, and the versions of all crates. It checks `cargo fmt`, builds and installs both packages, and runs library tests for `locallycloud-core` and `locallycloud-state`. It does not yet cover all service integrations, PostgreSQL, or OCI runtimes.
 
-Debian is built on Debian 13 amd64 using the Rust version declared in Cargo.toml. SQLite 3.53.4 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories. Packages currently retain the technical name `localcloud`.
+Debian is built on Debian 13 amd64 using the Rust version declared in Cargo.toml. SQLite 3.53.4 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories.
 
 After saving and pushing the version and Cargo.lock changes:
 

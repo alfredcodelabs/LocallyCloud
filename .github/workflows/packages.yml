@@ -81,7 +81,7 @@ jobs:
         run: |
           curl --fail --show-error --silent --location https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz -o /tmp/sqlite-autoconf-3530400.tar.gz
           bash packaging/debian/build-deb.sh /tmp/sqlite-autoconf-3530400.tar.gz
-          package="target/debian-package/dist/localcloud_$(bash scripts/package-version.sh debian)_amd64.deb"
+          package="target/debian-package/dist/locallycloud_$(bash scripts/package-version.sh debian)_amd64.deb"
           [[ "$(dpkg-deb -f "$package" Version)" == "$(bash scripts/package-version.sh debian)" ]]
           dpkg -i "$package"
       - name: Test core and state with packaged SQLite
@@ -89,7 +89,7 @@ jobs:
           export SQLITE3_LIB_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4/lib"
           export SQLITE3_INCLUDE_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4/include"
           export SQLITE3_STATIC=1
-          cargo test --locked -p localcloud-core -p localcloud-state --lib
+          cargo test --locked -p locallycloud-core -p locallycloud-state --lib
       - uses: actions/upload-artifact@v7
         with:
           name: package-debian-amd64
@@ -114,13 +114,13 @@ jobs:
           bash scripts/check-package-version.sh
           cd packaging/arch
           runuser -u builder -- makepkg --cleanbuild --noconfirm
-          expected="localcloud-$(bash ../../scripts/package-version.sh arch)-1-x86_64.pkg.tar.zst"
+          expected="locallycloud-$(bash ../../scripts/package-version.sh arch)-1-x86_64.pkg.tar.zst"
           test -f "$expected"
           pacman -U --noconfirm "$expected"
       - uses: actions/upload-artifact@v7
         with:
           name: package-arch-x86_64
-          path: packaging/arch/localcloud-*.pkg.tar.zst
+          path: packaging/arch/locallycloud-*.pkg.tar.zst
           if-no-files-found: error
 
   release:
