@@ -1,48 +1,48 @@
-# localcloud — Rust workspace manifest
+# locallycloud — Rust workspace manifest
 #
-# localcloud is a standalone Rust AWS emulator. Unsupported services can be
+# locallycloud is a standalone Rust AWS emulator. Unsupported services can be
 # forwarded to an optional external backend.
 
 [workspace]
 resolver = "2"
 members = [
-    "crates/localcloud",
-    "crates/localcloud-core",
-    "crates/localcloud-state",
-    "crates/localcloud-compute",
-    "crates/localcloud-lambda",
-    "crates/localcloud-iam-sts",
-    "crates/localcloud-dynamodb",
-    "crates/localcloud-s3",
-    "crates/localcloud-sqs",
-    "crates/localcloud-sns",
-    "crates/localcloud-eventbridge",
-    "crates/localcloud-stepfunctions",
-    "crates/localcloud-apigateway",
-    "crates/localcloud-cloudformation",
-    "crates/localcloud-ecr",
-    "crates/localcloud-ecs",
-    "crates/localcloud-ec2",
-    "crates/localcloud-elbv2",
-    "crates/localcloud-kms",
-    "crates/localcloud-ssm",
-    "crates/localcloud-secretsmanager",
-    "crates/localcloud-cloudwatch-monitoring",
-    "crates/localcloud-cloudwatch-logs",
-    "crates/localcloud-rds-data",
-    "crates/localcloud-rds",
-    "crates/localcloud-analytics",
-    "crates/localcloud-kinesis",
-    "crates/localcloud-firehose",
-    "crates/localcloud-xray",
-    "crates/localcloud-cloudtrail",
-    "crates/localcloud-route53",
-    "crates/localcloud-arc",
-    "crates/localcloud-region-switch",
-    "crates/localcloud-wafv2",
-    "crates/localcloud-cognito",
-    "crates/localcloud-acm",
-    "crates/localcloud-cloudfront",
+    "crates/server",
+    "crates/core",
+    "crates/state",
+    "crates/compute",
+    "crates/lambda",
+    "crates/iam-sts",
+    "crates/dynamodb",
+    "crates/s3",
+    "crates/sqs",
+    "crates/sns",
+    "crates/eventbridge",
+    "crates/stepfunctions",
+    "crates/apigateway",
+    "crates/cloudformation",
+    "crates/ecr",
+    "crates/ecs",
+    "crates/ec2",
+    "crates/elbv2",
+    "crates/kms",
+    "crates/ssm",
+    "crates/secretsmanager",
+    "crates/cloudwatch-monitoring",
+    "crates/cloudwatch-logs",
+    "crates/rds-data",
+    "crates/rds",
+    "crates/analytics",
+    "crates/kinesis",
+    "crates/firehose",
+    "crates/xray",
+    "crates/cloudtrail",
+    "crates/route53",
+    "crates/arc",
+    "crates/region-switch",
+    "crates/wafv2",
+    "crates/cognito",
+    "crates/acm",
+    "crates/cloudfront",
 ]
 
 [workspace.package]
@@ -104,42 +104,42 @@ jsonwebtoken = "=11.1.0"
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 
 # Internal crates
-localcloud-core = { path = "crates/localcloud-core" }
-localcloud-state = { path = "crates/localcloud-state" }
-localcloud-compute = { path = "crates/localcloud-compute" }
-localcloud-lambda = { path = "crates/localcloud-lambda" }
-localcloud-iam-sts = { path = "crates/localcloud-iam-sts" }
-localcloud-dynamodb = { path = "crates/localcloud-dynamodb" }
-localcloud-s3 = { path = "crates/localcloud-s3" }
-localcloud-sqs = { path = "crates/localcloud-sqs" }
-localcloud-sns = { path = "crates/localcloud-sns" }
-localcloud-eventbridge = { path = "crates/localcloud-eventbridge" }
-localcloud-stepfunctions = { path = "crates/localcloud-stepfunctions" }
-localcloud-apigateway = { path = "crates/localcloud-apigateway" }
-localcloud-cloudformation = { path = "crates/localcloud-cloudformation" }
-localcloud-ecr = { path = "crates/localcloud-ecr" }
-localcloud-ecs = { path = "crates/localcloud-ecs" }
-localcloud-ec2 = { path = "crates/localcloud-ec2" }
-localcloud-elbv2 = { path = "crates/localcloud-elbv2" }
-localcloud-kms = { path = "crates/localcloud-kms" }
-localcloud-ssm = { path = "crates/localcloud-ssm" }
-localcloud-secretsmanager = { path = "crates/localcloud-secretsmanager" }
-localcloud-cloudwatch-monitoring = { path = "crates/localcloud-cloudwatch-monitoring" }
-localcloud-cloudwatch-logs = { path = "crates/localcloud-cloudwatch-logs" }
-localcloud-rds-data = { path = "crates/localcloud-rds-data" }
-localcloud-rds = { path = "crates/localcloud-rds" }
-localcloud-analytics = { path = "crates/localcloud-analytics" }
-localcloud-kinesis = { path = "crates/localcloud-kinesis" }
-localcloud-firehose = { path = "crates/localcloud-firehose" }
-localcloud-xray = { path = "crates/localcloud-xray" }
-localcloud-cloudtrail = { path = "crates/localcloud-cloudtrail" }
-localcloud-route53 = { path = "crates/localcloud-route53" }
-localcloud-arc = { path = "crates/localcloud-arc" }
-localcloud-region-switch = { path = "crates/localcloud-region-switch" }
-localcloud-wafv2 = { path = "crates/localcloud-wafv2" }
-localcloud-cognito = { path = "crates/localcloud-cognito" }
-localcloud-acm = { path = "crates/localcloud-acm" }
-localcloud-cloudfront = { path = "crates/localcloud-cloudfront" }
+locallycloud-core = { path = "crates/core" }
+locallycloud-state = { path = "crates/state" }
+locallycloud-compute = { path = "crates/compute" }
+locallycloud-lambda = { path = "crates/lambda" }
+locallycloud-iam-sts = { path = "crates/iam-sts" }
+locallycloud-dynamodb = { path = "crates/dynamodb" }
+locallycloud-s3 = { path = "crates/s3" }
+locallycloud-sqs = { path = "crates/sqs" }
+locallycloud-sns = { path = "crates/sns" }
+locallycloud-eventbridge = { path = "crates/eventbridge" }
+locallycloud-stepfunctions = { path = "crates/stepfunctions" }
+locallycloud-apigateway = { path = "crates/apigateway" }
+locallycloud-cloudformation = { path = "crates/cloudformation" }
+locallycloud-ecr = { path = "crates/ecr" }
+locallycloud-ecs = { path = "crates/ecs" }
+locallycloud-ec2 = { path = "crates/ec2" }
+locallycloud-elbv2 = { path = "crates/elbv2" }
+locallycloud-kms = { path = "crates/kms" }
+locallycloud-ssm = { path = "crates/ssm" }
+locallycloud-secretsmanager = { path = "crates/secretsmanager" }
+locallycloud-cloudwatch-monitoring = { path = "crates/cloudwatch-monitoring" }
+locallycloud-cloudwatch-logs = { path = "crates/cloudwatch-logs" }
+locallycloud-rds-data = { path = "crates/rds-data" }
+locallycloud-rds = { path = "crates/rds" }
+locallycloud-analytics = { path = "crates/analytics" }
+locallycloud-kinesis = { path = "crates/kinesis" }
+locallycloud-firehose = { path = "crates/firehose" }
+locallycloud-xray = { path = "crates/xray" }
+locallycloud-cloudtrail = { path = "crates/cloudtrail" }
+locallycloud-route53 = { path = "crates/route53" }
+locallycloud-arc = { path = "crates/arc" }
+locallycloud-region-switch = { path = "crates/region-switch" }
+locallycloud-wafv2 = { path = "crates/wafv2" }
+locallycloud-cognito = { path = "crates/cognito" }
+locallycloud-acm = { path = "crates/acm" }
+locallycloud-cloudfront = { path = "crates/cloudfront" }
 
 [profile.dev.package.rsa]
 opt-level = 3

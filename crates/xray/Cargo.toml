@@ -1,0 +1,18 @@
+[package]
+name = "locallycloud-xray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native AWS X-Ray trace ingestion and retrieval subset for locallycloud"
+
+[dependencies]
+locallycloud-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "locallycloud-region-switch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ARC Region Switch routing-control workflows for LocallyCloud"
+
+[dependencies]
+locallycloud-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "locallycloud-cloudwatch-monitoring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native CloudWatch Monitoring emulation for locallycloud"
+
+[dependencies]
+locallycloud-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+time.workspace = true

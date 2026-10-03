@@ -1,0 +1,37 @@
+[package]
+name = "locallycloud-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "locallycloud AWS S3 service (REST-XML), registered Native in the Core ServiceRegistry"
+
+[features]
+integration = []
+
+[dependencies]
+locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+bytes = { version = "1", features = ["serde"] }
+dashmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64.workspace = true
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+quick-xml = "=0.42.0"
+tempfile = "3"
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+proptest = "1"

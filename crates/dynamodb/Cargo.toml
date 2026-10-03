@@ -1,0 +1,29 @@
+[package]
+name = "locallycloud-dynamodb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "locallycloud AWS DynamoDB service (JSON 1.0), registered Native in the Core ServiceRegistry"
+
+[dependencies]
+locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+base64.workspace = true
+bigdecimal = "0.4"
+rusqlite.workspace = true
+
+[dev-dependencies]
+proptest = "1"

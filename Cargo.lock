@@ -2144,61 +2144,61 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
-name = "localcloud"
+name = "locallycloud"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "flate2",
- "localcloud-acm",
- "localcloud-analytics",
- "localcloud-apigateway",
- "localcloud-arc",
- "localcloud-cloudformation",
- "localcloud-cloudfront",
- "localcloud-cloudtrail",
- "localcloud-cloudwatch-logs",
- "localcloud-cloudwatch-monitoring",
- "localcloud-cognito",
- "localcloud-compute",
- "localcloud-core",
- "localcloud-dynamodb",
- "localcloud-ec2",
- "localcloud-ecr",
- "localcloud-ecs",
- "localcloud-elbv2",
- "localcloud-eventbridge",
- "localcloud-firehose",
- "localcloud-iam-sts",
- "localcloud-kinesis",
- "localcloud-kms",
- "localcloud-lambda",
- "localcloud-rds",
- "localcloud-rds-data",
- "localcloud-region-switch",
- "localcloud-route53",
- "localcloud-s3",
- "localcloud-secretsmanager",
- "localcloud-sns",
- "localcloud-sqs",
- "localcloud-ssm",
- "localcloud-state",
- "localcloud-stepfunctions",
- "localcloud-wafv2",
- "localcloud-xray",
+ "locallycloud-acm",
+ "locallycloud-analytics",
+ "locallycloud-apigateway",
+ "locallycloud-arc",
+ "locallycloud-cloudformation",
+ "locallycloud-cloudfront",
+ "locallycloud-cloudtrail",
+ "locallycloud-cloudwatch-logs",
+ "locallycloud-cloudwatch-monitoring",
+ "locallycloud-cognito",
+ "locallycloud-compute",
+ "locallycloud-core",
+ "locallycloud-dynamodb",
+ "locallycloud-ec2",
+ "locallycloud-ecr",
+ "locallycloud-ecs",
+ "locallycloud-elbv2",
+ "locallycloud-eventbridge",
+ "locallycloud-firehose",
+ "locallycloud-iam-sts",
+ "locallycloud-kinesis",
+ "locallycloud-kms",
+ "locallycloud-lambda",
+ "locallycloud-rds",
+ "locallycloud-rds-data",
+ "locallycloud-region-switch",
+ "locallycloud-route53",
+ "locallycloud-s3",
+ "locallycloud-secretsmanager",
+ "locallycloud-sns",
+ "locallycloud-sqs",
+ "locallycloud-ssm",
+ "locallycloud-state",
+ "locallycloud-stepfunctions",
+ "locallycloud-wafv2",
+ "locallycloud-xray",
  "serde_json",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "localcloud-acm"
+name = "locallycloud-acm"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "pem",
  "ring",
  "serde_json",
@@ -2209,7 +2209,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-analytics"
+name = "locallycloud-analytics"
 version = "0.1.0-beta.1"
 dependencies = [
  "apache-avro",
@@ -2218,8 +2218,8 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-s3",
+ "locallycloud-core",
+ "locallycloud-s3",
  "parquet",
  "quick-xml",
  "serde",
@@ -2229,7 +2229,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-apigateway"
+name = "locallycloud-apigateway"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2240,9 +2240,9 @@ dependencies = [
  "http",
  "jsonschema",
  "jsonwebtoken",
- "localcloud-cognito",
- "localcloud-core",
- "localcloud-wafv2",
+ "locallycloud-cognito",
+ "locallycloud-core",
+ "locallycloud-wafv2",
  "proptest",
  "regex",
  "reqwest",
@@ -2256,19 +2256,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-arc"
+name = "locallycloud-arc"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde_json",
  "uuid",
 ]
 
 [[package]]
-name = "localcloud-cloudformation"
+name = "locallycloud-cloudformation"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2277,10 +2277,10 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-iam-sts",
- "localcloud-lambda",
- "localcloud-s3",
+ "locallycloud-core",
+ "locallycloud-iam-sts",
+ "locallycloud-lambda",
+ "locallycloud-s3",
  "serde_json",
  "serde_yaml_ng",
  "thiserror 1.0.69",
@@ -2291,14 +2291,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-cloudfront"
+name = "locallycloud-cloudfront"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "bytes",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "quick-xml",
  "serde_json",
  "time",
@@ -2307,20 +2307,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-cloudtrail"
+name = "locallycloud-cloudtrail"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde_json",
  "time",
  "uuid",
 ]
 
 [[package]]
-name = "localcloud-cloudwatch-logs"
+name = "locallycloud-cloudwatch-logs"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2329,7 +2329,7 @@ dependencies = [
  "flate2",
  "hmac 0.12.1",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "regex",
  "serde",
  "serde_json",
@@ -2340,13 +2340,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-cloudwatch-monitoring"
+name = "locallycloud-cloudwatch-monitoring"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2355,7 +2355,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-cognito"
+name = "locallycloud-cognito"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2363,7 +2363,7 @@ dependencies = [
  "base64 0.22.1",
  "http",
  "jsonwebtoken",
- "localcloud-core",
+ "locallycloud-core",
  "rand 0.8.7",
  "ring",
  "rsa",
@@ -2373,7 +2373,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-compute"
+name = "locallycloud-compute"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2386,7 +2386,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-core"
+name = "locallycloud-core"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2412,7 +2412,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-dynamodb"
+name = "locallycloud-dynamodb"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2422,8 +2422,8 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "proptest",
  "rusqlite",
  "serde",
@@ -2435,20 +2435,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-ec2"
+name = "locallycloud-ec2"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "form_urlencoded",
  "ipnet",
- "localcloud-core",
+ "locallycloud-core",
  "tokio",
  "uuid",
 ]
 
 [[package]]
-name = "localcloud-ecr"
+name = "locallycloud-ecr"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2457,7 +2457,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
@@ -2468,14 +2468,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-ecs"
+name = "locallycloud-ecs"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "bytes",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde",
  "serde_json",
  "tokio",
@@ -2483,19 +2483,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-elbv2"
+name = "locallycloud-elbv2"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "tokio",
  "uuid",
 ]
 
 [[package]]
-name = "localcloud-eventbridge"
+name = "locallycloud-eventbridge"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2505,10 +2505,10 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-s3",
- "localcloud-sqs",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-s3",
+ "locallycloud-sqs",
+ "locallycloud-state",
  "proptest",
  "reqwest",
  "rusqlite",
@@ -2525,7 +2525,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-firehose"
+name = "locallycloud-firehose"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2534,10 +2534,10 @@ dependencies = [
  "bytes",
  "http",
  "iceberg",
- "localcloud-analytics",
- "localcloud-core",
- "localcloud-s3",
- "localcloud-state",
+ "locallycloud-analytics",
+ "locallycloud-core",
+ "locallycloud-s3",
+ "locallycloud-state",
  "parquet",
  "rusqlite",
  "serde",
@@ -2549,7 +2549,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-iam-sts"
+name = "locallycloud-iam-sts"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2557,7 +2557,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "proptest",
  "serde",
  "serde_json",
@@ -2569,7 +2569,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-kinesis"
+name = "locallycloud-kinesis"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2577,8 +2577,8 @@ dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2588,7 +2588,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-kms"
+name = "locallycloud-kms"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2598,8 +2598,8 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2609,7 +2609,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-lambda"
+name = "locallycloud-lambda"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2619,10 +2619,10 @@ dependencies = [
  "dashmap",
  "http",
  "libc",
- "localcloud-compute",
- "localcloud-core",
- "localcloud-ec2",
- "localcloud-sqs",
+ "locallycloud-compute",
+ "locallycloud-core",
+ "locallycloud-ec2",
+ "locallycloud-sqs",
  "proptest",
  "reqwest",
  "serde",
@@ -2637,15 +2637,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-rds"
+name = "locallycloud-rds"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "form_urlencoded",
- "localcloud-core",
- "localcloud-ec2",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-ec2",
+ "locallycloud-state",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2654,7 +2654,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-rds-data"
+name = "locallycloud-rds-data"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2663,8 +2663,8 @@ dependencies = [
  "bytes",
  "futures-util",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2676,33 +2676,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-region-switch"
+name = "locallycloud-region-switch"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde_json",
  "tokio",
  "uuid",
 ]
 
 [[package]]
-name = "localcloud-route53"
+name = "locallycloud-route53"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "quick-xml",
  "time",
  "tokio",
 ]
 
 [[package]]
-name = "localcloud-s3"
+name = "locallycloud-s3"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2711,8 +2711,8 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "md-5 0.10.6",
  "proptest",
  "quick-xml",
@@ -2730,7 +2730,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-secretsmanager"
+name = "locallycloud-secretsmanager"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2738,8 +2738,8 @@ dependencies = [
  "base64 0.22.1",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2750,7 +2750,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-sns"
+name = "locallycloud-sns"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2759,9 +2759,9 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-sqs",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-sqs",
+ "locallycloud-state",
  "md-5 0.10.6",
  "proptest",
  "reqwest",
@@ -2777,7 +2777,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-sqs"
+name = "locallycloud-sqs"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2787,8 +2787,8 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "md-5 0.10.6",
  "proptest",
  "rusqlite",
@@ -2802,7 +2802,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-ssm"
+name = "locallycloud-ssm"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2810,8 +2810,8 @@ dependencies = [
  "base64 0.22.1",
  "dashmap",
  "http",
- "localcloud-core",
- "localcloud-state",
+ "locallycloud-core",
+ "locallycloud-state",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2821,7 +2821,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-state"
+name = "locallycloud-state"
 version = "0.1.0-beta.1"
 dependencies = [
  "libc",
@@ -2830,7 +2830,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-stepfunctions"
+name = "locallycloud-stepfunctions"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
@@ -2840,9 +2840,9 @@ dependencies = [
  "dashmap",
  "http",
  "jsonata-core",
- "localcloud-core",
- "localcloud-dynamodb",
- "localcloud-sqs",
+ "locallycloud-core",
+ "locallycloud-dynamodb",
+ "locallycloud-sqs",
  "md-5 0.10.6",
  "proptest",
  "serde_json",
@@ -2856,26 +2856,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "localcloud-wafv2"
+name = "locallycloud-wafv2"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde_json",
  "uuid",
 ]
 
 [[package]]
-name = "localcloud-xray"
+name = "locallycloud-xray"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
  "http",
- "localcloud-core",
+ "locallycloud-core",
  "serde_json",
  "tokio",
 ]

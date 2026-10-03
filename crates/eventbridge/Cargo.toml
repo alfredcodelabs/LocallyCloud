@@ -1,0 +1,36 @@
+[package]
+name = "locallycloud-eventbridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "locallycloud AWS EventBridge (events) service (JSON 1.1), registered Native in the Core ServiceRegistry"
+
+[dependencies]
+locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+zip.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time = { workspace = true, features = ["serde"] }
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "=1.11.0"
+locallycloud-s3.workspace = true
+locallycloud-sqs.workspace = true

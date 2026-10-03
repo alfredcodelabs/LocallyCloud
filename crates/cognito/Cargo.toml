@@ -1,0 +1,22 @@
+[package]
+name = "locallycloud-cognito"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native Cognito User Pools subset"
+
+[dependencies]
+locallycloud-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+serde_json.workspace = true
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
+base64.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+ring = "0.17"
+rsa = { version = "0.9.10", features = ["pem"] }
+rand = "0.8"

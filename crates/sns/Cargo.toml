@@ -1,0 +1,33 @@
+[package]
+name = "locallycloud-sns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "locallycloud AWS SNS service (Query/XML + JSON), registered Native in the Core ServiceRegistry"
+
+[dependencies]
+locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+base64.workspace = true
+time.workspace = true
+md-5 = "=0.10.6"
+sha2.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+proptest = "=1.11.0"
+locallycloud-sqs.workspace = true

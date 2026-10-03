@@ -1,0 +1,55 @@
+[package]
+name = "locallycloud"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native Linux AWS emulator"
+
+[[bin]]
+name = "locallycloud"
+path = "src/main.rs"
+
+[dependencies]
+locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+locallycloud-compute.workspace = true
+locallycloud-lambda.workspace = true
+locallycloud-iam-sts.workspace = true
+locallycloud-dynamodb.workspace = true
+locallycloud-s3.workspace = true
+locallycloud-sqs.workspace = true
+locallycloud-sns.workspace = true
+locallycloud-eventbridge.workspace = true
+locallycloud-stepfunctions.workspace = true
+locallycloud-apigateway.workspace = true
+locallycloud-cloudformation.workspace = true
+locallycloud-ecr.workspace = true
+locallycloud-ecs.workspace = true
+locallycloud-ec2.workspace = true
+locallycloud-elbv2.workspace = true
+locallycloud-kms.workspace = true
+locallycloud-ssm.workspace = true
+locallycloud-secretsmanager.workspace = true
+locallycloud-cloudwatch-monitoring.workspace = true
+locallycloud-cloudwatch-logs.workspace = true
+locallycloud-rds-data.workspace = true
+locallycloud-rds.workspace = true
+locallycloud-analytics.workspace = true
+locallycloud-kinesis.workspace = true
+locallycloud-firehose.workspace = true
+locallycloud-xray.workspace = true
+locallycloud-cloudtrail.workspace = true
+locallycloud-route53.workspace = true
+locallycloud-arc.workspace = true
+locallycloud-region-switch.workspace = true
+locallycloud-wafv2.workspace = true
+locallycloud-cognito.workspace = true
+locallycloud-acm.workspace = true
+locallycloud-cloudfront.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
