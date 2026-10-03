@@ -11,8 +11,3 @@ rsvg-convert -w 512 locallycloud-symbol-light.svg -o locallycloud-symbol-light.p
 rsvg-convert -w 1200 locallycloud-wordmark.svg -o locallycloud-wordmark.png
 rsvg-convert -w 1200 locallycloud-wordmark-light.svg -o locallycloud-wordmark-light.png
 rsvg-convert locallycloud-social.svg -o locallycloud-social.png
-
-# Compatibility filenames used by the current Debian and Arch packaging.
-for asset in locallycloud*.svg locallycloud*.png; do
-  cp -- "$asset" "${asset/locallycloud/localcloud}"
-done

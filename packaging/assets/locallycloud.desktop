@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=LocalCloud Dashboard
-Comment=Open the dashboard of a running LocalCloud instance
+Name=LocallyCloud Dashboard
+Comment=Open the dashboard of a running LocallyCloud instance
 Exec=xdg-open http://127.0.0.1:4566/_localcloud/ui
 TryExec=xdg-open
-Icon=localcloud
+Icon=locallycloud
 Terminal=false
 Categories=Development;

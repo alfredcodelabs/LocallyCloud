@@ -1,0 +1,154 @@
+name: CI and packages
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, develop, stage]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.version.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: version
+        name: Validate version and tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          bash scripts/check-package-version.sh
+          if [[ "$REF_TYPE" == tag ]]; then
+            expected="$(bash scripts/package-version.sh tag)"
+            [[ "$REF_NAME" == "$expected" ]] || {
+              echo "Tag $REF_NAME does not match Cargo.toml ($expected)" >&2
+              exit 1
+            }
+          fi
+          rust="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^rust-version = "\([^"]*\)"/\1/p;}' Cargo.toml)"
+          [[ "$rust" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+
+  debian:
+    needs: version
+    runs-on: ubuntu-24.04
+    container: debian:13
+    timeout-minutes: 60
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git cmake clang libclang-dev pkg-config python3
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install declared Rust toolchain
+        env:
+          RUST_VERSION: ${{ needs.version.outputs.rust }}
+        run: |
+          curl --fail --show-error --silent --location https://sh.rustup.rs -o /tmp/rustup-init.sh
+          bash /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_VERSION" --component rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Check formatting and workspace versions
+        run: |
+          cargo fmt --all -- --check
+          cargo metadata --locked --no-deps --format-version 1 > /tmp/metadata.json
+          python3 - <<'PY'
+          import json, subprocess
+          data = json.load(open('/tmp/metadata.json'))
+          version = subprocess.check_output(['bash', 'scripts/package-version.sh', 'product'], text=True).strip()
+          members = set(data['workspace_members'])
+          assert all(p['version'] == version for p in data['packages'] if p['id'] in members), 'Workspace versions differ'
+          PY
+      - name: Build Debian 13 amd64 package
+        run: |
+          curl --fail --show-error --silent --location https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz -o /tmp/sqlite-autoconf-3530400.tar.gz
+          bash packaging/debian/build-deb.sh /tmp/sqlite-autoconf-3530400.tar.gz
+          package="target/debian-package/dist/localcloud_$(bash scripts/package-version.sh debian)_amd64.deb"
+          [[ "$(dpkg-deb -f "$package" Version)" == "$(bash scripts/package-version.sh debian)" ]]
+          dpkg -i "$package"
+      - name: Test core and state with packaged SQLite
+        run: |
+          export SQLITE3_LIB_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4/lib"
+          export SQLITE3_INCLUDE_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4/include"
+          export SQLITE3_STATIC=1
+          cargo test --locked -p localcloud-core -p localcloud-state --lib
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-debian-amd64
+          path: target/debian-package/dist/*.deb
+          if-no-files-found: error
+
+  arch:
+    needs: version
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    timeout-minutes: 60
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm --needed rust cargo git sqlite cmake clang
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build Arch x86_64 package as unprivileged user
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          bash scripts/check-package-version.sh
+          cd packaging/arch
+          runuser -u builder -- makepkg --cleanbuild --noconfirm
+          expected="localcloud-$(bash ../../scripts/package-version.sh arch)-1-x86_64.pkg.tar.zst"
+          test -f "$expected"
+          pacman -U --noconfirm "$expected"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-arch-x86_64
+          path: packaging/arch/localcloud-*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [debian, arch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release with packages and checksums
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum -- *.deb *.pkg.tar.zst > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          flags=(--verify-tag --generate-notes --title "LocallyCloud $RELEASE_TAG")
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          else
+            flags+=(--latest)
+          fi
+          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst SHA256SUMS
