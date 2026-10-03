@@ -180,6 +180,13 @@ impl InternalDispatcher {
         evaluator.resolve_caller_arn(identity)
     }
 
+    pub fn identity_policy_denies(&self, request: authorization::AuthorizationRequest) -> bool {
+        self.registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+            .is_none_or(|evaluator| evaluator.identity_policy_denies(request))
+    }
+
     pub fn identity_policy_allows(&self, request: authorization::AuthorizationRequest) -> bool {
         self.registry
             .upgrade()
@@ -343,7 +350,44 @@ impl InternalDispatcher {
         body: Bytes,
         request_id: &str,
     ) -> Response {
-        self.dispatch_in_scope(method, uri, headers, body, request_id, None, false, None)
+        self.dispatch_in_scope(
+            method, uri, headers, body, request_id, None, false, None, None,
+        )
+        .await
+    }
+
+    /// Dashboard region selection is an external request, never a trusted account scope.
+    pub(crate) async fn dispatch_dashboard(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: Bytes,
+        region: &str,
+        service: &str,
+    ) -> Response {
+        let regional = Self {
+            registry: self.registry.clone(),
+            _registry_owner: self._registry_owner.clone(),
+            proxy_config: self.proxy_config.clone(),
+            legacy_health: self.legacy_health.clone(),
+            default_region: region.to_owned(),
+            account_id: self.account_id.clone(),
+            meter: self.meter.clone(),
+            kms_blocking_slots: self.kms_blocking_slots.clone(),
+        };
+        regional
+            .dispatch_in_scope(
+                method,
+                uri,
+                headers,
+                body,
+                &crate::observability::new_request_id(),
+                None,
+                false,
+                None,
+                Some(service),
+            )
             .await
     }
 
@@ -367,6 +411,7 @@ impl InternalDispatcher {
             None,
             false,
             Some(peer_ip),
+            None,
         )
         .await
     }
@@ -391,6 +436,7 @@ impl InternalDispatcher {
             request_id,
             Some((account_id, region)),
             false,
+            None,
             None,
         )
         .await
@@ -417,6 +463,7 @@ impl InternalDispatcher {
             Some((account_id, region)),
             true,
             None,
+            None,
         )
         .await
     }
@@ -432,6 +479,7 @@ impl InternalDispatcher {
         scope: Option<(&str, &str)>,
         suppressed: bool,
         peer_ip: Option<IpAddr>,
+        dashboard_service: Option<&str>,
     ) -> Response {
         let started_at = SystemTime::now();
         let authorization = header_str(headers, "authorization");
@@ -439,7 +487,7 @@ impl InternalDispatcher {
         let host = header_str(headers, "host");
         let path = uri.path().to_string();
         let x_amz_credential = uri.query().and_then(extract_x_amz_credential);
-        let region = scope
+        let mut region = scope
             .map(|(_, region)| region.to_owned())
             .unwrap_or_else(|| {
                 extract_region_from_credential_scope(
@@ -465,8 +513,44 @@ impl InternalDispatcher {
                 .with_request_id(request_id.to_string());
             return render(err.render(AwsProtocol::RestJson));
         };
-        let Some(decision) = resolve(&registry, &input)
-            .ok()
+        // The read allowlist already selected a service. Unsigned instance reads may
+        // lack an AWS routing hint or share paths (ECR/API Gateway). Selecting a
+        // destination never supplies an IAM scope or skips signature verification.
+        let selected = dashboard_service.and_then(|service| {
+            let service_name = ServiceName::new(service);
+            registry.native_handler(&service_name)?;
+            Some(crate::router::RoutingDecision {
+                service_name,
+                resolution_source: crate::router::ResolutionSource::DashboardSelection,
+                disposition: RouteDisposition::HandledNatively,
+            })
+        });
+        let public_invoke_region = if scope.is_none()
+            && dashboard_service.is_none()
+            && !claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref())
+        {
+            match registry.native_handler(&ServiceName::new("execute-api")) {
+                Some(handler) => {
+                    handler
+                        .public_invoke_region(&account_id, host.as_deref().unwrap_or(""), &path)
+                        .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Some(decision) = selected
+            .or_else(|| resolve(&registry, &input).ok())
+            .or_else(|| {
+                public_invoke_region
+                    .as_ref()
+                    .map(|_| crate::router::RoutingDecision {
+                        service_name: ServiceName::new("execute-api"),
+                        resolution_source: crate::router::ResolutionSource::HostPath,
+                        disposition: RouteDisposition::HandledNatively,
+                    })
+            })
             .filter(|decision| crate::router::permits_method(decision, method))
         else {
             tracing::warn!(request_id, path = %path, "unresolved request");
@@ -478,6 +562,11 @@ impl InternalDispatcher {
             .with_request_id(request_id.to_string());
             return render(err.render(AwsProtocol::RestJson));
         };
+        let public_invoke =
+            decision.service_name.as_str() == "execute-api" && public_invoke_region.is_some();
+        if public_invoke {
+            region = public_invoke_region.expect("public invocation resolved a region");
+        }
         log_routing_decision(&decision, request_id);
         if let Some(meter) = &self.meter {
             meter.record(decision.service_name.as_str(), body.len() as u64);
@@ -489,9 +578,21 @@ impl InternalDispatcher {
         let operation = safe_operation(
             decision.service_name.as_str(),
             method,
+            uri,
             x_amz_target.as_deref(),
             &body,
         );
+        let resource = crate::activity::resource_name(decision.service_name.as_str(), &path, &body);
+        // This excludes only dashboard reads from diagnostics, never from the audit observer.
+        let dashboard_read = headers
+            .get("x-locallycloud-dashboard")
+            .is_some_and(|v| v == "1")
+            && (*method == Method::GET
+                || ["List", "Describe", "Get", "Filter"]
+                    .iter()
+                    .any(|prefix| operation.starts_with(prefix))
+                || (decision.service_name.as_str() == "dynamodb"
+                    && matches!(operation.as_str(), "Scan" | "Query")));
         let ecr_token_request = decision.service_name.as_str() == "ecr"
             && x_amz_target.as_deref()
                 == Some("AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken");
@@ -501,16 +602,18 @@ impl InternalDispatcher {
             && evaluator
                 .as_ref()
                 .is_some_and(|evaluator| evaluator.strict_sigv4_required());
-        let public_request = unsigned_public_request(
-            decision.service_name.as_str(),
-            method,
-            uri,
-            headers,
-            host.as_deref(),
-        );
+        let public_request = public_invoke
+            || unsigned_public_request(
+                decision.service_name.as_str(),
+                method,
+                uri,
+                headers,
+                host.as_deref(),
+            );
         let verify_external = strict_external
             && (!public_request
                 || claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref()));
+        let mut signature_rejected = false;
         if ecr_token_request || ecs_verified_request || verify_external {
             // DynamoDB Streams is routed separately but signed with the dynamodb service name.
             let signing_service = if decision.service_name.as_str() == "streams.dynamodb" {
@@ -530,103 +633,118 @@ impl InternalDispatcher {
                 )
             });
             if !verified {
-                return invalid_signature(request_id, protocol);
+                signature_rejected = true;
             }
         }
-        let response = match decision.disposition {
-            RouteDisposition::ProxiedToLegacy => {
-                if !self.legacy_health.is_healthy() {
-                    tracing::warn!(
-                        request_id,
-                        service = decision.service_name.as_str(),
-                        "legacy backend known unhealthy; fast-failing proxied request"
-                    );
-                    render(
-                        AwsError::new("BadGateway", "legacy backend is unhealthy", 502)
-                            .with_request_id(request_id.to_string())
-                            .render(protocol),
-                    )
-                } else {
-                    match forward_to_legacy(method, uri, headers, body, &self.proxy_config).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            tracing::warn!(request_id, service = decision.service_name.as_str(), cause = %error,
+        let response = if signature_rejected {
+            invalid_signature(request_id, protocol)
+        } else {
+            match decision.disposition {
+                RouteDisposition::ProxiedToLegacy => {
+                    if !self.legacy_health.is_healthy() {
+                        tracing::warn!(
+                            request_id,
+                            service = decision.service_name.as_str(),
+                            "legacy backend known unhealthy; fast-failing proxied request"
+                        );
+                        render(
+                            AwsError::new("BadGateway", "legacy backend is unhealthy", 502)
+                                .with_request_id(request_id.to_string())
+                                .render(protocol),
+                        )
+                    } else {
+                        match forward_to_legacy(method, uri, headers, body, &self.proxy_config)
+                            .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                tracing::warn!(request_id, service = decision.service_name.as_str(), cause = %error,
                                 "legacy backend forwarding failed");
-                            render(
-                                AwsError::new(error.code(), error.to_string(), error.http_status())
+                                render(
+                                    AwsError::new(
+                                        error.code(),
+                                        error.to_string(),
+                                        error.http_status(),
+                                    )
                                     .with_request_id(request_id.to_string())
                                     .render(protocol),
-                            )
+                                )
+                            }
                         }
                     }
                 }
-            }
-            RouteDisposition::HandledNatively => {
-                match registry.native_handler(&decision.service_name) {
-                    Some(handler) => {
-                        let mut native_headers = headers.clone();
-                        native_headers.remove("x-locallycloud-trusted-peer-ip");
-                        native_headers.remove("x-locallycloud-verified-ecr-sigv4");
-                        // Only Core can attest that an external caller passed strict SigV4.
-                        // Strip any client-supplied value before native dispatch.
-                        native_headers.remove("x-locallycloud-verified-external-sigv4");
-                        native_headers.remove("x-locallycloud-verified-internal-scope");
-                        if scope.is_some() {
-                            native_headers.insert(
-                                "x-locallycloud-verified-internal-scope",
-                                HeaderValue::from_static("1"),
-                            );
-                        }
-                        if strict_external && verify_external {
-                            native_headers.insert(
-                                "x-locallycloud-verified-external-sigv4",
-                                HeaderValue::from_static("1"),
-                            );
-                        }
-                        if ecr_token_request {
-                            native_headers.insert(
-                                "x-locallycloud-verified-ecr-sigv4",
-                                HeaderValue::from_static("1"),
-                            );
-                        }
-                        if matches!(
-                            decision.service_name.as_str(),
-                            "apigateway" | "apigatewayv2" | "execute-api"
-                        ) {
-                            if let Some(peer_ip) = peer_ip {
-                                if let Ok(value) = HeaderValue::from_str(&peer_ip.to_string()) {
-                                    native_headers.insert("x-locallycloud-trusted-peer-ip", value);
+                RouteDisposition::HandledNatively => {
+                    match registry.native_handler(&decision.service_name) {
+                        Some(handler) => {
+                            let mut native_headers = headers.clone();
+                            native_headers.remove("x-locallycloud-trusted-peer-ip");
+                            native_headers.remove("x-locallycloud-verified-ecr-sigv4");
+                            // Only Core can attest that an external caller passed strict SigV4.
+                            // Strip any client-supplied value before native dispatch.
+                            native_headers.remove("x-locallycloud-verified-external-sigv4");
+                            native_headers.remove("x-locallycloud-verified-internal-scope");
+                            if scope.is_none() {
+                                native_headers.remove(identity::PRINCIPAL_HEADER);
+                            }
+                            if scope.is_some() {
+                                native_headers.insert(
+                                    "x-locallycloud-verified-internal-scope",
+                                    HeaderValue::from_static("1"),
+                                );
+                            }
+                            if strict_external && verify_external {
+                                native_headers.insert(
+                                    "x-locallycloud-verified-external-sigv4",
+                                    HeaderValue::from_static("1"),
+                                );
+                            }
+                            if ecr_token_request {
+                                native_headers.insert(
+                                    "x-locallycloud-verified-ecr-sigv4",
+                                    HeaderValue::from_static("1"),
+                                );
+                            }
+                            if matches!(
+                                decision.service_name.as_str(),
+                                "apigateway" | "apigatewayv2" | "execute-api"
+                            ) {
+                                if let Some(peer_ip) = peer_ip {
+                                    if let Ok(value) = HeaderValue::from_str(&peer_ip.to_string()) {
+                                        native_headers
+                                            .insert("x-locallycloud-trusted-peer-ip", value);
+                                    }
                                 }
                             }
+                            handler
+                                .handle(ServiceRequest {
+                                    method: method.clone(),
+                                    uri: uri.clone(),
+                                    headers: native_headers,
+                                    body,
+                                    region: region.clone(),
+                                    account_id: account_id.clone(),
+                                    request_id: request_id.to_string(),
+                                })
+                                .await
                         }
-                        handler
-                            .handle(ServiceRequest {
-                                method: method.clone(),
-                                uri: uri.clone(),
-                                headers: native_headers,
-                                body,
-                                region: region.clone(),
-                                account_id: account_id.clone(),
-                                request_id: request_id.to_string(),
-                            })
-                            .await
+                        None => render(
+                            AwsError::new(
+                                "NotImplementedException",
+                                "native service has no handler registered",
+                                501,
+                            )
+                            .with_request_id(request_id.to_string())
+                            .render(protocol),
+                        ),
                     }
-                    None => render(
-                        AwsError::new(
-                            "NotImplementedException",
-                            "native service has no handler registered",
-                            501,
-                        )
-                        .with_request_id(request_id.to_string())
-                        .render(protocol),
-                    ),
                 }
             }
         };
-        if !suppressed && decision.service_name.as_str() != "cloudtrail" {
+        if !suppressed {
             let error_code = response
                 .headers()
                 .get("x-amzn-errortype")
+                .or_else(|| response.headers().get("x-amz-function-error"))
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.rsplit('#').next())
                 .and_then(|value| value.split(':').next())
@@ -637,7 +755,7 @@ impl InternalDispatcher {
                             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
                 })
                 .map(str::to_string);
-            registry.emit_completion(DispatchOutcome {
+            let outcome = DispatchOutcome {
                 dispatch_id: uuid::Uuid::new_v4().to_string(),
                 request_id: request_id.chars().take(128).collect(),
                 account_id,
@@ -653,7 +771,13 @@ impl InternalDispatcher {
                 completed_at: SystemTime::now(),
                 http_status: response.status().as_u16(),
                 error_code,
-            });
+            };
+            if !dashboard_read {
+                registry.activity.record(&outcome, resource);
+            }
+            if decision.service_name.as_str() != "cloudtrail" {
+                registry.emit_completion(outcome);
+            }
         }
         response
     }
@@ -689,7 +813,34 @@ impl InternalDispatcher {
             return render(err.render(AwsProtocol::RestJson));
         };
 
-        match resolve(&registry, &input) {
+        let public_invoke_region =
+            if !claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref()) {
+                match registry.native_handler(&ServiceName::new("execute-api")) {
+                    Some(handler) => {
+                        handler
+                            .public_invoke_region(
+                                &self.account_id,
+                                host.as_deref().unwrap_or(""),
+                                &path,
+                            )
+                            .await
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+        let decision = resolve(&registry, &input).or_else(|error| {
+            public_invoke_region
+                .as_ref()
+                .map(|_| crate::router::RoutingDecision {
+                    service_name: ServiceName::new("execute-api"),
+                    resolution_source: crate::router::ResolutionSource::HostPath,
+                    disposition: RouteDisposition::HandledNatively,
+                })
+                .ok_or(error)
+        });
+        match decision {
             Ok(decision) => {
                 log_routing_decision(&decision, request_id);
                 if let Some(meter) = &self.meter {
@@ -703,6 +854,11 @@ impl InternalDispatcher {
                     authorization.as_deref(),
                     x_amz_credential.as_deref(),
                 )
+                .or_else(|| {
+                    (decision.service_name.as_str() == "execute-api")
+                        .then_some(public_invoke_region)
+                        .flatten()
+                })
                 .unwrap_or_else(|| self.default_region.clone());
                 let evaluator = registry.authorization_evaluator(&ServiceName::new("iam"));
                 let strict = evaluator
@@ -839,7 +995,41 @@ fn unsigned_public_request(
     }
 }
 
-fn safe_operation(service: &str, method: &Method, target: Option<&str>, body: &[u8]) -> String {
+fn safe_operation(
+    service: &str,
+    method: &Method,
+    uri: &Uri,
+    target: Option<&str>,
+    body: &[u8],
+) -> String {
+    if service == "lambda" {
+        let path: Vec<_> = uri.path().trim_matches('/').split('/').collect();
+        return match (method, path.as_slice()) {
+            (&Method::GET, ["2015-03-31", "functions"]) => "ListFunctions",
+            (&Method::POST, ["2015-03-31", "functions"]) => "CreateFunction",
+            (&Method::GET, ["2015-03-31", "functions", _]) => "GetFunction",
+            (&Method::DELETE, ["2015-03-31", "functions", _]) => "DeleteFunction",
+            (&Method::GET, ["2015-03-31", "functions", _, "configuration"]) => {
+                "GetFunctionConfiguration"
+            }
+            (&Method::PUT, ["2015-03-31", "functions", _, "configuration"]) => {
+                "UpdateFunctionConfiguration"
+            }
+            (&Method::PUT, ["2015-03-31", "functions", _, "code"]) => "UpdateFunctionCode",
+            (&Method::POST, ["2015-03-31", "functions", _, "invocations"]) => "Invoke",
+            (&Method::GET, ["2015-03-31", "event-source-mappings"]) => "ListEventSourceMappings",
+            (&Method::POST, ["2015-03-31", "event-source-mappings"]) => "CreateEventSourceMapping",
+            (&Method::GET, ["2015-03-31", "event-source-mappings", _]) => "GetEventSourceMapping",
+            (&Method::PUT, ["2015-03-31", "event-source-mappings", _]) => {
+                "UpdateEventSourceMapping"
+            }
+            (&Method::DELETE, ["2015-03-31", "event-source-mappings", _]) => {
+                "DeleteEventSourceMapping"
+            }
+            _ => "Unknown",
+        }
+        .to_string();
+    }
     let accepted_target = match service {
         "sqs" => target.filter(|value| value.starts_with("AmazonSQS.")),
         _ => target,
@@ -948,6 +1138,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lambda_operation_matches_resource_path_and_method() {
+        for (method, path, expected) in [
+            (Method::GET, "/2015-03-31/functions/", "ListFunctions"),
+            (
+                Method::DELETE,
+                "/2015-03-31/functions/orders",
+                "DeleteFunction",
+            ),
+            (
+                Method::GET,
+                "/2015-03-31/event-source-mappings/",
+                "ListEventSourceMappings",
+            ),
+            (
+                Method::DELETE,
+                "/2015-03-31/event-source-mappings/mapping",
+                "DeleteEventSourceMapping",
+            ),
+            (
+                Method::GET,
+                "/2015-03-31/functions/orders/policy",
+                "Unknown",
+            ),
+            (Method::DELETE, "/unmapped", "Unknown"),
+        ] {
+            assert_eq!(
+                safe_operation(
+                    "lambda",
+                    &method,
+                    &path.parse().unwrap(),
+                    Some("forged.DeleteFunction"),
+                    b"Action=DeleteFunction"
+                ),
+                expected
+            );
+        }
+    }
+
     fn strict_dispatcher(accepts_signature: bool) -> InternalDispatcher {
         let registry = ServiceRegistry::with_known_services();
         registry.register_native_with_authorization_evaluator(
@@ -971,6 +1200,74 @@ mod tests {
             "us-east-1".into(),
             "000000000000".into(),
         )
+    }
+
+    #[tokio::test]
+    async fn public_invoke_routes_region_without_attesting_identity_or_bypassing_signatures() {
+        struct RegionalInvoke;
+        #[async_trait::async_trait]
+        impl NativeHandler for RegionalInvoke {
+            async fn public_invoke_region(
+                &self,
+                account: &str,
+                _: &str,
+                path: &str,
+            ) -> Option<String> {
+                assert_eq!(account, "000000000000");
+                (path == "/execute-api/west/dev/orders").then(|| "us-west-2".into())
+            }
+            async fn handle(&self, request: ServiceRequest) -> Response {
+                assert!(!request.headers.contains_key(identity::PRINCIPAL_HEADER));
+                assert!(!request
+                    .headers
+                    .contains_key("x-locallycloud-verified-internal-scope"));
+                Response::new(Body::from(request.region))
+            }
+        }
+        let dispatcher = strict_dispatcher(false);
+        dispatcher.registry.upgrade().unwrap().register_native(
+            ServiceName::new("execute-api"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            Arc::new(RegionalInvoke),
+        );
+        let path = "/execute-api/west/dev/orders".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(identity::PRINCIPAL_HEADER, "forged".parse().unwrap());
+        let response = dispatcher
+            .dispatch(&Method::GET, &path, &headers, Bytes::new(), "rid")
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            "us-west-2"
+        );
+        headers.insert("authorization", auth("execute-api").parse().unwrap());
+        let response = dispatcher
+            .dispatch(&Method::GET, &path, &headers, Bytes::new(), "rid")
+            .await;
+        assert_eq!(
+            response.status(),
+            403,
+            "public routing must not bypass a claimed signature"
+        );
+        headers.remove("authorization");
+        let response = dispatcher
+            .dispatch_dashboard(
+                &Method::GET,
+                &path,
+                &headers,
+                Bytes::new(),
+                "us-west-2",
+                "execute-api",
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            403,
+            "public routes must not open the dashboard proxy"
+        );
     }
 
     #[tokio::test]
@@ -1014,11 +1311,57 @@ mod tests {
         assert_eq!(response.status(), 200);
     }
 
+    #[tokio::test]
+    async fn dashboard_region_keeps_strict_external_verification() {
+        let dispatcher = strict_dispatcher(false);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-target", "AmazonSQS.ListQueues".parse().unwrap());
+        headers.insert("x-locallycloud-dashboard", "1".parse().unwrap());
+        let response = dispatcher
+            .dispatch_dashboard(
+                &Method::POST,
+                &"/".parse().unwrap(),
+                &headers,
+                Bytes::from_static(b"{}"),
+                "us-west-2",
+                "sqs",
+            )
+            .await;
+        assert_eq!(response.status(), 403);
+        headers.remove("x-amz-target");
+        let response = dispatcher
+            .dispatch_dashboard(
+                &Method::POST,
+                &"/".parse().unwrap(),
+                &headers,
+                Bytes::from_static(b"{}"),
+                "us-west-2",
+                "sqs",
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            403,
+            "explicit service selection must still verify external identity"
+        );
+    }
+
     struct MarkerHandler;
 
     #[async_trait::async_trait]
     impl NativeHandler for MarkerHandler {
         async fn handle(&self, request: ServiceRequest) -> Response {
+            if request
+                .headers
+                .contains_key("x-locallycloud-verified-internal-scope")
+            {
+                assert_eq!(
+                    request.headers.get(identity::PRINCIPAL_HEADER).unwrap(),
+                    "arn:aws:iam::000000000000:role/test"
+                );
+            } else {
+                assert!(!request.headers.contains_key(identity::PRINCIPAL_HEADER));
+            }
             let marker = request
                 .headers
                 .get("x-locallycloud-verified-external-sigv4")
@@ -1063,6 +1406,10 @@ mod tests {
         headers.insert(
             "x-locallycloud-verified-external-sigv4",
             "forged".parse().unwrap(),
+        );
+        headers.insert(
+            identity::PRINCIPAL_HEADER,
+            "arn:aws:iam::000000000000:role/test".parse().unwrap(),
         );
         let internal = dispatcher
             .dispatch_scoped(
@@ -1649,6 +1996,97 @@ mod tests {
         assert_eq!(response.status(), 200);
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert_eq!(capture.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dashboard_reads_skip_activity_but_writes_and_audit_remain_visible() {
+        struct FailedHandler;
+        #[async_trait::async_trait]
+        impl NativeHandler for FailedHandler {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                Response::builder()
+                    .status(400)
+                    .header("x-amzn-errortype", "QueueDoesNotExist")
+                    .body(Body::from("private-response"))
+                    .unwrap()
+            }
+        }
+        let reg = ServiceRegistry::with_known_services();
+        reg.register_native(
+            ServiceName::new("sqs"),
+            ServiceMetadata::new(AwsProtocol::Json10, Some("AmazonSQS")),
+            Arc::new(FailedHandler),
+        );
+        reg.register_native(
+            ServiceName::new("dynamodb"),
+            ServiceMetadata::new(AwsProtocol::Json10, Some("DynamoDB_20120810")),
+            Arc::new(FailedHandler),
+        );
+        let observer = Arc::new(CaptureObserver(std::sync::Mutex::new(Vec::new())));
+        reg.set_completion_observer(observer.clone());
+        let dispatcher = InternalDispatcher::new(
+            reg.clone(),
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(2),
+            },
+            LegacyHealth::new(true),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let mut headers = HeaderMap::new();
+        for (index, operation) in ["GetQueueUrl", "GetQueueUrl", "SendMessage"]
+            .iter()
+            .enumerate()
+        {
+            headers.insert(
+                "x-amz-target",
+                format!("AmazonSQS.{operation}").parse().unwrap(),
+            );
+            if index > 0 {
+                headers.insert("x-locallycloud-dashboard", "1".parse().unwrap());
+            }
+            let response = dispatcher
+                .dispatch(
+                    &Method::POST,
+                    &"/".parse().unwrap(),
+                    &headers,
+                    Bytes::from_static(
+                        br#"{"QueueUrl":"http://localhost/queue","MessageBody":"private-payload"}"#,
+                    ),
+                    "request-id",
+                )
+                .await;
+            assert_eq!(response.status(), 400);
+        }
+        for operation in ["Scan", "Query"] {
+            headers.insert(
+                "x-amz-target",
+                format!("DynamoDB_20120810.{operation}").parse().unwrap(),
+            );
+            dispatcher
+                .dispatch(
+                    &Method::POST,
+                    &"/".parse().unwrap(),
+                    &headers,
+                    Bytes::from_static(br#"{"TableName":"orders"}"#),
+                    "request-id",
+                )
+                .await;
+        }
+        let snapshot = reg.activity.snapshot();
+        assert_eq!(snapshot.records.len(), 2);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(serialized.contains("QueueDoesNotExist"));
+        assert!(!serialized.contains("private-payload"));
+        assert!(!serialized.contains("private-response"));
+        for _ in 0..50 {
+            if observer.0.lock().unwrap().len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(observer.0.lock().unwrap().len(), 5);
     }
 
     #[tokio::test]

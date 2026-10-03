@@ -2,8 +2,8 @@
 //!
 //! A read-only view over the [`ServiceRegistry`](crate::registry::ServiceRegistry) (the single
 //! source of truth for which services are enabled and how they are handled). `status_json`
-//! powers both programmatic checks and the embedded dashboard; the dashboard is a single
-//! self-contained HTML page (no build step, no framework) served from the binary.
+//! powers both programmatic checks and the embedded dashboard. Its HTML and JavaScript are
+//! served from the binary without a build step or framework.
 
 use serde_json::json;
 
@@ -13,6 +13,52 @@ use crate::registry::{Disposition, ServiceRegistry};
 
 /// The built-in dashboard page, polling `/_locallycloud/status`.
 pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+pub const DASHBOARD_JS: &str = include_str!("dashboard.js");
+pub const DASHBOARD_I18N: &str = include_str!("dashboard-i18n.js");
+pub const DASHBOARD_CSS: &str = include_str!("dashboard.css");
+
+/// One embedded SVG sprite; related API namespaces share the same symbol.
+pub const SERVICE_ICONS_SVG: &str = include_str!("icons/sprite.svg");
+
+/// Return the sprite symbol ID for a registered service.
+pub fn service_icon(service: &str) -> Option<&'static str> {
+    match service {
+        "dynamodb" | "streams.dynamodb" => Some("dynamodb"),
+        "s3" => Some("s3"),
+        "lambda" => Some("lambda"),
+        "logs" | "monitoring" => Some("logs"),
+        "states" => Some("states"),
+        "sqs" => Some("sqs"),
+        "acm" => Some("acm"),
+        "apigateway" | "apigatewayv2" | "execute-api" => Some("apigateway"),
+        "athena" => Some("athena"),
+        "cloudformation" => Some("cloudformation"),
+        "cloudfront" => Some("cloudfront"),
+        "cloudtrail" => Some("cloudtrail"),
+        "cognito-idp" => Some("cognito-idp"),
+        "ec2" => Some("ec2"),
+        "ecr" => Some("ecr"),
+        "ecs" => Some("ecs"),
+        "elasticloadbalancing" => Some("elasticloadbalancing"),
+        "events" | "pipes" | "scheduler" | "schemas" => Some("events"),
+        "firehose" => Some("firehose"),
+        "glue" => Some("glue"),
+        "iam" | "sts" => Some("iam"),
+        "kinesis" => Some("kinesis"),
+        "kms" => Some("kms"),
+        "rds" | "rds-data" => Some("rds"),
+        "route53"
+        | "arc-region-switch"
+        | "route53-recovery-cluster"
+        | "route53-recovery-control-config" => Some("route53"),
+        "secretsmanager" => Some("secretsmanager"),
+        "sns" => Some("sns"),
+        "ssm" => Some("ssm"),
+        "wafv2" => Some("wafv2"),
+        "xray" => Some("xray"),
+        _ => None,
+    }
+}
 
 /// Build the status document: product/version/readiness, every registered service with its
 /// protocol and disposition (`Native` = handled in-process, `Proxied` = forwarded), plus
@@ -45,6 +91,7 @@ pub fn status_json(
                 .unwrap_or(0.0);
             json!({
                 "name": s.name,
+                "icon": service_icon(s.name.as_str()).map(|symbol| format!("/_locallycloud/icons.svg#{symbol}")),
                 "protocol": s.protocol.as_str(),
                 "disposition": s.disposition.as_str(),
                 "requests": requests,
@@ -114,6 +161,9 @@ mod tests {
             .unwrap();
         assert_eq!(s3["disposition"], "Native");
         assert_eq!(s3["protocol"], "REST-XML");
+        assert_eq!(s3["icon"], "/_locallycloud/icons.svg#s3");
+        assert_eq!(service_icon("logs"), service_icon("monitoring"));
+        assert!(service_icon("unknown-service").is_none());
         let sqs = doc["services"]
             .as_array()
             .unwrap()
@@ -126,6 +176,11 @@ mod tests {
     #[test]
     fn dashboard_html_is_embedded() {
         assert!(DASHBOARD_HTML.contains("locallycloud"));
-        assert!(DASHBOARD_HTML.contains("/_locallycloud/status"));
+        assert!(DASHBOARD_HTML.contains("/_locallycloud/dashboard.js"));
+        assert!(DASHBOARD_HTML.contains("/_locallycloud/dashboard.css"));
+        assert!(!DASHBOARD_HTML.contains("<style>"));
+        assert!(DASHBOARD_CSS.contains(".brand-logo"));
+        assert!(DASHBOARD_HTML.contains("/_locallycloud/brand/icon.svg"));
+        assert!(DASHBOARD_JS.contains("/_locallycloud/status"));
     }
 }

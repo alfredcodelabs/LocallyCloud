@@ -14,9 +14,11 @@
 //! Each module is currently a skeleton; behavior is filled in by the core
 //! implementation tasks.
 
+pub mod activity;
 pub mod audit;
 pub mod config;
 pub mod cost;
+mod dashboard_context;
 pub mod endpoint;
 pub mod error_mapping;
 pub mod handler;

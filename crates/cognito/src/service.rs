@@ -572,6 +572,17 @@ impl CognitoHandler {
 
 #[async_trait]
 impl NativeHandler for CognitoHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .pools
+            .read()
+            .map_err(|_| "Cognito inventory unavailable")?
+            .keys()
+            .filter(|k| k.account == account)
+            .map(|k| k.region.clone())
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let result = if request.method == http::Method::GET {
             self.public_metadata_response(&request)

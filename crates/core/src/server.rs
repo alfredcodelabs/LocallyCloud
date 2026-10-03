@@ -8,15 +8,18 @@
 //! path shared with cross-service calls. See Requirements 2, 3 and 23.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use crate::dashboard_context::{
+    encode, query_read, read_target, rest_read, valid_region, DashboardContext,
+};
 use axum::body::Body;
 use axum::extract::{
-    connect_info::ConnectInfo, ws::WebSocketUpgrade, FromRequestParts, Request, State,
+    connect_info::ConnectInfo, ws::WebSocketUpgrade, FromRequestParts, Path, Query, Request, State,
 };
-use axum::response::Response;
-use axum::routing::{any, get};
-use axum::Router;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get, post};
+use axum::{Json, Router};
 
 use crate::config::LocallyCloudConfig;
 use crate::error_mapping::AwsError;
@@ -44,6 +47,7 @@ struct AppState {
     registry: Arc<ServiceRegistry>,
     meter: Arc<crate::metering::Meter>,
     max_request_body_bytes: usize,
+    dashboard: Arc<DashboardContext>,
 }
 
 pub struct LocallyCloudServer {
@@ -98,12 +102,38 @@ impl LocallyCloudServer {
             registry: self.registry.clone(),
             meter,
             max_request_body_bytes: self.config.max_request_body_bytes,
+            dashboard: Arc::new(
+                DashboardContext::load(
+                    addr,
+                    self.config.account_id.clone(),
+                    self.config.default_region.clone(),
+                )
+                .await,
+            ),
         };
         let app = Router::new()
             .route("/_locallycloud/health", get(health_handler))
             .route("/_localstack/health", get(health_handler))
             .route("/_locallycloud/status", get(status_handler))
+            .route("/_locallycloud/activity", post(activity_handler))
+            .route("/_locallycloud/context", get(context_handler))
+            .route(
+                "/_locallycloud/explore/regions",
+                post(explorer_regions_handler),
+            )
+            .route(
+                "/_locallycloud/explore/read",
+                axum::routing::post(explorer_read_handler),
+            )
             .route("/_locallycloud/ui", get(ui_handler))
+            .route("/_locallycloud/ui/", get(ui_handler))
+            .route("/_locallycloud/ui/{*page}", get(ui_handler))
+            .route("/_locallycloud/explore/s3", get(s3_explorer_handler))
+            .route("/_locallycloud/dashboard.js", get(ui_script_handler))
+            .route("/_locallycloud/dashboard.css", get(ui_style_handler))
+            .route("/_locallycloud/brand/{asset}", get(ui_brand_handler))
+            .route("/_locallycloud/dashboard-i18n.js", get(ui_i18n_handler))
+            .route("/_locallycloud/icons.svg", get(ui_icons_handler))
             .fallback(any(dispatch_handler))
             .with_state(state);
 
@@ -169,15 +199,520 @@ async fn status_handler(State(state): State<AppState>) -> Response {
         .expect("status response is always valid")
 }
 
+#[derive(serde::Deserialize)]
+struct S3Browse {
+    bucket: Option<String>,
+    prefix: Option<String>,
+    token: Option<String>,
+    #[serde(flatten)]
+    context: BrowseContext,
+}
+
+impl S3Browse {
+    fn uri(&self) -> Result<http::Uri, &'static str> {
+        let Some(bucket) = &self.bucket else {
+            return Ok(http::Uri::from_static("/"));
+        };
+        if bucket.is_empty()
+            || bucket.len() > 63
+            || !bucket
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        {
+            return Err("invalid bucket name");
+        }
+        let mut path = format!("/{bucket}?list-type=2&delimiter=%2F&max-keys=100");
+        for (key, value) in [
+            ("prefix", &self.prefix),
+            ("continuation-token", &self.token),
+        ] {
+            if let Some(value) = value {
+                path.push_str(&format!("&{key}={}", encode(value)));
+            }
+        }
+        path.parse().map_err(|_| "invalid S3 listing URI")
+    }
+}
+
+// Browsers cannot set Host. Adapt only S3 listings to the normal AWS dispatcher;
+// IAM, account/region scope and audit remain enforced by that shared path.
+async fn s3_explorer_handler(
+    State(state): State<AppState>,
+    Query(query): Query<S3Browse>,
+    incoming: http::HeaderMap,
+) -> Response {
+    if !local_dashboard_headers(&incoming) {
+        return dashboard_error("dashboard reads require the local origin", 403);
+    }
+    let uri = match query.uri() {
+        Ok(uri) => uri,
+        Err(message) => {
+            return render(
+                AwsError::new("InvalidArgument", message, 400).render(AwsProtocol::RestXml),
+            )
+        }
+    };
+    let mut headers = http::HeaderMap::new();
+    headers.insert("host", http::HeaderValue::from_static("s3.localhost"));
+    headers.insert(
+        "x-locallycloud-dashboard",
+        http::HeaderValue::from_static("1"),
+    );
+    dashboard_read(
+        &state,
+        &query.context,
+        &http::Method::GET,
+        &uri,
+        headers,
+        bytes::Bytes::new(),
+        "s3",
+    )
+    .await
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BrowseContext {
+    region: Option<String>,
+    profile: Option<String>,
+}
+
+async fn context_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let dashboard = state.dashboard.refreshed().await;
+    Json(serde_json::json!({"accountId": state.dashboard.account_id,
+        "defaultRegion": state.dashboard.default_region, "defaultProfile": "instance",
+        "profiles": dashboard.profiles.iter().map(|p| serde_json::json!({"name": p.name, "region": p.region, "signed": p.credentials.is_some()})).collect::<Vec<_>>() }))
+}
+
+#[derive(serde::Deserialize)]
+struct BrowseRead {
+    #[serde(flatten)]
+    context: BrowseContext,
+    service: String,
+    operation: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    body: serde_json::Value,
+}
+
+// Resolve the account through the same verified STS path as the header. The browser
+// cannot request an arbitrary account's inventory by supplying an account id.
+struct DashboardAccount {
+    account: String,
+    region: String,
+    access_key: Option<String>,
+}
+
+async fn dashboard_account(
+    state: &AppState,
+    context: &BrowseContext,
+) -> Result<DashboardAccount, Box<Response>> {
+    let dashboard = state.dashboard.refreshed().await;
+    let profile = dashboard
+        .profile(context.profile.as_deref().unwrap_or("instance"))
+        .ok_or_else(|| Box::new(dashboard_error("unknown local profile", 400)))?;
+    let region = context.region.as_deref().unwrap_or(&profile.region);
+    if !valid_region(region) {
+        return Err(Box::new(dashboard_error("invalid region", 400)));
+    }
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "content-type",
+        http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+    );
+    headers.insert("host", http::HeaderValue::from_static("localhost"));
+    let identity = dispatch_dashboard_profile(
+        state,
+        profile,
+        region,
+        &http::Method::POST,
+        &http::Uri::from_static("/"),
+        headers,
+        bytes::Bytes::from_static(b"Action=GetCallerIdentity&Version=2011-06-15"),
+        "sts",
+    )
+    .await;
+    if !identity.status().is_success() {
+        return Err(Box::new(identity));
+    }
+    let Ok(body) = axum::body::to_bytes(identity.into_body(), 64 * 1024).await else {
+        return Err(Box::new(dashboard_error(
+            "identity response unavailable",
+            502,
+        )));
+    };
+    // STS is the in-process producer of this fixed response; only its decimal Account
+    // field is consumed, never arbitrary XML, resource values or client-supplied scope.
+    let account = std::str::from_utf8(&body)
+        .ok()
+        .and_then(|s| s.split_once("<Account>"))
+        .and_then(|(_, s)| s.split_once("</Account>"))
+        .map(|(account, _)| account)
+        .filter(|account| account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit()));
+    let Some(account) = account else {
+        return Err(Box::new(dashboard_error("invalid STS account", 502)));
+    };
+    Ok(DashboardAccount {
+        account: account.to_owned(),
+        region: region.to_owned(),
+        access_key: profile.access_key.clone(),
+    })
+}
+
+async fn explorer_regions_handler(
+    State(state): State<AppState>,
+    incoming: http::HeaderMap,
+    Json(context): Json<BrowseContext>,
+) -> Response {
+    if !local_dashboard_headers(&incoming) {
+        return dashboard_error("dashboard reads require the local origin", 403);
+    }
+    let verified = match dashboard_account(&state, &context).await {
+        Ok(verified) => verified,
+        Err(error) => return *error,
+    };
+    let account = &verified.account;
+    match state.registry.resource_inventory(account).await {
+        Ok(inventory) => {
+            Json(serde_json::json!({"accountId": account, "regions": inventory.regions, "services": inventory.services})).into_response()
+        }
+        Err(message) => dashboard_error(message, 503),
+    }
+}
+
+async fn explorer_read_handler(
+    State(state): State<AppState>,
+    incoming: http::HeaderMap,
+    Json(read): Json<BrowseRead>,
+) -> Response {
+    if !local_dashboard_headers(&incoming) {
+        return dashboard_error("dashboard reads require the local origin", 403);
+    }
+    let mut headers = http::HeaderMap::new();
+    let (method, uri, body) =
+        if read.service == "sts" && read.operation.as_deref() == Some("GetCallerIdentity") {
+            headers.insert(
+                "content-type",
+                http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            (
+                http::Method::POST,
+                http::Uri::from_static("/"),
+                bytes::Bytes::from_static(b"Action=GetCallerIdentity&Version=2011-06-15"),
+            )
+        } else if read.service == "lambda" {
+            let Some(path) = read.path.as_deref().filter(|path| lambda_read_path(path)) else {
+                return dashboard_error("unsupported Lambda read", 400);
+            };
+            let Ok(uri) = format!("/2015-03-31/{path}").parse::<http::Uri>() else {
+                return dashboard_error("invalid path", 400);
+            };
+            (http::Method::GET, uri, bytes::Bytes::new())
+        } else if matches!(read.service.as_str(), "sns" | "cloudformation") {
+            let body = match query_read(
+                &read.service,
+                read.operation.as_deref().unwrap_or(""),
+                &read.body,
+            ) {
+                Ok(body) => body,
+                Err(message) => return dashboard_error(message, 400),
+            };
+            headers.insert(
+                "content-type",
+                http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            (
+                http::Method::POST,
+                http::Uri::from_static("/"),
+                bytes::Bytes::from(body),
+            )
+        } else if matches!(read.service.as_str(), "apigateway" | "scheduler" | "pipes") {
+            let uri = match rest_read(&read.service, read.path.as_deref().unwrap_or("")) {
+                Ok(uri) => uri,
+                Err(message) => return dashboard_error(message, 400),
+            };
+            (http::Method::GET, uri, bytes::Bytes::new())
+        } else {
+            let Some((target, version)) =
+                read_target(&read.service, read.operation.as_deref().unwrap_or(""))
+            else {
+                return dashboard_error("unsupported dashboard read", 400);
+            };
+            headers.insert(
+                "content-type",
+                format!("application/x-amz-json-{version}").parse().unwrap(),
+            );
+            headers.insert(
+                "x-amz-target",
+                format!("{target}.{}", read.operation.as_deref().unwrap())
+                    .parse()
+                    .unwrap(),
+            );
+            (
+                http::Method::POST,
+                http::Uri::from_static("/"),
+                bytes::Bytes::from(read.body.to_string()),
+            )
+        };
+    headers.insert("host", http::HeaderValue::from_static("localhost"));
+    dashboard_read(
+        &state,
+        &read.context,
+        &method,
+        &uri,
+        headers,
+        body,
+        &read.service,
+    )
+    .await
+}
+
+// Profile signing is a local UI capability. Reject DNS rebinding and foreign origins;
+// shared credentials are not loaded when the listener is bound beyond loopback.
+fn local_dashboard_headers(headers: &http::HeaderMap) -> bool {
+    let Some(host) = headers.get("host").and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let Ok(authority) = host.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    if !matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]") {
+        return false;
+    }
+    headers.get("origin").is_none_or(|origin| {
+        origin
+            .to_str()
+            .is_ok_and(|origin| origin == format!("http://{host}"))
+    })
+}
+
+fn lambda_read_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or("");
+    if path == "functions/" || path == "event-source-mappings/" {
+        return true;
+    }
+    let parts: Vec<_> = path.split('/').collect();
+    parts.len() == 3
+        && parts[0] == "functions"
+        && !parts[1].is_empty()
+        && parts[2] == "configuration"
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dashboard_read(
+    state: &AppState,
+    context: &BrowseContext,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: http::HeaderMap,
+    body: bytes::Bytes,
+    service: &str,
+) -> Response {
+    let dashboard = state.dashboard.refreshed().await;
+    let Some(profile) = dashboard.profile(context.profile.as_deref().unwrap_or("instance")) else {
+        return dashboard_error("unknown local profile", 400);
+    };
+    let region = context.region.as_deref().unwrap_or(&profile.region);
+    if !valid_region(region) {
+        return dashboard_error("invalid region", 400);
+    }
+    dispatch_dashboard_profile(state, profile, region, method, uri, headers, body, service).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_dashboard_profile(
+    state: &AppState,
+    profile: &crate::dashboard_context::Profile,
+    region: &str,
+    method: &http::Method,
+    uri: &http::Uri,
+    mut headers: http::HeaderMap,
+    body: bytes::Bytes,
+    service: &str,
+) -> Response {
+    headers.insert(
+        "x-locallycloud-dashboard",
+        http::HeaderValue::from_static("1"),
+    );
+    if let (Some(access), Some(credentials)) = (&profile.access_key, &profile.credentials) {
+        if crate::integration::sigv4::sign(
+            method,
+            uri,
+            &mut headers,
+            &body,
+            region,
+            service,
+            access,
+            credentials,
+        )
+        .is_none()
+        {
+            return dashboard_error("local profile could not sign the request", 400);
+        }
+    }
+    state
+        .dispatcher
+        .dispatch_dashboard(method, uri, &headers, body, region, service)
+        .await
+}
+
+fn dashboard_error(message: &str, status: u16) -> Response {
+    render(AwsError::new("InvalidRequest", message, status).render(AwsProtocol::RestJson))
+}
+
 async fn ui_handler() -> Response {
     Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
+        .header("cache-control", "no-store")
         .body(Body::from(crate::status::DASHBOARD_HTML))
         .expect("dashboard html is always valid")
 }
 
+async fn activity_handler(
+    State(state): State<AppState>,
+    incoming: http::HeaderMap,
+    Json(context): Json<BrowseContext>,
+) -> Response {
+    if !local_dashboard_headers(&incoming) {
+        return dashboard_error("dashboard reads require the local origin", 403);
+    }
+    let verified = match dashboard_account(&state, &context).await {
+        Ok(verified) => verified,
+        Err(error) => return *error,
+    };
+    if state
+        .dispatcher
+        .authorize(crate::integration::authorization::AuthorizationRequest {
+            request_identity: crate::integration::RequestIdentity {
+                account_id: verified.account.clone(),
+                access_key_id: verified.access_key,
+                arn: None,
+            },
+            delegated_identity: None,
+            source_service: "dashboard".into(),
+            action: "cloudtrail:LookupEvents".into(),
+            resource: "*".into(),
+            context: std::collections::BTreeMap::from([(
+                "aws:requestedregion".into(),
+                vec![verified.region.clone()],
+            )]),
+        })
+        .is_err()
+    {
+        return render(
+            AwsError::new(
+                "AccessDeniedException",
+                "not authorized to inspect activity",
+                403,
+            )
+            .render(AwsProtocol::RestJson),
+        );
+    }
+    Json(
+        state
+            .registry
+            .activity
+            .snapshot_scoped(&verified.account, &verified.region),
+    )
+    .into_response()
+}
+
+async fn ui_script_handler() -> Response {
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/javascript; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(Body::from(crate::status::DASHBOARD_JS))
+        .expect("dashboard script is always valid")
+}
+
+async fn ui_style_handler() -> Response {
+    Response::builder()
+        .header("content-type", "text/css; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(Body::from(crate::status::DASHBOARD_CSS))
+        .expect("embedded dashboard CSS response is always valid")
+}
+
+async fn ui_brand_handler(Path(asset): Path<String>) -> Response {
+    let svg = match asset.as_str() {
+        "icon.svg" => include_str!("../../../packaging/assets/locallycloud.svg"),
+        "wordmark.svg" => include_str!("../../../packaging/assets/locallycloud-wordmark.svg"),
+        "wordmark-light.svg" => {
+            include_str!("../../../packaging/assets/locallycloud-wordmark-light.svg")
+        }
+        _ => return Response::builder().status(404).body(Body::empty()).unwrap(),
+    };
+    Response::builder()
+        .header("content-type", "image/svg+xml")
+        .header("cache-control", "no-store")
+        .body(Body::from(svg))
+        .expect("embedded brand asset response is always valid")
+}
+
+async fn ui_i18n_handler() -> Response {
+    Response::builder()
+        .header("content-type", "text/javascript; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(Body::from(crate::status::DASHBOARD_I18N))
+        .expect("dashboard translations response is always valid")
+}
+
+async fn ui_icons_handler(headers: http::HeaderMap) -> Response {
+    use sha2::Digest;
+    static ETAG: OnceLock<String> = OnceLock::new();
+    let etag = ETAG.get_or_init(|| {
+        format!(
+            "\"{:x}\"",
+            sha2::Sha256::digest(crate::status::SERVICE_ICONS_SVG)
+        )
+    });
+    let unchanged = headers
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+            })
+        });
+    Response::builder()
+        .status(if unchanged { 304 } else { 200 })
+        .header("content-type", "image/svg+xml")
+        .header("cache-control", "public, no-cache")
+        .header("etag", etag.as_str())
+        .body(if unchanged {
+            Body::empty()
+        } else {
+            Body::from(crate::status::SERVICE_ICONS_SVG)
+        })
+        .expect("embedded service sprite response is always valid")
+}
+
+fn dashboard_ui_request(method: &http::Method, uri: &http::Uri, headers: &http::HeaderMap) -> bool {
+    let path = uri.path().trim_start_matches('/');
+    let region = path.split('/').next().unwrap_or("");
+    method == http::Method::GET
+        && (valid_region(region) || matches!(region, "home" | "dashboard"))
+        && headers
+            .get("accept")
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| h.contains("text/html"))
+        && !headers.contains_key("authorization")
+        && !headers.contains_key("x-amz-target")
+        && !uri
+            .query()
+            .is_some_and(|q| q.to_ascii_lowercase().contains("x-amz-"))
+        && !headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| h.contains(".s3."))
+}
+
 async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Response {
+    if dashboard_ui_request(req.method(), req.uri(), req.headers()) {
+        return ui_handler().await;
+    }
     let (mut parts, body) = req.into_parts();
     let peer = ConnectInfo::<SocketAddr>::from_request_parts(&mut parts, &state)
         .await
@@ -260,5 +795,113 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod dashboard_tests {
+
+    #[tokio::test]
+    async fn service_sprite_is_cacheable_and_revalidates_by_content() {
+        let response = super::ui_icons_handler(http::HeaderMap::new()).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "image/svg+xml");
+        assert_eq!(response.headers()["cache-control"], "public, no-cache");
+        let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), crate::status::SERVICE_ICONS_SVG.as_bytes());
+        for candidate in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"old\", {etag}"),
+            "*".into(),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("if-none-match", candidate.parse().unwrap());
+            let response = super::ui_icons_handler(headers).await;
+            assert_eq!(response.status(), 304);
+            assert!(axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        let mut headers = http::HeaderMap::new();
+        headers.insert("if-none-match", "\"old\"".parse().unwrap());
+        assert_eq!(super::ui_icons_handler(headers).await.status(), 200);
+    }
+    use super::{BrowseContext, S3Browse};
+
+    #[test]
+    fn regional_html_never_intercepts_signed_aws_requests() {
+        let uri = "/us-east-1/dynamo/Orders".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("accept", "text/html".parse().unwrap());
+        assert!(super::dashboard_ui_request(
+            &http::Method::GET,
+            &uri,
+            &headers
+        ));
+        assert!(!super::dashboard_ui_request(
+            &http::Method::POST,
+            &uri,
+            &headers
+        ));
+        for path in ["/home", "/home/key", "/dashboard/key"] {
+            let path = path.parse().unwrap();
+            assert!(super::dashboard_ui_request(
+                &http::Method::GET,
+                &path,
+                &headers
+            ));
+            headers.insert("authorization", "AWS4-HMAC-SHA256 signed".parse().unwrap());
+            assert!(!super::dashboard_ui_request(
+                &http::Method::GET,
+                &path,
+                &headers
+            ));
+            headers.remove("authorization");
+        }
+        headers.insert("authorization", "AWS4-HMAC-SHA256 signed".parse().unwrap());
+        assert!(!super::dashboard_ui_request(
+            &http::Method::GET,
+            &uri,
+            &headers
+        ));
+        headers.remove("authorization");
+        let signed = "/us-east-1/dynamo/Orders?X-Amz-Signature=abc"
+            .parse()
+            .unwrap();
+        assert!(!super::dashboard_ui_request(
+            &http::Method::GET,
+            &signed,
+            &headers
+        ));
+        assert!(!super::lambda_read_path("functions/demo/invocations"));
+        headers.insert("host", "127.0.0.1:4566".parse().unwrap());
+        assert!(super::local_dashboard_headers(&headers));
+        headers.insert("origin", "https://untrusted.example".parse().unwrap());
+        assert!(!super::local_dashboard_headers(&headers));
+        headers.remove("origin");
+        headers.insert("host", "untrusted.example:4566".parse().unwrap());
+        assert!(!super::local_dashboard_headers(&headers));
+    }
+
+    #[test]
+    fn s3_browser_only_builds_listings_and_escapes_opaque_prefixes() {
+        let mut query = S3Browse {
+            bucket: None,
+            prefix: None,
+            token: None,
+            context: BrowseContext::default(),
+        };
+        assert_eq!(query.uri().unwrap().to_string(), "/");
+        query.bucket = Some("orders-demo".into());
+        query.prefix = Some("invoices/ñ &?".into());
+        query.token = Some("a+/=".into());
+        assert_eq!(query.uri().unwrap().to_string(), "/orders-demo?list-type=2&delimiter=%2F&max-keys=100&prefix=invoices%2F%C3%B1%20%26%3F&continuation-token=a%2B%2F%3D");
+        query.bucket = Some("orders-demo/key?delete".into());
+        assert!(query.uri().is_err());
     }
 }

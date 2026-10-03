@@ -555,7 +555,7 @@ impl YoukiRuntime {
         .map_err(|e| exec_failed(format!("public egress setup worker failed: {e}")))?
         .map_err(|e| {
             exec_failed(format!(
-                "isolated public egress requires rootless ip and nft: {e}"
+                "isolated public egress requires rootless ip/nft and kernel nft_redir support; if kernel modules no longer match the running kernel after an upgrade, reboot into the installed kernel: {e}"
             ))
         })?;
         let tcp = tokio::net::TcpListener::from_std(tcp)

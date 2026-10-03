@@ -88,8 +88,21 @@ pub struct ServiceEntry {
     authorization_evaluator: Option<Arc<dyn AuthorizationEvaluator>>,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct ResourcePresence {
+    pub regions: Vec<String>,
+    pub global: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ResourceInventory {
+    pub regions: Vec<String>,
+    pub services: std::collections::BTreeMap<String, ResourcePresence>,
+}
+
 /// Concurrent registry. Thread-safe for reads during request processing.
 pub struct ServiceRegistry {
+    pub activity: crate::activity::ActivityLog,
     services: DashMap<ServiceName, ServiceEntry>,
     internal_dispatcher: RwLock<Option<Arc<InternalDispatcher>>>,
     completion_sender: RwLock<Option<mpsc::Sender<DispatchOutcome>>>,
@@ -105,10 +118,52 @@ impl ServiceRegistry {
     /// An empty registry.
     pub fn new() -> Self {
         ServiceRegistry {
+            activity: crate::activity::ActivityLog::default(),
             services: DashMap::new(),
             internal_dispatcher: RwLock::new(None),
             completion_sender: RwLock::new(None),
         }
+    }
+
+    /// Snapshot handlers before awaiting; inventory reads never hold registry locks.
+    pub async fn resource_inventory(
+        &self,
+        account: &str,
+    ) -> Result<ResourceInventory, &'static str> {
+        let handlers: Vec<_> = self
+            .services
+            .iter()
+            .filter_map(|e| {
+                e.handler
+                    .clone()
+                    .map(|handler| (e.key().as_str().to_owned(), handler))
+            })
+            .collect();
+        let mut regions = std::collections::BTreeSet::new();
+        let mut services = std::collections::BTreeMap::new();
+        for (name, handler) in handlers {
+            let scoped = handler
+                .resource_regions(account)
+                .await?
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            regions.extend(scoped.iter().cloned());
+            services.insert(
+                name,
+                ResourcePresence {
+                    regions: scoped.into_iter().collect(),
+                    global: handler.has_global_resources(account).await?,
+                },
+            );
+        }
+        Ok(ResourceInventory {
+            regions: regions.into_iter().collect(),
+            services,
+        })
+    }
+
+    pub async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self.resource_inventory(account).await?.regions)
     }
 
     /// Install a bounded, nonblocking completed-dispatch queue. The observer must not hold
@@ -563,6 +618,97 @@ mod tests {
         async fn handle(&self, _request: ServiceRequest) -> Response {
             Response::new(Body::empty())
         }
+    }
+
+    #[tokio::test]
+    async fn resource_inventory_is_scoped_sorted_live_and_fails_closed() {
+        struct Inventory(std::sync::RwLock<Result<Vec<String>, &'static str>>);
+        #[async_trait::async_trait]
+        impl NativeHandler for Inventory {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                Response::new(Body::empty())
+            }
+            async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+                if account != "000000000000" {
+                    return Ok(Vec::new());
+                }
+                self.0.read().unwrap().clone()
+            }
+        }
+        let registry = ServiceRegistry::new();
+        let inventory = Arc::new(Inventory(std::sync::RwLock::new(Ok(vec![
+            "us-west-2".into(),
+            "us-east-1".into(),
+            "us-west-2".into(),
+        ]))));
+        registry.register_native(
+            ServiceName::new("dynamodb"),
+            ServiceMetadata::new(AwsProtocol::Json10, None),
+            inventory.clone(),
+        );
+        registry.register_native(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(TestHandler),
+        );
+        assert_eq!(
+            registry.resource_regions("000000000000").await.unwrap(),
+            ["us-east-1", "us-west-2"]
+        );
+        assert!(registry
+            .resource_regions("111111111111")
+            .await
+            .unwrap()
+            .is_empty());
+        let presence = registry.resource_inventory("000000000000").await.unwrap();
+        assert_eq!(
+            presence.services["dynamodb"].regions,
+            ["us-east-1", "us-west-2"]
+        );
+        assert!(!presence.services["dynamodb"].global);
+        assert!(presence.services["iam"].regions.is_empty());
+        struct Global;
+        #[async_trait::async_trait]
+        impl NativeHandler for Global {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                Response::new(Body::empty())
+            }
+            async fn has_global_resources(&self, account: &str) -> Result<bool, &'static str> {
+                Ok(account == "000000000000")
+            }
+        }
+        registry.register_native(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(Global),
+        );
+        assert!(
+            registry
+                .resource_inventory("000000000000")
+                .await
+                .unwrap()
+                .services["iam"]
+                .global
+        );
+        assert!(
+            !registry
+                .resource_inventory("111111111111")
+                .await
+                .unwrap()
+                .services["iam"]
+                .global
+        );
+        *inventory.0.write().unwrap() = Ok(Vec::new());
+        assert!(registry
+            .resource_regions("000000000000")
+            .await
+            .unwrap()
+            .is_empty());
+        *inventory.0.write().unwrap() = Err("unavailable");
+        assert_eq!(
+            registry.resource_regions("000000000000").await,
+            Err("unavailable")
+        );
     }
 
     #[test]

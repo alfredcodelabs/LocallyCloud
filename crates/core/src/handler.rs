@@ -31,6 +31,29 @@ pub struct ServiceRequest {
 pub trait NativeHandler: Send + Sync {
     async fn handle(&self, request: ServiceRequest) -> Response;
 
+    /// Resolve a public invocation from stored resources in the configured account.
+    /// This selects routing only; the handler still enforces invocation authorization.
+    async fn public_invoke_region(
+        &self,
+        _account: &str,
+        _host: &str,
+        _path: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Regions containing existing resources owned by this account. Global services and
+    /// handlers without regional control-plane resources contribute no regions.
+    /// Read-created scopes, defaults, deletion tombstones and telemetry are excluded.
+    async fn resource_regions(&self, _account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(Vec::new())
+    }
+
+    /// Whether this account owns any global control-plane resources.
+    async fn has_global_resources(&self, _account: &str) -> Result<bool, &'static str> {
+        Ok(false)
+    }
+
     async fn handle_websocket(
         &self,
         _request: ServiceRequest,

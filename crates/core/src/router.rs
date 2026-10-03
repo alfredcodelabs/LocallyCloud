@@ -15,6 +15,7 @@ pub enum ResolutionSource {
     HostPath,
     ActionField,
     RestJsonPath,
+    DashboardSelection,
 }
 
 /// Whether the request is handled in-process or forwarded to the legacy backend.
