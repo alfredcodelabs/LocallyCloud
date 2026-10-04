@@ -106,6 +106,11 @@ fn validate_resources(raw: &Value) -> Result<(), CfnError> {
                 "Properties for resource {logical_id} must be a JSON object"
             )));
         }
+        crate::provision::validate_network_property_names(
+            logical_id,
+            resource_type,
+            declaration.get("Properties").unwrap_or(&Value::Null),
+        )?;
         if let Some(depends_on) = declaration.get("DependsOn") {
             let valid = match depends_on {
                 Value::String(dependency) => !dependency.trim().is_empty(),
@@ -451,6 +456,27 @@ impl Template {
         Ok(ordered)
     }
 
+    pub fn effective_parameters(
+        &self,
+        supplied: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut parameters: BTreeMap<_, _> = self
+            .parameter_declarations()
+            .into_iter()
+            .filter_map(|(name, definition)| {
+                definition.get("Default").map(|value| {
+                    let value = value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string());
+                    (name, value)
+                })
+            })
+            .collect();
+        parameters.extend(supplied.clone());
+        parameters
+    }
+
     pub fn evaluate_conditions(
         &self,
         region: &str,
@@ -465,15 +491,7 @@ impl Template {
                     .ok_or_else(|| CfnError::Validation("Conditions must be a JSON object".into()))
             })
             .transpose()?;
-        let mut parameters = BTreeMap::new();
-        if let Some(declared) = self.raw.get("Parameters").and_then(Value::as_object) {
-            for (name, definition) in declared {
-                if let Some(default) = definition.get("Default").and_then(Value::as_str) {
-                    parameters.insert(name.clone(), default.to_string());
-                }
-            }
-        }
-        parameters.extend(supplied.clone());
+        let parameters = self.effective_parameters(supplied);
         let mut evaluated = BTreeMap::new();
         if let Some(definitions) = definitions {
             for name in definitions.keys() {
@@ -998,253 +1016,247 @@ enum Resolved {
 }
 
 /// Resolve intrinsic functions in a value against the provisioning context.
-pub fn resolve(value: &Value, ctx: &ResolveCtx) -> Value {
-    match resolve_value(value, ctx) {
-        Resolved::Value(v) => v,
+pub fn resolve(value: &Value, ctx: &ResolveCtx) -> Result<Value, CfnError> {
+    Ok(match resolve_value(value, ctx)? {
+        Resolved::Value(value) => value,
         Resolved::NoValue => Value::Null,
-    }
+    })
 }
 
-fn resolve_value(value: &Value, ctx: &ResolveCtx) -> Resolved {
-    match value {
+fn resolve_value(value: &Value, ctx: &ResolveCtx) -> Result<Resolved, CfnError> {
+    Ok(match value {
         Value::Object(map) if map.len() == 1 => {
-            let (k, v) = map.iter().next().unwrap();
-            match k.as_str() {
-                "Ref" => {
-                    let name = v.as_str().unwrap_or_default();
-                    if name == "AWS::NoValue" {
-                        Resolved::NoValue
-                    } else {
-                        Resolved::Value(resolve_ref(name, ctx))
-                    }
-                }
-                "Fn::GetAtt" => Resolved::Value(resolve_getatt(v, ctx)),
-                "Fn::Join" => Resolved::Value(resolve_join(v, ctx)),
-                "Fn::Sub" => Resolved::Value(resolve_sub(v, ctx)),
-                "Fn::Select" => Resolved::Value(resolve_select(v, ctx)),
-                "Fn::Split" => Resolved::Value(resolve_split(v, ctx)),
+            let (key, value) = map.iter().next().unwrap();
+            match key.as_str() {
+                "Ref" if value.as_str() == Some("AWS::NoValue") => Resolved::NoValue,
+                "Ref" => Resolved::Value(resolve_ref(value.as_str().unwrap_or_default(), ctx)?),
+                "Fn::GetAtt" => Resolved::Value(resolve_getatt(value, ctx)?),
+                "Fn::Join" => Resolved::Value(resolve_join(value, ctx)?),
+                "Fn::Sub" => Resolved::Value(resolve_sub(value, ctx)?),
+                "Fn::Select" => Resolved::Value(resolve_select(value, ctx)?),
+                "Fn::Split" => Resolved::Value(resolve_split(value, ctx)?),
                 "Fn::If" => {
-                    if let Some(args) = v.as_array().filter(|a| a.len() == 3) {
-                        let chosen = args
-                            .first()
-                            .and_then(Value::as_str)
-                            .and_then(|name| ctx.conditions.get(name))
-                            .map(|active| if *active { 1 } else { 2 });
-                        match chosen {
-                            Some(idx) => resolve_value(&args[idx], ctx),
-                            None => Resolved::Value(Value::Null),
-                        }
-                    } else {
-                        Resolved::Value(Value::Null)
-                    }
+                    let args =
+                        value
+                            .as_array()
+                            .filter(|args| args.len() == 3)
+                            .ok_or_else(|| {
+                                CfnError::Validation(
+                                    "Fn::If requires condition and two branches".into(),
+                                )
+                            })?;
+                    let condition = args[0]
+                        .as_str()
+                        .and_then(|name| ctx.conditions.get(name))
+                        .ok_or_else(|| {
+                            CfnError::Validation("Fn::If references an unknown condition".into())
+                        })?;
+                    resolve_value(&args[if *condition { 1 } else { 2 }], ctx)?
                 }
                 _ => {
-                    // Not an intrinsic: resolve the nested value, omitting this key when it
-                    // is `AWS::NoValue`.
-                    match resolve_value(v, ctx) {
-                        Resolved::Value(r) => {
-                            let mut out = serde_json::Map::new();
-                            out.insert(k.clone(), r);
-                            Resolved::Value(Value::Object(out))
-                        }
-                        Resolved::NoValue => Resolved::Value(Value::Object(serde_json::Map::new())),
+                    let mut result = serde_json::Map::new();
+                    if let Resolved::Value(value) = resolve_value(value, ctx)? {
+                        result.insert(key.clone(), value);
                     }
+                    Resolved::Value(Value::Object(result))
                 }
             }
         }
         Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                if let Resolved::Value(r) = resolve_value(v, ctx) {
-                    out.insert(k.clone(), r);
+            let mut result = serde_json::Map::new();
+            for (key, value) in map {
+                if let Resolved::Value(value) = resolve_value(value, ctx)? {
+                    result.insert(key.clone(), value);
                 }
             }
-            Resolved::Value(Value::Object(out))
+            Resolved::Value(Value::Object(result))
         }
-        Value::Array(a) => {
-            let mut items = Vec::with_capacity(a.len());
-            for v in a {
-                if let Resolved::Value(r) = resolve_value(v, ctx) {
-                    items.push(r);
+        Value::Array(values) => {
+            let mut result = Vec::with_capacity(values.len());
+            for value in values {
+                if let Resolved::Value(value) = resolve_value(value, ctx)? {
+                    result.push(value);
                 }
             }
-            Resolved::Value(Value::Array(items))
+            Resolved::Value(Value::Array(result))
         }
-        other => Resolved::Value(other.clone()),
-    }
+        value => Resolved::Value(value.clone()),
+    })
 }
 
 /// Resolve a value to a string (join arrays/scalars sensibly).
-pub fn resolve_to_string(value: &Value, ctx: &ResolveCtx) -> String {
-    value_to_string(&resolve(value, ctx))
+pub fn resolve_to_string(value: &Value, ctx: &ResolveCtx) -> Result<String, CfnError> {
+    Ok(value_to_string(&resolve(value, ctx)?))
 }
 
-fn value_to_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
         Value::Null => String::new(),
-        other => other.to_string(),
+        value => value.to_string(),
     }
 }
 
-fn resolve_ref(name: &str, ctx: &ResolveCtx) -> Value {
-    match name {
-        "AWS::Region" => Value::String(ctx.region.to_string()),
-        "AWS::AccountId" => Value::String(ctx.account.to_string()),
-        "AWS::StackName" => Value::String(ctx.stack_name.to_string()),
-        "AWS::Partition" => Value::String(ctx.partition.to_string()),
-        "AWS::URLSuffix" => Value::String("amazonaws.com".to_string()),
+fn resolve_ref(name: &str, ctx: &ResolveCtx) -> Result<Value, CfnError> {
+    Ok(match name {
+        "AWS::Region" => Value::String(ctx.region.into()),
+        "AWS::AccountId" => Value::String(ctx.account.into()),
+        "AWS::StackName" => Value::String(ctx.stack_name.into()),
+        "AWS::Partition" => Value::String(ctx.partition.into()),
+        "AWS::URLSuffix" => Value::String("amazonaws.com".into()),
         "AWS::NoValue" => Value::Null,
         "AWS::NotificationARNs" => Value::Array(vec![]),
-        _ => {
-            if let Some(res) = ctx.resources.get(name) {
-                Value::String(res.ref_value.clone())
-            } else if let Some(p) = ctx.parameters.get(name) {
-                Value::String(p.clone())
-            } else {
-                Value::String(String::new())
-            }
-        }
-    }
-}
-
-fn resolve_getatt(v: &Value, ctx: &ResolveCtx) -> Value {
-    let (id, attr) = match v {
-        Value::Array(a) => (
-            a.first()
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            a.get(1)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+        name => Value::String(
+            ctx.resources
+                .get(name)
+                .map(|resource| resource.ref_value.clone())
+                .or_else(|| ctx.parameters.get(name).cloned())
+                .ok_or_else(|| {
+                    CfnError::Validation(format!(
+                        "Ref references unavailable resource or parameter {name}"
+                    ))
+                })?,
         ),
-        Value::String(s) => match s.split_once('.') {
-            Some((id, attr)) => (id.to_string(), attr.to_string()),
-            None => (s.clone(), String::new()),
-        },
-        _ => return Value::String(String::new()),
+    })
+}
+
+fn resolve_getatt(value: &Value, ctx: &ResolveCtx) -> Result<Value, CfnError> {
+    let parts = match value {
+        Value::Array(parts) if parts.len() == 2 => parts[0].as_str().zip(parts[1].as_str()),
+        Value::String(value) => value.split_once('.'),
+        _ => None,
     };
+    let (id, attribute) = parts
+        .ok_or_else(|| CfnError::Validation("Fn::GetAtt requires resource and attribute".into()))?;
     ctx.resources
-        .get(&id)
-        .and_then(|r| r.attributes.get(&attr))
-        .map(|s| Value::String(s.clone()))
-        .unwrap_or_else(|| Value::String(String::new()))
+        .get(id)
+        .and_then(|resource| resource.attributes.get(attribute))
+        .map(|value| Value::String(value.clone()))
+        .ok_or_else(|| {
+            CfnError::Validation(format!(
+                "Fn::GetAtt attribute {id}.{attribute} is unavailable"
+            ))
+        })
 }
 
-fn resolve_join(v: &Value, ctx: &ResolveCtx) -> Value {
-    let Value::Array(a) = v else {
-        return Value::String(String::new());
-    };
-    let delim = a.first().and_then(Value::as_str).unwrap_or_default();
-    let parts = match a.get(1) {
-        Some(Value::Array(items)) => items
+fn resolve_join(value: &Value, ctx: &ResolveCtx) -> Result<Value, CfnError> {
+    let args = value
+        .as_array()
+        .filter(|args| args.len() == 2)
+        .ok_or_else(|| CfnError::Validation("Fn::Join requires delimiter and list".into()))?;
+    let delimiter = args[0]
+        .as_str()
+        .ok_or_else(|| CfnError::Validation("Fn::Join delimiter must be a string".into()))?;
+    let values = resolve(&args[1], ctx)?;
+    let values = values
+        .as_array()
+        .ok_or_else(|| CfnError::Validation("Fn::Join requires a list".into()))?;
+    Ok(Value::String(
+        values
             .iter()
-            .map(|it| resolve_to_string(it, ctx))
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    Value::String(parts.join(delim))
+            .map(value_to_string)
+            .collect::<Vec<_>>()
+            .join(delimiter),
+    ))
 }
 
-fn resolve_split(v: &Value, ctx: &ResolveCtx) -> Value {
-    let Value::Array(a) = v else {
-        return Value::Array(vec![]);
-    };
-    let delim = a
-        .first()
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let source = a
-        .get(1)
-        .map(|s| resolve_to_string(s, ctx))
-        .unwrap_or_default();
-    Value::Array(
-        source
-            .split(&delim)
-            .map(|s| Value::String(s.to_string()))
+fn resolve_split(value: &Value, ctx: &ResolveCtx) -> Result<Value, CfnError> {
+    let args = value
+        .as_array()
+        .filter(|args| args.len() == 2)
+        .ok_or_else(|| CfnError::Validation("Fn::Split requires delimiter and string".into()))?;
+    let delimiter = args[0]
+        .as_str()
+        .ok_or_else(|| CfnError::Validation("Fn::Split delimiter must be a string".into()))?;
+    Ok(Value::Array(
+        resolve_to_string(&args[1], ctx)?
+            .split(delimiter)
+            .map(|value| Value::String(value.into()))
             .collect(),
-    )
+    ))
 }
 
-fn resolve_select(v: &Value, ctx: &ResolveCtx) -> Value {
-    let Value::Array(a) = v else {
-        return Value::String(String::new());
-    };
-    let idx = a
-        .first()
-        .map(|s| resolve_to_string(s, ctx))
-        .unwrap_or_default()
+fn resolve_select(value: &Value, ctx: &ResolveCtx) -> Result<Value, CfnError> {
+    let args = value
+        .as_array()
+        .filter(|args| args.len() == 2)
+        .ok_or_else(|| CfnError::Validation("Fn::Select requires index and list".into()))?;
+    let index = resolve_to_string(&args[0], ctx)?
         .parse::<usize>()
-        .unwrap_or(0);
-    match a.get(1).map(|list| resolve(list, ctx)) {
-        Some(Value::Array(items)) => items
-            .get(idx)
-            .cloned()
-            .unwrap_or(Value::String(String::new())),
-        _ => Value::String(String::new()),
-    }
+        .map_err(|_| CfnError::Validation("Fn::Select index must be nonnegative".into()))?;
+    let values = resolve(&args[1], ctx)?;
+    values
+        .as_array()
+        .and_then(|values| values.get(index))
+        .cloned()
+        .ok_or_else(|| CfnError::Validation("Fn::Select index is outside its list".into()))
 }
 
-fn resolve_sub(v: &Value, ctx: &ResolveCtx) -> Value {
-    let (template, vars) = match v {
-        Value::String(s) => (s.clone(), BTreeMap::new()),
-        Value::Array(a) => {
-            let tmpl = a
-                .first()
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let mut vars = BTreeMap::new();
-            if let Some(Value::Object(m)) = a.get(1) {
-                for (k, val) in m {
-                    vars.insert(k.clone(), resolve_to_string(val, ctx));
-                }
-            }
-            (tmpl, vars)
+fn resolve_sub(value: &Value, ctx: &ResolveCtx) -> Result<Value, CfnError> {
+    let (template, variables) = match value {
+        Value::String(template) => (template.as_str(), BTreeMap::new()),
+        Value::Array(args) if args.len() == 2 => {
+            let template = args[0]
+                .as_str()
+                .ok_or_else(|| CfnError::Validation("Fn::Sub requires a string template".into()))?;
+            let values = args[1]
+                .as_object()
+                .ok_or_else(|| CfnError::Validation("Fn::Sub variables must be a map".into()))?;
+            let variables = values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), resolve_to_string(value, ctx)?)))
+                .collect::<Result<BTreeMap<_, _>, CfnError>>()?;
+            (template, variables)
         }
-        _ => return Value::String(String::new()),
+        _ => {
+            return Err(CfnError::Validation(
+                "Fn::Sub requires a template or template/variables pair".into(),
+            ))
+        }
     };
-    Value::String(substitute(&template, &vars, ctx))
+    Ok(Value::String(substitute(template, &variables, ctx)?))
 }
 
-/// Expand `${Name}` / `${Name.Attr}` tokens in a `Fn::Sub` template string.
-fn substitute(template: &str, vars: &BTreeMap<String, String>, ctx: &ResolveCtx) -> String {
-    let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end) = template[i + 2..].find('}') {
-                let name = &template[i + 2..i + 2 + end];
-                out.push_str(&resolve_sub_token(name, vars, ctx));
-                i += 2 + end + 1;
-                continue;
-            }
+/// Expand `${Name}` / `${Name.Attr}` tokens, preserving Unicode and escaped literals.
+fn substitute(
+    mut template: &str,
+    variables: &BTreeMap<String, String>,
+    ctx: &ResolveCtx,
+) -> Result<String, CfnError> {
+    let mut result = String::with_capacity(template.len());
+    while let Some(start) = template.find("${") {
+        result.push_str(&template[..start]);
+        let tail = &template[start + 2..];
+        let end = tail
+            .find('}')
+            .ok_or_else(|| CfnError::Validation("Fn::Sub has an unterminated variable".into()))?;
+        let name = &tail[..end];
+        if let Some(literal) = name.strip_prefix('!') {
+            result.push_str(&format!("${{{literal}}}"));
+        } else {
+            result.push_str(&resolve_sub_token(name, variables, ctx)?);
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        template = &tail[end + 1..];
     }
-    out
+    result.push_str(template);
+    Ok(result)
 }
 
-fn resolve_sub_token(name: &str, vars: &BTreeMap<String, String>, ctx: &ResolveCtx) -> String {
-    if let Some(v) = vars.get(name) {
-        return v.clone();
+fn resolve_sub_token(
+    name: &str,
+    variables: &BTreeMap<String, String>,
+    ctx: &ResolveCtx,
+) -> Result<String, CfnError> {
+    if let Some(value) = variables.get(name) {
+        return Ok(value.clone());
     }
-    if let Some((id, attr)) = name.split_once('.') {
-        return ctx
-            .resources
-            .get(id)
-            .and_then(|r| r.attributes.get(attr))
-            .cloned()
-            .unwrap_or_default();
+    if name.contains('.') {
+        return Ok(value_to_string(&resolve_getatt(
+            &Value::String(name.into()),
+            ctx,
+        )?));
     }
-    value_to_string(&resolve_ref(name, ctx))
+    Ok(value_to_string(&resolve_ref(name, ctx)?))
 }
 
 fn yaml_to_json(value: serde_yaml_ng::Value) -> Result<Value, CfnError> {
@@ -1369,6 +1381,42 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_attributes_fail_nested_resolution_and_respect_selected_branches() {
+        let resources = BTreeMap::from([(
+            "Api".into(),
+            ResolvedResource {
+                ref_value: "api-id".into(),
+                attributes: BTreeMap::from([(
+                    "ApiEndpoint".into(),
+                    "https://api.execute-api.us-east-1.amazonaws.com".into(),
+                )]),
+            },
+        )]);
+        let parameters = BTreeMap::new();
+        let mut context = ctx(&resources, &parameters);
+        let conditions = BTreeMap::from([("Enabled".into(), true)]);
+        context.conditions = &conditions;
+        for value in [
+            json!({"Nested":[{"Fn::GetAtt":["Api","Missing"]}]}),
+            json!({"Fn::Join":["/",[{"Fn::Sub":"${Api.Missing}"},"orders"]]}),
+            json!({"Fn::Sub":["${Endpoint}",{"Endpoint":{"Fn::GetAtt":"Api.Missing"}}]}),
+        ] {
+            let error = resolve(&value, &context).unwrap_err().to_string();
+            assert!(error.contains("Api.Missing"), "{error}");
+        }
+        assert_eq!(resolve(&json!({"Fn::If":["Enabled",{"Fn::GetAtt":"Api.ApiEndpoint"},{"Fn::GetAtt":"Api.Missing"}]}),&context).unwrap(),json!("https://api.execute-api.us-east-1.amazonaws.com"));
+        assert_eq!(
+            resolve(
+                &json!({"Fn::Sub":["á ${Api.Missing} ${!Api.Missing}",{"Api.Missing":"override"}]}),
+                &context
+            )
+            .unwrap(),
+            json!("á override ${Api.Missing}")
+        );
+        assert_eq!(resolve(&json!({"Drop":{"Fn::If":["Enabled",{"Ref":"AWS::NoValue"},{"Fn::GetAtt":"Api.Missing"}]}}),&context).unwrap(),json!({}));
+    }
+
+    #[test]
     fn resolves_ref_getatt_join_sub() {
         let mut res = BTreeMap::new();
         res.insert(
@@ -1385,26 +1433,27 @@ mod tests {
         let c = ctx(&resources, &params);
 
         assert_eq!(
-            resolve_to_string(&json!({ "Ref": "Bucket" }), &c),
+            resolve_to_string(&json!({ "Ref": "Bucket" }), &c).unwrap(),
             "my-bucket"
         );
         assert_eq!(
-            resolve_to_string(&json!({ "Fn::GetAtt": ["Bucket", "Arn"] }), &c),
+            resolve_to_string(&json!({ "Fn::GetAtt": ["Bucket", "Arn"] }), &c).unwrap(),
             "arn:aws:s3:::my-bucket"
         );
         assert_eq!(
-            resolve_to_string(&json!({ "Ref": "AWS::Region" }), &c),
+            resolve_to_string(&json!({ "Ref": "AWS::Region" }), &c).unwrap(),
             "us-east-1"
         );
         assert_eq!(
             resolve_to_string(
                 &json!({ "Fn::Join": ["/", [{ "Ref": "Bucket" }, "key"]] }),
                 &c
-            ),
+            )
+            .unwrap(),
             "my-bucket/key"
         );
         assert_eq!(
-            resolve_to_string(&json!({ "Fn::Sub": "${Bucket}-${AWS::AccountId}" }), &c),
+            resolve_to_string(&json!({ "Fn::Sub": "${Bucket}-${AWS::AccountId}" }), &c).unwrap(),
             "my-bucket-000000000000"
         );
     }
@@ -1543,7 +1592,7 @@ mod tests {
             {"Fn::If": ["Disabled", "second", {"Ref": "AWS::NoValue"}]},
             "third"
         ]);
-        assert_eq!(resolve(&value, &ctx), json!(["first", "third"]));
+        assert_eq!(resolve(&value, &ctx).unwrap(), json!(["first", "third"]));
     }
 
     #[test]
@@ -1566,7 +1615,8 @@ mod tests {
         let resolved = resolve(
             &json!({ "Keep": "yes", "Drop": { "Ref": "AWS::NoValue" } }),
             &c,
-        );
+        )
+        .unwrap();
         assert_eq!(resolved.get("Keep").unwrap(), "yes");
         assert!(resolved.get("Drop").is_none(), "AWS::NoValue drops the key");
     }
@@ -1582,7 +1632,7 @@ mod tests {
             "List": ["a", null, "b"],
             "Nested": { "Inner": null }
         });
-        assert_eq!(resolve(&value, &c), value);
+        assert_eq!(resolve(&value, &c).unwrap(), value);
     }
 
     #[test]
@@ -1593,7 +1643,8 @@ mod tests {
         let resolved = resolve(
             &json!({ "Outer": { "Drop": { "Ref": "AWS::NoValue" }, "Keep": 1 } }),
             &c,
-        );
+        )
+        .unwrap();
         assert_eq!(resolved, json!({ "Outer": { "Keep": 1 } }));
     }
 
@@ -1617,7 +1668,7 @@ mod tests {
             "List": [1, { "Fn::If": ["Enabled", { "Ref": "AWS::NoValue" }, 2]}, 3]
         });
         // Enabled=true selects the NoValue branch in "Off" and the list item: both omit.
-        let resolved = resolve(&value, &c);
+        let resolved = resolve(&value, &c).unwrap();
         assert_eq!(resolved, json!({ "On": "keep", "List": [1, 3] }));
 
         let conditions = BTreeMap::from([("Enabled".to_string(), false)]);
@@ -1627,7 +1678,7 @@ mod tests {
         };
         // Enabled=false selects "keep" for "Off"; the NoValue branch of "On" is now selected
         // and omits that key.
-        let resolved = resolve(&value, &c);
+        let resolved = resolve(&value, &c).unwrap();
         assert_eq!(resolved, json!({ "Off": "keep", "List": [1, 2, 3] }));
     }
 

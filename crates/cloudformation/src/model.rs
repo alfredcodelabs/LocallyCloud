@@ -8,6 +8,7 @@ pub enum StackStatus {
     ReviewInProgress,
     CreateComplete,
     UpdateComplete,
+    UpdateCompleteCleanupInProgress,
     DeleteComplete,
     CreateFailed,
     UpdateFailed,
@@ -20,12 +21,20 @@ impl StackStatus {
             StackStatus::ReviewInProgress => "REVIEW_IN_PROGRESS",
             StackStatus::CreateComplete => "CREATE_COMPLETE",
             StackStatus::UpdateComplete => "UPDATE_COMPLETE",
+            StackStatus::UpdateCompleteCleanupInProgress => "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS",
             StackStatus::DeleteComplete => "DELETE_COMPLETE",
             StackStatus::CreateFailed => "CREATE_FAILED",
             StackStatus::UpdateFailed => "UPDATE_FAILED",
             StackStatus::DeleteFailed => "DELETE_FAILED",
         }
     }
+}
+
+/// A retired physical network resource awaiting replacement cleanup.
+#[derive(Debug, Clone)]
+pub struct ReplacementCleanup {
+    pub physical_id: String,
+    pub properties: serde_json::Value,
 }
 
 /// A provisioned stack resource.
@@ -37,6 +46,7 @@ pub struct StackResource {
     pub status: String,
     /// `Fn::GetAtt`-resolvable attributes (e.g. `Arn`).
     pub attributes: BTreeMap<String, String>,
+    pub pending_cleanup: Vec<ReplacementCleanup>,
 }
 
 /// A recorded stack event (surfaced by `DescribeStackEvents`).

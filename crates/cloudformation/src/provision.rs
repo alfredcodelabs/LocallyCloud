@@ -20,7 +20,9 @@ use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use crate::error::CfnError;
 use crate::template::{ResolvedResource, ResourcePolicy};
 
+mod custom_domains;
 mod ec2;
+pub(crate) use ec2::validate_network_property_names;
 
 /// How an update that changes a resource's physical identity must handle the old instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,11 @@ pub enum Replacement {
 
 /// Complete resource-type surface supported by this provisioner.
 pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
+    "AWS::Route53::HostedZone",
+    "AWS::ApiGateway::DomainName",
+    "AWS::ApiGateway::BasePathMapping",
+    "AWS::ApiGatewayV2::DomainName",
+    "AWS::ApiGatewayV2::ApiMapping",
     "AWS::Route53::HealthCheck",
     "AWS::Route53::RecordSet",
     "AWS::S3::Bucket",
@@ -65,6 +72,11 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::EC2::RouteTable",
     "AWS::EC2::SubnetRouteTableAssociation",
     "AWS::EC2::VPCEndpoint",
+    "AWS::EC2::EIP",
+    "AWS::EC2::NatGateway",
+    "AWS::EC2::InternetGateway",
+    "AWS::EC2::VPCGatewayAttachment",
+    "AWS::EC2::Route",
     "AWS::ApiGateway::RestApi",
     "AWS::ApiGateway::Resource",
     "AWS::ApiGateway::Method",
@@ -83,6 +95,7 @@ pub struct Provisioner {
     registry: Weak<ServiceRegistry>,
     region: String,
     account: String,
+    caller_access_key: Option<String>,
 }
 
 impl Provisioner {
@@ -91,7 +104,13 @@ impl Provisioner {
             registry,
             region,
             account,
+            caller_access_key: None,
         }
+    }
+
+    pub(crate) fn with_caller_access_key(mut self, caller_access_key: Option<String>) -> Self {
+        self.caller_access_key = caller_access_key;
+        self
     }
 
     /// Provision one resource whose `properties` are already intrinsic-resolved. Returns the
@@ -104,6 +123,26 @@ impl Provisioner {
         properties: &Value,
     ) -> Result<ResolvedResource, CfnError> {
         match resource_type {
+            "AWS::Route53::HostedZone" => {
+                self.custom_domain_resource(logical_id, resource_type, properties)
+                    .await
+            }
+            "AWS::ApiGateway::DomainName" => {
+                self.custom_domain_resource(logical_id, resource_type, properties)
+                    .await
+            }
+            "AWS::ApiGateway::BasePathMapping" => {
+                self.custom_domain_resource(logical_id, resource_type, properties)
+                    .await
+            }
+            "AWS::ApiGatewayV2::DomainName" => {
+                self.custom_domain_resource(logical_id, resource_type, properties)
+                    .await
+            }
+            "AWS::ApiGatewayV2::ApiMapping" => {
+                self.custom_domain_resource(logical_id, resource_type, properties)
+                    .await
+            }
             "AWS::Route53::HealthCheck" => self.route53_health_check(logical_id, properties).await,
             "AWS::Route53::RecordSet" => {
                 self.route53_record_set(logical_id, properties, "CREATE")
@@ -161,6 +200,13 @@ impl Provisioner {
                 self.ec2_route_association(logical_id, properties).await
             }
             "AWS::EC2::VPCEndpoint" => self.ec2_vpc_endpoint(logical_id, properties).await,
+            "AWS::EC2::EIP" => self.ec2_eip(logical_id, properties).await,
+            "AWS::EC2::NatGateway" => self.ec2_nat_gateway(logical_id, properties).await,
+            "AWS::EC2::InternetGateway" => self.ec2_internet_gateway(logical_id, properties).await,
+            "AWS::EC2::VPCGatewayAttachment" => {
+                self.ec2_gateway_attachment(logical_id, properties).await
+            }
+            "AWS::EC2::Route" => self.ec2_route(logical_id, properties).await,
             "AWS::ApiGateway::RestApi" => self.apigateway_rest_api(logical_id, properties).await,
             "AWS::ApiGateway::Resource" => self.apigateway_resource(logical_id, properties).await,
             "AWS::ApiGateway::Method" => self.apigateway_method(logical_id, properties).await,
@@ -192,6 +238,72 @@ impl Provisioner {
         replacement: Replacement,
     ) -> Result<ResolvedResource, CfnError> {
         match resource_type {
+            "AWS::Route53::HostedZone" => {
+                self.update_custom_domain_resource(
+                    logical_id,
+                    resource_type,
+                    current,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
+            "AWS::ApiGateway::DomainName" => {
+                self.update_custom_domain_resource(
+                    logical_id,
+                    resource_type,
+                    current,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
+            "AWS::ApiGateway::BasePathMapping" => {
+                self.update_custom_domain_resource(
+                    logical_id,
+                    resource_type,
+                    current,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
+            "AWS::ApiGatewayV2::DomainName" => {
+                self.update_custom_domain_resource(
+                    logical_id,
+                    resource_type,
+                    current,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
+            "AWS::ApiGatewayV2::ApiMapping" => {
+                self.update_custom_domain_resource(
+                    logical_id,
+                    resource_type,
+                    current,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
+            "AWS::EC2::EIP"
+            | "AWS::EC2::NatGateway"
+            | "AWS::EC2::InternetGateway"
+            | "AWS::EC2::VPCGatewayAttachment"
+            | "AWS::EC2::Route" => {
+                self.update_ec2_network(
+                    logical_id,
+                    resource_type,
+                    current,
+                    previous_properties,
+                    properties,
+                    replacement,
+                )
+                .await
+            }
+
             "AWS::Route53::HealthCheck" => {
                 validate_route53_health_check(logical_id, previous_properties)?;
                 validate_route53_health_check(logical_id, properties)?;
@@ -528,6 +640,40 @@ impl Provisioner {
         properties: &Value,
     ) -> Result<(), CfnError> {
         match resource_type {
+            "AWS::Route53::HostedZone" => {
+                self.delete_custom_domain_resource(resource_type, physical_id, properties)
+                    .await
+            }
+            "AWS::ApiGateway::DomainName" => {
+                self.delete_custom_domain_resource(resource_type, physical_id, properties)
+                    .await
+            }
+            "AWS::ApiGateway::BasePathMapping" => {
+                self.delete_custom_domain_resource(resource_type, physical_id, properties)
+                    .await
+            }
+            "AWS::ApiGatewayV2::DomainName" => {
+                self.delete_custom_domain_resource(resource_type, physical_id, properties)
+                    .await
+            }
+            "AWS::ApiGatewayV2::ApiMapping" => {
+                self.delete_custom_domain_resource(resource_type, physical_id, properties)
+                    .await
+            }
+            "AWS::EC2::EIP" => self.delete_ec2_eip(physical_id).await,
+            "AWS::EC2::NatGateway" => {
+                self.delete_ec2("DeleteNatGateway", "NatGatewayId", physical_id)
+                    .await
+            }
+            "AWS::EC2::InternetGateway" => {
+                self.delete_ec2("DeleteInternetGateway", "InternetGatewayId", physical_id)
+                    .await
+            }
+            "AWS::EC2::VPCGatewayAttachment" => {
+                self.delete_ec2_gateway_attachment(properties).await
+            }
+            "AWS::EC2::Route" => self.delete_ec2_route(properties).await,
+
             "AWS::Route53::HealthCheck" => self.delete_route53_health_check(physical_id).await,
             "AWS::Route53::RecordSet" => {
                 self.change_route53_record_set(physical_id, properties, "DELETE")
@@ -3568,6 +3714,15 @@ impl Provisioner {
             .call_json("apigatewayv2", Method::POST, "/v2/apis", body, logical_id)
             .await?;
         let api_id = required_response_string(&response, "apiId", logical_id)?;
+        let endpoint = match required_response_string(&response, "apiEndpoint", logical_id) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                if let Err(cleanup) = self.delete_apigateway_v2_api(&api_id).await {
+                    return Err(with_cleanup_failure(error, cleanup));
+                }
+                return Err(error);
+            }
+        };
         if let Some(routes) = routes {
             if let Err(error) = self
                 .create_api_body_routes(logical_id, &api_id, &routes)
@@ -3578,8 +3733,18 @@ impl Provisioner {
             }
         }
         Ok(ResolvedResource {
-            ref_value: api_id,
-            attributes: Default::default(),
+            ref_value: api_id.clone(),
+            attributes: std::collections::BTreeMap::from([
+                ("ApiId".into(), api_id.clone()),
+                ("ApiEndpoint".into(), endpoint),
+                (
+                    "ExecuteApiArn".into(),
+                    format!(
+                        "arn:aws:execute-api:{}:{}:{api_id}",
+                        self.region, self.account
+                    ),
+                ),
+            ]),
         })
     }
 
@@ -4715,7 +4880,7 @@ impl Provisioner {
         }
     }
 
-    async fn call(
+    pub(crate) async fn call(
         &self,
         service: &str,
         method: Method,
@@ -4738,7 +4903,31 @@ impl Provisioner {
             account_id: self.account.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
         };
-        let response = handler.handle(request).await;
+        let response = if let Some(dispatcher) = registry.internal_dispatcher() {
+            let mut headers = request.headers;
+            let caller = self.caller_access_key.as_deref().unwrap_or("locallycloud");
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "AWS4-HMAC-SHA256 Credential={caller}/19700101/{}/{service}/aws4_request",
+                    self.region
+                ))
+                .map_err(|_| CfnError::Internal)?,
+            );
+            dispatcher
+                .dispatch_scoped(
+                    &request.method,
+                    &request.uri,
+                    &headers,
+                    request.body,
+                    &request.request_id,
+                    &self.account,
+                    &self.region,
+                )
+                .await
+        } else {
+            handler.handle(request).await
+        };
         let status = response.status().as_u16();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -5763,6 +5952,7 @@ fn route53_record_xml(logical_id: &str, props: &Value) -> Result<String, CfnErro
             "Failover",
             "SetIdentifier",
             "HealthCheckId",
+            "AliasTarget",
         ],
     )?;
     let name = required_property(props, "Name", logical_id)?;
@@ -5773,34 +5963,65 @@ fn route53_record_xml(logical_id: &str, props: &Value) -> Result<String, CfnErro
             "{logical_id} has unsupported record Type"
         )));
     }
-    let ttl = props
-        .get("TTL")
-        .and_then(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| value.as_u64().map(|n| n.to_string()))
-        })
-        .and_then(|value| value.parse::<u32>().ok().map(|_| value))
-        .ok_or_else(|| CfnError::Validation(format!("{logical_id} requires numeric TTL")))?;
-    let values = props
-        .get("ResourceRecords")
-        .and_then(Value::as_array)
-        .filter(|values| !values.is_empty() && values.len() <= 1000)
-        .ok_or_else(|| CfnError::Validation(format!("{logical_id} requires ResourceRecords")))?;
-    let mut records = String::new();
-    for value in values {
-        let value = value
-            .as_str()
-            .filter(|value| !value.is_empty())
+    let destination = if let Some(alias) = props.get("AliasTarget") {
+        ensure_known_properties(
+            logical_id,
+            "AliasTarget",
+            alias,
+            &["DNSName", "HostedZoneId", "EvaluateTargetHealth"],
+        )?;
+        if !matches!(kind.as_str(), "A" | "AAAA")
+            || props.get("TTL").is_some()
+            || props.get("ResourceRecords").is_some()
+        {
+            return Err(CfnError::Validation(format!(
+                "{logical_id} AliasTarget requires A/AAAA without TTL/ResourceRecords"
+            )));
+        }
+        let dns = required_property(alias, "DNSName", logical_id)?;
+        let zone = required_property(alias, "HostedZoneId", logical_id)?;
+        let evaluate = alias
+            .get("EvaluateTargetHealth")
+            .and_then(Value::as_bool)
             .ok_or_else(|| {
-                CfnError::Validation(format!("{logical_id} requires string ResourceRecords"))
+                CfnError::Validation(format!(
+                    "{logical_id} requires boolean EvaluateTargetHealth"
+                ))
             })?;
-        records.push_str(&format!(
-            "<ResourceRecord><Value>{}</Value></ResourceRecord>",
-            xml_escape(value)
-        ));
-    }
+        format!("<AliasTarget><HostedZoneId>{}</HostedZoneId><DNSName>{}</DNSName><EvaluateTargetHealth>{evaluate}</EvaluateTargetHealth></AliasTarget>", xml_escape(&zone), xml_escape(&dns))
+    } else {
+        let ttl = props
+            .get("TTL")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_u64().map(|n| n.to_string()))
+            })
+            .and_then(|value| value.parse::<u32>().ok().map(|_| value))
+            .ok_or_else(|| CfnError::Validation(format!("{logical_id} requires numeric TTL")))?;
+        let values = props
+            .get("ResourceRecords")
+            .and_then(Value::as_array)
+            .filter(|values| !values.is_empty() && values.len() <= 1000)
+            .ok_or_else(|| {
+                CfnError::Validation(format!("{logical_id} requires ResourceRecords"))
+            })?;
+        let mut records = String::new();
+        for value in values {
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CfnError::Validation(format!("{logical_id} requires string ResourceRecords"))
+                })?;
+            records.push_str(&format!(
+                "<ResourceRecord><Value>{}</Value></ResourceRecord>",
+                xml_escape(value)
+            ));
+        }
+        format!("<TTL>{ttl}</TTL><ResourceRecords>{records}</ResourceRecords>")
+    };
     let failover = props.get("Failover").and_then(Value::as_str);
     let identifier = props.get("SetIdentifier").and_then(Value::as_str);
     if (failover.is_some() != identifier.is_some())
@@ -5826,7 +6047,7 @@ fn route53_record_xml(logical_id: &str, props: &Value) -> Result<String, CfnErro
     let check = check
         .map(|id| format!("<HealthCheckId>{}</HealthCheckId>", xml_escape(id)))
         .unwrap_or_default();
-    Ok(format!("<ResourceRecordSet><Name>{}</Name><Type>{kind}</Type>{identifier}{failover}<TTL>{ttl}</TTL><ResourceRecords>{records}</ResourceRecords>{check}</ResourceRecordSet>", xml_escape(&name)))
+    Ok(format!("<ResourceRecordSet><Name>{}</Name><Type>{kind}</Type>{identifier}{failover}{destination}{check}</ResourceRecordSet>", xml_escape(&name)))
 }
 
 fn ensure_known_properties(
@@ -6995,6 +7216,152 @@ mod tests {
     use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
 
     use super::*;
+
+    #[tokio::test]
+    async fn api_v2_attributes_match_native_api_and_survive_update() {
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_apigateway::register(&registry);
+        let provisioner = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        for (protocol, scheme) in [("HTTP", "https"), ("WEBSOCKET", "wss")] {
+            let props = json!({"Name": "attributes", "ProtocolType": protocol,
+                "RouteSelectionExpression": if protocol == "HTTP" {
+                    "$request.method $request.path"
+                } else { "$request.body.action" }});
+            let api = provisioner.apigateway_v2_api("Api", &props).await.unwrap();
+            let actual = provisioner
+                .call_json(
+                    "apigatewayv2",
+                    Method::GET,
+                    &format!("/v2/apis/{}", api.ref_value),
+                    Value::Null,
+                    "Api",
+                )
+                .await
+                .unwrap();
+            assert_eq!(api.attributes["ApiEndpoint"], actual["apiEndpoint"]);
+            assert_eq!(
+                api.attributes["ApiEndpoint"],
+                format!(
+                    "{scheme}://{}.execute-api.us-west-2.amazonaws.com",
+                    api.ref_value
+                )
+            );
+            assert_eq!(api.attributes["ApiId"], api.ref_value);
+            assert_eq!(
+                api.attributes["ExecuteApiArn"],
+                format!(
+                    "arn:aws:execute-api:us-west-2:123456789012:{}",
+                    api.ref_value
+                )
+            );
+            let mut next = props.clone();
+            next["Name"] = json!("renamed");
+            let updated = provisioner
+                .update(
+                    "Api",
+                    "AWS::ApiGatewayV2::Api",
+                    &api,
+                    &props,
+                    &next,
+                    Replacement::Update(ResourcePolicy::Delete),
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated.attributes, api.attributes);
+            provisioner
+                .delete_apigateway_v2_api(&api.ref_value)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_provisioning_preserves_each_callers_access_key() {
+        use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
+        use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+        use std::time::Duration;
+        struct KeyRecorder(Mutex<Vec<String>>);
+        #[async_trait]
+        impl NativeHandler for KeyRecorder {
+            async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+                assert_eq!(request.account_id, "000000000000");
+                assert_eq!(request.region, "us-east-1");
+                assert_eq!(
+                    request
+                        .headers
+                        .get("x-locallycloud-verified-internal-scope")
+                        .unwrap(),
+                    "1"
+                );
+                let identity = RequestIdentity::access_key_from_authorization(
+                    request
+                        .headers
+                        .get(http::header::AUTHORIZATION)
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                self.0.lock().unwrap().push(identity);
+                http::Response::builder()
+                    .status(200)
+                    .body(Body::from("{}"))
+                    .unwrap()
+            }
+        }
+        let registry = Arc::new(ServiceRegistry::new());
+        let recorder = Arc::new(KeyRecorder(Mutex::new(Vec::new())));
+        registry.register_native(
+            ServiceName::new("kms"),
+            ServiceMetadata::new(AwsProtocol::Json11, Some("TrentService")),
+            recorder.clone(),
+        );
+        registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )));
+        let first = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )
+        .with_caller_access_key(Some("AKIAFIRSTCALLER000001".into()));
+        let second = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )
+        .with_caller_access_key(Some("AKIASECONDCALLER0001".into()));
+        let (a, b) = tokio::join!(
+            first.call_aws_json(
+                "kms",
+                "TrentService.ScheduleKeyDeletion",
+                json!({"KeyId":"first"}),
+                "first"
+            ),
+            second.call_aws_json(
+                "kms",
+                "TrentService.ScheduleKeyDeletion",
+                json!({"KeyId":"second"}),
+                "second"
+            )
+        );
+        a.unwrap();
+        b.unwrap();
+        let mut callers = recorder.0.lock().unwrap().clone();
+        callers.sort();
+        assert_eq!(callers, ["AKIAFIRSTCALLER000001", "AKIASECONDCALLER0001"]);
+    }
 
     struct IamRecorder {
         requests: Mutex<Vec<String>>,

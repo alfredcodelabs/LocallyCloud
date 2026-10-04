@@ -37,6 +37,19 @@ pub struct ChangeSet {
 }
 
 impl CfnStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .stacks
+            .iter()
+            .filter(|e| e.value().status != crate::model::StackStatus::DeleteComplete)
+            .filter_map(|e| {
+                let (owner, tail) = e.key().split_once(':')?;
+                let (region, _) = tail.split_once(':')?;
+                (owner == account).then(|| region.to_owned())
+            })
+            .collect())
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(CfnStore {
             stacks: DashMap::new(),

@@ -24,6 +24,8 @@ base64.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+locallycloud-apigateway.workspace = true
 locallycloud-s3.workspace = true
 locallycloud-iam-sts.workspace = true
 locallycloud-lambda.workspace = true
+locallycloud-ec2.workspace = true

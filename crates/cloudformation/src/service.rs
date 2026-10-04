@@ -1,7 +1,7 @@
 //! CloudFormation service handler: Query-protocol dispatch, stack lifecycle orchestration,
 //! and XML responses. Registered `Native` in the Core registry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use crate::model::{Output, Stack, StackEvent, StackResource, StackStatus};
 use crate::proto::Query;
 use crate::provision::{Provisioner, Replacement};
 use crate::store::{CfnStore, ChangeSet, ChangeSetChange};
-use crate::template::{resolve, ResolveCtx, ResolvedResource, Template};
+use crate::template::{resolve, ResolveCtx, ResolvedResource, ResourcePolicy, Template};
 use crate::xml::{query_envelope, text_el, xml_escape};
 
 const STACK_TYPE: &str = "AWS::CloudFormation::Stack";
@@ -27,6 +27,7 @@ const STACK_TYPE: &str = "AWS::CloudFormation::Stack";
 pub struct CfnHandler {
     store: Arc<CfnStore>,
     registry: Weak<ServiceRegistry>,
+    caller_access_key: Option<String>,
 }
 
 impl CfnHandler {
@@ -34,6 +35,7 @@ impl CfnHandler {
         CfnHandler {
             store: CfnStore::new(),
             registry,
+            caller_access_key: None,
         }
     }
 
@@ -43,6 +45,7 @@ impl CfnHandler {
             region.to_string(),
             account.to_string(),
         )
+        .with_caller_access_key(self.caller_access_key.clone())
     }
 
     async fn dispatch(
@@ -87,28 +90,18 @@ impl CfnHandler {
         if let Some(url) = q.get("TemplateURL") {
             let (bucket, key) = parse_s3_url(&url)
                 .ok_or_else(|| CfnError::Validation(format!("unsupported TemplateURL: {url}")))?;
-            let registry = self.registry.upgrade().ok_or(CfnError::Internal)?;
-            let handler = registry
-                .native_handler(&ServiceName::new("s3"))
-                .ok_or(CfnError::Internal)?;
             let mut headers = http::HeaderMap::new();
             headers.insert("host", http::HeaderValue::from_static("localhost:4566"));
-            let req = ServiceRequest {
-                method: Method::GET,
-                uri: format!("/{bucket}/{key}")
-                    .parse()
-                    .map_err(|_| CfnError::Internal)?,
-                headers,
-                body: Bytes::new(),
-                region: region.to_string(),
-                account_id: account.to_string(),
-                request_id: uuid::Uuid::new_v4().to_string(),
-            };
-            let resp = handler.handle(req).await;
-            let status = resp.status().as_u16();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .map_err(|_| CfnError::Internal)?;
+            let (status, bytes) = self
+                .provisioner(region, account)
+                .call(
+                    "s3",
+                    Method::GET,
+                    &format!("/{bucket}/{key}"),
+                    headers,
+                    Bytes::new(),
+                )
+                .await?;
             if !(200..300).contains(&status) {
                 return Err(CfnError::Validation(format!(
                     "could not fetch TemplateURL {url} ({status})"
@@ -157,7 +150,7 @@ impl CfnHandler {
         let body = self.resolve_template_body(q, region, account).await?;
         let template = Template::parse(&body)?;
         check_capabilities(q, &template)?;
-        let params = q.parameters();
+        let params = effective_parameters(q, &template, existing.as_ref())?;
         let conditions = template.evaluate_conditions(region, account, &params)?;
         let active = template.active_resources(&conditions)?;
         let changes = change_set_changes(existing.as_ref(), &active, region, account, &params)?;
@@ -175,6 +168,19 @@ impl CfnHandler {
         let mut request = q.clone();
         request.params.insert("TemplateBody".into(), body);
         request.params.remove("TemplateURL");
+        request
+            .params
+            .retain(|key, _| !key.starts_with("Parameters.member."));
+        for (index, (name, value)) in params.iter().enumerate() {
+            request.params.insert(
+                format!("Parameters.member.{}.ParameterKey", index + 1),
+                name.clone(),
+            );
+            request.params.insert(
+                format!("Parameters.member.{}.ParameterValue", index + 1),
+                value.clone(),
+            );
+        }
         let inserted = self.store.insert_change_set(
             account,
             region,
@@ -317,7 +323,7 @@ impl CfnHandler {
         let body = self.resolve_template_body(q, region, account).await?;
         let template = Template::parse(&body)?;
         check_capabilities(q, &template)?;
-        let parameters = q.parameters();
+        let parameters = effective_parameters(q, &template, None)?;
         let conditions = template.evaluate_conditions(region, account, &parameters)?;
         let active = template.active_resources(&conditions)?;
         let outputs = template.active_outputs(&conditions, &active)?;
@@ -369,7 +375,7 @@ impl CfnHandler {
         let name = q
             .get("StackName")
             .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
-        let existing = self
+        let mut existing = self
             .store
             .find(account, region, &name)
             .ok_or_else(|| CfnError::Validation(format!("Stack [{name}] does not exist")))?;
@@ -377,10 +383,30 @@ impl CfnHandler {
         let template = Template::parse(&body)?;
         check_capabilities(q, &template)?;
         let previous_template = Template::parse(&existing.template_body)?;
-        let parameters = q.parameters();
+        let parameters = effective_parameters(q, &template, Some(&existing))?;
         let conditions = template.evaluate_conditions(region, account, &parameters)?;
         let active = template.active_resources(&conditions)?;
         let output_exprs = template.active_outputs(&conditions, &active)?;
+
+        if existing
+            .resources
+            .iter()
+            .any(|resource| !resource.pending_cleanup.is_empty())
+        {
+            let failed = cleanup_network_replacements(
+                &self.provisioner(region, account),
+                &mut existing.resources,
+                &mut existing.events,
+            )
+            .await;
+            self.store.put(account, region, existing.clone());
+            if failed {
+                return Err(CfnError::Validation(
+                    "Previous network replacement cleanup is still pending; inspect stack events"
+                        .into(),
+                ));
+            }
+        }
 
         let (status, resources, outputs, mut events) = self
             .provision(
@@ -484,12 +510,51 @@ impl CfnHandler {
                 "DELETE_IN_PROGRESS",
                 None,
             ));
+            // Retired targets are kept in the stack until cleanup really succeeds.
+            let mut replacement_events = Vec::new();
+            cleanup_network_replacements(
+                &provisioner,
+                &mut stack.resources,
+                &mut replacement_events,
+            )
+            .await;
+            stack.events.extend(replacement_events);
             let mut remaining = stack.resources.clone();
             let mut failures = Vec::new();
 
-            // Tear down in reverse provisioning order. Continue after failures so independent
-            // resources still get a cleanup attempt.
-            for resource in stack.resources.iter().rev() {
+            // Updates can add a new dependency after its existing dependent in storage order.
+            // Use the current template graph for teardown, then include any retained old entries.
+            let mut deletion_order: Vec<_> = template
+                .active_resources(&conditions)?
+                .into_iter()
+                .rev()
+                .filter_map(|declaration| {
+                    stack
+                        .resources
+                        .iter()
+                        .find(|resource| resource.logical_id == declaration.logical_id)
+                })
+                .collect();
+            let ordered_ids: BTreeSet<_> = deletion_order
+                .iter()
+                .map(|resource| resource.logical_id.as_str())
+                .collect();
+            deletion_order.extend(
+                stack
+                    .resources
+                    .iter()
+                    .rev()
+                    .filter(|resource| !ordered_ids.contains(resource.logical_id.as_str())),
+            );
+            // Continue after failures so independent resources still get a cleanup attempt.
+            for resource in deletion_order {
+                if !resource.pending_cleanup.is_empty() {
+                    failures.push(format!(
+                        "{}: retired replacement cleanup is pending",
+                        resource.logical_id
+                    ));
+                    continue;
+                }
                 if declarations
                     .get(&resource.logical_id)
                     .is_some_and(|decl| decl.deletion_policy.retains_on_delete())
@@ -506,17 +571,27 @@ impl CfnHandler {
                 let properties = declarations
                     .get(&resource.logical_id)
                     .map(|decl| resolve(&decl.properties, &ctx))
-                    .unwrap_or(Value::Null);
+                    .transpose()
+                    .map(|properties| properties.unwrap_or(Value::Null));
                 stack.events.push(event(
                     &resource.logical_id,
                     &resource.resource_type,
                     "DELETE_IN_PROGRESS",
                     None,
                 ));
-                match provisioner
-                    .deprovision(&resource.resource_type, &resource.physical_id, &properties)
-                    .await
-                {
+                let deletion = match properties {
+                    Ok(properties) => {
+                        provisioner
+                            .deprovision(
+                                &resource.resource_type,
+                                &resource.physical_id,
+                                &properties,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match deletion {
                     Ok(()) => {
                         remaining.retain(|candidate| candidate.logical_id != resource.logical_id);
                         stack.events.push(event(
@@ -596,6 +671,8 @@ impl CfnHandler {
                 resource_type: String,
                 applied_properties: Value,
                 previous_properties: Value,
+                deferred_previous: Option<ResolvedResource>,
+                replacement_policy: ResourcePolicy,
             },
         }
 
@@ -640,13 +717,50 @@ impl CfnHandler {
             conditions: &previous_conditions,
         });
 
-        // Removed resources and logical ids whose type changed must not remain available to
-        // intrinsic resolution. Tear them down in reverse creation order before reconciling.
+        // Resolve prior resource properties before any destructive reconciliation. A missing
+        // attribute must preserve the old graph, not become an empty lifecycle argument.
+        let prior_properties = existing
+            .iter()
+            .map(|resource| {
+                let properties = previous_declarations
+                    .get(&resource.logical_id)
+                    .zip(previous_ctx.as_ref())
+                    .ok_or_else(|| {
+                        CfnError::Validation(format!(
+                            "previous declaration for {} is unavailable",
+                            resource.logical_id
+                        ))
+                    })?;
+                Ok((
+                    resource.logical_id.clone(),
+                    resolve(&properties.0.properties, properties.1)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, CfnError>>();
+        let prior_properties = match prior_properties {
+            Ok(properties) => properties,
+            Err(error) => {
+                return (
+                    StackStatus::UpdateFailed,
+                    existing.to_vec(),
+                    Vec::new(),
+                    vec![event(
+                        stack_name,
+                        STACK_TYPE,
+                        "UPDATE_FAILED",
+                        Some(error.to_string()),
+                    )],
+                )
+            }
+        };
+
+        // A type change reuses a logical ID, so its old resource is removed first.
+        // Pure removals stay in physical inventory until dependents have been updated.
         let mut removal_failures = BTreeMap::new();
         for resource in existing.iter().rev().filter(|resource| {
             declarations
                 .get(&resource.logical_id)
-                .is_none_or(|decl| decl.resource_type != resource.resource_type)
+                .is_some_and(|decl| decl.resource_type != resource.resource_type)
         }) {
             if previous_declarations
                 .get(&resource.logical_id)
@@ -654,10 +768,9 @@ impl CfnHandler {
             {
                 continue;
             }
-            let properties = previous_declarations
+            let properties = prior_properties
                 .get(&resource.logical_id)
-                .zip(previous_ctx.as_ref())
-                .map(|(decl, ctx)| resolve(&decl.properties, ctx))
+                .cloned()
                 .unwrap_or(Value::Null);
             if let Err(error) = provisioner
                 .deprovision(&resource.resource_type, &resource.physical_id, &properties)
@@ -673,12 +786,31 @@ impl CfnHandler {
                 removal_failures.contains_key(&resource.logical_id)
                     || declarations
                         .get(&resource.logical_id)
-                        .is_some_and(|decl| decl.resource_type == resource.resource_type)
+                        .is_none_or(|decl| decl.resource_type == resource.resource_type)
             })
             .cloned()
             .collect();
+        // Previous dependency order also covers dependencies introduced by prior updates.
+        let previous_order: BTreeMap<_, _> = previous
+            .and_then(|(template, _)| template.active_resources(&previous_conditions).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, declaration)| (declaration.logical_id, index))
+            .collect();
+        resources.sort_by_key(|resource| {
+            previous_order
+                .get(&resource.logical_id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         let mut resolved: BTreeMap<String, ResolvedResource> = resources
             .iter()
+            .filter(|resource| {
+                declarations
+                    .get(&resource.logical_id)
+                    .is_some_and(|decl| decl.resource_type == resource.resource_type)
+            })
             .map(|resource| {
                 (
                     resource.logical_id.clone(),
@@ -733,12 +865,23 @@ impl CfnHandler {
                 parameters,
                 conditions,
             };
-            let props = resolve(&decl.properties, &ctx);
+            let props = match resolve(&decl.properties, &ctx) {
+                Ok(properties) => properties,
+                Err(error) => {
+                    events.push(event(
+                        &decl.logical_id,
+                        &decl.resource_type,
+                        failed_status,
+                        Some(error.to_string()),
+                    ));
+                    failure_reason = Some(error.to_string());
+                    break;
+                }
+            };
             if let Some(current) = resolved.get(&decl.logical_id).cloned() {
-                let previous_properties = previous_declarations
+                let previous_properties = prior_properties
                     .get(&decl.logical_id)
-                    .zip(previous_ctx.as_ref())
-                    .map(|(previous_decl, ctx)| resolve(&previous_decl.properties, ctx))
+                    .cloned()
                     .unwrap_or(Value::Null);
                 if previous_properties == props {
                     continue;
@@ -774,6 +917,14 @@ impl CfnHandler {
                             resource_type: decl.resource_type.clone(),
                             applied_properties: props.clone(),
                             previous_properties,
+                            deferred_previous: (matches!(
+                                decl.resource_type.as_str(),
+                                "AWS::EC2::NatGateway"
+                                    | "AWS::EC2::Route"
+                                    | "AWS::EC2::VPCGatewayAttachment"
+                            ) && current.ref_value != updated.ref_value)
+                                .then_some(current),
+                            replacement_policy: decl.update_replace_policy,
                         });
                         resolved.insert(decl.logical_id.clone(), updated);
                         events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
@@ -809,6 +960,7 @@ impl CfnHandler {
                         resource_type: decl.resource_type.clone(),
                         status: complete.to_string(),
                         attributes: rr.attributes.clone(),
+                        pending_cleanup: Vec::new(),
                     });
                     events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
                     successful_actions.push(ReconcileAction::Created {
@@ -831,6 +983,37 @@ impl CfnHandler {
                 }
             }
         }
+
+        // Resolve outputs before retiring old dependencies, so failures use the same rollback.
+        let ctx = ResolveCtx {
+            region,
+            account,
+            stack_name,
+            partition: "aws",
+            resources: &resolved,
+            parameters,
+            conditions,
+        };
+        let outputs = output_exprs
+            .iter()
+            .map(|(key, value, export)| {
+                Ok(Output {
+                    key: key.clone(),
+                    value: crate::template::resolve_to_string(value, &ctx)?,
+                    export_name: export
+                        .as_ref()
+                        .map(|value| crate::template::resolve_to_string(value, &ctx))
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, CfnError>>();
+        let outputs = match outputs {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                failure_reason.get_or_insert_with(|| error.to_string());
+                Vec::new()
+            }
+        };
 
         if let Some(provisioning_failure) = failure_reason {
             let status = if creating {
@@ -893,6 +1076,8 @@ impl CfnHandler {
                         resource_type,
                         applied_properties,
                         previous_properties,
+                        deferred_previous,
+                        replacement_policy: _,
                     } => {
                         events.push(event(
                             logical_id,
@@ -911,17 +1096,24 @@ impl CfnHandler {
                             cleanup_failures.push(format!("{logical_id}: {reason}"));
                             continue;
                         };
-                        match provisioner
-                            .update(
-                                logical_id,
-                                resource_type,
-                                &current,
-                                applied_properties,
-                                previous_properties,
-                                Replacement::Rollback,
-                            )
-                            .await
-                        {
+                        let restore = if let Some(previous) = deferred_previous {
+                            provisioner
+                                .deprovision(resource_type, &current.ref_value, applied_properties)
+                                .await
+                                .map(|()| previous.clone())
+                        } else {
+                            provisioner
+                                .update(
+                                    logical_id,
+                                    resource_type,
+                                    &current,
+                                    applied_properties,
+                                    previous_properties,
+                                    Replacement::Rollback,
+                                )
+                                .await
+                        };
+                        match restore {
                             Ok(restored) => {
                                 if let Some(resource) = resources
                                     .iter_mut()
@@ -973,32 +1165,65 @@ impl CfnHandler {
             return (status, resources, Vec::new(), events);
         }
 
-        // Resolve outputs against the fully-provisioned resource set.
-        let ctx = ResolveCtx {
-            region,
-            account,
-            stack_name,
-            partition: "aws",
-            resources: &resolved,
-            parameters,
-            conditions,
-        };
-        let outputs = output_exprs
-            .iter()
-            .cloned()
-            .map(|(key, value_expr, export_expr)| Output {
-                key,
-                value: crate::template::resolve_to_string(&value_expr, &ctx),
-                export_name: export_expr.map(|e| crate::template::resolve_to_string(&e, &ctx)),
-            })
-            .collect();
+        for action in &successful_actions {
+            if let ReconcileAction::Updated {
+                logical_id,
+                previous_properties,
+                deferred_previous: Some(previous),
+                replacement_policy,
+                ..
+            } = action
+            {
+                if *replacement_policy != ResourcePolicy::Retain {
+                    if let Some(resource) = resources
+                        .iter_mut()
+                        .find(|resource| resource.logical_id == *logical_id)
+                    {
+                        resource
+                            .pending_cleanup
+                            .push(crate::model::ReplacementCleanup {
+                                physical_id: previous.ref_value.clone(),
+                                properties: previous_properties.clone(),
+                            });
+                    }
+                }
+            }
+        }
+        // Cleanup is last: failed reconciliation can restore the still-live old dependencies.
+        for resource in &mut resources {
+            if !declarations.contains_key(&resource.logical_id) {
+                if previous_declarations
+                    .get(&resource.logical_id)
+                    .is_some_and(|decl| decl.deletion_policy.retains_on_delete())
+                {
+                    continue;
+                }
+                let properties = prior_properties
+                    .get(&resource.logical_id)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                resource
+                    .pending_cleanup
+                    .push(crate::model::ReplacementCleanup {
+                        physical_id: resource.physical_id.clone(),
+                        properties,
+                    });
+            }
+        }
+        resources.retain(|resource| {
+            declarations.contains_key(&resource.logical_id) || !resource.pending_cleanup.is_empty()
+        });
+        let cleanup_failed =
+            cleanup_network_replacements(&provisioner, &mut resources, &mut events).await;
 
         let status = if creating {
             StackStatus::CreateComplete
+        } else if cleanup_failed {
+            StackStatus::UpdateCompleteCleanupInProgress
         } else {
             StackStatus::UpdateComplete
         };
-        events.push(event(stack_name, STACK_TYPE, complete, None));
+        events.push(event(stack_name, STACK_TYPE, status.as_str(), None));
         (status, resources, outputs, events)
     }
 
@@ -1206,6 +1431,10 @@ impl CfnHandler {
 
 #[async_trait]
 impl NativeHandler for CfnHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let q = Query::parse(&request.body);
         let op = match q.action() {
@@ -1215,7 +1444,72 @@ impl NativeHandler for CfnHandler {
                     .into_response(&request.request_id)
             }
         };
-        match self
+        if matches!(
+            op.as_str(),
+            "ListStacks"
+                | "DescribeStacks"
+                | "DescribeStackEvents"
+                | "DescribeStackResources"
+                | "DescribeStackResource"
+                | "ListStackResources"
+                | "GetTemplate"
+                | "GetTemplateSummary"
+                | "DescribeChangeSet"
+        ) {
+            let stack_name = q.get("StackName");
+            let resource = if op == "DescribeChangeSet" {
+                self.lookup_change_set(&q, &request.region, &request.account_id)
+                    .ok()
+                    .map(|change| change.stack_id)
+            } else {
+                stack_name
+                    .as_deref()
+                    .and_then(|name| self.store.find(&request.account_id, &request.region, name))
+                    .map(|stack| stack.stack_id)
+            }
+            .unwrap_or_else(|| "*".into());
+            let allowed = locallycloud_core::integration::authorization::authorize_native_read(
+                &self.registry,
+                &request,
+                "cloudformation",
+                &format!("cloudformation:{op}"),
+                &resource,
+            )
+            .is_ok();
+            let list_allowed = op != "DescribeStacks"
+                || stack_name.is_some()
+                || locallycloud_core::integration::authorization::authorize_native_read(
+                    &self.registry,
+                    &request,
+                    "cloudformation",
+                    "cloudformation:ListStacks",
+                    "*",
+                )
+                .is_ok();
+            if !allowed || !list_allowed {
+                return locallycloud_core::error_mapping::AwsError::new(
+                    "AccessDenied",
+                    "Not authorized to read CloudFormation resources",
+                    403,
+                )
+                .with_request_id(request.request_id.clone())
+                .with_xml_namespace(crate::error::CFN_XMLNS)
+                .render(AwsProtocol::Query)
+                .into_response();
+            }
+        }
+        let execution = Self {
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            caller_access_key: request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(
+                    locallycloud_core::integration::RequestIdentity::access_key_from_authorization,
+                ),
+        };
+        match execution
             .dispatch(&op, &q, &request.region, &request.account_id)
             .await
         {
@@ -1291,6 +1585,12 @@ fn check_capabilities(q: &Query, template: &Template) -> Result<(), CfnError> {
     }
 }
 
+fn parameter_no_echo(definition: &Value) -> bool {
+    definition
+        .get("NoEcho")
+        .is_some_and(|value| value == true || value.as_str() == Some("true"))
+}
+
 fn render_template_summary(template: &Template, include_types: bool) -> String {
     let resources = template.resources();
     let params = template
@@ -1321,10 +1621,7 @@ fn render_template_summary(template: &Template, include_types: bool) -> String {
                 parameter_type,
                 description,
                 default,
-                definition
-                    .get("NoEcho")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
+                parameter_no_echo(definition)
             )
         })
         .collect::<String>();
@@ -1373,6 +1670,81 @@ fn render_template_summary(template: &Template, include_types: bool) -> String {
         String::new()
     };
     format!("{description}<Parameters>{params}</Parameters><Capabilities>{capabilities}</Capabilities>{reason}<DeclaredTransforms>{transforms}</DeclaredTransforms>{types}")
+}
+
+fn effective_parameters(
+    q: &Query,
+    template: &Template,
+    previous: Option<&Stack>,
+) -> Result<BTreeMap<String, String>, CfnError> {
+    let declarations: BTreeMap<_, _> = template.parameter_declarations().into_iter().collect();
+    let previous = previous
+        .map(|stack| {
+            Template::parse(&stack.template_body)
+                .map(|template| template.effective_parameters(&stack.parameters))
+        })
+        .transpose()?;
+    let mut supplied = BTreeMap::new();
+    let mut index = 1;
+    while let Some(name) = q
+        .params
+        .get(&format!("Parameters.member.{index}.ParameterKey"))
+    {
+        if !declarations.contains_key(name) || supplied.contains_key(name) {
+            return Err(CfnError::Validation(format!(
+                "Unknown or duplicate parameter {name}"
+            )));
+        }
+        let value = q
+            .params
+            .get(&format!("Parameters.member.{index}.ParameterValue"));
+        let use_previous = match q
+            .params
+            .get(&format!("Parameters.member.{index}.UsePreviousValue"))
+            .map(String::as_str)
+        {
+            None | Some("false") => false,
+            Some("true") => true,
+            _ => {
+                return Err(CfnError::Validation(
+                    "UsePreviousValue must be true or false".into(),
+                ))
+            }
+        };
+        let resolved = if use_previous {
+            if value.is_some() {
+                return Err(CfnError::Validation(format!(
+                    "Parameter {name} cannot specify both ParameterValue and UsePreviousValue"
+                )));
+            }
+            previous
+                .as_ref()
+                .and_then(|values| values.get(name))
+                .cloned()
+                .ok_or_else(|| {
+                    CfnError::Validation(format!("Parameter {name} has no previous value"))
+                })?
+        } else if let Some(value) = value {
+            value.clone()
+        } else if let Some(value) = declarations[name].get("Default") {
+            value_to_text(value)
+        } else {
+            return Err(CfnError::Validation(format!(
+                "Parameter {name} requires a value"
+            )));
+        };
+        supplied.insert(name.clone(), resolved);
+        index += 1;
+    }
+    let parameters = template.effective_parameters(&supplied);
+    for name in declarations.keys() {
+        if !parameters.contains_key(name) {
+            return Err(CfnError::Validation(format!(
+                "Parameter {name} requires a value"
+            )));
+        }
+    }
+    Ok(parameters)
 }
 
 fn value_to_text(value: &Value) -> String {
@@ -1486,14 +1858,26 @@ fn render_stack(stack: &Stack) -> String {
             )
         })
         .collect();
-    let params: String = stack
-        .parameters
+    // Report effective defaults without mutating the stored values used by Ref/provisioning.
+    let declarations = Template::parse(&stack.template_body)
+        .ok()
+        .map(|template| template.parameter_declarations());
+    let parameters = Template::parse(&stack.template_body)
+        .map(|template| template.effective_parameters(&stack.parameters))
+        .unwrap_or_else(|_| stack.parameters.clone());
+    let params: String = parameters
         .iter()
-        .map(|(k, v)| {
+        .map(|(key, value)| {
+            // Corrupt stored templates must not reveal values when masking metadata is unavailable.
+            let hidden = declarations.as_ref().is_none_or(|declarations| {
+                declarations
+                    .iter()
+                    .any(|(name, definition)| name == key && parameter_no_echo(definition))
+            });
             format!(
                 "<member>{}{}</member>",
-                text_el("ParameterKey", k),
-                text_el("ParameterValue", v)
+                text_el("ParameterKey", key),
+                text_el("ParameterValue", if hidden { "*****" } else { value })
             )
         })
         .collect();
@@ -1621,6 +2005,64 @@ fn parse_s3_url(url: &str) -> Option<(String, String)> {
     Some((bucket.to_string(), key.to_string()))
 }
 
+/// Cleanup is deferred until new dependents have switched, and failed physical IDs remain
+/// attached to their stack resource for the next update/delete attempt.
+async fn cleanup_network_replacements(
+    provisioner: &Provisioner,
+    resources: &mut Vec<StackResource>,
+    events: &mut Vec<StackEvent>,
+) -> bool {
+    let mut failed = false;
+    let mut removed = BTreeSet::new();
+    for resource in resources.iter_mut().rev() {
+        let mut remaining = Vec::new();
+        for retired in resource.pending_cleanup.drain(..).rev() {
+            match provisioner
+                .deprovision(
+                    &resource.resource_type,
+                    &retired.physical_id,
+                    &retired.properties,
+                )
+                .await
+            {
+                Ok(()) => {
+                    if retired.physical_id == resource.physical_id {
+                        removed.insert(resource.logical_id.clone());
+                    }
+                    events.push(event(
+                        &resource.logical_id,
+                        &resource.resource_type,
+                        "DELETE_COMPLETE",
+                        Some(format!("Retired resource {}", retired.physical_id)),
+                    ));
+                }
+                Err(error) => {
+                    if retired.physical_id == resource.physical_id {
+                        resource.status = "DELETE_FAILED".into();
+                    }
+                    events.push(event(
+                        &resource.logical_id,
+                        &resource.resource_type,
+                        "DELETE_FAILED",
+                        Some(format!(
+                            "Replacement cleanup failed for {}: {error}",
+                            retired.physical_id
+                        )),
+                    ));
+                    remaining.push(retired);
+                    failed = true;
+                }
+            }
+        }
+        remaining.reverse();
+        resource.pending_cleanup = remaining;
+    }
+    resources.retain(|resource| {
+        !removed.contains(&resource.logical_id) || !resource.pending_cleanup.is_empty()
+    });
+    failed
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1690,6 +2132,121 @@ mod tests {
             .to_string(),
         )
         .expect("valid test template")
+    }
+
+    #[tokio::test]
+    async fn describe_stack_masks_noecho_effective_parameters_but_preserves_outputs() {
+        let (_registry, handler) = handler_with_s3(Arc::new(TestS3 {
+            failed_put: None,
+            existing: None,
+            fail_delete: false,
+            requests: Mutex::new(Vec::new()),
+        }));
+        let raw = serde_json::json!({
+            "Parameters": {
+                "Secret":{"Type":"String","NoEcho":true,"Default":"default-marker"},
+                "LegacySecret":{"Type":"String","NoEcho":"true","Default":"legacy-marker"},
+                "Visible":{"Type":"String","Default":"visible-default"},
+                "Count":{"Type":"Number","Default":7}
+            },
+            "Resources":{"Bucket":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"noecho-gate"}}},
+            "Outputs":{"DeliberateExposure":{"Value":{"Ref":"Secret"}},
+                "DefaultExposure":{"Value":{"Ref":"LegacySecret"}},
+                "NumberDefault":{"Value":{"Ref":"Count"}}}
+        });
+        let query = Query {
+            params: BTreeMap::from([
+                ("StackName".into(), "noecho-stack".into()),
+                ("TemplateBody".into(), raw.to_string()),
+                ("Parameters.member.1.ParameterKey".into(), "Secret".into()),
+                (
+                    "Parameters.member.1.ParameterValue".into(),
+                    "effective-marker".into(),
+                ),
+            ]),
+        };
+        handler
+            .create_stack(&query, "us-east-1", "000000000000", None)
+            .await
+            .unwrap();
+        let stack = handler
+            .store
+            .find("000000000000", "us-east-1", "noecho-stack")
+            .unwrap();
+        assert_eq!(stack.status, StackStatus::CreateComplete);
+        assert_eq!(stack.parameters["Secret"], "effective-marker");
+        let xml = handler
+            .describe_stacks(&query, "us-east-1", "000000000000")
+            .unwrap();
+        let parameters = xml
+            .split("<Parameters>")
+            .nth(1)
+            .unwrap()
+            .split("</Parameters>")
+            .next()
+            .unwrap();
+        assert!(parameters
+            .contains("<ParameterKey>Secret</ParameterKey><ParameterValue>*****</ParameterValue>"));
+        assert!(parameters.contains(
+            "<ParameterKey>LegacySecret</ParameterKey><ParameterValue>*****</ParameterValue>"
+        ));
+        assert!(parameters.contains(
+            "<ParameterKey>Visible</ParameterKey><ParameterValue>visible-default</ParameterValue>"
+        ));
+        assert!(!parameters.contains("effective-marker") && !parameters.contains("legacy-marker"));
+        assert!(xml.contains("<OutputValue>effective-marker</OutputValue>"));
+        assert!(xml.contains("<OutputValue>legacy-marker</OutputValue>"));
+        assert!(xml.contains("<OutputValue>7</OutputValue>"));
+        let mut update = query.clone();
+        update.params.remove("Parameters.member.1.ParameterValue");
+        update
+            .params
+            .insert("Parameters.member.1.UsePreviousValue".into(), "true".into());
+        let mut updated_template = raw.clone();
+        updated_template["Parameters"]["Secret"]["Default"] = serde_json::json!("changed-default");
+        updated_template["Parameters"]["Count"]["Default"] = serde_json::json!(8);
+        update
+            .params
+            .insert("TemplateBody".into(), updated_template.to_string());
+        handler
+            .update_stack(&update, "us-east-1", "000000000000")
+            .await
+            .unwrap();
+        let updated = handler
+            .store
+            .find("000000000000", "us-east-1", "noecho-stack")
+            .unwrap();
+        assert_eq!(updated.status, StackStatus::UpdateComplete);
+        assert_eq!(updated.parameters["Secret"], "effective-marker");
+        assert_eq!(updated.parameters["Count"], "8");
+        let updated_xml = handler
+            .describe_stacks(&query, "us-east-1", "000000000000")
+            .unwrap();
+        assert!(updated_xml.contains("<OutputValue>effective-marker</OutputValue>"));
+        assert!(updated_xml.contains("<OutputValue>8</OutputValue>"));
+        // Invalid previous-value requests fail before provisioning or changing state.
+        update.params.insert(
+            "Parameters.member.1.ParameterValue".into(),
+            "conflict".into(),
+        );
+        assert!(handler
+            .update_stack(&update, "us-east-1", "000000000000")
+            .await
+            .is_err());
+        assert_eq!(
+            handler
+                .store
+                .find("000000000000", "us-east-1", "noecho-stack")
+                .unwrap()
+                .parameters,
+            updated.parameters
+        );
+        let summary = render_template_summary(&Template::parse(&raw.to_string()).unwrap(), true);
+        assert!(
+            summary.contains("<DefaultValue>default-marker</DefaultValue><NoEcho>true</NoEcho>")
+        );
+        // The documented AWS string Boolean form is metadata too, not a masking bypass.
+        assert!(summary.contains("<DefaultValue>legacy-marker</DefaultValue><NoEcho>true</NoEcho>"));
     }
 
     #[test]
@@ -1824,6 +2381,7 @@ mod tests {
                     resource_type: "AWS::S3::Bucket".into(),
                     status: "CREATE_COMPLETE".into(),
                     attributes: BTreeMap::new(),
+                    pending_cleanup: Vec::new(),
                 }],
                 outputs: Vec::new(),
                 events: Vec::new(),
@@ -1908,6 +2466,59 @@ mod tests {
                 &output_exprs,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn unresolved_outputs_roll_back_created_resources_before_retiring_dependencies() {
+        let s3 = Arc::new(TestS3 {
+            failed_put: None,
+            existing: None,
+            fail_delete: false,
+            requests: Mutex::new(Vec::new()),
+        });
+        let (_registry, handler) = handler_with_s3(s3.clone());
+        let initial = Template::parse(
+            &serde_json::json!({"Resources":{
+                "Bucket":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"old"}},
+                "Retired":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"retired"}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let (_, existing, _, _) = run_provision(&handler, &initial, true, &[], None).await;
+        s3.requests.lock().unwrap().clear();
+        let next = Template::parse(
+            &serde_json::json!({"Resources":{
+            "Bucket":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"old"}},
+            "Added":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"new"}}
+        },"Outputs":{"Unavailable":{"Value":{"Fn::Sub":"${Bucket.Missing}"}}}})
+            .to_string(),
+        )
+        .unwrap();
+        let (status, resources, outputs, events) =
+            run_provision(&handler, &next, false, &existing, Some(&initial)).await;
+        assert_eq!(status, StackStatus::UpdateFailed);
+        assert!(outputs.is_empty());
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.logical_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Bucket", "Retired"])
+        );
+        assert_eq!(*s3.requests.lock().unwrap(), ["PUT /new", "DELETE /new"]);
+        assert!(events.iter().any(|event| event
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("Bucket.Missing"))));
+        s3.requests.lock().unwrap().clear();
+        let (status, resources, outputs, _) = run_provision(&handler, &next, true, &[], None).await;
+        assert_eq!(status, StackStatus::CreateFailed);
+        assert!(resources.is_empty() && outputs.is_empty());
+        assert_eq!(
+            *s3.requests.lock().unwrap(),
+            ["PUT /new", "PUT /old", "DELETE /old", "DELETE /new"]
+        );
     }
 
     #[tokio::test]
@@ -2069,6 +2680,7 @@ mod tests {
                         resource_type: "AWS::S3::Bucket".into(),
                         status: "CREATE_COMPLETE".into(),
                         attributes: BTreeMap::new(),
+                        pending_cleanup: Vec::new(),
                     },
                     StackResource {
                         logical_id: "Eph".into(),
@@ -2076,6 +2688,7 @@ mod tests {
                         resource_type: "AWS::S3::Bucket".into(),
                         status: "CREATE_COMPLETE".into(),
                         attributes: BTreeMap::new(),
+                        pending_cleanup: Vec::new(),
                     },
                 ],
                 outputs: Vec::new(),
@@ -2105,6 +2718,324 @@ mod tests {
         assert_eq!(
             *s3.requests.lock().expect("test S3 request lock"),
             ["DELETE /eph"]
+        );
+    }
+    #[tokio::test]
+    async fn removed_resource_cleanup_failure_keeps_inventory_until_retry() {
+        let failing = Arc::new(TestS3 {
+            failed_put: None,
+            existing: None,
+            fail_delete: true,
+            requests: Mutex::new(Vec::new()),
+        });
+        let (registry, handler) = handler_with_s3(failing);
+        let initial = policy_template("old", false);
+        let (_, original, _, _) = run_provision(&handler, &initial, true, &[], None).await;
+        let empty = Template::parse("{\"Resources\":{}}").unwrap();
+        let (status, mut pending, _, _) =
+            run_provision(&handler, &empty, false, &original, Some(&initial)).await;
+        assert_eq!(status, StackStatus::UpdateCompleteCleanupInProgress);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].physical_id, "old");
+        assert_eq!(pending[0].status, "DELETE_FAILED");
+        assert_eq!(pending[0].pending_cleanup[0].physical_id, "old");
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            Arc::new(TestS3 {
+                failed_put: None,
+                existing: None,
+                fail_delete: false,
+                requests: Mutex::new(Vec::new()),
+            }),
+        );
+        assert!(
+            !cleanup_network_replacements(
+                &handler.provisioner("us-east-1", "000000000000"),
+                &mut pending,
+                &mut Vec::new()
+            )
+            .await
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removed_security_group_survives_rollback_until_lambda_switches() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let ec2 = locallycloud_ec2::register(&registry);
+        locallycloud_lambda::register(&registry).attach_ec2(ec2.clone());
+        let handler = CfnHandler::new(Arc::downgrade(&registry));
+        let topology = serde_json::json!({"Resources": {
+            "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.55.0.0/16"}},
+            "Subnet":{"Type":"AWS::EC2::Subnet","Properties":{"VpcId":{"Ref":"Vpc"},"CidrBlock":"10.55.1.0/24"}},
+            "Preferred":{"Type":"AWS::EC2::SecurityGroup","Properties":{"VpcId":{"Ref":"Vpc"},"GroupDescription":"preferred"}},
+            "Retired":{"Type":"AWS::EC2::SecurityGroup","Properties":{"VpcId":{"Ref":"Vpc"},"GroupDescription":"retired"}},
+            "Function":{"Type":"AWS::Lambda::Function","Properties":{"FunctionName":"cfn-sg-switch","Runtime":"nodejs22.x","Handler":"index.handler","Role":"arn:aws:iam::000000000000:role/test","Code":{"ZipFile":"UEsDBBQAAAAAAMeaQ100F2L+HQAAAB0AAAAIAAAAaW5kZXguanNleHBvcnRzLmhhbmRsZXI9YXN5bmMoKT0+KHt9KVBLAQIUAxQAAAAAAMeaQ100F2L+HQAAAB0AAAAIAAAAAAAAAAAAAACAAQAAAABpbmRleC5qc1BLBQYAAAAAAQABADYAAABDAAAAAAA="},"VpcConfig":{"SubnetIds":[{"Ref":"Subnet"}],"SecurityGroupIds":[{"Ref":"Retired"}]}}}
+        }});
+        let initial = Template::parse(&topology.to_string()).unwrap();
+        let (status, original, _, events) =
+            run_provision(&handler, &initial, true, &[], None).await;
+        assert_eq!(status, StackStatus::CreateComplete, "{events:?}");
+        let retired = original
+            .iter()
+            .find(|resource| resource.logical_id == "Retired")
+            .unwrap()
+            .physical_id
+            .clone();
+        let mut changed = topology.clone();
+        changed["Resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("Retired");
+        changed["Resources"]["Function"]["Properties"]["VpcConfig"]["SecurityGroupIds"] =
+            serde_json::json!([{"Ref":"Preferred"}]);
+        let mut failed = changed.clone();
+        failed["Resources"]["Failure"] = serde_json::json!({"Type":"AWS::EC2::Subnet","DependsOn":"Function","Properties":{"VpcId":"vpc-missing","CidrBlock":"10.56.1.0/24"}});
+        let failed = Template::parse(&failed.to_string()).unwrap();
+        let (status, restored, _, events) =
+            run_provision(&handler, &failed, false, &original, Some(&initial)).await;
+        assert_eq!(status, StackStatus::UpdateFailed);
+        assert!(restored
+            .iter()
+            .any(|resource| resource.physical_id == retired));
+        assert!(!events
+            .iter()
+            .any(|event| event.status == "UPDATE_ROLLBACK_FAILED"));
+        async fn groups(ec2: &locallycloud_ec2::Ec2Handler) -> String {
+            let response = ec2
+                .handle(ServiceRequest {
+                    method: Method::POST,
+                    uri: "/".parse().unwrap(),
+                    headers: http::HeaderMap::new(),
+                    body: Bytes::from_static(b"Action=DescribeSecurityGroups&Version=2016-11-15"),
+                    region: "us-east-1".into(),
+                    account_id: "000000000000".into(),
+                    request_id: "gate".into(),
+                })
+                .await;
+            assert!(response.status().is_success());
+            String::from_utf8(
+                axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        }
+        assert!(groups(&ec2).await.contains(&retired));
+        let changed = Template::parse(&changed.to_string()).unwrap();
+        let (status, updated, _, _) =
+            run_provision(&handler, &changed, false, &restored, Some(&initial)).await;
+        assert_eq!(status, StackStatus::UpdateComplete);
+        assert!(!updated
+            .iter()
+            .any(|resource| resource.physical_id == retired));
+        assert!(!groups(&ec2).await.contains(&retired));
+        let empty = Template::parse("{\"Resources\":{}}").unwrap();
+        let (status, remaining, _, _) =
+            run_provision(&handler, &empty, false, &updated, Some(&changed)).await;
+        assert_eq!(status, StackStatus::UpdateComplete);
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nat_replacement_defers_cleanup_and_rollback_preserves_original_target() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let ec2 = locallycloud_ec2::register(&registry);
+        struct FaultEc2 {
+            native: Arc<locallycloud_ec2::Ec2Handler>,
+            fail_cleanup: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl NativeHandler for FaultEc2 {
+            async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+                if request.body.starts_with(b"Action=DeleteNatGateway&")
+                    && self
+                        .fail_cleanup
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return http::Response::builder()
+                        .status(503)
+                        .body(Body::from("injected cleanup failure"))
+                        .unwrap();
+                }
+                self.native.handle(request).await
+            }
+        }
+        let fault = Arc::new(FaultEc2 {
+            native: ec2.clone(),
+            fail_cleanup: std::sync::atomic::AtomicBool::new(false),
+        });
+        registry.register_native(
+            ServiceName::new("ec2"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            fault.clone(),
+        );
+        let handler = CfnHandler::new(Arc::downgrade(&registry));
+        let topology = serde_json::json!({"Resources": {
+            "Vpc": {"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.54.0.0/16"}},
+            "Subnet": {"Type":"AWS::EC2::Subnet","Properties":{"VpcId":{"Ref":"Vpc"},"CidrBlock":"10.54.1.0/24"}},
+            "Gateway": {"Type":"AWS::EC2::InternetGateway"},
+            "Attachment": {"Type":"AWS::EC2::VPCGatewayAttachment","Properties":{"VpcId":{"Ref":"Vpc"},"InternetGatewayId":{"Ref":"Gateway"}}},
+            "Address": {"Type":"AWS::EC2::EIP","DependsOn":"Attachment","Properties":{"Domain":"vpc"}},
+            "Nat": {"Type":"AWS::EC2::NatGateway","Properties":{"SubnetId":{"Ref":"Subnet"},"AllocationId":{"Fn::GetAtt":["Address","AllocationId"]}}},
+            "Table": {"Type":"AWS::EC2::RouteTable","Properties":{"VpcId":{"Ref":"Vpc"}}},
+            "Route": {"Type":"AWS::EC2::Route","Properties":{"RouteTableId":{"Ref":"Table"},"DestinationCidrBlock":"0.0.0.0/0","NatGatewayId":{"Ref":"Nat"}}}
+        }});
+        let initial = Template::parse(&topology.to_string()).unwrap();
+        let (status, original, _, _) = run_provision(&handler, &initial, true, &[], None).await;
+        assert_eq!(status, StackStatus::CreateComplete);
+        let original_nat = original
+            .iter()
+            .find(|resource| resource.logical_id == "Nat")
+            .unwrap()
+            .physical_id
+            .clone();
+        let mut changed = topology.clone();
+        changed["Resources"]["NewAddress"] =
+            serde_json::json!({"Type":"AWS::EC2::EIP","Properties":{"Domain":"vpc"}});
+        changed["Resources"]["Nat"]["Properties"]["AllocationId"] =
+            serde_json::json!({"Fn::GetAtt":["NewAddress","AllocationId"]});
+        let mut failed = changed.clone();
+        failed["Resources"]["Failure"] = serde_json::json!({"Type":"AWS::EC2::NatGateway","DependsOn":"Route","Properties":{"SubnetId":"subnet-missing","AllocationId":{"Fn::GetAtt":["NewAddress","AllocationId"]}}});
+        let failed = Template::parse(&failed.to_string()).unwrap();
+        let (status, restored, _, events) =
+            run_provision(&handler, &failed, false, &original, Some(&initial)).await;
+        assert_eq!(status, StackStatus::UpdateFailed);
+        assert!(!events
+            .iter()
+            .any(|event| event.status == "UPDATE_ROLLBACK_FAILED"));
+        assert_eq!(
+            restored
+                .iter()
+                .find(|resource| resource.logical_id == "Nat")
+                .unwrap()
+                .physical_id,
+            original_nat
+        );
+        async fn describe(handler: &locallycloud_ec2::Ec2Handler, action: &str) -> String {
+            let response = handler
+                .handle(ServiceRequest {
+                    method: Method::POST,
+                    uri: "/".parse().unwrap(),
+                    headers: http::HeaderMap::new(),
+                    body: Bytes::from(format!("Action={action}&Version=2016-11-15")),
+                    region: "us-east-1".into(),
+                    account_id: "000000000000".into(),
+                    request_id: "gate".into(),
+                })
+                .await;
+            assert!(response.status().is_success());
+            String::from_utf8(
+                axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        }
+        assert_eq!(
+            describe(&ec2, "DescribeNatGateways")
+                .await
+                .matches("<natGatewayId>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            describe(&ec2, "DescribeAddresses")
+                .await
+                .matches("<allocationId>")
+                .count(),
+            1
+        );
+        assert!(describe(&ec2, "DescribeRouteTables")
+            .await
+            .contains(&format!("<natGatewayId>{original_nat}</natGatewayId>")));
+        let changed_body = changed.to_string();
+        let changed = Template::parse(&changed_body).unwrap();
+        fault
+            .fail_cleanup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, mut updated, _, mut events) =
+            run_provision(&handler, &changed, false, &restored, Some(&initial)).await;
+        assert_eq!(status, StackStatus::UpdateCompleteCleanupInProgress);
+        let cleanup = &updated
+            .iter()
+            .find(|resource| resource.logical_id == "Nat")
+            .unwrap()
+            .pending_cleanup;
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].physical_id, original_nat);
+        assert!(
+            !cleanup_network_replacements(
+                &handler.provisioner("us-east-1", "000000000000"),
+                &mut updated,
+                &mut events
+            )
+            .await
+        );
+        let updated_nat = &updated
+            .iter()
+            .find(|resource| resource.logical_id == "Nat")
+            .unwrap()
+            .physical_id;
+        assert_ne!(updated_nat, &original_nat);
+        assert_eq!(
+            describe(&ec2, "DescribeNatGateways")
+                .await
+                .matches("<natGatewayId>")
+                .count(),
+            1
+        );
+        assert!(describe(&ec2, "DescribeRouteTables")
+            .await
+            .contains(&format!("<natGatewayId>{updated_nat}</natGatewayId>")));
+        assert!(updated
+            .iter()
+            .all(|resource| resource.pending_cleanup.is_empty()));
+        handler.store.put(
+            "000000000000",
+            "us-east-1",
+            Stack {
+                stack_id: "replacement-stack".into(),
+                stack_name: "replacement-stack".into(),
+                status: StackStatus::UpdateComplete,
+                template_body: changed_body,
+                parameters: BTreeMap::new(),
+                resources: updated,
+                outputs: Vec::new(),
+                events,
+                tags: Vec::new(),
+                creation_time: now_iso(),
+                last_updated_time: None,
+            },
+        );
+        handler
+            .delete_stack(
+                &Query::parse(b"StackName=replacement-stack"),
+                "us-east-1",
+                "000000000000",
+            )
+            .await
+            .unwrap();
+        assert!(handler
+            .store
+            .find("000000000000", "us-east-1", "replacement-stack")
+            .is_none());
+        assert_eq!(
+            describe(&ec2, "DescribeNatGateways")
+                .await
+                .matches("<natGatewayId>")
+                .count(),
+            0
+        );
+        assert_eq!(
+            describe(&ec2, "DescribeAddresses")
+                .await
+                .matches("<allocationId>")
+                .count(),
+            0
         );
     }
 }

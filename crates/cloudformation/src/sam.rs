@@ -4,6 +4,107 @@ use serde_json::{json, Map, Value};
 
 use crate::error::CfnError;
 
+fn http_api_domain(
+    generated: &mut Map<String, Value>,
+    api: &str,
+    stage: &str,
+    domain: &Value,
+) -> Result<(), CfnError> {
+    let domain = object(domain, "HttpApi.Domain")?;
+    only_keys(
+        domain,
+        &[
+            "DomainName",
+            "CertificateArn",
+            "EndpointConfiguration",
+            "SecurityPolicy",
+            "BasePath",
+            "Route53",
+        ],
+        "HttpApi.Domain",
+    )?;
+    let name = domain
+        .get("DomainName")
+        .ok_or_else(|| unsupported("HttpApi.Domain requires DomainName"))?;
+    let certificate = domain
+        .get("CertificateArn")
+        .ok_or_else(|| unsupported("HttpApi.Domain requires CertificateArn"))?;
+    if domain
+        .get("EndpointConfiguration")
+        .is_some_and(|v| v != "REGIONAL")
+        || domain.get("SecurityPolicy").is_some_and(|v| v != "TLS_1_2")
+    {
+        return Err(unsupported("HttpApi.Domain supports REGIONAL and TLS_1_2"));
+    }
+    let domain_id = format!("{api}DomainName");
+    add_generated(
+        generated,
+        domain_id.clone(),
+        json!({"Type":"AWS::ApiGatewayV2::DomainName","Properties":{"DomainName":name,"DomainNameConfigurations":[{"CertificateArn":certificate,"EndpointType":"REGIONAL","SecurityPolicy":"TLS_1_2"}]}}),
+    )?;
+    let paths = domain
+        .get("BasePath")
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| unsupported("HttpApi.Domain.BasePath must be a list"))
+        })
+        .transpose()?
+        .cloned()
+        .unwrap_or_else(|| vec![json!("/")]);
+    if paths.is_empty() {
+        return Err(unsupported("HttpApi.Domain.BasePath must not be empty"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, path) in paths.iter().enumerate() {
+        let path = path
+            .as_str()
+            .ok_or_else(|| unsupported("HttpApi.Domain.BasePath entries must be strings"))?
+            .trim_matches('/');
+        if !seen.insert(path) {
+            return Err(unsupported(
+                "HttpApi.Domain.BasePath has duplicate mappings",
+            ));
+        }
+        let mut properties =
+            json!({"DomainName":{"Ref":domain_id},"ApiId":{"Ref":api},"Stage":stage});
+        if !path.is_empty() {
+            properties["ApiMappingKey"] = json!(path);
+        }
+        add_generated(
+            generated,
+            format!("{api}ApiMapping{index}"),
+            json!({"Type":"AWS::ApiGatewayV2::ApiMapping","DependsOn":stage_id(api,stage),"Properties":properties}),
+        )?;
+    }
+    if let Some(route53) = domain.get("Route53") {
+        let route53 = object(route53, "HttpApi.Domain.Route53")?;
+        only_keys(
+            route53,
+            &["HostedZoneId", "EvaluateTargetHealth"],
+            "HttpApi.Domain.Route53",
+        )?;
+        let zone = route53
+            .get("HostedZoneId")
+            .ok_or_else(|| unsupported("HttpApi.Domain.Route53 requires HostedZoneId"))?;
+        let health = route53
+            .get("EvaluateTargetHealth")
+            .cloned()
+            .unwrap_or(json!(false));
+        if !health.is_boolean() {
+            return Err(unsupported(
+                "HttpApi.Domain.Route53.EvaluateTargetHealth must be boolean",
+            ));
+        }
+        add_generated(
+            generated,
+            format!("{api}Route53Record"),
+            json!({"Type":"AWS::Route53::RecordSet","Properties":{"HostedZoneId":zone,"Name":name,"Type":"A","AliasTarget":{"DNSName":{"Fn::GetAtt":[domain_id,"RegionalDomainName"]},"HostedZoneId":{"Fn::GetAtt":[domain_id,"RegionalHostedZoneId"]},"EvaluateTargetHealth":health}}}),
+        )?;
+    }
+    Ok(())
+}
+
 fn unsupported(message: impl Into<String>) -> CfnError {
     CfnError::Validation(format!("AWS::Serverless transform: {}", message.into()))
 }
@@ -73,16 +174,172 @@ fn api_body(title: Value) -> Value {
     })
 }
 
+// Intrinsics are expressions, not ordinary maps to merge recursively.
+fn intrinsic(value: &Value) -> bool {
+    value.as_object().is_some_and(|map| {
+        map.len() == 1
+            && map
+                .keys()
+                .any(|key| key == "Ref" || key.starts_with("Fn::"))
+    })
+}
+
+fn merge_globals(global: &Value, local: &Value) -> Value {
+    if intrinsic(global) || intrinsic(local) {
+        return local.clone();
+    }
+    match (global, local) {
+        (Value::Object(global), Value::Object(local)) => {
+            let mut merged = global.clone();
+            for (key, value) in local {
+                let value = merged
+                    .get(key)
+                    .map(|default| merge_globals(default, value))
+                    .unwrap_or_else(|| value.clone());
+                merged.insert(key.clone(), value);
+            }
+            Value::Object(merged)
+        }
+        (Value::Array(global), Value::Array(local)) => {
+            Value::Array(global.iter().chain(local).cloned().collect())
+        }
+        _ => local.clone(),
+    }
+}
+
+fn validate_function_globals(props: &Map<String, Value>) -> Result<(), CfnError> {
+    only_keys(
+        props,
+        &[
+            "CodeUri",
+            "Handler",
+            "Runtime",
+            "Environment",
+            "VpcConfig",
+            "Timeout",
+            "MemorySize",
+            "Description",
+        ],
+        "Globals.Function",
+    )?;
+    validate_global_values(props)
+}
+
+fn validate_global_values(props: &Map<String, Value>) -> Result<(), CfnError> {
+    for (key, value) in props {
+        if intrinsic(value) {
+            continue;
+        }
+        let valid = match key.as_str() {
+            "CodeUri" => value.is_string() || value.is_object(),
+            "Timeout" | "MemorySize" => value.is_number() || value.is_string(),
+            "Environment" | "VpcConfig" => value.is_object(),
+            _ => value.is_string(),
+        };
+        if !valid {
+            return Err(unsupported(format!("invalid Globals.Function.{key}")));
+        }
+        if key == "Environment" {
+            let environment = object(value, "Environment")?;
+            only_keys(environment, &["Variables"], "Environment")?;
+            if let Some(variables) = environment
+                .get("Variables")
+                .filter(|value| !intrinsic(value))
+            {
+                object(variables, "Environment.Variables")?;
+            }
+        }
+        if key == "VpcConfig" {
+            let vpc = object(value, "VpcConfig")?;
+            only_keys(
+                vpc,
+                &["SubnetIds", "SecurityGroupIds", "Ipv6AllowedForDualStack"],
+                "VpcConfig",
+            )?;
+            for (field, value) in vpc {
+                if !intrinsic(value)
+                    && !(if field == "Ipv6AllowedForDualStack" {
+                        value.is_boolean()
+                    } else {
+                        value.is_array()
+                    })
+                {
+                    return Err(unsupported(format!("invalid VpcConfig.{field}")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_globals(raw: &mut Value) -> Result<(), CfnError> {
+    let Some(globals) = raw.get("Globals").cloned() else {
+        return Ok(());
+    };
+    let globals = object(&globals, "Globals")?;
+    only_keys(globals, &["Function", "HttpApi"], "Globals")?;
+    for (kind, props) in globals {
+        let props = object(props, &format!("Globals.{kind}"))?;
+        if kind == "Function" {
+            validate_function_globals(props)?;
+        } else {
+            // No AWS HttpApi Globals property is implemented by the current adapter.
+            only_keys(props, &[], "Globals.HttpApi")?;
+        }
+    }
+    let resources = raw
+        .get_mut("Resources")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| unsupported("Resources must be an object"))?;
+    for declaration in resources.values_mut() {
+        let kind = declaration
+            .get("Type")
+            .and_then(Value::as_str)
+            .and_then(|kind| kind.strip_prefix("AWS::Serverless::"));
+        let Some(defaults) = kind.and_then(|kind| globals.get(kind)) else {
+            continue;
+        };
+        let props = declaration
+            .get("Properties")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        object(&props, "SAM resource Properties")?;
+        let merged = merge_globals(defaults, &props);
+        if kind == Some("Function") {
+            let effective = object(&merged, "Function Properties")?
+                .iter()
+                .filter(|(key, _)| defaults.get(key.as_str()).is_some())
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            validate_global_values(&effective)?;
+        }
+        declaration["Properties"] = merged;
+    }
+    raw.as_object_mut()
+        .expect("Resources requires object template")
+        .remove("Globals");
+    Ok(())
+}
+
 pub fn transform(raw: &mut Value) -> Result<(), CfnError> {
+    if raw.get("Transform").is_none() {
+        return Ok(());
+    }
+    // Commit only a fully validated transform, including generated resource collisions.
+    let mut processed = raw.clone();
+    transform_inner(&mut processed)?;
+    *raw = processed;
+    Ok(())
+}
+
+fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
     let Some(transform) = raw.get("Transform") else {
         return Ok(());
     };
     if transform != "AWS::Serverless-2016-10-31" {
         return Err(unsupported("only AWS::Serverless-2016-10-31 is supported"));
     }
-    if raw.get("Globals").is_some() {
-        return Err(unsupported("Globals are not supported"));
-    }
+    apply_globals(raw)?;
     let root = raw
         .as_object_mut()
         .ok_or_else(|| unsupported("template must be an object"))?;
@@ -136,7 +393,7 @@ pub fn transform(raw: &mut Value) -> Result<(), CfnError> {
             }
             "AWS::Serverless::HttpApi" => {
                 let p = object(&props, id)?;
-                only_keys(p, &["Name", "StageName"], id)?;
+                only_keys(p, &["Name", "StageName", "Domain"], id)?;
                 let mut api = json!({"Body": api_body(p.get("Name").cloned().unwrap_or_else(|| json!({"Ref":"AWS::StackName"})))});
                 if let Some(paths) = resources
                     .get(id)
@@ -158,6 +415,9 @@ pub fn transform(raw: &mut Value) -> Result<(), CfnError> {
                     stage_id(id, stage),
                     json!({"Type":"AWS::ApiGatewayV2::Stage","Properties":{"ApiId":{"Ref":id},"StageName":stage,"AutoDeploy":true}}),
                 )?;
+                if let Some(domain) = p.get("Domain") {
+                    http_api_domain(&mut generated, id, stage, domain)?;
+                }
             }
             "AWS::Serverless::Function" => {
                 let p = object(&props, id)?;
@@ -357,6 +617,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn http_domain_generates_regional_mapping_and_alias_with_dependency() {
+        let original = json!({"Transform":"AWS::Serverless-2016-10-31","Resources":{"Api":{"Type":"AWS::Serverless::HttpApi","Properties":{"Domain":{"DomainName":"api.example.test","CertificateArn":{"Ref":"Certificate"},"Route53":{"HostedZoneId":{"Ref":"Zone"}},"BasePath":["/","orders"]}}}}});
+        let mut template = original.clone();
+        transform(&mut template).unwrap();
+        let resources = &template["Resources"];
+        assert_eq!(
+            resources["ApiDomainName"]["Properties"]["DomainNameConfigurations"][0]
+                ["CertificateArn"],
+            json!({"Ref":"Certificate"})
+        );
+        assert_eq!(
+            resources["ApiApiMapping0"]["DependsOn"],
+            stage_id("Api", "$default")
+        );
+        assert!(resources["ApiApiMapping0"]["Properties"]
+            .get("ApiMappingKey")
+            .is_none());
+        assert_eq!(
+            resources["ApiApiMapping1"]["Properties"]["ApiMappingKey"],
+            "orders"
+        );
+        assert_eq!(
+            resources["ApiRoute53Record"]["Properties"]["AliasTarget"]["DNSName"],
+            json!({"Fn::GetAtt":["ApiDomainName","RegionalDomainName"]})
+        );
+        let mut invalid = original;
+        invalid["Resources"]["Api"]["Properties"]["Domain"]["EndpointConfiguration"] =
+            json!("EDGE");
+        let unchanged = invalid.clone();
+        assert!(transform(&mut invalid).is_err());
+        assert_eq!(invalid, unchanged);
+    }
+
+    #[test]
     fn explicit_api_after_function_keeps_generated_route() {
         let mut template = json!({
             "Transform":"AWS::Serverless-2016-10-31",
@@ -377,5 +671,143 @@ mod tests {
             "aws_proxy"
         );
         assert!(template["Resources"].get("FnGetRoute").is_none());
+    }
+}
+
+#[cfg(test)]
+mod globals_tests {
+    use super::*;
+
+    fn template(globals: Value, properties: Value) -> Value {
+        json!({"Transform":"AWS::Serverless-2016-10-31", "Globals":globals,
+            "Resources":{"Worker":{"Type":"AWS::Serverless::Function", "Properties":properties}}})
+    }
+
+    #[test]
+    fn globals_merge_effective_function_and_preserve_intrinsics() {
+        let mut raw = template(
+            json!({"Function":{
+                "CodeUri":"s3://artifacts/worker.zip", "Handler":"index.handler", "Runtime":"nodejs22.x",
+                "Timeout":30, "MemorySize":256,
+                "Environment":{"Variables":{"GLOBAL":"yes", "SHARED":"global"}},
+                "VpcConfig":{"SubnetIds":[{"Ref":"SharedSubnet"}], "SecurityGroupIds":["sg-global"]}
+            }}),
+            json!({"Runtime":"python3.13", "Timeout":60,
+                "Environment":{"Variables":{"SHARED":"local", "TABLE":{"Ref":"Orders"}}},
+                "VpcConfig":{"SubnetIds":[{"Ref":"LocalSubnet"}], "SecurityGroupIds":["sg-local"]}
+            }),
+        );
+        transform(&mut raw).unwrap();
+        let props = &raw["Resources"]["Worker"]["Properties"];
+        assert_eq!(props["Runtime"], "python3.13");
+        assert_eq!(props["Timeout"], 60);
+        assert_eq!(props["MemorySize"], 256);
+        assert_eq!(props["Handler"], "index.handler");
+        assert_eq!(
+            props["Code"],
+            json!({"S3Bucket":"artifacts", "S3Key":"worker.zip"})
+        );
+        assert_eq!(
+            props["Environment"]["Variables"],
+            json!({"GLOBAL":"yes", "SHARED":"local", "TABLE":{"Ref":"Orders"}})
+        );
+        assert_eq!(
+            props["VpcConfig"]["SubnetIds"],
+            json!([{"Ref":"SharedSubnet"}, {"Ref":"LocalSubnet"}])
+        );
+        assert_eq!(
+            props["VpcConfig"]["SecurityGroupIds"],
+            json!(["sg-global", "sg-local"])
+        );
+        assert!(raw.get("Globals").is_none());
+        assert!(raw.get("Transform").is_none());
+
+        // Expressions replace whole values, without combining Ref/Fn::If internals.
+        let choice = json!({"Fn::If":["East", {"Variables":{"REGION":"east"}}, {"Variables":{"REGION":"west"}}]});
+        let mut raw = template(
+            json!({"Function":{"Environment":{"Variables":{"OLD":"value"}}}}),
+            json!({"CodeUri":"s3://artifacts/worker.zip", "Environment":choice}),
+        );
+        transform(&mut raw).unwrap();
+        assert_eq!(
+            raw["Resources"]["Worker"]["Properties"]["Environment"],
+            choice
+        );
+
+        let mut raw = template(
+            json!({"Function":{"Environment":{"Variables":{"VAR":{"Ref":"GlobalValue"}}}}}),
+            json!({"CodeUri":"s3://artifacts/worker.zip", "Environment":{"Variables":{"VAR":{"Fn::Sub":"${LocalValue}"}}}}),
+        );
+        transform(&mut raw).unwrap();
+        assert_eq!(
+            raw["Resources"]["Worker"]["Properties"]["Environment"]["Variables"]["VAR"],
+            json!({"Fn::Sub":"${LocalValue}"})
+        );
+    }
+
+    #[test]
+    fn invalid_globals_and_late_transform_errors_leave_input_unchanged() {
+        for globals in [
+            json!(null),
+            json!([]),
+            json!({"Unknown":{}}),
+            json!({"Function":false}),
+            json!({"Function":{"Role":"arn:role"}}),
+            json!({"Function":{"Events":{}}}),
+            json!({"Function":{"Tags":{}}}),
+            json!({"HttpApi":{"Name":"invalid-aws-global"}}),
+            json!({"HttpApi":{"StageName":"dev"}}),
+            json!({"Function":{"Environment":null}}),
+            json!({"Function":{"Environment":{"Variables":[]}}}),
+            json!({"Function":{"VpcConfig":{"SecurityGroupIds":"sg-invalid"}}}),
+        ] {
+            let mut raw = template(globals, json!({"CodeUri":"s3://artifacts/worker.zip"}));
+            let before = raw.clone();
+            assert!(
+                transform(&mut raw).is_err(),
+                "accepted {}",
+                before["Globals"]
+            );
+            assert_eq!(raw, before);
+        }
+        let mut raw = template(
+            json!({"Function":{"Environment":{"Variables":{"GLOBAL":"yes"}}}}),
+            json!({"CodeUri":"s3://artifacts/worker.zip", "Environment":null}),
+        );
+        let before = raw.clone();
+        assert!(transform(&mut raw).is_err());
+        assert_eq!(raw, before);
+
+        // Earlier resources must not remain transformed when a later one fails.
+        let mut raw = template(
+            json!({"Function":{"Runtime":"nodejs22.x"}}),
+            json!({"CodeUri":"s3://artifacts/worker.zip"}),
+        );
+        raw["Resources"]["ZBroken"] =
+            json!({"Type":"AWS::Serverless::Function", "Properties":{"CodeUri":"unpackaged/path"}});
+        let before = raw.clone();
+        assert!(transform(&mut raw).is_err());
+        assert_eq!(raw, before);
+    }
+
+    #[test]
+    fn globals_do_not_change_implicit_api_or_native_resources() {
+        let mut raw = template(
+            json!({"Function":{"Runtime":"nodejs22.x", "Timeout":20}, "HttpApi":{}}),
+            json!({"CodeUri":"s3://artifacts/worker.zip", "Events":{"Get":{"Type":"HttpApi", "Properties":{"Path":"/orders", "Method":"GET"}}}}),
+        );
+        let queue = json!({"Type":"AWS::SQS::Queue", "Properties":{"QueueName":"orders"}});
+        raw["Resources"]["OrdersQueue"] = queue.clone();
+        transform(&mut raw).unwrap();
+        assert_eq!(raw["Resources"]["OrdersQueue"], queue);
+        assert_eq!(
+            raw["Resources"]["ServerlessHttpApi"]["Type"],
+            "AWS::ApiGatewayV2::Api"
+        );
+        assert!(
+            raw["Resources"]["ServerlessHttpApi"]["Properties"]["Body"]["paths"]["/orders"]
+                .get("get")
+                .is_some()
+        );
     }
 }
