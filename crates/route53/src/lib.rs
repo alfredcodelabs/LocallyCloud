@@ -183,6 +183,14 @@ struct Record {
     values: Vec<String>,
     failover: Option<String>,
     health_check_id: Option<String>,
+    alias: Option<AliasTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AliasTarget {
+    dns_name: String,
+    hosted_zone_id: String,
+    evaluate_target_health: bool,
 }
 
 #[derive(Clone)]
@@ -219,11 +227,16 @@ struct Account {
     health_checks: BTreeMap<String, HealthCheck>,
 }
 
+/// Resolves only registered local AWS endpoint targets, scoped by owning account.
+pub type AliasTargetResolver =
+    Arc<dyn Fn(&str, &str, &str) -> Option<Vec<std::net::IpAddr>> + Send + Sync>;
+
 pub type RoutingControlResolver = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
 
 pub struct Route53Service {
     accounts: Mutex<BTreeMap<String, Account>>,
     routing_control: Mutex<Option<RoutingControlResolver>>,
+    alias_target: Mutex<Option<AliasTargetResolver>>,
 }
 
 impl Default for Route53Service {
@@ -231,6 +244,7 @@ impl Default for Route53Service {
         Self {
             accounts: Mutex::new(BTreeMap::new()),
             routing_control: Mutex::new(None),
+            alias_target: Mutex::new(None),
         }
     }
 }
@@ -238,6 +252,33 @@ impl Default for Route53Service {
 impl Route53Service {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_alias_target_resolver(&self, resolver: AliasTargetResolver) {
+        *self.alias_target.lock().expect("alias-target lock") = Some(resolver);
+    }
+
+    fn record_values(&self, account: &str, record: &Record) -> Vec<String> {
+        let Some(alias) = &record.alias else {
+            return record.values.clone();
+        };
+        let resolver = self
+            .alias_target
+            .lock()
+            .ok()
+            .and_then(|resolver| resolver.clone());
+        resolver
+            .and_then(|resolver| resolver(account, &alias.dns_name, &alias.hosted_zone_id))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|address| {
+                matches!(
+                    (record.key.record_type.as_str(), address),
+                    ("A", std::net::IpAddr::V4(_)) | ("AAAA", std::net::IpAddr::V6(_))
+                )
+            })
+            .map(|address| address.to_string())
+            .collect()
     }
 
     /// Attach an ARC routing-control state reader. Unknown controls fail closed.
@@ -306,8 +347,10 @@ impl Route53Service {
                     record.key.name == name && record.key.record_type == record_type
                 })
             });
-        self.selected(account, records)
-            .map(|record| record.values)
+        let record = self.selected(account, records);
+        drop(accounts);
+        record
+            .map(|record| self.record_values(account_id, &record))
             .unwrap_or_default()
     }
 
@@ -620,6 +663,23 @@ impl Route53Service {
             item.only(&["Action", "ResourceRecordSet"])?;
             let action = item.required_value("Action")?;
             let record = parse_record(item.required("ResourceRecordSet")?, &zone.name)?;
+            if action != "DELETE" {
+                if let Some(alias) = &record.alias {
+                    let resolver = self
+                        .alias_target
+                        .lock()
+                        .map_err(|_| Error::internal())?
+                        .clone();
+                    if resolver
+                        .and_then(|resolve| {
+                            resolve(account_id, &alias.dns_name, &alias.hosted_zone_id)
+                        })
+                        .is_none()
+                    {
+                        return Err(Error::change("Alias target and hosted zone must identify a registered regional API Gateway domain in this account"));
+                    }
+                }
+            }
             if !seen.insert(record.key.clone()) {
                 return Err(Error::change(
                     "Repeated record identity in one change batch",
@@ -741,6 +801,16 @@ impl Route53Service {
 
 #[async_trait]
 impl NativeHandler for Route53Service {
+    async fn has_global_resources(&self, account: &str) -> Result<bool, &'static str> {
+        let accounts = self
+            .accounts
+            .lock()
+            .map_err(|_| "Route53 inventory unavailable")?;
+        Ok(accounts
+            .get(account)
+            .is_some_and(|state| !state.zones.is_empty() || !state.health_checks.is_empty()))
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         match self.dispatch(&request) {
             Ok(output) => output.into_response(&request.request_id),
@@ -800,6 +870,7 @@ fn default_records(name: &str) -> BTreeMap<RecordKey, Record> {
         ttl: 172800,
         failover: None,
         health_check_id: None,
+        alias: None,
         values: vec![
             "ns-1.awsdns-local.test.".into(),
             "ns-2.awsdns-local.test.".into(),
@@ -816,6 +887,7 @@ fn default_records(name: &str) -> BTreeMap<RecordKey, Record> {
         ttl: 900,
         failover: None,
         health_check_id: None,
+        alias: None,
         values: vec![
             "ns-1.awsdns-local.test. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400".into(),
         ],
@@ -869,12 +941,11 @@ fn parse_record(node: &Node, zone: &str) -> Result<Record, Error> {
             "SetIdentifier",
             "Failover",
             "HealthCheckId",
+            "AliasTarget",
         ]
         .contains(&child.name.as_str())
     }) {
-        return Err(Error::change(
-            "Routing policies and aliases are not supported",
-        ));
+        return Err(Error::change("Unsupported routing policy"));
     }
     let name = canonical_name(node.required_value("Name")?)?;
     if name != zone && !name.ends_with(&format!(".{zone}")) {
@@ -905,6 +976,50 @@ fn parse_record(node: &Node, zone: &str) -> Result<Record, Error> {
     }
     if health_check_id.as_ref().is_some_and(|id| id.is_empty()) {
         return Err(Error::change("Invalid HealthCheckId"));
+    }
+    if let Some(alias) = node
+        .children
+        .iter()
+        .find(|child| child.name == "AliasTarget")
+    {
+        alias.only(&["DNSName", "HostedZoneId", "EvaluateTargetHealth"])?;
+        if !matches!(record_type, "A" | "AAAA")
+            || node
+                .children
+                .iter()
+                .any(|child| matches!(child.name.as_str(), "TTL" | "ResourceRecords"))
+        {
+            return Err(Error::change(
+                "AliasTarget requires A/AAAA and excludes TTL/ResourceRecords",
+            ));
+        }
+        let target = AliasTarget {
+            dns_name: canonical_name(alias.required_value("DNSName")?)?,
+            hosted_zone_id: alias
+                .required_value("HostedZoneId")?
+                .trim_start_matches("/hostedzone/")
+                .to_owned(),
+            evaluate_target_health: match alias.required_value("EvaluateTargetHealth")? {
+                "true" => true,
+                "false" => false,
+                _ => return Err(Error::change("Invalid EvaluateTargetHealth")),
+            },
+        };
+        if target.hosted_zone_id.is_empty() {
+            return Err(Error::change("Alias HostedZoneId is required"));
+        }
+        return Ok(Record {
+            key: RecordKey {
+                name,
+                record_type: record_type.to_owned(),
+                identifier,
+            },
+            ttl: 60,
+            values: Vec::new(),
+            failover,
+            health_check_id,
+            alias: Some(target),
+        });
     }
     let ttl = node
         .required_value("TTL")?
@@ -956,6 +1071,7 @@ fn parse_record(node: &Node, zone: &str) -> Result<Record, Error> {
         values,
         failover,
         health_check_id,
+        alias: None,
     })
 }
 
@@ -1127,6 +1243,10 @@ fn record_fields(record: &Record) -> String {
         .as_ref()
         .map(|id| format!("<HealthCheckId>{}</HealthCheckId>", escape(id)))
         .unwrap_or_default();
+    if let Some(alias) = &record.alias {
+        return format!("<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{identifier}{failover}<AliasTarget><HostedZoneId>{}</HostedZoneId><DNSName>{}</DNSName><EvaluateTargetHealth>{}</EvaluateTargetHealth></AliasTarget>{health}</ResourceRecordSet>",
+            escape(&record.key.name), record.key.record_type, escape(&alias.hosted_zone_id), escape(&alias.dns_name), alias.evaluate_target_health);
+    }
     format!("<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{identifier}{failover}<TTL>{}</TTL><ResourceRecords>{values}</ResourceRecords>{health}</ResourceRecordSet>",
         escape(&record.key.name), record.key.record_type, record.ttl)
 }
@@ -1485,6 +1605,103 @@ mod tests {
         assert!(service
             .resolve_records("b", "_acme-challenge.example.test.", "TXT")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn regional_alias_requires_registered_target_and_preserves_delete_after_unbind() {
+        let service = Route53Service::new();
+        service.set_alias_target_resolver(Arc::new(|account, name, zone| {
+            (account == "a"
+                && name == "d-id.execute-api.us-east-1.amazonaws.com."
+                && zone == "Z1UJRXOUMOOFQ8")
+                .then(|| vec!["127.0.0.1".parse().unwrap()])
+        }));
+        call(
+            &service,
+            request(
+                Method::POST,
+                "/2013-04-01/hostedzone",
+                "a",
+                "us-east-1",
+                &create_xml(),
+            ),
+        )
+        .await;
+        let path = "/2013-04-01/hostedzone/Z0000000000001/rrset";
+        let record="<ResourceRecordSet><Name>example.test</Name><Type>A</Type><AliasTarget><DNSName>d-id.execute-api.us-east-1.amazonaws.com</DNSName><HostedZoneId>Z1UJRXOUMOOFQ8</HostedZoneId><EvaluateTargetHealth>true</EvaluateTargetHealth></AliasTarget></ResourceRecordSet>";
+        let change = |action: &str, record: &str| {
+            change_xml(&format!(
+                "<Change><Action>{action}</Action>{record}</Change>"
+            ))
+        };
+        let (status, body) = call(
+            &service,
+            request(
+                Method::POST,
+                path,
+                "a",
+                "us-east-1",
+                &change("CREATE", &record.replace("Z1UJRXOUMOOFQ8", "ZWRONG")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("InvalidChangeBatch"));
+        assert_eq!(
+            call(
+                &service,
+                request(
+                    Method::POST,
+                    path,
+                    "a",
+                    "us-east-1",
+                    &change("CREATE", record)
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            service.resolve_records("a", "example.test", "A"),
+            vec!["127.0.0.1"]
+        );
+        assert!(service.resolve_records("b", "example.test", "A").is_empty());
+        let (_, body) = call(&service, request(Method::GET, path, "a", "us-east-1", "")).await;
+        assert!(body.contains("<AliasTarget>"));
+        assert!(body.contains("<EvaluateTargetHealth>true</EvaluateTargetHealth>"));
+        service.set_alias_target_resolver(Arc::new(|_, _, _| None));
+        assert!(service.resolve_records("a", "example.test", "A").is_empty());
+        assert_eq!(
+            call(
+                &service,
+                request(
+                    Method::POST,
+                    path,
+                    "a",
+                    "us-east-1",
+                    &change("DELETE", record)
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &service,
+                request(
+                    Method::DELETE,
+                    "/2013-04-01/hostedzone/Z0000000000001",
+                    "a",
+                    "us-east-1",
+                    ""
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

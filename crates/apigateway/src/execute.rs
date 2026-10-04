@@ -207,6 +207,10 @@ fn invocation_target<'a>(host: &'a str, path: &'a str) -> Option<InvokeTarget<'a
     })
 }
 
+pub(crate) fn invocation_api_id<'a>(host: &'a str, path: &'a str) -> Option<&'a str> {
+    invocation_target(host, path).map(|target| target.api_id)
+}
+
 fn resource_path(segments: &[&str]) -> String {
     if segments.is_empty() {
         "/".to_string()

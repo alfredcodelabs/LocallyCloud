@@ -198,7 +198,7 @@ fn answer(service: &Route53Service, account: &str, packet: &[u8], limit: usize) 
                             .find(|record| record.key.record_type == "CNAME")
                     });
                 if let Some(record) = selected {
-                    for value in &record.values {
+                    for value in &service.record_values(account, record) {
                         let Some(rr) = encode_rr(record, value) else {
                             continue;
                         };
@@ -483,9 +483,36 @@ mod tests {
                     values: vec![value.into()],
                     failover: None,
                     health_check_id: None,
+                    alias: None,
                 },
             );
         }
+        let key = RecordKey {
+            name: "api.example.test.".into(),
+            record_type: "A".into(),
+            identifier: None,
+        };
+        records.insert(
+            key.clone(),
+            Record {
+                key,
+                ttl: 60,
+                values: vec![],
+                failover: None,
+                health_check_id: None,
+                alias: Some(crate::AliasTarget {
+                    dns_name: "d-id.execute-api.us-east-1.amazonaws.com.".into(),
+                    hosted_zone_id: "Z1UJRXOUMOOFQ8".into(),
+                    evaluate_target_health: false,
+                }),
+            },
+        );
+        service.set_alias_target_resolver(Arc::new(|account, name, zone| {
+            (account == "111111111111"
+                && name == "d-id.execute-api.us-east-1.amazonaws.com."
+                && zone == "Z1UJRXOUMOOFQ8")
+                .then(|| vec!["127.0.0.1".parse().unwrap()])
+        }));
         let mut account = Account::default();
         account.zones.insert(
             "Z1".into(),
@@ -518,6 +545,7 @@ mod tests {
         let service = fixture();
         for (name, kind, data) in [
             ("a.example.test.", 1, vec![192, 0, 2, 7]),
+            ("api.example.test.", 1, vec![127, 0, 0, 1]),
             (
                 "aaaa.example.test.",
                 28,
@@ -626,6 +654,7 @@ mod tests {
                     values: vec!["192.0.2.1".into()],
                     failover: Some("PRIMARY".into()),
                     health_check_id: Some("east".into()),
+                    alias: None,
                 },
             );
             let key = RecordKey {
@@ -641,6 +670,7 @@ mod tests {
                     values: vec!["192.0.2.2".into()],
                     failover: Some("SECONDARY".into()),
                     health_check_id: Some("west".into()),
+                    alias: None,
                 },
             );
             for id in ["east", "west"] {
@@ -717,7 +747,7 @@ mod tests {
         .await
         .unwrap();
         let addr = server.local_addr();
-        let packet = query("a.example.test.", 1);
+        let packet = query("api.example.test.", 1);
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         udp.send_to(&packet, addr).await.unwrap();
         let mut buffer = [0; 512];
@@ -726,7 +756,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(buffer[3], 0);
-        assert_eq!(buffer[size - 4..size], [192, 0, 2, 7]);
+        assert_eq!(buffer[size - 4..size], [127, 0, 0, 1]);
         let mut tcp = TcpStream::connect(addr).await.unwrap();
         tcp.write_u16(packet.len() as u16).await.unwrap();
         tcp.write_all(&packet).await.unwrap();
@@ -736,7 +766,7 @@ mod tests {
             .unwrap() as usize;
         let mut answer = vec![0; length];
         tcp.read_exact(&mut answer).await.unwrap();
-        assert_eq!(answer[length - 4..], [192, 0, 2, 7]);
+        assert_eq!(answer[length - 4..], [127, 0, 0, 1]);
         server.shutdown().await;
         assert!(TcpStream::connect(addr).await.is_err());
     }

@@ -3,6 +3,7 @@
 //! Wires observability, configuration, endpoint resolution, compute-runtime selection, the
 //! service registry, and the Axum server together, then runs until a shutdown signal.
 
+mod domain_tls;
 mod ec2_runtime;
 mod ecs_runtime;
 mod migration;
@@ -299,7 +300,8 @@ async fn main() {
         std::process::exit(4);
     }
     locallycloud_stepfunctions::register(&registry);
-    let gateway_waf = locallycloud_apigateway::register(&registry);
+    let acm = locallycloud_acm::register(&registry);
+    let gateway_waf = locallycloud_apigateway::register_with_acm(&registry, acm.clone());
     locallycloud_cloudformation::register(&registry);
     let ecr = locallycloud_ecr::register_with_handle(&registry);
     let ec2 = locallycloud_ec2::register_with_instance_runtime(
@@ -356,6 +358,17 @@ async fn main() {
     );
     let route53 = locallycloud_route53::register(&registry);
     route53.set_routing_control_resolver(Arc::new(move |arn| arc.is_on(arn)));
+    let alias_gateway = gateway_waf.clone();
+    let alias_address = if config.listen_addr.ip().is_unspecified() {
+        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        config.listen_addr.ip()
+    };
+    route53.set_alias_target_resolver(Arc::new(move |account, target, zone| {
+        alias_gateway
+            .regional_alias_registered(account, target, zone)
+            .then(|| vec![alias_address])
+    }));
     let dns = match std::env::var("LOCALLYCLOUD_ROUTE53_DNS_BIND") {
         Ok(value) => {
             let bind: SocketAddr = match value.parse() {
@@ -386,7 +399,6 @@ async fn main() {
     };
     let cognito = locallycloud_cognito::register(&registry);
     gateway_waf.set_cognito_jwks(cognito);
-    locallycloud_acm::register(&registry);
     locallycloud_cloudfront::register(&registry);
     let waf =
         locallycloud_wafv2::WafHandler::new_with_stage_resolver(Arc::new(gateway_waf.clone()));
@@ -454,7 +466,12 @@ async fn main() {
             std::process::exit(5);
         }
     };
-    let server = LocallyCloudServer::new(config, registry);
+    let domain_tls = domain_tls::DomainTls {
+        account: config.account_id.clone(),
+        gateway: gateway_waf,
+        certificates: acm,
+    };
+    let server = LocallyCloudServer::new(config, registry).with_tls_resolver(Arc::new(domain_tls));
 
     let server_result = server.run().await;
     ecs_runtime.shutdown().await;

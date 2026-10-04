@@ -116,6 +116,83 @@ fn key(account: &str, region: &str, id: &str) -> Key {
 }
 
 impl ApiGwStore {
+    pub(crate) async fn public_invoke_region(
+        &self,
+        account: &str,
+        host: &str,
+        api_id: Option<&str>,
+    ) -> Option<String> {
+        let mut matches = Vec::new();
+        if let Some(id) = api_id {
+            matches.extend(
+                self.rest
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .chain(self.v2.iter().map(|e| e.key().clone()))
+                    .filter(|key| key.0 == account && key.2 == id)
+                    .map(|key| key.1),
+            );
+        } else {
+            let scopes: Vec<_> = self
+                .shared
+                .iter()
+                .filter(|e| e.key().0 == account)
+                .map(|e| (e.key().1.clone(), e.value().clone()))
+                .collect();
+            for (region, scope) in scopes {
+                let scope = scope.read().await;
+                if scope
+                    .domains
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(host))
+                    || scope.private_domains.values().any(|domain| {
+                        domain
+                            .get("domainName")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.eq_ignore_ascii_case(host))
+                    })
+                {
+                    matches.push(region);
+                }
+            }
+        }
+        matches.sort();
+        matches.dedup();
+        (matches.len() == 1).then(|| matches.remove(0))
+    }
+
+    pub(crate) async fn resource_regions(
+        &self,
+        account: &str,
+    ) -> Result<Vec<String>, &'static str> {
+        let mut regions: Vec<_> = self
+            .rest
+            .iter()
+            .map(|e| e.key().clone())
+            .chain(self.v2.iter().map(|e| e.key().clone()))
+            .filter(|k| k.0 == account)
+            .map(|k| k.1)
+            .collect();
+        let scopes: Vec<_> = self
+            .shared
+            .iter()
+            .filter(|e| e.key().0 == account)
+            .map(|e| (e.key().1.clone(), e.value().clone()))
+            .collect();
+        for (region, scope) in scopes {
+            let s = scope.read().await;
+            if !s.api_keys.is_empty()
+                || !s.usage_plans.is_empty()
+                || !s.domains.is_empty()
+                || !s.private_domains.is_empty()
+                || !s.domain_access_associations.is_empty()
+            {
+                regions.push(region);
+            }
+        }
+        Ok(regions)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

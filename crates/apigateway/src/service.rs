@@ -19,6 +19,7 @@ use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, Ser
 use locallycloud_wafv2::{StageResolver, WafEvaluator};
 
 use crate::auth::JwtValidator;
+use crate::domains::DomainBindings;
 use crate::error::ApiGwError;
 use crate::execute::{self, ExecuteCtx};
 use crate::store::ApiGwStore;
@@ -31,6 +32,7 @@ pub(crate) struct ApiGwHandler {
     http: reqwest::Client,
     registry: Weak<ServiceRegistry>,
     waf: RwLock<Option<Weak<dyn WafEvaluator>>>,
+    domains: DomainBindings,
 }
 
 #[derive(Clone)]
@@ -39,6 +41,18 @@ pub struct ApiGatewayWafBinding {
 }
 
 impl ApiGatewayWafBinding {
+    pub async fn tls_certificate_arn(
+        &self,
+        account: &str,
+        hostname: &str,
+    ) -> Option<(String, String)> {
+        self.handler.domains.certificate(account, hostname)
+    }
+
+    pub fn regional_alias_registered(&self, account: &str, target: &str, zone: &str) -> bool {
+        self.handler.domains.alias_registered(account, target, zone)
+    }
+
     pub fn set_cognito_jwks(&self, provider: Arc<CognitoHandler>) {
         self.handler.validator.set_local_cognito(provider);
     }
@@ -83,6 +97,7 @@ impl ApiGwHandler {
             http,
             registry,
             waf: RwLock::new(None),
+            domains: DomainBindings::default(),
         }
     }
 
@@ -461,12 +476,12 @@ fn mapping_remainder<'a>(path: &'a str, mapping_key: &str) -> Option<&'a str> {
     path.strip_prefix(mapping_key)?.strip_prefix('/')
 }
 
-async fn is_private_domain_host(
+async fn domain_host_is_private(
     store: &ApiGwStore,
     account: &str,
     region: &str,
     host: &str,
-) -> bool {
+) -> Option<bool> {
     let domain_host = host.split(':').next().unwrap_or(host);
     let shared = store.shared(account, region);
     let guard = shared.read().await;
@@ -475,14 +490,18 @@ async fn is_private_domain_host(
         .keys()
         .any(|name| name.eq_ignore_ascii_case(domain_host))
     {
-        return false;
+        return Some(false);
     }
-    guard.private_domains.values().any(|domain| {
-        domain
-            .get("domainName")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case(domain_host))
-    })
+    guard
+        .private_domains
+        .values()
+        .any(|domain| {
+            domain
+                .get("domainName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(domain_host))
+        })
+        .then_some(true)
 }
 
 pub(crate) async fn custom_domain_target(
@@ -598,6 +617,35 @@ async fn connection_belongs_to_endpoint(
 
 #[async_trait]
 impl NativeHandler for ApiGwHandler {
+    async fn public_invoke_region(&self, account: &str, host: &str, path: &str) -> Option<String> {
+        let host = host.split(':').next().unwrap_or(host);
+        let normalized = host.to_ascii_lowercase();
+        let suffix = normalized
+            .split_once(".execute-api.")
+            .map(|(_, suffix)| suffix);
+        let explicit_region = suffix.and_then(|suffix| {
+            (!suffix.starts_with("localhost"))
+                .then(|| suffix.split('.').next())
+                .flatten()
+        });
+        let api_id = if suffix.is_some() || is_invoke_path(path) {
+            execute::invocation_api_id(host, path)
+        } else {
+            None
+        };
+        if api_id.is_some() {
+            if let Some(region) = explicit_region {
+                // Regional public hosts never fall back to a different region's API.
+                return Some(region.to_string());
+            }
+        }
+        self.store.public_invoke_region(account, host, api_id).await
+    }
+
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account).await
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let mut request = request;
         let trusted_peer_ip = request
@@ -609,7 +657,9 @@ impl NativeHandler for ApiGwHandler {
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if is_private_domain_host(&self.store, &request.account_id, &request.region, host).await {
+        let domain_kind =
+            domain_host_is_private(&self.store, &request.account_id, &request.region, host).await;
+        if domain_kind == Some(true) {
             return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
         }
         if let Some((stage, connection_id, api_id)) = management_target(host, request.uri.path()) {
@@ -671,18 +721,22 @@ impl NativeHandler for ApiGwHandler {
         }
         let path_invoke = is_invoke_path(request.uri.path());
         let execute_host = host.to_ascii_lowercase().contains(".execute-api.");
-        let custom_target = if execute_host || path_invoke || host.is_empty() {
-            None
-        } else {
-            custom_domain_target(
-                &self.store,
-                &request.account_id,
-                &request.region,
-                host,
-                &request.uri,
-            )
-            .await
-        };
+        let custom_target =
+            if execute_host || (path_invoke && domain_kind.is_none()) || host.is_empty() {
+                None
+            } else {
+                custom_domain_target(
+                    &self.store,
+                    &request.account_id,
+                    &request.region,
+                    host,
+                    &request.uri,
+                )
+                .await
+            };
+        if domain_kind == Some(false) && custom_target.is_none() {
+            return ApiGwError::NotFound("Not Found".into()).into_response(&request.request_id);
+        }
         if execute_host || path_invoke || custom_target.is_some() {
             let waf = match self.waf.read() {
                 Ok(binding) => match binding.as_ref() {
@@ -740,6 +794,27 @@ impl NativeHandler for ApiGwHandler {
                 }
             }
         };
+        if request.method == Method::GET {
+            let resource = format!(
+                "arn:aws:apigateway:{}::{}",
+                request.region,
+                request.uri.path()
+            );
+            if locallycloud_core::integration::authorization::authorize_native_read(
+                &self.registry,
+                &request,
+                "apigateway",
+                "apigateway:GET",
+                &resource,
+            )
+            .is_err()
+            {
+                return ApiGwError::Forbidden(
+                    "Not authorized to read API Gateway resources".into(),
+                )
+                .into_response(&request.request_id);
+            }
+        }
         let ctx = Ctx {
             store: &self.store,
             registry: &self.registry,
@@ -747,6 +822,7 @@ impl NativeHandler for ApiGwHandler {
             account: &request.account_id,
             request_id: &request.request_id,
             waf: Some(&self.waf),
+            domains: &self.domains,
         };
         match self
             .route(&request.method, &segs, request.uri.query(), &ctx, &body)
@@ -768,7 +844,9 @@ impl NativeHandler for ApiGwHandler {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        if is_private_domain_host(&self.store, &request.account_id, &request.region, &host).await {
+        if domain_host_is_private(&self.store, &request.account_id, &request.region, &host).await
+            == Some(true)
+        {
             return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
         }
         let direct = host.to_ascii_lowercase().contains(".execute-api.");
@@ -834,7 +912,23 @@ fn json_response(status: u16, value: Value) -> Response {
 /// Register API Gateway under both control-plane service names and `execute-api`; all names
 /// share one handler and one in-memory store.
 pub fn register(registry: &Arc<ServiceRegistry>) -> ApiGatewayWafBinding {
-    let handler = Arc::new(ApiGwHandler::new(Arc::downgrade(registry)));
+    register_handler(registry, ApiGwHandler::new(Arc::downgrade(registry)))
+}
+
+pub fn register_with_acm(
+    registry: &Arc<ServiceRegistry>,
+    acm: Arc<dyn locallycloud_acm::AcmAssociationApi>,
+) -> ApiGatewayWafBinding {
+    let mut handler = ApiGwHandler::new(Arc::downgrade(registry));
+    handler.domains = DomainBindings::with_acm(acm);
+    register_handler(registry, handler)
+}
+
+fn register_handler(
+    registry: &Arc<ServiceRegistry>,
+    handler: ApiGwHandler,
+) -> ApiGatewayWafBinding {
+    let handler = Arc::new(handler);
     let binding = ApiGatewayWafBinding {
         handler: handler.clone(),
     };
@@ -855,6 +949,12 @@ mod tests {
     use bytes::Bytes;
     use http::HeaderMap;
     use serde_json::json;
+
+    fn test_handler(registry: Weak<ServiceRegistry>) -> ApiGwHandler {
+        let mut handler = ApiGwHandler::new(registry);
+        handler.domains = crate::domains::fixture_bindings();
+        handler
+    }
 
     fn req(method: Method, path: &str, body: Value) -> ServiceRequest {
         let body = if body.is_null() {
@@ -920,7 +1020,7 @@ mod tests {
 
     #[tokio::test]
     async fn waf_uses_only_internal_peer_and_strips_it_from_request_headers() {
-        let handler = Arc::new(ApiGwHandler::new(Weak::new()));
+        let handler = Arc::new(test_handler(Weak::new()));
         let mut record = crate::store::RestApiRecord::default();
         record.stages.insert("prod".into(), json!({}));
         handler
@@ -976,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn v1_rest_api_full_lifecycle() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (s, api) = call(&h, Method::POST, "/restapis", json!({ "name": "my-api" })).await;
         assert_eq!(s, 201);
         let api_id = api["id"].as_str().unwrap().to_string();
@@ -1086,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn v1_missing_name_is_bad_request() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (s, body) = call(&h, Method::POST, "/restapis", json!({ "description": "x" })).await;
         assert_eq!(s, 400);
         assert_eq!(body["message"], "name is required");
@@ -1094,7 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn v1_sibling_path_part_conflict() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (_, api) = call(&h, Method::POST, "/restapis", json!({ "name": "a" })).await;
         let api_id = api["id"].as_str().unwrap().to_string();
         let root_id = api["rootResourceId"].as_str().unwrap().to_string();
@@ -1107,7 +1207,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_http_api_lifecycle() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (s, api) = call(
             &h,
             Method::POST,
@@ -1168,7 +1268,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_websocket_api_with_reserved_routes() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (s, api) = call(
             &h,
             Method::POST,
@@ -1205,7 +1305,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_websocket_requires_route_selection_expression() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (s, _) = call(
             &h,
             Method::POST,
@@ -1218,7 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_invalid_protocol_type_is_bad_request() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (s, _) = call(
             &h,
             Method::POST,
@@ -1231,7 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn v1_api_key_route_honors_include_value_query() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (status, key) = call(
             &h,
             Method::POST,
@@ -1260,7 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_deployment_route_is_dispatched() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (_, api) = call(
             &h,
             Method::POST,
@@ -1299,8 +1399,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_invocation_region_uses_existing_account_resources_and_unique_domains() {
+        let h = test_handler(Weak::new());
+        h.store
+            .insert_rest("000000000000", "us-west-2", "westapi", Default::default());
+        h.store
+            .insert_rest("000000000001", "eu-west-1", "otherapi", Default::default());
+        assert_eq!(
+            h.public_invoke_region(
+                "000000000000",
+                "localhost:4566",
+                "/restapis/westapi/dev/_user_request_/orders"
+            )
+            .await
+            .as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(
+            h.public_invoke_region(
+                "000000000000",
+                "westapi.execute-api.localhost:4566",
+                "/dev/orders"
+            )
+            .await
+            .as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(
+            h.public_invoke_region(
+                "000000000000",
+                "westapi.execute-api.us-east-1.amazonaws.com",
+                "/dev/orders"
+            )
+            .await
+            .as_deref(),
+            Some("us-east-1")
+        );
+        assert!(h
+            .public_invoke_region(
+                "000000000000",
+                "localhost",
+                "/restapis/otherapi/dev/_user_request_/orders"
+            )
+            .await
+            .is_none());
+        assert!(h
+            .public_invoke_region("000000000000", "localhost", "/restapis/westapi/resources")
+            .await
+            .is_none());
+        let private = "private.example.test";
+        h.store
+            .shared("000000000000", "us-west-2")
+            .write()
+            .await
+            .private_domains
+            .insert("private-id".into(), json!({"domainName":private}));
+        assert_eq!(
+            h.public_invoke_region("000000000000", private, "/orders")
+                .await
+                .as_deref(),
+            Some("us-west-2")
+        );
+        let mut denied = req(Method::GET, "/orders", Value::Null);
+        denied.region = "us-west-2".into();
+        denied
+            .headers
+            .insert(http::header::HOST, private.parse().unwrap());
+        assert_eq!(h.handle(denied).await.status(), 403);
+        let domain = "orders.example.test";
+        h.store
+            .shared("000000000000", "us-west-2")
+            .write()
+            .await
+            .domains
+            .insert(domain.into(), json!({"domainName":domain}));
+        assert_eq!(
+            h.public_invoke_region("000000000000", domain, "/shop/orders")
+                .await
+                .as_deref(),
+            Some("us-west-2")
+        );
+        for (method, path) in [(Method::POST, "/v2/apis"), (Method::GET, "/restapis")] {
+            let mut public = req(
+                method,
+                path,
+                json!({"name":"must-not-exist", "protocolType":"HTTP"}),
+            );
+            public.region = "us-west-2".into();
+            public
+                .headers
+                .insert(http::header::HOST, domain.parse().unwrap());
+            assert_eq!(h.handle(public).await.status(), 404);
+        }
+        assert!(h.store.list_v2("000000000000", "us-west-2").is_empty());
+        h.store
+            .shared("000000000000", "us-east-1")
+            .write()
+            .await
+            .domains
+            .insert(domain.into(), json!({"domainName":domain}));
+        assert!(h
+            .public_invoke_region("000000000000", domain, "/shop/orders")
+            .await
+            .is_none());
+        h.store
+            .insert_rest("000000000000", "eu-west-1", "westapi", Default::default());
+        assert!(h
+            .public_invoke_region(
+                "000000000000",
+                "localhost",
+                "/restapis/westapi/dev/_user_request_/orders"
+            )
+            .await
+            .is_none());
+        assert!(h
+            .public_invoke_region("000000000000", "unknown.example.test", "/orders")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn regional_domain_certificate_binding_is_validated_and_removed_atomically() {
+        let h = test_handler(Weak::new());
+        let cert = "arn:aws:acm:us-east-1:000000000000:certificate/test";
+        let body = json!({"domainName":"secured.example.test", "endpointConfiguration":{"types":["REGIONAL"]}, "regionalCertificateArn":cert});
+        let (status, original) = call(&h, Method::POST, "/domainnames", body.clone()).await;
+        assert_eq!(status, 201);
+        let target = original["regionalDomainName"].as_str().unwrap();
+        let zone = original["regionalHostedZoneId"].as_str().unwrap();
+        assert_eq!(zone, "Z1UJRXOUMOOFQ8");
+        assert_eq!(
+            h.domains
+                .certificate("000000000000", "SECURED.EXAMPLE.TEST."),
+            Some(("us-east-1".into(), cert.into()))
+        );
+        assert!(h.domains.alias_registered(
+            "000000000000",
+            &format!("{target}."),
+            &format!("/hostedzone/{zone}")
+        ));
+        for variant in ["SECURED.EXAMPLE.TEST", "secured.example.test."] {
+            let mut duplicate = body.clone();
+            duplicate["domainName"] = json!(variant);
+            assert_eq!(
+                call(&h, Method::POST, "/domainnames", duplicate).await.0,
+                409
+            );
+            assert_eq!(
+                h.domains.certificate("000000000000", variant),
+                Some(("us-east-1".into(), cert.into()))
+            );
+            assert!(h.domains.alias_registered("000000000000", target, zone));
+            assert_eq!(
+                call(
+                    &h,
+                    Method::GET,
+                    "/domainnames/secured.example.test",
+                    Value::Null
+                )
+                .await
+                .1,
+                original
+            );
+        }
+        assert!(!h.domains.alias_registered("000000000001", target, zone));
+        assert!(!h
+            .domains
+            .alias_registered("000000000000", target, "wrong-zone"));
+        for (path, value) in [
+            (
+                "/regionalCertificateArn",
+                "arn:aws:acm:us-west-2:000000000000:certificate/test",
+            ),
+            ("/securityPolicy", "TLS_1_0"),
+            ("/endpointConfiguration/types", "[\"EDGE\"]"),
+            ("/mutualTlsAuthentication", "{}"),
+        ] {
+            let (status, _) = call(
+                &h,
+                Method::PATCH,
+                "/domainnames/secured.example.test",
+                json!({"patchOperations":[{"op":"replace","path":path,"value":value}]}),
+            )
+            .await;
+            assert_eq!(status, 400);
+            assert_eq!(
+                call(
+                    &h,
+                    Method::GET,
+                    "/domainnames/secured.example.test",
+                    Value::Null
+                )
+                .await
+                .1,
+                original
+            );
+        }
+        let mut duplicate = req(
+            Method::POST,
+            "/domainnames",
+            json!({"domainName":"secured.example.test", "endpointConfiguration":{"types":["REGIONAL"]}, "regionalCertificateArn":"arn:aws:acm:us-west-2:000000000000:certificate/test"}),
+        );
+        duplicate.region = "us-west-2".into();
+        assert_eq!(h.handle(duplicate).await.status(), 409);
+        assert!(h
+            .store
+            .shared("000000000000", "us-west-2")
+            .read()
+            .await
+            .domains
+            .is_empty());
+        assert_eq!(
+            call(
+                &h,
+                Method::DELETE,
+                "/domainnames/secured.example.test",
+                Value::Null
+            )
+            .await
+            .0,
+            202
+        );
+        assert!(h
+            .domains
+            .certificate("000000000000", "secured.example.test")
+            .is_none());
+        assert!(!h.domains.alias_registered("000000000000", target, zone));
+
+        let body = json!({"domainName":"http-secured.example.test", "domainNameConfigurations":[{"certificateArn":cert,"endpointType":"REGIONAL"}]});
+        let (status, original) = call(&h, Method::POST, "/v2/domainnames", body).await;
+        assert_eq!(status, 201);
+        let target = original["domainNameConfigurations"][0]["apiGatewayDomainName"]
+            .as_str()
+            .unwrap();
+        for variant in ["HTTP-SECURED.EXAMPLE.TEST", "http-secured.example.test."] {
+            let duplicate = json!({"domainName":variant,"domainNameConfigurations":[{"certificateArn":cert,"endpointType":"REGIONAL"}]});
+            assert_eq!(
+                call(&h, Method::POST, "/v2/domainnames", duplicate).await.0,
+                409
+            );
+            assert_eq!(
+                h.domains.certificate("000000000000", variant),
+                Some(("us-east-1".into(), cert.into()))
+            );
+            assert!(h.domains.alias_registered(
+                "000000000000",
+                target,
+                original["domainNameConfigurations"][0]["hostedZoneId"]
+                    .as_str()
+                    .unwrap()
+            ));
+        }
+        let invalid = json!({"domainNameConfigurations":[{"certificateArn":"missing","endpointType":"REGIONAL"}]});
+        assert_eq!(
+            call(
+                &h,
+                Method::PATCH,
+                "/v2/domainnames/http-secured.example.test",
+                invalid
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            call(
+                &h,
+                Method::GET,
+                "/v2/domainnames/http-secured.example.test",
+                Value::Null
+            )
+            .await
+            .1,
+            original
+        );
+        assert_eq!(
+            call(
+                &h,
+                Method::DELETE,
+                "/v2/domainnames/http-secured.example.test",
+                Value::Null
+            )
+            .await
+            .0,
+            204
+        );
+        assert!(h
+            .domains
+            .certificate("000000000000", "http-secured.example.test")
+            .is_none());
+        assert!(!h
+            .domains
+            .alias_registered("000000000000", target, "Z1UJRXOUMOOFQ8"));
+        let unconfigured = ApiGwHandler::new(Weak::new());
+        assert_eq!(call(&unconfigured, Method::POST, "/domainnames", json!({"domainName":"missing.example.test", "endpointConfiguration":{"types":["REGIONAL"]}, "regionalCertificateArn":cert})).await.0, 400);
+        assert!(unconfigured
+            .store
+            .shared("000000000000", "us-east-1")
+            .read()
+            .await
+            .domains
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn custom_domain_mapping_dispatches_to_execute() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (_, api) = call(
             &h,
             Method::POST,
@@ -1327,7 +1731,7 @@ mod tests {
             &h,
             Method::POST,
             "/v2/domainnames",
-            json!({ "domainName": "api.example.test" }),
+            json!({ "domainName": "api.example.test", "domainNameConfigurations":[{"certificateArn":"arn:aws:acm:us-east-1:000000000000:certificate/test", "endpointType":"REGIONAL"}] }),
         )
         .await;
         let (status, _) = call(
@@ -1350,7 +1754,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_domain_requires_id_and_preserves_public_domain() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let name = "ledger.example.test";
         let policy = r#"{"Version":"2012-10-17","Statement":[]}"#;
         let (status, private) = call(
@@ -1410,7 +1814,7 @@ mod tests {
             &h,
             Method::POST,
             "/domainnames",
-            json!({"domainName": name, "endpointConfiguration": {"types": ["REGIONAL"]}}),
+            json!({"domainName": name, "endpointConfiguration": {"types": ["REGIONAL"]}, "regionalCertificateArn":"arn:aws:acm:us-east-1:000000000000:certificate/test"}),
         )
         .await;
         assert_eq!(status, 201);
@@ -1456,7 +1860,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_domain_associations_paginate_and_delete_by_encoded_arn() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (_, domain) = call(&h, Method::POST, "/domainnames", json!({
             "domainName": "private.example.test", "endpointConfiguration": {"types": ["PRIVATE"]}
         })).await;
@@ -1523,7 +1927,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_base_path_mapping_requires_matching_domain_id() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (_, domain) = call(&h, Method::POST, "/domainnames", json!({
             "domainName": "mapping.example.test", "endpointConfiguration": {"types": ["PRIVATE"]}
         })).await;
@@ -1624,7 +2028,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_domain_host_routes_when_private_domain_has_same_name() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let name = "shared.example.test";
         let (_, api) = call(
             &h,
@@ -1648,7 +2052,7 @@ mod tests {
             &h,
             Method::POST,
             "/v2/domainnames",
-            json!({"domainName": name}),
+            json!({"domainName": name, "domainNameConfigurations":[{"certificateArn":"arn:aws:acm:us-east-1:000000000000:certificate/test", "endpointType":"REGIONAL"}]}),
         )
         .await;
         assert_eq!(status, 201);
@@ -1693,7 +2097,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_domain_host_is_forbidden_even_with_association() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (_, private) = call(&h, Method::POST, "/domainnames", json!({
             "domainName": "private.example.test", "endpointConfiguration": {"types": ["PRIVATE"]}
         })).await;
@@ -1722,7 +2126,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_resource_is_not_found() {
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let h = test_handler(std::sync::Weak::new());
         let (s, _) = call(&h, Method::GET, "/bogus", Value::Null).await;
         assert_eq!(s, 404);
     }

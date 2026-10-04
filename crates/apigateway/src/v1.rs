@@ -20,6 +20,7 @@ pub struct Ctx<'a> {
     pub account: &'a str,
     pub request_id: &'a str,
     pub waf: Option<&'a RwLock<Option<Weak<dyn WafEvaluator>>>>,
+    pub(crate) domains: &'a crate::domains::DomainBindings,
 }
 
 type Out = Result<(u16, Value), ApiGwError>;
@@ -1849,6 +1850,11 @@ pub async fn create_domain_name(ctx: &Ctx<'_>, body: &Value) -> Out {
     if private {
         validate_private_config(body)?;
     }
+    let binding = if private {
+        None
+    } else {
+        Some(crate::domains::rest_binding(ctx, body, None)?)
+    };
     let domain_id = if private {
         Some(gen_id()[..8].to_string())
     } else {
@@ -1890,16 +1896,33 @@ pub async fn create_domain_name(ctx: &Ctx<'_>, body: &Value) -> Out {
             }
         }
     }
+    if let Some(binding) = &binding {
+        domain["regionalDomainName"] = json!(binding.target);
+        domain["regionalHostedZoneId"] = json!(binding.zone);
+        domain["domainNameStatus"] = json!("AVAILABLE");
+        domain
+            .as_object_mut()
+            .unwrap()
+            .remove("distributionDomainName");
+        domain
+            .as_object_mut()
+            .unwrap()
+            .remove("distributionHostedZoneId");
+    }
     let shared = ctx.store.shared(ctx.account, ctx.region);
     let mut guard = shared.write().await;
     if let Some(id) = domain_id {
         guard.private_domains.insert(id, domain.clone());
     } else {
-        if guard.domains.contains_key(domain_name) {
+        if guard.domains.keys().any(|existing| {
+            crate::domains::canonical(existing) == crate::domains::canonical(domain_name)
+        }) {
             return Err(ApiGwError::Conflict(format!(
                 "Domain name already exists: {domain_name}"
             )));
         }
+        ctx.domains
+            .publish(binding.expect("public domain preflight completed"))?;
         guard
             .domains
             .insert(domain_name.to_string(), domain.clone());
@@ -1974,6 +1997,16 @@ pub async fn update_domain_name(
             "Cannot change a public custom domain to PRIVATE".into(),
         ));
     }
+    if !private {
+        let binding = crate::domains::rest_binding(
+            ctx,
+            &updated,
+            domain.get("regionalDomainName").and_then(Value::as_str),
+        )?;
+        updated["regionalDomainName"] = json!(binding.target);
+        updated["regionalHostedZoneId"] = json!(binding.zone);
+        ctx.domains.publish(binding)?;
+    }
     *domain = updated.clone();
     Ok((200, public_domain(&updated)))
 }
@@ -1994,6 +2027,7 @@ pub async fn delete_domain_name(ctx: &Ctx<'_>, domain_name: &str, domain_id: Opt
             });
         }
     } else {
+        ctx.domains.remove(ctx.account, ctx.region, domain_name)?;
         guard.domains.remove(domain_name);
     }
     Ok((202, json!({})))
@@ -2365,6 +2399,7 @@ mod tests {
             account: "000000000000",
             request_id: "test",
             waf: None,
+            domains: &crate::domains::fixture_bindings(),
         };
         let (_, api) = create_rest_api(&ctx, &json!({ "name": "test" }))
             .await
@@ -2374,6 +2409,7 @@ mod tests {
             &ctx,
             &json!({
                 "domainName": "internal.example.test",
+                "regionalCertificateArn":"arn:aws:acm:us-east-1:000000000000:certificate/test",
                 "endpointConfiguration": { "types": ["REGIONAL"] }
             }),
         )
@@ -2413,6 +2449,7 @@ mod tests {
             account: "000000000000",
             request_id: "test",
             waf: None,
+            domains: &crate::domains::fixture_bindings(),
         };
         let (_, api) = create_rest_api(&ctx, &json!({ "name": "test" }))
             .await

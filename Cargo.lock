@@ -2241,6 +2241,7 @@ dependencies = [
  "http",
  "jsonschema",
  "jsonwebtoken",
+ "locallycloud-acm",
  "locallycloud-cognito",
  "locallycloud-core",
  "locallycloud-wafv2",

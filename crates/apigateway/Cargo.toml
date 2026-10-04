@@ -9,6 +9,7 @@ description = "locallycloud AWS API Gateway control plane (v1 REST + v2 HTTP/Web
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-acm.workspace = true
 locallycloud-cognito.workspace = true
 locallycloud-wafv2.workspace = true
 tokio.workspace = true

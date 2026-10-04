@@ -1,9 +1,10 @@
 //! Bounded DER and PEM validation for the supported RSA import profile.
-//! No private-key bytes leave this module. Certificate chains are rejected
+//! Validated DER is retained only for the internal TLS capability. Certificate chains are rejected
 //! until full path validation can be performed.
 
 use ring::signature::{KeyPair, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use time::{Date, Month, PrimitiveDateTime, Time};
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub(super) struct MaterialMetadata {
@@ -15,6 +16,12 @@ pub(super) struct MaterialMetadata {
     pub not_before: i64,
     pub not_after: i64,
     pub key_algorithm: &'static str,
+}
+
+pub(super) struct ValidatedMaterial {
+    pub metadata: MaterialMetadata,
+    pub certificate_der: Vec<u8>,
+    pub private_key_der: Zeroizing<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -192,7 +199,7 @@ pub(super) fn validate(
     certificate_pem: &[u8],
     private_key_pem: &[u8],
     now: i64,
-) -> Result<MaterialMetadata, ()> {
+) -> Result<ValidatedMaterial, ()> {
     if certificate_pem.is_empty()
         || certificate_pem.len() > 32768
         || private_key_pem.is_empty()
@@ -210,6 +217,7 @@ pub(super) fn validate(
     if cert_pem.tag() != "CERTIFICATE" || key_pem.tag() != "PRIVATE KEY" {
         return Err(());
     }
+    let private_key_der = Zeroizing::new(key_pem.into_contents());
     let cert = sole(cert_pem.contents(), 0x30)?;
     let mut envelope = cert.value;
     let tbs = expect(&mut envelope, 0x30)?;
@@ -274,7 +282,7 @@ pub(super) fn validate(
         4096 => "RSA_4096",
         _ => return Err(()),
     };
-    let key = RsaKeyPair::from_pkcs8(key_pem.contents()).map_err(|_| ())?;
+    let key = RsaKeyPair::from_pkcs8(&private_key_der).map_err(|_| ())?;
     if key.public_key().as_ref() != public_key {
         return Err(());
     }
@@ -306,7 +314,7 @@ pub(super) fn validate(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    Ok(MaterialMetadata {
+    let metadata = MaterialMetadata {
         domain: subject_cn.clone(),
         names,
         subject: format!("CN={subject_cn}"),
@@ -315,5 +323,10 @@ pub(super) fn validate(
         not_before,
         not_after,
         key_algorithm,
+    };
+    Ok(ValidatedMaterial {
+        metadata,
+        certificate_der: cert_pem.into_contents(),
+        private_key_der,
     })
 }

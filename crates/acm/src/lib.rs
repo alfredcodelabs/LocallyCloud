@@ -1,5 +1,6 @@
 //! Scoped native ACM import slice for locally supplied RSA certificates.
-//! Material is validated before mutation. Only certificate metadata is retained.
+//! Material is validated before mutation. Private DER stays zeroized in memory and is
+//! available only through the scoped internal TLS capability, never the AWS API.
 mod material;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -34,6 +35,8 @@ struct Certificate {
     metadata: material::MaterialMetadata,
     tags: BTreeMap<String, String>,
     imported_at: i64,
+    tls: Option<Arc<AcmTlsIdentity>>,
+    associations: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -51,6 +54,13 @@ pub enum AssociationDecision {
     StateUnavailable,
 }
 
+/// Validated local TLS material for an internal consumer. Never log or serialize it.
+/// The private PKCS8 DER is zeroized on drop; this service does not write it to disk.
+pub struct AcmTlsIdentity {
+    pub certificate_der: Vec<u8>,
+    pub private_key_der: Zeroizing<Vec<u8>>,
+}
+
 /// A typed certificate association preflight. It never exports private material.
 pub trait AcmAssociationApi: Send + Sync {
     fn preflight(
@@ -60,6 +70,31 @@ pub trait AcmAssociationApi: Send + Sync {
         arn: &str,
         dns_name: &str,
     ) -> AssociationDecision;
+
+    fn tls_identity(
+        &self,
+        account: &str,
+        region: &str,
+        arn: &str,
+        dns_name: &str,
+    ) -> Result<AcmTlsIdentity, AssociationDecision>;
+
+    fn acquire(
+        &self,
+        account: &str,
+        region: &str,
+        arn: &str,
+        dns_name: &str,
+        consumer_id: &str,
+    ) -> Result<(), AssociationDecision>;
+
+    fn release(
+        &self,
+        account: &str,
+        region: &str,
+        arn: &str,
+        consumer_id: &str,
+    ) -> Result<(), AssociationDecision>;
 }
 
 #[derive(Default)]
@@ -121,7 +156,12 @@ impl AcmHandler {
             BTreeMap::new()
         };
         let now = now();
-        let metadata = material::validate(&cert, &key, now).map_err(|_| invalid_parameter())?;
+        let material = material::validate(&cert, &key, now).map_err(|_| invalid_parameter())?;
+        let metadata = material.metadata;
+        let tls = Arc::new(AcmTlsIdentity {
+            certificate_der: material.certificate_der,
+            private_key_der: material.private_key_der,
+        });
         let scope = scope(req);
         let mut state = self.state.lock().map_err(|_| internal())?;
         if let Some(arn) = replacement {
@@ -131,7 +171,18 @@ impl AcmHandler {
                 .get_mut(&scope)
                 .and_then(|certs| certs.get_mut(arn))
                 .ok_or_else(not_found)?;
+            if existing.metadata.key_algorithm != metadata.key_algorithm {
+                return Err(invalid_parameter());
+            }
+            if existing
+                .associations
+                .values()
+                .any(|dns_name| !metadata.names.iter().any(|name| covers(name, dns_name)))
+            {
+                return Err(invalid_parameter());
+            }
             existing.metadata = metadata;
+            existing.tls = Some(tls);
             existing.imported_at = now;
             return Ok(json!({"CertificateArn": arn}));
         }
@@ -152,6 +203,8 @@ impl AcmHandler {
                 metadata,
                 tags,
                 imported_at: now,
+                tls: Some(tls),
+                associations: BTreeMap::new(),
             },
         );
         Ok(json!({"CertificateArn": arn}))
@@ -187,7 +240,7 @@ impl AcmHandler {
             "NotBefore": m.not_before,
             "NotAfter": m.not_after,
             "ImportedAt": cert.imported_at,
-            "InUseBy": [],
+            "InUseBy": cert.associations.keys().collect::<Vec<_>>(),
             "RenewalEligibility": "INELIGIBLE"
         }}))
     }
@@ -256,7 +309,7 @@ impl AcmHandler {
                 if allowed_type {
                     summaries.push(json!({"CertificateArn": cert.arn, "DomainName": cert.metadata.domain,
                             "SubjectAlternativeNameSummaries": cert.metadata.names, "Status": status, "Type": "IMPORTED",
-                            "KeyAlgorithm": key_type, "HasAdditionalSubjectAlternativeNames": false}));
+                            "KeyAlgorithm": key_type, "HasAdditionalSubjectAlternativeNames": false, "InUse": !cert.associations.is_empty()}));
                 }
             }
         }
@@ -271,13 +324,12 @@ impl AcmHandler {
         let arn = required_string(body, "CertificateArn")?;
         validate_arn(req, arn)?;
         let mut state = self.state.lock().map_err(|_| internal())?;
-        let removed = state
-            .certs
-            .get_mut(&scope(req))
-            .and_then(|certs| certs.remove(arn));
-        if removed.is_none() {
-            return Err(not_found());
+        let certs = state.certs.get_mut(&scope(req)).ok_or_else(not_found)?;
+        let cert = certs.get(arn).ok_or_else(not_found)?;
+        if !cert.associations.is_empty() {
+            return Err(err("ResourceInUseException", "The certificate is in use"));
         }
+        certs.remove(arn);
         Ok(json!({}))
     }
 
@@ -346,6 +398,37 @@ impl AcmHandler {
     }
 }
 
+fn eligible_certificate<'a>(
+    state: &'a State,
+    account: &str,
+    region: &str,
+    arn: &str,
+    dns_name: &str,
+) -> Result<&'a Certificate, AssociationDecision> {
+    let scope = Scope {
+        account: account.to_owned(),
+        region: region.to_owned(),
+    };
+    let cert = state
+        .certs
+        .get(&scope)
+        .and_then(|certs| certs.get(arn))
+        .ok_or(AssociationDecision::NotFound)?;
+    let now = now();
+    if now < cert.metadata.not_before || now >= cert.metadata.not_after {
+        return Err(AssociationDecision::UnsupportedMaterial);
+    }
+    if !cert
+        .metadata
+        .names
+        .iter()
+        .any(|name| covers(name, dns_name))
+    {
+        return Err(AssociationDecision::NameNotCovered);
+    }
+    Ok(cert)
+}
+
 impl AcmAssociationApi for AcmHandler {
     fn preflight(
         &self,
@@ -354,27 +437,87 @@ impl AcmAssociationApi for AcmHandler {
         arn: &str,
         dns_name: &str,
     ) -> AssociationDecision {
-        let state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return AssociationDecision::StateUnavailable,
+        let Ok(state) = self.state.lock() else {
+            return AssociationDecision::StateUnavailable;
         };
-        let scope = Scope {
-            account: account.to_owned(),
-            region: region.to_owned(),
-        };
-        let Some(cert) = state.certs.get(&scope).and_then(|certs| certs.get(arn)) else {
-            return AssociationDecision::NotFound;
-        };
-        if cert
-            .metadata
-            .names
-            .iter()
-            .any(|name| covers(name, dns_name))
-        {
-            AssociationDecision::Eligible
-        } else {
-            AssociationDecision::NameNotCovered
+        eligible_certificate(&state, account, region, arn, dns_name)
+            .map(|_| AssociationDecision::Eligible)
+            .unwrap_or_else(|decision| decision)
+    }
+
+    fn tls_identity(
+        &self,
+        account: &str,
+        region: &str,
+        arn: &str,
+        dns_name: &str,
+    ) -> Result<AcmTlsIdentity, AssociationDecision> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AssociationDecision::StateUnavailable)?;
+        let material = eligible_certificate(&state, account, region, arn, dns_name)?
+            .tls
+            .as_ref()
+            .ok_or(AssociationDecision::UnsupportedMaterial)?;
+        Ok(AcmTlsIdentity {
+            certificate_der: material.certificate_der.clone(),
+            private_key_der: Zeroizing::new(material.private_key_der.to_vec()),
+        })
+    }
+
+    fn acquire(
+        &self,
+        account: &str,
+        region: &str,
+        arn: &str,
+        dns_name: &str,
+        consumer_id: &str,
+    ) -> Result<(), AssociationDecision> {
+        if consumer_id.is_empty() || consumer_id.len() > 2048 {
+            return Err(AssociationDecision::UnsupportedMaterial);
         }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AssociationDecision::StateUnavailable)?;
+        eligible_certificate(&state, account, region, arn, dns_name)?;
+        let scope = Scope {
+            account: account.into(),
+            region: region.into(),
+        };
+        state
+            .certs
+            .get_mut(&scope)
+            .and_then(|certs| certs.get_mut(arn))
+            .ok_or(AssociationDecision::NotFound)?
+            .associations
+            .insert(consumer_id.into(), dns_name.into());
+        Ok(())
+    }
+
+    fn release(
+        &self,
+        account: &str,
+        region: &str,
+        arn: &str,
+        consumer_id: &str,
+    ) -> Result<(), AssociationDecision> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AssociationDecision::StateUnavailable)?;
+        let scope = Scope {
+            account: account.into(),
+            region: region.into(),
+        };
+        let cert = state
+            .certs
+            .get_mut(&scope)
+            .and_then(|certs| certs.get_mut(arn))
+            .ok_or(AssociationDecision::NotFound)?;
+        cert.associations.remove(consumer_id);
+        Ok(())
     }
 }
 
@@ -383,7 +526,9 @@ fn covers(pattern: &str, name: &str) -> bool {
         return true;
     }
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        if let Some(prefix) = name.strip_suffix(suffix) {
+        let normalized = name.to_ascii_lowercase();
+        let suffix = suffix.to_ascii_lowercase();
+        if let Some(prefix) = normalized.strip_suffix(&suffix) {
             return prefix.ends_with('.')
                 && prefix[..prefix.len() - 1].bytes().all(|b| b != b'.')
                 && prefix.len() > 1;
@@ -394,6 +539,18 @@ fn covers(pattern: &str, name: &str) -> bool {
 
 #[async_trait]
 impl NativeHandler for AcmHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| "ACM inventory unavailable")?
+            .certs
+            .iter()
+            .filter(|(k, v)| k.account == account && !v.is_empty())
+            .map(|(k, _)| k.region.clone())
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let result = if request.method != http::Method::POST
             || request.uri.path() != "/"
@@ -584,8 +741,181 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tls_material_import_is_scoped_atomic_redacted_and_revocable() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        fn fixture(dns_name: &str, bits: &str) -> (Vec<u8>, Zeroizing<Vec<u8>>) {
+            let generated = Command::new("openssl")
+                .args([
+                    "genpkey",
+                    "-algorithm",
+                    "RSA",
+                    "-pkeyopt",
+                    &format!("rsa_keygen_bits:{bits}"),
+                ])
+                .output()
+                .unwrap();
+            let private_pem = Zeroizing::new(generated.stdout);
+            assert!(generated.status.success());
+            let mut child = Command::new("openssl")
+                .args([
+                    "req",
+                    "-new",
+                    "-x509",
+                    "-key",
+                    "/dev/stdin",
+                    "-days",
+                    "1",
+                    "-subj",
+                    &format!("/CN={dns_name}"),
+                    "-addext",
+                    &format!("subjectAltName=DNS:{dns_name}"),
+                    "-addext",
+                    "extendedKeyUsage=serverAuth",
+                    "-addext",
+                    "keyUsage=digitalSignature,keyEncipherment",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(&private_pem).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(result.status.success());
+            (result.stdout, private_pem)
+        }
+        let handler = AcmHandler::new();
+        let req = ServiceRequest {
+            method: http::Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            body: Default::default(),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            request_id: "tls-import".into(),
+        };
+        let (cert, key) = fixture("api.example.test", "2048");
+        let mut import =
+            json!({"Certificate":STANDARD.encode(&cert), "PrivateKey":STANDARD.encode(&key)})
+                .as_object()
+                .unwrap()
+                .clone();
+        let arn = handler.import(&req, &import).unwrap()["CertificateArn"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first = handler
+            .tls_identity(&req.account_id, &req.region, &arn, "api.example.test")
+            .unwrap();
+        assert_eq!(
+            first.certificate_der,
+            pem::parse(&cert).unwrap().into_contents()
+        );
+        assert!(
+            first.private_key_der.as_slice() == pem::parse(&key).unwrap().contents(),
+            "private DER mismatch"
+        );
+        assert!(matches!(
+            handler.tls_identity(&req.account_id, "eu-west-1", &arn, "api.example.test"),
+            Err(AssociationDecision::NotFound)
+        ));
+        assert!(matches!(
+            handler.tls_identity("111111111111", &req.region, &arn, "api.example.test"),
+            Err(AssociationDecision::NotFound)
+        ));
+        assert!(matches!(
+            handler.tls_identity(&req.account_id, &req.region, &arn, "other.example.test"),
+            Err(AssociationDecision::NameNotCovered)
+        ));
+        let lookup = json!({"CertificateArn":arn}).as_object().unwrap().clone();
+        let described = handler.describe(&req, &lookup).unwrap().to_string();
+        assert!(!described.contains("PrivateKey") && !described.contains(&STANDARD.encode(&key)));
+        let consumer = "arn:aws:apigateway:us-east-1::/domainnames/api.example.test";
+        handler
+            .acquire(
+                &req.account_id,
+                &req.region,
+                &arn,
+                "api.example.test",
+                consumer,
+            )
+            .unwrap();
+        assert_eq!(
+            handler.describe(&req, &lookup).unwrap()["Certificate"]["InUseBy"],
+            json!([consumer])
+        );
+        assert!(handler.delete(&req, &lookup).is_err());
+        assert!(handler
+            .release("111111111111", &req.region, &arn, consumer)
+            .is_err());
+        assert!(handler.delete(&req, &lookup).is_err());
+        let (wrong_name_cert, wrong_name_key) = fixture("other.example.test", "2048");
+        let wrong_name = json!({"CertificateArn":arn,"Certificate":STANDARD.encode(&wrong_name_cert),"PrivateKey":STANDARD.encode(&wrong_name_key)}).as_object().unwrap().clone();
+        assert!(handler.import(&req, &wrong_name).is_err());
+        assert_eq!(
+            handler
+                .tls_identity(&req.account_id, &req.region, &arn, "api.example.test")
+                .unwrap()
+                .certificate_der,
+            first.certificate_der
+        );
+        let (different_size_cert, different_size_key) = fixture("api.example.test", "3072");
+        let different_size = json!({"CertificateArn":arn,"Certificate":STANDARD.encode(&different_size_cert),"PrivateKey":STANDARD.encode(&different_size_key)}).as_object().unwrap().clone();
+        assert!(handler.import(&req, &different_size).is_err());
+        let (next_cert, next_key) = fixture("api.example.test", "2048");
+        import.insert("CertificateArn".into(), json!(arn));
+        import.insert("Certificate".into(), json!(STANDARD.encode(&next_cert)));
+        assert!(handler.import(&req, &import).is_err()); // Invalid pair cannot replace live TLS material.
+        assert_eq!(
+            handler
+                .tls_identity(&req.account_id, &req.region, &arn, "api.example.test")
+                .unwrap()
+                .certificate_der,
+            first.certificate_der
+        );
+        import.insert("PrivateKey".into(), json!(STANDARD.encode(&next_key)));
+        handler.import(&req, &import).unwrap();
+        let updated = handler
+            .tls_identity(&req.account_id, &req.region, &arn, "api.example.test")
+            .unwrap();
+        assert_ne!(updated.certificate_der, first.certificate_der);
+        assert!(
+            updated.private_key_der.as_slice() != first.private_key_der.as_slice(),
+            "private DER was not replaced"
+        );
+        handler
+            .state
+            .lock()
+            .unwrap()
+            .certs
+            .get_mut(&scope(&req))
+            .unwrap()
+            .get_mut(&arn)
+            .unwrap()
+            .metadata
+            .not_after = now();
+        assert!(matches!(
+            handler.tls_identity(&req.account_id, &req.region, &arn, "api.example.test"),
+            Err(AssociationDecision::UnsupportedMaterial)
+        ));
+        handler
+            .release(&req.account_id, &req.region, &arn, consumer)
+            .unwrap();
+        handler
+            .release(&req.account_id, &req.region, &arn, consumer)
+            .unwrap(); // Same consumer release is idempotent.
+        handler.delete(&req, &lookup).unwrap();
+        assert!(matches!(
+            handler.tls_identity(&req.account_id, &req.region, &arn, "api.example.test"),
+            Err(AssociationDecision::NotFound)
+        ));
+    }
+
+    #[test]
     fn wildcard_covers_exactly_one_label() {
         assert!(covers("*.example.test", "api.example.test"));
+        assert!(covers("*.EXAMPLE.TEST", "API.example.test"));
         assert!(!covers("*.example.test", "deep.api.example.test"));
         assert!(!covers("*.example.test", "example.test"));
         assert!(!covers("*.example.test", "evilexample.test"));
@@ -623,6 +953,8 @@ mod tests {
                     metadata,
                     tags: BTreeMap::new(),
                     imported_at: 0,
+                    tls: None,
+                    associations: BTreeMap::new(),
                 },
             );
         assert_eq!(

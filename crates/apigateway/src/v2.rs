@@ -1239,23 +1239,26 @@ pub async fn create_domain_name(ctx: &Ctx<'_>, body: &Value) -> Out {
     check_type(body, "tags", Value::is_object)?;
     let shared = ctx.store.shared(ctx.account, ctx.region);
     let mut guard = shared.write().await;
-    if guard.domains.contains_key(domain_name) {
+    if guard.domains.keys().any(|existing| {
+        crate::domains::canonical(existing) == crate::domains::canonical(domain_name)
+    }) {
         return Err(ApiGwError::Conflict(format!(
             "Domain name already exists: {domain_name}"
         )));
     }
+    let binding = crate::domains::http_binding(ctx, body, None)?;
     let mut domain = json!({
         "domainName": domain_name,
         "apiMappingSelectionExpression": "$request.basepath",
-        "domainNameConfigurations": body.get("domainNameConfigurations").cloned().unwrap_or_else(|| json!([{
-            "apiGatewayDomainName": format!("{}.execute-api.{}.amazonaws.com", gen_id(), ctx.region),
-            "endpointType": "REGIONAL",
-            "hostedZoneId": "Z2FDTNDATAQYW2",
-            "ipAddressType": "ipv4",
-            "securityPolicy": "TLS_1_2"
-        }])),
+        "domainNameConfigurations": body["domainNameConfigurations"].clone(),
         "tags": body.get("tags").cloned().unwrap_or(json!({})),
     });
+    domain["domainNameConfigurations"][0]["apiGatewayDomainName"] = json!(binding.target);
+    domain["domainNameConfigurations"][0]["hostedZoneId"] = json!(binding.zone);
+    domain["domainNameConfigurations"][0]["endpointType"] = json!("REGIONAL");
+    domain["domainNameConfigurations"][0]["securityPolicy"] = json!("TLS_1_2");
+    domain["domainNameConfigurations"][0]["domainNameStatus"] = json!("AVAILABLE");
+    ctx.domains.publish(binding)?;
     domain[INTERNAL_MAPPINGS] = json!({});
     domain[INTERNAL_BASE_PATH_MAPPINGS] = json!({});
     if let Some(value) = body.get("mutualTlsAuthentication") {
@@ -1296,8 +1299,9 @@ pub async fn update_domain_name(ctx: &Ctx<'_>, domain_name: &str, body: &Value) 
         .domains
         .get_mut(domain_name)
         .ok_or_else(|| ApiGwError::NotFound(format!("Invalid domain name {domain_name}")))?;
+    let mut updated = domain.clone();
     copy_fields(
-        domain,
+        &mut updated,
         body,
         &[
             "domainNameConfigurations",
@@ -1305,17 +1309,30 @@ pub async fn update_domain_name(ctx: &Ctx<'_>, domain_name: &str, body: &Value) 
             "tags",
         ],
     );
-    Ok((200, public_domain(domain)))
+    let target = domain
+        .pointer("/domainNameConfigurations/0/apiGatewayDomainName")
+        .and_then(Value::as_str);
+    let binding = crate::domains::http_binding(ctx, &updated, target)?;
+    updated["domainNameConfigurations"][0]["apiGatewayDomainName"] = json!(binding.target);
+    updated["domainNameConfigurations"][0]["hostedZoneId"] = json!(binding.zone);
+    updated["domainNameConfigurations"][0]["endpointType"] = json!("REGIONAL");
+    updated["domainNameConfigurations"][0]["securityPolicy"] = json!("TLS_1_2");
+    updated["domainNameConfigurations"][0]["domainNameStatus"] = json!("AVAILABLE");
+    ctx.domains.publish(binding)?;
+    *domain = updated.clone();
+    Ok((200, public_domain(&updated)))
 }
 
 pub async fn delete_domain_name(ctx: &Ctx<'_>, domain_name: &str) -> Out {
     let shared = ctx.store.shared(ctx.account, ctx.region);
     let mut guard = shared.write().await;
-    if guard.domains.remove(domain_name).is_none() {
+    if !guard.domains.contains_key(domain_name) {
         return Err(ApiGwError::NotFound(format!(
             "Invalid domain name {domain_name}"
         )));
     }
+    ctx.domains.remove(ctx.account, ctx.region, domain_name)?;
+    guard.domains.remove(domain_name);
     Ok((204, json!({})))
 }
 
