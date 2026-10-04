@@ -537,6 +537,18 @@ impl Error {
 
 #[async_trait]
 impl NativeHandler for RegionSwitchHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| "Region Switch inventory unavailable")?
+            .plans
+            .iter()
+            .filter(|(_, p)| p.account == account)
+            .filter_map(|(arn, _)| arn.split(':').nth(3).map(str::to_owned))
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let target = request
             .headers

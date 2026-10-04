@@ -1303,6 +1303,29 @@ impl From<EcsError> for AwsError {
 }
 #[async_trait]
 impl NativeHandler for EcsHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let s = self.state.lock().map_err(|_| "ECS inventory unavailable")?;
+        let mut regions: Vec<_> = s
+            .clusters
+            .iter()
+            .filter(|((k, _), active)| k.account == account && **active)
+            .map(|((k, _), _)| k.region.clone())
+            .collect();
+        regions.extend(
+            s.definitions
+                .iter()
+                .filter(|((k, _), v)| k.account == account && !v.is_empty())
+                .map(|((k, _), _)| k.region.clone()),
+        );
+        regions.extend(
+            s.services
+                .iter()
+                .filter(|((k, _, _), v)| k.account == account && v.status != "INACTIVE")
+                .map(|((k, _, _), _)| k.region.clone()),
+        );
+        Ok(regions)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         match self.process_async(&request).await {
             Ok(value) => Response::builder()

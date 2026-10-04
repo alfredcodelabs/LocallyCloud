@@ -587,6 +587,16 @@ impl CloudFrontHandler {
 
 #[async_trait]
 impl NativeHandler for CloudFrontHandler {
+    async fn has_global_resources(&self, account: &str) -> Result<bool, &'static str> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| "CloudFront inventory unavailable")?
+            .distributions
+            .values()
+            .any(|d| d.account == account))
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         self.process(&request).await
     }

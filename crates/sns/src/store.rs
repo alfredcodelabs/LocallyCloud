@@ -69,6 +69,15 @@ fn key(arn: &TopicArn) -> Key {
 }
 
 impl SnsStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .topics
+            .iter()
+            .filter(|e| e.key().0 == account)
+            .map(|e| e.key().1.clone())
+            .collect())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

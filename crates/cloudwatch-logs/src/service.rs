@@ -300,6 +300,10 @@ fn decode<T: DeserializeOwned>(body: Value) -> Result<T, LogsError> {
 
 #[async_trait]
 impl NativeHandler for LogsHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let operation = protocol::operation(&request.headers).ok();
         let wakes_retention = operation.is_some_and(|operation| {

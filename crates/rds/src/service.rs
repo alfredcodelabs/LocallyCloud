@@ -2068,6 +2068,42 @@ impl RdsHandler {
 
 #[async_trait]
 impl NativeHandler for RdsHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let mut regions = Vec::new();
+        let instances = self
+            .instances
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let snapshots = self
+            .snapshots
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let clusters = self
+            .clusters
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let subnet_groups = self
+            .subnet_groups
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for map in [instances, snapshots, clusters, subnet_groups] {
+            regions.extend(map.into_iter().filter(|k| k.0 == account).map(|k| k.1));
+        }
+        Ok(regions)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let input = Input::parse(&request);
         let action = input.get("Action").unwrap_or("Unknown");
@@ -3308,5 +3344,49 @@ mod vpc_tests {
         ))).await;
         assert_eq!(legacy.status(), 200);
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn inventory_waiting_on_snapshots_does_not_block_cluster_deletion() {
+        let root = std::env::temp_dir().join(format!(
+            "locallycloud-rds-inventory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let handler = RdsHandler::new(root.clone());
+        let request = ServiceRequest {
+            method: axum::http::Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: Default::default(),
+            body: "Action=CreateDBCluster&DBClusterIdentifier=inventory-cluster&Engine=aurora-postgresql&MasterUsername=admin&MasterUserPassword=test-password".into(),
+            account_id: "000000000000".into(),
+            region: "us-east-1".into(),
+            request_id: "inventory-regression".into(),
+        };
+        let input = Input::parse(&request);
+        handler.create_cluster(&request, &input).await.unwrap();
+        let snapshots = handler.snapshots.lock().await;
+        let inventory = handler.resource_regions(&request.account_id);
+        tokio::pin!(inventory);
+        poll_fn(|cx| {
+            assert!(inventory.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let deleted = tokio::time::timeout(
+            Duration::from_secs(2),
+            handler.delete_cluster(&request, &input),
+        )
+        .await;
+        drop(snapshots);
+        assert!(deleted.expect("inventory held an unrelated lock").is_ok());
+        assert!(inventory.await.unwrap().is_empty());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

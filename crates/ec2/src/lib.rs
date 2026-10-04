@@ -2510,6 +2510,25 @@ async fn serve_instance_proxy(
 
 #[async_trait]
 impl NativeHandler for Ec2Handler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .scopes
+            .lock()
+            .map_err(|_| "EC2 inventory unavailable")?
+            .iter()
+            .filter(|(k, s)| {
+                k.0 == account
+                    && (!s.vpcs.is_empty()
+                        || !s.internet_gateways.is_empty()
+                        || !s.elastic_ips.is_empty()
+                        || s.instances
+                            .values()
+                            .any(|i| i.state != InstanceState::Terminated))
+            })
+            .map(|(k, _)| k.1.clone())
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let input = match Input::parse(&request) {
             Ok(input) => input,
@@ -4548,5 +4567,65 @@ mod tests {
             .0,
             200
         );
+    }
+    #[tokio::test]
+    async fn elastic_addresses_are_unique_across_scopes_and_reusable_after_release() {
+        let handler = Ec2Handler::default();
+        let mut addresses = std::collections::HashSet::new();
+        let mut first_allocation = String::new();
+        let mut first_ip = String::new();
+        for index in 0..254 {
+            let account = if index % 2 == 0 { "111" } else { "222" };
+            let region = if index % 3 == 0 {
+                "us-east-1"
+            } else {
+                "us-west-2"
+            };
+            let (status, xml) = call(
+                &handler,
+                account,
+                region,
+                "Action=AllocateAddress&Domain=vpc",
+            )
+            .await;
+            assert_eq!(status, 200);
+            let ip = id(&xml, "publicIp");
+            assert!(
+                addresses.insert(ip.clone()),
+                "duplicate public address {ip}"
+            );
+            if index == 0 {
+                first_allocation = id(&xml, "allocationId");
+                first_ip = ip;
+            }
+        }
+        let (status, xml) = call(
+            &handler,
+            "333",
+            "us-east-1",
+            "Action=AllocateAddress&Domain=vpc",
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(xml.contains("AddressLimitExceeded"));
+        assert_eq!(
+            call(
+                &handler,
+                "111",
+                "us-east-1",
+                &format!("Action=ReleaseAddress&AllocationId={first_allocation}")
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, xml) = call(
+            &handler,
+            "333",
+            "us-east-1",
+            "Action=AllocateAddress&Domain=vpc",
+        )
+        .await;
+        assert_eq!(id(&xml, "publicIp"), first_ip);
     }
 }

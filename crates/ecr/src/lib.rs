@@ -886,6 +886,18 @@ fn now_epoch() -> f64 {
 
 #[async_trait]
 impl NativeHandler for EcrHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .repos
+            .iter()
+            .filter_map(|e| {
+                let (owner, tail) = e.key().split_once(':')?;
+                let (region, _) = tail.split_once(':')?;
+                (owner == account).then(|| region.to_owned())
+            })
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         if request.uri.path() == "/v2" || request.uri.path().starts_with("/v2/") {
             return self.handle_registry(request).await;

@@ -1138,6 +1138,27 @@ impl Elbv2Handler {
 
 #[async_trait]
 impl NativeHandler for Elbv2Handler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let mut regions: Vec<_> = self
+            .groups
+            .lock()
+            .map_err(|_| "ELB inventory unavailable")?
+            .iter()
+            .filter(|(k, v)| k.0 == account && !v.is_empty())
+            .map(|(k, _)| k.1.clone())
+            .collect();
+        regions.extend(
+            self.albs
+                .lock()
+                .map_err(|_| "ELB inventory unavailable")?
+                .load_balancers
+                .iter()
+                .filter(|(k, v)| k.0 == account && !v.is_empty())
+                .map(|(k, _)| k.1.clone()),
+        );
+        Ok(regions)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let result = if request.method != http::Method::POST || request.body.len() > MAX_BODY {
             Err(Error::invalid("Invalid ELBv2 Query request"))

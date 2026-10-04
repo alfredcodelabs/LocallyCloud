@@ -184,6 +184,7 @@ fn authorize(
     else {
         return Ok(());
     };
+    let delegated_identity = locallycloud_core::integration::identity::trusted_role(request);
     for (action, table) in authorization_targets(op, body)? {
         let resource = if table == "*" {
             table
@@ -212,7 +213,7 @@ fn authorize(
                     access_key_id: Some(access_key.clone()),
                     arn: None,
                 },
-                delegated_identity: None,
+                delegated_identity: delegated_identity.clone(),
                 source_service: "dynamodb".into(),
                 action: format!("dynamodb:{action}"),
                 resource,
@@ -283,6 +284,16 @@ fn authorization_targets(op: &str, body: &Value) -> Result<Vec<(String, String)>
 
 #[async_trait]
 impl NativeHandler for DynamoHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .store
+            .all_tables()
+            .into_iter()
+            .filter(|(owner, _, _)| owner == account)
+            .map(|(_, region, _)| region)
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         self.ensure_reaper();
         let op = match operation(&request, TARGET_PREFIX) {

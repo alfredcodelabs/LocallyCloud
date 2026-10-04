@@ -146,6 +146,10 @@ impl SnsHandler {
 
 #[async_trait]
 impl NativeHandler for SnsHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let x_amz_target = request
             .headers
@@ -159,6 +163,40 @@ impl NativeHandler for SnsHandler {
                     .into_response(protocol.aws(), &request.request_id)
             }
         };
+        if matches!(
+            op.as_str(),
+            "ListTopics"
+                | "ListSubscriptions"
+                | "GetTopicAttributes"
+                | "ListSubscriptionsByTopic"
+                | "GetSubscriptionAttributes"
+                | "ListTagsForResource"
+        ) {
+            let resource = match op.as_str() {
+                "GetTopicAttributes" | "ListSubscriptionsByTopic" => {
+                    input.get("TopicArn").unwrap_or_default()
+                }
+                "ListTagsForResource" => input.get("ResourceArn").unwrap_or_default(),
+                // AWS grants subscription attribute reads against the parent topic ARN.
+                "GetSubscriptionAttributes" => input
+                    .get("SubscriptionArn")
+                    .and_then(|arn| arn.rsplit_once(':').map(|(topic, _)| topic.to_owned()))
+                    .unwrap_or_default(),
+                _ => "*".into(),
+            };
+            if locallycloud_core::integration::authorization::authorize_native_read(
+                &self.registry,
+                &request,
+                "sns",
+                &format!("sns:{op}"),
+                &resource,
+            )
+            .is_err()
+            {
+                return SnsError::AuthorizationError("Not authorized to read SNS resources".into())
+                    .into_response(protocol.aws(), &request.request_id);
+            }
+        }
         let ctx = Ctx {
             store: &self.store,
             region: &request.region,

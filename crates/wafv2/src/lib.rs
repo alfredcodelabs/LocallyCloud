@@ -673,6 +673,17 @@ impl WafEvaluator for WafHandler {
 
 #[async_trait]
 impl NativeHandler for WafHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let state = self.state.lock().map_err(|_| "WAF inventory unavailable")?;
+        Ok(state
+            .ipsets
+            .keys()
+            .chain(state.webacls.keys())
+            .filter(|k| k.0 == account)
+            .map(|k| k.1.clone())
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         if request.method != http::Method::POST {
             return WafError::invalid().render(&request.request_id);

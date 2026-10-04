@@ -259,22 +259,31 @@ impl Ec2Handler {
             return Err(Ec2Error::unsupported("Domain"));
         }
         let id = resource_id("eipalloc");
-        let bytes = Uuid::new_v4().into_bytes();
-        let ip = Ipv4Addr::new(198, 51, 100, bytes[0].max(1));
-        self.scopes
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .elastic_ips
-            .insert(
-                id.clone(),
-                ElasticIp {
-                    allocation_id: id.clone(),
-                    public_ip: ip,
-                    nat_gateway_id: None,
-                },
-            );
+        let mut scopes = self.scopes.lock().unwrap();
+        let ip = (1..=254)
+            .map(|last| Ipv4Addr::new(198, 51, 100, last))
+            .find(|ip| {
+                !scopes.values().any(|scope| {
+                    scope
+                        .elastic_ips
+                        .values()
+                        .any(|address| address.public_ip == *ip)
+                })
+            })
+            .ok_or_else(|| {
+                Ec2Error::new(
+                    "AddressLimitExceeded",
+                    "The local public address pool is exhausted",
+                )
+            })?;
+        scopes.entry(key).or_default().elastic_ips.insert(
+            id.clone(),
+            ElasticIp {
+                allocation_id: id.clone(),
+                public_ip: ip,
+                nat_gateway_id: None,
+            },
+        );
         Ok(format!(
             "<allocationId>{id}</allocationId><publicIp>{ip}</publicIp><domain>vpc</domain>"
         ))

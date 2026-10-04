@@ -47,6 +47,18 @@ pub struct LogsStore {
 }
 
 impl LogsStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .state
+            .read()
+            .map_err(|_| "log inventory unavailable")?
+            .groups
+            .keys()
+            .filter(|k| k.scope.account_id == account)
+            .map(|k| k.scope.region.clone())
+            .collect())
+    }
+
     pub fn create_group(&self, key: GroupKey, mut group: LogGroup) -> Result<(), LogsError> {
         let expected_arn = format!(
             "arn:aws:logs:{}:{}:log-group:{}",
