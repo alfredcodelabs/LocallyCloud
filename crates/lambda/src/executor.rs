@@ -644,7 +644,9 @@ impl Executor {
                     return Ok(InvokeResult {
                         outcome: Outcome::Error {
                             error_type: FunctionErrorType::Unhandled,
-                            payload: format!("{{\"errorMessage\":\"{e}\"}}").into_bytes(),
+                            payload: serde_json::json!({"errorMessage": e})
+                                .to_string()
+                                .into_bytes(),
                         },
                         logs: String::new(),
                         request_id: None,
@@ -1410,8 +1412,7 @@ impl Executor {
             {
                 Ok(result) => result,
                 Err(error) => {
-                    self.owned_envs.remove(&env_key);
-                    self.broker.cleanup_extensions(&env_key);
+                    self.cleanup_failed_start(&env_key, Some(lease)).await;
                     return Err(format!("isolated VPC guest start failed: {error}"));
                 }
             };
@@ -1430,9 +1431,7 @@ impl Executor {
                 {
                     Ok(listener) => private_listeners.push((listener, address, port)),
                     Err(error) => {
-                        let _ = self.runtime.stop_task(&env_key).await;
-                        self.owned_envs.remove(&env_key);
-                        self.broker.cleanup_extensions(&env_key);
+                        self.cleanup_failed_start(&env_key, Some(lease)).await;
                         return Err(format!("private VPC listener failed: {error}"));
                     }
                 }
@@ -1449,16 +1448,12 @@ impl Executor {
                 {
                     Ok(listener) => Some(listener),
                     Err(error) => {
-                        let _ = self.runtime.stop_task(&env_key).await;
-                        self.owned_envs.remove(&env_key);
-                        self.broker.cleanup_extensions(&env_key);
+                        self.cleanup_failed_start(&env_key, Some(lease)).await;
                         return Err(format!("public VPC egress setup failed: {error}"));
                     }
                 }
             } else if ec2.public_nat_route(account, region, &lease.eni_id) {
-                let _ = self.runtime.stop_task(&env_key).await;
-                self.owned_envs.remove(&env_key);
-                self.broker.cleanup_extensions(&env_key);
+                self.cleanup_failed_start(&env_key, Some(lease)).await;
                 return Err("public VPC egress requires host ip and nft".into());
             } else {
                 None
@@ -1466,18 +1461,14 @@ impl Executor {
             let upstream = match crate::vpc_dns::system_resolver() {
                 Ok(resolver) => resolver,
                 Err(error) => {
-                    let _ = self.runtime.stop_task(&env_key).await;
-                    self.owned_envs.remove(&env_key);
-                    self.broker.cleanup_extensions(&env_key);
+                    self.cleanup_failed_start(&env_key, Some(lease)).await;
                     return Err(format!("VPC DNS system resolver unavailable: {error}"));
                 }
             };
             let (dns_udp, dns_tcp) = match self.runtime.bind_isolated_dns(&env_key).await {
                 Ok(sockets) => sockets,
                 Err(error) => {
-                    let _ = self.runtime.stop_task(&env_key).await;
-                    self.owned_envs.remove(&env_key);
-                    self.broker.cleanup_extensions(&env_key);
+                    self.cleanup_failed_start(&env_key, Some(lease)).await;
                     return Err(format!("VPC DNS setup failed: {error}"));
                 }
             };
@@ -1542,9 +1533,7 @@ impl Executor {
                 for proxy in proxies {
                     proxy.abort();
                 }
-                let _ = self.runtime.stop_task(&env_key).await;
-                self.owned_envs.remove(&env_key);
-                self.broker.cleanup_extensions(&env_key);
+                self.cleanup_failed_start(&env_key, Some(lease)).await;
                 return Err(format!("VPC guest readiness marker failed: {error}"));
             }
             self.vpc_proxies.insert(env_key.clone(), proxies);
@@ -1552,27 +1541,11 @@ impl Executor {
             self.vpc_public_egress
                 .insert(env_key.clone(), public_egress_enabled);
         } else if let Err(error) = self.runtime.start_task(&env_key, &spec).await {
-            self.owned_envs.remove(&env_key);
-            self.broker.cleanup_extensions(&env_key);
+            self.cleanup_failed_start(&env_key, None).await;
             return Err(format!("guest start failed: {error}"));
         }
         if let Err(error) = self.mark_rootfs_running(&env_key) {
-            match self.runtime.stop_task(&env_key).await {
-                Ok(_) => {
-                    if let Some((_, proxies)) = self.vpc_proxies.remove(&env_key) {
-                        for proxy in proxies {
-                            proxy.abort();
-                        }
-                    }
-                    self.vpc_networks.remove(&env_key);
-                    self.vpc_public_egress.remove(&env_key);
-                    self.cleanup_owned_rootfs(&env_key)
-                }
-                Err(stop_error) => {
-                    self.owned_envs.remove(&env_key);
-                    tracing::warn!(%env_key, %stop_error, "guest may remain after owner marker failure");
-                }
-            }
+            self.cleanup_failed_start(&env_key, None).await;
             return Err(format!("rootfs ownership transition failed: {error}"));
         }
         self.log_state.insert(
@@ -1723,6 +1696,14 @@ impl Executor {
         for env_key in remaining {
             self.stop_env(&env_key).await;
         }
+    }
+
+    async fn cleanup_failed_start(&self, env_key: &str, lease: Option<TaskNetworkLease>) {
+        if let Some(lease) = lease {
+            self.vpc_networks.insert(env_key.to_owned(), lease);
+        }
+        // Keep the same confirmed-process-absence boundary as normal spindown.
+        self.stop_env(env_key).await;
     }
 
     fn release_vpc_runtime(&self, env_key: &str) {
@@ -2190,7 +2171,9 @@ mod tests {
     #[async_trait]
     impl ComputeRuntime for StopRace {
         async fn start_task(&self, _: &str, _: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
-            unreachable!()
+            Err(RuntimeError::ExecutionFailed {
+                reason: "nft: \"unsupported\"\nsecond line\\path".into(),
+            })
         }
 
         async fn stop_task(&self, _: &str) -> Result<TaskHandle, RuntimeError> {
@@ -2233,13 +2216,33 @@ mod tests {
             if env == "immediate" {
                 absent.store(true, Ordering::Release);
             }
-            exec.stop_env(env).await;
+            exec.cleanup_failed_start(env, None).await;
             assert_eq!(exec.rootfs_root.join(env).exists(), env == "late");
             assert_eq!(exec.vpc_public_egress.contains_key(env), env == "late");
         }
         exec.recover_orphaned_guests().await;
         assert!(!exec.rootfs_root.join("late").exists());
         assert!(!exec.vpc_public_egress.contains_key("late"));
+        let function = func(
+            "provided.al2023",
+            10,
+            zip_with(&[("bootstrap", b"#!/bin/sh\nexit 1\n")]),
+        );
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &function, b"{}".to_vec())
+            .await
+            .unwrap();
+        match result.outcome {
+            Outcome::Error { payload, .. } => {
+                let error: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert!(error["errorMessage"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nft: \"unsupported\"\nsecond line\\path"));
+            }
+            outcome => panic!("Expected startup error, got {outcome:?}"),
+        }
+        assert_eq!(std::fs::read_dir(&exec.rootfs_root).unwrap().count(), 0);
         std::fs::remove_dir_all(tmp).unwrap();
     }
 

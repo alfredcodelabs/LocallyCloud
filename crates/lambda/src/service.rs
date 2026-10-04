@@ -47,8 +47,8 @@ use crate::control_plane::{
 use crate::error::LambdaError;
 use crate::esm::{
     create_mapping, parse_batching_window, poll_once, update_response_types,
-    validate_batch_configuration, validate_batch_size, BatchSource, EsmStore, SourceType,
-    SqsBatchSource,
+    validate_batch_configuration, validate_batch_size, BatchSource, EsmStore, KinesisBatchSource,
+    SourceType, SqsBatchSource,
 };
 use crate::executor::{DestinationRouter, Executor};
 use crate::model::{function_arn, resolve_function_name, FunctionStore, LayerStore, VpcConfig};
@@ -95,6 +95,10 @@ impl LambdaHandler {
             concurrency: ConcurrencyLimiter::new(DEFAULT_REGION_LIMIT),
             esm_workers: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn attach_state(&self, state: Arc<locallycloud_state::StateDb>) -> Result<(), LambdaError> {
+        self.esm.attach_state(state)
     }
 
     /// Inject the EC2 control plane used to validate Lambda VPC selections.
@@ -396,7 +400,18 @@ impl LambdaHandler {
                     let input = self.materialize_s3_zip(req, &input, Some("Code")).await?;
                     self.validate_layer_references(region, account, &input)?;
                     let vpc = self.validate_vpc_config(account, region, &input)?;
-                    create_function(&self.store, region, account, &input, vpc)
+                    let result = create_function(&self.store, region, account, &input, vpc)?;
+                    if let Some(arn) = result
+                        .1
+                        .as_ref()
+                        .and_then(|value| value.get("FunctionArn"))
+                        .and_then(Value::as_str)
+                    {
+                        for mapping in self.esm.list(Some(arn), None) {
+                            self.reconcile_esm(account, region, &mapping);
+                        }
+                    }
+                    Ok(result)
                 }
                 Method::GET => list_functions(&self.store, region, account),
                 _ => Err(unsupported()),
@@ -632,6 +647,20 @@ impl LambdaHandler {
                         self.validate_sqs_event_source(req, &esm.event_source_arn)
                             .await?;
                     }
+                    if SourceType::from_arn(&esm.event_source_arn) == Some(SourceType::Kinesis) {
+                        KinesisBatchSource::new(
+                            self.registry.clone(),
+                            self.esm.clone(),
+                            self.store.clone(),
+                            esm.clone(),
+                            account,
+                            region,
+                        )
+                        .map_err(LambdaError::InvalidParameterValue)?
+                        .validate()
+                        .await
+                        .map_err(LambdaError::InvalidParameterValue)?;
+                    }
                     if !self
                         .esm
                         .list(Some(&esm.function_arn), Some(&esm.event_source_arn))
@@ -642,9 +671,9 @@ impl LambdaHandler {
                             esm.function_arn, esm.event_source_arn
                         )));
                     }
-                    self.esm.insert(esm.clone());
+                    self.esm.insert(esm.clone())?;
                     self.reconcile_esm(account, region, &esm);
-                    Ok((202, Some(esm.to_json())))
+                    Ok((202, Some(self.esm.get(&esm.uuid).unwrap_or(esm).to_json())))
                 }
                 Method::GET => {
                     let query = req.uri.query().unwrap_or("");
@@ -656,6 +685,11 @@ impl LambdaHandler {
                         .esm
                         .list(function_filter.as_deref(), source_filter.as_deref())
                         .iter()
+                        .filter(|mapping| {
+                            mapping.function_arn.starts_with(&format!(
+                                "arn:aws:lambda:{region}:{account}:function:"
+                            ))
+                        })
                         .map(|e| e.to_json())
                         .collect();
                     Ok((
@@ -665,83 +699,101 @@ impl LambdaHandler {
                 }
                 _ => Err(unsupported()),
             },
-            ["2015-03-31", "event-source-mappings", uuid] => match req.method {
-                Method::GET => self
+            ["2015-03-31", "event-source-mappings", uuid] => {
+                let expected = format!("arn:aws:lambda:{region}:{account}:function:");
+                if !self
                     .esm
                     .get(uuid)
-                    .map(|e| (200, Some(e.to_json())))
-                    .ok_or_else(|| {
-                        LambdaError::ResourceNotFound(format!(
-                            "event source mapping not found: {uuid}"
-                        ))
-                    }),
-                Method::PUT => {
-                    let input = parse_json(&req.body)?;
-                    let existing = self.esm.get(uuid).ok_or_else(|| {
-                        LambdaError::ResourceNotFound(format!(
-                            "event source mapping not found: {uuid}"
-                        ))
-                    })?;
-                    let batch_size = input
-                        .get("BatchSize")
-                        .map(|value| {
-                            let size = value.as_u64().ok_or_else(|| {
-                                LambdaError::InvalidParameterValue(
-                                    "BatchSize must be an integer".into(),
-                                )
-                            })?;
-                            validate_batch_size(
-                                SourceType::from_arn(&existing.event_source_arn)
-                                    .expect("stored event source type"),
-                                size,
-                            )
-                        })
-                        .transpose()?;
-                    let source_type = SourceType::from_arn(&existing.event_source_arn)
-                        .expect("stored event source type");
-                    let window =
-                        parse_batching_window(&input, existing.maximum_batching_window_in_seconds)?;
-                    validate_batch_configuration(
-                        source_type,
-                        &existing.event_source_arn,
-                        batch_size.unwrap_or(existing.batch_size),
-                        window,
-                    )?;
-                    let function_response_types = update_response_types(&input)?;
-                    let updated = self
+                    .is_some_and(|mapping| mapping.function_arn.starts_with(&expected))
+                {
+                    return Err(LambdaError::ResourceNotFound(format!(
+                        "event source mapping not found: {uuid}"
+                    )));
+                }
+                match req.method {
+                    Method::GET => self
                         .esm
-                        .update(uuid, |e| {
-                            if let Some(batch_size) = batch_size {
-                                e.batch_size = batch_size;
-                            }
-                            e.maximum_batching_window_in_seconds = window;
-                            if let Some(types) = function_response_types {
-                                e.function_response_types = types;
-                            }
-                            if let Some(enabled) = input.get("Enabled").and_then(Value::as_bool) {
-                                e.enabled = enabled;
-                                e.state = if enabled {
-                                    "Enabled".into()
-                                } else {
-                                    "Disabled".into()
-                                };
-                            }
-                        })
-                        .expect("mapping existence checked above");
-                    self.reconcile_esm(account, region, &updated);
-                    Ok((202, Some(updated.to_json())))
-                }
-                Method::DELETE => {
-                    let removed = self.esm.remove(uuid).ok_or_else(|| {
-                        LambdaError::ResourceNotFound(format!(
-                            "event source mapping not found: {uuid}"
+                        .get(uuid)
+                        .map(|e| (200, Some(e.to_json())))
+                        .ok_or_else(|| {
+                            LambdaError::ResourceNotFound(format!(
+                                "event source mapping not found: {uuid}"
+                            ))
+                        }),
+                    Method::PUT => {
+                        let input = parse_json(&req.body)?;
+                        let existing = self.esm.get(uuid).ok_or_else(|| {
+                            LambdaError::ResourceNotFound(format!(
+                                "event source mapping not found: {uuid}"
+                            ))
+                        })?;
+                        let batch_size = input
+                            .get("BatchSize")
+                            .map(|value| {
+                                let size = value.as_u64().ok_or_else(|| {
+                                    LambdaError::InvalidParameterValue(
+                                        "BatchSize must be an integer".into(),
+                                    )
+                                })?;
+                                validate_batch_size(
+                                    SourceType::from_arn(&existing.event_source_arn)
+                                        .expect("stored event source type"),
+                                    size,
+                                )
+                            })
+                            .transpose()?;
+                        let source_type = SourceType::from_arn(&existing.event_source_arn)
+                            .expect("stored event source type");
+                        let window = parse_batching_window(
+                            &input,
+                            existing.maximum_batching_window_in_seconds,
+                        )?;
+                        validate_batch_configuration(
+                            source_type,
+                            &existing.event_source_arn,
+                            batch_size.unwrap_or(existing.batch_size),
+                            window,
+                        )?;
+                        let function_response_types = update_response_types(&input)?;
+                        let updated = self
+                            .esm
+                            .update(uuid, |e| {
+                                if let Some(batch_size) = batch_size {
+                                    e.batch_size = batch_size;
+                                }
+                                e.maximum_batching_window_in_seconds = window;
+                                if let Some(types) = function_response_types {
+                                    e.function_response_types = types;
+                                }
+                                if let Some(enabled) = input.get("Enabled").and_then(Value::as_bool)
+                                {
+                                    e.enabled = enabled;
+                                    e.state = if enabled {
+                                        "Enabled".into()
+                                    } else {
+                                        "Disabled".into()
+                                    };
+                                }
+                            })?
+                            .expect("mapping existence checked above");
+                        self.reconcile_esm(account, region, &updated);
+                        Ok((
+                            202,
+                            Some(self.esm.get(&updated.uuid).unwrap_or(updated).to_json()),
                         ))
-                    })?;
-                    self.abort_esm(uuid);
-                    Ok((202, Some(removed.to_json())))
+                    }
+                    Method::DELETE => {
+                        let removed = self.esm.remove(uuid)?.ok_or_else(|| {
+                            LambdaError::ResourceNotFound(format!(
+                                "event source mapping not found: {uuid}"
+                            ))
+                        })?;
+                        self.abort_esm(uuid);
+                        Ok((202, Some(removed.to_json())))
+                    }
+                    _ => Err(unsupported()),
                 }
-                _ => Err(unsupported()),
-            },
+            }
             ["2017-03-31", "tags", arn] => match req.method {
                 Method::GET => list_tags(&self.store, region, account, arn),
                 Method::POST => {
@@ -762,33 +814,91 @@ impl LambdaHandler {
 impl LambdaHandler {
     fn reconcile_esm(&self, account: &str, region: &str, mapping: &crate::esm::EventSourceMapping) {
         self.abort_esm(&mapping.uuid);
-        if !mapping.enabled
-            || self.executor.is_none()
-            || SourceType::from_arn(&mapping.event_source_arn) != Some(SourceType::Sqs)
+        if !mapping.enabled {
+            return;
+        }
+        if self.executor.is_none() {
+            let _ = self.esm.update(&mapping.uuid, |mapping| {
+                mapping.state = "Disabled".into();
+                mapping.last_processing_result = Some("ComputeUnavailable".into());
+            });
+            return;
+        }
+        let name = mapping
+            .function_arn
+            .split(":function:")
+            .nth(1)
+            .and_then(|name| name.split(':').next());
+        if name.is_none_or(|name| self.store.get(account, region, name).is_none()) {
+            let _ = self.esm.update(&mapping.uuid, |mapping| {
+                mapping.state = "Disabled".into();
+                mapping.last_processing_result = Some("FunctionUnavailable".into());
+            });
+            return;
+        }
+        let source: Arc<dyn BatchSource> = match SourceType::from_arn(&mapping.event_source_arn) {
+            Some(SourceType::Sqs) => match SqsBatchSource::new(
+                self.registry.clone(),
+                &mapping.event_source_arn,
+                account,
+                region,
+            ) {
+                Ok(source) => Arc::new(source),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start event source mapping");
+                    return;
+                }
+            },
+            Some(SourceType::Kinesis) => match KinesisBatchSource::new(
+                self.registry.clone(),
+                self.esm.clone(),
+                self.store.clone(),
+                mapping.clone(),
+                account,
+                region,
+            ) {
+                Ok(source) => Arc::new(source),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start event source mapping");
+                    return;
+                }
+            },
+            _ => return,
+        };
+        if self
+            .esm
+            .update(&mapping.uuid, |mapping| {
+                mapping.state = "Enabled".into();
+                mapping.last_processing_result = None;
+            })
+            .is_err()
         {
             return;
         }
-
-        let source = match SqsBatchSource::new(
-            self.registry.clone(),
-            &mapping.event_source_arn,
-            account,
-            region,
-        ) {
-            Ok(source) => Arc::new(source) as Arc<dyn BatchSource>,
-            Err(error) => {
-                tracing::warn!(uuid = %mapping.uuid, %error, "could not start SQS event source mapping");
-                return;
-            }
-        };
         let store = self.esm.clone();
         let registry = self.registry.clone();
         let uuid = mapping.uuid.clone();
         let worker_uuid = uuid.clone();
         let account = account.to_string();
         let region = region.to_string();
+        let functions = self.store.clone();
         let worker = tokio::spawn(async move {
             while let Some(current) = store.get(&worker_uuid).filter(|item| item.enabled) {
+                let function_name = current
+                    .function_arn
+                    .split(":function:")
+                    .nth(1)
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("");
+                if functions.get(&account, &region, function_name).is_none() {
+                    let _ = store.update(&worker_uuid, |mapping| {
+                        mapping.state = "Disabled".into();
+                        mapping.last_processing_result = Some("FunctionUnavailable".into());
+                    });
+                    break;
+                }
                 let result = poll_once(&current, &source, |event| {
                     let registry = registry.clone();
                     let account = account.clone();
@@ -820,10 +930,16 @@ impl LambdaHandler {
                     }
                 })
                 .await;
+                let processing = match &result {
+                    Ok(true) => "OK".to_string(),
+                    Ok(false) => "No records processed".to_string(),
+                    Err(error) => error.clone(),
+                };
+                let _ = store.set_processing_result(&worker_uuid, processing);
                 if let Err(error) = result {
-                    tracing::warn!(uuid = %worker_uuid, %error, "SQS event source mapping cycle failed");
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tracing::warn!(uuid = %worker_uuid, %error, "Event source mapping cycle failed");
                 }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         });
         if let Ok(mut workers) = self.esm_workers.lock() {
@@ -879,6 +995,12 @@ impl Drop for LambdaHandler {
 
 #[async_trait]
 impl NativeHandler for LambdaHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let mut regions = self.store.resource_regions(account)?;
+        regions.extend(self.layers.resource_regions(account)?);
+        Ok(regions)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         if let Err(error) = authorization::check(self, &request) {
             return error.into_response(&request.request_id);
@@ -1368,7 +1490,7 @@ impl DestinationRouter for RegistryDestinationRouter {
 }
 
 /// Register Lambda as a `Native` REST-JSON service in the Core registry.
-pub fn register(registry: &Arc<ServiceRegistry>) {
+pub fn register(registry: &Arc<ServiceRegistry>) -> Arc<LambdaHandler> {
     let handler = Arc::new(LambdaHandler::with_parts(Arc::downgrade(registry), None));
     let native_handler: Arc<dyn NativeHandler> = handler.clone();
     let lambda_api: Arc<dyn LambdaInternalApi> = handler.clone();
@@ -1378,6 +1500,7 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
         native_handler,
         lambda_api,
     );
+    handler
 }
 
 /// Register Lambda with the data plane wired: spin up the Runtime API server on an ephemeral
@@ -1399,8 +1522,7 @@ pub async fn register_with_execution(
         Some(rt) => Arc::new(rt) as Arc<dyn ComputeRuntime>,
         None => {
             tracing::warn!("no daemonless OCI runtime (crun/youki) found; Lambda invoke disabled");
-            register(registry);
-            return None;
+            return Some(register(registry));
         }
     };
 
@@ -1413,8 +1535,7 @@ pub async fn register_with_execution(
         Ok(limit) => limit,
         Err(error) => {
             tracing::error!(%error, "invalid LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL; Lambda invoke disabled");
-            register(registry);
-            return None;
+            return Some(register(registry));
         }
     };
 
@@ -1428,8 +1549,7 @@ pub async fn register_with_execution(
                     Ok(current) => current.join(path),
                     Err(error) => {
                         tracing::error!(%error, "could not resolve LOCALLYCLOUD_WORK_DIR");
-                        register(registry);
-                        return None;
+                        return Some(register(registry));
                     }
                 }
             }
@@ -1438,8 +1558,7 @@ pub async fn register_with_execution(
     };
     if let Err(error) = locallycloud_compute::private_dir::ensure(&work) {
         tracing::error!(%error, path = %work.display(), "Lambda work directory is unavailable or insecure");
-        register(registry);
-        return None;
+        return Some(register(registry));
     }
 
     let broker = Arc::new(InvocationBroker::new());
@@ -1449,8 +1568,7 @@ pub async fn register_with_execution(
         Ok(l) => l,
         Err(e) => {
             tracing::error!(error = %e, "could not bind the Lambda Runtime API; invoke disabled");
-            register(registry);
-            return None;
+            return Some(register(registry));
         }
     };
     let runtime_api_base = listener
@@ -2045,7 +2163,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let uuid = v["UUID"].as_str().unwrap().to_string();
         assert_eq!(v["BatchSize"], 5);
-        assert_eq!(v["State"], "Enabled");
+        assert_eq!(v["State"], "Disabled");
+        assert_eq!(v["LastProcessingResult"], "ComputeUnavailable");
 
         // Get, list, update (disable), delete.
         let get = handler

@@ -536,6 +536,10 @@ impl GlueHandler {
 
 #[async_trait]
 impl NativeHandler for GlueHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.state.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         match self.process(&request) {
             Ok(value) => Response::builder()

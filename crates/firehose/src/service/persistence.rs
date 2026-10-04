@@ -44,7 +44,21 @@ impl SavedStream {
 
     fn into_stream(self) -> Result<DeliveryStream, PersistError> {
         Ok(DeliveryStream {
-            source: self.source,
+            source: self.source.map(|mut source| {
+                if let Some(sequence) = source.checkpoint.take() {
+                    source
+                        .checkpoints
+                        .entry("shardId-000000000000".into())
+                        .or_insert(sequence);
+                }
+                if let Some(sequence) = source.fetched.take() {
+                    source
+                        .fetched_shards
+                        .entry("shardId-000000000000".into())
+                        .or_insert(sequence);
+                }
+                source
+            }),
             generation: Uuid::parse_str(&self.generation)?,
             created_at: self.created_at,
             destination: self.destination,

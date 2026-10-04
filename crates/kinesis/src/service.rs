@@ -15,6 +15,7 @@ use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::registry::AwsProtocol;
 use locallycloud_state::{StateDb, StateError};
+use md5::{Digest, Md5};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,10 +31,11 @@ const MAX_RECORDS: usize = 10_000;
 const MAX_GET_RECORD_BYTES: usize = 10 * 1024 * 1024;
 const RETENTION_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 const DEFAULT_MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 const SHARD_ID: &str = "shardId-000000000000";
+const MAX_SHARDS: i64 = 128;
 const ITERATOR_LIFETIME_SECONDS: i64 = 300;
 const MAX_ITERATOR_BYTES: usize = 16 * 1024;
-const HASH_KEY_END: &str = "340282366920938463463374607431768211455";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -78,6 +80,11 @@ struct Stream {
     generation: String,
     created_at: f64,
     next_sequence: u64,
+    shards: Vec<Shard>,
+}
+
+#[derive(Default)]
+struct Shard {
     first_position: usize,
     records: VecDeque<Record>,
 }
@@ -109,20 +116,24 @@ struct Store {
 
 impl Store {
     fn trim_expired(&mut self, now: f64) {
-        for stream in self.streams.values_mut() {
+        for shard in self
+            .streams
+            .values_mut()
+            .flat_map(|stream| &mut stream.shards)
+        {
             let mut trimmed = false;
-            while stream
+            while shard
                 .records
                 .front()
                 .is_some_and(|record| record.arrival_time <= now - RETENTION_SECONDS)
             {
-                let record = stream.records.pop_front().expect("nonempty front");
+                let record = shard.records.pop_front().expect("nonempty front");
                 self.buffered_bytes -= record_charge(&record.data, &record.partition_key);
-                stream.first_position += 1;
+                shard.first_position += 1;
                 trimmed = true;
             }
             if trimmed {
-                stream.records.shrink_to_fit();
+                shard.records.shrink_to_fit();
             }
         }
     }
@@ -210,10 +221,10 @@ impl KinesisHandler {
         scope: &Scope,
     ) -> Result<Success, KinesisError> {
         validate_stream_name(&request.stream_name)?;
-        if request.shard_count != 1 {
-            return Err(KinesisError::InvalidArgument(
-                "Only ShardCount=1 is supported by the LocallyCloud one-shard milestone".into(),
-            ));
+        if !(1..=MAX_SHARDS).contains(&request.shard_count) {
+            return Err(KinesisError::InvalidArgument(format!(
+                "ShardCount must be between 1 and {MAX_SHARDS} for this local backend"
+            )));
         }
         let key = StreamKey::new(scope, &request.stream_name);
         let mut store = self.lock_store()?;
@@ -227,8 +238,7 @@ impl KinesisHandler {
             generation: Uuid::new_v4().to_string(),
             created_at: now_epoch()?,
             next_sequence: 1,
-            first_position: 0,
-            records: VecDeque::new(),
+            shards: (0..request.shard_count).map(|_| Shard::default()).collect(),
         };
         if let Some(persistence) = &self.persistence {
             persistence
@@ -255,7 +265,8 @@ impl KinesisHandler {
                 "StreamName": request.stream_name,
                 "StreamARN": scope.stream_arn(&request.stream_name),
                 "StreamStatus": "ACTIVE",
-                "Shards": [shard_value()],
+                "Shards": (0..stream.shards.len()).map(|index| shard_value(index, stream.shards.len())).collect::<Vec<_>>(),
+                "HasMoreShards": false,
                 "RetentionPeriodHours": 24,
                 "StreamCreationTimestamp": stream.created_at,
                 "EnhancedMonitoring": [{ "ShardLevelMetrics": [] }]
@@ -270,13 +281,12 @@ impl KinesisHandler {
     ) -> Result<Success, KinesisError> {
         validate_stream_name(&request.stream_name)?;
         let store = self.lock_store()?;
-        if !store
+        let stream = store
             .streams
-            .contains_key(&StreamKey::new(scope, &request.stream_name))
-        {
-            return Err(stream_not_found(&request.stream_name));
-        }
-        Ok(Success::Json(json!({ "Shards": [shard_value()] })))
+            .get(&StreamKey::new(scope, &request.stream_name))
+            .ok_or_else(|| stream_not_found(&request.stream_name))?;
+        Ok(Success::Json(json!({ "Shards": (0..stream.shards.len())
+            .map(|index| shard_value(index, stream.shards.len())).collect::<Vec<_>>() })))
     }
 
     fn put_record(
@@ -294,6 +304,10 @@ impl KinesisHandler {
                 "The record exceeds the supported 1 MiB limit".into(),
             ));
         }
+        let hash = match request.explicit_hash_key.as_deref() {
+            Some(value) => parse_hash_key(value)?,
+            None => u128::from_be_bytes(Md5::digest(request.partition_key.as_bytes()).into()),
+        };
         let arrival_time = now_epoch()?;
         let mut store = self.lock_store()?;
         if !store
@@ -313,6 +327,12 @@ impl KinesisHandler {
             .streams
             .get_mut(&StreamKey::new(scope, &request.stream_name))
             .ok_or_else(|| stream_not_found(&request.stream_name))?;
+        let shard_index = (0..stream.shards.len())
+            .find(|index| {
+                let (start, end) = hash_range(*index, stream.shards.len());
+                hash >= start && hash <= end
+            })
+            .ok_or(KinesisError::Internal)?;
         let sequence_number = stream.next_sequence.to_string();
         let next_sequence = stream
             .next_sequence
@@ -329,15 +349,16 @@ impl KinesisHandler {
                 .append(
                     &StreamKey::new(scope, &request.stream_name),
                     stream,
+                    shard_index,
                     &record,
                 )
                 .map_err(|_| KinesisError::Internal)?;
         }
         stream.next_sequence = next_sequence;
-        stream.records.push_back(record);
+        stream.shards[shard_index].records.push_back(record);
         store.buffered_bytes += charge;
         Ok(Success::Json(json!({
-            "ShardId": SHARD_ID,
+            "ShardId": shard_id(shard_index),
             "SequenceNumber": sequence_number
         })))
     }
@@ -350,17 +371,15 @@ impl KinesisHandler {
         validate_stream_name(&request.stream_name)?;
         if !matches!(
             request.shard_iterator_type.as_str(),
-            "TRIM_HORIZON" | "AFTER_SEQUENCE_NUMBER"
+            "TRIM_HORIZON"
+                | "LATEST"
+                | "AT_TIMESTAMP"
+                | "AT_SEQUENCE_NUMBER"
+                | "AFTER_SEQUENCE_NUMBER"
         ) {
             return Err(KinesisError::Validation(
-                "Only TRIM_HORIZON and AFTER_SEQUENCE_NUMBER are supported".into(),
+                "Unsupported ShardIteratorType".into(),
             ));
-        }
-        if request.shard_id != SHARD_ID {
-            return Err(KinesisError::ResourceNotFound(format!(
-                "Could not find shard {} in stream {}.",
-                request.shard_id, request.stream_name
-            )));
         }
         let mut store = self.lock_store()?;
         store.trim_expired(now_epoch()?);
@@ -368,6 +387,9 @@ impl KinesisHandler {
             .streams
             .get(&StreamKey::new(scope, &request.stream_name))
             .ok_or_else(|| stream_not_found(&request.stream_name))?;
+        let shard = shard_index(&request.shard_id)
+            .and_then(|index| stream.shards.get(index))
+            .ok_or_else(|| shard_not_found(&request.stream_name))?;
         let token = self.encode_iterator(IteratorPayload {
             version: 1,
             account_id: scope.account_id.clone(),
@@ -376,16 +398,33 @@ impl KinesisHandler {
             generation: stream.generation.clone(),
             shard_id: request.shard_id,
             position: if request.shard_iterator_type == "TRIM_HORIZON" {
-                stream.first_position
+                shard.first_position
+            } else if request.shard_iterator_type == "LATEST" {
+                shard.first_position + shard.records.len()
+            } else if request.shard_iterator_type == "AT_TIMESTAMP" {
+                let timestamp = request
+                    .timestamp
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| KinesisError::InvalidArgument("Timestamp is required".into()))?;
+                shard.first_position
+                    + shard
+                        .records
+                        .iter()
+                        .position(|record| record.arrival_time >= timestamp)
+                        .unwrap_or(shard.records.len())
             } else {
                 let sequence = request.starting_sequence_number.as_deref().ok_or_else(|| {
                     KinesisError::InvalidArgument("StartingSequenceNumber is required".into())
                 })?;
-                stream
+                shard
                     .records
                     .iter()
                     .position(|record| record.sequence_number == sequence)
-                    .map(|position| stream.first_position + position + 1)
+                    .map(|position| {
+                        shard.first_position
+                            + position
+                            + usize::from(request.shard_iterator_type == "AFTER_SEQUENCE_NUMBER")
+                    })
                     .ok_or_else(|| {
                         KinesisError::InvalidArgument("StartingSequenceNumber was not found".into())
                     })?
@@ -415,7 +454,7 @@ impl KinesisHandler {
                 "The shard iterator has expired".into(),
             ));
         }
-        if payload.version != 1 || payload.shard_id != SHARD_ID {
+        if payload.version != 1 {
             return Err(invalid_iterator());
         }
         let mut store = self.lock_store()?;
@@ -427,20 +466,23 @@ impl KinesisHandler {
         if stream.generation != payload.generation {
             return Err(shard_not_found(&payload.stream_name));
         }
-        if payload.position < stream.first_position {
+        let shard = shard_index(&payload.shard_id)
+            .and_then(|index| stream.shards.get(index))
+            .ok_or_else(invalid_iterator)?;
+        if payload.position < shard.first_position {
             return Err(KinesisError::ExpiredIterator(
                 "The iterator points to trimmed records".into(),
             ));
         }
-        let tail = stream.first_position + stream.records.len();
+        let tail = shard.first_position + shard.records.len();
         if payload.position > tail {
             return Err(invalid_iterator());
         }
         let mut page_bytes = 0;
-        let records = stream
+        let records = shard
             .records
             .iter()
-            .skip(payload.position - stream.first_position)
+            .skip(payload.position - shard.first_position)
             .take(limit as usize)
             .take_while(|record| {
                 let fits = page_bytes + record.data.len() <= MAX_GET_RECORD_BYTES;
@@ -497,8 +539,9 @@ impl KinesisHandler {
             .remove(&key)
             .ok_or_else(|| stream_not_found(&request.stream_name))?;
         store.buffered_bytes -= removed
-            .records
+            .shards
             .iter()
+            .flat_map(|shard| &shard.records)
             .map(|record| record_charge(&record.data, &record.partition_key))
             .sum::<usize>();
         Ok(Success::Empty)
@@ -546,6 +589,18 @@ impl KinesisHandler {
 
 #[async_trait]
 impl NativeHandler for KinesisHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| "Kinesis inventory unavailable")?
+            .streams
+            .keys()
+            .filter(|k| k.scope.account_id == account)
+            .map(|k| k.scope.region.clone())
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let request_id = request.request_id.clone();
         let handler = self.clone();
@@ -635,6 +690,7 @@ struct PutRecordRequest {
     stream_name: String,
     data: String,
     partition_key: String,
+    explicit_hash_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -644,6 +700,7 @@ struct GetShardIteratorRequest {
     shard_id: String,
     shard_iterator_type: String,
     starting_sequence_number: Option<String>,
+    timestamp: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -708,16 +765,51 @@ fn validate_partition_key(value: &str) -> Result<(), KinesisError> {
     Ok(())
 }
 
-fn shard_value() -> Value {
-    json!({
-        "ShardId": SHARD_ID,
-        "HashKeyRange": {
-            "StartingHashKey": "0",
-            "EndingHashKey": HASH_KEY_END
+fn shard_id(index: usize) -> String {
+    format!("shardId-{index:012}")
+}
+
+fn shard_index(value: &str) -> Option<usize> {
+    let index = value.strip_prefix("shardId-")?.parse().ok()?;
+    (shard_id(index) == value).then_some(index)
+}
+
+fn parse_hash_key(value: &str) -> Result<u128, KinesisError> {
+    if value.is_empty()
+        || !value.bytes().all(|b| b.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(KinesisError::InvalidArgument(
+            "Invalid ExplicitHashKey".into(),
+        ));
+    }
+    value.parse().map_err(|_| {
+        KinesisError::InvalidArgument("ExplicitHashKey exceeds the 128-bit hash range".into())
+    })
+}
+
+fn hash_range(index: usize, count: usize) -> (u128, u128) {
+    let count = count as u128;
+    let boundary = |i: usize| {
+        let i = i as u128;
+        (u128::MAX / count) * i + ((u128::MAX % count + 1) * i) / count
+    };
+    (
+        boundary(index),
+        if index + 1 == count as usize {
+            u128::MAX
+        } else {
+            boundary(index + 1) - 1
         },
-        "SequenceNumberRange": {
-            "StartingSequenceNumber": "1"
-        }
+    )
+}
+
+fn shard_value(index: usize, count: usize) -> Value {
+    let (start, end) = hash_range(index, count);
+    json!({
+        "ShardId": shard_id(index),
+        "HashKeyRange": {"StartingHashKey": start.to_string(), "EndingHashKey": end.to_string()},
+        "SequenceNumberRange": {"StartingSequenceNumber": "1"}
     })
 }
 
@@ -726,9 +818,7 @@ fn stream_not_found(name: &str) -> KinesisError {
 }
 
 fn shard_not_found(stream_name: &str) -> KinesisError {
-    KinesisError::ResourceNotFound(format!(
-        "Shard {SHARD_ID} in stream {stream_name} does not exist"
-    ))
+    KinesisError::ResourceNotFound(format!("Shard in stream {stream_name} does not exist"))
 }
 
 fn invalid_iterator() -> KinesisError {
@@ -778,6 +868,7 @@ mod tests {
                 stream_name: "events".into(),
                 data: STANDARD.encode(data),
                 partition_key: "p".into(),
+                explicit_hash_key: None,
             },
             &scope(),
         )
@@ -791,6 +882,7 @@ mod tests {
                     shard_id: SHARD_ID.into(),
                     shard_iterator_type: "TRIM_HORIZON".into(),
                     starting_sequence_number: None,
+                    timestamp: None,
                 },
                 &scope(),
             )
@@ -864,7 +956,7 @@ mod tests {
                 .get(&StreamKey::new(&scope(), "events"))
                 .unwrap();
             assert_eq!(stream.next_sequence, 2);
-            assert_eq!(stream.records.len(), 1);
+            assert_eq!(stream.shards[0].records.len(), 1);
             assert_eq!(store.buffered_bytes, handler.max_buffered_bytes);
         }
         handler
@@ -929,7 +1021,7 @@ mod tests {
                 .streams
                 .get_mut(&StreamKey::new(&scope(), "events"))
                 .unwrap();
-            stream.records.front_mut().unwrap().arrival_time =
+            stream.shards[0].records.front_mut().unwrap().arrival_time =
                 now_epoch().unwrap() - RETENTION_SECONDS - 1.0;
         }
         let current = iterator(&handler);
@@ -961,5 +1053,179 @@ mod tests {
             handler.lock_store().unwrap().buffered_bytes,
             record_charge(b"B", "p")
         );
+    }
+    #[test]
+    fn multishard_hash_routing_iterators_and_restart_preserve_isolation() {
+        let root = std::env::temp_dir().join(format!("kinesis-multishard-{}", Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let handler = KinesisHandler::with_state(state.clone()).unwrap();
+        handler
+            .create_stream(
+                CreateStreamRequest {
+                    stream_name: "events".into(),
+                    shard_count: 3,
+                },
+                &scope(),
+            )
+            .unwrap();
+        let expected = [
+            ("a", None, 0),
+            ("middle", Some(hash_range(1, 3).0.to_string()), 1),
+            ("z", None, 2),
+            ("zero", Some("0".into()), 0),
+            ("last", Some(u128::MAX.to_string()), 2),
+        ];
+        for (key, hash, index) in &expected {
+            let Success::Json(result) = handler
+                .put_record(
+                    PutRecordRequest {
+                        stream_name: "events".into(),
+                        partition_key: (*key).into(),
+                        data: STANDARD.encode(key.as_bytes()),
+                        explicit_hash_key: hash.clone(),
+                    },
+                    &scope(),
+                )
+                .unwrap()
+            else {
+                panic!("put");
+            };
+            assert_eq!(result["ShardId"], shard_id(*index));
+        }
+        let Success::Json(description) = handler
+            .describe_stream(
+                StreamNameRequest {
+                    stream_name: "events".into(),
+                },
+                &scope(),
+            )
+            .unwrap()
+        else {
+            panic!("describe");
+        };
+        assert_eq!(
+            description["StreamDescription"]["Shards"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let mut iterators = Vec::new();
+        for index in 0..3 {
+            let Success::Json(result) = handler
+                .get_shard_iterator(
+                    GetShardIteratorRequest {
+                        stream_name: "events".into(),
+                        shard_id: shard_id(index),
+                        shard_iterator_type: "TRIM_HORIZON".into(),
+                        starting_sequence_number: None,
+                        timestamp: None,
+                    },
+                    &scope(),
+                )
+                .unwrap()
+            else {
+                panic!("iterator");
+            };
+            iterators.push(result["ShardIterator"].as_str().unwrap().to_string());
+        }
+        let before = handler.lock_store().unwrap().streams[&StreamKey::new(&scope(), "events")]
+            .next_sequence;
+        for invalid in ["-1", "01", "340282366920938463463374607431768211456"] {
+            assert!(handler
+                .put_record(
+                    PutRecordRequest {
+                        stream_name: "events".into(),
+                        partition_key: "p".into(),
+                        data: STANDARD.encode(b"invalid"),
+                        explicit_hash_key: Some(invalid.into())
+                    },
+                    &scope()
+                )
+                .is_err());
+        }
+        assert_eq!(
+            handler.lock_store().unwrap().streams[&StreamKey::new(&scope(), "events")]
+                .next_sequence,
+            before
+        );
+        drop(handler);
+        let handler = KinesisHandler::with_state(state).unwrap();
+        for (index, token) in iterators.into_iter().enumerate() {
+            let Success::Json(page) = handler
+                .get_records(
+                    GetRecordsRequest {
+                        shard_iterator: token,
+                        limit: Some(10),
+                    },
+                    &scope(),
+                )
+                .unwrap()
+            else {
+                panic!("records");
+            };
+            let actual: Vec<_> = page["Records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["PartitionKey"].as_str().unwrap())
+                .collect();
+            let want: Vec<_> = expected
+                .iter()
+                .filter(|(_, _, shard)| *shard == index)
+                .map(|(key, _, _)| *key)
+                .collect();
+            assert_eq!(actual, want);
+        }
+        drop(handler);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_shard_sqlite_migration_preserves_positions_and_next_sequence() {
+        let root = std::env::temp_dir().join(format!("kinesis-migration-{}", Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        {
+            let db = state.connection().unwrap();
+            db.execute_batch("CREATE TABLE kinesis_streams (account TEXT, region TEXT, name TEXT, generation TEXT, created_at REAL, next_sequence INTEGER, first_position INTEGER, PRIMARY KEY(account,region,name)); CREATE TABLE kinesis_records (account TEXT, region TEXT, name TEXT, position INTEGER, sequence TEXT, data BLOB, partition_key TEXT, arrival_time REAL, PRIMARY KEY(account,region,name,position));").unwrap();
+            db.execute("INSERT INTO kinesis_streams VALUES ('000000000000','us-east-1','events','legacy',?1,16,7)", [now_epoch().unwrap()]).unwrap();
+            db.execute("INSERT INTO kinesis_records VALUES ('000000000000','us-east-1','events',7,'15',?1,'p',?2)", rusqlite::params![b"legacy".as_slice(), now_epoch().unwrap()]).unwrap();
+        }
+        let handler = KinesisHandler::with_state(state.clone()).unwrap();
+        let Success::Json(page) = handler
+            .get_records(
+                GetRecordsRequest {
+                    shard_iterator: iterator(&handler),
+                    limit: Some(10),
+                },
+                &scope(),
+            )
+            .unwrap()
+        else {
+            panic!("records");
+        };
+        assert_eq!(page["Records"][0]["SequenceNumber"], "15");
+        assert_eq!(page["Records"][0]["Data"], STANDARD.encode(b"legacy"));
+        let Success::Json(put) = put(&handler, b"new").unwrap() else {
+            panic!("put");
+        };
+        assert_eq!(put["SequenceNumber"], "16");
+        drop(handler);
+        let handler = KinesisHandler::with_state(state).unwrap();
+        let Success::Json(page) = handler
+            .get_records(
+                GetRecordsRequest {
+                    shard_iterator: iterator(&handler),
+                    limit: Some(10),
+                },
+                &scope(),
+            )
+            .unwrap()
+        else {
+            panic!("records");
+        };
+        assert_eq!(page["Records"].as_array().unwrap().len(), 2);
+        drop(handler);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

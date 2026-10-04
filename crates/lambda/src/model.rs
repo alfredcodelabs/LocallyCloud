@@ -310,6 +310,15 @@ pub struct FunctionStore {
 }
 
 impl FunctionStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .records
+            .iter()
+            .filter(|e| e.key().account_id == account)
+            .map(|e| e.key().region.clone())
+            .collect())
+    }
+
     pub fn new() -> Self {
         FunctionStore {
             records: DashMap::new(),
@@ -857,6 +866,15 @@ pub struct LayerStore {
 }
 
 impl LayerStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .records
+            .iter()
+            .filter(|e| e.key().account_id == account && !e.value().versions.is_empty())
+            .map(|e| e.key().region.clone())
+            .collect())
+    }
+
     pub fn new() -> Self {
         LayerStore {
             records: DashMap::new(),

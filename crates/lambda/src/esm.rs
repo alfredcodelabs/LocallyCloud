@@ -1,9 +1,13 @@
 //! Event source mappings (ESM): lifecycle store + the poll→batch→invoke contract.
 //!
 //! The control plane creates/updates/deletes mappings for SQS, DynamoDB Streams, and Kinesis
-//! sources. SQS mappings are backed by a production poller; stream-source polling remains a
-//! control-plane-only surface until those services expose equivalent source adapters.
+//! sources. SQS and Kinesis have source adapters; DynamoDB Streams remains control plane only.
 
+mod kinesis;
+mod persistence;
+pub use kinesis::KinesisBatchSource;
+
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,7 +67,7 @@ impl SourceType {
 }
 
 /// An event source mapping.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventSourceMapping {
     pub uuid: String,
     pub function_arn: String,
@@ -75,6 +79,10 @@ pub struct EventSourceMapping {
     pub state: String,
     pub last_modified: f64,
     pub starting_position: Option<String>,
+    #[serde(default)]
+    pub starting_timestamp: f64,
+    #[serde(default)]
+    pub last_processing_result: Option<String>,
 }
 
 impl EventSourceMapping {
@@ -94,9 +102,12 @@ impl EventSourceMapping {
             "MaximumBatchingWindowInSeconds": self.maximum_batching_window_in_seconds,
             "FunctionResponseTypes": self.function_response_types,
             "State": self.state,
-            "StateTransitionReason": "USER_INITIATED",
+            "StateTransitionReason": self.last_processing_result.as_deref().unwrap_or("USER_INITIATED"),
             "LastModified": self.last_modified,
         });
+        if let Some(result) = &self.last_processing_result {
+            v["LastProcessingResult"] = json!(result);
+        }
         if let Some(pos) = &self.starting_position {
             v["StartingPosition"] = json!(pos);
         }
@@ -121,6 +132,8 @@ fn now() -> f64 {
 #[derive(Default)]
 pub struct EsmStore {
     mappings: DashMap<String, EventSourceMapping>,
+    persistence: std::sync::Mutex<Option<persistence::Persistence>>,
+    checkpoints: DashMap<(String, String), (f64, Option<String>)>,
 }
 
 impl EsmStore {
@@ -128,27 +141,115 @@ impl EsmStore {
         Self::default()
     }
 
-    pub fn insert(&self, esm: EventSourceMapping) {
+    pub fn insert(&self, esm: EventSourceMapping) -> Result<(), LambdaError> {
+        self.save(&esm)?;
         self.mappings.insert(esm.uuid.clone(), esm);
+        Ok(())
+    }
+
+    /// Startup-only injection, before accepting requests or starting pollers.
+    pub fn attach_state(&self, state: Arc<locallycloud_state::StateDb>) -> Result<(), LambdaError> {
+        let persistence = persistence::Persistence::open(state)?;
+        for mut mapping in persistence.load()? {
+            if mapping.enabled {
+                mapping.state = "Disabled".into();
+                mapping.last_processing_result = Some("FunctionUnavailable".into());
+            }
+            self.mappings.insert(mapping.uuid.clone(), mapping);
+        }
+        for (key, checkpoint) in persistence.checkpoints()? {
+            self.checkpoints.insert(key, checkpoint);
+        }
+        *self.persistence.lock().map_err(|_| state_error())? = Some(persistence);
+        Ok(())
+    }
+
+    fn save(&self, mapping: &EventSourceMapping) -> Result<(), LambdaError> {
+        if let Some(state) = self.persistence.lock().map_err(|_| state_error())?.as_ref() {
+            state.save(mapping)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_shard(
+        &self,
+        uuid: &str,
+        shard: &str,
+        generation: f64,
+    ) -> Result<Option<String>, String> {
+        let key = (uuid.to_string(), shard.to_string());
+        if let Some(existing) = self.checkpoints.get(&key) {
+            if existing.0 != generation {
+                return Err("Kinesis source stream was replaced".into());
+            }
+            return Ok(existing.1.clone());
+        }
+        self.save_checkpoint(uuid, shard, generation, None)?;
+        Ok(None)
+    }
+
+    fn save_checkpoint(
+        &self,
+        uuid: &str,
+        shard: &str,
+        generation: f64,
+        sequence: Option<String>,
+    ) -> Result<(), String> {
+        if let Some(state) = self
+            .persistence
+            .lock()
+            .map_err(|_| "ESM state lock failed")?
+            .as_ref()
+        {
+            state
+                .save_checkpoint(uuid, shard, generation, sequence.as_deref())
+                .map_err(|e| e.to_string())?;
+        }
+        self.checkpoints
+            .insert((uuid.into(), shard.into()), (generation, sequence));
+        Ok(())
     }
 
     pub fn get(&self, uuid: &str) -> Option<EventSourceMapping> {
         self.mappings.get(uuid).map(|e| e.clone())
     }
 
-    pub fn remove(&self, uuid: &str) -> Option<EventSourceMapping> {
-        self.mappings.remove(uuid).map(|(_, v)| v)
+    pub fn remove(&self, uuid: &str) -> Result<Option<EventSourceMapping>, LambdaError> {
+        if let Some(state) = self.persistence.lock().map_err(|_| state_error())?.as_ref() {
+            state.remove(uuid)?;
+        }
+        self.checkpoints.retain(|(id, _), _| id != uuid);
+        Ok(self.mappings.remove(uuid).map(|(_, v)| v))
     }
 
     pub fn update<F: FnOnce(&mut EventSourceMapping)>(
         &self,
         uuid: &str,
         f: F,
-    ) -> Option<EventSourceMapping> {
-        let mut e = self.mappings.get_mut(uuid)?;
-        f(&mut e);
-        e.last_modified = now();
-        Some(e.clone())
+    ) -> Result<Option<EventSourceMapping>, LambdaError> {
+        let Some(mut e) = self.mappings.get_mut(uuid) else {
+            return Ok(None);
+        };
+        let mut next = e.clone();
+        f(&mut next);
+        next.last_modified = now();
+        self.save(&next)?;
+        *e = next.clone();
+        Ok(Some(next))
+    }
+
+    pub fn set_processing_result(&self, uuid: &str, result: String) -> Result<(), LambdaError> {
+        let Some(mut mapping) = self.mappings.get_mut(uuid) else {
+            return Ok(());
+        };
+        if mapping.last_processing_result.as_deref() == Some(&result) {
+            return Ok(());
+        }
+        let mut next = mapping.clone();
+        next.last_processing_result = Some(result);
+        self.save(&next)?;
+        *mapping = next;
+        Ok(())
     }
 
     /// All mappings, optionally filtered by function ARN and/or event-source ARN.
@@ -305,6 +406,8 @@ pub fn create_mapping(
         },
         last_modified: now(),
         starting_position,
+        starting_timestamp: now(),
+        last_processing_result: None,
     })
 }
 
@@ -416,7 +519,7 @@ where
     }
     let event = build_batch_event(source_type, &mapping.event_source_arn, &records);
     let Some(response) = run(event).await else {
-        return Ok(true);
+        return Err("Lambda invocation failed".into());
     };
 
     let failed = if mapping.reports_batch_item_failures() {
@@ -428,9 +531,18 @@ where
     } else {
         HashSet::new()
     };
+    let mut blocked = false;
     let succeeded: Vec<String> = records
         .iter()
-        .filter(|record| !failed.contains(&record.item_identifier))
+        .filter(|record| {
+            let failed = failed.contains(&record.item_identifier);
+            if source_type == SourceType::Kinesis {
+                blocked |= failed;
+                !blocked
+            } else {
+                !failed
+            }
+        })
         .map(|record| record.ack_token.clone())
         .collect();
     if !succeeded.is_empty() {
@@ -474,57 +586,70 @@ impl SqsBatchSource {
     }
 
     async fn dispatch(&self, target: &str, body: Value) -> Result<Value, String> {
-        let registry = self
-            .registry
-            .upgrade()
-            .ok_or_else(|| "service registry is unavailable".to_string())?;
-        let dispatcher = registry
-            .internal_dispatcher()
-            .ok_or_else(|| "internal dispatcher is unavailable".to_string())?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-amz-target",
-            HeaderValue::from_str(target).map_err(|error| error.to_string())?,
-        );
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/x-amz-json-1.0"),
-        );
-        let uri: Uri = "/"
-            .parse()
-            .map_err(|error: http::uri::InvalidUri| error.to_string())?;
-        IdentityPropagator::attach(
-            &mut headers,
-            &CallerIdentity::ServicePrincipal {
-                service: "lambda".into(),
-            },
-        );
-        let response = dispatcher
-            .dispatch_scoped(
-                &Method::POST,
-                &uri,
-                &headers,
-                Bytes::from(body.to_string()),
-                &Uuid::new_v4().to_string(),
-                &self.account,
-                &self.region,
-            )
-            .await;
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .map_err(|error| error.to_string())?;
-        if !status.is_success() {
-            return Err(format!(
-                "{target} failed with {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ));
-        }
-        if bytes.is_empty() {
-            Ok(Value::Null)
+        dispatch_source(&self.registry, &self.account, &self.region, target, body).await
+    }
+}
+
+async fn dispatch_source(
+    registry: &Weak<ServiceRegistry>,
+    account: &str,
+    region: &str,
+    target: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let registry = registry
+        .upgrade()
+        .ok_or_else(|| "service registry is unavailable".to_string())?;
+    let dispatcher = registry
+        .internal_dispatcher()
+        .ok_or_else(|| "internal dispatcher is unavailable".to_string())?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-amz-target",
+        HeaderValue::from_str(target).map_err(|error| error.to_string())?,
+    );
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static(if target.starts_with("Kinesis_") {
+            "application/x-amz-json-1.1"
         } else {
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())
-        }
+            "application/x-amz-json-1.0"
+        }),
+    );
+    let uri: Uri = "/"
+        .parse()
+        .map_err(|error: http::uri::InvalidUri| error.to_string())?;
+    IdentityPropagator::attach(
+        &mut headers,
+        &CallerIdentity::ServicePrincipal {
+            service: "lambda".into(),
+        },
+    );
+    let response = dispatcher
+        .dispatch_scoped(
+            &Method::POST,
+            &uri,
+            &headers,
+            Bytes::from(body.to_string()),
+            &Uuid::new_v4().to_string(),
+            account,
+            region,
+        )
+        .await;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "{target} failed with {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+    if bytes.is_empty() {
+        Ok(Value::Null)
+    } else {
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
     }
 }
 
@@ -655,6 +780,10 @@ impl BatchSource for SqsBatchSource {
     }
 }
 
+fn state_error() -> LambdaError {
+    LambdaError::InternalError("Lambda event source state is unavailable".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +876,8 @@ mod tests {
             state: "Enabled".into(),
             last_modified: 0.0,
             starting_position: None,
+            starting_timestamp: now(),
+            last_processing_result: None,
         }
     }
 

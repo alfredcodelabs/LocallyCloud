@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -97,8 +97,16 @@ struct KinesisSource {
     arn: String,
     name: String,
     role_arn: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     fetched: Option<String>,
+    #[serde(default)]
+    checkpoints: BTreeMap<String, String>,
+    #[serde(default)]
+    fetched_shards: BTreeMap<String, String>,
+    #[serde(default)]
+    next_shard: usize,
     ready: bool,
     failure: Option<String>,
     creation_timestamp: Option<f64>,
@@ -216,6 +224,7 @@ impl FirehoseHandler {
         if matches!(
             operation,
             "CreateDeliveryStream"
+                | "ListDeliveryStreams"
                 | "DescribeDeliveryStream"
                 | "PutRecord"
                 | "PutRecordBatch"
@@ -229,6 +238,7 @@ impl FirehoseHandler {
                 self.create_delivery_stream(decode(&request.body)?, &scope, request)
                     .await
             }
+            "ListDeliveryStreams" => self.list_delivery_streams(decode(&request.body)?, &scope),
             "DescribeDeliveryStream" => {
                 self.describe_delivery_stream(decode(&request.body)?, &scope)
             }
@@ -242,6 +252,58 @@ impl FirehoseHandler {
         }
     }
 
+    fn list_delivery_streams(
+        &self,
+        request: ListDeliveryStreamsRequest,
+        scope: &Scope,
+    ) -> Result<Success, FirehoseError> {
+        let limit = request.limit.unwrap_or(10);
+        if !(1..=10_000).contains(&limit) {
+            return Err(FirehoseError::InvalidArgument(
+                "Limit must be between 1 and 10000".into(),
+            ));
+        }
+        if let Some(start) = &request.exclusive_start_delivery_stream_name {
+            validate_stream_name(start)?;
+        }
+        if request.delivery_stream_type.as_deref().is_some_and(|kind| {
+            !matches!(
+                kind,
+                "DirectPut" | "KinesisStreamAsSource" | "MSKAsSource" | "DatabaseAsSource"
+            )
+        }) {
+            return Err(FirehoseError::InvalidArgument(
+                "Invalid DeliveryStreamType".into(),
+            ));
+        }
+        let mut names: Vec<_> = self
+            .inner
+            .lock_streams()?
+            .iter()
+            .filter(|(key, stream)| {
+                key.scope == *scope
+                    && request
+                        .exclusive_start_delivery_stream_name
+                        .as_ref()
+                        .is_none_or(|start| key.name > *start)
+                    && request.delivery_stream_type.as_deref().is_none_or(|kind| {
+                        kind == if stream.source.is_some() {
+                            "KinesisStreamAsSource"
+                        } else {
+                            "DirectPut"
+                        }
+                    })
+            })
+            .map(|(key, _)| key.name.clone())
+            .collect();
+        names.sort_unstable();
+        let has_more = names.len() > limit as usize;
+        names.truncate(limit as usize);
+        Ok(Success::Json(
+            json!({"DeliveryStreamNames": names, "HasMoreDeliveryStreams": has_more}),
+        ))
+    }
+
     async fn create_delivery_stream(
         &self,
         request: CreateDeliveryStreamRequest,
@@ -250,7 +312,10 @@ impl FirehoseHandler {
     ) -> Result<Success, FirehoseError> {
         validate_stream_name(&request.delivery_stream_name)?;
         let source = match (
-            request.delivery_stream_type.as_str(),
+            request
+                .delivery_stream_type
+                .as_deref()
+                .unwrap_or("DirectPut"),
             request.kinesis_stream_source_configuration,
         ) {
             ("DirectPut", None) => None,
@@ -285,6 +350,9 @@ impl FirehoseHandler {
                     role_arn: config.role_arn,
                     checkpoint: None,
                     fetched: None,
+                    checkpoints: BTreeMap::new(),
+                    fetched_shards: BTreeMap::new(),
+                    next_shard: 0,
                     ready: false,
                     failure: None,
                     creation_timestamp: None,
@@ -380,7 +448,7 @@ impl FirehoseHandler {
         };
         self.inner.persist_create(&key, &stream)?;
         streams.insert(key, stream);
-        if request.delivery_stream_type == "KinesisStreamAsSource" {
+        if request.delivery_stream_type.as_deref() == Some("KinesisStreamAsSource") {
             self.inner.ensure_worker()?;
             self.inner.notify.notify_one();
         }
@@ -419,13 +487,18 @@ impl FirehoseHandler {
             .ok_or(FirehoseError::AccessDenied)?;
         let body: Value = serde_json::from_slice(&request.body)
             .map_err(|error| FirehoseError::Serialization(error.to_string()))?;
-        let name = body
-            .get("DeliveryStreamName")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                FirehoseError::InvalidArgument("DeliveryStreamName is required".into())
-            })?;
-        validate_stream_name(name)?;
+        let resource = if operation == "ListDeliveryStreams" {
+            "*".to_owned()
+        } else {
+            let name = body
+                .get("DeliveryStreamName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    FirehoseError::InvalidArgument("DeliveryStreamName is required".into())
+                })?;
+            validate_stream_name(name)?;
+            scope.stream_arn(name)
+        };
         evaluator
             .authorize(AuthorizationRequest {
                 request_identity: RequestIdentity {
@@ -443,7 +516,7 @@ impl FirehoseHandler {
                         operation
                     }
                 ),
-                resource: scope.stream_arn(name),
+                resource,
                 context: Default::default(),
             })
             .map_err(|_| FirehoseError::AccessDenied)
@@ -483,7 +556,7 @@ impl FirehoseHandler {
             access_key_id: Some(access_key_id),
             arn: None,
         };
-        authorize_roles(&registry, scope, &caller, source, destination)?;
+        authorize_roles(&registry, scope, &caller, source, destination, true)?;
         Ok(Some(caller))
     }
 
@@ -602,7 +675,7 @@ impl FirehoseHandler {
         self.inner.authorize_stream_runtime(scope, stream)?;
         if stream.destination.iceberg.is_some() && !iceberg::valid_record(&data) {
             return Err(FirehoseError::InvalidArgument(
-                "Iceberg Record.Data must match the id/payload schema".into(),
+                "Iceberg Record.Data must contain a flat JSON object; destination schema validation applies during delivery".into(),
             ));
         }
         let (buffered_records, buffered_bytes) = buffered_usage(stream);
@@ -683,7 +756,7 @@ impl FirehoseHandler {
                 failed += 1;
                 responses.push(json!({
                     "ErrorCode": "InvalidArgumentException",
-                    "ErrorMessage": "Iceberg Record.Data must match the id/payload schema"
+                    "ErrorMessage": "Iceberg Record.Data must contain a flat JSON object; destination schema validation applies during delivery"
                 }));
                 continue;
             }
@@ -789,21 +862,26 @@ fn authorize_roles(
     caller: &RequestIdentity,
     source: Option<&KinesisSource>,
     destination: &DestinationConfig,
+    assignment: bool,
 ) -> Result<(), FirehoseError> {
     let evaluator = registry
         .authorization_evaluator(&ServiceName::new("iam"))
         .ok_or(FirehoseError::AccessDenied)?;
     let authorize = |role_arn: &str, action: &str, resource: &str| {
-        evaluator
-            .authorize_service_role(ServiceRoleAuthorizationRequest {
-                source_arn: None,
-                caller: caller.clone(),
-                role_arn: role_arn.to_owned(),
-                service_principal: "firehose.amazonaws.com".into(),
-                action: action.into(),
-                resource: resource.into(),
-            })
-            .map_err(|_| FirehoseError::AccessDenied)
+        let request = ServiceRoleAuthorizationRequest {
+            source_arn: None,
+            caller: caller.clone(),
+            role_arn: role_arn.to_owned(),
+            service_principal: "firehose.amazonaws.com".into(),
+            action: action.into(),
+            resource: resource.into(),
+        };
+        if assignment {
+            evaluator.authorize_service_role(request)
+        } else {
+            evaluator.authorize_service_role_execution(request)
+        }
+        .map_err(|_| FirehoseError::AccessDenied)
     };
     if let Some(source) = source {
         for action in [
@@ -885,6 +963,7 @@ impl Inner {
             caller,
             stream.source.as_ref(),
             &stream.destination,
+            false,
         )
         .map_err(|_| {
             FirehoseError::ServiceUnavailable("Firehose role authorization is denied".into())
@@ -946,6 +1025,7 @@ impl Inner {
                                 caller,
                                 None,
                                 &batch.destination,
+                                false,
                             )
                             .is_ok()
                         });
@@ -1039,7 +1119,7 @@ impl Inner {
                             .source
                             .as_ref()
                             .expect("filtered source")
-                            .checkpoint
+                            .checkpoints
                             .clone(),
                         stream
                             .source
@@ -1067,17 +1147,30 @@ impl Inner {
         {
             let authorized = role_caller.as_ref().is_none_or(|caller| {
                 self.registry.upgrade().is_some_and(|registry| {
-                    authorize_roles(&registry, &key.scope, caller, Some(&source), &destination)
-                        .is_ok()
+                    authorize_roles(
+                        &registry,
+                        &key.scope,
+                        caller,
+                        Some(&source),
+                        &destination,
+                        false,
+                    )
+                    .is_ok()
                 })
             });
             let result = if authorized {
-                self.fetch_source_record(&key, &name, checkpoint.as_deref(), creation_timestamp)
-                    .await
+                self.fetch_source_record(
+                    &key,
+                    &name,
+                    &checkpoint,
+                    creation_timestamp,
+                    source.next_shard,
+                )
+                .await
             } else {
                 Err("SOURCE_ACCESS_DENIED")
             };
-            let Ok((observed_creation, records)) = result else {
+            let Ok((observed_creation, records, next_shard)) = result else {
                 let reason = result.err().unwrap_or("SOURCE_UNAVAILABLE");
                 if let Ok(mut streams) = self.lock_streams() {
                     if let Some(stream) = streams
@@ -1115,20 +1208,23 @@ impl Inner {
             source.creation_timestamp = Some(observed_creation);
             if records
                 .iter()
-                .any(|(_, data)| data.len() > MAX_RECORD_BYTES)
-                || records.iter().map(|(_, data)| data.len()).sum::<usize>() > MAX_BUFFERED_BYTES
+                .any(|(_, _, data)| data.len() > MAX_RECORD_BYTES)
+                || records.iter().map(|(_, _, data)| data.len()).sum::<usize>() > MAX_BUFFERED_BYTES
             {
                 source.failure = Some("SOURCE_BATCH_TOO_LARGE".to_string());
                 tracing::warn!(stream = %key.name, "Firehose Kinesis source page exceeds supported limit");
                 continue;
             }
             source.failure = None;
-            if let Some((sequence, _)) = records.last() {
-                source.fetched = Some(sequence.clone());
+            for (shard, sequence, _) in &records {
+                source
+                    .fetched_shards
+                    .insert(shard.clone(), sequence.clone());
             }
+            source.next_shard = next_shard;
             let data = records
                 .into_iter()
-                .map(|(_, data)| data)
+                .map(|(_, _, data)| data)
                 .collect::<Vec<_>>();
             if let Err(error) = self.persist_append(&key, stream, &data) {
                 *stream = previous;
@@ -1143,9 +1239,10 @@ impl Inner {
         &self,
         key: &StreamKey,
         name: &str,
-        checkpoint: Option<&str>,
+        checkpoints: &BTreeMap<String, String>,
         creation_timestamp: Option<f64>,
-    ) -> Result<(f64, Vec<(String, Vec<u8>)>), &'static str> {
+        next_shard: usize,
+    ) -> Result<(f64, Vec<(String, String, Vec<u8>)>, usize), &'static str> {
         let description = self
             .call_kinesis(key, "DescribeStream", json!({"StreamName": name}))
             .await
@@ -1160,33 +1257,56 @@ impl Inner {
             .call_kinesis(key, "ListShards", json!({"StreamName": name}))
             .await
             .map_err(|_| "SOURCE_UNAVAILABLE")?;
-        let shards = shards["Shards"].as_array().ok_or("SOURCE_UNAVAILABLE")?;
-        if shards.len() != 1 || shards[0]["ShardId"] != "shardId-000000000000" {
-            return Err("SOURCE_UNAVAILABLE");
-        }
-        let mut iterator_request = json!({"StreamName": name,
-            "ShardId": "shardId-000000000000", "ShardIteratorType": "TRIM_HORIZON"});
-        if let Some(sequence) = checkpoint {
-            iterator_request["ShardIteratorType"] = json!("AFTER_SEQUENCE_NUMBER");
-            iterator_request["StartingSequenceNumber"] = json!(sequence);
-        }
-        let iterator = self
-            .call_kinesis(key, "GetShardIterator", iterator_request)
-            .await
-            .map_err(|_| "SOURCE_UNAVAILABLE")?;
-        let iterator = iterator["ShardIterator"]
-            .as_str()
+        let shards = shards["Shards"]
+            .as_array()
+            .filter(|shards| !shards.is_empty())
             .ok_or("SOURCE_UNAVAILABLE")?;
-        let page = self
-            .call_kinesis(
-                key,
-                "GetRecords",
-                json!({"ShardIterator": iterator, "Limit": MAX_BUFFERED_RECORDS}),
-            )
-            .await
-            .map_err(|_| "SOURCE_UNAVAILABLE")?;
+        let mut records = Vec::new();
+        let mut bytes = 0;
+        let mut cursor = next_shard % shards.len();
+        for offset in 0..shards.len() {
+            let index = (next_shard + offset) % shards.len();
+            let shard = shards[index]["ShardId"]
+                .as_str()
+                .ok_or("SOURCE_UNAVAILABLE")?;
+            let mut request =
+                json!({"StreamName":name,"ShardId":shard,"ShardIteratorType":"TRIM_HORIZON"});
+            if let Some(sequence) = checkpoints.get(shard) {
+                request["ShardIteratorType"] = json!("AFTER_SEQUENCE_NUMBER");
+                request["StartingSequenceNumber"] = json!(sequence);
+            }
+            let iterator = self
+                .call_kinesis(key, "GetShardIterator", request)
+                .await
+                .map_err(|_| "SOURCE_UNAVAILABLE")?;
+            let iterator = iterator["ShardIterator"]
+                .as_str()
+                .ok_or("SOURCE_UNAVAILABLE")?;
+            let page = self.call_kinesis(key, "GetRecords", json!({"ShardIterator":iterator,"Limit":(MAX_BUFFERED_RECORDS / shards.len()).max(1)})).await.map_err(|_| "SOURCE_UNAVAILABLE")?;
+            let mut full = false;
+            for record in page["Records"].as_array().ok_or("SOURCE_UNAVAILABLE")? {
+                let sequence = record["SequenceNumber"]
+                    .as_str()
+                    .ok_or("SOURCE_UNAVAILABLE")?;
+                let data = record["Data"].as_str().ok_or("SOURCE_UNAVAILABLE")?;
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| "SOURCE_UNAVAILABLE")?;
+                if bytes + data.len() > MAX_BUFFERED_BYTES || records.len() >= MAX_BUFFERED_RECORDS
+                {
+                    full = true;
+                    break;
+                }
+                bytes += data.len();
+                records.push((shard.to_string(), sequence.to_string(), data));
+            }
+            cursor = (index + 1) % shards.len();
+            if full || bytes >= MAX_BUFFERED_BYTES || records.len() >= MAX_BUFFERED_RECORDS {
+                break;
+            }
+        }
         let current = self
-            .call_kinesis(key, "DescribeStream", json!({"StreamName": name}))
+            .call_kinesis(key, "DescribeStream", json!({"StreamName":name}))
             .await
             .map_err(|_| "SOURCE_UNAVAILABLE")?;
         if current["StreamDescription"]["StreamCreationTimestamp"].as_f64()
@@ -1194,22 +1314,7 @@ impl Inner {
         {
             return Err("SOURCE_REPLACED");
         }
-        let records = page["Records"].as_array().ok_or("SOURCE_UNAVAILABLE")?;
-        let records = records
-            .iter()
-            .map(|record| {
-                let sequence = record["SequenceNumber"]
-                    .as_str()
-                    .ok_or("SOURCE_UNAVAILABLE")?
-                    .to_owned();
-                let data = record["Data"].as_str().ok_or("SOURCE_UNAVAILABLE")?;
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|_| "SOURCE_UNAVAILABLE")?;
-                Ok((sequence, data))
-            })
-            .collect::<Result<Vec<_>, &'static str>>()?;
-        Ok((observed_creation, records))
+        Ok((observed_creation, records, cursor))
     }
 
     async fn call_kinesis(
@@ -1460,8 +1565,11 @@ impl Inner {
         if delivered {
             if let Some(source) = updated.source.as_mut() {
                 if let Some(sequence) = source.fetched.take() {
-                    source.checkpoint = Some(sequence);
+                    source
+                        .checkpoints
+                        .insert("shardId-000000000000".into(), sequence);
                 }
+                source.checkpoints.append(&mut source.fetched_shards);
             }
             updated.delivery_attempts = 0;
             updated.retry_at = None;
@@ -1507,6 +1615,18 @@ impl Inner {
 
 #[async_trait]
 impl NativeHandler for FirehoseHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .inner
+            .streams
+            .lock()
+            .map_err(|_| "Firehose inventory unavailable")?
+            .keys()
+            .filter(|k| k.scope.account_id == account)
+            .map(|k| k.scope.region.clone())
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         match self.process(&request).await {
             Ok(success) => Response::builder()
@@ -1575,9 +1695,17 @@ impl From<FirehoseError> for AwsError {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct ListDeliveryStreamsRequest {
+    limit: Option<i64>,
+    delivery_stream_type: Option<String>,
+    exclusive_start_delivery_stream_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct CreateDeliveryStreamRequest {
     delivery_stream_name: String,
-    delivery_stream_type: String,
+    delivery_stream_type: Option<String>,
     extended_s3_destination_configuration: Option<ExtendedS3DestinationConfiguration>,
     iceberg_destination_configuration: Option<IcebergDestinationConfiguration>,
     kinesis_stream_source_configuration: Option<KinesisStreamSourceConfiguration>,
@@ -1645,17 +1773,17 @@ struct ExtendedS3DestinationConfiguration {
     role_arn: String,
     #[serde(rename = "BucketARN")]
     bucket_arn: String,
-    prefix: String,
-    buffering_hints: BufferingHints,
-    compression_format: String,
+    prefix: Option<String>,
+    buffering_hints: Option<BufferingHints>,
+    compression_format: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct BufferingHints {
     #[serde(rename = "SizeInMBs")]
-    size_in_m_bs: i64,
-    interval_in_seconds: i64,
+    size_in_m_bs: Option<i64>,
+    interval_in_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1696,19 +1824,34 @@ impl DestinationConfig {
         config: ExtendedS3DestinationConfiguration,
         scope: &Scope,
     ) -> Result<Self, FirehoseError> {
-        if config.buffering_hints.size_in_m_bs != 1
-            || config.buffering_hints.interval_in_seconds != 60
-        {
-            return Err(unsupported(
-                "BufferingHints must be SizeInMBs=1 and IntervalInSeconds=60",
+        let hints = config.buffering_hints.as_ref();
+        let size = hints.and_then(|hints| hints.size_in_m_bs);
+        let interval = hints.and_then(|hints| hints.interval_in_seconds);
+        if size.is_some() != interval.is_some() {
+            return Err(FirehoseError::InvalidArgument(
+                "BufferingHints requires both SizeInMBs and IntervalInSeconds".into(),
             ));
         }
-        if config.compression_format != "UNCOMPRESSED" {
+        if size.unwrap_or(5) != 1 || interval.unwrap_or(300) != 60 {
+            return Err(unsupported(
+                "BufferingHints defaults to AWS SizeInMBs=5 and IntervalInSeconds=300; locally only explicit SizeInMBs=1 and IntervalInSeconds=60 is supported",
+            ));
+        }
+        if config
+            .compression_format
+            .as_deref()
+            .unwrap_or("UNCOMPRESSED")
+            != "UNCOMPRESSED"
+        {
             return Err(unsupported("CompressionFormat must be UNCOMPRESSED"));
+        }
+        let prefix = config.prefix.unwrap_or_default();
+        if prefix.is_empty() {
+            return Err(unsupported("The automatic AWS UTC time Prefix is not supported; provide an explicit nonempty Prefix"));
         }
         let bucket = validate_bucket_arn(&config.bucket_arn)?;
         validate_role_arn(&config.role_arn, &scope.account_id)?;
-        if config.prefix.is_empty() || config.prefix.len() > 512 {
+        if prefix.len() > 512 {
             return Err(FirehoseError::InvalidArgument(
                 "Prefix must contain 1-512 bytes".into(),
             ));
@@ -1718,7 +1861,7 @@ impl DestinationConfig {
             role_arn: config.role_arn,
             bucket_arn: config.bucket_arn,
             bucket,
-            prefix: config.prefix,
+            prefix,
             iceberg: None,
         })
     }
@@ -1732,7 +1875,7 @@ fn validate_iceberg_configuration(
         return Err(unsupported("AppendOnly must be true for Iceberg delivery"));
     }
     if let Some(hints) = &config.buffering_hints {
-        if hints.size_in_m_bs != 1 || hints.interval_in_seconds != 60 {
+        if hints.size_in_m_bs != Some(1) || hints.interval_in_seconds != Some(60) {
             return Err(unsupported(
                 "Iceberg BufferingHints must be SizeInMBs=1 and IntervalInSeconds=60",
             ));
@@ -1922,7 +2065,7 @@ fn delivery_exhausted(stream: &DeliveryStream) -> FirehoseError {
 
 fn unsupported(message: &str) -> FirehoseError {
     FirehoseError::InvalidArgument(format!(
-        "{message}; only the LocallyCloud DirectPut to Extended S3 milestone is supported"
+        "{message}; unsupported local Firehose configuration"
     ))
 }
 
@@ -1997,6 +2140,9 @@ mod tests {
                 role_arn: String::new(),
                 checkpoint: Some("12".into()),
                 fetched: Some("13".into()),
+                checkpoints: BTreeMap::new(),
+                fetched_shards: BTreeMap::new(),
+                next_shard: 0,
                 ready: true,
                 failure: None,
                 creation_timestamp: Some(1.0),
@@ -2074,7 +2220,13 @@ mod tests {
         let restored = streams.get(&key).unwrap();
         assert!(restored.pending.is_empty() && restored.retained.is_empty());
         assert_eq!(
-            restored.source.as_ref().unwrap().checkpoint.as_deref(),
+            restored
+                .source
+                .as_ref()
+                .unwrap()
+                .checkpoints
+                .get("shardId-000000000000")
+                .map(String::as_str),
             Some("13")
         );
         drop(streams);
@@ -2329,6 +2481,76 @@ mod tests {
                 "CompressionFormat": "UNCOMPRESSED"
             }
         });
+        let mut create = create;
+        create.as_object_mut().unwrap().remove("DeliveryStreamType");
+        // AWS optional omissions must not fail deserialization or silently acquire
+        // the local fast-buffer settings instead of AWS's 5 MiB / 300 s defaults.
+        for hints in [
+            None,
+            Some(json!({})),
+            Some(json!({"SizeInMBs": 5, "IntervalInSeconds": 300})),
+        ] {
+            let mut omitted = create.clone();
+            let destination = omitted["ExtendedS3DestinationConfiguration"]
+                .as_object_mut()
+                .unwrap();
+            destination.remove("CompressionFormat");
+            destination.remove("Prefix");
+            match hints {
+                Some(hints) => {
+                    destination.insert("BufferingHints".into(), hints);
+                }
+                None => {
+                    destination.remove("BufferingHints");
+                }
+            }
+            assert!(
+                matches!(handler.process(&request("CreateDeliveryStream", omitted)).await,
+                Err(FirehoseError::InvalidArgument(message)) if message.contains("defaults to AWS") && message.contains("unsupported"))
+            );
+        }
+        for field in ["SizeInMBs", "IntervalInSeconds"] {
+            let mut partial = create.clone();
+            partial["ExtendedS3DestinationConfiguration"]["BufferingHints"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                matches!(handler.process(&request("CreateDeliveryStream", partial)).await,
+                Err(FirehoseError::InvalidArgument(message)) if message.contains("requires both"))
+            );
+        }
+        for prefix in [None, Some(json!(""))] {
+            let mut omitted = create.clone();
+            let destination = omitted["ExtendedS3DestinationConfiguration"]
+                .as_object_mut()
+                .unwrap();
+            match prefix {
+                Some(prefix) => {
+                    destination.insert("Prefix".into(), prefix);
+                }
+                None => {
+                    destination.remove("Prefix");
+                }
+            }
+            assert!(
+                matches!(handler.process(&request("CreateDeliveryStream", omitted)).await,
+                Err(FirehoseError::InvalidArgument(message)) if message.contains("automatic AWS UTC time Prefix"))
+            );
+        }
+        assert_eq!(
+            handler
+                .process(&request("ListDeliveryStreams", json!({})))
+                .await
+                .unwrap()
+                .into_value(),
+            json!({"DeliveryStreamNames": [], "HasMoreDeliveryStreams": false})
+        );
+        assert!(handler.inner.lock_streams().unwrap().is_empty());
+        create["ExtendedS3DestinationConfiguration"]
+            .as_object_mut()
+            .unwrap()
+            .remove("CompressionFormat");
         assert!(handler
             .process(&request("CreateDeliveryStream", create))
             .await
@@ -2349,5 +2571,53 @@ mod tests {
         assert!(description["DeliveryStreamDescription"]["Destinations"][0]
             .get("IcebergDestinationDescription")
             .is_none());
+        for (name, account, region) in [
+            ("z-events", "000000000000", "us-east-1"),
+            ("a-events", "000000000000", "us-east-1"),
+            ("other-account", "111111111111", "us-east-1"),
+            ("other-region", "000000000000", "eu-west-1"),
+        ] {
+            let mut create = request(
+                "CreateDeliveryStream",
+                json!({"DeliveryStreamName":name,"ExtendedS3DestinationConfiguration":{
+                "RoleARN":format!("arn:aws:iam::{account}:role/firehose"),"BucketARN":"arn:aws:s3:::events","Prefix":"delivery/","BufferingHints":{"SizeInMBs":1,"IntervalInSeconds":60}}}),
+            );
+            create.account_id = account.into();
+            create.region = region.into();
+            handler.process(&create).await.unwrap();
+        }
+        assert_eq!(
+            handler
+                .process(&request("ListDeliveryStreams", json!({"Limit":2})))
+                .await
+                .unwrap()
+                .into_value(),
+            json!({"DeliveryStreamNames":["a-events","s3-events"],"HasMoreDeliveryStreams":true})
+        );
+        assert_eq!(handler.process(&request("ListDeliveryStreams", json!({"Limit":2,"ExclusiveStartDeliveryStreamName":"s3-events","DeliveryStreamType":"DirectPut"}))).await.unwrap().into_value(),
+            json!({"DeliveryStreamNames":["z-events"],"HasMoreDeliveryStreams":false}));
+        assert_eq!(
+            handler
+                .process(&request(
+                    "ListDeliveryStreams",
+                    json!({"DeliveryStreamType":"KinesisStreamAsSource"})
+                ))
+                .await
+                .unwrap()
+                .into_value(),
+            json!({"DeliveryStreamNames":[],"HasMoreDeliveryStreams":false})
+        );
+        for body in [
+            json!({"Limit":0}),
+            json!({"Limit":10001}),
+            json!({"Limit":-1}),
+            json!({"ExclusiveStartDeliveryStreamName":"bad name"}),
+            json!({"DeliveryStreamType":"wrong"}),
+        ] {
+            assert!(matches!(
+                handler.process(&request("ListDeliveryStreams", body)).await,
+                Err(FirehoseError::InvalidArgument(_))
+            ));
+        }
     }
 }

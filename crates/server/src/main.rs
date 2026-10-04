@@ -268,6 +268,12 @@ async fn main() {
             std::process::exit(5);
         }
     };
+    if let Some(lambda) = &lambda_handler {
+        if let Err(error) = lambda.attach_state(state.clone()) {
+            tracing::error!(%error, "failed to load Lambda event source mappings");
+            std::process::exit(4);
+        }
+    }
     if let Err(error) = locallycloud_dynamodb::register_with_state(&registry, state.clone()) {
         tracing::error!(%error, "failed to register DynamoDB");
         std::process::exit(4);

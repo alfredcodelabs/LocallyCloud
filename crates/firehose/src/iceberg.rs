@@ -1,5 +1,5 @@
 //! Narrow append-only Iceberg v2 delivery through the trusted service dispatcher.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,11 +7,12 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Uri};
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Manifest, ManifestList,
-    ManifestListWriter, ManifestWriterBuilder, Operation, Snapshot, Summary, TableMetadata,
+    DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Manifest,
+    ManifestList, ManifestListWriter, ManifestWriterBuilder, Operation, Snapshot, Struct, Summary,
+    TableMetadata,
 };
 use locallycloud_core::integration::InternalDispatcher;
-use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
@@ -153,84 +154,246 @@ fn s3_uri(location: &str, allowed_bucket: &str) -> Result<Uri> {
         .map_err(|_| Error::Unsupported)
 }
 
+// Destination metadata is authoritative; admission only checks the flat JSON envelope.
 pub(super) fn valid_record(record: &[u8]) -> bool {
-    parse_row(record).is_ok()
+    serde_json::from_slice::<Value>(record)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .is_some_and(|v| !v.is_empty() && v.values().all(|v| !v.is_object() && !v.is_array()))
 }
 
-fn parse_row(record: &[u8]) -> Result<(i64, Option<String>)> {
-    let value: Value = serde_json::from_slice(record).map_err(|_| Error::Unsupported)?;
-    let object = value.as_object().ok_or(Error::Unsupported)?;
-    if object.keys().any(|key| key != "id" && key != "payload") {
+fn schema_fields(raw: &Value) -> Result<&Vec<Value>> {
+    raw["schemas"]
+        .as_array()
+        .and_then(|schemas| {
+            schemas
+                .iter()
+                .find(|schema| schema["schema-id"] == raw["current-schema-id"])
+        })
+        .and_then(|schema| schema["fields"].as_array())
+        .ok_or(Error::Unsupported)
+}
+
+fn parquet_type(kind: &str) -> Result<&'static str> {
+    match kind {
+        "long" => Ok("INT64"),
+        "int" => Ok("INT32"),
+        "string" => Ok("BYTE_ARRAY (UTF8)"),
+        "boolean" => Ok("BOOLEAN"),
+        "date" => Ok("INT32 (DATE)"),
+        "timestamp" => Ok("INT64 (TIMESTAMP(MICROS,false))"),
+        "timestamptz" => Ok("INT64 (TIMESTAMP(MICROS,true))"),
+        "decimal(18, 2)" | "decimal(18,2)" => Ok("INT64 (DECIMAL(18,2))"),
+        _ => Err(Error::Unsupported),
+    }
+}
+
+fn exact_cents(value: &str) -> Result<i64> {
+    let negative = value.starts_with('-');
+    let value = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || fraction.len() > 2
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
         return Err(Error::Unsupported);
     }
-    let id = object
-        .get("id")
-        .and_then(Value::as_i64)
+    let whole: i64 = whole.parse().map_err(|_| Error::Unsupported)?;
+    let fraction: i64 = format!("{fraction:0<2}")
+        .parse()
+        .map_err(|_| Error::Unsupported)?;
+    let cents = whole
+        .checked_mul(100)
+        .and_then(|w| w.checked_add(fraction))
         .ok_or(Error::Unsupported)?;
-    let payload = match object.get("payload") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) => Some(value.clone()),
-        _ => return Err(Error::Unsupported),
-    };
-    Ok((id, payload))
+    if cents >= 1_000_000_000_000_000_000 {
+        return Err(Error::Unsupported);
+    }
+    Ok(if negative { -cents } else { cents })
 }
 
-fn parse_rows(records: &[Vec<u8>]) -> Result<Vec<(i64, Option<String>)>> {
-    records.iter().map(|record| parse_row(record)).collect()
-}
-
-fn parquet_rows(rows: &[(i64, Option<String>)]) -> Result<Vec<u8>> {
-    let schema = Arc::new(
-        parse_message_type(
-            "message events { REQUIRED INT64 id = 1; OPTIONAL BYTE_ARRAY payload (UTF8) = 2; }",
-        )
-        .map_err(|_| Error::Unsupported)?,
-    );
-    let mut bytes = Vec::new();
-    let props = Arc::new(WriterProperties::builder().build());
-    let mut writer =
-        SerializedFileWriter::new(&mut bytes, schema, props).map_err(|_| Error::Transient)?;
-    let mut group = writer.next_row_group().map_err(|_| Error::Transient)?;
-    let mut id = group
-        .next_column()
-        .map_err(|_| Error::Transient)?
-        .ok_or(Error::Transient)?;
-    id.typed::<Int64Type>()
-        .write_batch(
-            &rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            None,
-            None,
-        )
-        .map_err(|_| Error::Transient)?;
-    id.close().map_err(|_| Error::Transient)?;
-    let mut payload = group
-        .next_column()
-        .map_err(|_| Error::Transient)?
-        .ok_or(Error::Transient)?;
-    let mut levels = Vec::with_capacity(rows.len());
-    let mut values = Vec::new();
-    for (_, value) in rows {
-        if let Some(value) = value {
-            levels.push(1);
-            values.push(ByteArray::from(value.as_str()));
-        } else {
-            levels.push(0);
+fn parquet_rows(records: &[Vec<u8>], fields: &[Value]) -> Result<Vec<u8>> {
+    let rows = records
+        .iter()
+        .map(|record| serde_json::from_slice::<Value>(record).map_err(|_| Error::Unsupported))
+        .collect::<Result<Vec<_>>>()?;
+    for row in &rows {
+        let object = row.as_object().ok_or(Error::Unsupported)?;
+        if object
+            .keys()
+            .any(|name| !fields.iter().any(|f| f["name"] == *name))
+        {
+            return Err(Error::Unsupported);
         }
     }
-    payload
-        .typed::<ByteArrayType>()
-        .write_batch(&values, Some(&levels), None)
-        .map_err(|_| Error::Transient)?;
-    payload.close().map_err(|_| Error::Transient)?;
+    let mut schema = String::from("message events {");
+    for field in fields {
+        let name = field["name"].as_str().ok_or(Error::Unsupported)?;
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(Error::Unsupported);
+        }
+        let kind = parquet_type(field["type"].as_str().ok_or(Error::Unsupported)?)?;
+        // Parquet grammar puts logical annotation after the field name.
+        let (physical, logical) = kind.split_once(' ').unwrap_or((kind, ""));
+        schema.push_str(&format!(
+            " {} {physical} {name} {logical} = {};",
+            if field["required"] == true {
+                "REQUIRED"
+            } else {
+                "OPTIONAL"
+            },
+            field["id"].as_i64().ok_or(Error::Unsupported)?
+        ));
+    }
+    schema.push('}');
+    let schema = Arc::new(parse_message_type(&schema).map_err(|_| Error::Unsupported)?);
+    let mut bytes = Vec::new();
+    let mut writer = SerializedFileWriter::new(
+        &mut bytes,
+        schema,
+        Arc::new(WriterProperties::builder().build()),
+    )
+    .map_err(|_| Error::Transient)?;
+    let mut group = writer.next_row_group().map_err(|_| Error::Transient)?;
+    for field in fields {
+        let name = field["name"].as_str().ok_or(Error::Unsupported)?;
+        let kind = field["type"].as_str().ok_or(Error::Unsupported)?;
+        let required = field["required"] == true;
+        let mut levels = Vec::new();
+        let mut values = Vec::new();
+        for row in &rows {
+            let value = &row[name];
+            if value.is_null() {
+                if required {
+                    return Err(Error::Unsupported);
+                }
+                levels.push(0);
+            } else {
+                levels.push(1);
+                values.push(value);
+            }
+        }
+        let levels = if required {
+            None
+        } else {
+            Some(levels.as_slice())
+        };
+        let mut column = group
+            .next_column()
+            .map_err(|_| Error::Transient)?
+            .ok_or(Error::Transient)?;
+        match kind {
+            "string" => {
+                let values = values
+                    .iter()
+                    .map(|v| v.as_str().map(ByteArray::from).ok_or(Error::Unsupported))
+                    .collect::<Result<Vec<_>>>()?;
+                column
+                    .typed::<ByteArrayType>()
+                    .write_batch(&values, levels, None)
+                    .map_err(|_| Error::Transient)?;
+            }
+            "boolean" => {
+                let values = values
+                    .iter()
+                    .map(|v| v.as_bool().ok_or(Error::Unsupported))
+                    .collect::<Result<Vec<_>>>()?;
+                column
+                    .typed::<BoolType>()
+                    .write_batch(&values, levels, None)
+                    .map_err(|_| Error::Transient)?;
+            }
+            "int" | "date" => {
+                let values = values
+                    .iter()
+                    .map(|v| {
+                        if kind == "int" {
+                            return v
+                                .as_i64()
+                                .and_then(|v| i32::try_from(v).ok())
+                                .ok_or(Error::Unsupported);
+                        }
+                        let date = time::Date::parse(
+                            v.as_str().ok_or(Error::Unsupported)?,
+                            &time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")
+                                .map_err(|_| Error::Unsupported)?,
+                        )
+                        .map_err(|_| Error::Unsupported)?;
+                        Ok(date.to_julian_day() - 2_440_588)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                column
+                    .typed::<Int32Type>()
+                    .write_batch(&values, levels, None)
+                    .map_err(|_| Error::Transient)?;
+            }
+            _ => {
+                let values = values
+                    .iter()
+                    .map(|v| match kind {
+                        "long" => v.as_i64().ok_or(Error::Unsupported),
+                        "decimal(18,2)" | "decimal(18, 2)" => {
+                            exact_cents(v.as_str().ok_or(Error::Unsupported)?)
+                        }
+                        "timestamp" | "timestamptz" => {
+                            let date = time::OffsetDateTime::parse(
+                                v.as_str().ok_or(Error::Unsupported)?,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .map_err(|_| Error::Unsupported)?;
+                            if date.unix_timestamp_nanos() % 1000 != 0
+                                || (kind == "timestamp" && date.offset() != time::UtcOffset::UTC)
+                            {
+                                return Err(Error::Unsupported);
+                            }
+                            i64::try_from(date.unix_timestamp_nanos() / 1000)
+                                .map_err(|_| Error::Unsupported)
+                        }
+                        _ => Err(Error::Unsupported),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                column
+                    .typed::<Int64Type>()
+                    .write_batch(&values, levels, None)
+                    .map_err(|_| Error::Transient)?;
+            }
+        }
+        column.close().map_err(|_| Error::Transient)?;
+    }
     group.close().map_err(|_| Error::Transient)?;
     writer.close().map_err(|_| Error::Transient)?;
     Ok(bytes)
 }
 
+fn partition_column(raw: &Value) -> Result<Option<&str>> {
+    let spec = raw["partition-specs"]
+        .as_array()
+        .and_then(|specs| {
+            specs
+                .iter()
+                .find(|spec| spec["spec-id"] == raw["default-spec-id"])
+        })
+        .ok_or(Error::Unsupported)?;
+    let partitions = spec["fields"].as_array().ok_or(Error::Unsupported)?;
+    if partitions.is_empty() {
+        return Ok(None);
+    }
+    if partitions.len() != 1 || partitions[0]["transform"] != "identity" {
+        return Err(Error::Unsupported);
+    }
+    let field = schema_fields(raw)?
+        .iter()
+        .find(|f| f["id"] == partitions[0]["source-id"])
+        .ok_or(Error::Unsupported)?;
+    if field["type"] != "date" || field["required"] != true {
+        return Err(Error::Unsupported);
+    }
+    field["name"].as_str().map(Some).ok_or(Error::Unsupported)
+}
+
 fn validate_metadata(raw: &Value, metadata: &TableMetadata, bucket: &str) -> Result<()> {
-    if metadata.format_version() != FormatVersion::V2
-        || !metadata.default_partition_spec().fields().is_empty()
-    {
+    if metadata.format_version() != FormatVersion::V2 {
         return Err(Error::Unsupported);
     }
     for entry in metadata.metadata_log() {
@@ -242,26 +405,27 @@ fn validate_metadata(raw: &Value, metadata: &TableMetadata, bucket: &str) -> Res
     for entry in metadata.partition_statistics_iter() {
         s3_uri(&entry.statistics_path, bucket)?;
     }
-    let fields = raw["schemas"]
-        .as_array()
-        .and_then(|schemas| {
-            schemas
-                .iter()
-                .find(|schema| schema["schema-id"] == raw["current-schema-id"])
-        })
-        .and_then(|schema| schema["fields"].as_array())
-        .ok_or(Error::Unsupported)?;
-    if fields.len() != 2
-        || fields[0]["name"] != "id"
-        || fields[0]["type"] != "long"
-        || fields[0]["required"] != true
-        || fields[0]["id"] != 1
-        || fields[1]["name"] != "payload"
-        || fields[1]["type"] != "string"
-        || fields[1]["required"] != false
-        || fields[1]["id"] != 2
-    {
+    partition_column(raw)?;
+    let fields = schema_fields(raw)?;
+    if fields.is_empty() || fields.len() > 32 {
         return Err(Error::Unsupported);
+    }
+    for field in fields {
+        if field.get("initial-default").is_some_and(|v| !v.is_null())
+            || field.get("write-default").is_some_and(|v| !v.is_null())
+        {
+            return Err(Error::Unsupported);
+        }
+        let name = field["name"].as_str().ok_or(Error::Unsupported)?;
+        if !name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(Error::Unsupported);
+        }
+        parquet_type(field["type"].as_str().ok_or(Error::Unsupported)?)?;
     }
     Ok(())
 }
@@ -355,16 +519,15 @@ pub(super) async fn append(
     token: Uuid,
     records: &[Vec<u8>],
 ) -> Result<()> {
-    let rows = parse_rows(records)?;
-    if rows.is_empty() {
+    if records.is_empty() {
         return Ok(());
     }
-    let parquet = parquet_rows(&rows)?;
     // The data file URI remains fixed across CAS retries; failed attempts are unreachable until commit.
     let batch = token.to_string();
     for _ in 0..3 {
         let (table, metadata_uri, metadata, mut manifests, manifest_count) =
             inspect(&ctx, target).await?;
+        let raw = serde_json::to_value(&metadata).map_err(|_| Error::Unsupported)?;
         let version = table["VersionId"].as_str().ok_or(Error::Unsupported)?;
         let root = metadata.location().trim_end_matches('/');
         if metadata.snapshots().any(|snapshot| {
@@ -376,26 +539,61 @@ pub(super) async fn append(
         }) {
             return Ok(());
         }
+        let mut groups: BTreeMap<Option<String>, Vec<Vec<u8>>> = BTreeMap::new();
+        for record in records {
+            let value: Value = serde_json::from_slice(record).map_err(|_| Error::Unsupported)?;
+            let partition = partition_column(&raw)?
+                .map(|name| {
+                    value[name]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or(Error::Unsupported)
+                })
+                .transpose()?;
+            groups.entry(partition).or_default().push(record.clone());
+        }
+        // Validate every partition before writing any object.
+        let groups = groups
+            .into_iter()
+            .map(|(partition, records)| {
+                let parquet = parquet_rows(&records, schema_fields(&raw)?)?;
+                Ok((partition, records.len(), parquet))
+            })
+            .collect::<Result<Vec<_>>>()?;
         // The new snapshot and manifest must also fit the published beta bounds.
         if metadata.snapshots().len() >= MAX_SNAPSHOTS || manifest_count >= MAX_MANIFESTS {
             return Err(Error::Unsupported);
         }
         let snapshot_id = (Uuid::new_v4().as_u128() & i64::MAX as u128) as i64;
         let seq = metadata.next_sequence_number();
-        let data_uri = format!("{root}/data/{batch}.parquet");
         let manifest_uri = format!("{root}/metadata/{batch}-{snapshot_id}.avro");
         let list_uri = format!("{root}/metadata/{batch}-{snapshot_id}-list.avro");
         let new_meta_uri = format!("{root}/metadata/{batch}-{snapshot_id}.metadata.json");
-        ctx.put(&data_uri, Bytes::from(parquet.clone())).await?;
-        let file = DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path(data_uri)
-            .file_format(DataFileFormat::Parquet)
-            .record_count(rows.len() as u64)
-            .file_size_in_bytes(parquet.len() as u64)
-            .partition_spec_id(metadata.default_partition_spec_id())
-            .build()
-            .map_err(|_| Error::Unsupported)?;
+        let mut files = Vec::new();
+        for (partition, count, parquet) in groups {
+            let suffix = partition.as_deref().unwrap_or("unpartitioned");
+            let data_uri = format!("{root}/data/{batch}-{suffix}.parquet");
+            let partition = match partition {
+                Some(date) => Struct::from_iter([Some(
+                    Literal::date_from_str(date).map_err(|_| Error::Unsupported)?,
+                )]),
+                None => Struct::empty(),
+            };
+            let size = parquet.len();
+            ctx.put(&data_uri, Bytes::from(parquet)).await?;
+            files.push(
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(data_uri)
+                    .file_format(DataFileFormat::Parquet)
+                    .record_count(count as u64)
+                    .file_size_in_bytes(size as u64)
+                    .partition(partition)
+                    .partition_spec_id(metadata.default_partition_spec_id())
+                    .build()
+                    .map_err(|_| Error::Unsupported)?,
+            );
+        }
         let io = FileIO::new_with_memory();
         let manifest_mem = format!("memory:///{batch}-{snapshot_id}.avro");
         let output = io.new_output(&manifest_mem).map_err(|_| Error::Transient)?;
@@ -406,7 +604,9 @@ pub(super) async fn append(
             metadata.default_partition_spec().as_ref().clone(),
         )
         .build_v2_data();
-        writer.add_file(file, seq).map_err(|_| Error::Transient)?;
+        for file in files {
+            writer.add_file(file, seq).map_err(|_| Error::Transient)?;
+        }
         let mut manifest = writer
             .write_manifest_file()
             .await

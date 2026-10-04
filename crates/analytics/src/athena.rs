@@ -25,6 +25,11 @@ use uuid::Uuid;
 
 use crate::state::Scope;
 
+mod sql;
+use sql::{
+    apply_predicates, sum_result, Predicate, Projection, QueryResult, ResultColumn, SqlParser,
+};
+
 pub(crate) const TARGET_PREFIX: &str = "AmazonAthena";
 const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 const SCAN_LIMIT: u64 = 64 * 1024 * 1024;
@@ -583,210 +588,6 @@ fn now_epoch() -> Result<f64, AthenaError> {
         .map_err(|_| AthenaError::Internal)
 }
 
-struct ParsedQuery {
-    database: Option<String>,
-    table: String,
-    projection: Projection,
-}
-
-#[derive(Clone)]
-enum Projection {
-    Count(String),
-    Columns(Vec<String>),
-}
-
-struct ResultColumn {
-    name: String,
-    kind: &'static str,
-}
-
-struct QueryResult {
-    columns: Vec<ResultColumn>,
-    rows: Vec<Vec<Option<String>>>,
-}
-
-impl QueryResult {
-    fn count(alias: String, count: u64) -> Self {
-        Self {
-            columns: vec![ResultColumn {
-                name: alias.clone(),
-                kind: "bigint",
-            }],
-            rows: vec![vec![Some(alias)], vec![Some(count.to_string())]],
-        }
-    }
-
-    fn csv(&self) -> String {
-        self.rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|value| csv_field(value.as_deref().unwrap_or("")))
-                    .collect::<Vec<_>>()
-                    .join(",")
-                    + "\n"
-            })
-            .collect()
-    }
-}
-
-struct SqlParser<'a> {
-    input: &'a [u8],
-    position: usize,
-}
-
-impl<'a> SqlParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            input: input.as_bytes(),
-            position: 0,
-        }
-    }
-
-    fn parse(mut self) -> Result<ParsedQuery, String> {
-        self.keyword("SELECT")?;
-        let projection = if self.try_keyword("COUNT") {
-            self.punctuation(b'(')?;
-            self.punctuation(b'*')?;
-            self.punctuation(b')')?;
-            Projection::Count(if self.try_keyword("AS") {
-                self.identifier()?
-            } else {
-                "_col0".into()
-            })
-        } else {
-            let mut columns = vec![self.identifier()?];
-            while self.try_punctuation(b',') {
-                columns.push(self.identifier()?);
-            }
-            if columns.len() > 32 {
-                return Err("too many selected columns".into());
-            }
-            Projection::Columns(columns)
-        };
-        self.keyword("FROM")?;
-        let first = self.identifier()?;
-        self.skip_whitespace();
-        let (database, table) = if self.peek() == Some(b'.') {
-            self.position += 1;
-            (Some(first), self.identifier()?)
-        } else {
-            (None, first)
-        };
-        self.skip_whitespace();
-        if self.peek() == Some(b';') {
-            self.position += 1;
-        }
-        self.skip_whitespace();
-        if self.position != self.input.len() {
-            return Err("unexpected trailing SQL".into());
-        }
-        Ok(ParsedQuery {
-            database,
-            table,
-            projection,
-        })
-    }
-
-    fn keyword(&mut self, expected: &str) -> Result<(), String> {
-        self.skip_whitespace();
-        let bytes = expected.as_bytes();
-        let end = self.position + bytes.len();
-        if end > self.input.len()
-            || !self.input[self.position..end].eq_ignore_ascii_case(bytes)
-            || self
-                .input
-                .get(end)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            return Err(format!("expected {expected}"));
-        }
-        self.position = end;
-        Ok(())
-    }
-
-    fn try_keyword(&mut self, expected: &str) -> bool {
-        let original = self.position;
-        if self.keyword(expected).is_ok() {
-            true
-        } else {
-            self.position = original;
-            false
-        }
-    }
-
-    fn punctuation(&mut self, expected: u8) -> Result<(), String> {
-        self.skip_whitespace();
-        if self.peek() != Some(expected) {
-            return Err(format!("expected {}", expected as char));
-        }
-        self.position += 1;
-        Ok(())
-    }
-
-    fn try_punctuation(&mut self, expected: u8) -> bool {
-        self.skip_whitespace();
-        if self.peek() == Some(expected) {
-            self.position += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn identifier(&mut self) -> Result<String, String> {
-        self.skip_whitespace();
-        if self.peek() == Some(b'"') {
-            self.position += 1;
-            let mut value = Vec::new();
-            loop {
-                let Some(byte) = self.peek() else {
-                    return Err("unterminated quoted identifier".into());
-                };
-                self.position += 1;
-                if byte == b'"' {
-                    if self.peek() == Some(b'"') {
-                        value.push(b'"');
-                        self.position += 1;
-                        continue;
-                    }
-                    break;
-                }
-                value.push(byte);
-            }
-            if value.is_empty() {
-                return Err("identifier must not be empty".into());
-            }
-            return String::from_utf8(value).map_err(|_| "identifier is not UTF-8".into());
-        }
-        let start = self.position;
-        if !self
-            .peek()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-        {
-            return Err("expected identifier".into());
-        }
-        self.position += 1;
-        while self
-            .peek()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        {
-            self.position += 1;
-        }
-        Ok(String::from_utf8_lossy(&self.input[start..self.position]).to_ascii_lowercase())
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            self.position += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.input.get(self.position).copied()
-    }
-}
-
 #[derive(Debug)]
 enum WorkerFailure {
     Cancelled,
@@ -905,7 +706,7 @@ async fn execute_query(
 ) -> Result<(), WorkerFailure> {
     let parsed = SqlParser::new(&spec.query_string).parse().map_err(|reason| {
         WorkerFailure::failed(
-            format!("Unsupported SQL: {reason}; expected SELECT COUNT(*) or SELECT column[, column] FROM identifier[.identifier] [;]"),
+            format!("Unsupported SQL: {reason}; expected SELECT COUNT(*), SUM(column), or column[, column] FROM identifier[.identifier] [WHERE column operator literal [AND ...]] [;]"),
             0,
         )
     })?;
@@ -924,25 +725,77 @@ async fn execute_query(
             )
         })?;
     let table = glue_table_snapshot(registry, scope, caller, &database, &parsed.table).await?;
-    let (result, scanned) = match parsed.projection {
-        Projection::Count(alias) => {
-            let (count, scanned) = if is_iceberg_table(&table) {
-                iceberg_count(registry, scope, caller, record, &table).await?
-            } else {
-                jsonl_count(registry, scope, caller, record, &table).await?
+    let (result, scanned) =
+        if !parsed.predicates.is_empty() || matches!(parsed.projection, Projection::Sum { .. }) {
+            if !is_iceberg_table(&table) {
+                return Err(WorkerFailure::failed(
+                    "Predicates require an Iceberg table",
+                    0,
+                ));
+            }
+            let mut names = match &parsed.projection {
+                Projection::Columns(names) => names.clone(),
+                Projection::Count(_) => Vec::new(),
+                Projection::Sum { column, .. } => vec![column.clone()],
             };
-            (QueryResult::count(alias, count), scanned)
-        }
-        Projection::Columns(columns) if is_iceberg_table(&table) => {
-            iceberg_rows(registry, scope, caller, record, &table, &columns).await?
-        }
-        Projection::Columns(_) => {
-            return Err(WorkerFailure::failed(
-                "Column projection requires an Iceberg table",
-                0,
-            ))
-        }
-    };
+            let projected = names.len();
+            for predicate in &parsed.predicates {
+                if !names.contains(&predicate.column) {
+                    names.push(predicate.column.clone());
+                }
+            }
+            let (mut result, scanned) = iceberg_rows(
+                registry,
+                scope,
+                caller,
+                record,
+                &table,
+                &names,
+                &parsed.predicates,
+            )
+            .await?;
+            apply_predicates(&mut result, &parsed.predicates)
+                .map_err(|reason| WorkerFailure::failed(reason, scanned))?;
+            match &parsed.projection {
+                Projection::Sum { alias, .. } => (
+                    sum_result(&result, alias)
+                        .map_err(|reason| WorkerFailure::failed(reason, scanned))?,
+                    scanned,
+                ),
+                Projection::Count(alias) => (
+                    QueryResult::count(alias.clone(), result.rows.len().saturating_sub(1) as u64),
+                    scanned,
+                ),
+                Projection::Columns(_) => {
+                    result.columns.truncate(projected);
+                    for row in &mut result.rows {
+                        row.truncate(projected);
+                    }
+                    (result, scanned)
+                }
+            }
+        } else {
+            match parsed.projection {
+                Projection::Count(alias) => {
+                    let (count, scanned) = if is_iceberg_table(&table) {
+                        iceberg_count(registry, scope, caller, record, &table).await?
+                    } else {
+                        jsonl_count(registry, scope, caller, record, &table).await?
+                    };
+                    (QueryResult::count(alias, count), scanned)
+                }
+                Projection::Columns(columns) if is_iceberg_table(&table) => {
+                    iceberg_rows(registry, scope, caller, record, &table, &columns, &[]).await?
+                }
+                Projection::Sum { .. } => unreachable!("SUM takes the row reader path"),
+                Projection::Columns(_) => {
+                    return Err(WorkerFailure::failed(
+                        "Column projection requires an Iceberg table",
+                        0,
+                    ))
+                }
+            }
+        };
     ensure_running(record)?;
     let csv = result.csv();
     if csv.len() > MAX_RESULT_BYTES {
@@ -1151,6 +1004,7 @@ async fn iceberg_rows(
     record: &Arc<Mutex<QueryRecord>>,
     table: &GlueTableOutput,
     names: &[String],
+    predicates: &[Predicate],
 ) -> Result<(QueryResult, u64), WorkerFailure> {
     let (metadata, manifest_list, mut scanned) =
         iceberg_manifest_list(registry, scope, caller, record, table).await?;
@@ -1198,6 +1052,8 @@ async fn iceberg_rows(
         scanned = add_scan(record, scanned, body.len())?;
         let manifest = AvroReader::new(&body[..])
             .map_err(|_| WorkerFailure::failed("Iceberg manifest Avro is invalid", scanned))?;
+        let spec_id = avro_integer(avro_field(&item, "partition_spec_id", scanned)?, scanned)?;
+        let partition = iceberg_partition(&metadata, spec_id, scanned)?;
         for entry in manifest {
             ensure_running(record)?;
             let entry = entry.map_err(|_| {
@@ -1226,6 +1082,37 @@ async fn iceberg_rows(
                     scanned,
                 ));
             }
+            if let Some((partition_name, source_name)) = &partition {
+                let tuple = avro_field(file, "partition", scanned)?;
+                let day = avro_date(avro_field(tuple, partition_name, scanned)?, scanned)?;
+                let date = i32::try_from(day)
+                    .ok()
+                    .and_then(|day| day.checked_add(2_440_588))
+                    .and_then(|day| time::Date::from_julian_day(day).ok())
+                    .ok_or_else(|| WorkerFailure::failed("Invalid date partition", scanned))?
+                    .to_string();
+                let mut partition_result = QueryResult {
+                    columns: vec![ResultColumn {
+                        name: source_name.clone(),
+                        kind: "date",
+                    }],
+                    rows: vec![vec![Some(source_name.clone())], vec![Some(date)]],
+                };
+                let applicable = predicates
+                    .iter()
+                    .filter(|p| p.column == *source_name)
+                    .map(|p| Predicate {
+                        column: p.column.clone(),
+                        operator: p.operator.clone(),
+                        value: p.value.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                apply_predicates(&mut partition_result, &applicable)
+                    .map_err(|reason| WorkerFailure::failed(reason, scanned))?;
+                if partition_result.rows.len() == 1 {
+                    continue;
+                }
+            }
             let path = avro_string(avro_field(file, "file_path", scanned)?, scanned)?;
             let location = parse_s3_location(path)
                 .map_err(|_| WorkerFailure::failed("Iceberg data file path is invalid", scanned))?;
@@ -1250,11 +1137,38 @@ async fn iceberg_rows(
                 .iter()
                 .map(|column| column.kind)
                 .collect::<Vec<_>>();
+            let schema = metadata["schemas"]
+                .as_array()
+                .and_then(|schemas| {
+                    schemas
+                        .iter()
+                        .find(|s| s["schema-id"] == metadata["current-schema-id"])
+                })
+                .and_then(|s| s["fields"].as_array())
+                .ok_or_else(|| WorkerFailure::failed("Current schema missing", scanned))?;
+            let definitions = names
+                .iter()
+                .map(|name| {
+                    let field = schema
+                        .iter()
+                        .find(|f| f["name"] == *name)
+                        .ok_or_else(|| WorkerFailure::failed("Projected field missing", scanned))?;
+                    Ok((
+                        field["id"]
+                            .as_i64()
+                            .and_then(|id| i32::try_from(id).ok())
+                            .ok_or_else(|| WorkerFailure::failed("Field ID missing", scanned))?,
+                        field["required"] == true,
+                    ))
+                })
+                .collect::<Result<Vec<_>, WorkerFailure>>()?;
             let names = names.to_vec();
-            let rows = tokio::task::spawn_blocking(move || parquet_rows(body, &names, &expected))
-                .await
-                .map_err(|_| WorkerFailure::failed("Parquet reader task failed", scanned))?
-                .map_err(|reason| WorkerFailure::failed(reason, scanned))?;
+            let rows = tokio::task::spawn_blocking(move || {
+                parquet_typed_rows(body, &names, &expected, Some(&definitions))
+            })
+            .await
+            .map_err(|_| WorkerFailure::failed("Parquet reader task failed", scanned))?
+            .map_err(|reason| WorkerFailure::failed(reason, scanned))?;
             result_bytes = result_bytes.saturating_add(
                 rows.iter()
                     .flat_map(|row| row.iter())
@@ -1279,26 +1193,67 @@ async fn iceberg_rows(
     Ok((result, scanned))
 }
 
+fn iceberg_partition(
+    metadata: &Value,
+    spec_id: i64,
+    scanned: u64,
+) -> Result<Option<(String, String)>, WorkerFailure> {
+    let specs = metadata["partition-specs"]
+        .as_array()
+        .ok_or_else(|| WorkerFailure::failed("Iceberg partition specs missing", scanned))?;
+    let spec = specs
+        .iter()
+        .find(|s| s["spec-id"].as_i64() == Some(spec_id))
+        .ok_or_else(|| WorkerFailure::failed("Iceberg partition spec missing", scanned))?;
+    let fields = spec["fields"]
+        .as_array()
+        .ok_or_else(|| WorkerFailure::failed("Iceberg partition fields missing", scanned))?;
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    if fields.len() != 1 || fields[0]["transform"] != "identity" {
+        return Err(WorkerFailure::failed(
+            "Only one identity date partition is supported",
+            scanned,
+        ));
+    }
+    let source = metadata["schemas"]
+        .as_array()
+        .and_then(|schemas| {
+            schemas
+                .iter()
+                .find(|s| s["schema-id"] == metadata["current-schema-id"])
+        })
+        .and_then(|schema| schema["fields"].as_array())
+        .and_then(|fields_| fields_.iter().find(|f| f["id"] == fields[0]["source-id"]))
+        .ok_or_else(|| WorkerFailure::failed("Partition source missing", scanned))?;
+    if source["type"] != "date" || source["required"] != true {
+        return Err(WorkerFailure::failed(
+            "Partition source must be a required date",
+            scanned,
+        ));
+    }
+    Ok(Some((
+        fields[0]["name"]
+            .as_str()
+            .ok_or_else(|| WorkerFailure::failed("Partition name missing", scanned))?
+            .into(),
+        source["name"]
+            .as_str()
+            .ok_or_else(|| WorkerFailure::failed("Partition source name missing", scanned))?
+            .into(),
+    )))
+}
+
 fn iceberg_columns(
     metadata: &Value,
     names: &[String],
     scanned: u64,
 ) -> Result<Vec<ResultColumn>, WorkerFailure> {
-    if metadata
-        .get("partition-specs")
-        .and_then(Value::as_array)
-        .is_some_and(|specs| {
-            specs.iter().any(|spec| {
-                spec.get("fields")
-                    .and_then(Value::as_array)
-                    .is_some_and(|fields| !fields.is_empty())
-            })
-        })
-    {
-        return Err(WorkerFailure::failed(
-            "Partitioned Iceberg tables are unsupported",
-            scanned,
-        ));
+    if let Some(specs) = metadata["partition-specs"].as_array() {
+        for spec in specs {
+            iceberg_partition(metadata, spec["spec-id"].as_i64().unwrap_or(-1), scanned)?;
+        }
     }
     let schema_id = metadata
         .get("current-schema-id")
@@ -1331,9 +1286,23 @@ fn iceberg_columns(
             .ok_or_else(|| {
                 WorkerFailure::failed(format!("Iceberg column {name} was not found"), scanned)
             })?;
+        if field.get("initial-default").is_some_and(|v| !v.is_null())
+            || field.get("write-default").is_some_and(|v| !v.is_null())
+        {
+            return Err(WorkerFailure::failed(
+                "Iceberg field defaults are unsupported",
+                scanned,
+            ));
+        }
         let kind = match field.get("type").and_then(Value::as_str) {
             Some("long") => "bigint",
             Some("string") => "varchar",
+            Some("int") => "integer",
+            Some("boolean") => "boolean",
+            Some("date") => "date",
+            Some("timestamp") => "timestamp",
+            Some("timestamptz") => "timestamptz",
+            Some("decimal(18,2)" | "decimal(18, 2)") => "decimal(18,2)",
             _ => {
                 return Err(WorkerFailure::failed(
                     format!("Iceberg column {name} has unsupported type"),
@@ -1378,13 +1347,57 @@ fn add_scan(
     Ok(total)
 }
 
+#[cfg(test)]
 fn parquet_rows(
     body: Bytes,
     names: &[String],
     expected: &[&str],
 ) -> Result<Vec<Vec<Option<String>>>, String> {
+    parquet_typed_rows(body, names, expected, None)
+}
+
+fn parquet_typed_rows(
+    body: Bytes,
+    names: &[String],
+    expected: &[&str],
+    definitions: Option<&[(i32, bool)]>,
+) -> Result<Vec<Vec<Option<String>>>, String> {
     let reader =
         SerializedFileReader::new(body).map_err(|_| "Parquet data file is invalid".to_string())?;
+    let physical_names = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            match definitions {
+                Some(definitions) => {
+                    let columns = reader.metadata().file_metadata().schema_descr().columns();
+                    let matching = columns.iter().find(|c| {
+                        c.self_type().get_basic_info().has_id()
+                            && c.self_type().get_basic_info().id() == definitions[index].0
+                    });
+                    if let Some(column) = matching {
+                        return Ok(Some(column.self_type().name().to_owned()));
+                    }
+                    if columns
+                        .iter()
+                        .any(|c| c.self_type().get_basic_info().has_id())
+                    {
+                        return if definitions[index].1 {
+                            Err(format!(
+                                "Required field ID {} missing",
+                                definitions[index].0
+                            ))
+                        } else {
+                            Ok(None)
+                        };
+                    }
+                    // Legacy unambiguous files without IDs remain readable by name.
+                    Ok(Some(name.clone()))
+                }
+                None => Ok(Some(name.clone())),
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let iter = reader
         .get_row_iter(None)
         .map_err(|_| "Parquet rows are invalid".to_string())?;
@@ -1393,15 +1406,53 @@ fn parquet_rows(
     for row in iter {
         let row = row.map_err(|_| "Parquet row is invalid".to_string())?;
         let mut values = Vec::new();
-        for (name, expected) in names.iter().zip(expected) {
+        for (index, ((name, expected), physical_name)) in
+            names.iter().zip(expected).zip(&physical_names).enumerate()
+        {
+            let Some(physical_name) = physical_name else {
+                values.push(None);
+                continue;
+            };
             let (_, value) = row
                 .get_column_iter()
-                .find(|(column, _)| *column == name)
+                .find(|(column, _)| *column == physical_name)
                 .ok_or_else(|| format!("Parquet column {name} was not found"))?;
             values.push(match (expected, value) {
-                (_, ParquetField::Null) => None,
+                (_, ParquetField::Null) => {
+                    if definitions.is_some_and(|definitions| definitions[index].1) {
+                        return Err(format!("Required column {name} contains null"));
+                    }
+                    None
+                }
                 (&"bigint", ParquetField::Long(value)) => Some(value.to_string()),
                 (&"varchar", ParquetField::Str(value)) => Some(value.clone()),
+                (&"integer", ParquetField::Int(value)) => Some(value.to_string()),
+                (&"boolean", ParquetField::Bool(value)) => Some(value.to_string()),
+                (&"date", ParquetField::Date(value)) => Some(
+                    time::Date::from_julian_day(
+                        value.checked_add(2_440_588).ok_or("date out of range")?,
+                    )
+                    .map_err(|_| "date out of range")?
+                    .to_string(),
+                ),
+                (&"timestamp" | &"timestamptz", ParquetField::TimestampMicros(value)) => Some(
+                    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(*value) * 1000)
+                        .map_err(|_| "timestamp out of range")?
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|_| "timestamp formatting failed")?,
+                ),
+                (&"decimal(18,2)", ParquetField::Decimal(value))
+                    if value.scale() == 2 && value.precision() == 18 && value.data().len() == 8 =>
+                {
+                    let cents =
+                        i64::from_be_bytes(value.data().try_into().map_err(|_| "invalid decimal")?);
+                    Some(format!(
+                        "{}{}.{:02}",
+                        if cents < 0 { "-" } else { "" },
+                        cents.unsigned_abs() / 100,
+                        cents.unsigned_abs() % 100
+                    ))
+                }
                 _ => return Err(format!("Parquet column {name} has unsupported value type")),
             });
         }
@@ -1476,6 +1527,17 @@ fn avro_field<'a>(
             }),
         _ => Err(WorkerFailure::failed(
             "Iceberg manifest list record is not a record",
+            scanned,
+        )),
+    }
+}
+
+fn avro_date(value: &AvroValue, scanned: u64) -> Result<i64, WorkerFailure> {
+    match value {
+        AvroValue::Date(day) | AvroValue::Int(day) => Ok(i64::from(*day)),
+        AvroValue::Union(_, value) => avro_date(value, scanned),
+        _ => Err(WorkerFailure::failed(
+            "Iceberg date partition has invalid type",
             scanned,
         )),
     }
@@ -1778,14 +1840,6 @@ fn looks_like_ipv4(name: &str) -> bool {
     let mut parts = name.split('.');
     (0..4).all(|_| parts.next().is_some_and(|part| part.parse::<u8>().is_ok()))
         && parts.next().is_none()
-}
-
-fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\r', '\n']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 fn output_key(prefix: &str, query_id: &str) -> String {
@@ -2449,7 +2503,7 @@ mod tests {
         assert!(
             matches!(parsed.projection, Projection::Columns(ref names) if names == &["id", "payload"])
         );
-        assert!(SqlParser::new("SELECT id FROM events WHERE id = 1")
+        assert!(SqlParser::new("SELECT id FROM events GROUP BY id")
             .parse()
             .is_err());
 

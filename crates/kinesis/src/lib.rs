@@ -10,7 +10,7 @@ use crate::service::KinesisHandler;
 
 const TARGET_PREFIX: &str = "Kinesis_20131202";
 
-/// Register the narrow native one-shard Kinesis milestone.
+/// Register the native static multishard Kinesis backend.
 pub fn register(registry: &Arc<ServiceRegistry>) {
     let handler: Arc<dyn NativeHandler> = Arc::new(KinesisHandler::new());
     registry.register_native(

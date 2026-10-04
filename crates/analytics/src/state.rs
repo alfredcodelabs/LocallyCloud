@@ -69,6 +69,26 @@ pub(crate) struct AnalyticsState {
 }
 
 impl AnalyticsState {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let mut regions = Vec::new();
+        for e in self
+            .catalogs
+            .iter()
+            .filter(|e| e.key().account_id == account)
+        {
+            if !e
+                .value()
+                .lock()
+                .map_err(|_| "Glue inventory unavailable")?
+                .databases
+                .is_empty()
+            {
+                regions.push(e.key().region.clone());
+            }
+        }
+        Ok(regions)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             catalogs: DashMap::new(),
