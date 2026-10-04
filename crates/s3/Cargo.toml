@@ -33,5 +33,9 @@ quick-xml = "=0.42.0"
 tempfile = "3"
 tokio-util = { version = "0.7", features = ["io"] }
 
+aws-lc-rs.workspace = true
+zeroize.workspace = true
+futures-util = "0.3"
+
 [dev-dependencies]
 proptest = "1"

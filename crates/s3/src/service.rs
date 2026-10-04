@@ -283,8 +283,45 @@ impl S3Handler {
     }
 
     fn with_state(registry: Weak<ServiceRegistry>, state: Arc<StateDb>) -> Result<Self, String> {
+        let storage_keys = crate::encryption::StorageKeys::persistent(&state).map_err(|_| {
+            "S3 storage key unavailable; check LOCALLYCLOUD_KMS_MASTER_KEY and state database"
+                .to_string()
+        })?;
+        Self::load_state(registry, state, storage_keys, true)
+    }
+
+    /// Load offline migration state without replaying notification work.
+    pub fn for_migration(
+        registry: &Arc<ServiceRegistry>,
+        state: Arc<StateDb>,
+    ) -> Result<Self, String> {
+        let storage_keys = crate::encryption::StorageKeys::persistent(&state).map_err(|_| {
+            "S3 storage key unavailable; check LOCALLYCLOUD_KMS_MASTER_KEY and state database"
+                .to_string()
+        })?;
+        Self::load_state(Arc::downgrade(registry), state, storage_keys, false)
+    }
+
+    #[cfg(test)]
+    fn with_storage_keys(
+        registry: Weak<ServiceRegistry>,
+        state: Arc<StateDb>,
+        storage_keys: crate::encryption::StorageKeys,
+    ) -> Result<Self, String> {
+        Self::load_state(registry, state, storage_keys, true)
+    }
+
+    fn load_state(
+        registry: Weak<ServiceRegistry>,
+        state: Arc<StateDb>,
+        storage_keys: crate::encryption::StorageKeys,
+        replay_notifications: bool,
+    ) -> Result<Self, String> {
         let persistence = S3Persistence::new(state)?;
         let mut handler = Self::with_registry(registry);
+        Arc::get_mut(&mut handler.store)
+            .expect("new S3 store")
+            .storage_keys = Arc::new(storage_keys);
         if let Some(payload) = persistence.load()? {
             handler
                 .store
@@ -296,10 +333,116 @@ impl S3Handler {
         }
         let has_pending = persistence.has_pending()?;
         handler.persistence = Some(persistence);
-        if has_pending {
+        if has_pending && replay_notifications {
             handler.start_notification_worker();
         }
         Ok(handler)
+    }
+
+    /// Explicit administrative migration: each bucket is committed atomically.
+    /// Legacy bodies stay readable until this is requested; no migration runs at startup.
+    pub async fn migrate_legacy_encryption(
+        &self,
+        request: &ServiceRequest,
+    ) -> Result<usize, S3Error> {
+        let _mutation = self.mutation_lock.lock().await;
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(S3Error::InternalError);
+        }
+        let mut migrated = 0;
+        for name in self.store.list_names(&request.account_id) {
+            let bucket = self
+                .store
+                .get(&request.account_id, &name)
+                .ok_or(S3Error::NoSuchBucket)?;
+            let original = bucket.read().await.clone();
+            let mut updated = original.clone();
+            let dispatcher = self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.internal_dispatcher());
+            let ctx = Ctx {
+                store: &self.store,
+                account: &request.account_id,
+                region: &updated.region,
+                request_id: &request.request_id,
+                dispatcher,
+                delegated_identity: None,
+                strict_external: false,
+                identity: Some(RequestIdentity {
+                    account_id: request.account_id.clone(),
+                    access_key_id: request
+                        .headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(RequestIdentity::access_key_from_authorization),
+                    arn: None,
+                }),
+            };
+            let mut count = 0;
+            for (key, object) in &mut updated.objects {
+                if !matches!(object.body, crate::store::StoredBody::Encrypted(_)) {
+                    object.body =
+                        ops::encrypt_body(&ctx, &name, key, &object.body, &object.encryption)
+                            .await?;
+                    count += 1;
+                }
+            }
+            for (key, versions) in &mut updated.versions {
+                for version in versions {
+                    if let crate::store::VersionValue::Object(object) = &mut version.value {
+                        if !matches!(object.body, crate::store::StoredBody::Encrypted(_)) {
+                            object.body = ops::encrypt_body(
+                                &ctx,
+                                &name,
+                                key,
+                                &object.body,
+                                &object.encryption,
+                            )
+                            .await?;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            for upload in updated.uploads.values_mut() {
+                if upload.key_envelope.is_none() {
+                    upload.key_envelope = Some(
+                        ops::encrypt_body(
+                            &ctx,
+                            &name,
+                            &upload.key,
+                            &crate::store::StoredBody::Inline(bytes::Bytes::new()),
+                            &upload.encryption,
+                        )
+                        .await?,
+                    );
+                    count += 1;
+                }
+                for part in upload.parts.values_mut() {
+                    if !matches!(part.body, crate::store::StoredBody::Encrypted(_)) {
+                        part.body = ops::encrypt_body(
+                            &ctx,
+                            &name,
+                            &upload.key,
+                            &part.body,
+                            &upload.encryption,
+                        )
+                        .await?;
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                *bucket.write().await = updated;
+                if let Err(error) = self.persist(Vec::new()) {
+                    *bucket.write().await = original;
+                    return Err(error);
+                }
+                migrated += count;
+            }
+        }
+        Ok(migrated)
     }
 
     fn persist(&self, notifications: Vec<StoredDelivery>) -> Result<(), S3Error> {
@@ -590,11 +733,34 @@ impl S3Handler {
             (&Method::GET, Shape::Service) => q.only_keys(&[]),
             (&Method::OPTIONS, Shape::Bucket(_) | Shape::Object(_, _)) => true,
             (&Method::PUT, Shape::Bucket(_)) => {
-                q.only_keys(&[]) || (q.only_keys(&["notification"]) && q.has("notification"))
+                q.only_keys(&[])
+                    || (q.only_keys(&["notification"]) && q.has("notification"))
+                    || (q.only_keys(&["versioning"]) && q.has("versioning"))
             }
             (&Method::DELETE | &Method::HEAD, Shape::Bucket(_)) => q.only_keys(&[]),
             (&Method::GET, Shape::Bucket(_)) => {
                 (q.only_keys(&["notification"]) && q.has("notification"))
+                    || (q.only_keys(&["versioning"]) && q.has("versioning"))
+                    || (q.has("versions")
+                        && q.only_keys(&[
+                            "versions",
+                            "prefix",
+                            "delimiter",
+                            "key-marker",
+                            "version-id-marker",
+                            "max-keys",
+                            "encoding-type",
+                        ]))
+                    || (q.has("uploads")
+                        && q.only_keys(&[
+                            "uploads",
+                            "prefix",
+                            "delimiter",
+                            "key-marker",
+                            "upload-id-marker",
+                            "max-uploads",
+                            "encoding-type",
+                        ]))
                     || q.only_keys(&[
                         "list-type",
                         "prefix",
@@ -612,9 +778,15 @@ impl S3Handler {
                 q.only_keys(&["uploads", "uploadId"]) && (q.has("uploads") || q.has("uploadId"))
             }
             (&Method::PUT, Shape::Object(_, _)) => q.only_keys(&["uploadId", "partNumber"]),
-            (&Method::GET | &Method::HEAD | &Method::DELETE, Shape::Object(_, _)) => {
+            (&Method::GET, Shape::Object(_, _)) => {
                 q.only_keys(&["versionId"])
+                    || (q.has("uploadId")
+                        && q.only_keys(&["uploadId", "part-number-marker", "max-parts"]))
             }
+            (&Method::DELETE, Shape::Object(_, _)) => {
+                q.only_keys(&["versionId"]) || (q.has("uploadId") && q.only_keys(&["uploadId"]))
+            }
+            (&Method::HEAD, Shape::Object(_, _)) => q.only_keys(&["versionId"]),
             _ => false,
         }
     }
@@ -707,6 +879,14 @@ impl S3Handler {
     }
 
     async fn route(&self, req: &ServiceRequest) -> Result<Response, S3Error> {
+        if req.headers.keys().any(|name| {
+            name.as_str().contains("server-side-encryption-customer")
+                || name == "x-amz-server-side-encryption-context"
+        }) {
+            return Err(S3Error::NotImplemented(
+                "SSE-C and additional KMS encryption context are not implemented".into(),
+            ));
+        }
         let host = req.headers.get("host").and_then(|v| v.to_str().ok());
         let q = QueryParams::parse(req.uri.query());
         let dispatcher = self
@@ -719,6 +899,17 @@ impl S3Handler {
             region: &req.region,
             request_id: &req.request_id,
             dispatcher,
+            delegated_identity: locallycloud_core::integration::identity::trusted_role(req),
+            strict_external: Self::strict_external(req),
+            identity: Some(RequestIdentity {
+                account_id: req.account_id.clone(),
+                access_key_id: req
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(RequestIdentity::access_key_from_authorization),
+                arn: None,
+            }),
         };
         if is_s3_control(req, host) {
             if Self::strict_external(req) {
@@ -783,6 +974,7 @@ impl S3Handler {
                 ops::put_bucket_notification(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("versioning") => {
+                self.authorize_action(req, "s3:PutBucketVersioning", &format!("arn:aws:s3:::{b}"))?;
                 ops::put_bucket_versioning(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("tagging") => {
@@ -843,10 +1035,25 @@ impl S3Handler {
                 } else if q.has("policy") {
                     ops::get_bucket_policy(&ctx, b).await
                 } else if q.has("versioning") {
+                    self.authorize_action(
+                        req,
+                        "s3:GetBucketVersioning",
+                        &format!("arn:aws:s3:::{b}"),
+                    )?;
                     ops::get_bucket_versioning(&ctx, b).await
                 } else if q.has("versions") {
+                    self.authorize_action(
+                        req,
+                        "s3:ListBucketVersions",
+                        &format!("arn:aws:s3:::{b}"),
+                    )?;
                     ops::list_object_versions(&ctx, b, &q).await
                 } else if q.has("uploads") {
+                    self.authorize_action(
+                        req,
+                        "s3:ListBucketMultipartUploads",
+                        &format!("arn:aws:s3:::{b}"),
+                    )?;
                     ops::list_multipart_uploads(&ctx, b, &q).await
                 } else if q.has("acl") {
                     ops::get_bucket_acl(&ctx, b).await
@@ -1018,6 +1225,11 @@ impl S3Handler {
                 ops::get_object_attributes(&ctx, b, k, &req.headers, q.get("versionId")).await
             }
             (&Method::GET, Shape::Object(b, k)) if q.get("uploadId").is_some() => {
+                self.authorize_action(
+                    req,
+                    "s3:ListMultipartUploadParts",
+                    &format!("arn:aws:s3:::{b}/{k}"),
+                )?;
                 ops::list_parts(
                     &ctx,
                     b,
@@ -1049,6 +1261,11 @@ impl S3Handler {
                 ops::delete_object_tagging(&ctx, b, k, q.get("versionId")).await
             }
             (&Method::DELETE, Shape::Object(b, k)) if q.get("uploadId").is_some() => {
+                self.authorize_action(
+                    req,
+                    "s3:AbortMultipartUpload",
+                    &format!("arn:aws:s3:::{b}/{k}"),
+                )?;
                 ops::abort_multipart_upload(
                     &ctx,
                     b,
@@ -1081,6 +1298,10 @@ impl S3Handler {
 
 #[async_trait]
 impl NativeHandler for S3Handler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account).await
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         // ponytail: one S3 mutation lock; split by bucket if throughput needs it.
         let _guard = self.mutation_lock.lock().await;
@@ -1122,6 +1343,9 @@ impl NativeHandler for S3Handler {
                     region: &request.region,
                     request_id: &request.request_id,
                     dispatcher: None,
+                    identity: None,
+                    delegated_identity: None,
+                    strict_external: false,
                 };
                 ops::apply_cors_headers(
                     &ctx,
@@ -1311,15 +1535,14 @@ impl S3Persistence {
 pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
-) -> Result<(), String> {
-    let handler: Arc<dyn NativeHandler> =
-        Arc::new(S3Handler::with_state(Arc::downgrade(registry), state)?);
+) -> Result<Arc<S3Handler>, String> {
+    let handler = Arc::new(S3Handler::with_state(Arc::downgrade(registry), state)?);
     registry.register_native(
         ServiceName::new("s3"),
         ServiceMetadata::new(AwsProtocol::RestXml, None),
-        handler,
+        handler.clone(),
     );
-    Ok(())
+    Ok(handler)
 }
 
 pub fn register(registry: &Arc<ServiceRegistry>) {
@@ -1348,6 +1571,15 @@ mod tests {
     };
     use locallycloud_core::integration::InternalDispatcher;
     use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+
+    pub(super) fn test_state_handler(
+        registry: Weak<ServiceRegistry>,
+        state: Arc<StateDb>,
+    ) -> Result<S3Handler, String> {
+        let keys = crate::encryption::StorageKeys::with_master(&state, &[0x42; 32])
+            .map_err(|error| error.to_string())?;
+        S3Handler::with_storage_keys(registry, state, keys)
+    }
 
     type RecordedRequests = Arc<Mutex<Vec<(String, String)>>>;
 
@@ -1399,14 +1631,21 @@ mod tests {
     #[derive(Default)]
     struct FakeKmsApi {
         requests: Mutex<Vec<KmsValidateKeyRequest>>,
+        decrypt_failure: Mutex<Option<KmsInternalError>>,
     }
 
     impl KmsInternalApi for FakeKmsApi {
         fn generate_data_key(
             &self,
-            _request: KmsGenerateDataKeyRequest,
+            request: KmsGenerateDataKeyRequest,
         ) -> Result<KmsGenerateDataKeyOutput, KmsInternalError> {
-            Err(KmsInternalError::Unavailable)
+            Ok(KmsGenerateDataKeyOutput {
+                plaintext: locallycloud_core::integration::kms::SensitiveBytes::new(vec![0x21; 32]),
+                ciphertext: locallycloud_core::integration::kms::SensitiveBytes::new(
+                    serde_json::to_vec(&request.encryption_context).unwrap(),
+                ),
+                key_id: request.key_id,
+            })
         }
 
         fn encrypt(
@@ -1418,9 +1657,20 @@ mod tests {
 
         fn decrypt(
             &self,
-            _request: KmsDecryptRequest,
+            request: KmsDecryptRequest,
         ) -> Result<KmsDecryptOutput, KmsInternalError> {
-            Err(KmsInternalError::Unavailable)
+            if let Some(error) = *self.decrypt_failure.lock().unwrap() {
+                return Err(error);
+            }
+            if serde_json::to_vec(&request.encryption_context).unwrap()
+                != request.ciphertext.as_slice()
+            {
+                return Err(KmsInternalError::InvalidCiphertext);
+            }
+            Ok(KmsDecryptOutput {
+                plaintext: locallycloud_core::integration::kms::SensitiveBytes::new(vec![0x21; 32]),
+                key_id: request.key_id.unwrap(),
+            })
         }
 
         fn validate_key(
@@ -1429,20 +1679,50 @@ mod tests {
         ) -> Result<KmsValidateKeyOutput, KmsInternalError> {
             self.requests.lock().unwrap().push(request.clone());
             match request.key_id.as_str() {
-                "alias/data" | "key-123" | "arn:aws:kms:us-east-1:000000000000:key/key-123" => {
-                    Ok(KmsValidateKeyOutput {
-                        key_arn: "arn:aws:kms:us-east-1:000000000000:key/key-123".to_string(),
-                    })
-                }
+                "alias/aws/s3"
+                | "alias/data"
+                | "key-123"
+                | "arn:aws:kms:us-east-1:000000000000:key/key-123" => Ok(KmsValidateKeyOutput {
+                    key_arn: "arn:aws:kms:us-east-1:000000000000:key/key-123".to_string(),
+                }),
                 "denied" => Err(KmsInternalError::AccessDenied),
-                "disabled" => Err(KmsInternalError::InvalidState),
+                "disabled" => Err(KmsInternalError::Disabled),
                 _ => Err(KmsInternalError::NotFound),
             }
         }
     }
 
+    struct FixtureKmsIdentity;
+    impl locallycloud_core::integration::authorization::AuthorizationEvaluator for FixtureKmsIdentity {
+        fn authorize(
+            &self,
+            _request: AuthorizationRequest,
+        ) -> Result<(), locallycloud_core::integration::authorization::AuthorizationError> {
+            Ok(())
+        }
+        fn resolve_caller_arn(
+            &self,
+            _: &RequestIdentity,
+        ) -> Result<Option<String>, locallycloud_core::integration::authorization::AuthorizationError>
+        {
+            Ok(Some("arn:aws:iam::000000000000:root".into()))
+        }
+        fn identity_policy_allows(&self, _: AuthorizationRequest) -> bool {
+            true
+        }
+        fn identity_policy_denies(&self, _: AuthorizationRequest) -> bool {
+            false
+        }
+    }
+
     fn kms_handler() -> (S3Handler, Arc<ServiceRegistry>, Arc<FakeKmsApi>) {
         let registry = ServiceRegistry::with_known_services();
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(KmsHttpStub),
+            Arc::new(FixtureKmsIdentity),
+        );
         let kms = Arc::new(FakeKmsApi::default());
         registry.register_native_with_kms_api(
             ServiceName::new("kms"),
@@ -1880,6 +2160,260 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_multipart_and_version_listing_use_native_iam_actions() {
+        let (h, _registry, policy) = write_policy_handler();
+        h.handle(req(Method::PUT, "/bucket", "", &[])).await;
+        let initiated = h
+            .handle(req(Method::POST, "/bucket/a%20b?uploads", "", &[]))
+            .await;
+        let id = xml_value(&body_string(initiated).await.1, "UploadId");
+        let part_path = format!("/bucket/a%20b?uploadId={id}&partNumber=1");
+        assert_eq!(
+            h.handle(req(Method::PUT, &part_path, "part", &[]))
+                .await
+                .status(),
+            200
+        );
+        let list_parts = format!("/bucket/a%20b?uploadId={id}");
+        let cases = [
+            (
+                Method::GET,
+                "/bucket?versions".to_string(),
+                "s3:ListBucketVersions",
+                "arn:aws:s3:::bucket",
+            ),
+            (
+                Method::GET,
+                "/bucket?uploads".to_string(),
+                "s3:ListBucketMultipartUploads",
+                "arn:aws:s3:::bucket",
+            ),
+            (
+                Method::GET,
+                list_parts.clone(),
+                "s3:ListMultipartUploadParts",
+                "arn:aws:s3:::bucket/a b",
+            ),
+            (
+                Method::DELETE,
+                list_parts.clone(),
+                "s3:AbortMultipartUpload",
+                "arn:aws:s3:::bucket/a b",
+            ),
+        ];
+        let versioning =
+            "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        for (method, body, action) in [
+            (Method::PUT, versioning, "s3:PutBucketVersioning"),
+            (Method::GET, "", "s3:GetBucketVersioning"),
+        ] {
+            assert_eq!(
+                h.handle(req(
+                    method,
+                    "/bucket?versioning",
+                    body,
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+                403
+            );
+            let call = policy.requests.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                (call.action.as_str(), call.resource.as_str()),
+                (action, "arn:aws:s3:::bucket")
+            );
+        }
+        assert!(!body_string(
+            h.handle(req(Method::GET, "/bucket?versioning", "", &[]))
+                .await
+        )
+        .await
+        .1
+        .contains("Enabled"));
+        for (method, path, action, resource) in &cases {
+            assert_eq!(
+                h.handle(req(method.clone(), path, "", VERIFIED_WRITE_HEADERS))
+                    .await
+                    .status(),
+                403
+            );
+            let call = policy.requests.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                (call.action.as_str(), call.resource.as_str()),
+                (*action, *resource)
+            );
+        }
+        assert_eq!(
+            h.handle(req(Method::GET, &list_parts, "", &[]))
+                .await
+                .status(),
+            200
+        );
+        policy
+            .allow
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            h.handle(req(
+                Method::PUT,
+                "/bucket?versioning",
+                versioning,
+                VERIFIED_WRITE_HEADERS
+            ))
+            .await
+            .status(),
+            200
+        );
+        assert!(body_string(
+            h.handle(req(
+                Method::GET,
+                "/bucket?versioning",
+                "",
+                VERIFIED_WRITE_HEADERS
+            ))
+            .await
+        )
+        .await
+        .1
+        .contains("Enabled"));
+        for (method, path, _, _) in cases {
+            let expected = if method == Method::DELETE { 204 } else { 200 };
+            assert_eq!(
+                h.handle(req(method, &path, "", VERIFIED_WRITE_HEADERS))
+                    .await
+                    .status(),
+                expected
+            );
+        }
+        assert_eq!(
+            h.handle(req(Method::GET, &list_parts, "", &[]))
+                .await
+                .status(),
+            404
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_kms_body_requires_migration_for_verified_or_delegated_reads() {
+        let (h, _registry, policy) = write_policy_handler();
+        h.handle(req(Method::PUT, "/bucket", "", &[])).await;
+        h.handle(req(Method::PUT, "/bucket/source", "legacy secret", &[]))
+            .await;
+        {
+            let bucket = h.store.get("000000000000", "bucket").unwrap();
+            let mut guard = bucket.write().await;
+            let object = guard.objects.get_mut("source").unwrap();
+            object.body = crate::store::StoredBody::Inline(Bytes::from_static(b"legacy secret"));
+            object.encryption.algorithm = crate::store::SseAlgorithm::AwsKms;
+        }
+        policy
+            .allow
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ordinary = h.handle(req(Method::GET, "/bucket/source", "", &[])).await;
+        assert_eq!(
+            ordinary.headers()["x-locallycloud-storage-format"],
+            "legacy-plaintext"
+        );
+        assert_eq!(body_string(ordinary).await.1, "legacy secret");
+        for headers in [
+            VERIFIED_WRITE_HEADERS,
+            &[
+                ("x-locallycloud-verified-internal-scope", "1"),
+                (
+                    "x-locallycloud-caller-principal",
+                    "arn:aws:iam::000000000000:role/path/worker/session",
+                ),
+            ][..],
+        ] {
+            let denied = h
+                .handle(req(Method::GET, "/bucket/source", "", headers))
+                .await;
+            let (status, body) = body_string(denied).await;
+            assert_eq!(status, 403);
+            assert!(body.contains("migrate-s3-encryption"));
+            assert!(!body.contains("legacy secret"));
+            let mut copy_headers = headers.to_vec();
+            copy_headers.push(("x-amz-copy-source", "/bucket/source"));
+            assert_eq!(
+                h.handle(req(Method::PUT, "/bucket/copy", "", &copy_headers))
+                    .await
+                    .status(),
+                403
+            );
+        }
+        let initiated = h
+            .handle(req(Method::POST, "/bucket/final?uploads", "", &[]))
+            .await;
+        let upload = xml_value(&body_string(initiated).await.1, "UploadId");
+        let part = format!("/bucket/final?uploadId={upload}&partNumber=1");
+        let mut copied = VERIFIED_WRITE_HEADERS.to_vec();
+        copied.push(("x-amz-copy-source", "/bucket/source"));
+        assert_eq!(
+            h.handle(req(Method::PUT, &part, "", &copied))
+                .await
+                .status(),
+            403
+        );
+        let uploaded = h.handle(req(Method::PUT, &part, "legacy part", &[])).await;
+        let etag = uploaded.headers()["etag"].to_str().unwrap().to_string();
+        {
+            let bucket = h.store.get("000000000000", "bucket").unwrap();
+            let mut guard = bucket.write().await;
+            let staged = guard.uploads.get_mut(&upload).unwrap();
+            staged.encryption.algorithm = crate::store::SseAlgorithm::AwsKms;
+            staged.key_envelope = None;
+            staged.parts.get_mut(&1).unwrap().body =
+                crate::store::StoredBody::Inline(Bytes::from_static(b"legacy part"));
+        }
+        let completed = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>");
+        assert_eq!(
+            h.handle(req(
+                Method::POST,
+                &format!("/bucket/final?uploadId={upload}"),
+                &completed,
+                VERIFIED_WRITE_HEADERS
+            ))
+            .await
+            .status(),
+            403
+        );
+        assert_eq!(
+            h.handle(req(
+                Method::GET,
+                &format!("/bucket/final?uploadId={upload}"),
+                "",
+                &[]
+            ))
+            .await
+            .status(),
+            200
+        );
+        assert_eq!(
+            h.handle(req(Method::GET, "/bucket/final", "", &[]))
+                .await
+                .status(),
+            404
+        );
+        assert_eq!(
+            h.handle(req(
+                Method::HEAD,
+                "/bucket/source",
+                "",
+                VERIFIED_WRITE_HEADERS
+            ))
+            .await
+            .status(),
+            200
+        );
+        assert_eq!(
+            h.handle(req(Method::GET, "/bucket/copy", "", &[]))
+                .await
+                .status(),
+            404
+        );
+    }
+
+    #[tokio::test]
     async fn strict_unmapped_subresource_fails_before_mutation() {
         let (handler, _registry, policy) = write_policy_handler();
         assert_eq!(
@@ -1988,7 +2522,7 @@ mod tests {
         );
         assert_eq!(
             response.headers()["x-amz-server-side-encryption-bucket-key-enabled"],
-            "true"
+            "false"
         );
     }
 
@@ -2011,7 +2545,7 @@ mod tests {
             "<SSEAlgorithm>aws:kms</SSEAlgorithm>",
             "<KMSMasterKeyID>alias/data</KMSMasterKeyID>",
             "</ApplyServerSideEncryptionByDefault>",
-            "<BucketKeyEnabled>true</BucketKeyEnabled>",
+            "<BucketKeyEnabled>false</BucketKeyEnabled>",
             "</Rule></ServerSideEncryptionConfiguration>"
         );
         assert_eq!(
@@ -2030,7 +2564,7 @@ mod tests {
         assert!(configured.contains(
             "<KMSMasterKeyID>arn:aws:kms:us-east-1:000000000000:key/key-123</KMSMasterKeyID>"
         ));
-        assert!(configured.contains("<BucketKeyEnabled>true</BucketKeyEnabled>"));
+        assert!(configured.contains("<BucketKeyEnabled>false</BucketKeyEnabled>"));
         {
             let requests = kms.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
@@ -2086,7 +2620,7 @@ mod tests {
     async fn put_and_copy_encryption_headers_override_bucket_defaults() {
         let (h, _registry, _kms) = kms_handler();
         h.handle(req(Method::PUT, "/buck", "", &[])).await;
-        let kms_configuration = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>key-123</KMSMasterKeyID></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>";
+        let kms_configuration = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>key-123</KMSMasterKeyID></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>";
         h.handle(req(Method::PUT, "/buck?encryption", kms_configuration, &[]))
             .await;
 
@@ -2123,16 +2657,16 @@ mod tests {
             ))
             .await
             .status(),
-            400
+            200
         );
         let unchanged = h
             .handle(req(Method::GET, "/buck/overridden", "", &[]))
             .await;
         assert_eq!(
             unchanged.headers()["x-amz-server-side-encryption"],
-            "AES256"
+            "aws:kms"
         );
-        assert_eq!(body_string(unchanged).await.1, "aes");
+        assert_eq!(body_string(unchanged).await.1, "mutated");
 
         for headers in [
             vec![
@@ -2183,7 +2717,7 @@ mod tests {
                     ("x-amz-copy-source", "/buck/inherited"),
                     ("x-amz-server-side-encryption", "aws:kms"),
                     ("x-amz-server-side-encryption-aws-kms-key-id", "alias/data"),
-                    ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
+                    ("x-amz-server-side-encryption-bucket-key-enabled", "false"),
                 ],
             ))
             .await;
@@ -2235,12 +2769,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unusable_kms_key_returns_native_s3_error_without_plaintext() {
+        let (h, _registry, kms) = kms_handler();
+        h.handle(req(Method::PUT, "/buck", "", &[])).await;
+        assert_eq!(
+            h.handle(req(
+                Method::PUT,
+                "/buck/private",
+                "protected invoice",
+                &[
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    ("x-amz-server-side-encryption-aws-kms-key-id", "alias/data"),
+                ]
+            ))
+            .await
+            .status(),
+            200
+        );
+        for (error, code) in [
+            (KmsInternalError::Disabled, "KMS.DisabledException"),
+            (
+                KmsInternalError::InvalidState,
+                "KMS.KMSInvalidStateException",
+            ),
+        ] {
+            *kms.decrypt_failure.lock().unwrap() = Some(error);
+            let (status, body) =
+                body_string(h.handle(req(Method::GET, "/buck/private", "", &[])).await).await;
+            assert_eq!(status, 400);
+            assert!(body.contains(&format!("<Code>{code}</Code>")));
+            assert!(!body.contains("protected invoice"));
+        }
+        *kms.decrypt_failure.lock().unwrap() = None;
+        assert_eq!(
+            body_string(h.handle(req(Method::GET, "/buck/private", "", &[])).await)
+                .await
+                .1,
+            "protected invoice"
+        );
+    }
+
+    #[tokio::test]
     async fn multipart_encryption_is_fixed_at_initiation_and_propagated() {
         let (h, _registry, _kms) = kms_handler();
         h.handle(req(Method::PUT, "/buck", "", &[])).await;
         h.handle(req(Method::PUT, "/buck/source", "source", &[]))
             .await;
-        let kms_configuration = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>alias/data</KMSMasterKeyID></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>";
+        let kms_configuration = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>alias/data</KMSMasterKeyID></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>";
         h.handle(req(Method::PUT, "/buck?encryption", kms_configuration, &[]))
             .await;
 
@@ -2431,7 +3006,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
-        let handler = S3Handler::with_state(Weak::new(), state.clone()).unwrap();
+        let handler = test_state_handler(Weak::new(), state.clone()).unwrap();
         assert_eq!(
             handler
                 .handle(req(Method::PUT, "/batch-cap", "", &[]))
@@ -2527,7 +3102,7 @@ mod tests {
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
         let registry = ServiceRegistry::with_known_services();
-        let first = S3Handler::with_state(Arc::downgrade(&registry), state.clone()).unwrap();
+        let first = test_state_handler(Arc::downgrade(&registry), state.clone()).unwrap();
         assert_eq!(
             first
                 .handle(req(Method::PUT, "/durable-events", "", &[]))
@@ -2568,8 +3143,7 @@ mod tests {
         drop(registry);
 
         let (_unused, failing_registry, failed_requests) = event_handler(500);
-        let failing =
-            S3Handler::with_state(Arc::downgrade(&failing_registry), state.clone()).unwrap();
+        let failing = test_state_handler(Arc::downgrade(&failing_registry), state.clone()).unwrap();
         wait_for_count(&failed_requests, 3).await;
         let pending: i64 = state
             .connection()
@@ -2583,7 +3157,7 @@ mod tests {
         drop(failing_registry);
 
         let (_unused, registry, requests) = event_handler(200);
-        let reopened = S3Handler::with_state(Arc::downgrade(&registry), state.clone()).unwrap();
+        let reopened = test_state_handler(Arc::downgrade(&registry), state.clone()).unwrap();
         wait_for_count(&requests, 1).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -4624,7 +5198,7 @@ mod restart_persistence_tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
-        let handler = S3Handler::with_state(Weak::new(), state.clone()).unwrap();
+        let handler = super::tests::test_state_handler(Weak::new(), state.clone()).unwrap();
         assert!(handler
             .handle(request(Method::PUT, "/durable", Bytes::new()))
             .await
@@ -4642,7 +5216,7 @@ mod restart_persistence_tests {
                 .is_success());
         }
         drop(handler);
-        let reopened = S3Handler::with_state(Weak::new(), state).unwrap();
+        let reopened = super::tests::test_state_handler(Weak::new(), state).unwrap();
         for (key, expected) in [("small", vec![1_u8; 8]), ("large", vec![2_u8; 70_000])] {
             let response = reopened
                 .handle(request(
@@ -4659,5 +5233,193 @@ mod restart_persistence_tests {
                 Bytes::from(expected)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod encryption_storage_tests {
+    use super::*;
+    use crate::store::{StoredBody, VersionValue};
+    use bytes::Bytes;
+    use http::StatusCode;
+
+    fn request(method: Method, uri: &str, body: Bytes) -> ServiceRequest {
+        ServiceRequest {
+            method,
+            uri: uri.parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            body,
+            account_id: "000000000000".into(),
+            region: "us-east-1".into(),
+            request_id: "encryption-gate".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_migration_preserves_versions_and_restart_data() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDb::open(root.path().join("private/state.sqlite3")).unwrap());
+        let handler = super::tests::test_state_handler(Weak::new(), state.clone()).unwrap();
+        handler
+            .handle(request(Method::PUT, "/legacy-orders", Bytes::new()))
+            .await;
+        handler
+            .handle(request(
+                Method::PUT,
+                "/legacy-orders?versioning",
+                Bytes::from_static(
+                    b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                ),
+            ))
+            .await;
+        handler
+            .handle(request(
+                Method::PUT,
+                "/legacy-orders/invoice",
+                Bytes::from_static(b"old invoice bytes"),
+            ))
+            .await;
+        let bucket = handler.store.get("000000000000", "legacy-orders").unwrap();
+        let (version, etag) = {
+            let mut guard = bucket.write().await;
+            let object = guard.objects.get_mut("invoice").unwrap();
+            object.body = StoredBody::Inline(Bytes::from_static(b"old invoice bytes"));
+            let etag = object.etag.clone();
+            let version = &mut guard.versions.get_mut("invoice").unwrap()[0];
+            if let VersionValue::Object(object) = &mut version.value {
+                object.body = StoredBody::Inline(Bytes::from_static(b"old invoice bytes"));
+            }
+            (version.id.clone(), etag)
+        };
+        handler.persist(Vec::new()).unwrap();
+        let old = handler
+            .handle(request(Method::GET, "/legacy-orders/invoice", Bytes::new()))
+            .await;
+        assert_eq!(
+            old.headers()["x-locallycloud-storage-format"],
+            "legacy-plaintext"
+        );
+        assert!(!old.headers().contains_key("x-amz-server-side-encryption"));
+        assert_eq!(
+            axum::body::to_bytes(old.into_body(), 1000).await.unwrap(),
+            Bytes::from_static(b"old invoice bytes")
+        );
+        let migrate = request(Method::POST, "/", Bytes::new());
+        let before: Vec<u8> = state
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload FROM s3_state", [], |row| row.get(0))
+            .unwrap();
+        state.connection().unwrap().execute_batch("CREATE TRIGGER migration_failure BEFORE UPDATE ON s3_state BEGIN SELECT RAISE(FAIL, 'migration interrupted'); END;").unwrap();
+        assert!(handler.migrate_legacy_encryption(&migrate).await.is_err());
+        assert_eq!(
+            bucket.read().await.objects["invoice"]
+                .body
+                .read_all()
+                .unwrap(),
+            Bytes::from_static(b"old invoice bytes")
+        );
+        let failed: Vec<u8> = state
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload FROM s3_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, failed);
+        state
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER migration_failure;")
+            .unwrap();
+        drop(handler);
+        let handler = super::tests::test_state_handler(Weak::new(), state.clone()).unwrap();
+
+        assert_eq!(
+            handler.migrate_legacy_encryption(&migrate).await.unwrap(),
+            2
+        );
+        assert_eq!(
+            handler.migrate_legacy_encryption(&migrate).await.unwrap(),
+            0
+        );
+        let payload: Vec<u8> = state
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload FROM s3_state", [], |row| row.get(0))
+            .unwrap();
+        assert!(!payload
+            .windows(17)
+            .any(|bytes| bytes == b"old invoice bytes"));
+        let blobs = handler.persistence.as_ref().unwrap().blobs.clone();
+        for path in std::fs::read_dir(blobs).unwrap() {
+            let bytes = std::fs::read(path.unwrap().path()).unwrap();
+            assert!(!bytes.windows(17).any(|bytes| bytes == b"old invoice bytes"));
+        }
+        drop(handler);
+        let reopened = super::tests::test_state_handler(Weak::new(), state).unwrap();
+        for uri in [
+            "/legacy-orders/invoice".to_string(),
+            format!("/legacy-orders/invoice?versionId={version}"),
+        ] {
+            let response = reopened
+                .handle(request(Method::GET, &uri, Bytes::new()))
+                .await;
+            assert_eq!(response.headers()["ETag"], etag);
+            assert_eq!(response.headers()["x-amz-server-side-encryption"], "AES256");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1000)
+                    .await
+                    .unwrap(),
+                Bytes::from_static(b"old invoice bytes")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_keys_reject_without_mutating_object_or_configuration() {
+        let handler = S3Handler::new();
+        handler
+            .handle(request(Method::PUT, "/bucket-keys", Bytes::new()))
+            .await;
+        let mut put = request(
+            Method::PUT,
+            "/bucket-keys/unsupported",
+            Bytes::from_static(b"private"),
+        );
+        put.headers.insert(
+            "x-amz-server-side-encryption",
+            HeaderValue::from_static("aws:kms"),
+        );
+        put.headers.insert(
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            HeaderValue::from_static("true"),
+        );
+        assert_eq!(
+            handler.handle(put).await.status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            handler
+                .handle(request(
+                    Method::GET,
+                    "/bucket-keys/unsupported",
+                    Bytes::new()
+                ))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let body = Bytes::from_static(b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>");
+        assert_eq!(
+            handler
+                .handle(request(Method::PUT, "/bucket-keys?encryption", body))
+                .await
+                .status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        let bucket = handler.store.get("000000000000", "bucket-keys").unwrap();
+        assert_eq!(
+            bucket.read().await.encryption,
+            crate::store::ServerSideEncryption::default()
+        );
     }
 }

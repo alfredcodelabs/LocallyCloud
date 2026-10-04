@@ -2708,10 +2708,12 @@ name = "locallycloud-s3"
 version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "bytes",
  "dashmap",
+ "futures-util",
  "http",
  "locallycloud-core",
  "locallycloud-state",
@@ -2729,6 +2731,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

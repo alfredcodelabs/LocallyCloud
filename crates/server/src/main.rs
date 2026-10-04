@@ -5,6 +5,7 @@
 
 mod ec2_runtime;
 mod ecs_runtime;
+mod migration;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
@@ -200,6 +201,22 @@ async fn main() {
         }
     };
 
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "migrate-s3-encryption")
+    {
+        if arguments.len() != 1 {
+            eprintln!("Usage: locallycloud migrate-s3-encryption (uses configured state, account and master key)");
+            std::process::exit(2);
+        }
+        if let Err(error) = migration::s3(&config).await {
+            tracing::error!(%error, "S3 encryption migration failed");
+            std::process::exit(5);
+        }
+        return;
+    }
+
     let endpoint =
         EndpointResolver::resolve(config.external_endpoint.as_deref(), config.listen_addr);
     tracing::info!(
@@ -242,6 +259,13 @@ async fn main() {
         Err(error) => {
             tracing::error!(%error, "durable state startup task failed");
             std::process::exit(4);
+        }
+    };
+    let _state_lock = match state.lock_runtime() {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(%error, "state is already in use or cannot be locked");
+            std::process::exit(5);
         }
     };
     if let Err(error) = locallycloud_dynamodb::register_with_state(&registry, state.clone()) {

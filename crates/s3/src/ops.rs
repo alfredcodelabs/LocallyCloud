@@ -3,21 +3,25 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::encryption::EncryptedBody;
 use axum::body::Body;
 use axum::response::Response;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::kms::{
-    KmsCallContext, KmsInternalError, KmsValidateKeyRequest,
+    KmsCallContext, KmsDecryptRequest, KmsGenerateDataKeyRequest, KmsInternalError,
+    KmsValidateKeyRequest, SensitiveBytes,
 };
-use locallycloud_core::integration::InternalDispatcher;
+use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 use tokio::sync::RwLock;
 
 use crate::error::S3Error;
 use crate::integrity::{
-    checksum_base64, decode_aws_chunked, etag, md5_raw, multipart_etag, validate_checksum,
+    checksum_base64, decode_aws_chunked, etag, multipart_etag, validate_checksum,
     validate_content_md5, ChecksumAlgorithm,
 };
 use crate::notifications::{self, EventType, ObjectEvent};
@@ -39,6 +43,9 @@ pub struct Ctx<'a> {
     pub region: &'a str,
     pub request_id: &'a str,
     pub dispatcher: Option<Arc<InternalDispatcher>>,
+    pub identity: Option<RequestIdentity>,
+    pub delegated_identity: Option<CallerIdentity>,
+    pub strict_external: bool,
 }
 
 pub struct MutationResult {
@@ -165,11 +172,20 @@ fn explicit_encryption(
             Ok(ServerSideEncryption::default())
         }
         SseAlgorithm::AwsKms => {
-            let key_id = kms_key_id
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    S3Error::InvalidArgument("A KMS key ID is required when using aws:kms".into())
-                })?;
+            if bucket_key {
+                return Err(S3Error::NotImplemented(
+                    "S3 Bucket Keys are not implemented".into(),
+                ));
+            }
+            let key_id = match kms_key_id {
+                Some("") => {
+                    return Err(S3Error::InvalidArgument(
+                        "KMS key ID must not be empty".into(),
+                    ))
+                }
+                Some(value) => value,
+                None => "alias/aws/s3",
+            };
             Ok(ServerSideEncryption {
                 algorithm,
                 kms_key_arn: Some(canonical_kms_key(ctx, key_id)?),
@@ -211,6 +227,199 @@ fn request_encryption(
         kms_key_id,
         bucket_key_enabled(bucket_key_header)?,
     )
+}
+
+fn kms_call(
+    ctx: &Ctx<'_>,
+    action: &str,
+    key: &str,
+    encryption_context: &BTreeMap<String, String>,
+) -> Result<KmsCallContext, S3Error> {
+    let dispatcher = ctx.dispatcher.as_deref().ok_or(S3Error::InternalError)?;
+    let identity = ctx.identity.clone().unwrap_or_else(|| RequestIdentity {
+        account_id: ctx.account.into(),
+        access_key_id: None,
+        arn: None,
+    });
+    let caller_arn = match &ctx.delegated_identity {
+        Some(CallerIdentity::AssumedRole { role_arn, .. }) => Some(role_arn.clone()),
+        _ => dispatcher
+            .resolve_caller_arn(&identity)
+            .map_err(|_| S3Error::AccessDenied)?,
+    };
+    let mut context: BTreeMap<String, Vec<String>> = encryption_context
+        .iter()
+        .map(|(key, value)| {
+            (
+                format!("kms:encryptioncontext:{}", key.to_ascii_lowercase()),
+                vec![value.clone()],
+            )
+        })
+        .collect();
+    context.insert(
+        "kms:viaservice".into(),
+        vec![format!("s3.{}.amazonaws.com", ctx.region)],
+    );
+    context.insert(
+        "kms:calleraccount".into(),
+        vec![caller_arn
+            .as_deref()
+            .and_then(|arn| arn.split(':').nth(4))
+            .unwrap_or(ctx.account)
+            .into()],
+    );
+    let request = AuthorizationRequest {
+        request_identity: identity,
+        delegated_identity: ctx.delegated_identity.clone(),
+        source_service: "s3".into(),
+        action: action.into(),
+        resource: key.into(),
+        context,
+    };
+    Ok(KmsCallContext {
+        source_service: "s3".into(),
+        account_id: ctx.account.into(),
+        region: ctx.region.into(),
+        request_id: ctx.request_id.into(),
+        caller_arn: caller_arn.clone(),
+        iam_policy_allowed: dispatcher.identity_policy_allows(request.clone()),
+        iam_policy_denied: (caller_arn.is_some() || dispatcher.strict_sigv4_required())
+            && dispatcher.identity_policy_denies(request),
+    })
+}
+
+pub(crate) async fn encrypt_body(
+    ctx: &Ctx<'_>,
+    bucket: &str,
+    key: &str,
+    body: &StoredBody,
+    encryption: &ServerSideEncryption,
+) -> Result<StoredBody, S3Error> {
+    if encryption.bucket_key_enabled {
+        return Err(S3Error::NotImplemented(
+            "S3 Bucket Keys are not implemented".into(),
+        ));
+    }
+    let context = BTreeMap::from([("aws:s3:arn".into(), format!("arn:aws:s3:::{bucket}/{key}"))]);
+    let (plain, wrapped, kms_key) = match encryption.algorithm {
+        SseAlgorithm::Aes256 => {
+            let (plain, wrapped) = ctx.store.storage_keys.generate(&context)?;
+            (plain, wrapped, None)
+        }
+        SseAlgorithm::AwsKms => {
+            let key_id = encryption
+                .kms_key_arn
+                .as_deref()
+                .ok_or(S3Error::InternalError)?;
+            let call = kms_call(ctx, "kms:GenerateDataKey", key_id, &context)?;
+            let output = ctx
+                .dispatcher
+                .as_deref()
+                .ok_or(S3Error::InternalError)?
+                .kms_generate_data_key_bounded(
+                    KmsGenerateDataKeyRequest {
+                        call,
+                        key_id: key_id.into(),
+                        number_of_bytes: 32,
+                        encryption_context: context.clone(),
+                    },
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .map_err(kms_error)?;
+            (
+                output.plaintext,
+                output.ciphertext.into_vec(),
+                Some(output.key_id),
+            )
+        }
+    };
+    let source = body.clone();
+    let encrypted = tokio::task::spawn_blocking(move || {
+        EncryptedBody::encrypt(&source, &plain, wrapped, kms_key, context)
+    })
+    .await
+    .map_err(|_| S3Error::InternalError)??;
+    Ok(StoredBody::Encrypted(Arc::new(encrypted)))
+}
+
+pub(crate) async fn open_body(
+    ctx: &Ctx<'_>,
+    bucket: &str,
+    key: &str,
+    body: &StoredBody,
+    encryption: &ServerSideEncryption,
+) -> Result<StoredBody, S3Error> {
+    let StoredBody::Encrypted(encrypted) = body else {
+        if encryption.algorithm == SseAlgorithm::AwsKms
+            && !matches!(body, StoredBody::Opened(_, _))
+            && (ctx.strict_external
+                || ctx.delegated_identity.is_some()
+                || ctx
+                    .dispatcher
+                    .as_deref()
+                    .is_some_and(InternalDispatcher::strict_sigv4_required))
+        {
+            return Err(S3Error::LegacyKmsMigrationRequired);
+        }
+        return Ok(body.clone());
+    };
+    let context = BTreeMap::from([("aws:s3:arn".into(), format!("arn:aws:s3:::{bucket}/{key}"))]);
+    if encrypted.context != context {
+        return Err(S3Error::InternalError);
+    }
+    let plain = if let Some(key_id) = &encrypted.kms_key {
+        let call = kms_call(ctx, "kms:Decrypt", key_id, &context)?;
+        ctx.dispatcher
+            .as_deref()
+            .ok_or(S3Error::InternalError)?
+            .kms_decrypt_bounded(
+                KmsDecryptRequest {
+                    call,
+                    key_id: Some(key_id.clone()),
+                    ciphertext: SensitiveBytes::new(encrypted.wrapped_key.clone()),
+                    encryption_context: context,
+                },
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .map_err(kms_error)?
+            .plaintext
+    } else {
+        ctx.store
+            .storage_keys
+            .decrypt(&context, &encrypted.wrapped_key)?
+    };
+    Ok(StoredBody::Opened(encrypted.clone(), Arc::new(plain)))
+}
+
+async fn encrypt_upload_part(
+    ctx: &Ctx<'_>,
+    bucket: &str,
+    key: &str,
+    upload: &MultipartUpload,
+    body: &StoredBody,
+) -> Result<StoredBody, S3Error> {
+    let Some(envelope) = &upload.key_envelope else {
+        return encrypt_body(ctx, bucket, key, body, &upload.encryption).await;
+    };
+    let opened = open_body(ctx, bucket, key, envelope, &upload.encryption).await?;
+    let StoredBody::Opened(encrypted, plain) = opened else {
+        return Err(S3Error::InternalError);
+    };
+    let source = body.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        EncryptedBody::encrypt(
+            &source,
+            &plain,
+            encrypted.wrapped_key.clone(),
+            encrypted.kms_key.clone(),
+            encrypted.context.clone(),
+        )
+    })
+    .await
+    .map_err(|_| S3Error::InternalError)??;
+    Ok(StoredBody::Encrypted(Arc::new(output)))
 }
 
 fn with_sse_headers(
@@ -1622,8 +1831,18 @@ pub(crate) async fn put_object_with_event(
         .to_string();
     let tags = parse_tagging_header(header(headers, "x-amz-tagging"))?;
     let now = OffsetDateTime::now_utc();
-    let etag_value = etag(&body);
-    let stored_body = StoredBody::new(body)?;
+    let mut etag_value = etag(&body);
+    let stored_body = encrypt_body(
+        ctx,
+        bucket_name,
+        key,
+        &StoredBody::Inline(body),
+        &encryption,
+    )
+    .await?;
+    if encryption.algorithm == SseAlgorithm::AwsKms {
+        etag_value = stored_body.opaque_etag()?;
+    }
     let mut guard = b.write().await;
     check_write_conditions(headers, guard.objects.get(key))?;
     if let Some(current) = guard.objects.get(key) {
@@ -1789,9 +2008,11 @@ pub(crate) async fn read_object_body(
 ) -> Result<Bytes, S3Error> {
     let bucket = bucket(ctx, bucket_name).await?;
     let guard = bucket.read().await;
-    let body = selected_object(&guard, key, version_id)?.0.body;
+    let object = selected_object(&guard, key, version_id)?.0;
     drop(guard);
-    body.read_all()
+    open_body(ctx, bucket_name, key, &object.body, &object.encryption)
+        .await?
+        .read_all()
 }
 
 pub async fn get_object(
@@ -1807,10 +2028,11 @@ pub async fn get_object(
     check_read_conditions(headers, &object)?;
     drop(guard);
 
+    let opened = open_body(ctx, bucket_name, key, &object.body, &object.encryption).await?;
     let total = object.body.len();
     if let Some(range) = header(headers, "range") {
         let (start, end) = parse_range(range, total)?;
-        let body = object.body.response_body(start, end - start + 1).await?;
+        let body = opened.response_body(start, end - start + 1).await?;
         return Ok(object_response(
             &object,
             Some((start, end, total)),
@@ -1820,7 +2042,7 @@ pub async fn get_object(
             resolved_version.as_deref(),
         ));
     }
-    let body = object.body.response_body(0, total).await?;
+    let body = opened.response_body(0, total).await?;
     Ok(object_response(
         &object,
         None,
@@ -1962,16 +2184,21 @@ fn object_response(
     head: bool,
     version_id: Option<&str>,
 ) -> Response {
-    let mut builder = with_sse_headers(
-        Response::builder()
-            .header("ETag", &object.etag)
-            .header("Content-Type", &object.content_type)
-            .header("Last-Modified", http_date(object.last_modified))
-            .header("Accept-Ranges", "bytes")
-            .header("x-amz-request-id", request_id)
-            .header("x-amz-storage-class", &object.storage_class),
-        &object.encryption,
-    );
+    let builder = Response::builder()
+        .header("ETag", &object.etag)
+        .header("Content-Type", &object.content_type)
+        .header("Last-Modified", http_date(object.last_modified))
+        .header("Accept-Ranges", "bytes")
+        .header("x-amz-request-id", request_id)
+        .header("x-amz-storage-class", &object.storage_class);
+    let mut builder = if matches!(
+        object.body,
+        StoredBody::Encrypted(_) | StoredBody::Opened(_, _)
+    ) {
+        with_sse_headers(builder, &object.encryption)
+    } else {
+        builder.header("x-locallycloud-storage-format", "legacy-plaintext")
+    };
     if let Some(retention) = &object.retention {
         builder = builder
             .header("x-amz-object-lock-mode", retention.mode.as_str())
@@ -2564,10 +2791,25 @@ pub async fn copy_object(
         source_object.tags.clone()
     };
     validate_tags(&tags)?;
-    let copied_etag = source_object.body.single_part_etag()?;
+    let source_body = open_body(
+        ctx,
+        &src_bucket,
+        &src_key,
+        &source_object.body,
+        &source_object.encryption,
+    )
+    .await?;
+    let hash_body = source_body.clone();
+    let mut copied_etag = tokio::task::spawn_blocking(move || hash_body.single_part_etag())
+        .await
+        .map_err(|_| S3Error::InternalError)??;
     let dest = bucket(ctx, dest_bucket).await?;
     let default_encryption = dest.read().await.encryption.clone();
     let encryption = request_encryption(ctx, headers, &default_encryption)?;
+    let copied_body = encrypt_body(ctx, dest_bucket, dest_key, &source_body, &encryption).await?;
+    if encryption.algorithm == SseAlgorithm::AwsKms {
+        copied_etag = copied_body.opaque_etag()?;
+    }
     let mut guard = dest.write().await;
     if let Some(current) = guard.objects.get(dest_key) {
         ensure_not_protected(current, bypass_governance(headers))?;
@@ -2575,7 +2817,7 @@ pub async fn copy_object(
     let now = OffsetDateTime::now_utc();
     let (retention, legal_hold) = object_lock_values(headers, &guard, now)?;
     let new_object = StoredObject {
-        body: source_object.body.clone(),
+        body: copied_body,
         etag: copied_etag,
         checksums: source_object.checksums.clone(),
         content_type,
@@ -2735,6 +2977,16 @@ pub async fn create_multipart_upload(
     let b = bucket(ctx, bucket_name).await?;
     let default_encryption = b.read().await.encryption.clone();
     let encryption = request_encryption(ctx, headers, &default_encryption)?;
+    let key_envelope = Some(
+        encrypt_body(
+            ctx,
+            bucket_name,
+            key,
+            &StoredBody::Inline(Bytes::new()),
+            &encryption,
+        )
+        .await?,
+    );
     let tags = parse_tagging_header(header(headers, "x-amz-tagging"))?;
     let now = OffsetDateTime::now_utc();
     let mut guard = b.write().await;
@@ -2755,6 +3007,7 @@ pub async fn create_multipart_upload(
         retention,
         legal_hold,
         encryption: encryption.clone(),
+        key_envelope,
         parts: BTreeMap::new(),
         parts_revision: 0,
     };
@@ -2819,6 +3072,13 @@ pub async fn upload_part(
 ) -> Result<Response, S3Error> {
     let b = bucket(ctx, bucket_name).await?;
     ensure_upload(&b, key, upload_id).await?;
+    let upload_state = b
+        .read()
+        .await
+        .uploads
+        .get(upload_id)
+        .cloned()
+        .ok_or(S3Error::NoSuchUpload)?;
     let part_number = checked_part_number(part_number)?;
     let (body, checksums) = prepare_put_body(headers, wire_body)?;
     if let Some(md5) = header(headers, "content-md5") {
@@ -2826,7 +3086,14 @@ pub async fn upload_part(
     }
     let part = StoredPart {
         etag: etag(&body),
-        body,
+        body: encrypt_upload_part(
+            ctx,
+            bucket_name,
+            key,
+            &upload_state,
+            &StoredBody::Inline(body),
+        )
+        .await?,
         checksums,
         last_modified: OffsetDateTime::now_utc(),
     };
@@ -2866,6 +3133,13 @@ pub async fn upload_part_copy(
 ) -> Result<Response, S3Error> {
     let b = bucket(ctx, bucket_name).await?;
     ensure_upload(&b, key, upload_id).await?;
+    let upload_state = b
+        .read()
+        .await
+        .uploads
+        .get(upload_id)
+        .cloned()
+        .ok_or(S3Error::NoSuchUpload)?;
     let part_number = checked_part_number(part_number)?;
     let source = header(headers, "x-amz-copy-source")
         .ok_or_else(|| S3Error::InvalidArgument("x-amz-copy-source is required".into()))?;
@@ -2876,15 +3150,28 @@ pub async fn upload_part_copy(
         selected_object(&guard, &src_key, src_version.as_deref())?.0
     };
     check_copy_conditions(headers, &source_object)?;
-    let body = if let Some(range) = header(headers, "x-amz-copy-source-range") {
+    let source_body = open_body(
+        ctx,
+        &src_bucket,
+        &src_key,
+        &source_object.body,
+        &source_object.encryption,
+    )
+    .await?;
+    let (start, len) = if let Some(range) = header(headers, "x-amz-copy-source-range") {
         let (start, end) = parse_range(range, source_object.size())?;
-        source_object.body.read_range(start, end + 1)?
+        (start, end - start + 1)
     } else {
-        source_object.body.read_all()?
+        (0, source_object.size())
     };
+    let body = StoredBody::Range(Box::new(source_body), start, len);
+    let hash_body = body.clone();
+    let etag = tokio::task::spawn_blocking(move || hash_body.single_part_etag())
+        .await
+        .map_err(|_| S3Error::InternalError)??;
     let part = StoredPart {
-        etag: etag(&body),
-        body,
+        etag,
+        body: encrypt_upload_part(ctx, bucket_name, key, &upload_state, &body).await?,
         checksums: BTreeMap::new(),
         last_modified: OffsetDateTime::now_utc(),
     };
@@ -2992,12 +3279,17 @@ pub async fn complete_multipart_upload(
     }
     let mut selected = Vec::with_capacity(requested.len());
     for (number, expected_etag, checksums) in &requested {
-        let part = upload.parts.get(number).ok_or(S3Error::InvalidPart)?;
+        let mut part = upload
+            .parts
+            .get(number)
+            .cloned()
+            .ok_or(S3Error::InvalidPart)?;
+        part.body = open_body(ctx, bucket_name, key, &part.body, &upload.encryption).await?;
         if part.etag != *expected_etag {
             return Err(S3Error::InvalidPart);
         }
         for (algorithm, expected) in checksums {
-            validate_checksum(*algorithm, expected, &part.body)?;
+            validate_checksum(*algorithm, expected, &part.body.read_all()?)?;
         }
         selected.push((*number, part.clone()));
     }
@@ -3013,7 +3305,14 @@ pub async fn complete_multipart_upload(
         let mut digests = Vec::with_capacity(selected.len());
         let mut object_parts = Vec::with_capacity(selected.len());
         for (number, part) in selected {
-            digests.push(md5_raw(&part.body));
+            let etag = part.body.single_part_etag()?;
+            let hex = etag.trim_matches('"');
+            let mut digest = [0; 16];
+            for (i, byte) in digest.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                    .map_err(|_| S3Error::InternalError)?;
+            }
+            digests.push(digest);
             object_parts.push(StoredObjectPart {
                 number,
                 size: part.body.len(),
@@ -3021,10 +3320,11 @@ pub async fn complete_multipart_upload(
             });
             bodies.push(part.body);
         }
-        Ok::<_, S3Error>((StoredBody::from_parts(&bodies)?, digests, object_parts))
+        Ok::<_, S3Error>((StoredBody::Parts(bodies), digests, object_parts))
     })
     .await
     .map_err(|_| S3Error::InternalError)??;
+    let body = encrypt_upload_part(ctx, bucket_name, key, &upload, &body).await?;
     let mut guard = b.write().await;
     let current = guard
         .uploads

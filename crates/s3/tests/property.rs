@@ -737,7 +737,7 @@ proptest! {
                 state.versioning = VersioningState::Enabled;
                 state.notification_configuration = configuration.clone();
             }
-            let concurrent_ctx = locallycloud_s3::ops::Ctx { store: &concurrent_store, account: account_a, region: "us-east-1", request_id: "concurrent", dispatcher: None };
+            let concurrent_ctx = locallycloud_s3::ops::Ctx { store: &concurrent_store, account: account_a, region: "us-east-1", request_id: "concurrent", dispatcher: None, identity: None, delegated_identity: None, strict_external: false };
             let headers = HeaderMap::new();
             let (first, second) = tokio::join!(
                 locallycloud_s3::ops::put_object(&concurrent_ctx, "bucket", "a", &headers, Bytes::from(left.clone())),
@@ -753,7 +753,7 @@ proptest! {
                 state.versioning = VersioningState::Enabled;
                 state.notification_configuration = configuration;
             }
-            let sequential_ctx = locallycloud_s3::ops::Ctx { store: &sequential_store, account: account_a, region: "us-east-1", request_id: "sequential", dispatcher: None };
+            let sequential_ctx = locallycloud_s3::ops::Ctx { store: &sequential_store, account: account_a, region: "us-east-1", request_id: "sequential", dispatcher: None, identity: None, delegated_identity: None, strict_external: false };
             let sequential_results = vec![
                 locallycloud_s3::ops::put_object(&sequential_ctx, "bucket", "a", &headers, Bytes::from(left)).await.expect("first sequential write"),
                 locallycloud_s3::ops::put_object(&sequential_ctx, "bucket", "b", &headers, Bytes::from(right)).await.expect("second sequential write"),
@@ -764,10 +764,18 @@ proptest! {
             let sequential_state = sequential_bucket.read().await;
             let state_projection = |state: &locallycloud_s3::store::BucketState| {
                 state.objects.iter().map(|(key, object)| {
-                    (key.clone(), (object.body.read_all().expect("stored body is readable"), object.etag.clone(), state.versions[key].len()))
+                    (key.clone(), (object.size(), object.etag.clone(), state.versions[key].len()))
                 }).collect::<BTreeMap<_, _>>()
             };
             prop_assert_eq!(state_projection(&concurrent_state), state_projection(&sequential_state));
+            drop(concurrent_state);
+            drop(sequential_state);
+            for key in ["a", "b"] {
+                let concurrent = locallycloud_s3::ops::get_object(&concurrent_ctx, "bucket", key, &headers, None).await.expect("concurrent GET");
+                let sequential = locallycloud_s3::ops::get_object(&sequential_ctx, "bucket", key, &headers, None).await.expect("sequential GET");
+                prop_assert_eq!(axum::body::to_bytes(concurrent.into_body(), usize::MAX).await.unwrap(), axum::body::to_bytes(sequential.into_body(), usize::MAX).await.unwrap());
+            }
+
             let event_projection = |results: Vec<locallycloud_s3::ops::MutationResult>| {
                 results.into_iter().flat_map(|result| result.events).map(|event| (event.key, event.event_type.event_name(), event.size, event.etag)).collect::<BTreeSet<_>>()
             };
