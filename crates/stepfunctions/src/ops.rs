@@ -445,7 +445,13 @@ pub async fn delete_state_machine(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
     let Some(handle) = ctx.store.get_machine(ctx.account, ctx.region, &target.name) else {
         return Ok(json!({}));
     };
-    handle.write().await.status = StateMachineStatus::Deleting;
+    {
+        let mut machine = handle.write().await;
+        if machine.status == StateMachineStatus::Deleting {
+            return Ok(json!({}));
+        }
+        machine.status = StateMachineStatus::Deleting;
+    }
 
     let store = (*ctx.store).clone();
     let account = ctx.account.to_string();
@@ -454,6 +460,9 @@ pub async fn delete_state_machine(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
     tokio::spawn(async move {
         // Preserve an observable DELETING state before completing the asynchronous delete.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        store
+            .wait_for_execution_workers(&account, &region, &name)
+            .await;
         store.remove_machine(&account, &region, &name);
     });
     Ok(json!({}))
@@ -1269,6 +1278,15 @@ pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
         ctx.region,
         ctx.account,
     );
+    let worker = ctx
+        .store
+        .admit_execution_worker(ctx.account, ctx.region, &target.name)
+        .await
+        .ok_or_else(|| {
+            SfnError::StateMachineDeleting(format!(
+                "State machine {state_machine_arn} is deleting or was deleted"
+            ))
+        })?;
     let sm = Arc::new(StateMachine::parse(&target.definition)?);
     let execution_name = str_field(v, "name")
         .map(String::from)
@@ -1365,6 +1383,7 @@ pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
     interpreter.execution_start_time = start_time;
     let run_handle = exec_handle.clone();
     tokio::spawn(async move {
+        let _worker = worker;
         if let Err(error) = interpreter.run(run_handle.clone()).await {
             let mut execution = run_handle.write().await;
             execution.status = Status::Failed;
@@ -1397,6 +1416,15 @@ pub async fn start_sync_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
         ctx.region,
         ctx.account,
     );
+    let worker = ctx
+        .store
+        .admit_execution_worker(ctx.account, ctx.region, &target.name)
+        .await
+        .ok_or_else(|| {
+            SfnError::StateMachineDeleting(format!(
+                "State machine {state_machine_arn} is deleting or was deleted"
+            ))
+        })?;
     let sm = Arc::new(StateMachine::parse(&target.definition)?);
     let execution_name = str_field(v, "name")
         .map(String::from)
@@ -1452,6 +1480,7 @@ pub async fn start_sync_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
     );
     interpreter.execution_input = input.clone();
     interpreter.execution_start_time = start_time;
+    let _worker = worker;
     interpreter.run(execution.clone()).await?;
     let completed = execution.read().await;
     let mut response = json!({
@@ -1730,6 +1759,21 @@ pub async fn redrive_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
         .store
         .get_execution(arn)
         .ok_or_else(|| SfnError::ExecutionDoesNotExist(format!("{arn} does not exist")))?;
+    let machine_name = handle
+        .read()
+        .await
+        .state_machine_arn
+        .split(':')
+        .nth(6)
+        .unwrap_or_default()
+        .to_owned();
+    let worker = ctx
+        .store
+        .admit_execution_worker(ctx.account, ctx.region, &machine_name)
+        .await
+        .ok_or_else(|| {
+            SfnError::StateMachineDeleting("State machine is deleting or was deleted".into())
+        })?;
     let (
         state,
         input,
@@ -1808,6 +1852,7 @@ pub async fn redrive_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
     interpreter.execution_start_time = execution_start_time;
     let run_handle = handle.clone();
     tokio::spawn(async move {
+        let _worker = worker;
         if let Err(error) = interpreter.redrive(run_handle.clone(), state, input).await {
             let mut execution = run_handle.write().await;
             execution.status = Status::Failed;

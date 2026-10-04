@@ -12,6 +12,7 @@ use crate::proto::Query;
 pub struct CfnStore {
     stacks: DashMap<String, Stack>,
     change_sets: DashMap<String, ChangeSet>,
+    deleted: DashMap<String, (std::time::Instant, Stack)>,
 }
 
 #[derive(Clone)]
@@ -54,6 +55,7 @@ impl CfnStore {
         Arc::new(CfnStore {
             stacks: DashMap::new(),
             change_sets: DashMap::new(),
+            deleted: DashMap::new(),
         })
     }
 
@@ -77,6 +79,12 @@ impl CfnStore {
             .iter()
             .find(|e| e.key().starts_with(&prefix) && e.value().stack_id == name_or_id)
             .map(|e| e.value().clone())
+            .or_else(|| {
+                self.expire_deleted();
+                self.deleted
+                    .get(&Self::key(account, region, name_or_id))
+                    .map(|entry| entry.value().1.clone())
+            })
     }
 
     pub fn put(&self, account: &str, region: &str, stack: Stack) {
@@ -84,10 +92,37 @@ impl CfnStore {
             .insert(Self::key(account, region, &stack.stack_name), stack);
     }
 
-    pub fn remove(&self, account: &str, region: &str, name: &str) -> Option<Stack> {
+    fn expire_deleted(&self) {
+        // AWS retains deleted-stack descriptions for 90 days, addressed by stack ID.
+        self.deleted.retain(|_, (deleted_at, _)| {
+            deleted_at.elapsed() < std::time::Duration::from_secs(90 * 24 * 60 * 60)
+        });
+    }
+
+    pub fn archive(&self, account: &str, region: &str, stack: Stack) {
+        self.expire_deleted();
         self.stacks
-            .remove(&Self::key(account, region, name))
-            .map(|(_, s)| s)
+            .remove(&Self::key(account, region, &stack.stack_name));
+        let prefix = format!("{account}:{region}:");
+        self.change_sets
+            .retain(|key, change| !key.starts_with(&prefix) || change.stack_id != stack.stack_id);
+        self.deleted.insert(
+            Self::key(account, region, &stack.stack_id),
+            (std::time::Instant::now(), stack),
+        );
+    }
+
+    pub fn list_with_deleted(&self, account: &str, region: &str) -> Vec<Stack> {
+        self.expire_deleted();
+        let mut stacks = self.list(account, region);
+        let prefix = format!("{account}:{region}:");
+        stacks.extend(
+            self.deleted
+                .iter()
+                .filter(|entry| entry.key().starts_with(&prefix))
+                .map(|entry| entry.value().1.clone()),
+        );
+        stacks
     }
 
     pub fn list(&self, account: &str, region: &str) -> Vec<Stack> {
@@ -171,6 +206,44 @@ impl CfnStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleted_history_is_scoped_expires_and_does_not_occupy_the_name() {
+        let store = CfnStore::new();
+        let mut stack = Stack {
+            stack_id: "arn:stack:old".into(),
+            stack_name: "stack".into(),
+            status: crate::model::StackStatus::DeleteComplete,
+            template_body: "{\"Resources\":{}}".into(),
+            parameters: Default::default(),
+            resources: Vec::new(),
+            outputs: Vec::new(),
+            events: Vec::new(),
+            tags: Vec::new(),
+            creation_time: String::new(),
+            last_updated_time: None,
+        };
+        store.archive("account", "region", stack.clone());
+        assert!(store.find("account", "region", "stack").is_none());
+        assert!(store.find("other", "region", "arn:stack:old").is_none());
+        assert!(store.find("account", "other", "arn:stack:old").is_none());
+        assert!(store.find("account", "region", "arn:stack:old").is_some());
+        stack.stack_id = "arn:stack:new".into();
+        stack.status = crate::model::StackStatus::CreateComplete;
+        store.put("account", "region", stack);
+        assert_eq!(
+            store.find("account", "region", "stack").unwrap().stack_id,
+            "arn:stack:new"
+        );
+        assert_eq!(store.list_with_deleted("account", "region").len(), 2);
+        store
+            .deleted
+            .get_mut(&CfnStore::key("account", "region", "arn:stack:old"))
+            .unwrap()
+            .0 = std::time::Instant::now() - std::time::Duration::from_secs(91 * 24 * 60 * 60);
+        assert!(store.find("account", "region", "arn:stack:old").is_none());
+        assert_eq!(store.list_with_deleted("account", "region").len(), 1);
+    }
 
     #[test]
     fn change_set_is_claimed_once_under_contention() {

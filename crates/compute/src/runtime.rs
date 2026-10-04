@@ -58,6 +58,14 @@ pub enum RuntimeError {
     ExecutionFailed { reason: String },
 }
 
+/// Incremental captured output. Cursors count original bytes, including evicted bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOutput {
+    pub text: String,
+    pub next_cursor: u64,
+    pub dropped_bytes: u64,
+}
+
 /// Abstraction over a workload-execution backend.
 #[async_trait]
 pub trait ComputeRuntime: Send + Sync {
@@ -130,6 +138,28 @@ pub trait ComputeRuntime: Send + Sync {
     /// Backends without durable task state retain the rootfs for manual recovery.
     async fn reconcile_orphaned_task(&self, _task_id: &str) -> Result<bool, RuntimeError> {
         Ok(false)
+    }
+
+    /// Consume output after an absolute byte cursor. Native backends bound retained output.
+    async fn read_output(&self, task_id: &str, cursor: u64) -> Result<TaskOutput, RuntimeError> {
+        let text = self.get_output(task_id).await?;
+        let next_cursor = text.len() as u64;
+        let start = (cursor as usize).min(text.len());
+        let start = (start..=text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(text.len());
+        Ok(TaskOutput {
+            text: text[start..].into(),
+            next_cursor,
+            dropped_bytes: 0,
+        })
+    }
+
+    /// Finalize resources only after the backend has confirmed termination.
+    async fn release_task(&self, _task_id: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "task finalization unavailable for this backend".into(),
+        })
     }
 
     /// Retrieve the captured stdout of a completed or stopped task.

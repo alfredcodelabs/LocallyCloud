@@ -44,7 +44,7 @@ use uuid::Uuid;
 use crate::code_store::CodeStore;
 use crate::error::LambdaError;
 use crate::exec_env::{build_execution_env, ExecEnvInputs};
-use crate::model::{LambdaFunction, LayerStore};
+use crate::model::{FunctionStore, LambdaFunction, LayerStore};
 use crate::rootfs::build_rootfs;
 use crate::runtime_api::{FunctionErrorType, InvocationBroker, Outcome};
 
@@ -374,6 +374,7 @@ pub struct Executor {
     /// Set after construction so extension phase completion can return an env to the pool
     /// without delaying the HTTP response from the runtime.
     self_ref: OnceLock<Weak<Executor>>,
+    function_store: Mutex<Weak<FunctionStore>>,
     code_store: Arc<CodeStore>,
     layers: Arc<LayerStore>,
     rootfs_root: PathBuf,
@@ -397,6 +398,10 @@ pub struct Executor {
     log_state: DashMap<String, ExecutionLogState>,
     /// Rootfs owned by this process, including environments not yet returned to a warm pool.
     owned_envs: DashMap<String, File>,
+    environment_functions: DashMap<String, String>,
+    memory_budget_mb: u64,
+    memory_reservations: Arc<Mutex<HashMap<String, u64>>>,
+    stopping: DashMap<String, Arc<tokio::sync::Mutex<bool>>>,
     closed: AtomicBool,
     invocations: tokio::sync::RwLock<()>,
     reaper_gate: tokio::sync::Mutex<()>,
@@ -429,7 +434,31 @@ pub struct InvokeResult {
 
 struct ExecutionLogState {
     stream_name: String,
-    output_bytes: usize,
+    output_bytes: u64,
+    account: String,
+    region: String,
+    function_name: String,
+    role: String,
+}
+
+/// Cancellation keeps ownership until asynchronous process cleanup confirms termination.
+struct EnvironmentLease {
+    executor: Weak<Executor>,
+    env_key: String,
+    armed: bool,
+}
+
+impl Drop for EnvironmentLease {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(executor) = self.executor.upgrade() {
+                let key = self.env_key.clone();
+                tokio::spawn(async move {
+                    executor.stop_env_reason(&key, "FAILURE").await;
+                });
+            }
+        }
+    }
 }
 
 /// Pool state guarded as one unit so invalidation cannot race with returning an environment.
@@ -477,6 +506,7 @@ impl Executor {
         Executor {
             broker,
             self_ref: OnceLock::new(),
+            function_store: Mutex::new(Weak::new()),
             code_store,
             layers: Arc::new(LayerStore::new()),
             rootfs_root: rootfs_root.into(),
@@ -494,6 +524,10 @@ impl Executor {
             install_host_runtime: false,
             log_state: DashMap::new(),
             owned_envs: DashMap::new(),
+            environment_functions: DashMap::new(),
+            memory_budget_mb: 1024,
+            memory_reservations: Arc::new(Mutex::new(HashMap::new())),
+            stopping: DashMap::new(),
             closed: AtomicBool::new(false),
             invocations: tokio::sync::RwLock::new(()),
             reaper_gate: tokio::sync::Mutex::new(()),
@@ -509,6 +543,10 @@ impl Executor {
     /// Attach the EC2 control plane used for real VPC ENI and endpoint policy.
     pub fn attach_ec2(&self, ec2: Arc<Ec2Handler>) {
         *self.ec2.lock().unwrap() = Some(ec2);
+    }
+
+    pub(crate) fn attach_function_store(&self, store: &Arc<FunctionStore>) {
+        *self.function_store.lock().unwrap() = Arc::downgrade(store);
     }
 
     pub(crate) fn bind_arc(self: &Arc<Self>) {
@@ -532,6 +570,22 @@ impl Executor {
                 _ => Err("expected an integer from 0 to 1024".into()),
             },
         }
+    }
+
+    pub(crate) fn parse_memory_budget(value: Option<&str>) -> Result<u64, String> {
+        match value {
+            None => Ok(1024),
+            Some(raw) => raw
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0 && *value <= u64::from(u32::MAX))
+                .ok_or_else(|| "expected a positive memory budget in MiB".into()),
+        }
+    }
+
+    pub(crate) fn with_memory_budget(mut self, memory_mb: u64) -> Self {
+        self.memory_budget_mb = memory_mb;
+        self
     }
 
     pub(crate) fn with_max_warm_total(mut self, limit: usize) -> Self {
@@ -588,6 +642,14 @@ impl Executor {
                 "Lambda executor is shutting down".into(),
             ));
         }
+        if let Some(store) = self.function_store.lock().unwrap().upgrade() {
+            if !store.execution_snapshot_exists(account, region, func) {
+                return Err(LambdaError::ResourceNotFound(format!(
+                    "function no longer exists: {}",
+                    func.function_arn
+                )));
+            }
+        }
         if func.package_type != "Zip" {
             return Err(LambdaError::NotImplemented(
                 "image-package invocation is not yet supported".into(),
@@ -632,6 +694,15 @@ impl Executor {
             Some(key) => key,
             None => match self.cold_start(account, region, func, code).await {
                 Ok(key) => key,
+                Err(e @ LambdaError::TooManyRequests(_)) => {
+                    self.publish_throttle_metric(
+                        account,
+                        region,
+                        func,
+                        &Uuid::new_v4().to_string(),
+                    );
+                    return Err(e);
+                }
                 Err(e) => {
                     self.publish_invocation_metrics(
                         account,
@@ -644,7 +715,7 @@ impl Executor {
                     return Ok(InvokeResult {
                         outcome: Outcome::Error {
                             error_type: FunctionErrorType::Unhandled,
-                            payload: serde_json::json!({"errorMessage": e})
+                            payload: serde_json::json!({"errorMessage": e.to_string()})
                                 .to_string()
                                 .into_bytes(),
                         },
@@ -657,6 +728,7 @@ impl Executor {
             },
         };
 
+        let mut environment_lease = self.environment_lease(&env_key);
         let timeout_ms = (func.timeout as i64) * 1000;
         let started = Instant::now();
         let (request_id, rx) = self.broker.submit_traced(
@@ -701,22 +773,7 @@ impl Executor {
             Some(invoke_elapsed.as_secs_f64() * 1000.0),
         );
         let broker_logs = self.broker.take_logs(&request_id);
-        let captured = self.runtime.get_output(&env_key).await.unwrap_or_default();
-        let (fallback_logs, log_stream_name) = match self.log_state.get_mut(&env_key) {
-            Some(mut state) => {
-                let start = if captured.len() >= state.output_bytes
-                    && captured.is_char_boundary(state.output_bytes)
-                {
-                    state.output_bytes
-                } else {
-                    0
-                };
-                let logs = captured[start..].to_string();
-                state.output_bytes = captured.len();
-                (logs, Some(state.stream_name.clone()))
-            }
-            None => (captured, None),
-        };
+        let (fallback_logs, log_stream_name) = self.read_environment_logs(&env_key).await;
         let has_extensions = self.broker.has_extensions(&env_key);
         let logs = if has_extensions || crate::rootfs::is_custom(func.runtime.as_deref()) {
             fallback_logs
@@ -725,13 +782,18 @@ impl Executor {
                 .map(|chunks| chunks.concat())
                 .unwrap_or(fallback_logs)
         };
-        let result = InvokeResult {
+        let mut result = InvokeResult {
             outcome,
             logs,
             request_id: Some(request_id.clone()),
             log_stream_name,
             billed_duration_ms,
         };
+
+        if !matches!(result.outcome, Outcome::Success(_)) || !has_extensions {
+            self.publish_invocation_logs(account, region, func, &result)
+                .await?;
+        }
 
         if matches!(result.outcome, Outcome::Success(_)) && has_extensions {
             let deadline = tokio::time::Instant::from_std(
@@ -748,19 +810,8 @@ impl Executor {
                         .wait_extensions_rearmed(&env_key, &request_id, deadline)
                         .await;
                     let mut complete = background_result;
-                    let captured = executor
-                        .runtime
-                        .get_output(&env_key)
-                        .await
-                        .unwrap_or_default();
-                    if let Some(mut state) = executor.log_state.get_mut(&env_key) {
-                        if captured.len() >= state.output_bytes
-                            && captured.is_char_boundary(state.output_bytes)
-                        {
-                            complete.logs.push_str(&captured[state.output_bytes..]);
-                        }
-                        state.output_bytes = captured.len();
-                    }
+                    let (tail, _) = executor.read_environment_logs(&env_key).await;
+                    complete.logs.push_str(&tail);
                     complete.billed_duration_ms = started.elapsed().as_millis() as u64;
                     if let Err(error) = executor
                         .publish_invocation_logs(&account, &region, &function, &complete)
@@ -779,15 +830,19 @@ impl Executor {
                         executor.stop_env_reason(&env_key, reason).await;
                     }
                 });
+                environment_lease.armed = false;
                 return Ok(result);
             }
             // Standalone test executors have no Arc owner to hold the environment lease.
-            if self
+            let phase = self
                 .broker
                 .wait_extensions_rearmed(&env_key, &request_id, deadline)
-                .await
-                .is_ok()
-            {
+                .await;
+            let (tail, _) = self.read_environment_logs(&env_key).await;
+            result.logs.push_str(&tail);
+            self.publish_invocation_logs(account, region, func, &result)
+                .await?;
+            if phase.is_ok() {
                 self.return_warm(&pool_key, &env_key, generation).await;
             } else {
                 self.stop_env_reason(&env_key, "TIMEOUT").await;
@@ -809,8 +864,7 @@ impl Executor {
                 self.stop_env_reason(&env_key, reason).await;
             }
         }
-        self.publish_invocation_logs(account, region, func, &result)
-            .await?;
+        environment_lease.armed = false;
         Ok(result)
     }
 
@@ -1170,15 +1224,184 @@ impl Executor {
             std::fs::remove_file(owner_marker_path(owner_dir, env_key))
         });
         if let Err(error) = result {
-            tracing::warn!(%env_key, %error, "rootfs cleanup deferred");
+            tracing::warn!(%env_key, %error, "rootfs cleanup deferred; ownership retained");
+            self.owned_envs.insert(env_key.to_owned(), marker);
+            let gate = self.stopping.entry(env_key.to_owned()).or_default().clone();
+            if let Ok(mut finalized) = gate.try_lock() {
+                *finalized = true;
+            }
+            return;
         }
         drop(marker);
     }
 
     fn cleanup_owned_rootfs(&self, env_key: &str) {
+        self.broker.release(env_key);
         if let Some((_, marker)) = self.owned_envs.remove(env_key) {
             self.cleanup_rootfs_with_marker(env_key, marker);
+            if !self.owned_envs.contains_key(env_key) {
+                self.environment_functions.remove(env_key);
+            }
+            self.memory_reservations.lock().unwrap().remove(env_key);
         }
+    }
+
+    async fn reserve_memory(&self, env_key: &str, memory_mb: u64) -> Result<(), LambdaError> {
+        // Include bounded log capture and supervisor overhead in addition to guest memory.
+        let required = memory_mb.saturating_add(32);
+        loop {
+            {
+                let mut reservations = self.memory_reservations.lock().unwrap();
+                let used: u64 = reservations.values().sum();
+                if required <= self.memory_budget_mb.saturating_sub(used) {
+                    reservations.insert(env_key.to_owned(), required);
+                    return Ok(());
+                }
+            }
+            let idle = {
+                let _gate = self.warm_gate.lock().unwrap();
+                let oldest = self
+                    .warm
+                    .iter()
+                    .flat_map(|entry| {
+                        let pool = entry.lock().unwrap();
+                        pool.envs
+                            .iter()
+                            .map(|env| (env.sequence, entry.key().clone(), env.env_key.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .min_by_key(|entry| entry.0);
+                oldest.map(|(_, pool_key, key)| {
+                    if let Some(pool) = self.warm.get(&pool_key) {
+                        pool.lock().unwrap().envs.retain(|env| env.env_key != key);
+                    }
+                    key
+                })
+            };
+            match idle {
+                Some(key) => self.stop_env(&key).await,
+                None => return Err(LambdaError::TooManyRequests(
+                    format!("Local compute memory budget exhausted ({required} MiB required, {} MiB budget)", self.memory_budget_mb)
+                )),
+            }
+        }
+    }
+
+    fn environment_lease(&self, env_key: &str) -> EnvironmentLease {
+        EnvironmentLease {
+            executor: self.self_ref.get().cloned().unwrap_or_default(),
+            env_key: env_key.to_owned(),
+            armed: true,
+        }
+    }
+
+    async fn read_environment_logs(&self, env_key: &str) -> (String, Option<String>) {
+        let (cursor, stream) = self
+            .log_state
+            .get(env_key)
+            .map(|state| (state.output_bytes, Some(state.stream_name.clone())))
+            .unwrap_or((0, None));
+        let output = match self.runtime.read_output(env_key, cursor).await {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(%env_key, %error, "guest logs could not be read");
+                return (String::new(), stream);
+            }
+        };
+        if let Some(mut state) = self.log_state.get_mut(env_key) {
+            state.output_bytes = output.next_cursor;
+        }
+        let mut logs = output.text;
+        if output.dropped_bytes > 0 {
+            logs.insert_str(
+                0,
+                &format!(
+                    "[locallycloud: {} log bytes dropped because the capture limit was exceeded]\n",
+                    output.dropped_bytes
+                ),
+            );
+        }
+        (logs, stream)
+    }
+
+    async fn publish_environment_tail(&self, env_key: &str) -> Result<(), LambdaError> {
+        let Some(state) = self.log_state.get(env_key) else {
+            return Ok(());
+        };
+        let (account, region, name, role) = (
+            state.account.clone(),
+            state.region.clone(),
+            state.function_name.clone(),
+            state.role.clone(),
+        );
+        drop(state);
+        let (logs, stream) = self.read_environment_logs(env_key).await;
+        if logs.is_empty() {
+            return Ok(());
+        }
+        let Some(registry) = self.registry.upgrade() else {
+            return Ok(());
+        };
+        let sink = registry
+            .log_sink(&ServiceName::new("logs"))
+            .ok_or_else(|| LambdaError::InternalError("CloudWatch Logs is unavailable".into()))?;
+        let scope = LogScope::new(&account, &region);
+        let correlation = Uuid::new_v4().to_string();
+        let context = ProducerContext {
+            source_service: "lambda".into(),
+            identity: CallerIdentity::AssumedRole {
+                role_arn: role,
+                session_name: correlation.clone(),
+            },
+            correlation: CorrelationContext {
+                flow_id: correlation,
+                span_id: Uuid::new_v4().to_string(),
+            },
+            loop_depth: 0,
+        };
+        // Resolve rather than recreate: stack deletion may intentionally remove the group.
+        let group = sink
+            .resolve_group(
+                scope.clone(),
+                ProducerGroupSpec {
+                    name: format!("/aws/lambda/{name}"),
+                },
+                context.clone(),
+            )
+            .await
+            .map_err(|error| {
+                LambdaError::InternalError(format!("final logs publication failed: {error}"))
+            })?;
+        let target = sink
+            .ensure_stream(
+                scope.clone(),
+                group,
+                ProducerStreamSpec {
+                    name: stream.unwrap_or_else(|| env_key.to_owned()),
+                },
+                context.clone(),
+            )
+            .await
+            .map_err(|error| {
+                LambdaError::InternalError(format!("final logs publication failed: {error}"))
+            })?;
+        let timestamp_ms = now_ms();
+        sink.append(
+            scope,
+            target,
+            logs.lines()
+                .map(|line| ProducerLogEvent {
+                    timestamp_ms,
+                    message: line.to_owned(),
+                })
+                .collect(),
+            context,
+        )
+        .await
+        .map_err(|error| {
+            LambdaError::InternalError(format!("final logs publication failed: {error}"))
+        })?;
+        Ok(())
     }
 
     /// Cold-start a new execution environment (extract code, build rootfs, launch the guest).
@@ -1188,8 +1411,36 @@ impl Executor {
         region: &str,
         func: &LambdaFunction,
         code: &[u8],
-    ) -> Result<String, String> {
+    ) -> Result<String, LambdaError> {
         let env_key = format!("{}-{}", sanitize(&func.function_arn), Uuid::new_v4());
+        self.reserve_memory(&env_key, u64::from(func.memory_size))
+            .await?;
+        self.environment_functions.insert(
+            env_key.clone(),
+            crate::model::function_arn(region, account, &func.function_name),
+        );
+        let mut lease = self.environment_lease(&env_key);
+        let result = self
+            .cold_start_inner(account, region, func, code, env_key.clone())
+            .await;
+        if result.is_ok() {
+            lease.armed = false;
+        }
+        if result.is_err() && !self.owned_envs.contains_key(&env_key) {
+            self.environment_functions.remove(&env_key);
+            self.memory_reservations.lock().unwrap().remove(&env_key);
+        }
+        result.map_err(LambdaError::InternalError)
+    }
+
+    async fn cold_start_inner(
+        &self,
+        account: &str,
+        region: &str,
+        func: &LambdaFunction,
+        code: &[u8],
+        env_key: String,
+    ) -> Result<String, String> {
         let stored = self
             .code_store
             .store_zip(account, region, &func.function_name, code)
@@ -1553,6 +1804,10 @@ impl Executor {
             ExecutionLogState {
                 stream_name: log_stream,
                 output_bytes: 0,
+                account: account.to_owned(),
+                region: region.to_owned(),
+                function_name: func.function_name.clone(),
+                role: func.role.clone(),
             },
         );
         if self.broker.has_extensions(&env_key) {
@@ -1562,7 +1817,7 @@ impl Executor {
                 return Err(format!("extension initialization failed: {error}"));
             }
         }
-        Ok(env_key)
+        Ok(env_key.clone())
     }
 
     /// Take a non-expired warm environment and its generation for `pool_key`.
@@ -1585,11 +1840,15 @@ impl Executor {
     async fn return_warm(&self, pool_key: &str, env_key: &str, generation: u64) {
         let to_stop = {
             let _gate = self.warm_gate.lock().unwrap();
+            if !self.owned_envs.contains_key(env_key) {
+                return;
+            }
             let mut to_stop = Vec::new();
             {
                 let entry = self.warm.entry(pool_key.to_string()).or_default();
                 let mut pool = entry.lock().unwrap();
-                if pool.generation != generation
+                if self.closed.load(Ordering::Acquire)
+                    || pool.generation != generation
                     || pool.envs.len() >= self.max_warm_per_key
                     || self.max_warm_total == 0
                 {
@@ -1672,6 +1931,14 @@ impl Executor {
             }
         }
         self.recover_orphaned_guests().await;
+        let failed: Vec<String> = self
+            .stopping
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in failed {
+            self.stop_env(&key).await;
+        }
         let keys: Vec<String> = self.warm.iter().map(|entry| entry.key().clone()).collect();
         for key in keys {
             self.evict_expired(&key).await;
@@ -1722,9 +1989,16 @@ impl Executor {
     }
 
     async fn stop_env_reason(&self, env_key: &str, reason: &str) {
-        let Some((_, marker)) = self.owned_envs.remove(env_key) else {
+        let gate = self.stopping.entry(env_key.to_owned()).or_default().clone();
+        let mut finalized = gate.lock().await;
+        if !self.owned_envs.contains_key(env_key) {
+            self.broker.release(env_key);
+            self.log_state.remove(env_key);
+            self.environment_functions.remove(env_key);
+            self.memory_reservations.lock().unwrap().remove(env_key);
+            self.stopping.remove(env_key);
             return;
-        };
+        }
         if self.broker.has_extensions(env_key) {
             let grace = Duration::from_secs(2);
             let deadline_ms = unix_ms() + grace.as_millis() as i64;
@@ -1742,26 +2016,85 @@ impl Executor {
             tokio::time::sleep(grace).await;
         }
         self.broker.stop(env_key);
-        self.broker.cleanup_extensions(env_key);
-        self.log_state.remove(env_key);
-        let stopped = match self.runtime.stop_task(env_key).await {
-            Ok(_) | Err(RuntimeError::TaskAlreadyCompleted { .. }) => true,
-            Err(error) => match self.runtime.reconcile_orphaned_task(env_key).await {
-                Ok(true) => true,
-                Ok(false) => {
-                    tracing::warn!(%env_key, %error, "guest stop could not be confirmed; rootfs retained");
-                    false
-                }
-                Err(reconcile_error) => {
-                    tracing::warn!(%env_key, %error, %reconcile_error, "guest stop could not be confirmed; rootfs retained");
-                    false
-                }
-            },
+        let stopped = if *finalized {
+            true
+        } else {
+            match self.runtime.stop_task(env_key).await {
+                Ok(_) | Err(RuntimeError::TaskAlreadyCompleted { .. }) => true,
+                Err(error) => match self.runtime.reconcile_orphaned_task(env_key).await {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        tracing::warn!(%env_key, %error, "guest stop could not be confirmed; rootfs retained");
+                        false
+                    }
+                    Err(reconcile_error) => {
+                        tracing::warn!(%env_key, %error, %reconcile_error, "guest stop could not be confirmed; rootfs retained");
+                        false
+                    }
+                },
+            }
         };
         if stopped {
+            if !*finalized {
+                if let Err(error) = self.publish_environment_tail(env_key).await {
+                    tracing::warn!(%env_key, %error, "final guest logs could not be published");
+                }
+                if let Err(error) = self.runtime.release_task(env_key).await {
+                    tracing::warn!(%env_key, %error, "guest runtime cleanup deferred; ownership retained");
+                    return;
+                }
+                *finalized = true;
+            }
+            self.broker.release(env_key);
+            self.log_state.remove(env_key);
             self.release_vpc_runtime(env_key);
-            self.cleanup_rootfs_with_marker(env_key, marker);
+            if let Some((_, marker)) = self.owned_envs.remove(env_key) {
+                self.cleanup_rootfs_with_marker(env_key, marker);
+            }
+            self.memory_reservations.lock().unwrap().remove(env_key);
+            if !self.owned_envs.contains_key(env_key) {
+                self.environment_functions.remove(env_key);
+                self.stopping.remove(env_key);
+            }
         }
+    }
+
+    pub(crate) async fn delete_function_resources(
+        &self,
+        store: &FunctionStore,
+        region: &str,
+        account: &str,
+        name: &str,
+    ) -> Result<(u16, Option<serde_json::Value>), LambdaError> {
+        // ponytail: deletion pauses admission globally; per-function gates only if throughput needs it.
+        let _drained = self.invocations.write().await;
+        let resolved = crate::model::resolve_function_name(name, region)?;
+        let arn = crate::model::function_arn(region, account, &resolved);
+        self.invalidate_function_warm(&arn).await;
+        let active: Vec<String> = self
+            .environment_functions
+            .iter()
+            .filter(|entry| entry.value() == &arn)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in &active {
+            self.stop_env(key).await;
+        }
+        let remaining: Vec<String> = active
+            .into_iter()
+            .filter(|key| self.owned_envs.contains_key(key))
+            .collect();
+        if !remaining.is_empty() {
+            return Err(LambdaError::InternalError(format!(
+                "function cleanup incomplete; retained environments: {}",
+                remaining.join(", ")
+            )));
+        }
+        self.code_store.remove(account, region, &resolved)?;
+        let result = crate::control_plane::delete_function(store, region, account, name)?;
+        let pool_prefix = format!("{arn}:");
+        self.warm.retain(|key, _| !key.starts_with(&pool_prefix));
+        Ok(result)
     }
 
     /// Invalidate every published version and $LATEST when a function is deleted.
@@ -2051,6 +2384,10 @@ mod tests {
                 state: TaskState::Stopped,
             })
         }
+        async fn release_task(&self, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         async fn get_output(&self, _id: &str) -> Result<String, RuntimeError> {
             Ok(String::new())
         }
@@ -2132,6 +2469,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_budget_evicts_warm_and_releases_after_shutdown_and_start_failure() {
+        assert_eq!(Executor::parse_memory_budget(None).unwrap(), 1024);
+        for invalid in ["0", "-1", "oops", "18446744073709551615"] {
+            assert!(Executor::parse_memory_budget(Some(invalid)).is_err());
+        }
+        let broker = Arc::new(InvocationBroker::new());
+        let mut exec = build_executor(broker, GuestBehavior::EchoUppercaseLen).await;
+        exec.memory_budget_mb = 160; // 128 MiB guest + 32 MiB host overhead.
+        let code = zip_with(&[("index.js", b"x")]);
+        let first = func("nodejs22.x", 10, code.clone());
+        let mut second = first.clone();
+        second.function_name = "second".into();
+        second.function_arn.push_str("-second");
+        exec.invoke_sync("000000000000", "us-east-1", &first, b"{}".to_vec())
+            .await
+            .unwrap();
+        let previous = exec.owned_envs.iter().next().unwrap().key().clone();
+        exec.invoke_sync("000000000000", "us-east-1", &second, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(!exec.owned_envs.contains_key(&previous));
+        assert_eq!(
+            exec.memory_reservations
+                .lock()
+                .unwrap()
+                .values()
+                .sum::<u64>(),
+            160
+        );
+        let oversized = {
+            let mut function = first.clone();
+            function.memory_size = 256;
+            function
+        };
+        assert!(matches!(
+            exec.invoke_sync("000000000000", "us-east-1", &oversized, b"{}".to_vec())
+                .await,
+            Err(LambdaError::TooManyRequests(_))
+        ));
+        assert!(exec.memory_reservations.lock().unwrap().is_empty());
+        let invalid = func("provided.al2023", 10, code);
+        assert!(exec
+            .cold_start(
+                "000000000000",
+                "us-east-1",
+                &invalid,
+                invalid.code_zip.as_ref().unwrap()
+            )
+            .await
+            .is_err());
+        assert!(exec.memory_reservations.lock().unwrap().is_empty());
+        exec.shutdown().await;
+        assert!(exec.owned_envs.is_empty());
+        assert!(exec.log_state.is_empty());
+        assert!(exec.stopping.is_empty());
+    }
+
+    #[tokio::test]
+    async fn function_deletion_cleans_owned_environments_and_rejects_stale_invocations() {
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = Arc::new(build_executor(broker, GuestBehavior::EchoUppercaseLen).await);
+        exec.bind_arc();
+        let store = Arc::new(FunctionStore::new());
+        exec.attach_function_store(&store);
+        let function = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        store
+            .create("000000000000", "us-east-1", function.clone())
+            .unwrap();
+        exec.invoke_sync("000000000000", "us-east-1", &function, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(exec.owned_envs.len(), 1);
+        exec.delete_function_resources(&store, "us-east-1", "000000000000", "fn")
+            .await
+            .unwrap();
+        assert!(exec.owned_envs.is_empty());
+        assert!(exec.warm.is_empty());
+        let code_path = exec
+            .rootfs_root
+            .parent()
+            .unwrap()
+            .join("code/000000000000/us-east-1/fn");
+        assert!(!code_path.exists());
+        exec.return_warm("deleted-function:$LATEST", "released-environment", 0)
+            .await;
+        assert!(exec.warm.is_empty());
+        assert!(exec.memory_reservations.lock().unwrap().is_empty());
+        assert!(matches!(
+            exec.invoke_sync("000000000000", "us-east-1", &function, b"{}".to_vec())
+                .await,
+            Err(LambdaError::ResourceNotFound(_))
+        ));
+        let mut recreated = function.clone();
+        recreated.revision_id = "recreated".into();
+        store
+            .create("000000000000", "us-east-1", recreated.clone())
+            .unwrap();
+        assert!(matches!(
+            exec.invoke_sync("000000000000", "us-east-1", &function, b"{}".to_vec())
+                .await,
+            Err(LambdaError::ResourceNotFound(_))
+        ));
+        exec.invoke_sync("000000000000", "us-east-1", &recreated, b"{}".to_vec())
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&code_path).unwrap();
+        std::fs::write(&code_path, b"cleanup obstruction").unwrap();
+        assert!(exec
+            .delete_function_resources(&store, "us-east-1", "000000000000", "fn")
+            .await
+            .is_err());
+        assert!(store.get("000000000000", "us-east-1", "fn").is_some());
+        std::fs::remove_file(&code_path).unwrap();
+        exec.delete_function_resources(&store, "us-east-1", "000000000000", "fn")
+            .await
+            .unwrap();
+        exec.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_invocation_releases_environment_and_budget() {
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = Arc::new(build_executor(broker, GuestBehavior::Hang).await);
+        exec.bind_arc();
+        let function = func("nodejs22.x", 30, zip_with(&[("index.js", b"x")]));
+        let running = {
+            let exec = exec.clone();
+            tokio::spawn(async move {
+                exec.invoke_sync("000000000000", "us-east-1", &function, b"{}".to_vec())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while exec.log_state.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        running.abort();
+        let _ = running.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !exec.owned_envs.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(exec.memory_reservations.lock().unwrap().is_empty());
+        assert!(exec.environment_functions.is_empty());
+        assert_eq!(exec.broker.inflight_count(), 0);
+        exec.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn recovery_only_collects_unlocked_prestart_rootfs() {
         let broker = Arc::new(InvocationBroker::new());
         let (first, _) = build_executor_tracked(broker, GuestBehavior::EchoUppercaseLen).await;
@@ -2186,6 +2678,10 @@ mod tests {
             Ok(self.absent.load(Ordering::Acquire))
         }
 
+        async fn release_task(&self, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         async fn get_output(&self, _: &str) -> Result<String, RuntimeError> {
             unreachable!()
         }
@@ -2220,7 +2716,9 @@ mod tests {
             assert_eq!(exec.rootfs_root.join(env).exists(), env == "late");
             assert_eq!(exec.vpc_public_egress.contains_key(env), env == "late");
         }
-        exec.recover_orphaned_guests().await;
+        assert!(exec.owned_envs.contains_key("late"));
+        exec.reap_expired_warm().await;
+        assert!(!exec.owned_envs.contains_key("late"));
         assert!(!exec.rootfs_root.join("late").exists());
         assert!(!exec.vpc_public_egress.contains_key("late"));
         let function = func(
@@ -2243,6 +2741,14 @@ mod tests {
             outcome => panic!("Expected startup error, got {outcome:?}"),
         }
         assert_eq!(std::fs::read_dir(&exec.rootfs_root).unwrap().count(), 0);
+        exec.reserve_rootfs("cleanup-failure").unwrap();
+        std::os::unix::fs::symlink(&tmp, exec.rootfs_root.join("cleanup-failure")).unwrap();
+        exec.cleanup_owned_rootfs("cleanup-failure");
+        assert!(exec.owned_envs.contains_key("cleanup-failure"));
+        assert!(exec.stopping.contains_key("cleanup-failure"));
+        std::fs::remove_file(exec.rootfs_root.join("cleanup-failure")).unwrap();
+        exec.reap_expired_warm().await;
+        assert!(!exec.owned_envs.contains_key("cleanup-failure"));
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
@@ -2256,6 +2762,10 @@ mod tests {
         async fn stop_task(&self, _: &str) -> Result<TaskHandle, RuntimeError> {
             unreachable!()
         }
+        async fn release_task(&self, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         async fn get_output(&self, _: &str) -> Result<String, RuntimeError> {
             unreachable!()
         }
@@ -2500,7 +3010,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("bootstrap"));
+        assert!(error.to_string().contains("bootstrap"));
         assert_eq!(std::fs::read_dir(&exec.rootfs_root).unwrap().count(), 0);
     }
 
@@ -2940,6 +3450,10 @@ mod tests {
                 state: TaskState::Stopped,
             })
         }
+        async fn release_task(&self, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         async fn get_output(&self, _id: &str) -> Result<String, RuntimeError> {
             Ok(String::new())
         }

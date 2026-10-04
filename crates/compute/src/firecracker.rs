@@ -27,12 +27,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::runtime::{ComputeRuntime, RuntimeError, TaskHandle, TaskSpec, TaskState};
+use crate::runtime::{ComputeRuntime, RuntimeError, TaskHandle, TaskOutput, TaskSpec, TaskState};
 
 /// Future interface for fast warm starts. Implementation detail is deferred to the Lambda
 /// spec (Req 15.4); declared here so the contract is part of the compute layer.
@@ -51,8 +51,8 @@ struct RunningTask {
     process: Child,
     socket: PathBuf,
     state: TaskState,
-    output: Arc<Mutex<String>>,
-    _reader: tokio::task::JoinHandle<()>,
+    output: Arc<Mutex<crate::output::OutputCapture>>,
+    _reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct FirecrackerRuntime {
@@ -64,7 +64,7 @@ pub struct FirecrackerRuntime {
     rootfs_path: PathBuf,
     /// Directory under which per-task API sockets are created.
     socket_dir: PathBuf,
-    tasks: Arc<DashMap<String, RunningTask>>,
+    tasks: Arc<DashMap<String, Arc<Mutex<RunningTask>>>>,
 }
 
 impl FirecrackerRuntime {
@@ -217,11 +217,12 @@ impl ComputeRuntime for FirecrackerRuntime {
             .spawn()
             .map_err(|e| boot_failed(format!("spawning firecracker: {e}")))?;
 
-        let output = Arc::new(Mutex::new(String::new()));
+        let output = Arc::new(Mutex::new(crate::output::OutputCapture::default()));
         let reader = spawn_serial_reader(process.stdout.take(), output.clone());
 
         if let Err(err) = self.boot(task_id, spec, &socket).await {
-            let _ = process.start_kill();
+            let _ = process.kill().await;
+            let _ = process.wait().await;
             let _ = std::fs::remove_file(&socket);
             reader.abort();
             return Err(err);
@@ -229,13 +230,13 @@ impl ComputeRuntime for FirecrackerRuntime {
 
         self.tasks.insert(
             task_id.to_string(),
-            RunningTask {
+            Arc::new(Mutex::new(RunningTask {
                 process,
                 socket,
                 state: TaskState::Running,
                 output,
-                _reader: reader,
-            },
+                _reader: Some(reader),
+            })),
         );
         Ok(TaskHandle {
             task_id: task_id.to_string(),
@@ -245,12 +246,12 @@ impl ComputeRuntime for FirecrackerRuntime {
 
     async fn stop_task(&self, task_id: &str) -> Result<TaskHandle, RuntimeError> {
         let socket = {
-            let entry = self
-                .tasks
-                .get(task_id)
-                .ok_or_else(|| RuntimeError::TaskNotFound {
+            let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
+                RuntimeError::TaskNotFound {
                     task_id: task_id.to_string(),
-                })?;
+                }
+            })?;
+            let entry = slot.lock().await;
             if entry.state == TaskState::Completed {
                 return Err(RuntimeError::TaskAlreadyCompleted {
                     task_id: task_id.to_string(),
@@ -261,14 +262,27 @@ impl ComputeRuntime for FirecrackerRuntime {
 
         let _ = fc_put(&socket, "/actions", r#"{"action_type":"SendCtrlAltDel"}"#).await;
 
-        let mut entry = self
-            .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| RuntimeError::TaskNotFound {
+        let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
+            RuntimeError::TaskNotFound {
                 task_id: task_id.to_string(),
-            })?;
-        let _ = entry.process.start_kill();
-        let _ = std::fs::remove_file(&entry.socket);
+            }
+        })?;
+        let mut entry = slot.lock().await;
+        entry
+            .process
+            .start_kill()
+            .map_err(|e| boot_failed(format!("stopping microVM: {e}")))?;
+        tokio::time::timeout(Duration::from_secs(5), entry.process.wait())
+            .await
+            .map_err(|_| boot_failed("microVM termination timed out"))?
+            .map_err(|e| boot_failed(format!("reaping microVM: {e}")))?;
+        if let Some(reader) = entry._reader.as_mut() {
+            let joined = tokio::time::timeout(Duration::from_secs(5), reader)
+                .await
+                .map_err(|_| boot_failed("microVM output drain timed out"))?;
+            entry._reader = None;
+            joined.map_err(|e| boot_failed(format!("draining microVM output: {e}")))?;
+        }
         entry.state = TaskState::Stopped;
         Ok(TaskHandle {
             task_id: task_id.to_string(),
@@ -277,12 +291,12 @@ impl ComputeRuntime for FirecrackerRuntime {
     }
 
     async fn task_state(&self, task_id: &str) -> Result<TaskState, RuntimeError> {
-        let mut entry = self
-            .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| RuntimeError::TaskNotFound {
+        let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
+            RuntimeError::TaskNotFound {
                 task_id: task_id.to_string(),
-            })?;
+            }
+        })?;
+        let mut entry = slot.lock().await;
         if entry.state == TaskState::Running {
             if let Some(status) = entry
                 .process
@@ -299,17 +313,58 @@ impl ComputeRuntime for FirecrackerRuntime {
         Ok(entry.state)
     }
 
+    async fn read_output(&self, task_id: &str, cursor: u64) -> Result<TaskOutput, RuntimeError> {
+        let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
+            RuntimeError::TaskNotFound {
+                task_id: task_id.into(),
+            }
+        })?;
+        let output = slot.lock().await.output.clone();
+        let captured = output.lock().await.read(cursor);
+        Ok(captured)
+    }
+
+    async fn release_task(&self, task_id: &str) -> Result<(), RuntimeError> {
+        let Some(slot) = self.tasks.get(task_id).map(|s| s.clone()) else {
+            return Ok(());
+        };
+        if self.task_state(task_id).await? == TaskState::Running {
+            self.stop_task(task_id).await?;
+        }
+        let mut entry = slot.lock().await;
+        tokio::time::timeout(Duration::from_secs(5), entry.process.wait())
+            .await
+            .map_err(|_| boot_failed("microVM termination timed out"))?
+            .map_err(|e| boot_failed(format!("reaping microVM: {e}")))?;
+        if let Some(reader) = entry._reader.as_mut() {
+            let joined = tokio::time::timeout(Duration::from_secs(5), reader)
+                .await
+                .map_err(|_| boot_failed("microVM output drain timed out"))?;
+            entry._reader = None;
+            joined.map_err(|e| boot_failed(format!("draining microVM output: {e}")))?;
+        }
+        match tokio::fs::remove_file(&entry.socket).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(boot_failed(format!("removing microVM socket: {e}"))),
+        }
+        drop(entry);
+        self.tasks
+            .remove_if(task_id, |_, current| Arc::ptr_eq(current, &slot));
+        Ok(())
+    }
+
     async fn get_output(&self, task_id: &str) -> Result<String, RuntimeError> {
         let output = {
-            let entry = self
-                .tasks
-                .get(task_id)
-                .ok_or_else(|| RuntimeError::TaskNotFound {
+            let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
+                RuntimeError::TaskNotFound {
                     task_id: task_id.to_string(),
-                })?;
+                }
+            })?;
+            let entry = slot.lock().await;
             entry.output.clone()
         };
-        let captured = output.lock().await.clone();
+        let captured = output.lock().await.text();
         Ok(captured)
     }
 }
@@ -326,18 +381,19 @@ fn json_str(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Read the firecracker process stdout (guest serial console) line-by-line into `sink`.
+/// Drain guest serial console in bounded chunks, including unterminated lines.
 fn spawn_serial_reader(
     stdout: Option<tokio::process::ChildStdout>,
-    sink: Arc<Mutex<String>>,
+    sink: Arc<Mutex<crate::output::OutputCapture>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let Some(stdout) = stdout else { return };
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let mut buf = sink.lock().await;
-            buf.push_str(&line);
-            buf.push('\n');
+        let Some(mut stdout) = stdout else { return };
+        let mut chunk = [0u8; 8192];
+        while let Ok(count) = stdout.read(&mut chunk).await {
+            if count == 0 {
+                break;
+            }
+            sink.lock().await.extend_from_slice(&chunk[..count]);
         }
     })
 }
@@ -544,6 +600,34 @@ mod tests {
             Err(RuntimeError::ExecutionFailed { reason }) if reason.contains("configured rootfs")
         ));
         assert!(rt.ensure_supported_spec(&spec()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_socket_cleanup_can_be_retried_after_reader_join() {
+        let root = std::env::temp_dir().join(format!("compute-fc-release-{}", std::process::id()));
+        crate::private_dir::ensure(&root).unwrap();
+        let socket = root.join("socket");
+        std::fs::create_dir(&socket).unwrap();
+        let mut process = Command::new("/bin/true").spawn().unwrap();
+        process.wait().await.unwrap();
+        let rt = FirecrackerRuntime::new("/unused", "/unused", "/unused");
+        rt.tasks.insert(
+            "done".into(),
+            Arc::new(Mutex::new(RunningTask {
+                process,
+                socket: socket.clone(),
+                state: TaskState::Completed,
+                output: Arc::new(Mutex::new(crate::output::OutputCapture::default())),
+                _reader: Some(tokio::spawn(async {})),
+            })),
+        );
+        assert!(rt.release_task("done").await.is_err());
+        assert!(rt.tasks.contains_key("done"));
+        std::fs::remove_dir(&socket).unwrap();
+        rt.release_task("done").await.unwrap();
+        rt.release_task("done").await.unwrap();
+        assert!(rt.tasks.is_empty());
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]

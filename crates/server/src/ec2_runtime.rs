@@ -90,7 +90,10 @@ impl InstanceRuntime for Ec2OciRuntime {
         match runtime.stop_task(instance_id).await {
             Ok(_)
             | Err(RuntimeError::TaskNotFound { .. })
-            | Err(RuntimeError::TaskAlreadyCompleted { .. }) => Ok(()),
+            | Err(RuntimeError::TaskAlreadyCompleted { .. }) => runtime
+                .release_task(instance_id)
+                .await
+                .map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         }
     }

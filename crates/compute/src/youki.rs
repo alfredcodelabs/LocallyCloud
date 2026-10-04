@@ -24,11 +24,12 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::runtime::{ComputeRuntime, RuntimeError, TaskHandle, TaskSpec, TaskState};
+use crate::runtime::{ComputeRuntime, RuntimeError, TaskHandle, TaskOutput, TaskSpec, TaskState};
 
 struct TaskRecord {
     state: TaskState,
-    output: Vec<u8>,
+    output: crate::output::OutputCapture,
+    finished: bool,
     bundle: PathBuf,
     isolated_network: bool,
 }
@@ -129,6 +130,13 @@ impl YoukiRuntime {
         config["process"]["cwd"] = serde_json::Value::from("/");
         config["root"]["path"] = serde_json::Value::from(rootfs.display().to_string());
         config["root"]["readonly"] = serde_json::Value::Bool(true);
+        if spec.memory_mb == 0 {
+            return Err(exec_failed("OCI memory_mb must be positive"));
+        }
+        let memory_bytes = u64::from(spec.memory_mb) * 1024 * 1024;
+        config["linux"]["resources"]["memory"]["limit"] = serde_json::json!(memory_bytes);
+        // OCI swap counts RAM+swap; equal values disable host swap for the guest.
+        config["linux"]["resources"]["memory"]["swap"] = serde_json::json!(memory_bytes);
 
         // Lambda rootfses provide a per-environment /tmp. Bind it writable while the
         // rest of the rootfs stays read-only; generic OCI tasks may omit this directory.
@@ -180,6 +188,14 @@ impl YoukiRuntime {
         isolated_network: bool,
     ) -> Result<TaskHandle, RuntimeError> {
         self.ensure_runtime_available()?;
+        let controllers = tokio::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
+            .await
+            .map_err(|e| exec_failed(format!("OCI requires cgroup v2 memory delegation: {e}")))?;
+        if !controllers.split_whitespace().any(|c| c == "memory") {
+            return Err(exec_failed(
+                "OCI memory controller unavailable; enable rootless systemd cgroup v2 delegation",
+            ));
+        }
         if task_id.is_empty()
             || !task_id
                 .bytes()
@@ -225,7 +241,8 @@ impl YoukiRuntime {
         }
         let slot: Slot = Arc::new(Mutex::new(TaskRecord {
             state: TaskState::Running,
-            output: Vec::new(),
+            output: crate::output::OutputCapture::default(),
+            finished: false,
             bundle: bundle.clone(),
             isolated_network,
         }));
@@ -245,7 +262,10 @@ impl YoukiRuntime {
         let id = task_id.to_string();
         tokio::spawn(async move {
             let child = Command::new(&runtime_binary)
+                .arg("--systemd-cgroup")
                 .arg("run")
+                .arg("--pid-file")
+                .arg(bundle.join("pid"))
                 .arg("--bundle")
                 .arg(&bundle)
                 .arg(&id)
@@ -299,10 +319,73 @@ impl YoukiRuntime {
                     }
                 }
             }
-            let _ = tokio::fs::remove_dir_all(&bundle).await;
+            slot.lock().await.finished = true;
         });
+        // Do not advertise Running until the native runtime has applied the kernel limit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let expected = u64::from(spec.memory_mb) * 1024 * 1024;
+        let launch = loop {
+            let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
+                RuntimeError::TaskNotFound {
+                    task_id: task_id.into(),
+                }
+            })?;
+            let record = slot.lock().await;
+            if record.finished {
+                // A successful native run also proves required resources were accepted;
+                // short-lived tasks can exit before /proc exposes their cgroup to us.
+                if record.state == TaskState::Completed {
+                    break Ok(());
+                }
+                break Err(exec_failed(format!(
+                    "OCI launch failed: {}",
+                    record.output.text()
+                )));
+            }
+            let pid_path = record.bundle.join("pid");
+            drop(record);
+            if let Ok(pid) = tokio::fs::read_to_string(pid_path).await {
+                if let Ok(pid) = pid.trim().parse::<u32>() {
+                    if let Ok(groups) =
+                        tokio::fs::read_to_string(format!("/proc/{pid}/cgroup")).await
+                    {
+                        if let Some(group) =
+                            groups.lines().find_map(|line| line.strip_prefix("0::"))
+                        {
+                            let path = Path::new("/sys/fs/cgroup")
+                                .join(group.trim_start_matches('/'))
+                                .join("memory.max");
+                            if let Ok(limit) = tokio::fs::read_to_string(&path).await {
+                                let swap = tokio::fs::read_to_string(
+                                    path.with_file_name("memory.swap.max"),
+                                )
+                                .await;
+                                if limit.trim().parse::<u64>() == Ok(expected)
+                                    && swap.is_ok_and(|v| v.trim() == "0")
+                                {
+                                    break Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break Err(exec_failed(
+                    "OCI memory limit could not be verified; enable systemd user memory delegation",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        if let Err(error) = launch {
+            // Keep ownership if termination cannot be proven; the caller can retry release.
+            if let Err(cleanup) = self.release_task(task_id).await {
+                return Err(exec_failed(format!("{error}; cleanup pending: {cleanup}")));
+            }
+            return Err(error);
+        }
         Ok(TaskHandle {
-            task_id: task_id.to_string(),
+            task_id: task_id.into(),
             state: TaskState::Running,
         })
     }
@@ -689,13 +772,16 @@ impl ComputeRuntime for YoukiRuntime {
             });
         }
         if state == TaskState::Stopped || state == TaskState::Failed {
+            wait_finished(&slot).await?;
             return Ok(TaskHandle {
                 task_id: task_id.to_string(),
                 state,
             });
         }
 
-        let killed = self.oci_command(&["kill", task_id, "KILL"]).await?;
+        let killed = self
+            .oci_command(&["kill", "--all", task_id, "KILL"])
+            .await?;
         if !killed.status.success() {
             return Err(exec_failed(format!(
                 "stopping OCI task: {}",
@@ -706,9 +792,12 @@ impl ComputeRuntime for YoukiRuntime {
         if record.state == TaskState::Running {
             record.state = TaskState::Stopped;
         }
+        let state = record.state;
+        drop(record);
+        wait_finished(&slot).await?;
         Ok(TaskHandle {
-            task_id: task_id.to_string(),
-            state: record.state,
+            task_id: task_id.into(),
+            state,
         })
     }
 
@@ -766,6 +855,22 @@ impl ComputeRuntime for YoukiRuntime {
         }
         let deleted = self.oci_command(&["delete", "--force", task_id]).await?;
         if !deleted.status.success() {
+            // `crun run` may remove its own state between observation and deletion.
+            // Confirm both exact state absence and inventory absence before accepting it.
+            let state = self.oci_command(&["state", task_id]).await?;
+            let missing = String::from_utf8_lossy(&state.stderr);
+            if !state.status.success()
+                && (missing.contains("does not exist") || missing.contains("not found"))
+            {
+                let listed = self.oci_command(&["list", "--quiet"]).await?;
+                if listed.status.success()
+                    && !String::from_utf8_lossy(&listed.stdout)
+                        .lines()
+                        .any(|id| id.trim() == task_id)
+                {
+                    return Ok(true);
+                }
+            }
             return Err(exec_failed(format!(
                 "deleting orphaned OCI guest: {}",
                 String::from_utf8_lossy(&deleted.stderr).trim()
@@ -784,15 +889,60 @@ impl ComputeRuntime for YoukiRuntime {
         Ok(state)
     }
 
+    async fn read_output(&self, task_id: &str, cursor: u64) -> Result<TaskOutput, RuntimeError> {
+        let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
+            RuntimeError::TaskNotFound {
+                task_id: task_id.into(),
+            }
+        })?;
+        let output = slot.lock().await.output.read(cursor);
+        Ok(output)
+    }
+
+    async fn release_task(&self, task_id: &str) -> Result<(), RuntimeError> {
+        let Some(slot) = self.tasks.get(task_id).map(|s| s.clone()) else {
+            return Ok(());
+        };
+        // Terminate descendants before draining: inherited pipes may otherwise never reach EOF.
+        if !self.reconcile_orphaned_task(task_id).await? {
+            return Err(exec_failed(
+                "OCI task termination could not be verified; retaining bundle",
+            ));
+        }
+        wait_finished(&slot).await?;
+        let bundle = slot.lock().await.bundle.clone();
+        match tokio::fs::remove_dir_all(&bundle).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(exec_failed(format!("removing OCI bundle: {error}"))),
+        }
+        self.tasks
+            .remove_if(task_id, |_, current| Arc::ptr_eq(current, &slot));
+        Ok(())
+    }
+
     async fn get_output(&self, task_id: &str) -> Result<String, RuntimeError> {
         let slot = self.tasks.get(task_id).map(|s| s.clone()).ok_or_else(|| {
             RuntimeError::TaskNotFound {
                 task_id: task_id.to_string(),
             }
         })?;
-        let captured = slot.lock().await.output.clone();
-        Ok(String::from_utf8_lossy(&captured).into_owned())
+        let captured = slot.lock().await.output.text();
+        Ok(captured)
     }
+}
+
+async fn wait_finished(slot: &Slot) -> Result<(), RuntimeError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !slot.lock().await.finished {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(exec_failed(
+                "OCI task output drain timed out; retaining task and bundle",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
 }
 
 async fn stream_output(mut pipe: impl AsyncRead + Unpin, slot: Slot) {
@@ -838,10 +988,87 @@ mod tests {
     fn slot_with(state: TaskState) -> Slot {
         Arc::new(Mutex::new(TaskRecord {
             state,
-            output: b"out".to_vec(),
+            output: {
+                let mut out = crate::output::OutputCapture::default();
+                out.extend_from_slice(b"out");
+                out
+            },
+            finished: state != TaskState::Running,
             bundle: PathBuf::new(),
             isolated_network: false,
         }))
+    }
+
+    #[tokio::test]
+    async fn oci_bundle_requires_exact_memory_limit() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("compute-memory-config-{}", std::process::id()));
+        crate::private_dir::ensure(&root).unwrap();
+        let binary = root.join("runtime");
+        std::fs::write(&binary, "#!/bin/sh\nprintf '%s' '{\"process\":{},\"root\":{},\"linux\":{\"namespaces\":[]},\"mounts\":[]}' > config.json\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = YoukiRuntime::new(binary);
+        let mut task = spec();
+        task.memory_mb = 257;
+        rt.write_bundle_config(&root, &task, &root, false)
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            value["linux"]["resources"]["memory"]["limit"],
+            257_u64 * 1024 * 1024
+        );
+        assert_eq!(
+            value["linux"]["resources"]["memory"]["swap"],
+            257_u64 * 1024 * 1024
+        );
+        task.memory_mb = 0;
+        assert!(rt
+            .write_bundle_config(&root, &task, &root, false)
+            .await
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalized_task_churn_and_failed_cleanup_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("compute-release-{}", std::process::id()));
+        crate::private_dir::ensure(&root).unwrap();
+        let binary = root.join("runtime");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in state) echo 'does not exist' >&2; exit 1;; list) exit 0;; esac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = YoukiRuntime::new(binary);
+        for n in 0..32 {
+            let id = format!("ended-{n}");
+            let slot = slot_with(TaskState::Completed);
+            let bundle = root.join(&id);
+            std::fs::create_dir(&bundle).unwrap();
+            slot.lock().await.bundle = bundle.clone();
+            slot.lock()
+                .await
+                .output
+                .extend_from_slice(&vec![b'x'; 2 * 1024 * 1024]);
+            rt.tasks.insert(id.clone(), slot);
+            rt.release_task(&id).await.unwrap();
+            assert!(!bundle.exists());
+            assert!(rt.tasks.is_empty());
+            rt.release_task(&id).await.unwrap();
+        }
+        let slot = slot_with(TaskState::Failed);
+        let bundle = root.join("failed-bundle");
+        std::fs::write(&bundle, "not a directory").unwrap();
+        slot.lock().await.bundle = bundle.clone();
+        rt.tasks.insert("retry".into(), slot);
+        assert!(rt.release_task("retry").await.is_err());
+        assert!(rt.tasks.contains_key("retry"));
+        std::fs::remove_file(&bundle).unwrap();
+        std::fs::create_dir(&bundle).unwrap();
+        rt.release_task("retry").await.unwrap();
+        assert!(rt.tasks.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

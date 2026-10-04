@@ -85,8 +85,12 @@ impl LambdaHandler {
             .as_ref()
             .map(|executor| executor.layer_store())
             .unwrap_or_else(|| Arc::new(LayerStore::new()));
+        let store = Arc::new(FunctionStore::new());
+        if let Some(executor) = &executor {
+            executor.attach_function_store(&store);
+        }
         LambdaHandler {
-            store: Arc::new(FunctionStore::new()),
+            store,
             layers,
             esm: Arc::new(EsmStore::new()),
             registry,
@@ -419,18 +423,12 @@ impl LambdaHandler {
             ["2015-03-31", "functions", name] => match req.method {
                 Method::GET => get_function(&self.store, region, account, name),
                 Method::DELETE => {
-                    let result = delete_function(&self.store, region, account, name)?;
-                    if let (Some(exec), Ok(resolved_name)) =
-                        (&self.executor, resolve_function_name(name, region))
-                    {
-                        exec.invalidate_function_warm(&function_arn(
-                            region,
-                            account,
-                            &resolved_name,
-                        ))
-                        .await;
+                    if let Some(exec) = &self.executor {
+                        exec.delete_function_resources(&self.store, region, account, name)
+                            .await
+                    } else {
+                        delete_function(&self.store, region, account, name)
                     }
-                    Ok(result)
                 }
                 _ => Err(unsupported()),
             },
@@ -1539,6 +1537,19 @@ pub async fn register_with_execution(
         }
     };
 
+    let memory_budget = match std::env::var("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB") {
+        Ok(value) => Executor::parse_memory_budget(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Executor::parse_memory_budget(None),
+        Err(error) => Err(error.to_string()),
+    };
+    let memory_budget = match memory_budget {
+        Ok(limit) => limit,
+        Err(error) => {
+            tracing::error!(%error, "invalid LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB; Lambda invoke disabled");
+            return Some(register(registry));
+        }
+    };
+
     let work = match std::env::var_os("LOCALLYCLOUD_WORK_DIR") {
         Some(path) if !path.is_empty() => {
             let path = std::path::PathBuf::from(path);
@@ -1562,6 +1573,7 @@ pub async fn register_with_execution(
     }
 
     let broker = Arc::new(InvocationBroker::new());
+    broker.require_registered_environments();
     // Bind the Runtime API server on an ephemeral loopback port; guests reach it via the host
     // network namespace (see YoukiRuntime egress).
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -1593,6 +1605,7 @@ pub async fn register_with_execution(
     )
     .with_layer_store(layers)
     .with_max_warm_total(max_warm_total)
+    .with_memory_budget(memory_budget)
     .with_service_registry(Arc::downgrade(registry))
     .with_destination_router(Arc::new(RegistryDestinationRouter {
         registry: Arc::downgrade(registry),

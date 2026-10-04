@@ -102,6 +102,43 @@ enum Transition {
 
 impl Interpreter {
     /// Run a new execution to completion.
+    async fn check_machine_deletion(
+        &self,
+        execution: Option<&Arc<RwLock<Execution>>>,
+    ) -> Result<(), AslError> {
+        if self.test_state_mode || self.execution_type != "STANDARD" {
+            return Ok(());
+        }
+        let Some(machine) = self
+            .store
+            .get_machine(&self.account, &self.region, &self.sm_name)
+        else {
+            return Ok(());
+        };
+        if machine.read().await.status != crate::store::StateMachineStatus::Deleting {
+            return Ok(());
+        }
+        if let Some(handle) = execution {
+            let mut execution = handle.write().await;
+            if execution.status == crate::store::Status::Running {
+                execution.status = crate::store::Status::Aborted;
+                execution.cause = Some("State machine is deleting".into());
+                execution.stop_date = Some(crate::clock::now_epoch());
+                if self.record_history {
+                    execution.record(
+                        "ExecutionAborted",
+                        json!({"cause":"State machine is deleting"}),
+                    );
+                }
+            }
+        }
+        self.store.cancel_pending_tasks(&self.exec_arn).await;
+        Err(AslError::new(
+            "States.TaskFailed",
+            "State machine is deleting",
+        ))
+    }
+
     pub async fn run(&self, exec: Arc<RwLock<Execution>>) -> Result<(), SfnError> {
         let input = exec.read().await.input.clone();
         if self.record_history {
@@ -295,6 +332,7 @@ impl Interpreter {
             let mut variables = initial_variables;
             let mut transitions = 0u32;
             loop {
+                self.check_machine_deletion(events.or(cursor)).await?;
                 if let Some(execution) = events.or(cursor) {
                     if execution.read().await.status != crate::store::Status::Running {
                         return Err(AslError::new("States.TaskFailed", "execution was stopped"));
@@ -349,6 +387,7 @@ impl Interpreter {
                     Ok(result) => result,
                     Err(error) => return Err(error),
                 };
+                self.check_machine_deletion(events.or(cursor)).await?;
                 validate_state_payload_size(&output)?;
                 variables = updated_variables;
                 if let Some(execution) = cursor {

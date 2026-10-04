@@ -98,6 +98,7 @@ struct TaskRecord {
     container: String,
     status: String,
     network: Option<TaskNetworkInfo>,
+    stopped_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -350,6 +351,7 @@ impl EcsHandler {
                 .to_owned(),
             status: "PENDING".into(),
             network: None,
+            stopped_reason: None,
         };
         {
             let mut state = self.state.lock().map_err(|_| EcsError::Internal)?;
@@ -382,22 +384,39 @@ impl EcsHandler {
         }
         let network_info = match runtime.start(&task).await {
             Ok(network_info) => network_info,
-            Err(_) => {
-                let mut state = self.state.lock().map_err(|_| EcsError::Internal)?;
-                state.tasks.remove(&(scope.clone(), arn));
-                if let Some(token) = input.client_token.as_deref() {
-                    state.task_tokens.remove(&(scope.clone(), token.to_owned()));
+            Err(reason) => {
+                let cleanup = runtime.stop(&task_id).await;
+                record.status = if cleanup.is_ok() {
+                    "STOPPED"
+                } else {
+                    "STOPPING"
                 }
+                .into();
+                let reason = match cleanup {
+                    Ok(()) => reason,
+                    Err(error) => format!("{reason}; cleanup pending for {task_id}: {error}"),
+                };
+                record.stopped_reason = Some(reason.clone());
+                self.state
+                    .lock()
+                    .map_err(|_| EcsError::Internal)?
+                    .tasks
+                    .insert((scope.clone(), arn.clone()), record.clone());
                 return Ok(
-                    json!({"tasks":[],"failures":[{"arn":input.task_definition,"reason":"RESOURCE:INIT_ERROR","detail":"Task initialization failed"}]}),
+                    json!({"tasks":[],"failures":[{"arn":arn,"reason":"RESOURCE:INIT_ERROR","detail":reason}]}),
                 );
             }
         };
         record.network = Some(network_info);
+        let mut state = self.state.lock().map_err(|_| EcsError::Internal)?;
+        // StopTask may have requested teardown while the runtime was starting.
+        if let Some(current) = state.tasks.get(&(scope.clone(), arn.clone())) {
+            if matches!(current.status.as_str(), "STOPPING" | "STOPPED") {
+                return Ok(json!({"tasks":[task_value(&arn, scope, current)],"failures":[]}));
+            }
+        }
         record.status = "RUNNING".into();
-        self.state
-            .lock()
-            .map_err(|_| EcsError::Internal)?
+        state
             .tasks
             .insert((scope.clone(), arn.clone()), record.clone());
         Ok(json!({"tasks":[task_value(&arn, scope, &record)],"failures":[]}))
@@ -471,17 +490,30 @@ impl EcsHandler {
             .cloned()
             .filter(|r| r.cluster == cluster)
             .ok_or_else(|| EcsError::Client("Task was not found".into()))?;
-        if record.status == "PENDING" {
-            return Err(EcsError::Client("Task is still starting".into()));
-        }
-        if record.status == "RUNNING" {
+        if record.status != "STOPPED" {
+            let mut stopping = record.clone();
+            stopping.status = "STOPPING".into();
+            self.state
+                .lock()
+                .map_err(|_| EcsError::Internal)?
+                .tasks
+                .insert((scope.clone(), arn.clone()), stopping.clone());
             let task_id = arn.rsplit('/').next().unwrap_or("");
-            self.runtime
+            if let Err(error) = self
+                .runtime
                 .as_ref()
                 .ok_or(EcsError::Internal)?
                 .stop(task_id)
                 .await
-                .map_err(EcsError::Client)?;
+            {
+                stopping.stopped_reason = Some(format!("Cleanup pending for {task_id}: {error}"));
+                self.state
+                    .lock()
+                    .map_err(|_| EcsError::Internal)?
+                    .tasks
+                    .insert((scope.clone(), arn.clone()), stopping);
+                return Err(EcsError::Client(error));
+            }
         }
         let mut record = record;
         record.status = "STOPPED".into();
@@ -988,12 +1020,16 @@ fn task_value(arn: &str, scope: &Scope, record: &TaskRecord) -> Value {
             ]}])
         })
         .unwrap_or_else(|| json!([]));
-    json!({"taskArn":arn,"clusterArn":scope.cluster_arn(&record.cluster),
+    let mut value = json!({"taskArn":arn,"clusterArn":scope.cluster_arn(&record.cluster),
         "taskDefinitionArn":record.definition,"lastStatus":record.status,
-        "desiredStatus":if record.status == "RUNNING" {"RUNNING"} else {"STOPPED"},
+        "desiredStatus":if matches!(record.status.as_str(), "RUNNING" | "PENDING") {"RUNNING"} else {"STOPPED"},
         "launchType":"FARGATE","platformVersion":"1.4.0",
         "containers":[{"name":record.container,"lastStatus":record.status}],
-        "attachments":attachments,"attributes":[]})
+        "attachments":attachments,"attributes":[]});
+    if let Some(reason) = &record.stopped_reason {
+        value["stoppedReason"] = json!(reason);
+    }
+    value
 }
 
 fn service_name(scope: &Scope, cluster: &str, id: &str) -> Result<String, EcsError> {
@@ -1370,6 +1406,120 @@ mod tests {
         json!({"family":family,"containerDefinitions":[{"name":"app","image":"example.com/app:1"}],
             "requiresCompatibilities":["FARGATE"],"networkMode":"awsvpc","cpu":cpu,"memory":memory})
     }
+    struct FailedStartRuntime {
+        cleanup_fails: std::sync::atomic::AtomicBool,
+        starts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl TaskRuntime for FailedStartRuntime {
+        async fn preflight(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn start(&self, _: &TaskLaunch) -> Result<TaskNetworkInfo, String> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("OCI readiness failed".into())
+        }
+        async fn stop(&self, _: &str) -> Result<(), String> {
+            if self.cleanup_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("rootfs removal denied".into())
+            } else {
+                Ok(())
+            }
+        }
+        async fn running(&self, _: &str) -> bool {
+            false
+        }
+    }
+    #[tokio::test]
+    async fn failed_start_preserves_task_identity_reason_token_and_cleanup_retry() {
+        let runtime = Arc::new(FailedStartRuntime {
+            cleanup_fails: std::sync::atomic::AtomicBool::new(true),
+            starts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = EcsHandler::with_runtime(Some(runtime.clone()));
+        let account = "111111111111";
+        let region = "us-east-1";
+        handler
+            .process(&request(
+                "CreateCluster",
+                json!({"clusterName":"web"}),
+                account,
+                region,
+            ))
+            .ok()
+            .unwrap();
+        let mut definition = task("web", "256", "1024");
+        definition["containerDefinitions"][0]["portMappings"] = json!([{"containerPort":8080}]);
+        handler
+            .process(&request(
+                "RegisterTaskDefinition",
+                definition,
+                account,
+                region,
+            ))
+            .ok()
+            .unwrap();
+        let input = json!({"cluster":"web", "taskDefinition":"web", "launchType":"FARGATE", "clientToken":"stable-failure", "networkConfiguration":{"awsvpcConfiguration":{"subnets":["subnet-test"]}}});
+        let failed = handler
+            .process_async(&request("RunTask", input.clone(), account, region))
+            .await
+            .ok()
+            .unwrap();
+        let arn = failed["failures"][0]["arn"].as_str().unwrap();
+        assert!(arn.starts_with("arn:aws:ecs:us-east-1:111111111111:task/web/"));
+        assert!(failed["failures"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("OCI readiness failed"));
+        assert!(failed["failures"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("rootfs removal denied"));
+        let repeated = handler
+            .process_async(&request("RunTask", input, account, region))
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(repeated["tasks"][0]["taskArn"], arn);
+        assert_eq!(repeated["tasks"][0]["lastStatus"], "STOPPING");
+        assert!(repeated["tasks"][0]["stoppedReason"]
+            .as_str()
+            .unwrap()
+            .contains("cleanup pending"));
+        assert_eq!(runtime.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let stop = request(
+            "StopTask",
+            json!({"cluster":"web", "task":arn}),
+            account,
+            region,
+        );
+        assert!(handler.process_async(&stop).await.is_err());
+        runtime
+            .cleanup_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let stopped = handler.process_async(&stop).await.ok().unwrap();
+        assert_eq!(stopped["task"]["lastStatus"], "STOPPED");
+        let described = handler
+            .process_async(&request(
+                "DescribeTasks",
+                json!({"cluster":"web","tasks":[arn]}),
+                account,
+                region,
+            ))
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(described["tasks"][0]["lastStatus"], "STOPPED");
+    }
+
     #[test]
     fn cluster_lifecycle_scope_and_failures() {
         let handler = EcsHandler::new();

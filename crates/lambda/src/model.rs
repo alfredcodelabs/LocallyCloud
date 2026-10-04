@@ -372,6 +372,29 @@ impl FunctionStore {
             .map(|r| r.latest.clone())
     }
 
+    /// Check an execution snapshot without cloning its code archive.
+    pub(crate) fn execution_snapshot_exists(
+        &self,
+        account_id: &str,
+        region: &str,
+        function: &LambdaFunction,
+    ) -> bool {
+        self.records
+            .get(&Self::key(account_id, region, &function.function_name))
+            .is_some_and(|record| {
+                let current = if function.version == "$LATEST" {
+                    Some(&record.latest)
+                } else {
+                    function
+                        .version
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|version| record.versions.get(&version))
+                };
+                current.is_some_and(|current| current.revision_id == function.revision_id)
+            })
+    }
+
     /// A specific published version's function snapshot.
     pub fn get_version(
         &self,

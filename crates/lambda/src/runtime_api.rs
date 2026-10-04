@@ -90,6 +90,7 @@ impl Queue {
 /// serving the same key share its queue, and a `next` poll returns the next queued invocation.
 #[derive(Default)]
 pub struct InvocationBroker {
+    require_registered: AtomicBool,
     queues: DashMap<String, Arc<Queue>>,
     inflight: DashMap<String, oneshot::Sender<Outcome>>,
     inflight_keys: DashMap<String, String>,
@@ -100,6 +101,10 @@ pub struct InvocationBroker {
 impl InvocationBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn require_registered_environments(&self) {
+        self.require_registered.store(true, Ordering::Release);
     }
 
     fn queue(&self, key: &str) -> Arc<Queue> {
@@ -138,6 +143,14 @@ impl InvocationBroker {
     ) -> (String, oneshot::Receiver<Outcome>) {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
+        let registered = self.extensions.get(key);
+        if self.require_registered.load(Ordering::Acquire) && registered.is_none() {
+            let _ = tx.send(Outcome::Error {
+                error_type: FunctionErrorType::Unhandled,
+                payload: b"execution environment no longer exists".to_vec(),
+            });
+            return (request_id, rx);
+        }
         self.inflight.insert(request_id.clone(), tx);
         self.inflight_keys
             .insert(request_id.clone(), key.to_owned());
@@ -168,8 +181,14 @@ impl InvocationBroker {
         let queue = self.queue(key);
         {
             let mut pending = queue.pending.lock().unwrap();
+            if !queue.open.load(Ordering::Acquire) {
+                drop(pending);
+                self.fail_unhandled(&request_id, b"execution environment stopped".to_vec());
+                return (request_id, rx);
+            }
             pending.push_back(invocation);
         }
+        drop(registered);
         queue.notify.notify_one();
         (request_id, rx)
     }
@@ -178,8 +197,13 @@ impl InvocationBroker {
     /// queued, otherwise waits until one arrives. Returns `None` once the environment is
     /// stopped (the Runtime API maps this to HTTP 204).
     pub async fn next(&self, key: &str) -> Option<PendingInvocation> {
+        let registered = self.extensions.get(key);
+        if self.require_registered.load(Ordering::Acquire) && registered.is_none() {
+            return None;
+        }
         let _poll_guard = self.mark_runtime_ready(key);
         let queue = self.queue(key);
+        drop(registered);
         loop {
             let notified = queue.notify.notified();
             tokio::pin!(notified);
@@ -189,8 +213,18 @@ impl InvocationBroker {
             }
             {
                 let mut pending = queue.pending.lock().unwrap();
-                if let Some(invocation) = pending.pop_front() {
-                    return Some(invocation);
+                while let Some(invocation) = pending.pop_front() {
+                    let live = self
+                        .inflight
+                        .get(&invocation.request_id)
+                        .is_some_and(|sender| !sender.is_closed());
+                    if live && invocation.deadline_ms > now_ms() {
+                        return Some(invocation);
+                    }
+                    self.fail_unhandled(
+                        &invocation.request_id,
+                        b"invocation expired or cancelled".to_vec(),
+                    );
                 }
             }
             // Register the waiter before checking state, so stop cannot lose its wakeup.
@@ -200,15 +234,38 @@ impl InvocationBroker {
 
     /// Record managed-runtime output before the invocation outcome is completed.
     pub fn record_logs(&self, request_id: &str, logs: Vec<String>) -> bool {
-        if !self.inflight.contains_key(request_id) {
+        let Some(sender) = self.inflight.get(request_id) else {
+            return false;
+        };
+        if sender.is_closed() {
             return false;
         }
-        self.logs.insert(request_id.to_string(), logs);
+        const LIMIT: usize = 1024 * 1024;
+        let mut retained = Vec::new();
+        let mut remaining = LIMIT;
+        let mut dropped = 0;
+        for mut chunk in logs {
+            let mut end = chunk.len().min(remaining);
+            while !chunk.is_char_boundary(end) {
+                end -= 1;
+            }
+            dropped += chunk.len() - end;
+            chunk.truncate(end);
+            remaining -= end;
+            if !chunk.is_empty() {
+                retained.push(chunk);
+            }
+        }
+        if dropped > 0 {
+            retained.push(format!("\n[locallycloud: {dropped} log bytes dropped because the capture limit was exceeded]\n"));
+        }
+        self.logs.insert(request_id.to_string(), retained);
         true
     }
 
     /// Take the output recorded for one completed invocation.
     pub fn take_logs(&self, request_id: &str) -> Option<Vec<String>> {
+        self.inflight_keys.remove(request_id);
         self.logs.remove(request_id).map(|(_, logs)| logs)
     }
 
@@ -216,8 +273,12 @@ impl InvocationBroker {
     /// idempotent no-op (the Runtime API returns 202 regardless).
     pub fn complete(&self, request_id: &str, outcome: Outcome) {
         if let Some((_, tx)) = self.inflight.remove(request_id) {
-            self.inflight_keys.remove(request_id);
-            let _ = tx.send(outcome);
+            if tx.send(outcome).is_err() {
+                self.logs.remove(request_id);
+            }
+            if !self.logs.contains_key(request_id) {
+                self.inflight_keys.remove(request_id);
+            }
         }
     }
 
@@ -251,6 +312,8 @@ impl InvocationBroker {
 
     /// Complete an in-flight invocation with an `Unhandled` error (timeout, crash, stop).
     pub fn fail_unhandled(&self, request_id: &str, payload: Vec<u8>) {
+        self.logs.remove(request_id);
+        self.inflight_keys.remove(request_id);
         self.complete(
             request_id,
             Outcome::Error {
@@ -258,6 +321,13 @@ impl InvocationBroker {
                 payload,
             },
         );
+    }
+
+    /// Forget a stopped environment after its guest has been reaped.
+    pub fn release(&self, key: &str) {
+        self.stop(key);
+        self.cleanup_extensions(key);
+        self.queues.remove(key);
     }
 
     /// Number of currently in-flight invocations (test/observability aid).
@@ -365,6 +435,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn release_cancellation_and_large_logs_leave_no_indexes() {
+        let broker = Arc::new(InvocationBroker::new());
+        for index in 0..64 {
+            let key = format!("env-{index}");
+            let (id, receiver) = broker.submit(&key, vec![0; 1024], "arn", 1000);
+            assert!(broker.record_logs(&id, vec!["x".repeat(2 * 1024 * 1024)]));
+            let retained: usize = broker.logs.get(&id).unwrap().iter().map(String::len).sum();
+            assert!(retained < 1024 * 1024 + 256);
+            drop(receiver);
+            broker.complete(&id, Outcome::Success(vec![]));
+            let waiter = {
+                let broker = broker.clone();
+                let key = key.clone();
+                tokio::spawn(async move { broker.next(&key).await })
+            };
+            tokio::task::yield_now().await;
+            broker.release(&key);
+            assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none());
+        }
+        assert!(broker.queues.is_empty());
+        assert!(broker.logs.is_empty());
+        assert!(broker.inflight.is_empty());
+        assert!(broker.inflight_keys.is_empty());
+        broker.require_registered_environments();
+        assert!(broker.next("released-env").await.is_none());
+        let (_, late) = broker.submit("released-env", vec![], "arn", 1000);
+        assert!(matches!(late.await.unwrap(), Outcome::Error { .. }));
+        assert!(broker.queues.is_empty());
     }
 
     #[tokio::test]

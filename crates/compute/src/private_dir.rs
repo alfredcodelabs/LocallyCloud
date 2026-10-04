@@ -4,6 +4,18 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub fn work_dir(kind: &str) -> PathBuf {
+    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_work_dir(kind, cache.as_deref(), home.as_deref())
+}
+
+fn resolve_work_dir(kind: &str, cache: Option<&Path>, home: Option<&Path>) -> PathBuf {
+    if let Some(cache) = cache.filter(|p| p.is_absolute()) {
+        return cache.join("locallycloud").join(kind);
+    }
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        return home.join(".cache/locallycloud").join(kind);
+    }
     std::env::temp_dir().join(format!("locallycloud-{kind}-{}", unsafe {
         libc::geteuid()
     }))
@@ -37,6 +49,26 @@ pub fn ensure(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_absolute_user_disk_cache() {
+        assert_eq!(
+            resolve_work_dir(
+                "oci",
+                Some(Path::new("/disk/cache")),
+                Some(Path::new("/home/user"))
+            ),
+            PathBuf::from("/disk/cache/locallycloud/oci")
+        );
+        assert_eq!(
+            resolve_work_dir(
+                "oci",
+                Some(Path::new("relative")),
+                Some(Path::new("/home/user"))
+            ),
+            PathBuf::from("/home/user/.cache/locallycloud/oci")
+        );
+    }
 
     #[test]
     fn rejects_symlink_and_public_work_directory() {

@@ -71,7 +71,7 @@ impl CfnHandler {
             "GetTemplate" => self.get_template(q, region, account),
             "ValidateTemplate" => self.validate_template(q, region, account).await,
             "GetTemplateSummary" => self.get_template_summary(q, region, account).await,
-            "ListStacks" => Ok(self.list_stacks(region, account)),
+            "ListStacks" => Ok(self.list_stacks(q, region, account)),
             other => Err(CfnError::Unsupported(format!(
                 "operation {other} is not supported"
             ))),
@@ -474,6 +474,9 @@ impl CfnHandler {
             .get("StackName")
             .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
         if let Some(mut stack) = self.store.find(account, region, &name) {
+            if stack.status == StackStatus::DeleteComplete {
+                return Ok(String::new());
+            }
             let provisioner = self.provisioner(region, account);
             let template = Template::parse(&stack.template_body)?;
             let declarations: BTreeMap<_, _> = template
@@ -546,8 +549,17 @@ impl CfnHandler {
                     .rev()
                     .filter(|resource| !ordered_ids.contains(resource.logical_id.as_str())),
             );
+            // Producers can recreate a managed group while an invocation is draining.
+            // Stable sorting preserves the graph order of every other resource.
+            deletion_order.sort_by_key(|resource| resource.resource_type == "AWS::Logs::LogGroup");
             // Continue after failures so independent resources still get a cleanup attempt.
             for resource in deletion_order {
+                if matches!(
+                    resource.status.as_str(),
+                    "DELETE_COMPLETE" | "DELETE_SKIPPED"
+                ) {
+                    continue;
+                }
                 if !resource.pending_cleanup.is_empty() {
                     failures.push(format!(
                         "{}: retired replacement cleanup is pending",
@@ -559,13 +571,44 @@ impl CfnHandler {
                     .get(&resource.logical_id)
                     .is_some_and(|decl| decl.deletion_policy.retains_on_delete())
                 {
-                    remaining.retain(|candidate| candidate.logical_id != resource.logical_id);
+                    if let Some(candidate) = remaining
+                        .iter_mut()
+                        .find(|candidate| candidate.logical_id == resource.logical_id)
+                    {
+                        candidate.status = "DELETE_SKIPPED".into();
+                    }
                     stack.events.push(event(
                         &resource.logical_id,
                         &resource.resource_type,
                         "DELETE_SKIPPED",
                         Some("retained by DeletionPolicy".into()),
                     ));
+                    continue;
+                }
+                if resource.resource_type == "AWS::Logs::LogGroup"
+                    && remaining.iter().any(|candidate| {
+                        matches!(
+                            candidate.resource_type.as_str(),
+                            "AWS::Lambda::Function" | "AWS::StepFunctions::StateMachine"
+                        ) && candidate.status == "DELETE_FAILED"
+                    })
+                {
+                    let reason =
+                        "Log group cleanup deferred because a stack log producer failed deletion"
+                            .to_owned();
+                    if let Some(candidate) = remaining
+                        .iter_mut()
+                        .find(|candidate| candidate.logical_id == resource.logical_id)
+                    {
+                        candidate.status = "DELETE_FAILED".into();
+                    }
+                    stack.events.push(event(
+                        &resource.logical_id,
+                        &resource.resource_type,
+                        "DELETE_FAILED",
+                        Some(reason.clone()),
+                    ));
+                    failures.push(format!("{}: {reason}", resource.logical_id));
                     continue;
                 }
                 let properties = declarations
@@ -579,6 +622,23 @@ impl CfnHandler {
                     "DELETE_IN_PROGRESS",
                     None,
                 ));
+                let log_notice = if resource.resource_type == "AWS::Lambda::Function" {
+                    let group = format!("/aws/lambda/{}", resource.physical_id);
+                    if stack.resources.iter().any(|candidate| {
+                        candidate.resource_type == "AWS::Logs::LogGroup"
+                            && candidate.physical_id == group
+                    }) {
+                        None
+                    } else {
+                        match provisioner.associated_lambda_log_group(&resource.physical_id).await {
+                            Ok(Some(group)) => Some(format!("Associated log group {group} is not managed by this stack and remains after Lambda deletion")),
+                            Ok(None) => None,
+                            Err(error) => Some(format!("Could not verify associated log group {group}: {error}")),
+                        }
+                    }
+                } else {
+                    None
+                };
                 let deletion = match properties {
                     Ok(properties) => {
                         provisioner
@@ -593,12 +653,17 @@ impl CfnHandler {
                 };
                 match deletion {
                     Ok(()) => {
-                        remaining.retain(|candidate| candidate.logical_id != resource.logical_id);
+                        if let Some(candidate) = remaining
+                            .iter_mut()
+                            .find(|candidate| candidate.logical_id == resource.logical_id)
+                        {
+                            candidate.status = "DELETE_COMPLETE".into();
+                        }
                         stack.events.push(event(
                             &resource.logical_id,
                             &resource.resource_type,
                             "DELETE_COMPLETE",
-                            None,
+                            log_notice,
                         ));
                     }
                     Err(error) => {
@@ -621,7 +686,16 @@ impl CfnHandler {
             }
 
             if failures.is_empty() {
-                self.store.remove(account, region, &stack.stack_name);
+                stack.status = StackStatus::DeleteComplete;
+                stack.resources = remaining;
+                stack.last_updated_time = Some(now_iso());
+                stack.events.push(event(
+                    &stack.stack_name,
+                    STACK_TYPE,
+                    "DELETE_COMPLETE",
+                    None,
+                ));
+                self.store.archive(account, region, stack);
             } else {
                 let reason = failures.join("; ");
                 stack.status = StackStatus::DeleteFailed;
@@ -1345,11 +1419,12 @@ impl CfnHandler {
             .iter()
             .map(|r| {
                 format!(
-                    "<member>{}{}{}{}<LastUpdatedTimestamp>{}</LastUpdatedTimestamp></member>",
+                    "<member>{}{}{}{}{}<LastUpdatedTimestamp>{}</LastUpdatedTimestamp></member>",
                     text_el("LogicalResourceId", &r.logical_id),
                     text_el("PhysicalResourceId", &r.physical_id),
                     text_el("ResourceType", &r.resource_type),
                     text_el("ResourceStatus", &r.status),
+                    resource_status_reason(&stack, r),
                     xml_escape(&stack.creation_time),
                 )
             })
@@ -1410,11 +1485,18 @@ impl CfnHandler {
         Ok(render_template_summary(&template, true))
     }
 
-    fn list_stacks(&self, region: &str, account: &str) -> String {
+    fn list_stacks(&self, q: &Query, region: &str, account: &str) -> String {
+        let filters: Vec<_> = q
+            .params
+            .iter()
+            .filter(|(key, _)| key.starts_with("StackStatusFilter.member."))
+            .map(|(_, value)| value.as_str())
+            .collect();
         let members: String = self
             .store
-            .list(account, region)
+            .list_with_deleted(account, region)
             .iter()
+            .filter(|s| filters.is_empty() || filters.contains(&s.status.as_str()))
             .map(|s| {
                 format!(
                     "<member>{}{}{}<CreationTime>{}</CreationTime></member>",
@@ -1892,18 +1974,27 @@ fn render_stack(stack: &Stack) -> String {
             )
         })
         .collect();
+    let status_reason = stack
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.resource_type == STACK_TYPE && event.status == stack.status.as_str())
+        .and_then(|event| event.reason.as_deref())
+        .map(|reason| text_el("StackStatusReason", reason))
+        .unwrap_or_default();
     let last_updated = stack
         .last_updated_time
         .as_ref()
         .map(|t| text_el("LastUpdatedTime", t))
         .unwrap_or_default();
     format!(
-        "<member>{}{}{}<CreationTime>{}</CreationTime>{}<Outputs>{}</Outputs><Parameters>{}</Parameters><Tags>{}</Tags><DisableRollback>false</DisableRollback><EnableTerminationProtection>false</EnableTerminationProtection></member>",
+        "<member>{}{}{}<CreationTime>{}</CreationTime>{}{}<Outputs>{}</Outputs><Parameters>{}</Parameters><Tags>{}</Tags><DisableRollback>false</DisableRollback><EnableTerminationProtection>false</EnableTerminationProtection></member>",
         text_el("StackId", &stack.stack_id),
         text_el("StackName", &stack.stack_name),
         text_el("StackStatus", stack.status.as_str()),
         xml_escape(&stack.creation_time),
         last_updated,
+        status_reason,
         outputs,
         params,
         tags,
@@ -1942,15 +2033,28 @@ fn render_resource_detail(stack: &Stack, r: &StackResource) -> String {
     format!("<member>{}</member>", resource_detail_inner(stack, r))
 }
 
+fn resource_status_reason(stack: &Stack, r: &StackResource) -> String {
+    stack
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.logical_id == r.logical_id && event.status == r.status)
+        .and_then(|event| event.reason.as_deref())
+        .map(|reason| text_el("ResourceStatusReason", reason))
+        .unwrap_or_default()
+}
+
 fn resource_detail_inner(stack: &Stack, r: &StackResource) -> String {
+    let reason = resource_status_reason(stack, r);
     format!(
-        "{}{}{}{}{}{}<Timestamp>{}</Timestamp><LastUpdatedTimestamp>{}</LastUpdatedTimestamp>",
+        "{}{}{}{}{}{}{}<Timestamp>{}</Timestamp><LastUpdatedTimestamp>{}</LastUpdatedTimestamp>",
         text_el("StackId", &stack.stack_id),
         text_el("StackName", &stack.stack_name),
         text_el("LogicalResourceId", &r.logical_id),
         text_el("PhysicalResourceId", &r.physical_id),
         text_el("ResourceType", &r.resource_type),
         text_el("ResourceStatus", &r.status),
+        reason,
         xml_escape(&stack.creation_time),
         xml_escape(&stack.creation_time),
     )
@@ -2356,7 +2460,7 @@ mod tests {
             fail_delete: true,
             requests: Mutex::new(Vec::new()),
         });
-        let (_registry, handler) = handler_with_s3(s3);
+        let (registry, handler) = handler_with_s3(s3);
         let template_body = serde_json::json!({
             "Resources": {
                 "Bucket": {
@@ -2414,6 +2518,37 @@ mod tests {
             .events
             .iter()
             .any(|event| { event.logical_id == "stack" && event.status == "DELETE_FAILED" }));
+        let query = Query::parse(b"StackName=stack");
+        assert!(handler
+            .describe_stacks(&query, "us-east-1", "000000000000")
+            .unwrap()
+            .contains("<StackStatusReason>"));
+        assert!(handler
+            .describe_stack_resources(&query, "us-east-1", "000000000000")
+            .unwrap()
+            .contains("<ResourceStatusReason>"));
+        let healthy = Arc::new(TestS3 {
+            failed_put: None,
+            existing: None,
+            fail_delete: false,
+            requests: Mutex::new(Vec::new()),
+        });
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            healthy.clone(),
+        );
+        handler
+            .delete_stack(&query, "us-east-1", "000000000000")
+            .await
+            .unwrap();
+        let archived = handler
+            .store
+            .find("000000000000", "us-east-1", "stack-id")
+            .unwrap();
+        assert_eq!(archived.status, StackStatus::DeleteComplete);
+        assert_eq!(archived.resources[0].status, "DELETE_COMPLETE");
+        assert_eq!(*healthy.requests.lock().unwrap(), ["DELETE /bucket"]);
     }
 
     fn policy_template(bucket_name: &str, retain_on_replace: bool) -> Template {
@@ -2648,6 +2783,147 @@ mod tests {
         }));
     }
 
+    struct DrainingLambdaLogs {
+        fail_lambda: std::sync::atomic::AtomicBool,
+        groups: Mutex<BTreeSet<String>>,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl NativeHandler for DrainingLambdaLogs {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            if request.uri.path().starts_with("/2015-03-31/functions/") {
+                self.calls.lock().unwrap().push("delete-lambda".into());
+                if self.fail_lambda.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Response::builder().status(500).body(Body::empty()).unwrap();
+                }
+                // Model the final log publication of a draining in-flight invocation.
+                self.groups
+                    .lock()
+                    .unwrap()
+                    .insert("/aws/lambda/function".into());
+            } else {
+                assert_eq!(
+                    request.headers["x-amz-target"],
+                    "Logs_20140328.DeleteLogGroup"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                self.calls.lock().unwrap().push("delete-log-group".into());
+                self.groups
+                    .lock()
+                    .unwrap()
+                    .remove(body["logGroupName"].as_str().unwrap());
+            }
+            Response::builder()
+                .status(200)
+                .body(Body::from("{}"))
+                .unwrap()
+        }
+    }
+    #[tokio::test]
+    async fn managed_log_cleanup_follows_producer_drain_and_retries_failed_producer() {
+        let probe = Arc::new(DrainingLambdaLogs {
+            fail_lambda: std::sync::atomic::AtomicBool::new(true),
+            groups: Mutex::new(BTreeSet::from([
+                "/aws/lambda/function".into(),
+                "kept".into(),
+            ])),
+            calls: Mutex::new(Vec::new()),
+        });
+        let registry = Arc::new(ServiceRegistry::new());
+        registry.register_native(
+            ServiceName::new("lambda"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            probe.clone(),
+        );
+        registry.register_native(
+            ServiceName::new("logs"),
+            ServiceMetadata::new(AwsProtocol::Json11, None),
+            probe.clone(),
+        );
+        let handler = CfnHandler::new(Arc::downgrade(&registry));
+        let body = serde_json::json!({"Resources": {
+            "Function":{"Type":"AWS::Lambda::Function","Properties":{"FunctionName":"function"}},
+            "Logs":{"Type":"AWS::Logs::LogGroup","Properties":{"LogGroupName":{"Fn::Sub":"/aws/lambda/${Function}"}}},
+            "Kept":{"Type":"AWS::Logs::LogGroup","DeletionPolicy":"Retain","Properties":{"LogGroupName":"kept"}}
+        }}).to_string();
+        let resources = [
+            ("Function", "function", "AWS::Lambda::Function"),
+            ("Logs", "/aws/lambda/function", "AWS::Logs::LogGroup"),
+            ("Kept", "kept", "AWS::Logs::LogGroup"),
+        ]
+        .into_iter()
+        .map(|(logical_id, physical_id, resource_type)| StackResource {
+            logical_id: logical_id.into(),
+            physical_id: physical_id.into(),
+            resource_type: resource_type.into(),
+            status: "CREATE_COMPLETE".into(),
+            attributes: BTreeMap::new(),
+            pending_cleanup: Vec::new(),
+        })
+        .collect();
+        handler.store.put(
+            "000000000000",
+            "us-east-1",
+            Stack {
+                stack_id: "drain-stack-id".into(),
+                stack_name: "drain-stack".into(),
+                status: StackStatus::CreateComplete,
+                template_body: body,
+                parameters: BTreeMap::new(),
+                resources,
+                outputs: Vec::new(),
+                events: Vec::new(),
+                tags: Vec::new(),
+                creation_time: now_iso(),
+                last_updated_time: None,
+            },
+        );
+        let query = Query::parse(b"StackName=drain-stack");
+        handler
+            .delete_stack(&query, "us-east-1", "000000000000")
+            .await
+            .unwrap();
+        let failed = handler
+            .store
+            .find("000000000000", "us-east-1", "drain-stack")
+            .unwrap();
+        assert_eq!(failed.status, StackStatus::DeleteFailed);
+        assert_eq!(failed.resource("Logs").unwrap().status, "DELETE_FAILED");
+        assert_eq!(
+            failed.resource("Logs").unwrap().physical_id,
+            "/aws/lambda/function"
+        );
+        assert_eq!(failed.resource("Kept").unwrap().status, "DELETE_SKIPPED");
+        assert_eq!(*probe.calls.lock().unwrap(), ["delete-lambda"]);
+        assert!(probe
+            .groups
+            .lock()
+            .unwrap()
+            .contains("/aws/lambda/function"));
+        probe
+            .fail_lambda
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        handler
+            .delete_stack(&query, "us-east-1", "000000000000")
+            .await
+            .unwrap();
+        assert_eq!(
+            *probe.calls.lock().unwrap(),
+            ["delete-lambda", "delete-lambda", "delete-log-group"]
+        );
+        assert_eq!(
+            *probe.groups.lock().unwrap(),
+            BTreeSet::from(["kept".into()])
+        );
+        let deleted = handler
+            .store
+            .find("000000000000", "us-east-1", "drain-stack-id")
+            .unwrap();
+        assert_eq!(deleted.status, StackStatus::DeleteComplete);
+        assert_eq!(deleted.resource("Logs").unwrap().status, "DELETE_COMPLETE");
+        assert_eq!(deleted.resource("Kept").unwrap().status, "DELETE_SKIPPED");
+    }
+
     #[tokio::test]
     async fn delete_stack_retains_retain_except_on_create_bucket() {
         let s3 = Arc::new(TestS3 {
@@ -2719,6 +2995,55 @@ mod tests {
             *s3.requests.lock().expect("test S3 request lock"),
             ["DELETE /eph"]
         );
+        let archived = handler
+            .store
+            .find("000000000000", "us-east-1", "stack-id")
+            .unwrap();
+        assert_eq!(archived.status, StackStatus::DeleteComplete);
+        assert_eq!(archived.resource("Kept").unwrap().status, "DELETE_SKIPPED");
+        assert_eq!(archived.resource("Eph").unwrap().status, "DELETE_COMPLETE");
+        let query = Query::parse(b"StackName=stack-id");
+        let resources = handler
+            .describe_stack_resources(&query, "us-east-1", "000000000000")
+            .unwrap();
+        assert!(resources.contains("<PhysicalResourceId>kept</PhysicalResourceId>"));
+        assert!(resources
+            .contains("<ResourceStatusReason>retained by DeletionPolicy</ResourceStatusReason>"));
+        assert!(handler
+            .describe_stack_events(&query, "us-east-1", "000000000000")
+            .unwrap()
+            .contains("<PhysicalResourceId>eph</PhysicalResourceId>"));
+        assert!(handler
+            .describe_stacks(
+                &Query::parse(b"StackName=stack"),
+                "us-east-1",
+                "000000000000"
+            )
+            .is_err());
+        assert!(!handler
+            .describe_stacks(&Query::parse(b""), "us-east-1", "000000000000")
+            .unwrap()
+            .contains("stack-id"));
+        assert!(handler
+            .list_stacks(
+                &Query::parse(b"StackStatusFilter.member.1=DELETE_COMPLETE"),
+                "us-east-1",
+                "000000000000"
+            )
+            .contains("stack-id"));
+        assert!(!handler
+            .list_stacks(
+                &Query::parse(b"StackStatusFilter.member.1=CREATE_COMPLETE"),
+                "us-east-1",
+                "000000000000"
+            )
+            .contains("stack-id"));
+        // Repeated deletion by archived ID cannot delete retained physical resources.
+        handler
+            .delete_stack(&query, "us-east-1", "000000000000")
+            .await
+            .unwrap();
+        assert_eq!(s3.requests.lock().unwrap().len(), 1);
     }
     #[tokio::test]
     async fn removed_resource_cleanup_failure_keeps_inventory_until_retry() {
@@ -2998,7 +3323,9 @@ mod tests {
             "000000000000",
             "us-east-1",
             Stack {
-                stack_id: "replacement-stack".into(),
+                stack_id:
+                    "arn:aws:cloudformation:us-east-1:000000000000:stack/replacement-stack/id"
+                        .into(),
                 stack_name: "replacement-stack".into(),
                 status: StackStatus::UpdateComplete,
                 template_body: changed_body,

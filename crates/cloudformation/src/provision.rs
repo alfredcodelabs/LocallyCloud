@@ -2917,7 +2917,7 @@ impl Provisioner {
             arn,
         )
         .await?;
-        for _ in 0..40 {
+        for _ in 0..300 {
             match self
                 .call_aws_json(
                     "states",
@@ -2927,7 +2927,7 @@ impl Provisioner {
                 )
                 .await
             {
-                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
                 Err(CfnError::ResourceFailed(message))
                     if message.contains("StateMachineDoesNotExist") =>
                 {
@@ -2937,7 +2937,7 @@ impl Provisioner {
             }
         }
         Err(CfnError::ResourceFailed(format!(
-            "Step Functions state machine {arn} was not deleted"
+            "Step Functions state machine {arn} is still deleting; active executions or final log delivery have not finished; retry deletion"
         )))
     }
 
@@ -4551,6 +4551,34 @@ impl Provisioner {
             None => format!("role {role}"),
         };
         ensure_delete_succeeded(&format!("IAM {action}"), &target, status, &response)
+    }
+
+    pub(crate) async fn associated_lambda_log_group(
+        &self,
+        function: &str,
+    ) -> Result<Option<String>, CfnError> {
+        // The native executor and guest environment use this exact configured default.
+        // This is an association, never proof that CloudFormation owns the log group.
+        let group = format!("/aws/lambda/{function}");
+        let result = self
+            .call_logs(
+                "DescribeLogGroups",
+                json!({"logGroupNamePrefix": group}),
+                function,
+            )
+            .await?;
+        let groups = result
+            .get("logGroups")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CfnError::ResourceFailed(
+                    "CloudWatch Logs DescribeLogGroups returned no logGroups list".into(),
+                )
+            })?;
+        Ok(groups
+            .iter()
+            .any(|entry| entry.get("logGroupName").and_then(Value::as_str) == Some(group.as_str()))
+            .then_some(group))
     }
 
     async fn delete_function(&self, function: &str) -> Result<(), CfnError> {

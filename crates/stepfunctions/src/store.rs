@@ -286,6 +286,29 @@ pub struct SfnStore {
     activities: Arc<DashMap<Key, Arc<ActivityRecord>>>,
     pending_tasks: Arc<DashMap<String, Arc<PendingTask>>>,
     quota_lock: Arc<Mutex<()>>,
+    execution_workers: Arc<DashMap<Key, usize>>,
+    workers_changed: Arc<Notify>,
+}
+
+/// Holds machine deletion until its execution and final log delivery have finished.
+pub(crate) struct ExecutionWorker {
+    counts: Arc<DashMap<Key, usize>>,
+    changed: Arc<Notify>,
+    key: Key,
+}
+impl Drop for ExecutionWorker {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            self.counts.entry(self.key.clone())
+        {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+        self.changed.notify_waiters();
+    }
 }
 
 fn key(account: &str, region: &str, name: &str) -> Key {
@@ -306,6 +329,39 @@ impl SfnStore {
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) async fn admit_execution_worker(
+        &self,
+        account: &str,
+        region: &str,
+        name: &str,
+    ) -> Option<ExecutionWorker> {
+        let handle = self.get_machine(account, region, name)?;
+        let machine = handle.read().await;
+        if machine.status != StateMachineStatus::Active {
+            return None;
+        }
+        let key = key(account, region, name);
+        *self.execution_workers.entry(key.clone()).or_default() += 1;
+        Some(ExecutionWorker {
+            counts: self.execution_workers.clone(),
+            changed: self.workers_changed.clone(),
+            key,
+        })
+    }
+
+    pub(crate) async fn wait_for_execution_workers(&self, account: &str, region: &str, name: &str) {
+        let key = key(account, region, name);
+        loop {
+            let notified = self.workers_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.execution_workers.contains_key(&key) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn create_machine(&self, account: &str, region: &str, rec: StateMachineRecord) -> bool {

@@ -19,15 +19,104 @@ use tokio::task::JoinHandle;
 pub struct EcsOciRuntime {
     ecr: Arc<locallycloud_ecr::EcrHandler>,
     ec2: Arc<locallycloud_ec2::Ec2Handler>,
-    runtime: Mutex<Option<Arc<YoukiRuntime>>>,
-    roots: Mutex<HashMap<String, TaskResources>>,
+    runtime: Arc<Mutex<Option<Arc<YoukiRuntime>>>>,
+    roots: Arc<Mutex<HashMap<String, TaskResources>>>,
 }
 
 struct TaskResources {
     root: PathBuf,
-    network: locallycloud_ec2::TaskNetworkLease,
-    proxy: JoinHandle<()>,
+    network: Option<locallycloud_ec2::TaskNetworkLease>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
+    proxy: Option<JoinHandle<()>>,
 }
+// Cancellation owns the same cleanup path as explicit StopTask. The worker holds the
+// lifecycle lock while materializing, so dropping the request cannot delete its live files.
+struct StartupCleanup {
+    runtime: Arc<Mutex<Option<Arc<YoukiRuntime>>>>,
+    roots: Arc<Mutex<HashMap<String, TaskResources>>>,
+    task_id: String,
+    lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    armed: bool,
+}
+impl StartupCleanup {
+    async fn fail(&mut self, reason: String) -> String {
+        self.lock.take();
+        let cleanup = cleanup_task(&self.runtime, &self.roots, &self.task_id).await;
+        self.armed = false;
+        match cleanup {
+            Ok(()) => reason,
+            Err(error) => format!("{reason}; cleanup pending for {}: {error}", self.task_id),
+        }
+    }
+}
+impl Drop for StartupCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let runtime = self.runtime.clone();
+            let roots = self.roots.clone();
+            let task_id = self.task_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = cleanup_task(&runtime, &roots, &task_id).await {
+                    tracing::warn!(%task_id, %error, "cancelled ECS startup cleanup pending");
+                }
+            });
+        }
+    }
+}
+async fn cleanup_task(
+    runtime: &Mutex<Option<Arc<YoukiRuntime>>>,
+    roots: &Mutex<HashMap<String, TaskResources>>,
+    task_id: &str,
+) -> Result<(), String> {
+    let lifecycle = roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(task_id)
+        .map(|resources| resources.lifecycle.clone());
+    let _lifecycle = match lifecycle {
+        Some(gate) => Some(gate.lock_owned().await),
+        None => None,
+    };
+    let runtime = runtime
+        .lock()
+        .map_err(|_| "ECS runtime lock unavailable")?
+        .clone();
+    if let Some(runtime) = runtime {
+        match runtime.stop_task(task_id).await {
+            Ok(_)
+            | Err(RuntimeError::TaskAlreadyCompleted { .. })
+            | Err(RuntimeError::TaskNotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        runtime
+            .release_task(task_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let root = roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(task_id)
+        .map(|resources| {
+            if let Some(proxy) = resources.proxy.take() {
+                proxy.abort();
+            }
+            resources.root.clone()
+        });
+    if let Some(root) = root {
+        match tokio::fs::remove_dir_all(root).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(task_id);
+    }
+    Ok(())
+}
+
 impl EcsOciRuntime {
     pub fn new(
         ecr: Arc<locallycloud_ecr::EcrHandler>,
@@ -36,8 +125,8 @@ impl EcsOciRuntime {
         Self {
             ecr,
             ec2,
-            runtime: Mutex::new(None),
-            roots: Mutex::new(HashMap::new()),
+            runtime: Arc::new(Mutex::new(None)),
+            roots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub async fn shutdown(&self) {
@@ -103,24 +192,54 @@ impl TaskRuntime for EcsOciRuntime {
         let work = locallycloud_compute::private_dir::work_dir("ecs");
         locallycloud_compute::private_dir::ensure(&work).map_err(|error| error.to_string())?;
         let root = work.join(&task_id);
+        if root.exists() {
+            return Err("Task rootfs already exists".into());
+        }
+        let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
+        let start_lock = lifecycle.clone().lock_owned().await;
+        self.roots.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            task_id.clone(),
+            TaskResources {
+                root: root.clone(),
+                network: None,
+                lifecycle,
+                proxy: None,
+            },
+        );
+        let mut startup = StartupCleanup {
+            runtime: self.runtime.clone(),
+            roots: self.roots.clone(),
+            task_id: task_id.clone(),
+            lock: None,
+            armed: true,
+        };
         let root_for_build = root.clone();
         let config = config.to_vec();
         let layers = layers
             .into_iter()
             .map(|(blob, compressed)| (blob.to_vec(), compressed))
             .collect::<Vec<_>>();
-        let image_defaults =
-            tokio::task::spawn_blocking(move || materialize(&root_for_build, &config, &layers))
-                .await
-                .map_err(|e| e.to_string())??;
+        let materialized = tokio::task::spawn_blocking(move || {
+            let result = materialize(&root_for_build, &config, &layers);
+            (result, start_lock)
+        })
+        .await;
+        let (result, start_lock) = match materialized {
+            Ok(result) => result,
+            Err(error) => return Err(startup.fail(error.to_string()).await),
+        };
+        startup.lock = Some(start_lock);
+        let image_defaults = match result {
+            Ok(defaults) => defaults,
+            Err(error) => return Err(startup.fail(error).await),
+        };
         let command = if task.command.is_empty() {
             image_defaults.0
         } else {
             task.command.clone()
         };
         if command.is_empty() {
-            let _ = fs::remove_dir_all(&root);
-            return Err("Image has no command".into());
+            return Err(startup.fail("Image has no command".into()).await);
         }
         let mut env = image_defaults.1;
         env.extend(task.environment.clone());
@@ -133,8 +252,9 @@ impl TaskRuntime for EcsOciRuntime {
         ) {
             Some(network) => network,
             None => {
-                let _ = fs::remove_dir_all(&root);
-                return Err("Unable to reserve task network interface".into());
+                return Err(startup
+                    .fail("Unable to reserve task network interface".into())
+                    .await);
             }
         };
         let spec = TaskSpec {
@@ -148,37 +268,51 @@ impl TaskRuntime for EcsOciRuntime {
         let runtime = match self.runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
-                let _ = fs::remove_dir_all(&root);
-                return Err(error);
+                return Err(startup.fail(error).await);
             }
         };
+        let info = TaskNetworkInfo {
+            eni_id: network.eni_id.clone(),
+            private_ip: network.private_ip,
+            subnet_id: network.subnet_id.clone(),
+        };
+        self.roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&task_id)
+            .expect("startup lifecycle owns tracked root")
+            .network = Some(network);
         if let Err(error) = runtime
             .start_isolated_service(&task_id, &spec, task.port, Duration::from_secs(5))
             .await
         {
-            let _ = fs::remove_dir_all(&root);
-            return Err(error.to_string());
+            return Err(startup.fail(error.to_string()).await);
         }
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
-                let _ = runtime.stop_task(&task_id).await;
-                let _ = fs::remove_dir_all(&root);
-                return Err(error.to_string());
+                return Err(startup.fail(error.to_string()).await);
             }
         };
         let endpoint = match listener.local_addr() {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                let _ = runtime.stop_task(&task_id).await;
-                let _ = fs::remove_dir_all(&root);
-                return Err(error.to_string());
+                return Err(startup.fail(error.to_string()).await);
             }
         };
-        if !network.set_endpoint(task.port, endpoint) {
-            let _ = runtime.stop_task(&task_id).await;
-            let _ = fs::remove_dir_all(&root);
-            return Err("Unable to publish task endpoint".into());
+        let published = self
+            .roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&task_id)
+            .is_some_and(|resources| {
+                resources
+                    .network
+                    .as_ref()
+                    .is_some_and(|network| network.set_endpoint(task.port, endpoint))
+            });
+        if !published {
+            return Err(startup.fail("Unable to publish task endpoint".into()).await);
         }
         let proxy = tokio::spawn(serve_task_proxy(
             listener,
@@ -192,46 +326,21 @@ impl TaskRuntime for EcsOciRuntime {
                 guest_port: task.port,
             },
         ));
-        let info = TaskNetworkInfo {
-            eni_id: network.eni_id.clone(),
-            private_ip: network.private_ip,
-            subnet_id: network.subnet_id.clone(),
-        };
-        self.roots
+        let mut roots = self
+            .roots
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                task_id,
-                TaskResources {
-                    root,
-                    network,
-                    proxy,
-                },
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(resources) = roots.get_mut(&task_id) {
+            resources.proxy = Some(proxy);
+        } else {
+            proxy.abort();
+            return Err("Task cleanup raced with startup".into());
+        }
+        startup.armed = false;
         Ok(info)
     }
     async fn stop(&self, task_id: &str) -> Result<(), String> {
-        let runtime = self.runtime()?;
-        match runtime.stop_task(task_id).await {
-            Ok(_)
-            | Err(RuntimeError::TaskAlreadyCompleted { .. })
-            | Err(RuntimeError::TaskNotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-        let resources = {
-            self.roots
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(task_id)
-        };
-        if let Some(resources) = resources {
-            resources.proxy.abort();
-            drop(resources.network);
-            tokio::fs::remove_dir_all(resources.root)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        cleanup_task(&self.runtime, &self.roots, task_id).await
     }
     async fn running(&self, task_id: &str) -> bool {
         let running = match self.runtime() {
@@ -265,8 +374,13 @@ async fn serve_task_proxy(listener: TcpListener, context: TaskProxyContext) {
         group_ids,
         guest_port,
     } = context;
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((mut inbound, peer)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let Ok((mut inbound, peer)) = accepted else {
             break;
         };
         let std::net::IpAddr::V4(source) = peer.ip() else {
@@ -277,7 +391,7 @@ async fn serve_task_proxy(listener: TcpListener, context: TaskProxyContext) {
         }
         let runtime = runtime.clone();
         let task_id = task_id.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Ok(mut outbound) = runtime
                 .connect_isolated_tcp(&task_id, guest_port, Duration::from_secs(2))
                 .await
@@ -364,10 +478,7 @@ fn materialize(
             extract_layer(root, layer)
         }
     });
-    if let Err(error) = result {
-        let _ = fs::remove_dir_all(root);
-        return Err(error);
-    }
+    result?;
     Ok((command, env))
 }
 
@@ -458,4 +569,84 @@ fn extract_layer(root: &Path, layer: &[u8]) -> Result<(), String> {
             .ok_or("Layer too large")?;
     }
     Err("Truncated OCI layer".into())
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelled_materialization_waits_for_worker_and_failed_cleanup_remains_retryable() {
+        let base = std::env::temp_dir().join(format!(
+            "locallycloud-ecs-cleanup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let root = base.join("root");
+        fs::create_dir(&root).unwrap();
+        let runtime = Arc::new(Mutex::new(None));
+        let roots = Arc::new(Mutex::new(HashMap::new()));
+        let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
+        let worker_lock = lifecycle.clone().lock_owned().await;
+        roots.lock().unwrap().insert(
+            "building".into(),
+            TaskResources {
+                root: root.clone(),
+                network: None,
+                lifecycle,
+                proxy: None,
+            },
+        );
+        let startup = StartupCleanup {
+            runtime: runtime.clone(),
+            roots: roots.clone(),
+            task_id: "building".into(),
+            lock: None,
+            armed: true,
+        };
+        let (finish, worker_wait) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            worker_wait.recv().unwrap();
+            fs::write(
+                worker_root.join("last-file"),
+                b"worker still owns its files",
+            )
+            .unwrap();
+            drop(worker_lock);
+        });
+        drop(startup);
+        tokio::task::yield_now().await;
+        assert!(root.exists());
+        finish.send(()).unwrap();
+        worker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while roots.lock().unwrap().contains_key("building") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!root.exists());
+        let retry = base.join("retry");
+        fs::write(&retry, b"a file makes directory cleanup fail").unwrap();
+        roots.lock().unwrap().insert(
+            "retry".into(),
+            TaskResources {
+                root: retry.clone(),
+                network: None,
+                lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+                proxy: None,
+            },
+        );
+        assert!(cleanup_task(&runtime, &roots, "retry").await.is_err());
+        assert!(roots.lock().unwrap().contains_key("retry"));
+        fs::remove_file(&retry).unwrap();
+        fs::create_dir(&retry).unwrap();
+        cleanup_task(&runtime, &roots, "retry").await.unwrap();
+        assert!(roots.lock().unwrap().is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
 }

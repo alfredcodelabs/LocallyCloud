@@ -85,6 +85,10 @@ async fn isolated_http_service_is_reachable_only_through_runtime_connector() {
             .is_err(),
         "stopped guest cannot be connected"
     );
+    runtime
+        .release_task(&task_id)
+        .await
+        .expect("release isolated guest");
     std::fs::remove_dir_all(&rootfs).unwrap();
 }
 
@@ -136,6 +140,10 @@ async fn readiness_timeout_stops_the_isolated_guest() {
         .connect_isolated_tcp(&task_id, actual_port, Duration::from_millis(100))
         .await
         .is_err());
+    runtime
+        .release_task(&task_id)
+        .await
+        .expect("release isolated guest");
     std::fs::remove_dir_all(rootfs).unwrap();
 }
 
@@ -201,6 +209,10 @@ async fn isolated_guest_reaches_host_listener_only_through_its_own_loopback() {
         .await
         .unwrap()
         .contains("isolated-loopback-ok"));
+    runtime
+        .release_task(&task_id)
+        .await
+        .expect("release isolated guest");
     std::fs::remove_dir_all(rootfs).unwrap();
 }
 
@@ -300,6 +312,10 @@ async fn isolated_guest_connects_to_private_ip_without_host_route() {
         .await
         .unwrap()
         .contains("isolated-loopback-ok"));
+    runtime
+        .release_task(&task_id)
+        .await
+        .expect("release isolated guest");
     std::fs::remove_dir_all(rootfs).unwrap();
 }
 
@@ -383,5 +399,9 @@ async fn isolated_guest_public_tcp_keeps_original_destination() {
         .await
         .unwrap()
         .contains("isolated-loopback-ok"));
+    runtime
+        .release_task(&task_id)
+        .await
+        .expect("release isolated guest");
     std::fs::remove_dir_all(rootfs).unwrap();
 }

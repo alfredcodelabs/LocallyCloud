@@ -89,6 +89,10 @@ async fn assert_lifecycle(runtime: &dyn ComputeRuntime, spec: &TaskSpec, task_id
             "unexpected stop error: {e}"
         ),
     }
+    runtime
+        .release_task(task_id)
+        .await
+        .expect("finalize guest and readers");
     output
 }
 

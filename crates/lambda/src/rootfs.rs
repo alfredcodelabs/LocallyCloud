@@ -27,12 +27,19 @@ const api = `http://${process.env.AWS_LAMBDA_RUNTIME_API}/2018-06-01/runtime`;
 const [moduleName, exportName] = process.env._HANDLER.split(/\.(?=[^.]+$)/);
 let handler;
 let invocationLogs = null;
+let logBytes = 0;
+let droppedLogBytes = 0;
+const logLimit = 128 * 1024;
 
 function captureWrites(stream) {
   const write = stream.write.bind(stream);
   stream.write = (chunk, encoding, callback) => {
     if (invocationLogs !== null) {
-      invocationLogs.push(Buffer.isBuffer(chunk) ? chunk.toString(typeof encoding === 'string' ? encoding : 'utf8') : String(chunk));
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), typeof encoding === 'string' ? encoding : 'utf8');
+      const size = invocationLogs.length < 4096 ? Math.min(data.length, logLimit - logBytes) : 0;
+      if (size > 0) invocationLogs.push(data.subarray(0, size).toString('utf8'));
+      logBytes += size;
+      droppedLogBytes += data.length - size;
     }
     return write(chunk, encoding, callback);
   };
@@ -80,6 +87,8 @@ while (true) {
     delete process.env._X_AMZN_TRACE_ID;
   }
   invocationLogs = [];
+  logBytes = 0;
+  droppedLogBytes = 0;
   let outcomePath;
   let outcomeBody;
   let outcomeHeaders = {};
@@ -105,6 +114,7 @@ while (true) {
     outcomeHeaders = { 'lambda-runtime-function-error-type': 'Handled' };
   }
 
+  if (droppedLogBytes > 0) invocationLogs.push(`\n[locallycloud: ${droppedLogBytes} log bytes dropped because the capture limit was exceeded]\n`);
   try {
     await post(`/invocation/${requestId}/logs`, JSON.stringify(invocationLogs));
   } catch (error) {
@@ -132,6 +142,9 @@ API = "http://{}/2018-06-01/runtime".format(os.environ["AWS_LAMBDA_RUNTIME_API"]
 module_name, function_name = os.environ["_HANDLER"].rsplit(".", 1)
 handler = None
 invocation_logs = None
+log_bytes = 0
+dropped_log_bytes = 0
+LOG_LIMIT = 128 * 1024
 
 class InvocationTee:
     """A persistent stdout/stderr that also records output of the active invocation.
@@ -148,11 +161,19 @@ class InvocationTee:
         return self._stream.encoding
 
     def write(self, data):
+        global log_bytes, dropped_log_bytes
         written = self._stream.write(data)
         # Read the global once: another thread may end the invocation concurrently.
         logs = invocation_logs
         if logs is not None:
-            logs.append(data)
+            remaining = LOG_LIMIT - log_bytes
+            # Bound the encoding allocation too, even for one very large write.
+            retained = data[:remaining].encode("utf-8")[:remaining].decode("utf-8", errors="ignore") if len(logs) < 4096 else ""
+            size = len(retained.encode("utf-8"))
+            if retained:
+                logs.append(retained)
+            log_bytes += size
+            dropped_log_bytes += len(data) - len(retained)
         return written
 
     def writelines(self, lines):
@@ -227,6 +248,8 @@ while True:
     else:
         os.environ.pop("_X_AMZN_TRACE_ID", None)
     invocation_logs = []
+    log_bytes = 0
+    dropped_log_bytes = 0
     error_type = None
     try:
         if handler is None:
@@ -245,6 +268,8 @@ while True:
         }
         error_type = "Handled"
     finally:
+        if dropped_log_bytes:
+            invocation_logs.append("\n[locallycloud: {} log characters dropped because the capture limit was exceeded]\n".format(dropped_log_bytes))
         captured = "".join(invocation_logs)
         invocation_logs = None
         sys.stdout.flush()
@@ -253,7 +278,7 @@ while True:
     try:
         post(
             "/invocation/{}/logs".format(request_id),
-            captured.splitlines(keepends=True),
+            [captured],
         )
     except Exception as error:
         outcome_path = "/invocation/{}/error".format(request_id)

@@ -176,6 +176,10 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method};
+    use locallycloud_core::integration::logs::{
+        AppendOutcome, GroupRef, InternalLogSink, LogScope, ProducerContext, ProducerGroupSpec,
+        ProducerLogEvent, ProducerStreamSpec, SinkError, StreamRef,
+    };
     use serde_json::json;
     use std::time::Duration;
 
@@ -1254,5 +1258,184 @@ mod tests {
             .await;
         let (_, body) = body_of(response).await;
         assert!(body["Messages"].as_array().is_none_or(Vec::is_empty));
+    }
+    #[tokio::test]
+    async fn deletion_waits_for_standard_transition_and_rejects_new_executions() {
+        let reg = registry();
+        let h = handler(&reg, "states");
+        let arn = create_sm(
+            &h,
+            "delete-running",
+            json!({
+                "StartAt": "Pause", "States": {
+                    "Pause": { "Type": "Wait", "Seconds": 1, "Next": "Done" },
+                    "Done": { "Type": "Pass", "End": true }
+                }
+            }),
+        )
+        .await;
+        let started = sfn(&h, "StartExecution", json!({"stateMachineArn": arn})).await;
+        let exec = started["executionArn"].as_str().unwrap();
+        for _ in 0..100 {
+            let history = sfn(&h, "GetExecutionHistory", json!({"executionArn": exec})).await;
+            if history["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "WaitStateEntered")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        sfn(&h, "DeleteStateMachine", json!({"stateMachineArn": arn})).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let machine = sfn(&h, "DescribeStateMachine", json!({"stateMachineArn": arn})).await;
+        assert_eq!(machine["status"], "DELETING");
+        let (status, body) = body_of(
+            h.handle(req(
+                "AWSStepFunctions",
+                "StartExecution",
+                json!({"stateMachineArn": arn}),
+            ))
+            .await,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(body["__type"]
+            .as_str()
+            .unwrap()
+            .contains("StateMachineDeleting"));
+        let execution = await_execution(&h, exec).await;
+        assert_eq!(execution["status"], "ABORTED");
+        let history = sfn(&h, "GetExecutionHistory", json!({"executionArn": exec})).await;
+        assert!(history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "ExecutionAborted"));
+        assert!(!history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["stateEnteredEventDetails"]["name"] == "Done"));
+        await_machine_deleted(&h, &arn).await;
+    }
+
+    async fn await_machine_deleted(h: &Arc<dyn NativeHandler>, arn: &str) {
+        for _ in 0..100 {
+            let (status, body) = body_of(
+                h.handle(req(
+                    "AWSStepFunctions",
+                    "DescribeStateMachine",
+                    json!({"stateMachineArn": arn}),
+                ))
+                .await,
+            )
+            .await;
+            if status == 400 {
+                assert!(body["__type"]
+                    .as_str()
+                    .unwrap()
+                    .contains("StateMachineDoesNotExist"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("state machine remained after its workers completed");
+    }
+
+    #[derive(Default)]
+    struct GatedLogs {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl InternalLogSink for GatedLogs {
+        async fn resolve_group(
+            &self,
+            _: LogScope,
+            spec: ProducerGroupSpec,
+            _: ProducerContext,
+        ) -> Result<GroupRef, SinkError> {
+            Ok(GroupRef { name: spec.name })
+        }
+        async fn ensure_group(
+            &self,
+            scope: LogScope,
+            spec: ProducerGroupSpec,
+            context: ProducerContext,
+        ) -> Result<GroupRef, SinkError> {
+            self.resolve_group(scope, spec, context).await
+        }
+        async fn ensure_stream(
+            &self,
+            _: LogScope,
+            group: GroupRef,
+            spec: ProducerStreamSpec,
+            _: ProducerContext,
+        ) -> Result<StreamRef, SinkError> {
+            Ok(StreamRef {
+                group_name: group.name,
+                stream_name: spec.name,
+            })
+        }
+        async fn append(
+            &self,
+            _: LogScope,
+            _: StreamRef,
+            events: Vec<ProducerLogEvent>,
+            _: ProducerContext,
+        ) -> Result<AppendOutcome, SinkError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(AppendOutcome {
+                stored_events: events.len(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn express_deletion_waits_for_final_log_delivery() {
+        let reg = registry();
+        let h = handler(&reg, "states");
+        let sink = Arc::new(GatedLogs::default());
+        reg.register_native_with_log_sink(
+            ServiceName::new("logs"),
+            ServiceMetadata::new(AwsProtocol::Json11, Some("Logs_20140328")),
+            h.clone(),
+            sink.clone(),
+        );
+        let created = sfn(&h, "CreateStateMachine", json!({
+            "name": "express-drain", "type": "EXPRESS",
+            "roleArn": "arn:aws:iam::000000000000:role/sfn",
+            "definition": json!({"StartAt":"Done", "States":{"Done":{"Type":"Pass", "End":true}}}).to_string(),
+            "loggingConfiguration": {"level":"ALL", "destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"arn:aws:logs:us-east-1:000000000000:log-group:/test/express:*"}}]}
+        })).await;
+        let arn = created["stateMachineArn"].as_str().unwrap().to_string();
+        let sync_h = h.clone();
+        let sync_arn = arn.clone();
+        let sync = tokio::spawn(async move {
+            sfn(
+                &sync_h,
+                "StartSyncExecution",
+                json!({"stateMachineArn":sync_arn}),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), sink.entered.notified())
+            .await
+            .unwrap();
+        sfn(&h, "DeleteStateMachine", json!({"stateMachineArn":arn})).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            sfn(&h, "DescribeStateMachine", json!({"stateMachineArn":arn})).await["status"],
+            "DELETING"
+        );
+        assert!(!sync.is_finished());
+        sink.release.notify_one();
+        assert_eq!(sync.await.unwrap()["status"], "SUCCEEDED");
+        await_machine_deleted(&h, &arn).await;
     }
 }

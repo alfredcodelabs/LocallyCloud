@@ -96,6 +96,10 @@ async fn oci_runtime_runs_hello_task_and_captures_output() {
         state = runtime.task_state("hello-task").await.unwrap();
     }
     assert_eq!(state, TaskState::Completed);
+    runtime
+        .release_task("hello-task")
+        .await
+        .expect("release completed guest");
     let _ = std::fs::remove_dir_all(&rootfs);
 }
 
@@ -118,15 +122,25 @@ async fn oci_runtime_reports_failed_guest_process() {
         memory_mb: 128,
         vcpu_count: 1,
     };
-    runtime.start_task("failed-task", &spec).await.unwrap();
-    let mut state = TaskState::Running;
-    for _ in 0..150 {
-        state = runtime.task_state("failed-task").await.unwrap();
-        if state != TaskState::Running {
-            break;
+    match runtime.start_task("failed-task", &spec).await {
+        Err(error) => assert!(error.to_string().contains("OCI launch failed"), "{error}"),
+        Ok(_) => {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let state = runtime.task_state("failed-task").await.unwrap();
+                if state != TaskState::Running {
+                    assert_eq!(state, TaskState::Failed);
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    runtime
+        .release_task("failed-task")
+        .await
+        .expect("failed launch cleanup is idempotent");
+    assert!(runtime.task_state("failed-task").await.is_err());
     let _ = std::fs::remove_dir_all(&rootfs);
-    assert_eq!(state, TaskState::Failed);
 }

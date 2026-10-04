@@ -74,9 +74,15 @@ impl CodeStore {
         })
     }
 
-    /// Remove a function's extracted code (best-effort).
-    pub fn remove(&self, account: &str, region: &str, name: &str) {
-        let _ = fs::remove_dir_all(self.function_dir(account, region, name));
+    /// Remove extracted code before reporting a function deletion as complete.
+    pub fn remove(&self, account: &str, region: &str, name: &str) -> Result<(), LambdaError> {
+        match fs::remove_dir_all(self.function_dir(account, region, name)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(LambdaError::InternalError(format!(
+                "function code cleanup failed: {error}"
+            ))),
+        }
     }
 }
 
@@ -217,7 +223,7 @@ mod tests {
             b"#!/bin/sh\necho hi\n"
         );
 
-        store.remove("0", "us-east-1", "fn");
+        store.remove("0", "us-east-1", "fn").unwrap();
         assert!(!stored.dir.exists());
         let _ = fs::remove_dir_all(&root);
     }

@@ -689,15 +689,18 @@
         ], apiGatewayPage,
       ],
       cloudformation: [
-        () => paginatedPanel(t("stacks"), (token) => api("cloudformation", "DescribeStacks", { NextToken: token }),
-          "Stacks", "NextToken", ["name", "status", "created"], (stacks) => stacks.map((stack) => [link(resourceHref("cloudformation", stack.StackName), stack.StackName), stack.StackStatus, fmtDate(stack.CreationTime)])),
+        () => paginatedPanel(t("stacks"), (token) => api("cloudformation", "ListStacks", { NextToken: token }),
+          "StackSummaries", "NextToken", ["name", "status", "created"], (stacks) => stacks.map((stack) => [link(resourceHref("cloudformation", stack.StackId), stack.StackName), stack.StackStatus, fmtDate(stack.CreationTime)])),
         (name) => [panel(t("config"), async () => {
           const stack = (await api("cloudformation", "DescribeStacks", { StackName: name })).Stacks?.[0];
           return [kv([["status", stack?.StackStatus], ["ARN", stack?.StackId], ["error", stack?.StackStatusReason]]),
             table(["name", "value"], (stack?.Outputs || []).map((output) => [output.OutputKey, output.OutputValue]))];
         }),
-        panel(t("resources"), async () => table(["name", "type", "status", "resource"],
-          ((await api("cloudformation", "DescribeStackResources", { StackName: name })).StackResources || []).map((resource) => [resource.LogicalResourceId, resource.ResourceType, resource.ResourceStatus, stackResourceLink(resource)]))),
+        panel(t("resources"), async () => [h("p", { cls: "muted" }, t("stackCleanupNotice")),
+          table(["name", "type", "status", "resource", "cleanupReason"],
+          ((await api("cloudformation", "DescribeStackResources", { StackName: name })).StackResources || []).map((resource) => [resource.LogicalResourceId, resource.ResourceType, resource.ResourceStatus,
+            resource.ResourceStatus === "DELETE_COMPLETE" ? resource.PhysicalResourceId : stackResourceLink(resource),
+            resource.ResourceStatusReason || (resource.ResourceStatus === "DELETE_SKIPPED" ? t("retainedByPolicy") : "—")]))]),
         paginatedPanel(t("stackEvents"), (token) => api("cloudformation", "DescribeStackEvents", { StackName: name, NextToken: token }),
           "StackEvents", "NextToken", ["time", "name", "status", "error"], (events) => events.map((event) => [fmtDate(event.Timestamp), event.LogicalResourceId, event.ResourceStatus, event.ResourceStatusReason])),
         ],
