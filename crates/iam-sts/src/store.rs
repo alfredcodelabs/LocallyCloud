@@ -36,6 +36,14 @@ impl IamStore {
         Self::default()
     }
 
+    pub fn has_resources(&self, account: &str) -> bool {
+        self.users.iter().any(|e| e.key().0 == account)
+            || self.groups.iter().any(|e| e.key().0 == account)
+            || self.roles.iter().any(|e| e.key().0 == account)
+            || self.policies.iter().any(|e| e.key().0 == account)
+            || self.instance_profiles.iter().any(|e| e.key().0 == account)
+    }
+
     // ---- users ----------------------------------------------------------------
     pub fn create_user(&self, account: &str, user: IamUser) -> Created<IamUser> {
         match self.users.entry(key(account, &user.user_name)) {

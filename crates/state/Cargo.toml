@@ -8,6 +8,8 @@ license.workspace = true
 description = "Shared durable SQLite state for small LocallyCloud control planes"
 
 [dependencies]
+base64.workspace = true
+zeroize.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 libc = "0.2"

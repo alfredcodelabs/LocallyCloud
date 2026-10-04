@@ -151,4 +151,14 @@ pub struct Pipe {
     pub generation: u64,
     /// Last successfully processed sequence number for each stream shard.
     pub source_checkpoints: BTreeMap<String, String>,
+    #[serde(default)]
+    pub source_creation_timestamp: Option<f64>,
+    #[serde(default = "source_start_timestamp")]
+    pub source_start_timestamp: f64,
+    #[serde(default)]
+    pub source_cursor: usize,
+}
+
+pub(crate) fn source_start_timestamp() -> f64 {
+    OffsetDateTime::now_utc().unix_timestamp_nanos() as f64 / 1_000_000_000.0
 }

@@ -37,6 +37,9 @@ pub struct AuthorizationRequest {
 /// Authorization for a service to use one IAM role for one concrete operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceRoleAuthorizationRequest {
+    /// Originating service resource, supplied by native adapters, never external headers.
+    /// None when AWS does not supply SourceArn/SourceAccount (Lambda execution roles).
+    pub source_arn: Option<String>,
     pub caller: RequestIdentity,
     pub role_arn: String,
     pub service_principal: String,
@@ -129,9 +132,71 @@ pub trait AuthorizationEvaluator: Send + Sync {
         Ok(None)
     }
 
-    /// Evaluate an identity policy independently of permissive service enforcement.
+    /// Key-policy direct grants cannot override explicit IAM Deny, boundaries or session limits.
+    /// Unknown evaluators fail closed.
+    fn identity_policy_denies(&self, _request: AuthorizationRequest) -> bool {
+        true
+    }
+
+    /// Evaluate genuine identity permission independently of permissive service enforcement.
     /// A KMS account-principal grant can delegate only when this returns true.
     fn identity_policy_allows(&self, _request: AuthorizationRequest) -> bool {
         false
     }
+}
+
+/// Shared identity verification for external native management reads. Internal dispatcher
+/// scopes are attested by Core; an external header cannot create that attestation.
+pub fn authorize_native_read(
+    registry: &std::sync::Weak<crate::registry::ServiceRegistry>,
+    request: &crate::handler::ServiceRequest,
+    service: &str,
+    action: &str,
+    resource: &str,
+) -> Result<(), AuthorizationError> {
+    // Standalone native handlers can run without IAM; Core rejects a missing registry
+    // before external dispatch, so this does not bypass configured ingress enforcement.
+    let Some(registry) = registry.upgrade() else {
+        return Ok(());
+    };
+    let Some(evaluator) =
+        registry.authorization_evaluator(&crate::registry::ServiceName::new("iam"))
+    else {
+        return Ok(());
+    };
+    if !evaluator.strict_sigv4_required() {
+        return Ok(());
+    }
+    if request
+        .headers
+        .get("x-locallycloud-verified-internal-scope")
+        .is_some_and(|v| v == "1")
+    {
+        return Ok(());
+    }
+    if !request
+        .headers
+        .get("x-locallycloud-verified-external-sigv4")
+        .is_some_and(|v| v == "1")
+    {
+        return Err(AuthorizationError::Denied);
+    }
+    let access_key_id = request
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(RequestIdentity::access_key_from_authorization)
+        .ok_or(AuthorizationError::Denied)?;
+    evaluator.authorize(AuthorizationRequest {
+        request_identity: RequestIdentity {
+            account_id: request.account_id.clone(),
+            access_key_id: Some(access_key_id),
+            arn: None,
+        },
+        delegated_identity: None,
+        source_service: service.into(),
+        action: action.into(),
+        resource: resource.into(),
+        context: BTreeMap::from([("aws:requestedregion".into(), vec![request.region.clone()])]),
+    })
 }

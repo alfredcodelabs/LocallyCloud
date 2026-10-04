@@ -9,6 +9,7 @@ pub(crate) enum KmsError {
     AlreadyExists,
     NotFound,
     InvalidState,
+    Disabled,
     InvalidCiphertext,
     AccessDenied,
     Unsupported,
@@ -56,6 +57,7 @@ impl KmsError {
                 400,
             ),
             Self::NotFound => ("NotFoundException", "The requested key was not found", 400),
+            Self::Disabled => ("DisabledException", "The key is disabled", 400),
             Self::InvalidState => (
                 "KMSInvalidStateException",
                 "The key is not in a valid state for this operation",

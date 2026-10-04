@@ -1,5 +1,6 @@
 //! Deliberately small KMS key-policy evaluator. Unsupported policy constructs fail closed.
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::error::KmsError;
 
@@ -15,8 +16,7 @@ struct Statement {
     principals: Vec<String>,
     actions: Vec<String>,
     resources: Vec<String>,
-    source_arn: Option<Vec<String>>,
-    source_account: Option<Vec<String>>,
+    conditions: Vec<(String, String, Vec<String>)>,
 }
 
 impl KeyPolicy {
@@ -82,20 +82,47 @@ impl KeyPolicy {
             {
                 return Err(KmsError::Unsupported);
             }
-            let mut source_arn = None;
-            let mut source_account = None;
+            let mut parsed_conditions = Vec::new();
             if let Some(conditions) = entry.get("Condition") {
                 let map = conditions.as_object().ok_or(KmsError::Validation)?;
                 for (operator, values) in map {
+                    if !matches!(
+                        operator.as_str(),
+                        "StringEquals"
+                            | "StringLike"
+                            | "ArnEquals"
+                            | "ArnLike"
+                            | "StringEqualsIfExists"
+                            | "StringLikeIfExists"
+                            | "ArnEqualsIfExists"
+                            | "ArnLikeIfExists"
+                            | "Null"
+                    ) {
+                        return Err(KmsError::Unsupported);
+                    }
                     let values = values.as_object().ok_or(KmsError::Validation)?;
                     for (name, value) in values {
-                        match (operator.as_str(), name.as_str()) {
-                            ("ArnEquals", "aws:SourceArn") => source_arn = Some(strings(value)?),
-                            ("StringEquals", "aws:SourceAccount") => {
-                                source_account = Some(strings(value)?)
-                            }
-                            _ => return Err(KmsError::Unsupported),
+                        let name = name.to_ascii_lowercase();
+                        if !matches!(
+                            name.as_str(),
+                            "aws:sourcearn"
+                                | "aws:sourceaccount"
+                                | "kms:viaservice"
+                                | "kms:calleraccount"
+                                | "kms:encryptioncontextkeys"
+                        ) && !name.starts_with("kms:encryptioncontext:")
+                        {
+                            return Err(KmsError::Unsupported);
                         }
+                        let candidates = strings(value)?;
+                        if operator == "Null"
+                            && candidates
+                                .iter()
+                                .any(|value| value != "true" && value != "false")
+                        {
+                            return Err(KmsError::Validation);
+                        }
+                        parsed_conditions.push((operator.clone(), name, candidates));
                     }
                 }
             }
@@ -104,8 +131,7 @@ impl KeyPolicy {
                 principals,
                 actions,
                 resources,
-                source_arn,
-                source_account,
+                conditions: parsed_conditions,
             });
         }
         Ok(Self { raw, statements })
@@ -133,6 +159,28 @@ impl KeyPolicy {
         source_account: &str,
         iam_policy_allowed: bool,
     ) -> bool {
+        let mut context = BTreeMap::new();
+        if let Some(arn) = source_arn {
+            context.insert("aws:sourcearn".into(), vec![arn.into()]);
+            context.insert("aws:sourceaccount".into(), vec![source_account.into()]);
+        }
+        self.allows_in_context(
+            principal,
+            action,
+            source_account,
+            iam_policy_allowed,
+            &context,
+        )
+    }
+
+    pub(crate) fn allows_in_context(
+        &self,
+        principal: Option<&str>,
+        action: &str,
+        source_account: &str,
+        iam_policy_allowed: bool,
+        context: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
         let root = format!("arn:aws:iam::{source_account}:root");
         let same_account = principal.is_some_and(|arn| {
             arn.starts_with(&format!("arn:aws:iam::{source_account}:"))
@@ -151,12 +199,10 @@ impl KeyPolicy {
                     .iter()
                     .any(|a| a.eq_ignore_ascii_case("kms:*") || a.eq_ignore_ascii_case(action))
                 || statement.resources.is_empty()
-                || statement.source_arn.as_ref().is_some_and(|arns| {
-                    !source_arn.is_some_and(|arn| arns.iter().any(|candidate| candidate == arn))
-                })
-                || statement.source_account.as_ref().is_some_and(|accounts| {
-                    !accounts.iter().any(|candidate| candidate == source_account)
-                })
+                || !statement
+                    .conditions
+                    .iter()
+                    .all(|(op, key, values)| condition_matches(op, key, values, context))
             {
                 continue;
             }
@@ -167,6 +213,60 @@ impl KeyPolicy {
         }
         allowed
     }
+}
+
+fn condition_matches(
+    op: &str,
+    key: &str,
+    values: &[String],
+    context: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    let actual = context.get(key).filter(|values| !values.is_empty());
+    if op == "Null" {
+        return values
+            .iter()
+            .any(|value| (value == "true") == actual.is_none());
+    }
+    let (base, if_exists) = op
+        .strip_suffix("IfExists")
+        .map_or((op, false), |base| (base, true));
+    let Some(actual) = actual else {
+        return if_exists;
+    };
+    actual.iter().any(|value| {
+        values.iter().any(|candidate| match base {
+            "StringEquals" => candidate == value,
+            "StringLike" | "ArnLike" | "ArnEquals" => wildcard(candidate, value),
+            _ => false,
+        })
+    })
+}
+
+// Case-sensitive wildcard matching for condition values; never case-fold object ARNs.
+fn wildcard(pattern: &str, value: &str) -> bool {
+    let p: Vec<_> = pattern.chars().collect();
+    let v: Vec<_> = value.chars().collect();
+    let (mut pi, mut vi, mut star, mut retry) = (0, 0, None, 0);
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == v[vi]) {
+            pi += 1;
+            vi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            retry = vi;
+        } else if let Some(index) = star {
+            pi = index + 1;
+            retry += 1;
+            vi = retry;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn strings(value: &Value) -> Result<Vec<String>, KmsError> {

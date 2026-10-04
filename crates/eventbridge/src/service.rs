@@ -64,6 +64,14 @@ struct PipesHandler(Arc<Services>);
 
 #[async_trait]
 impl NativeHandler for EventsHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.0
+            .events
+            .store
+            .resource_regions(account, "events")
+            .await
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let target = match request
             .headers
@@ -114,6 +122,14 @@ impl NativeHandler for EventsHandler {
 
 #[async_trait]
 impl NativeHandler for SchedulerHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.0
+            .events
+            .store
+            .resource_regions(account, "scheduler")
+            .await
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let (operation, path_value) = match scheduler_route(&request.method, request.uri.path()) {
             Some(route) => route,
@@ -166,6 +182,10 @@ impl NativeHandler for SchedulerHandler {
 
 #[async_trait]
 impl NativeHandler for PipesHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.0.events.store.resource_regions(account, "pipes").await
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let (operation, path_value) = match pipes_route(&request.method, request.uri.path()) {
             Some(route) => route,

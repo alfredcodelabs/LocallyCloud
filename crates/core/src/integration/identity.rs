@@ -56,9 +56,56 @@ impl IdentityPropagator {
     }
 }
 
+/// Resolve a role only from Core's attested internal dispatch, never a public header.
+pub fn trusted_role(request: &crate::handler::ServiceRequest) -> Option<CallerIdentity> {
+    if request
+        .headers
+        .get("x-locallycloud-verified-internal-scope")
+        != Some(&http::HeaderValue::from_static("1"))
+    {
+        return None;
+    }
+    let principal = request.headers.get(PRINCIPAL_HEADER)?.to_str().ok()?;
+    let (role_arn, session_name) = principal.rsplit_once('/')?;
+    let prefix = format!("arn:aws:iam::{}:role/", request.account_id);
+    if !role_arn.starts_with(&prefix) || role_arn.len() <= prefix.len() || session_name.is_empty() {
+        return None;
+    }
+    Some(CallerIdentity::AssumedRole {
+        role_arn: role_arn.into(),
+        session_name: session_name.into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_role_requires_core_attestation_and_matching_account() {
+        let mut request = crate::handler::ServiceRequest {
+            method: http::Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            body: bytes::Bytes::new(),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            request_id: "r".into(),
+        };
+        let role = CallerIdentity::AssumedRole {
+            role_arn: "arn:aws:iam::000000000000:role/path/worker".into(),
+            session_name: "sfn".into(),
+        };
+        IdentityPropagator::attach(&mut request.headers, &role);
+        assert_eq!(trusted_role(&request), None);
+        request.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            http::HeaderValue::from_static("1"),
+        );
+        assert_eq!(trusted_role(&request), Some(role));
+        request.account_id = "999999999999".into();
+        assert_eq!(trusted_role(&request), None);
+    }
 
     #[test]
     fn principals_render_per_kind() {

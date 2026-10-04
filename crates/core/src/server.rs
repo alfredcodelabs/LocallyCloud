@@ -20,6 +20,7 @@ use axum::extract::{
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use http::StatusCode;
 
 use crate::config::LocallyCloudConfig;
 use crate::error_mapping::AwsError;
@@ -54,6 +55,7 @@ pub struct LocallyCloudServer {
     config: Arc<LocallyCloudConfig>,
     registry: Arc<ServiceRegistry>,
     readiness: Readiness,
+    tls_resolver: Option<Arc<dyn crate::tls::TlsIdentityResolver>>,
 }
 
 impl LocallyCloudServer {
@@ -62,7 +64,13 @@ impl LocallyCloudServer {
             config: Arc::new(config),
             registry,
             readiness: Readiness::new(),
+            tls_resolver: None,
         }
+    }
+
+    pub fn with_tls_resolver(mut self, resolver: Arc<dyn crate::tls::TlsIdentityResolver>) -> Self {
+        self.tls_resolver = Some(resolver);
+        self
     }
 
     /// Bind, serve, and run until an OS termination signal, then shut down gracefully.
@@ -135,14 +143,18 @@ impl LocallyCloudServer {
             .route("/_locallycloud/dashboard-i18n.js", get(ui_i18n_handler))
             .route("/_locallycloud/icons.svg", get(ui_icons_handler))
             .fallback(any(dispatch_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                tls_domain_handler,
+            ))
             .with_state(state);
 
         let grace = self.config.shutdown_grace_period;
 
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
         let serve = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+            crate::tls::DomainListener::new(listener, self.tls_resolver),
+            app.into_make_service_with_connect_info::<crate::tls::ConnectionInfo>(),
         )
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
@@ -709,12 +721,74 @@ fn dashboard_ui_request(method: &http::Method, uri: &http::Uri, headers: &http::
             .is_some_and(|h| h.contains(".s3."))
 }
 
+async fn tls_domain_handler(
+    State(state): State<AppState>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let server_name = req
+        .extensions()
+        .get::<ConnectInfo<crate::tls::ConnectionInfo>>()
+        .and_then(|info| info.0.server_name.as_deref());
+    let Some(server_name) = server_name else {
+        return next.run(req).await;
+    };
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let authority = host.parse::<http::uri::Authority>().ok();
+    if !authority
+        .as_ref()
+        .is_some_and(|authority| authority.host().eq_ignore_ascii_case(server_name))
+    {
+        return StatusCode::MISDIRECTED_REQUEST.into_response();
+    }
+    let credential = req
+        .uri()
+        .query()
+        .and_then(crate::integration::extract_x_amz_credential);
+    let authorization = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if crate::integration::claims_sigv4_identity(authorization, credential.as_deref())
+        && !crate::router::extract_service_from_credential_scope(
+            authorization,
+            credential.as_deref(),
+        )
+        .is_some_and(|service| service.as_str() == "execute-api")
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let registered = match state
+        .registry
+        .native_handler(&crate::registry::ServiceName::new("execute-api"))
+    {
+        Some(handler) => handler
+            .public_invoke_region(&state.dashboard.account_id, host, "/")
+            .await
+            .is_some(),
+        None => false,
+    };
+    if !registered {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // SNI authenticates a domain's data plane, never its dashboard or AWS control plane.
+    dispatch_handler(State(state), req).await
+}
+
 async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Response {
-    if dashboard_ui_request(req.method(), req.uri(), req.headers()) {
+    let tls = req
+        .extensions()
+        .get::<ConnectInfo<crate::tls::ConnectionInfo>>()
+        .is_some_and(|info| info.0.server_name.is_some());
+    if !tls && dashboard_ui_request(req.method(), req.uri(), req.headers()) {
         return ui_handler().await;
     }
     let (mut parts, body) = req.into_parts();
-    let peer = ConnectInfo::<SocketAddr>::from_request_parts(&mut parts, &state)
+    let peer = ConnectInfo::<crate::tls::ConnectionInfo>::from_request_parts(&mut parts, &state)
         .await
         .ok();
     if let Ok(upgrade) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
@@ -754,7 +828,7 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
                     &parts.headers,
                     body_bytes,
                     &request_id,
-                    addr.ip(),
+                    addr.peer.ip(),
                 )
                 .await
         }

@@ -281,6 +281,10 @@ impl SecretsManagerHandler {
 
 #[async_trait]
 impl NativeHandler for SecretsManagerHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let result = if self.persistence_failed.load(Ordering::Acquire) {
             Err(SecretsError::Internal)

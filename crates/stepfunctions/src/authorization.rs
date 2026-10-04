@@ -211,6 +211,7 @@ pub fn authorize_role_assignment(
         .ok_or(SfnError::AccessDenied)?;
     evaluator
         .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+            source_arn: resource(op, body, request)?,
             caller: RequestIdentity {
                 account_id: request.account_id.clone(),
                 access_key_id: Some(access_key_id),

@@ -25,6 +25,7 @@ pub struct DeliveryFailure;
 #[derive(Debug, Clone)]
 pub struct DeliveryRequest {
     pub source_service: &'static str,
+    pub source_arn: Option<String>,
     pub arn: String,
     pub payload: String,
     pub role_arn: Option<String>,
@@ -39,6 +40,7 @@ impl From<(&Target, String)> for DeliveryRequest {
     fn from((target, payload): (&Target, String)) -> Self {
         Self {
             source_service: "events",
+            source_arn: None,
             arn: target.arn.clone(),
             payload,
             role_arn: target.role_arn.clone(),
@@ -55,6 +57,7 @@ pub(crate) fn authorize_role_execution(
     registry: &ServiceRegistry,
     role_arn: Option<&str>,
     source_service: &str,
+    source_arn: Option<&str>,
     action: &str,
     resource: &str,
     account: &str,
@@ -74,6 +77,7 @@ pub(crate) fn authorize_role_execution(
     };
     evaluator
         .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+            source_arn: source_arn.map(str::to_string),
             caller: RequestIdentity {
                 account_id: account.into(),
                 access_key_id: None,
@@ -109,6 +113,7 @@ fn authorize_target(
         registry,
         request.role_arn.as_deref(),
         request.source_service,
+        request.source_arn.as_deref(),
         action,
         &request.arn,
         account,
@@ -142,6 +147,11 @@ pub(crate) async fn deliver_logs(
     rule_name: &str,
     correlation: CorrelationContext,
 ) -> Result<(), ()> {
+    if request.role_arn.is_some()
+        && !authorize_target(registry, request, InvocationMode::AsyncTarget, account)
+    {
+        return Err(());
+    }
     let group_name = log_group_name(&request.arn, region, account).ok_or(())?;
     let scope = LogScope::new(account, region);
     let identity = request.role_arn.as_ref().map_or(
@@ -226,6 +236,7 @@ pub(crate) async fn deliver_logs(
     if let Some(dlq) = &request.dead_letter_arn {
         let dlq_request = DeliveryRequest {
             source_service: request.source_service,
+            source_arn: request.source_arn.clone(),
             arn: dlq.clone(),
             payload: request.payload.clone(),
             role_arn: request.role_arn.clone(),
@@ -294,6 +305,7 @@ pub async fn deliver(
     if let Some(dlq) = &request.dead_letter_arn {
         let dlq_request = DeliveryRequest {
             source_service: request.source_service,
+            source_arn: request.source_arn.clone(),
             arn: dlq.clone(),
             payload: request.payload.clone(),
             role_arn: request.role_arn.clone(),
@@ -667,6 +679,7 @@ mod tests {
     fn request(arn: &str, payload: Value) -> DeliveryRequest {
         DeliveryRequest {
             source_service: "events",
+            source_arn: None,
             arn: arn.into(),
             payload: payload.to_string(),
             role_arn: None,

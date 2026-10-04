@@ -28,6 +28,10 @@ pub(crate) struct KmsService {
 }
 
 impl KmsService {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account)
+    }
+
     pub(crate) fn new(db: Arc<StateDb>) -> Result<Self, KmsError> {
         Ok(Self {
             store: KmsStore::new(db)?,
@@ -49,6 +53,8 @@ impl KmsService {
             "DeleteAlias" => self.delete_alias(body, &scope),
             "ListAliases" => self.list_aliases(body, &scope),
             "DescribeKey" => self.describe_key(body, &scope),
+            "DisableKey" => self.set_enabled(body, &scope, false),
+            "EnableKey" => self.set_enabled(body, &scope, true),
             "ListKeys" => self.list_keys(body, &scope),
             "ListResourceTags" => self.list_resource_tags(body, &scope),
             "Encrypt" => self.encrypt(body, &scope),
@@ -78,26 +84,28 @@ impl KmsService {
         }
         validate_internal_context(&encryption_context)?;
         let scope = Scope::new(&call.account_id, &call.region);
-        let key_id = self.resolve_key_id(&key_id, &scope)?;
+        let key_id = if self.is_own_managed_alias(&key_id, &scope, &call.source_service) {
+            self.service_default_key(&scope, &call.source_service)?
+        } else {
+            self.resolve_key_id(&key_id, &scope)?
+        };
         let context = crypto::canonical_context(&encryption_context)?;
         let mut plaintext = Zeroizing::new(crypto::generate_data_key(number_of_bytes)?);
         let result = self
             .store
             .with_key(&scope, &key_id, |key| {
                 if !key.is_enabled() {
-                    return Err(KmsError::InvalidState);
+                    return Err(inactive_key_error(key));
                 }
                 if key
                     .owner_service
                     .as_deref()
                     .is_some_and(|owner| owner != call.source_service)
-                    || !policy_allows(
+                    || !internal_policy_allows(
                         key,
-                        call.caller_arn.as_deref(),
+                        &call,
                         "kms:GenerateDataKey",
-                        None,
-                        &scope,
-                        call.iam_policy_allowed,
+                        &encryption_context,
                     )
                 {
                     return Err(KmsError::AccessDenied);
@@ -160,7 +168,12 @@ impl KmsService {
                     return Err(KmsError::AccessDenied);
                 }
                 if !key.is_enabled() {
-                    return Err(KmsError::InvalidState);
+                    return Err(inactive_key_error(key));
+                }
+                if call.source_service == "s3"
+                    && !internal_policy_allows(key, &call, "kms:Encrypt", &encryption_context)
+                {
+                    return Err(KmsError::AccessDenied);
                 }
                 crypto::seal(
                     &key.material,
@@ -214,16 +227,9 @@ impl KmsService {
                     return Err(KmsError::AccessDenied);
                 }
                 if !key.is_enabled() {
-                    return Err(KmsError::InvalidState);
+                    return Err(inactive_key_error(key));
                 }
-                if !policy_allows(
-                    key,
-                    call.caller_arn.as_deref(),
-                    "kms:Decrypt",
-                    None,
-                    &scope,
-                    call.iam_policy_allowed,
-                ) {
+                if !internal_policy_allows(key, &call, "kms:Decrypt", &encryption_context) {
                     return Err(KmsError::AccessDenied);
                 }
                 if key.material_version != envelope.material_version {
@@ -244,7 +250,12 @@ impl KmsService {
     ) -> Result<KmsValidateKeyOutput, KmsError> {
         validate_internal_call(&request.call)?;
         let scope = Scope::new(&request.call.account_id, &request.call.region);
-        let key_id = self.resolve_key_id(&request.key_id, &scope)?;
+        let key_id =
+            if self.is_own_managed_alias(&request.key_id, &scope, &request.call.source_service) {
+                self.service_default_key(&scope, &request.call.source_service)?
+            } else {
+                self.resolve_key_id(&request.key_id, &scope)?
+            };
         self.store
             .with_key(&scope, &key_id, |key| {
                 if key
@@ -256,7 +267,7 @@ impl KmsService {
                 } else if key.is_enabled() {
                     Ok(())
                 } else {
-                    Err(KmsError::InvalidState)
+                    Err(inactive_key_error(key))
                 }
             })
             .ok_or(KmsError::NotFound)??;
@@ -266,19 +277,29 @@ impl KmsService {
     }
 
     fn service_default_key(&self, scope: &Scope, service: &str) -> Result<String, KmsError> {
-        if !matches!(service, "ssm" | "secretsmanager") {
+        if !matches!(service, "ssm" | "secretsmanager" | "s3") {
             return Err(KmsError::AccessDenied);
         }
         self.store.service_default_key(scope, service, || {
             let mut record =
                 new_key_record(format!("Default key for {service}"), KeyManager::Aws, scope)?;
             record.owner_service = Some(service.to_owned());
+            if service == "s3" {
+                record.policy = KeyPolicy::parse(json!({"Statement": {
+                    "Effect":"Allow", "Principal":"*", "Action":["kms:GenerateDataKey","kms:Decrypt","kms:Encrypt"],
+                    "Resource":"*", "Condition":{"StringEquals":{
+                        "kms:CallerAccount":scope.account_id,
+                        "kms:ViaService":format!("s3.{}.amazonaws.com", scope.region)
+                    }}
+                }}).to_string())?;
+                record.explicit_policy = true;
+            }
             Ok(record)
         })
     }
 
     fn is_own_managed_alias(&self, key_id: &str, scope: &Scope, service: &str) -> bool {
-        if !matches!(service, "ssm" | "secretsmanager") {
+        if !matches!(service, "ssm" | "secretsmanager" | "s3") {
             return false;
         }
         let alias = format!("alias/aws/{service}");
@@ -309,7 +330,7 @@ impl KmsService {
             .store
             .with_key(scope, &key_id, |key| {
                 if !key.is_enabled() {
-                    return Err(KmsError::InvalidState);
+                    return Err(inactive_key_error(key));
                 }
                 crypto::seal(
                     &key.material,
@@ -366,7 +387,7 @@ impl KmsService {
             .store
             .with_key(scope, &key_id, |key| {
                 if !key.is_enabled() {
-                    return Err(KmsError::InvalidState);
+                    return Err(inactive_key_error(key));
                 }
                 if !policy_allows(key, None, "kms:Decrypt", None, scope, false) {
                     return Err(KmsError::AccessDenied);
@@ -423,7 +444,7 @@ impl KmsService {
             .store
             .with_key(scope, &key_id, |key| {
                 if !key.is_enabled() {
-                    return Err(KmsError::InvalidState);
+                    return Err(inactive_key_error(key));
                 }
                 if !policy_allows(key, None, "kms:GenerateDataKey", None, scope, false) {
                     return Err(KmsError::AccessDenied);
@@ -505,6 +526,66 @@ fn new_key_record(
         material_version: 1,
         material: crypto::generate_material()?,
     })
+}
+
+fn inactive_key_error(key: &KeyRecord) -> KmsError {
+    if matches!(key.state, KeyState::Disabled) {
+        KmsError::Disabled
+    } else {
+        KmsError::InvalidState
+    }
+}
+
+fn internal_policy_allows(
+    key: &KeyRecord,
+    call: &KmsCallContext,
+    action: &str,
+    encryption: &BTreeMap<String, String>,
+) -> bool {
+    if call.iam_policy_denied {
+        return false;
+    }
+    if !key.explicit_policy && (call.source_service != "s3" || call.caller_arn.is_none()) {
+        // Unknown development identities retain permissive-mode behavior. The strict IAM
+        // capability sets iam_policy_denied for unresolved identities before reaching here.
+        return true;
+    }
+    let caller_account = call
+        .caller_arn
+        .as_deref()
+        .filter(|arn| arn.starts_with("arn:"))
+        .and_then(|arn| arn.split(':').nth(4))
+        .unwrap_or(&call.account_id);
+    let mut context = BTreeMap::from([
+        ("kms:calleraccount".into(), vec![caller_account.to_string()]),
+        (
+            "kms:viaservice".into(),
+            vec![format!(
+                "{}.{}.amazonaws.com",
+                call.source_service, call.region
+            )],
+        ),
+        (
+            "kms:encryptioncontextkeys".into(),
+            encryption.keys().cloned().collect(),
+        ),
+    ]);
+    for (key, value) in encryption {
+        context
+            .entry(format!(
+                "kms:encryptioncontext:{}",
+                key.to_ascii_lowercase()
+            ))
+            .or_insert_with(Vec::new)
+            .push(value.clone());
+    }
+    key.policy.allows_in_context(
+        call.caller_arn.as_deref(),
+        action,
+        &call.account_id,
+        call.iam_policy_allowed,
+        &context,
+    )
 }
 
 fn policy_allows(

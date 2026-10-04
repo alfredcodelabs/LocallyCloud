@@ -541,7 +541,6 @@ impl InternalDispatcher {
             None
         };
         let Some(decision) = selected
-            .or_else(|| resolve(&registry, &input).ok())
             .or_else(|| {
                 public_invoke_region
                     .as_ref()
@@ -551,6 +550,7 @@ impl InternalDispatcher {
                         disposition: RouteDisposition::HandledNatively,
                     })
             })
+            .or_else(|| resolve(&registry, &input).ok())
             .filter(|decision| crate::router::permits_method(decision, method))
         else {
             tracing::warn!(request_id, path = %path, "unresolved request");
@@ -602,14 +602,19 @@ impl InternalDispatcher {
             && evaluator
                 .as_ref()
                 .is_some_and(|evaluator| evaluator.strict_sigv4_required());
-        let public_request = public_invoke
+        let public_request = (public_invoke
             || unsigned_public_request(
                 decision.service_name.as_str(),
                 method,
                 uri,
                 headers,
                 host.as_deref(),
-            );
+            ))
+            && !(decision.service_name.as_str() == "execute-api"
+                && host
+                    .as_deref()
+                    .is_some_and(|host| host.to_ascii_lowercase().contains(".execute-api."))
+                && execute_api_management_path(uri.path()));
         let verify_external = strict_external
             && (!public_request
                 || claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref()));
@@ -830,16 +835,15 @@ impl InternalDispatcher {
             } else {
                 None
             };
-        let decision = resolve(&registry, &input).or_else(|error| {
-            public_invoke_region
-                .as_ref()
-                .map(|_| crate::router::RoutingDecision {
-                    service_name: ServiceName::new("execute-api"),
-                    resolution_source: crate::router::ResolutionSource::HostPath,
-                    disposition: RouteDisposition::HandledNatively,
-                })
-                .ok_or(error)
-        });
+        let decision = public_invoke_region
+            .as_ref()
+            .map(|_| crate::router::RoutingDecision {
+                service_name: ServiceName::new("execute-api"),
+                resolution_source: crate::router::ResolutionSource::HostPath,
+                disposition: RouteDisposition::HandledNatively,
+            })
+            .map(Ok)
+            .unwrap_or_else(|| resolve(&registry, &input));
         match decision {
             Ok(decision) => {
                 log_routing_decision(&decision, request_id);
@@ -950,7 +954,10 @@ fn invalid_signature(request_id: &str, protocol: AwsProtocol) -> Response {
     )
 }
 
-fn claims_sigv4_identity(authorization: Option<&str>, query_credential: Option<&str>) -> bool {
+pub(crate) fn claims_sigv4_identity(
+    authorization: Option<&str>,
+    query_credential: Option<&str>,
+) -> bool {
     authorization
         .is_some_and(|value| value.contains("AWS4-HMAC-SHA256") || value.contains("Credential="))
         || query_credential.is_some()
@@ -973,7 +980,8 @@ fn unsigned_public_request(
                 && matches!(*method, Method::GET | Method::HEAD)
         }
         "execute-api" => {
-            host.is_some_and(|host| host.to_ascii_lowercase().contains(".execute-api."))
+            !execute_api_management_path(uri.path())
+                && host.is_some_and(|host| host.to_ascii_lowercase().contains(".execute-api."))
         }
         "cloudfront" => host.is_some_and(|host| {
             host.split(':')
@@ -993,6 +1001,14 @@ fn unsigned_public_request(
         }
         _ => false,
     }
+}
+
+fn execute_api_management_path(path: &str) -> bool {
+    let segments: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+    matches!(
+        segments.as_slice(),
+        ["@connections", _] | [_, "@connections", _]
+    )
 }
 
 fn safe_operation(
@@ -1233,6 +1249,7 @@ mod tests {
         let path = "/execute-api/west/dev/orders".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(identity::PRINCIPAL_HEADER, "forged".parse().unwrap());
+        headers.insert("x-amz-target", "AmazonSQS.ListQueues".parse().unwrap());
         let response = dispatcher
             .dispatch(&Method::GET, &path, &headers, Bytes::new(), "rid")
             .await;
@@ -1267,6 +1284,25 @@ mod tests {
             response.status(),
             403,
             "public routes must not open the dashboard proxy"
+        );
+        headers.clear();
+        headers.insert(
+            "host",
+            "west.execute-api.us-west-2.amazonaws.com".parse().unwrap(),
+        );
+        let response = dispatcher
+            .dispatch(
+                &Method::POST,
+                &"/dev/@connections/connection".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+                "rid",
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            403,
+            "WebSocket management requires a verified caller"
         );
     }
 

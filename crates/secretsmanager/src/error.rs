@@ -33,6 +33,7 @@ impl SecretsError {
             KmsInternalError::Unavailable | KmsInternalError::Internal => Self::EncryptionFailure,
             KmsInternalError::InvalidRequest
             | KmsInternalError::NotFound
+            | KmsInternalError::Disabled
             | KmsInternalError::InvalidState
             | KmsInternalError::InvalidCiphertext => Self::EncryptionFailure,
         }
@@ -44,6 +45,7 @@ impl SecretsError {
             KmsInternalError::Unavailable | KmsInternalError::Internal => Self::DecryptionFailure,
             KmsInternalError::InvalidRequest
             | KmsInternalError::NotFound
+            | KmsInternalError::Disabled
             | KmsInternalError::InvalidState
             | KmsInternalError::InvalidCiphertext => Self::DecryptionFailure,
         }

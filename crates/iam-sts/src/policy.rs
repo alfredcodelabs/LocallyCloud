@@ -96,7 +96,12 @@ impl PolicyDocument {
 }
 
 /// Minimal service-principal trust check. Unsupported trust constructs deny the role.
-pub fn service_trust_allows(document: &str, service: &str, role_arn: &str) -> bool {
+pub fn service_trust_allows(
+    document: &str,
+    service: &str,
+    role_arn: &str,
+    context: &BTreeMap<String, Vec<String>>,
+) -> bool {
     let Ok(root) = serde_json::from_str::<Value>(document) else {
         return false;
     };
@@ -113,22 +118,29 @@ pub fn service_trust_allows(document: &str, service: &str, role_arn: &str) -> bo
         if statement.get("NotPrincipal").is_some()
             || statement.get("NotAction").is_some()
             || statement.get("NotResource").is_some()
-            || statement.get("Condition").is_some()
         {
             return false;
         }
-        let Some(effect) = statement.get("Effect").and_then(Value::as_str) else {
+        let Ok(parsed) = parse_statement(statement, false) else {
             return false;
         };
-        if effect != "Allow" && effect != "Deny" {
+        // Unknown operators fail closed even with IfExists or an explicit Deny.
+        if parsed.conditions.keys().any(|operator| {
+            !matches!(
+                operator.as_str(),
+                "StringEquals"
+                    | "StringLike"
+                    | "ArnEquals"
+                    | "ArnLike"
+                    | "Null"
+                    | "StringEqualsIfExists"
+                    | "StringLikeIfExists"
+                    | "ArnEqualsIfExists"
+                    | "ArnLikeIfExists"
+            )
+        }) {
             return false;
         }
-        let Some(actions) = statement
-            .get("Action")
-            .and_then(|value| parse_string_set("Action", Some(value)).ok())
-        else {
-            return false;
-        };
         let principal = statement.get("Principal");
         let principal_matches = match principal {
             Some(Value::String(value)) if value == "*" => true,
@@ -138,18 +150,15 @@ pub fn service_trust_allows(document: &str, service: &str, role_arn: &str) -> bo
                 .is_some_and(|services| any_glob(&services, service)),
             _ => false,
         };
-        let resource_matches = match statement.get("Resource") {
-            None => true,
-            Some(value) => parse_string_set("Resource", Some(value))
-                .is_ok_and(|resources| any_glob(&resources, role_arn)),
+        let request = EvalRequest {
+            action: "sts:AssumeRole".into(),
+            resource: role_arn.into(),
+            context: context.clone(),
         };
-        if !principal_matches || !any_glob(&actions, "sts:AssumeRole") || !resource_matches {
+        if !principal_matches || !parsed.matches(&request) {
             continue;
         }
-        if effect == "Deny" {
-            return false;
-        }
-        if effect != "Allow" {
+        if parsed.effect == Effect::Deny {
             return false;
         }
         allowed = true;
@@ -305,8 +314,12 @@ fn condition_values(value: &Value) -> Result<Vec<String>, IamStsError> {
 
 /// Case-insensitive glob: `*` matches any sequence (incl. empty), `?` exactly one char.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    glob_match_case_sensitive(&pattern.to_ascii_lowercase(), &text.to_ascii_lowercase())
+}
+
+fn glob_match_case_sensitive(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
     // Iterative wildcard match with backtracking.
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star, mut mark) = (None, 0usize);
@@ -403,8 +416,12 @@ fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> bool {
         "StringNotEquals" => policy_value != ctx_value,
         "StringEqualsIgnoreCase" => policy_value.eq_ignore_ascii_case(ctx_value),
         "StringNotEqualsIgnoreCase" => !policy_value.eq_ignore_ascii_case(ctx_value),
-        "StringLike" | "ArnLike" | "ArnEquals" => glob_match(policy_value, ctx_value),
-        "StringNotLike" | "ArnNotLike" | "ArnNotEquals" => !glob_match(policy_value, ctx_value),
+        "StringLike" | "ArnLike" | "ArnEquals" => {
+            glob_match_case_sensitive(policy_value, ctx_value)
+        }
+        "StringNotLike" | "ArnNotLike" | "ArnNotEquals" => {
+            !glob_match_case_sensitive(policy_value, ctx_value)
+        }
         "Bool" => policy_value.eq_ignore_ascii_case(ctx_value),
         "NumericEquals" => num(policy_value) == num(ctx_value),
         "NumericNotEquals" => num(policy_value) != num(ctx_value),

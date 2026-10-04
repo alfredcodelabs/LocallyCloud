@@ -197,6 +197,16 @@ impl SqsHandler {
 
 #[async_trait]
 impl NativeHandler for SqsHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .store
+            .all()
+            .into_iter()
+            .filter(|q| q.arn.account == account)
+            .map(|q| q.arn.region.clone())
+            .collect())
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let target = request
             .headers

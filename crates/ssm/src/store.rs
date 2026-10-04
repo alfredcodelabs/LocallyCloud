@@ -35,6 +35,15 @@ pub(crate) struct ParameterStore {
 }
 
 impl ParameterStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .parameters
+            .iter()
+            .filter(|e| e.key().scope.account_id == account)
+            .map(|e| e.key().scope.region.clone())
+            .collect())
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             parameters: DashMap::new(),

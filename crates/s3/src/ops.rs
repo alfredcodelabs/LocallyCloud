@@ -119,9 +119,10 @@ fn bucket_key_enabled(value: Option<&str>) -> Result<bool, S3Error> {
 fn kms_error(error: KmsInternalError) -> S3Error {
     match error {
         KmsInternalError::AccessDenied => S3Error::AccessDenied,
+        KmsInternalError::Disabled => S3Error::KmsDisabled,
+        KmsInternalError::InvalidState => S3Error::KmsInvalidState,
         KmsInternalError::InvalidRequest
         | KmsInternalError::NotFound
-        | KmsInternalError::InvalidState
         | KmsInternalError::InvalidCiphertext => {
             S3Error::InvalidArgument("The KMS key is invalid or unavailable".into())
         }
@@ -140,6 +141,7 @@ fn canonical_kms_key(ctx: &Ctx<'_>, key_id: &str) -> Result<String, S3Error> {
                 request_id: ctx.request_id.to_string(),
                 caller_arn: None,
                 iam_policy_allowed: false,
+                iam_policy_denied: false,
             },
             key_id: key_id.to_string(),
         })

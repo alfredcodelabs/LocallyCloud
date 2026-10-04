@@ -224,6 +224,7 @@ pub(super) fn check(
         if let Some(role) = body.get("RoleArn").and_then(Value::as_str) {
             evaluator
                 .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+                    source_arn: Some(rule(req, bus_name(default_bus), required(body, "Name")?)),
                     caller: identity.clone(),
 
                     role_arn: role.into(),
@@ -247,6 +248,7 @@ pub(super) fn check(
             if let Some(role) = target.get("RoleArn").and_then(Value::as_str) {
                 evaluator
                     .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+                        source_arn: Some(rule(req, bus_name(default_bus), required(body, "Rule")?)),
                         caller: identity.clone(),
 
                         role_arn: role.into(),

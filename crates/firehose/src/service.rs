@@ -796,6 +796,7 @@ fn authorize_roles(
     let authorize = |role_arn: &str, action: &str, resource: &str| {
         evaluator
             .authorize_service_role(ServiceRoleAuthorizationRequest {
+                source_arn: None,
                 caller: caller.clone(),
                 role_arn: role_arn.to_owned(),
                 service_principal: "firehose.amazonaws.com".into(),

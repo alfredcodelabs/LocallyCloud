@@ -134,6 +134,27 @@ impl StateDb {
         Ok(connection)
     }
 
+    /// Hold this guard for a server or offline migration's lifetime. SQLite locks alone
+    /// cannot protect independently cached service snapshots from another process.
+    pub fn lock_runtime(&self) -> Result<std::fs::File, StateError> {
+        let mut path = self.path.as_os_str().to_owned();
+        path.push(".runtime.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.try_lock().map_err(|error| {
+            std::io::Error::other(format!(
+                "cannot acquire exclusive state lock; stop the other instance: {error}"
+            ))
+        })?;
+        Ok(file)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -142,6 +163,25 @@ impl StateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_lock_excludes_another_owner_and_releases_on_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "locallycloud-state-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = StateDb::open(root.join("state.sqlite3")).unwrap();
+        let guard = state.lock_runtime().unwrap();
+        let other = StateDb::open(state.path().to_owned()).unwrap();
+        assert!(other.lock_runtime().is_err());
+        drop(guard);
+        drop(other.lock_runtime().unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn private_dir_rejects_public_directory_and_symlink() {
@@ -207,4 +247,29 @@ mod tests {
         drop(reopened);
         fs::remove_dir_all(root).expect("cleanup");
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MasterKeyError {
+    #[error("LOCALLYCLOUD_KMS_MASTER_KEY is required")]
+    Missing,
+    #[error("LOCALLYCLOUD_KMS_MASTER_KEY must be base64 for exactly 32 bytes")]
+    Invalid,
+}
+
+/// The same externally supplied master protects each service's distinct key material.
+pub fn external_master_key() -> Result<zeroize::Zeroizing<Vec<u8>>, MasterKeyError> {
+    use base64::Engine;
+    let encoded = zeroize::Zeroizing::new(
+        std::env::var("LOCALLYCLOUD_KMS_MASTER_KEY").map_err(|_| MasterKeyError::Missing)?,
+    );
+    let decoded = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(|_| MasterKeyError::Invalid)?,
+    );
+    if decoded.len() != 32 {
+        return Err(MasterKeyError::Invalid);
+    }
+    Ok(decoded)
 }

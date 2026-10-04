@@ -82,6 +82,53 @@ impl KmsService {
         Ok(json!({ "KeyMetadata": metadata }))
     }
 
+    pub(crate) fn key_admin_policy(
+        &self,
+        selector: &str,
+        account: &str,
+        region: &str,
+    ) -> Result<(String, KeyPolicy, bool), KmsError> {
+        let scope = Scope::new(account, region);
+        let id = self.resolve_key_id(selector, &scope)?;
+        self.store
+            .with_key(&scope, &id, |key| {
+                (scope.key_arn(&id), key.policy.clone(), key.explicit_policy)
+            })
+            .ok_or(KmsError::NotFound)
+    }
+
+    pub(super) fn set_enabled(
+        &self,
+        body: &Map<String, Value>,
+        scope: &Scope,
+        enabled: bool,
+    ) -> Result<Value, KmsError> {
+        require_known_fields(body, &["KeyId"])?;
+        let selector = required_string(body, "KeyId")?;
+        // Enable/DisableKey accepts a key ID/ARN, never an alias.
+        if selector.starts_with("alias/") || selector.contains(":alias/") {
+            return Err(KmsError::Validation);
+        }
+        let key_id = self.resolve_key_id(selector, scope)?;
+        self.store
+            .with_key_mut(scope, &key_id, |key| {
+                if key.manager != KeyManager::Customer {
+                    return Err(KmsError::AccessDenied);
+                }
+                if matches!(key.state, KeyState::PendingDeletion { .. }) {
+                    return Err(KmsError::InvalidState);
+                }
+                key.state = if enabled {
+                    KeyState::Enabled
+                } else {
+                    KeyState::Disabled
+                };
+                Ok(())
+            })?
+            .ok_or(KmsError::NotFound)?;
+        Ok(json!({}))
+    }
+
     pub(super) fn describe_key(
         &self,
         body: &Map<String, Value>,
@@ -220,7 +267,7 @@ impl KmsService {
                 if key.manager != KeyManager::Customer {
                     return Err(KmsError::AccessDenied);
                 }
-                if !key.is_enabled() {
+                if !matches!(key.state, KeyState::Enabled | KeyState::Disabled) {
                     return Err(KmsError::InvalidState);
                 }
                 key.state = KeyState::PendingDeletion {

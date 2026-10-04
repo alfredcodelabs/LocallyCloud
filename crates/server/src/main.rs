@@ -96,6 +96,7 @@ impl locallycloud_region_switch::ExecutionRoleAuthorizer for IamExecutionRoleAut
             "route53-recovery-cluster:UpdateRoutingControlStates",
         ] {
             let auth = ServiceRoleAuthorizationRequest {
+                source_arn: None,
                 caller: caller.clone(),
                 role_arn: role_arn.into(),
                 service_principal: "arc-region-switch.amazonaws.com".into(),

@@ -293,6 +293,17 @@ fn key(account: &str, region: &str, name: &str) -> Key {
 }
 
 impl SfnStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .machines
+            .iter()
+            .map(|e| e.key().clone())
+            .chain(self.activities.iter().map(|e| e.key().clone()))
+            .filter(|k| k.0 == account)
+            .map(|k| k.1)
+            .collect())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

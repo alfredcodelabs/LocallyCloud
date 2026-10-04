@@ -569,7 +569,7 @@ mod exists_tests {
                 &vars
             )
             .unwrap(),
-            json!([])
+            Value::Null
         );
         assert_eq!(
             evaluate("{% ($x := 1; $exists($states.input.empty)) %}", &vars).unwrap(),
@@ -598,7 +598,7 @@ mod exists_tests {
             evaluate("{% $exists($states.input.missing) %}", &vars).unwrap(),
             json!(false)
         );
-        // A non-empty value and a filter result (an array, even empty) are values.
+        // A non-empty array is a value; an empty filter produces an absent sequence.
         assert_eq!(
             evaluate("{% $exists($states.input.items) %}", &vars).unwrap(),
             json!(true)
@@ -609,7 +609,7 @@ mod exists_tests {
                 &vars
             )
             .unwrap(),
-            json!(true)
+            json!(false)
         );
         // An empty sequence from a predicate with no match stays absent.
         assert_eq!(

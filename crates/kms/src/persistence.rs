@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use aws_lc_rs::aead::{Aad, Nonce, RandomizedNonceKey, AES_256_GCM, NONCE_LEN};
-use base64::{engine::general_purpose::STANDARD, Engine};
 use locallycloud_state::StateDb;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -34,14 +33,11 @@ struct SavedKey {
 
 impl KmsPersistence {
     pub(crate) fn new(db: Arc<StateDb>) -> Result<Self, KmsError> {
-        let encoded = Zeroizing::new(
-            std::env::var("LOCALLYCLOUD_KMS_MASTER_KEY").map_err(|_| KmsError::MissingMasterKey)?,
-        );
-        let mut decoded = Zeroizing::new(
-            STANDARD
-                .decode(encoded.as_bytes())
-                .map_err(|_| KmsError::InvalidMasterKey)?,
-        );
+        let mut decoded =
+            locallycloud_state::external_master_key().map_err(|error| match error {
+                locallycloud_state::MasterKeyError::Missing => KmsError::MissingMasterKey,
+                locallycloud_state::MasterKeyError::Invalid => KmsError::InvalidMasterKey,
+            })?;
         let master: [u8; 32] = decoded
             .as_slice()
             .try_into()
@@ -93,6 +89,7 @@ impl KmsPersistence {
             let material = self.open_material(&scope, &saved.key_id, &saved.sealed_material)?;
             let state = match saved.state.as_str() {
                 "Enabled" => KeyState::Enabled,
+                "Disabled" => KeyState::Disabled,
                 "PendingDeletion" => KeyState::PendingDeletion {
                     deletion_date: saved.deletion_date.ok_or(KmsError::Internal)?,
                     pending_window_days: saved.pending_window_days.ok_or(KmsError::Internal)?,
@@ -208,6 +205,7 @@ impl KmsPersistence {
     ) -> Result<(), KmsError> {
         let (state, deletion_date, pending_window_days) = match key.state {
             KeyState::Enabled => ("Enabled", None, None),
+            KeyState::Disabled => ("Disabled", None, None),
             KeyState::PendingDeletion {
                 deletion_date,
                 pending_window_days,

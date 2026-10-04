@@ -51,6 +51,24 @@ pub(crate) struct SecretStore {
 }
 
 impl SecretStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let mut regions = Vec::new();
+        for e in self
+            .secrets
+            .iter()
+            .filter(|e| e.key().scope.account_id == account)
+        {
+            if e.value()
+                .lock()
+                .map_err(|_| "secret inventory unavailable")?
+                .is_some()
+            {
+                regions.push(e.key().scope.region.clone());
+            }
+        }
+        Ok(regions)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             secrets: DashMap::new(),

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Contract version understood by the registry and internal callers.
-pub const KMS_INTERNAL_API_VERSION: u16 = 3;
+pub const KMS_INTERNAL_API_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KmsCallContext {
@@ -15,12 +15,15 @@ pub struct KmsCallContext {
     pub caller_arn: Option<String>,
     /// True only when the stored IAM identity policy explicitly permits this operation.
     pub iam_policy_allowed: bool,
+    /// Explicit IAM deny or an unresolved/boundary-limited identity; cannot be overridden by key policy.
+    pub iam_policy_denied: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KmsServiceKey {
     SecretsManager,
     Ssm,
+    S3,
 }
 
 impl KmsServiceKey {
@@ -28,6 +31,7 @@ impl KmsServiceKey {
         match self {
             Self::SecretsManager => "secretsmanager",
             Self::Ssm => "ssm",
+            Self::S3 => "s3",
         }
     }
 }
@@ -151,6 +155,8 @@ pub enum KmsInternalError {
     InvalidRequest,
     #[error("KMS key was not found")]
     NotFound,
+    #[error("KMS key is disabled")]
+    Disabled,
     #[error("KMS key is not usable")]
     InvalidState,
     #[error("KMS rejected the ciphertext")]

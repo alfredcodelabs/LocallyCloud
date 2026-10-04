@@ -96,6 +96,7 @@ base64 = "0.22"
 flate2 = "=1.1.9"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 zeroize = "=1.9.0"
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
 # Zip package handling for Lambda code (deflate only; no bzip2/zstd to keep the footprint small)
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

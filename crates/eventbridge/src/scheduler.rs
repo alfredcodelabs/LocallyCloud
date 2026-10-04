@@ -1027,6 +1027,10 @@ fn schedule_delivery(schedule: &Schedule, scheduled_due: OffsetDateTime) -> Deli
     let retry = schedule.target.get("RetryPolicy").unwrap_or(&Value::Null);
     DeliveryRequest {
         source_service: "scheduler",
+        source_arn: schedule
+            .arn
+            .split_once(":schedule/")
+            .map(|(prefix, _)| format!("{prefix}:schedule-group/{}", schedule.group)),
         arn: schedule
             .target
             .get("Arn")

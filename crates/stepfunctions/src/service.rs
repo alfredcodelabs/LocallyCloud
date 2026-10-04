@@ -92,6 +92,10 @@ impl SfnHandler {
 
 #[async_trait]
 impl NativeHandler for SfnHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let op = match Self::operation(&request) {
             Some(o) => o,

@@ -91,6 +91,12 @@ pub enum S3Error {
     AccessForbidden,
     #[error("Access Denied")]
     AccessDenied,
+    #[error("Legacy SSE-KMS data requires offline migrate-s3-encryption before authorized reads")]
+    LegacyKmsMigrationRequired,
+    #[error("The specified KMS key is not enabled")]
+    KmsDisabled,
+    #[error("The state of the specified KMS key is not valid for this request")]
+    KmsInvalidState,
     #[error("{0}")]
     NotImplemented(String),
     #[error("We encountered an internal error. Please try again.")]
@@ -140,7 +146,9 @@ impl S3Error {
             S3Error::AuthorizationQueryParametersError => "AuthorizationQueryParametersError",
             S3Error::InvalidTag => "InvalidTag",
             S3Error::AccessForbidden => "AccessForbidden",
-            S3Error::AccessDenied => "AccessDenied",
+            S3Error::AccessDenied | S3Error::LegacyKmsMigrationRequired => "AccessDenied",
+            S3Error::KmsDisabled => "KMS.DisabledException",
+            S3Error::KmsInvalidState => "KMS.KMSInvalidStateException",
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::InternalError => "InternalError",
         }
@@ -181,11 +189,14 @@ impl S3Error {
             | S3Error::MalformedXML
             | S3Error::AuthorizationQueryParametersError
             | S3Error::InvalidTag => 400,
+            S3Error::KmsDisabled | S3Error::KmsInvalidState => 400,
             S3Error::PreconditionFailed => 412,
             S3Error::NotModified => 304,
             S3Error::InvalidRange => 416,
             S3Error::MethodNotAllowed | S3Error::DeleteMarkerVersion(_) => 405,
-            S3Error::AccessForbidden | S3Error::AccessDenied => 403,
+            S3Error::AccessForbidden
+            | S3Error::AccessDenied
+            | S3Error::LegacyKmsMigrationRequired => 403,
             S3Error::NotImplemented(_) => 501,
             S3Error::InternalError => 500,
         }

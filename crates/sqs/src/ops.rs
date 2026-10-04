@@ -1168,6 +1168,7 @@ fn kms_call(ctx: &Ctx<'_>) -> KmsCallContext {
         request_id: ctx.request_id.into(),
         caller_arn,
         iam_policy_allowed: false,
+        iam_policy_denied: false,
     }
 }
 
@@ -1202,6 +1203,7 @@ fn move_kms_failure(error: KmsInternalError) -> MoveKmsFailure {
         KmsInternalError::Unavailable | KmsInternalError::Internal => MoveKmsFailure::Retryable,
         KmsInternalError::InvalidRequest
         | KmsInternalError::NotFound
+        | KmsInternalError::Disabled
         | KmsInternalError::InvalidState
         | KmsInternalError::InvalidCiphertext
         | KmsInternalError::AccessDenied => MoveKmsFailure::Terminal,

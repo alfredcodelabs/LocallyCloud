@@ -66,10 +66,11 @@ impl KmsHandler {
         Ok(handler)
     }
 
-    fn authorize_put_key_policy(
+    fn authorize_key_admin(
         &self,
         request: &ServiceRequest,
         body: &serde_json::Map<String, Value>,
+        operation: &str,
     ) -> Result<(), KmsError> {
         let registry = self.registry.upgrade().ok_or(KmsError::AccessDenied)?;
         let dispatcher = registry
@@ -79,33 +80,69 @@ impl KmsHandler {
             .get("KeyId")
             .and_then(Value::as_str)
             .ok_or(KmsError::Validation)?;
-        let resource = if key_id.starts_with("arn:aws:kms:") {
-            key_id.to_owned()
-        } else {
-            format!(
-                "arn:aws:kms:{}:{}:key/{key_id}",
-                request.region, request.account_id
-            )
-        };
+        if matches!(
+            operation,
+            "EnableKey" | "DisableKey" | "ScheduleKeyDeletion"
+        ) && (key_id.starts_with("alias/") || key_id.contains(":alias/"))
+        {
+            return Err(KmsError::Validation);
+        }
+        let (resource, policy, explicit_policy) =
+            self.service
+                .key_admin_policy(key_id, &request.account_id, &request.region)?;
         let authorization = request
             .headers
             .get(http::header::AUTHORIZATION)
             .and_then(|header| header.to_str().ok());
-        dispatcher
-            .authorize(AuthorizationRequest {
-                request_identity: RequestIdentity {
-                    account_id: request.account_id.clone(),
-                    access_key_id: authorization
-                        .and_then(RequestIdentity::access_key_from_authorization),
-                    arn: None,
-                },
-                delegated_identity: None,
-                source_service: "kms".into(),
-                action: "kms:PutKeyPolicy".into(),
-                resource,
-                context: Default::default(),
-            })
-            .map_err(|_| KmsError::AccessDenied)
+        let identity = RequestIdentity {
+            account_id: request.account_id.clone(),
+            access_key_id: authorization.and_then(RequestIdentity::access_key_from_authorization),
+            arn: None,
+        };
+        let principal = dispatcher
+            .resolve_caller_arn(&identity)
+            .map_err(|_| KmsError::AccessDenied)?;
+        let mut context = std::collections::BTreeMap::from([(
+            "kms:calleraccount".into(),
+            vec![request.account_id.clone()],
+        )]);
+        if let Some(principal) = &principal {
+            context.insert("aws:principalarn".into(), vec![principal.clone()]);
+            context.insert(
+                "aws:principalaccount".into(),
+                vec![request.account_id.clone()],
+            );
+        }
+        let authorization = AuthorizationRequest {
+            request_identity: identity,
+            delegated_identity: None,
+            source_service: "kms".into(),
+            action: format!("kms:{operation}"),
+            resource,
+            context: context.clone(),
+        };
+        if dispatcher.identity_policy_denies(authorization.clone()) {
+            return Err(KmsError::AccessDenied);
+        }
+        if principal.is_none() {
+            return if !explicit_policy && !dispatcher.strict_sigv4_required() {
+                Ok(())
+            } else {
+                Err(KmsError::AccessDenied)
+            };
+        }
+        let iam_allowed = dispatcher.identity_policy_allows(authorization);
+        if policy.allows_in_context(
+            principal.as_deref(),
+            &format!("kms:{operation}"),
+            &request.account_id,
+            iam_allowed,
+            &context,
+        ) {
+            Ok(())
+        } else {
+            Err(KmsError::AccessDenied)
+        }
     }
 
     fn before_internal_call(&self) -> Result<(), KmsInternalError> {
@@ -184,6 +221,10 @@ impl KmsInternalApi for KmsHandler {
 
 #[async_trait]
 impl NativeHandler for KmsHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.service.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let result: Result<Value, AwsError> = if request.method != http::Method::POST {
             Err(unknown_operation())
@@ -203,8 +244,11 @@ impl NativeHandler for KmsHandler {
                 Some(operation) => match serde_json::from_slice::<Value>(&request.body) {
                     Err(_) => Err(KmsError::Serialization.into_aws()),
                     Ok(Value::Object(body)) => {
-                        let authorization = if operation == "PutKeyPolicy" {
-                            self.authorize_put_key_policy(&request, &body)
+                        let authorization = if matches!(
+                            operation,
+                            "PutKeyPolicy" | "DisableKey" | "EnableKey" | "ScheduleKeyDeletion"
+                        ) {
+                            self.authorize_key_admin(&request, &body, operation)
                         } else {
                             Ok(())
                         };
@@ -236,7 +280,19 @@ impl NativeHandler for KmsHandler {
                 .status(200)
                 .header("content-type", "application/x-amz-json-1.1")
                 .header("x-amzn-RequestId", &request.request_id)
-                .body(Body::from(value.to_string()))
+                .body(
+                    if matches!(
+                        request
+                            .headers
+                            .get("x-amz-target")
+                            .and_then(|target| target.to_str().ok()),
+                        Some("TrentService.DisableKey" | "TrentService.EnableKey")
+                    ) {
+                        Body::empty()
+                    } else {
+                        Body::from(value.to_string())
+                    },
+                )
                 .expect("JSON response is valid"),
             Err(error) => error
                 .with_request_id(request.request_id)
@@ -256,6 +312,7 @@ fn map_internal_error(error: KmsError) -> KmsInternalError {
         | KmsError::Unsupported => KmsInternalError::InvalidRequest,
         KmsError::NotFound => KmsInternalError::NotFound,
         KmsError::InvalidState => KmsInternalError::InvalidState,
+        KmsError::Disabled => KmsInternalError::Disabled,
         KmsError::InvalidCiphertext => KmsInternalError::InvalidCiphertext,
         KmsError::AccessDenied => KmsInternalError::AccessDenied,
         KmsError::Internal
@@ -311,15 +368,34 @@ mod tests {
     use super::*;
     use locallycloud_core::integration::kms::KMS_INTERNAL_API_VERSION;
 
-    struct DenyAdmin;
-
-    impl locallycloud_core::integration::authorization::AuthorizationEvaluator for DenyAdmin {
+    struct AdminPolicy {
+        denied: std::sync::atomic::AtomicBool,
+        allowed: std::sync::atomic::AtomicBool,
+        strict: std::sync::atomic::AtomicBool,
+        principal: std::sync::Mutex<Option<String>>,
+    }
+    impl locallycloud_core::integration::authorization::AuthorizationEvaluator for AdminPolicy {
         fn authorize(
             &self,
-            request: locallycloud_core::integration::authorization::AuthorizationRequest,
+            _: AuthorizationRequest,
         ) -> Result<(), locallycloud_core::integration::authorization::AuthorizationError> {
-            assert_eq!(request.action, "kms:PutKeyPolicy");
-            Err(locallycloud_core::integration::authorization::AuthorizationError::Denied)
+            Ok(())
+        }
+        fn resolve_caller_arn(
+            &self,
+            _: &RequestIdentity,
+        ) -> Result<Option<String>, locallycloud_core::integration::authorization::AuthorizationError>
+        {
+            Ok(self.principal.lock().unwrap().clone())
+        }
+        fn identity_policy_denies(&self, _: AuthorizationRequest) -> bool {
+            self.denied.load(Ordering::Relaxed)
+        }
+        fn identity_policy_allows(&self, _: AuthorizationRequest) -> bool {
+            self.allowed.load(Ordering::Relaxed)
+        }
+        fn strict_sigv4_required(&self) -> bool {
+            self.strict.load(Ordering::Relaxed)
         }
     }
 
@@ -333,15 +409,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_key_policy_requires_administrative_iam_permission() {
+    async fn administrative_operations_honor_key_policy_and_identity_denial() {
         use locallycloud_core::integration::InternalDispatcher;
         use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
         let registry = ServiceRegistry::with_known_services();
+        let admin = Arc::new(AdminPolicy {
+            denied: std::sync::atomic::AtomicBool::new(false),
+            allowed: std::sync::atomic::AtomicBool::new(false),
+            strict: std::sync::atomic::AtomicBool::new(false),
+            principal: std::sync::Mutex::new(Some("arn:aws:iam::000000000000:user/admin".into())),
+        });
         registry.register_native_with_authorization_evaluator(
             ServiceName::new("iam"),
             ServiceMetadata::new(AwsProtocol::Query, None),
             Arc::new(EmptyHandler),
-            Arc::new(DenyAdmin),
+            admin.clone(),
         );
         registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
             &registry,
@@ -354,26 +436,91 @@ mod tests {
             "000000000000".into(),
         )));
         let handler = KmsHandler::with_registry(&registry, test_db()).unwrap();
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-amz-target", "TrentService.PutKeyPolicy".parse().unwrap());
-        let response = handler
-            .handle(ServiceRequest {
-                method: http::Method::POST,
-                uri: "/".parse().unwrap(),
-                headers,
-                body: bytes::Bytes::from_static(
-                    br#"{"KeyId":"key","PolicyName":"default","Policy":"{}"}"#,
-                ),
-                region: "us-east-1".into(),
-                account_id: "000000000000".into(),
-                request_id: "request".into(),
-            })
-            .await;
-        assert_eq!(response.status(), 400);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
+        let create = handler
+            .service
+            .dispatch(
+                "CreateKey",
+                serde_json::json!({}).as_object().unwrap(),
+                "000000000000",
+                "us-east-1",
+            )
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("AccessDeniedException"));
+        let key = create["KeyMetadata"]["KeyId"].as_str().unwrap();
+        async fn admin_call(handler: &KmsHandler, key: &str, action: &str) -> http::StatusCode {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "x-amz-target",
+                format!("TrentService.{action}").parse().unwrap(),
+            );
+            handler
+                .handle(ServiceRequest {
+                    method: http::Method::POST,
+                    uri: "/".parse().unwrap(),
+                    headers,
+                    body: bytes::Bytes::from(serde_json::json!({"KeyId":key}).to_string()),
+                    region: "us-east-1".into(),
+                    account_id: "000000000000".into(),
+                    request_id: "admin-test".into(),
+                })
+                .await
+                .status()
+        }
+        // The default account grant delegates to actual IAM permission.
+        assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
+        assert_eq!(admin_call(&handler, key, "ScheduleKeyDeletion").await, 400);
+        assert_eq!(
+            handler
+                .service
+                .dispatch(
+                    "DescribeKey",
+                    serde_json::json!({"KeyId":key}).as_object().unwrap(),
+                    "000000000000",
+                    "us-east-1"
+                )
+                .unwrap()["KeyMetadata"]["KeyState"],
+            "Enabled"
+        );
+        admin.allowed.store(true, Ordering::Relaxed);
+        assert_eq!(admin_call(&handler, key, "DisableKey").await, 200);
+        let policy = |principal: &str, deny: bool| {
+            serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":principal},"Action":"kms:*","Resource":"*"},{"Effect":if deny {"Deny"} else {"Allow"},"Principal":{"AWS":principal},"Action":"kms:DisableKey","Resource":"*"}]}).to_string()
+        };
+        let set_policy = |raw: String| {
+            handler.service.dispatch("PutKeyPolicy", serde_json::json!({"KeyId":key,"Policy":raw,"BypassPolicyLockoutSafetyCheck":true}).as_object().unwrap(), "000000000000", "us-east-1").unwrap();
+        };
+        // Direct key-policy grants do not require an additional identity Allow.
+        set_policy(policy("arn:aws:iam::000000000000:user/admin", false));
+        admin.allowed.store(false, Ordering::Relaxed);
+        assert_eq!(admin_call(&handler, key, "EnableKey").await, 200);
+        // Explicit identity Deny and boundaries dominate a direct grant.
+        admin.denied.store(true, Ordering::Relaxed);
+        assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
+        assert_eq!(admin_call(&handler, key, "ScheduleKeyDeletion").await, 400);
+        admin.denied.store(false, Ordering::Relaxed);
+        set_policy(policy("arn:aws:iam::000000000000:user/admin", true));
+        admin.allowed.store(true, Ordering::Relaxed);
+        assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
+        set_policy(policy("arn:aws:iam::000000000000:user/other", false));
+        assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
+        *admin.principal.lock().unwrap() = None;
+        assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
+        let legacy = handler
+            .service
+            .dispatch(
+                "CreateKey",
+                serde_json::json!({}).as_object().unwrap(),
+                "000000000000",
+                "us-east-1",
+            )
+            .unwrap();
+        let legacy = legacy["KeyMetadata"]["KeyId"].as_str().unwrap();
+        assert_eq!(admin_call(&handler, legacy, "DisableKey").await, 200);
+        admin.strict.store(true, Ordering::Relaxed);
+        assert_eq!(admin_call(&handler, legacy, "EnableKey").await, 400);
+        assert_eq!(
+            admin_call(&handler, "alias/example", "DisableKey").await,
+            400
+        );
     }
 
     #[test]

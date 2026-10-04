@@ -107,6 +107,17 @@ fn initialize(state: &StateDb) -> Result<(), String> {
 
 #[async_trait]
 impl NativeHandler for SchemasService {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let state = self.state.clone();
+        let account = account.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let db = state.connection().map_err(|_| "Schemas inventory unavailable")?;
+            let mut stmt = db.prepare("SELECT region FROM schemas_registries WHERE account=?1 AND name NOT LIKE 'aws.%' UNION SELECT region FROM schemas_items WHERE account=?1 UNION SELECT region FROM schemas_discoverers WHERE account=?1").map_err(|_| "Schemas inventory unavailable")?;
+            let rows = stmt.query_map([account], |row| row.get(0)).map_err(|_| "Schemas inventory unavailable")?;
+            rows.collect::<Result<Vec<String>, _>>().map_err(|_| "Schemas inventory unavailable")
+        }).await.map_err(|_| "Schemas inventory unavailable")?
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let state = self.state.clone();
         let registry = self.registry.clone();

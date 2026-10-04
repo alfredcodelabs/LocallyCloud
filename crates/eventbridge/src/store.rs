@@ -48,6 +48,56 @@ pub struct EbStore {
 }
 
 impl EbStore {
+    pub(crate) async fn resource_regions(
+        &self,
+        account: &str,
+        service: &str,
+    ) -> Result<Vec<String>, &'static str> {
+        if !self.healthy() {
+            return Err("EventBridge inventory unavailable");
+        }
+        let scopes: Vec<_> = self
+            .scopes
+            .iter()
+            .filter(|e| e.key().0 == account)
+            .map(|e| (e.key().1.clone(), e.value().clone()))
+            .collect();
+        let mut regions = Vec::new();
+        for (region, scope) in scopes {
+            let s = scope.read().await;
+            let bus = s.buses.values().any(|b| {
+                b.name != "default"
+                    || !b.rules.is_empty()
+                    || b.policy.is_some()
+                    || b.kms_key_identifier.is_some()
+                    || b.dead_letter_config.is_some()
+                    || b.log_config.is_some()
+                    || b.description.is_some()
+                    || !b.tags.is_empty()
+            });
+            let present = match service {
+                "events" => {
+                    bus || !s.archives.is_empty()
+                        || !s.replays.is_empty()
+                        || !s.connections.is_empty()
+                        || !s.api_destinations.is_empty()
+                }
+                "scheduler" => {
+                    !s.schedules.is_empty()
+                        || s.schedule_groups
+                            .values()
+                            .any(|g| g.name != "default" || !g.tags.is_empty())
+                }
+                "pipes" => !s.pipes.is_empty(),
+                _ => false,
+            };
+            if present {
+                regions.push(region);
+            }
+        }
+        Ok(regions)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

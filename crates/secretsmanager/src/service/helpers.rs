@@ -386,6 +386,7 @@ pub(super) fn kms_call(request: &ServiceRequest, scope: &Scope) -> KmsCallContex
         request_id: request.request_id.clone(),
         caller_arn: None,
         iam_policy_allowed: false,
+        iam_policy_denied: false,
     }
 }
 

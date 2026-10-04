@@ -2513,6 +2513,7 @@ impl Interpreter {
         }
         evaluator
             .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                source_arn: Some(self.sm_arn.clone()),
                 caller: RequestIdentity {
                     account_id: self.account.clone(),
                     access_key_id: None,

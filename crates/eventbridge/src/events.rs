@@ -1378,6 +1378,7 @@ async fn fanout_rules(
                 },
                 &effective_target,
                 payload,
+                &rule.arn,
                 &rule.name,
             )
             .await;
@@ -2657,6 +2658,7 @@ async fn deliver_rule_targets(
             },
             &effective_target,
             payload,
+            &rule.arn,
             &rule.name,
         )
         .await;
@@ -2668,6 +2670,7 @@ async fn deliver_event_target(
     context: FanoutContext<'_>,
     target: &Target,
     payload: String,
+    rule_arn: &str,
     rule_name: &str,
 ) -> bool {
     let FanoutContext {
@@ -2679,7 +2682,8 @@ async fn deliver_event_target(
         correlation,
     } = context;
     if target.arn.split(':').nth(2) == Some("logs") {
-        let request = DeliveryRequest::from((target, payload));
+        let mut request = DeliveryRequest::from((target, payload));
+        request.source_arn = Some(rule_arn.into());
         return delivery::deliver_logs(registry, &request, region, account, rule_name, correlation)
             .await
             .is_ok();
@@ -2690,6 +2694,17 @@ async fn deliver_event_target(
         account: arn_account,
     }) = EbArn::parse(&target.arn)
     {
+        if !delivery::authorize_role_execution(
+            registry,
+            target.role_arn.as_deref(),
+            "events",
+            Some(rule_arn),
+            "events:InvokeApiDestination",
+            &target.arn,
+            account,
+        ) {
+            return false;
+        }
         let scope = store.scope(account, region).await;
         let configuration = if arn_region == region && arn_account == account {
             let state = scope.read().await;
@@ -2724,6 +2739,7 @@ async fn deliver_event_target(
             if let Some(dlq) = &target.dead_letter_arn {
                 let request = DeliveryRequest {
                     source_service: "events",
+                    source_arn: Some(rule_arn.into()),
                     arn: dlq.clone(),
                     payload,
                     role_arn: target.role_arn.clone(),
@@ -2743,7 +2759,8 @@ async fn deliver_event_target(
         }
         return delivered;
     }
-    let request = DeliveryRequest::from((target, payload));
+    let mut request = DeliveryRequest::from((target, payload));
+    request.source_arn = Some(rule_arn.into());
     delivery::deliver(registry, &request, region, account)
         .await
         .is_ok()

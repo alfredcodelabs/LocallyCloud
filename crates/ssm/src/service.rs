@@ -370,6 +370,7 @@ fn kms_call(request: &ServiceRequest, scope: &Scope) -> KmsCallContext {
         request_id: request.request_id.clone(),
         caller_arn: None,
         iam_policy_allowed: false,
+        iam_policy_denied: false,
     }
 }
 
@@ -386,6 +387,10 @@ fn map_kms_error(error: KmsInternalError) -> SsmError {
 
 #[async_trait]
 impl NativeHandler for SsmHandler {
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.store.resource_regions(account)
+    }
+
     async fn handle(&self, request: ServiceRequest) -> Response {
         let result = if self.persistence_failed.load(Ordering::Acquire) {
             Err(SsmError::Internal)

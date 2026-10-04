@@ -314,6 +314,9 @@ impl PipesService {
             tags: pipe_tags(body),
             generation: 1,
             source_checkpoints: BTreeMap::new(),
+            source_creation_timestamp: None,
+            source_start_timestamp: crate::model::source_start_timestamp(),
+            source_cursor: 0,
         };
         pipe_persistence::save(self.store.state_db(), account, region, &pipe)
             .map_err(PipesError::Internal)?;
@@ -389,6 +392,9 @@ impl PipesService {
         if let Some(value) = body.get("SourceParameters") {
             pipe.source_parameters = value.clone();
             pipe.source_checkpoints.clear();
+            pipe.source_creation_timestamp = None;
+            pipe.source_start_timestamp = crate::model::source_start_timestamp();
+            pipe.source_cursor = 0;
         }
         if body.get("Enrichment").is_some() {
             pipe.enrichment = body
@@ -672,6 +678,25 @@ impl PipesService {
                         continue;
                     }
                 };
+                if current.source.contains(":kinesis:") || current.source.contains(":dynamodb:") {
+                    let mut state = scope.write().await;
+                    let Some(stored) = state
+                        .pipes
+                        .get(&item.name)
+                        .filter(|stored| stored.generation == item.generation)
+                    else {
+                        break;
+                    };
+                    let mut updated = stored.clone();
+                    updated.source_creation_timestamp = batch.source_creation_timestamp;
+                    updated.source_cursor = batch.source_cursor;
+                    if pipe_persistence::save(store.state_db(), &account, &region, &updated)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    state.pipes.insert(item.name.clone(), updated);
+                }
                 for record in &batch.records {
                     if !process_record(
                         &registry,
@@ -763,6 +788,8 @@ struct PolledRecord {
 
 struct PollBatch {
     records: Vec<PolledRecord>,
+    source_creation_timestamp: Option<f64>,
+    source_cursor: usize,
 }
 
 async fn poll_source(
@@ -809,18 +836,54 @@ async fn poll_source(
                 }
             })
             .collect();
-        return Ok(PollBatch { records });
+        return Ok(PollBatch {
+            records,
+            source_creation_timestamp: None,
+            source_cursor: 0,
+        });
     }
 
+    let source_creation_timestamp = if pipe.source.contains(":kinesis:") {
+        let description = dispatch_json(
+            registry,
+            pipe,
+            account,
+            "kinesis",
+            "Kinesis_20131202.DescribeStream",
+            json!({"StreamName":kinesis_stream_name(&pipe.source).ok_or(())?}),
+            region,
+        )
+        .await?;
+        let observed = description["StreamDescription"]["StreamCreationTimestamp"]
+            .as_f64()
+            .ok_or(())?;
+        if pipe
+            .source_creation_timestamp
+            .is_some_and(|expected| expected != observed)
+        {
+            return Err(());
+        }
+        Some(observed)
+    } else {
+        None
+    };
     let shards = discover_stream_shards(registry, pipe, region, account).await?;
+    if shards.is_empty() {
+        return Err(());
+    }
+    let next_cursor = (pipe.source_cursor + 1) % shards.len();
     let (service, target) = if pipe.source.contains(":kinesis:") {
         ("kinesis", "Kinesis_20131202.GetRecords")
     } else {
         ("dynamodb", "DynamoDBStreams_20120810.GetRecords")
     };
     let mut records = Vec::new();
-    for shard in shards {
-        let cursor = create_stream_iterator(registry, pipe, region, account, &shard).await?;
+    for shard in shards
+        .iter()
+        .skip(pipe.source_cursor % shards.len())
+        .take(1)
+    {
+        let cursor = create_stream_iterator(registry, pipe, region, account, shard).await?;
         let response = dispatch_json(
             registry,
             pipe,
@@ -846,7 +909,11 @@ async fn poll_source(
             });
         }
     }
-    Ok(PollBatch { records })
+    Ok(PollBatch {
+        records,
+        source_creation_timestamp,
+        source_cursor: next_cursor,
+    })
 }
 
 async fn discover_stream_shards(
@@ -931,6 +998,10 @@ async fn create_stream_iterator(
     } else {
         let position = find_string(&pipe.source_parameters, "StartingPosition").unwrap_or("LATEST");
         request["ShardIteratorType"] = json!(position);
+        if kinesis && position == "LATEST" {
+            request["ShardIteratorType"] = json!("AT_TIMESTAMP");
+            request["Timestamp"] = json!(pipe.source_start_timestamp);
+        }
         if position == "AT_TIMESTAMP" {
             request["Timestamp"] = find_value(&pipe.source_parameters, "StartingPositionTimestamp")
                 .cloned()
@@ -1054,6 +1125,7 @@ async fn process_record(
     }
     let request = DeliveryRequest {
         source_service: "pipes",
+        source_arn: Some(pipe.arn.clone()),
         arn: pipe.target.clone(),
         payload: match payload {
             Value::String(value) => value,
@@ -1093,6 +1165,7 @@ async fn invoke_sync_enrichment(
 ) -> Result<Value, ()> {
     let request = DeliveryRequest {
         source_service: "pipes",
+        source_arn: Some(pipe.arn.clone()),
         arn: arn.into(),
         payload,
         role_arn: Some(pipe.role_arn.clone()),
@@ -1125,6 +1198,7 @@ async fn handle_record_failure(
     };
     let dlq = DeliveryRequest {
         source_service: "pipes",
+        source_arn: Some(pipe.arn.clone()),
         arn: arn.into(),
         payload: record.payload.to_string(),
         role_arn: Some(pipe.role_arn.clone()),
@@ -1233,6 +1307,7 @@ async fn dispatch_json(
         registry,
         Some(&pipe.role_arn),
         "pipes",
+        Some(&pipe.arn),
         &permission,
         &pipe.source,
         account,
@@ -1834,6 +1909,9 @@ mod tests {
             tags: BTreeMap::new(),
             generation: 1,
             source_checkpoints: BTreeMap::new(),
+            source_creation_timestamp: None,
+            source_start_timestamp: crate::model::source_start_timestamp(),
+            source_cursor: 0,
         };
         let output = invoke_sync_enrichment(
             &registry,
@@ -1985,6 +2063,9 @@ mod tests {
             tags: BTreeMap::new(),
             generation: 1,
             source_checkpoints: BTreeMap::new(),
+            source_creation_timestamp: None,
+            source_start_timestamp: crate::model::source_start_timestamp(),
+            source_cursor: 0,
         };
         assert!(record_matches(&pipe, &payload));
         pipe.source_parameters = json!({});

@@ -13,6 +13,75 @@ use super::authorization::SigningCredentials;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Sign local dashboard reads using server-held profile credentials and the verifier's
+/// canonicalization. Secrets and signatures never enter browser responses.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sign(
+    method: &Method,
+    uri: &Uri,
+    headers: &mut HeaderMap,
+    body: &[u8],
+    region: &str,
+    service: &str,
+    access_key: &str,
+    credentials: &SigningCredentials,
+) -> Option<()> {
+    let date = OffsetDateTime::now_utc()
+        .format(
+            &format_description::parse_borrowed::<3>("[year][month][day]T[hour][minute][second]Z")
+                .ok()?,
+        )
+        .ok()?;
+    headers.insert("x-amz-date", date.parse().ok()?);
+    if let Some(token) = &credentials.session_token {
+        headers.insert("x-amz-security-token", token.parse().ok()?);
+    }
+    let mut names: Vec<_> = headers.keys().map(|key| key.as_str()).collect();
+    names.sort_unstable();
+    let signed = names.join(";");
+    let canonical_headers = names
+        .iter()
+        .map(|name| {
+            Some(format!(
+                "{}:{}\n",
+                name,
+                header(headers, name)?
+                    .split_ascii_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join("");
+    let canonical = format!(
+        "{}\n{}\n{}\n{}\n{}\n{:x}",
+        method,
+        canonical_uri(uri.path())?,
+        canonical_query(uri.query())?,
+        canonical_headers,
+        signed,
+        Sha256::digest(body)
+    );
+    let scope = format!("{}/{region}/{service}/aws4_request", &date[..8]);
+    let message = format!(
+        "AWS4-HMAC-SHA256\n{date}\n{scope}\n{:x}",
+        Sha256::digest(canonical.as_bytes())
+    );
+    let key = hmac(
+        format!("AWS4{}", credentials.secret_access_key).as_bytes(),
+        &date.as_bytes()[..8],
+    )?;
+    let key = hmac(&key, region.as_bytes())?;
+    let key = hmac(&key, service.as_bytes())?;
+    let key = hmac(&key, b"aws4_request")?;
+    let signature = hmac(&key, message.as_bytes())?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    headers.insert("authorization", format!("AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={signature}").parse().ok()?);
+    Some(())
+}
+
 pub fn verify(
     method: &Method,
     uri: &Uri,
@@ -495,5 +564,84 @@ mod tests {
         assert!(!check(&headers, &body, Some("other")));
         headers.remove("x-amz-security-token");
         assert!(!check(&headers, &body, Some("session")));
+    }
+}
+
+#[cfg(test)]
+mod dashboard_signing_tests {
+    use super::*;
+    #[test]
+    fn signed_local_reads_reject_payload_region_and_token_tampering() {
+        let credentials = SigningCredentials {
+            secret_access_key: "local-secret".into(),
+            session_token: Some("local-token".into()),
+        };
+        for (service, uri, method, body) in [
+            ("dynamodb", "/", Method::POST, b"{}".as_slice()),
+            (
+                "s3",
+                "/orders?prefix=a%20b&list-type=2",
+                Method::GET,
+                b"".as_slice(),
+            ),
+            (
+                "lambda",
+                "/2015-03-31/functions/demo/configuration",
+                Method::GET,
+                b"".as_slice(),
+            ),
+        ] {
+            let uri = uri.parse().unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("host", "localhost".parse().unwrap());
+            sign(
+                &method,
+                &uri,
+                &mut headers,
+                body,
+                "us-west-2",
+                service,
+                "LOCAL",
+                &credentials,
+            )
+            .unwrap();
+            assert!(verify(
+                &method,
+                &uri,
+                &headers,
+                body,
+                "us-west-2",
+                service,
+                |_| Some(credentials.clone())
+            ));
+            assert!(!verify(
+                &method,
+                &uri,
+                &headers,
+                b"changed",
+                "us-west-2",
+                service,
+                |_| Some(credentials.clone())
+            ));
+            assert!(!verify(
+                &method,
+                &uri,
+                &headers,
+                body,
+                "us-east-1",
+                service,
+                |_| Some(credentials.clone())
+            ));
+            headers.insert("x-amz-security-token", "changed".parse().unwrap());
+            assert!(!verify(
+                &method,
+                &uri,
+                &headers,
+                body,
+                "us-west-2",
+                service,
+                |_| Some(credentials.clone())
+            ));
+        }
     }
 }

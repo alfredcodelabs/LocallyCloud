@@ -54,6 +54,7 @@ impl Drop for SecretMaterial {
 #[derive(Clone)]
 pub(crate) enum KeyState {
     Enabled,
+    Disabled,
     PendingDeletion {
         deletion_date: f64,
         pending_window_days: u32,
@@ -97,6 +98,7 @@ impl KeyRecord {
     pub(crate) fn metadata(&self, scope: &Scope) -> Value {
         let (key_state, deletion_date) = match self.state {
             KeyState::Enabled => ("Enabled", None),
+            KeyState::Disabled => ("Disabled", None),
             KeyState::PendingDeletion { deletion_date, .. } => {
                 ("PendingDeletion", Some(deletion_date))
             }
@@ -129,7 +131,7 @@ impl KeyRecord {
                 pending_window_days,
                 ..
             } => Some(pending_window_days),
-            KeyState::Enabled => None,
+            KeyState::Enabled | KeyState::Disabled => None,
         }
     }
 }

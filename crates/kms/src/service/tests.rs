@@ -54,6 +54,7 @@ fn internal_call(account: &str, region: &str) -> KmsCallContext {
         request_id: "request-id".to_owned(),
         caller_arn: None,
         iam_policy_allowed: false,
+        iam_policy_denied: false,
     }
 }
 
@@ -424,5 +425,307 @@ fn rotation_status_is_disabled_for_new_keys_and_scoped() {
             "eu-west-1"
         ),
         Err(KmsError::NotFound)
+    ));
+}
+
+#[test]
+fn s3_default_and_customer_keys_enforce_context_and_revocation() {
+    let service = test_service();
+    let object = "arn:aws:s3:::orders/Invoice.pdf".to_string();
+    let context = BTreeMap::from([("aws:s3:arn".into(), object.clone())]);
+    let user = format!("arn:aws:iam::{ACCOUNT}:user/alice");
+    let caller = KmsCallContext {
+        caller_arn: Some(user.clone()),
+        ..internal_call(ACCOUNT, REGION)
+    };
+    let managed = service
+        .validate_key_internal(KmsValidateKeyRequest {
+            call: caller.clone(),
+            key_id: "alias/aws/s3".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        call_ok(&service, "DescribeKey", json!({"KeyId":"alias/aws/s3"}))["KeyMetadata"]
+            ["KeyManager"],
+        "AWS"
+    );
+    let generate =
+        |call: KmsCallContext, key: &str, encryption_context: BTreeMap<String, String>| {
+            service.generate_data_key_internal(KmsGenerateDataKeyRequest {
+                call,
+                key_id: key.into(),
+                number_of_bytes: 32,
+                encryption_context,
+            })
+        };
+    let managed_data = generate(caller.clone(), "alias/aws/s3", context.clone()).unwrap();
+    assert_eq!(managed_data.key_id, managed.key_arn);
+    let decrypt_managed = |encryption_context| {
+        service.decrypt_internal(KmsDecryptRequest {
+            call: caller.clone(),
+            key_id: Some(managed.key_arn.clone()),
+            ciphertext: SensitiveBytes::new(managed_data.ciphertext.as_slice().to_vec()),
+            encryption_context,
+        })
+    };
+    assert_eq!(
+        decrypt_managed(context.clone())
+            .unwrap()
+            .plaintext
+            .as_slice(),
+        managed_data.plaintext.as_slice()
+    );
+    assert!(matches!(
+        decrypt_managed(BTreeMap::from([(
+            "aws:s3:arn".into(),
+            "arn:aws:s3:::orders/Other.pdf".into()
+        )])),
+        Err(KmsError::InvalidCiphertext)
+    ));
+
+    assert!(matches!(
+        generate(
+            KmsCallContext {
+                iam_policy_denied: true,
+                ..caller.clone()
+            },
+            "alias/aws/s3",
+            context.clone()
+        ),
+        Err(KmsError::AccessDenied)
+    ));
+    assert!(matches!(
+        generate(
+            KmsCallContext {
+                source_service: "ssm".into(),
+                ..caller.clone()
+            },
+            &managed.key_arn,
+            context.clone()
+        ),
+        Err(KmsError::AccessDenied)
+    ));
+    assert!(matches!(
+        generate(
+            KmsCallContext {
+                caller_arn: Some("arn:aws:iam::111111111111:user/alice".into()),
+                ..caller.clone()
+            },
+            &managed.key_arn,
+            context.clone()
+        ),
+        Err(KmsError::AccessDenied)
+    ));
+    let (customer, customer_arn) = create_key(&service, ACCOUNT, REGION);
+    assert!(matches!(
+        generate(caller.clone(), &customer, context.clone()),
+        Err(KmsError::AccessDenied)
+    ));
+    assert!(generate(
+        KmsCallContext {
+            iam_policy_allowed: true,
+            ..caller.clone()
+        },
+        &customer,
+        context.clone()
+    )
+    .is_ok());
+    let policy = json!({"Statement":[
+        {"Effect":"Allow","Principal":{"AWS":format!("arn:aws:iam::{ACCOUNT}:root")},"Action":"kms:*","Resource":"*"},
+        {"Effect":"Allow","Principal":{"AWS":user},"Action":["kms:GenerateDataKey","kms:Decrypt"],"Resource":"*",
+            "Condition":{"StringEquals":{"kms:ViaService":format!("s3.{REGION}.amazonaws.com"),"kms:CallerAccount":ACCOUNT},
+                "StringLike":{"kms:EncryptionContext:aws:s3:arn":"arn:aws:s3:::orders/Invoice*"}}}
+    ]}).to_string();
+    call_ok(
+        &service,
+        "PutKeyPolicy",
+        json!({"KeyId":customer,"Policy":policy}),
+    );
+    let data = generate(caller.clone(), &customer, context.clone()).unwrap();
+    assert!(matches!(
+        generate(caller.clone(), &customer, BTreeMap::new()),
+        Err(KmsError::AccessDenied)
+    ));
+    assert!(matches!(
+        generate(
+            caller.clone(),
+            &customer,
+            BTreeMap::from([("aws:s3:arn".into(), object.replace("Invoice", "invoice"))])
+        ),
+        Err(KmsError::AccessDenied)
+    ));
+    assert!(matches!(
+        generate(
+            KmsCallContext {
+                iam_policy_denied: true,
+                ..caller.clone()
+            },
+            &customer,
+            context.clone()
+        ),
+        Err(KmsError::AccessDenied)
+    ));
+    assert!(generate(
+        KmsCallContext {
+            region: "us-west-2".into(),
+            ..caller.clone()
+        },
+        &customer_arn,
+        context.clone()
+    )
+    .is_err());
+    let decrypt = |call: KmsCallContext, encryption_context| {
+        service.decrypt_internal(KmsDecryptRequest {
+            call,
+            key_id: Some(customer_arn.clone()),
+            ciphertext: SensitiveBytes::new(data.ciphertext.as_slice().to_vec()),
+            encryption_context,
+        })
+    };
+    assert_eq!(
+        decrypt(caller.clone(), context.clone())
+            .unwrap()
+            .plaintext
+            .as_slice(),
+        data.plaintext.as_slice()
+    );
+    assert!(matches!(
+        decrypt(caller.clone(), BTreeMap::new()),
+        Err(KmsError::AccessDenied)
+    ));
+    call_ok(
+        &service,
+        "PutKeyPolicy",
+        json!({"KeyId":customer,"Policy":KeyPolicy::default_for(ACCOUNT).raw()}),
+    );
+    assert!(matches!(
+        decrypt(caller.clone(), context.clone()),
+        Err(KmsError::AccessDenied)
+    ));
+    call_ok(
+        &service,
+        "ScheduleKeyDeletion",
+        json!({"KeyId":customer,"PendingWindowInDays":7}),
+    );
+    assert!(matches!(
+        decrypt(caller, context),
+        Err(KmsError::InvalidState)
+    ));
+}
+
+#[test]
+fn customer_key_disable_survives_reopen_and_blocks_crypto_until_enabled() {
+    let db = crate::test_db();
+    let service = KmsService::new(db.clone()).unwrap();
+    let (key, arn) = create_key(&service, ACCOUNT, REGION);
+    let ciphertext = call_ok(
+        &service,
+        "Encrypt",
+        json!({"KeyId":key,"Plaintext":STANDARD.encode(b"durable secret")}),
+    )["CiphertextBlob"]
+        .clone();
+    call_ok(&service, "DisableKey", json!({"KeyId": arn}));
+    assert!(matches!(
+        service.validate_key_internal(KmsValidateKeyRequest {
+            call: internal_call(ACCOUNT, REGION),
+            key_id: key.clone(),
+        }),
+        Err(KmsError::Disabled)
+    ));
+    drop(service);
+    let service = KmsService::new(db).unwrap();
+    assert_eq!(
+        call_ok(&service, "DescribeKey", json!({"KeyId": key}))["KeyMetadata"]["KeyState"],
+        "Disabled"
+    );
+    assert!(matches!(
+        call(
+            &service,
+            "GenerateDataKey",
+            json!({"KeyId": key, "KeySpec":"AES_256"}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::Disabled)
+    ));
+    assert!(matches!(
+        call(
+            &service,
+            "Decrypt",
+            json!({"CiphertextBlob":ciphertext}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::Disabled)
+    ));
+    assert!(matches!(
+        call(
+            &service,
+            "Encrypt",
+            json!({"KeyId":key,"Plaintext":STANDARD.encode(b"durable secret")}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::Disabled)
+    ));
+    assert!(matches!(
+        call(
+            &service,
+            "DisableKey",
+            json!({"KeyId":arn}),
+            ACCOUNT,
+            "eu-west-1"
+        ),
+        Err(KmsError::NotFound)
+    ));
+    call_ok(&service, "EnableKey", json!({"KeyId": key}));
+    assert_eq!(
+        call_ok(&service, "Decrypt", json!({"CiphertextBlob":ciphertext}))["Plaintext"],
+        STANDARD.encode(b"durable secret")
+    );
+    call_ok(
+        &service,
+        "GenerateDataKey",
+        json!({"KeyId": key, "KeySpec":"AES_256"}),
+    );
+    let managed = service
+        .service_default_key(&Scope::new(ACCOUNT, REGION), "s3")
+        .unwrap();
+    assert!(matches!(
+        call(
+            &service,
+            "DisableKey",
+            json!({"KeyId": managed}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::AccessDenied)
+    ));
+    call_ok(&service, "DisableKey", json!({"KeyId": key}));
+    assert!(matches!(
+        crate::map_internal_error(KmsError::Disabled),
+        locallycloud_core::integration::kms::KmsInternalError::Disabled
+    ));
+    call_ok(&service, "ScheduleKeyDeletion", json!({"KeyId": key}));
+    assert!(matches!(
+        call(
+            &service,
+            "ScheduleKeyDeletion",
+            json!({"KeyId":key}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::InvalidState)
+    ));
+
+    assert!(matches!(
+        call(
+            &service,
+            "EnableKey",
+            json!({"KeyId": key}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::InvalidState)
     ));
 }

@@ -60,6 +60,15 @@ pub(crate) struct KmsStore {
 }
 
 impl KmsStore {
+    pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        Ok(self
+            .keys
+            .iter()
+            .filter(|e| e.key().scope.account_id == account)
+            .map(|e| e.key().scope.region.clone())
+            .collect())
+    }
+
     pub(crate) fn new(db: Arc<StateDb>) -> Result<Self, KmsError> {
         let persistence = KmsPersistence::new(db)?;
         let store = Self {

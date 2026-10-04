@@ -107,6 +107,28 @@ impl EnforcementFilter {
         }
     }
 
+    /// Resource/key policies may provide a direct Allow, but cannot override denies or limits.
+    pub fn identity_policy_denies(
+        &self,
+        identity: &RequestIdentity,
+        action: &str,
+        resource: &str,
+        context: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let Some(key) = identity.access_key_id.as_deref() else {
+            return true;
+        };
+        let Ok(caller) = self.resolve_caller(&identity.account_id, key) else {
+            return true;
+        };
+        let request = EvalRequest {
+            action: action.into(),
+            resource: resource.into(),
+            context: context.clone(),
+        };
+        context_denies(&caller, &request)
+    }
+
     /// Evaluate one role's stored identity policies and permission boundary.
     pub fn check_role(
         &self,
@@ -115,6 +137,51 @@ impl EnforcementFilter {
         action: &str,
         resource: &str,
     ) -> Result<(), IamStsError> {
+        self.check_role_with_context(account, role_arn, action, resource, &BTreeMap::new())
+    }
+
+    pub fn check_role_with_context(
+        &self,
+        account: &str,
+        role_arn: &str,
+        action: &str,
+        resource: &str,
+        context: &BTreeMap<String, Vec<String>>,
+    ) -> Result<(), IamStsError> {
+        let caller = self.role_context(account, role_arn)?;
+        let request = EvalRequest {
+            action: action.into(),
+            resource: resource.into(),
+            context: context.clone(),
+        };
+        match evaluate(&caller.identity, caller.boundary.as_deref(), None, &request) {
+            Decision::Allowed => Ok(()),
+            Decision::ImplicitDeny | Decision::ExplicitDeny => Err(IamStsError::AccessDenied(
+                format!("role is not authorized for {action} on {resource}"),
+            )),
+        }
+    }
+
+    pub fn role_policy_denies(
+        &self,
+        account: &str,
+        role_arn: &str,
+        action: &str,
+        resource: &str,
+        context: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let Ok(caller) = self.role_context(account, role_arn) else {
+            return true;
+        };
+        let request = EvalRequest {
+            action: action.into(),
+            resource: resource.into(),
+            context: context.clone(),
+        };
+        context_denies(&caller, &request)
+    }
+
+    fn role_context(&self, account: &str, role_arn: &str) -> Result<CallerContext, IamStsError> {
         let name = role_arn.rsplit('/').next().unwrap_or(role_arn);
         let role = self
             .store
@@ -128,17 +195,11 @@ impl EnforcementFilter {
             .map(|arn| self.policy_doc(account, arn))
             .transpose()?
             .map(|policy| vec![policy]);
-        let request = EvalRequest {
-            action: action.into(),
-            resource: resource.into(),
-            context: BTreeMap::new(),
-        };
-        match evaluate(&identity, boundary.as_deref(), None, &request) {
-            Decision::Allowed => Ok(()),
-            Decision::ImplicitDeny | Decision::ExplicitDeny => Err(IamStsError::AccessDenied(
-                format!("role is not authorized for {action} on {resource}"),
-            )),
-        }
+        Ok(CallerContext {
+            identity,
+            boundary,
+            session: None,
+        })
     }
 
     fn resolve_caller(
@@ -260,6 +321,18 @@ fn parse_stored_policy(document: &str) -> Result<PolicyDocument, IamStsError> {
         .map_err(|_| IamStsError::AccessDenied("stored policy is malformed".into()))
 }
 
+fn context_denies(caller: &CallerContext, request: &EvalRequest) -> bool {
+    evaluate(&caller.identity, None, None, request) == Decision::ExplicitDeny
+        || caller
+            .boundary
+            .as_ref()
+            .is_some_and(|policies| evaluate(policies, None, None, request) != Decision::Allowed)
+        || caller
+            .session
+            .as_ref()
+            .is_some_and(|policies| evaluate(policies, None, None, request) != Decision::Allowed)
+}
+
 fn unresolvable_caller(access_key_id: &str) -> IamStsError {
     IamStsError::AccessDenied(format!(
         "caller for access key {access_key_id} cannot be resolved"
@@ -316,6 +389,40 @@ mod tests {
             access_key_id: Some(akid.to_string()),
             arn: None,
         }
+    }
+
+    #[test]
+    fn key_policy_grants_respect_explicit_denies_and_identity_revocation() {
+        let (filter, store) = filter();
+        let account = "000000000000";
+        let key = "AKIACONTEXT";
+        let mut principal = user_with_key("alice", key);
+        store.create_user(account, principal.clone());
+        let context = BTreeMap::from([(
+            "kms:viaservice".into(),
+            vec!["s3.us-east-1.amazonaws.com".into()],
+        )]);
+        assert!(!filter.identity_policy_denies(&identity(key), "kms:Decrypt", "*", &context));
+        principal.inline_policies.insert("deny".into(), r#"{"Statement":{"Effect":"Deny","Action":"kms:Decrypt","Resource":"*","Condition":{"StringEquals":{"kms:ViaService":"s3.us-east-1.amazonaws.com"}}}}"#.into());
+        store.update_user(account, "alice", |user| {
+            user.inline_policies = principal.inline_policies.clone();
+        });
+        assert!(filter.identity_policy_denies(&identity(key), "kms:Decrypt", "*", &context));
+        assert!(!filter.identity_policy_denies(
+            &identity(key),
+            "kms:GenerateDataKey",
+            "*",
+            &context
+        ));
+        store.update_user(account, "alice", |user| {
+            user.access_keys[0].status = "Inactive".into();
+        });
+        assert!(filter.identity_policy_denies(
+            &identity(key),
+            "kms:GenerateDataKey",
+            "*",
+            &context
+        ));
     }
 
     #[test]

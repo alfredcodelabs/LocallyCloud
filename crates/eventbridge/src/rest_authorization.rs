@@ -139,7 +139,11 @@ pub(super) fn check(
         && ((service == "scheduler" && operation == "CreateScheduleGroup")
             || (service == "pipes" && operation == "CreatePipe"))
     {
-        authorize(&format!("{service}:TagResource"), resource, BTreeMap::new())?;
+        authorize(
+            &format!("{service}:TagResource"),
+            resource.clone(),
+            BTreeMap::new(),
+        )?;
     }
     let role = match (service, operation) {
         ("scheduler", "CreateSchedule" | "UpdateSchedule") => body
@@ -152,6 +156,18 @@ pub(super) fn check(
     if let Some(role) = role {
         evaluator
             .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+                source_arn: Some(if service == "scheduler" {
+                    format!(
+                        "arn:aws:scheduler:{}:{}:schedule-group/{}",
+                        request.region,
+                        request.account_id,
+                        body.get("GroupName")
+                            .and_then(Value::as_str)
+                            .unwrap_or("default")
+                    )
+                } else {
+                    resource
+                }),
                 caller: identity,
                 role_arn: role.into(),
                 service_principal: format!("{service}.amazonaws.com"),
