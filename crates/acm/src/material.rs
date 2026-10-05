@@ -6,7 +6,7 @@ use ring::signature::{KeyPair, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_819
 use time::{Date, Month, PrimitiveDateTime, Time};
 use zeroize::Zeroizing;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct MaterialMetadata {
     pub domain: String,
     pub names: Vec<String>,
@@ -15,7 +15,7 @@ pub(super) struct MaterialMetadata {
     pub serial: String,
     pub not_before: i64,
     pub not_after: i64,
-    pub key_algorithm: &'static str,
+    pub key_algorithm: String,
 }
 
 pub(super) struct ValidatedMaterial {
@@ -322,7 +322,7 @@ pub(super) fn validate(
         serial,
         not_before,
         not_after,
-        key_algorithm,
+        key_algorithm: key_algorithm.to_owned(),
     };
     Ok(ValidatedMaterial {
         metadata,

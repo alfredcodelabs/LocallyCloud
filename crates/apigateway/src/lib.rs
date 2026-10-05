@@ -20,4 +20,4 @@ pub mod websocket;
 #[cfg(test)]
 mod property_tests;
 
-pub use service::{register, register_with_acm};
+pub use service::{register, register_with_acm, register_with_state};

@@ -9,6 +9,9 @@ description = "Partial native AWS Certificate Manager imported certificate servi
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
@@ -19,6 +22,4 @@ ring = "=0.17.14"
 time.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true

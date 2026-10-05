@@ -5,9 +5,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
+
+#[path = "persistence.rs"]
+mod persistence;
+pub(crate) use persistence::Persistence;
 
 /// Generate a 10-character lowercase-alphanumeric API Gateway id.
 pub fn gen_id() -> String {
@@ -20,7 +25,7 @@ pub fn gen_id() -> String {
 }
 
 /// Immutable v1 configuration captured by a deployment.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct RestDeploymentSnapshot {
     pub resources: BTreeMap<String, Value>,
     pub authorizers: BTreeMap<String, Value>,
@@ -30,7 +35,7 @@ pub struct RestDeploymentSnapshot {
 }
 
 /// A v1 REST API and its child resources.
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct RestApiRecord {
     pub api: Value,
     pub resources: BTreeMap<String, Value>,
@@ -56,7 +61,7 @@ impl RestApiRecord {
 }
 
 /// Immutable v2 configuration captured by a deployment.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ApiV2DeploymentSnapshot {
     pub api: Value,
     pub routes: BTreeMap<String, Value>,
@@ -65,7 +70,7 @@ pub struct ApiV2DeploymentSnapshot {
 }
 
 /// A v2 API (HTTP or WEBSOCKET) and its child resources.
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ApiV2Record {
     pub api: Value,
     pub routes: BTreeMap<String, Value>,
@@ -88,7 +93,7 @@ impl ApiV2Record {
 }
 
 /// Resources shared by the v1 and v2 control planes in one account and region.
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SharedRecord {
     pub api_keys: BTreeMap<String, Value>,
     pub usage_plans: BTreeMap<String, Value>,
@@ -96,7 +101,9 @@ pub struct SharedRecord {
     /// Private REST custom domains, keyed by their AWS domainNameId.
     pub private_domains: BTreeMap<String, Value>,
     pub domain_access_associations: BTreeMap<String, Value>,
+    #[serde(skip)]
     pub connections: BTreeMap<String, Value>,
+    #[serde(skip)]
     pub authorizer_cache: BTreeMap<String, Value>,
 }
 

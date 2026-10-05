@@ -20,6 +20,7 @@ pub(crate) struct DomainBinding {
 pub(crate) struct DomainBindings {
     acm: Option<Arc<dyn AcmAssociationApi>>,
     active: Mutex<HashMap<String, DomainBinding>>,
+    defer_releases: bool,
 }
 
 pub(crate) fn canonical(name: &str) -> String {
@@ -31,6 +32,7 @@ impl DomainBindings {
         Self {
             acm: Some(acm),
             active: Mutex::default(),
+            defer_releases: false,
         }
     }
 
@@ -106,7 +108,7 @@ impl DomainBindings {
         .map_err(association_error)?;
         if let Some(old) = active
             .get(&binding.name)
-            .filter(|old| old.certificate_arn != binding.certificate_arn)
+            .filter(|old| !self.defer_releases && old.certificate_arn != binding.certificate_arn)
         {
             if let Err(error) =
                 acm.release(&old.account, &old.region, &old.certificate_arn, &consumer)
@@ -135,13 +137,15 @@ impl DomainBindings {
             .filter(|entry| entry.account == account && entry.region == region)
         {
             let consumer = format!("arn:aws:apigateway:{region}::/domainnames/{name}");
-            self.acm
-                .as_ref()
-                .ok_or_else(|| {
-                    ApiGwError::Internal("ACM custom domain binding is unavailable".into())
-                })?
-                .release(account, region, &binding.certificate_arn, &consumer)
-                .map_err(association_error)?;
+            if !self.defer_releases {
+                self.acm
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ApiGwError::Internal("ACM custom domain binding is unavailable".into())
+                    })?
+                    .release(account, region, &binding.certificate_arn, &consumer)
+                    .map_err(association_error)?;
+            }
             active.remove(&name);
         }
         Ok(())
@@ -359,4 +363,233 @@ pub(crate) fn fixture_bindings() -> DomainBindings {
         }
     }
     DomainBindings::with_acm(Arc::new(CertificateFixture))
+}
+
+/// Compensate ACM associations when a staged configuration is cancelled or fails to commit.
+pub(crate) struct DomainTransaction<'a> {
+    original: &'a DomainBindings,
+    pub staged: DomainBindings,
+    committed: bool,
+}
+impl DomainBindings {
+    pub(crate) fn transaction(&self) -> Result<DomainTransaction<'_>, ApiGwError> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| ApiGwError::Internal("Custom domain bindings are unavailable".into()))?
+            .clone();
+        Ok(DomainTransaction {
+            original: self,
+            staged: Self {
+                acm: self.acm.clone(),
+                active: Mutex::new(active),
+                defer_releases: true,
+            },
+            committed: false,
+        })
+    }
+}
+impl DomainTransaction<'_> {
+    pub(crate) fn commit(mut self) -> Result<(), ApiGwError> {
+        let mut original =
+            self.original.active.lock().map_err(|_| {
+                ApiGwError::Internal("Custom domain bindings are unavailable".into())
+            })?;
+        let staged =
+            self.staged.active.lock().map_err(|_| {
+                ApiGwError::Internal("Custom domain bindings are unavailable".into())
+            })?;
+        let retired: Vec<_> = original
+            .iter()
+            .filter(|(name, old)| {
+                !staged
+                    .get(*name)
+                    .is_some_and(|new| new.certificate_arn == old.certificate_arn)
+            })
+            .map(|(_, binding)| binding.clone())
+            .collect();
+        *original = staged.clone();
+        self.committed = true;
+        drop(original);
+        drop(staged);
+        // Retain the old certificate lease until the new configuration/binding is confirmed.
+        if let Some(acm) = &self.original.acm {
+            for binding in retired {
+                let consumer = format!(
+                    "arn:aws:apigateway:{}::/domainnames/{}",
+                    binding.region, binding.name
+                );
+                if acm
+                    .release(
+                        &binding.account,
+                        &binding.region,
+                        &binding.certificate_arn,
+                        &consumer,
+                    )
+                    .is_err()
+                {
+                    tracing::error!("API Gateway retired certificate lease cleanup failed; restart rebuilds current associations");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for DomainTransaction<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(acm) = &self.original.acm else {
+            return;
+        };
+        let Ok(original) = self.original.active.lock() else {
+            tracing::error!("API Gateway certificate rollback unavailable");
+            return;
+        };
+        let Ok(staged) = self.staged.active.lock() else {
+            tracing::error!("API Gateway staged certificate rollback unavailable");
+            return;
+        };
+        for (name, binding) in staged.iter() {
+            if original
+                .get(name)
+                .is_some_and(|old| old.certificate_arn == binding.certificate_arn)
+            {
+                continue;
+            }
+            let consumer = format!(
+                "arn:aws:apigateway:{}::/domainnames/{}",
+                binding.region, binding.name
+            );
+            if acm
+                .release(
+                    &binding.account,
+                    &binding.region,
+                    &binding.certificate_arn,
+                    &consumer,
+                )
+                .is_err()
+            {
+                tracing::error!("API Gateway staged certificate association rollback failed");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Default)]
+    struct Leases(Mutex<BTreeMap<String, BTreeSet<String>>>);
+    impl AcmAssociationApi for Leases {
+        fn preflight(&self, _: &str, _: &str, _: &str, _: &str) -> AssociationDecision {
+            AssociationDecision::Eligible
+        }
+        fn tls_identity(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<locallycloud_acm::AcmTlsIdentity, AssociationDecision> {
+            Err(AssociationDecision::NotFound)
+        }
+        fn acquire(
+            &self,
+            _: &str,
+            _: &str,
+            arn: &str,
+            _: &str,
+            consumer: &str,
+        ) -> Result<(), AssociationDecision> {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(arn.into())
+                .or_default()
+                .insert(consumer.into());
+            Ok(())
+        }
+        fn release(
+            &self,
+            _: &str,
+            _: &str,
+            arn: &str,
+            consumer: &str,
+        ) -> Result<(), AssociationDecision> {
+            if let Some(leases) = self.0.lock().unwrap().get_mut(arn) {
+                leases.remove(consumer);
+            }
+            Ok(())
+        }
+    }
+    #[test]
+    fn old_certificate_is_reserved_until_binding_commit_and_staged_lease_rolls_back() {
+        let leases = Arc::new(Leases::default());
+        let bindings = DomainBindings::with_acm(leases.clone());
+        let binding = |arn: &str| DomainBinding {
+            account: "account".into(),
+            region: "us-east-1".into(),
+            name: "orders.example.test".into(),
+            certificate_arn: arn.into(),
+            target: "regional-target".into(),
+            zone: "regional-zone".into(),
+        };
+        let held = |arn: &str| {
+            leases
+                .0
+                .lock()
+                .unwrap()
+                .get(arn)
+                .is_some_and(|leases| !leases.is_empty())
+        };
+        bindings.publish(binding("old")).unwrap();
+        {
+            let transaction = bindings.transaction().unwrap();
+            transaction
+                .staged
+                .remove("account", "us-east-1", "orders.example.test")
+                .unwrap();
+            assert!(held("old"));
+        }
+        assert!(held("old"));
+        {
+            let transaction = bindings.transaction().unwrap();
+            transaction.staged.publish(binding("new")).unwrap();
+            assert!(held("old") && held("new"));
+            assert_eq!(
+                bindings
+                    .certificate("account", "orders.example.test")
+                    .unwrap()
+                    .1,
+                "old"
+            );
+        }
+        assert!(held("old") && !held("new"));
+        let transaction = bindings.transaction().unwrap();
+        transaction.staged.publish(binding("new")).unwrap();
+        transaction.commit().unwrap();
+        assert!(!held("old") && held("new"));
+        assert_eq!(
+            bindings
+                .certificate("account", "orders.example.test")
+                .unwrap()
+                .1,
+            "new"
+        );
+        let transaction = bindings.transaction().unwrap();
+        transaction
+            .staged
+            .remove("account", "us-east-1", "orders.example.test")
+            .unwrap();
+        assert!(held("new"));
+        transaction.commit().unwrap();
+        assert!(!held("new"));
+        assert!(bindings
+            .certificate("account", "orders.example.test")
+            .is_none());
+    }
 }

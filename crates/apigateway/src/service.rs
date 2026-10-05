@@ -33,6 +33,8 @@ pub(crate) struct ApiGwHandler {
     registry: Weak<ServiceRegistry>,
     waf: RwLock<Option<Weak<dyn WafEvaluator>>>,
     domains: DomainBindings,
+    persistence: Option<crate::store::Persistence>,
+    configuration_gate: tokio::sync::RwLock<()>,
 }
 
 #[derive(Clone)]
@@ -98,6 +100,8 @@ impl ApiGwHandler {
             registry,
             waf: RwLock::new(None),
             domains: DomainBindings::default(),
+            persistence: None,
+            configuration_gate: tokio::sync::RwLock::new(()),
         }
     }
 
@@ -815,20 +819,89 @@ impl NativeHandler for ApiGwHandler {
                 .into_response(&request.request_id);
             }
         }
+        let write = !matches!(request.method, Method::GET | Method::HEAD | Method::OPTIONS);
+        let _write = if write {
+            Some(self.configuration_gate.write().await)
+        } else {
+            None
+        };
+        let _read = if !write {
+            Some(self.configuration_gate.read().await)
+        } else {
+            None
+        };
+        // ponytail: clone only this scope's small configuration, never invocation bodies.
+        let staged = if write && self.persistence.is_some() {
+            let staged = ApiGwStore::new();
+            staged.install_scope(
+                &request.account_id,
+                &request.region,
+                self.store
+                    .snapshot_scope(&request.account_id, &request.region)
+                    .await,
+            );
+            Some(staged)
+        } else {
+            None
+        };
+        let domain_transaction = if staged.is_some() {
+            match self.domains.transaction() {
+                Ok(transaction) => Some(transaction),
+                Err(error) => return error.into_response(&request.request_id),
+            }
+        } else {
+            None
+        };
         let ctx = Ctx {
-            store: &self.store,
+            store: staged.as_ref().unwrap_or(&self.store),
             registry: &self.registry,
             region: &request.region,
             account: &request.account_id,
             request_id: &request.request_id,
             waf: Some(&self.waf),
-            domains: &self.domains,
+            domains: domain_transaction
+                .as_ref()
+                .map(|transaction| &transaction.staged)
+                .unwrap_or(&self.domains),
         };
         match self
             .route(&request.method, &segs, request.uri.query(), &ctx, &body)
             .await
         {
-            Ok((status, value)) => json_response(status, value),
+            Ok((status, value)) => {
+                if let (Some(staged), Some(persistence)) = (&staged, &self.persistence) {
+                    let snapshot = staged
+                        .snapshot_scope(&request.account_id, &request.region)
+                        .await;
+                    if self
+                        .store
+                        .publish_scope(&request.account_id, &request.region, snapshot, |snapshot| {
+                            let commit =
+                                || persistence.save(&request.account_id, &request.region, snapshot);
+                            if tokio::runtime::Handle::current().runtime_flavor()
+                                == tokio::runtime::RuntimeFlavor::MultiThread
+                            {
+                                tokio::task::block_in_place(commit)
+                            } else {
+                                commit()
+                            }
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return ApiGwError::Internal(
+                            "API Gateway configuration could not be committed".into(),
+                        )
+                        .into_response(&request.request_id);
+                    }
+                    if let Some(transaction) = domain_transaction {
+                        if let Err(error) = transaction.commit() {
+                            return error.into_response(&request.request_id);
+                        }
+                    }
+                }
+                json_response(status, value)
+            }
             Err(err) => err.into_response(&request.request_id),
         }
     }
@@ -924,6 +997,28 @@ pub fn register_with_acm(
     register_handler(registry, handler)
 }
 
+/// Register durable API Gateway resources; initialization errors leave the service unregistered.
+pub async fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    acm: Arc<dyn locallycloud_acm::AcmAssociationApi>,
+) -> Result<ApiGatewayWafBinding, String> {
+    let mut handler = ApiGwHandler::new(Arc::downgrade(registry));
+    handler.domains = DomainBindings::with_acm(acm);
+    let persistence = crate::store::Persistence::new(
+        state,
+        locallycloud_state::StateCipher::from_env().map_err(|e| e.to_string())?,
+    )?;
+    persistence.restore(&handler.store)?;
+    handler
+        .store
+        .restore_domain_bindings(&handler.domains)
+        .await
+        .map_err(|e| e.to_string())?;
+    handler.persistence = Some(persistence);
+    Ok(register_handler(registry, handler))
+}
+
 fn register_handler(
     registry: &Arc<ServiceRegistry>,
     handler: ApiGwHandler,
@@ -954,6 +1049,238 @@ mod tests {
         let mut handler = ApiGwHandler::new(registry);
         handler.domains = crate::domains::fixture_bindings();
         handler
+    }
+
+    #[tokio::test]
+    async fn durable_configuration_restores_and_failed_commit_stays_invisible() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-apigw-state-{}", uuid::Uuid::new_v4()));
+        let state =
+            Arc::new(locallycloud_state::StateDb::open(root.join("state.sqlite3")).unwrap());
+        let registry = ServiceRegistry::with_known_services();
+        let durable = || {
+            let mut handler = test_handler(Arc::downgrade(&registry));
+            let persistence = crate::store::Persistence::new(
+                state.clone(),
+                locallycloud_state::StateCipher::with_key(&[7; 32]),
+            )
+            .unwrap();
+            persistence.restore(&handler.store).unwrap();
+            handler.persistence = Some(persistence);
+            handler
+        };
+        let handler = durable();
+        let (status, rest) = call(
+            &handler,
+            Method::POST,
+            "/restapis",
+            serde_json::json!({"name":"persisted-rest"}),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let rest_id = rest["id"].as_str().unwrap();
+        {
+            let shared = handler.store.shared("000000000000", "us-east-1");
+            let mut shared = shared.write().await;
+            shared.connections.insert(
+                "live-connection".into(),
+                serde_json::json!({"runtime":true}),
+            );
+            shared
+                .authorizer_cache
+                .insert("live-cache".into(), serde_json::json!({"runtime":true}));
+        }
+        let (status, api) = call(
+            &handler,
+            Method::POST,
+            "/v2/apis",
+            serde_json::json!({"name":"persisted-http","protocolType":"HTTP"}),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let api_id = api["apiId"].as_str().unwrap();
+        let (status, integration)=call(&handler,Method::POST,&format!("/v2/apis/{api_id}/integrations"),serde_json::json!({"integrationType":"HTTP_PROXY","integrationMethod":"GET","integrationUri":"https://example.com"})).await;
+        assert_eq!(status, 201);
+        let integration_id = integration["integrationId"].as_str().unwrap();
+        assert_eq!(call(&handler,Method::POST,&format!("/v2/apis/{api_id}/routes"),serde_json::json!({"routeKey":"GET /orders","target":format!("integrations/{integration_id}")})).await.0,201);
+        let (status, deployment) = call(
+            &handler,
+            Method::POST,
+            &format!("/v2/apis/{api_id}/deployments"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 201);
+        assert_eq!(
+            call(
+                &handler,
+                Method::POST,
+                &format!("/v2/apis/{api_id}/stages"),
+                serde_json::json!({"stageName":"prod","deploymentId":deployment["deploymentId"]})
+            )
+            .await
+            .0,
+            201
+        );
+        assert_eq!(call(&handler,Method::POST,"/v2/domainnames",serde_json::json!({"domainName":"durable.example.test","domainNameConfigurations":[{"certificateArn":"arn:aws:acm:us-east-1:000000000000:certificate/test","endpointType":"REGIONAL"}]})).await.0,201);
+        assert_eq!(
+            call(
+                &handler,
+                Method::POST,
+                "/v2/domainnames/durable.example.test/apimappings",
+                serde_json::json!({"apiId":api_id,"stage":"prod","apiMappingKey":"orders"})
+            )
+            .await
+            .0,
+            201
+        );
+        {
+            let shared = handler.store.shared("000000000000", "us-east-1");
+            let shared = shared.read().await;
+            assert!(shared.connections.contains_key("live-connection"));
+            assert!(shared.authorizer_cache.contains_key("live-cache"));
+        }
+        let restored = durable();
+        {
+            let shared = restored.store.shared("000000000000", "us-east-1");
+            let shared = shared.read().await;
+            assert!(shared.connections.is_empty());
+            assert!(shared.authorizer_cache.is_empty());
+        }
+        restored
+            .store
+            .restore_domain_bindings(&restored.domains)
+            .await
+            .unwrap();
+        assert!(restored
+            .domains
+            .certificate("000000000000", "durable.example.test")
+            .is_some());
+        assert_eq!(
+            call(
+                &restored,
+                Method::GET,
+                "/v2/domainnames/durable.example.test/apimappings",
+                Value::Null
+            )
+            .await
+            .1["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            call(
+                &restored,
+                Method::GET,
+                &format!("/restapis/{rest_id}"),
+                Value::Null
+            )
+            .await
+            .1["name"],
+            "persisted-rest"
+        );
+        assert_eq!(
+            call(
+                &restored,
+                Method::GET,
+                &format!("/v2/apis/{api_id}/routes"),
+                Value::Null
+            )
+            .await
+            .1["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            call(
+                &restored,
+                Method::GET,
+                &format!("/v2/apis/{api_id}/stages/prod"),
+                Value::Null
+            )
+            .await
+            .1["deploymentId"],
+            deployment["deploymentId"]
+        );
+        let raw: Vec<u8> = state
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload FROM apigateway_scopes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!raw
+            .windows(b"persisted-http".len())
+            .any(|window| window == b"persisted-http"));
+        let mut other = req(Method::GET, &format!("/v2/apis/{api_id}"), Value::Null);
+        other.region = "eu-west-1".into();
+        assert_eq!(restored.handle(other).await.status(), 404);
+        state.connection().unwrap().execute_batch("CREATE TRIGGER reject_apigw_update BEFORE UPDATE ON apigateway_scopes BEGIN SELECT RAISE(ABORT,'forced commit failure'); END;").unwrap();
+        assert_eq!(
+            call(
+                &restored,
+                Method::PATCH,
+                &format!("/v2/apis/{api_id}"),
+                serde_json::json!({"name":"uncommitted"})
+            )
+            .await
+            .0,
+            500
+        );
+        assert_eq!(
+            call(
+                &restored,
+                Method::GET,
+                &format!("/v2/apis/{api_id}"),
+                Value::Null
+            )
+            .await
+            .1["name"],
+            "persisted-http"
+        );
+        assert_eq!(
+            call(
+                &restored,
+                Method::DELETE,
+                "/v2/domainnames/durable.example.test",
+                Value::Null
+            )
+            .await
+            .0,
+            500
+        );
+        assert!(restored
+            .domains
+            .certificate("000000000000", "durable.example.test")
+            .is_some());
+        assert_eq!(
+            call(
+                &restored,
+                Method::GET,
+                "/v2/domainnames/durable.example.test",
+                Value::Null
+            )
+            .await
+            .0,
+            200
+        );
+        let after_failure = durable();
+        assert_eq!(
+            call(
+                &after_failure,
+                Method::GET,
+                &format!("/v2/apis/{api_id}"),
+                Value::Null
+            )
+            .await
+            .1["name"],
+            "persisted-http"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn req(method: Method, path: &str, body: Value) -> ServiceRequest {

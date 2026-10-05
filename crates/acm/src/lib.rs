@@ -2,6 +2,7 @@
 //! Material is validated before mutation. Private DER stays zeroized in memory and is
 //! available only through the scoped internal TLS capability, never the AWS API.
 mod material;
+mod persistence;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -55,7 +56,7 @@ pub enum AssociationDecision {
 }
 
 /// Validated local TLS material for an internal consumer. Never log or serialize it.
-/// The private PKCS8 DER is zeroized on drop; this service does not write it to disk.
+/// The private PKCS8 DER is zeroized on drop and only stored in authenticated ciphertext.
 pub struct AcmTlsIdentity {
     pub certificate_der: Vec<u8>,
     pub private_key_der: Zeroizing<Vec<u8>>,
@@ -97,14 +98,22 @@ pub trait AcmAssociationApi: Send + Sync {
     ) -> Result<(), AssociationDecision>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AcmHandler {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    persistence: Option<Arc<persistence::AcmPersistence>>,
 }
 
 impl AcmHandler {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    fn save(&self, scope: &Scope, cert: &Certificate) -> Result<(), AwsError> {
+        if let Some(persistence) = &self.persistence {
+            persistence.save(scope, cert)?;
+        }
+        Ok(())
     }
 
     fn execute(
@@ -181,12 +190,15 @@ impl AcmHandler {
             {
                 return Err(invalid_parameter());
             }
-            existing.metadata = metadata;
-            existing.tls = Some(tls);
-            existing.imported_at = now;
+            let mut replacement = existing.clone();
+            replacement.metadata = metadata;
+            replacement.tls = Some(tls);
+            replacement.imported_at = now;
+            self.save(&scope, &replacement)?;
+            *existing = replacement;
             return Ok(json!({"CertificateArn": arn}));
         }
-        let certs = state.certs.entry(scope).or_default();
+        let certs = state.certs.entry(scope.clone()).or_default();
         if certs.len() >= MAX_CERTS {
             return Err(err("LimitExceededException", "Certificate limit exceeded"));
         }
@@ -196,17 +208,16 @@ impl AcmHandler {
             req.account_id,
             Uuid::new_v4()
         );
-        certs.insert(
-            arn.clone(),
-            Certificate {
-                arn: arn.clone(),
-                metadata,
-                tags,
-                imported_at: now,
-                tls: Some(tls),
-                associations: BTreeMap::new(),
-            },
-        );
+        let certificate = Certificate {
+            arn: arn.clone(),
+            metadata,
+            tags,
+            imported_at: now,
+            tls: Some(tls),
+            associations: BTreeMap::new(),
+        };
+        self.save(&scope, &certificate)?;
+        certs.insert(arn.clone(), certificate);
         Ok(json!({"CertificateArn": arn}))
     }
 
@@ -290,7 +301,7 @@ impl AcmHandler {
         let mut summaries = Vec::new();
         if let Some(certs) = all {
             for cert in certs.values() {
-                let key_type = cert.metadata.key_algorithm;
+                let key_type = cert.metadata.key_algorithm.as_str();
                 let status = if now() >= cert.metadata.not_after {
                     "EXPIRED"
                 } else {
@@ -329,6 +340,9 @@ impl AcmHandler {
         if !cert.associations.is_empty() {
             return Err(err("ResourceInUseException", "The certificate is in use"));
         }
+        if let Some(persistence) = &self.persistence {
+            persistence.delete(&scope(req), arn)?;
+        }
         certs.remove(arn);
         Ok(json!({}))
     }
@@ -353,7 +367,10 @@ impl AcmHandler {
         if new_count > 50 {
             return Err(err("TooManyTagsException", "Tag limit exceeded"));
         }
-        cert.tags.extend(additions);
+        let mut updated = cert.clone();
+        updated.tags.extend(additions);
+        self.save(&scope(req), &updated)?;
+        *cert = updated;
         Ok(json!({}))
     }
 
@@ -372,9 +389,12 @@ impl AcmHandler {
             .get_mut(&scope(req))
             .and_then(|certs| certs.get_mut(arn))
             .ok_or_else(not_found)?;
+        let mut updated = cert.clone();
         for key in removals.keys() {
-            cert.tags.remove(key);
+            updated.tags.remove(key);
         }
+        self.save(&scope(req), &updated)?;
+        *cert = updated;
         Ok(json!({}))
     }
 
@@ -568,7 +588,14 @@ impl NativeHandler for AcmHandler {
             match op {
                 None => Err(err("UnknownOperationException", "Unknown operation")),
                 Some(op) => match serde_json::from_slice::<Value>(&request.body) {
-                    Ok(Value::Object(body)) => self.execute(op, &request, &body),
+                    Ok(Value::Object(body)) => {
+                        let handler = self.clone();
+                        let op = op.to_owned();
+                        let request = request.clone();
+                        tokio::task::spawn_blocking(move || handler.execute(&op, &request, &body))
+                            .await
+                            .unwrap_or_else(|_| Err(internal()))
+                    }
                     _ => Err(invalid_parameter()),
                 },
             }
@@ -593,7 +620,25 @@ impl NativeHandler for AcmHandler {
 }
 
 pub fn register(registry: &Arc<ServiceRegistry>) -> Arc<AcmHandler> {
-    let handler = AcmHandler::new();
+    register_handler(registry, AcmHandler::new())
+}
+
+pub fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    db: Arc<locallycloud_state::StateDb>,
+) -> Result<Arc<AcmHandler>, AwsError> {
+    let persistence = persistence::AcmPersistence::new(db)?;
+    let state = persistence.restore()?;
+    Ok(register_handler(
+        registry,
+        Arc::new(AcmHandler {
+            state: Arc::new(Mutex::new(state)),
+            persistence: Some(Arc::new(persistence)),
+        }),
+    ))
+}
+
+fn register_handler(registry: &Arc<ServiceRegistry>, handler: Arc<AcmHandler>) -> Arc<AcmHandler> {
     registry.register_native(
         ServiceName::new("acm"),
         ServiceMetadata::new(AwsProtocol::Json11, Some("CertificateManager")),
@@ -740,51 +785,51 @@ fn validate_arn(req: &ServiceRequest, arn: &str) -> Result<(), AwsError> {
 mod tests {
     use super::*;
 
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    pub(super) fn fixture(dns_name: &str, bits: &str) -> (Vec<u8>, Zeroizing<Vec<u8>>) {
+        let generated = Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                &format!("rsa_keygen_bits:{bits}"),
+            ])
+            .output()
+            .unwrap();
+        let private_pem = Zeroizing::new(generated.stdout);
+        assert!(generated.status.success());
+        let mut child = Command::new("openssl")
+            .args([
+                "req",
+                "-new",
+                "-x509",
+                "-key",
+                "/dev/stdin",
+                "-days",
+                "1",
+                "-subj",
+                &format!("/CN={dns_name}"),
+                "-addext",
+                &format!("subjectAltName=DNS:{dns_name}"),
+                "-addext",
+                "extendedKeyUsage=serverAuth",
+                "-addext",
+                "keyUsage=digitalSignature,keyEncipherment",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&private_pem).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success());
+        (result.stdout, private_pem)
+    }
     #[test]
     fn tls_material_import_is_scoped_atomic_redacted_and_revocable() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        fn fixture(dns_name: &str, bits: &str) -> (Vec<u8>, Zeroizing<Vec<u8>>) {
-            let generated = Command::new("openssl")
-                .args([
-                    "genpkey",
-                    "-algorithm",
-                    "RSA",
-                    "-pkeyopt",
-                    &format!("rsa_keygen_bits:{bits}"),
-                ])
-                .output()
-                .unwrap();
-            let private_pem = Zeroizing::new(generated.stdout);
-            assert!(generated.status.success());
-            let mut child = Command::new("openssl")
-                .args([
-                    "req",
-                    "-new",
-                    "-x509",
-                    "-key",
-                    "/dev/stdin",
-                    "-days",
-                    "1",
-                    "-subj",
-                    &format!("/CN={dns_name}"),
-                    "-addext",
-                    &format!("subjectAltName=DNS:{dns_name}"),
-                    "-addext",
-                    "extendedKeyUsage=serverAuth",
-                    "-addext",
-                    "keyUsage=digitalSignature,keyEncipherment",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(&private_pem).unwrap();
-            let result = child.wait_with_output().unwrap();
-            assert!(result.status.success());
-            (result.stdout, private_pem)
-        }
         let handler = AcmHandler::new();
         let req = ServiceRequest {
             method: http::Method::POST,
@@ -934,7 +979,7 @@ mod tests {
             serial: "1".to_owned(),
             not_before: 0,
             not_after: i64::MAX,
-            key_algorithm: "RSA_2048",
+            key_algorithm: "RSA_2048".to_owned(),
         };
         handler
             .state
