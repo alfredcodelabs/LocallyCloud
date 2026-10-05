@@ -11,6 +11,8 @@ use locallycloud_core::registry::AwsProtocol;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IamStsError {
     #[error("{0}")]
+    InternalFailure(String),
+    #[error("{0}")]
     NoSuchEntity(String),
     #[error("{0}")]
     EntityAlreadyExists(String),
@@ -31,6 +33,7 @@ pub enum IamStsError {
 impl IamStsError {
     pub fn code(&self) -> &'static str {
         match self {
+            IamStsError::InternalFailure(_) => "InternalFailure",
             IamStsError::NoSuchEntity(_) => "NoSuchEntity",
             IamStsError::EntityAlreadyExists(_) => "EntityAlreadyExists",
             IamStsError::DeleteConflict(_) => "DeleteConflict",
@@ -44,6 +47,7 @@ impl IamStsError {
 
     pub fn http_status(&self) -> u16 {
         match self {
+            IamStsError::InternalFailure(_) => 500,
             IamStsError::NoSuchEntity(_) => 404,
             IamStsError::EntityAlreadyExists(_)
             | IamStsError::DeleteConflict(_)

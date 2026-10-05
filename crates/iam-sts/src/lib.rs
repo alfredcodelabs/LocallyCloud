@@ -9,6 +9,7 @@ pub mod error;
 pub mod iam;
 pub mod ids;
 pub mod model;
+mod persistence;
 pub mod policy;
 pub mod query;
 pub mod service;

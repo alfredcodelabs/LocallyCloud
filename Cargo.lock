@@ -2564,7 +2564,9 @@ dependencies = [
  "dashmap",
  "http",
  "locallycloud-core",
+ "locallycloud-state",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2572,6 +2574,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -31,12 +31,15 @@ use crate::protocol::{
 };
 use crate::store::ParameterStore;
 
+mod by_path;
+
 const KMS_CALL_LIMIT: Duration = Duration::from_secs(2);
 
 pub(crate) struct SsmHandler {
     registry: Weak<ServiceRegistry>,
     store: Arc<ParameterStore>,
     persistence_failed: AtomicBool,
+    path_tokens: locallycloud_state::StateCipher,
 }
 
 impl SsmHandler {
@@ -45,6 +48,7 @@ impl SsmHandler {
             registry,
             store: Arc::new(ParameterStore::new()),
             persistence_failed: AtomicBool::new(false),
+            path_tokens: by_path::token_cipher(),
         }
     }
 
@@ -56,6 +60,7 @@ impl SsmHandler {
             registry,
             store: Arc::new(ParameterStore::with_state(state)?),
             persistence_failed: AtomicBool::new(false),
+            path_tokens: by_path::token_cipher(),
         })
     }
 
@@ -83,6 +88,7 @@ impl SsmHandler {
         }
         let scope = Scope::new(&request.account_id, &request.region);
         match operation {
+            "GetParametersByPath" => self.get_parameters_by_path(request, &scope).await,
             "PutParameter" => {
                 self.put_parameter(decode(&request.body)?, &scope, request)
                     .await

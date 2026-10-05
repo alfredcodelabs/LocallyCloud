@@ -434,7 +434,26 @@ impl NativeHandler for IamHandler {
         if let Err(e) = self.state.enforce(&request, "iam", &action) {
             return e.into_response(&request.request_id, IAM_XMLNS);
         }
-        match dispatch_iam(&self.state, &request.account_id, &action, &q) {
+        let result = if action.starts_with("Get")
+            || action.starts_with("List")
+            || action.starts_with("Simulate")
+        {
+            dispatch_iam(&self.state, &request.account_id, &action, &q)
+        } else {
+            let store = self.state.store.clone();
+            let account = request.account_id.clone();
+            let operation = action.clone();
+            tokio::task::spawn_blocking(move || {
+                store.transact(|staged| dispatch_iam_store(staged, &account, &operation, &q))
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::persistence::state_error(
+                    "IAM mutation worker failed",
+                ))
+            })
+        };
+        match result {
             Ok(body) => xml_response(&response_envelope(
                 &action,
                 IAM_XMLNS,
@@ -462,13 +481,15 @@ impl NativeHandler for StsHandler {
         if let Err(e) = self.state.enforce(&request, "sts", &action) {
             return e.into_response(&request.request_id, STS_XMLNS);
         }
-        match dispatch_sts(
-            &self.state,
-            &request.account_id,
-            &action,
-            &q,
-            caller_key.as_deref(),
-        ) {
+        let state = self.state.clone();
+        let account = request.account_id.clone();
+        let operation = action.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            dispatch_sts(&state, &account, &operation, &q, caller_key.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| Err(crate::persistence::state_error("STS worker failed")));
+        match result {
             Ok(body) => xml_response(&response_envelope(
                 &action,
                 STS_XMLNS,
@@ -481,7 +502,10 @@ impl NativeHandler for StsHandler {
 }
 
 fn dispatch_iam(state: &IamStsState, account: &str, action: &str, q: &QueryRequest) -> OpResult {
-    let store = &state.store;
+    dispatch_iam_store(&state.store, account, action, q)
+}
+
+fn dispatch_iam_store(store: &IamStore, account: &str, action: &str, q: &QueryRequest) -> OpResult {
     match action {
         // Users
         "CreateUser" => iam::create_user(store, account, q),
@@ -621,7 +645,7 @@ fn dispatch_sts(
             // Strict mode already rejects missing/inactive keys in `enforce` above.
             Ok(sts::get_caller_identity(account, None))
         }
-        "GetSessionToken" => Ok(sts::get_session_token(sessions, account, q)),
+        "GetSessionToken" => sts::get_session_token(sessions, account, q),
         "GetFederationToken" => sts::get_federation_token(sessions, account, q),
         "DecodeAuthorizationMessage" => sts::decode_authorization_message(q),
         other => Err(IamStsError::InvalidAction(format!(
@@ -649,8 +673,8 @@ fn xml_response(body: &str) -> Response {
         .expect("xml response is always valid")
 }
 
-/// Explicit startup credential for a process-local strict-mode IAM administrator.
-/// Revocation is effective in this process; a fresh process seeds the configured key again.
+/// Explicit startup credential for a strict-mode IAM administrator.
+/// Durable registration preserves an existing credential and its revocation state.
 pub struct BootstrapCredentials {
     access_key_id: String,
     secret_access_key: String,
@@ -731,6 +755,13 @@ fn seed_bootstrap_user(store: &IamStore, account: &str, credentials: BootstrapCr
     let _ = store.create_user(account, user);
 }
 
+fn seed_durable_bootstrap(store: &IamStore, account: &str, credentials: BootstrapCredentials) {
+    if !store.bootstrap_initialized(account) {
+        seed_bootstrap_user(store, account, credentials);
+        store.mark_bootstrap_initialized(account);
+    }
+}
+
 /// Register IAM and STS for the configured account. Validate bootstrap before publishing
 /// either service, so strict mode never starts with an unreachable control plane.
 pub fn register_with_account(
@@ -740,6 +771,35 @@ pub fn register_with_account(
     let credentials =
         BootstrapCredentials::from_env(EnforcementMode::from_env() == EnforcementMode::Strict)?;
     register_inner(registry, account, credentials);
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RegistrationError {
+    #[error(transparent)]
+    Bootstrap(#[from] BootstrapError),
+    #[error(transparent)]
+    State(#[from] IamStsError),
+}
+
+pub fn register_with_state(
+    registry: &ServiceRegistry,
+    account: &str,
+    db: Arc<locallycloud_state::StateDb>,
+) -> Result<(), RegistrationError> {
+    let credentials =
+        BootstrapCredentials::from_env(EnforcementMode::from_env() == EnforcementMode::Strict)?;
+    let persistence = Arc::new(crate::persistence::IamPersistence::new(db)?);
+    let store = Arc::new(IamStore::durable(persistence.clone())?);
+    let sessions = Arc::new(SessionStore::durable(persistence)?);
+    store.transact(|staged| {
+        iam::seed_aws_managed_policies(staged);
+        if let Some(credentials) = credentials {
+            seed_durable_bootstrap(staged, account, credentials);
+        }
+        Ok(())
+    })?;
+    publish_handlers(registry, store, sessions);
     Ok(())
 }
 
@@ -753,14 +813,16 @@ fn register_inner(
     account: &str,
     credentials: Option<BootstrapCredentials>,
 ) {
-    let state = Arc::new(IamStsState::new(
-        Arc::new(IamStore::new()),
-        Arc::new(SessionStore::new()),
-    ));
-    iam::seed_aws_managed_policies(&state.store);
+    let store = Arc::new(IamStore::new());
+    iam::seed_aws_managed_policies(&store);
     if let Some(credentials) = credentials {
-        seed_bootstrap_user(&state.store, account, credentials);
+        seed_bootstrap_user(&store, account, credentials);
     }
+    publish_handlers(registry, store, Arc::new(SessionStore::new()));
+}
+
+fn publish_handlers(registry: &ServiceRegistry, store: Arc<IamStore>, sessions: Arc<SessionStore>) {
+    let state = Arc::new(IamStsState::new(store, sessions));
     let iam_handler: Arc<dyn NativeHandler> = Arc::new(IamHandler {
         state: state.clone(),
     });
@@ -1394,5 +1456,281 @@ mod tests {
         let h = sts_handler();
         let resp = h.handle(request("Action=GetCallerIdentity")).await;
         assert_eq!(resp.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::persistence::IamPersistence;
+    use locallycloud_state::{StateCipher, StateDb};
+
+    fn bootstrap_credentials() -> BootstrapCredentials {
+        BootstrapCredentials {
+            access_key_id: "AKIAABCDEFGHIJKLMNOP".into(),
+            secret_access_key: "durable-bootstrap-secret".into(),
+        }
+    }
+    fn persistence(db: Arc<StateDb>, key: u8) -> Arc<IamPersistence> {
+        Arc::new(IamPersistence::with_cipher(db, StateCipher::with_key(&[key; 32])).unwrap())
+    }
+    fn dispatch(store: &IamStore, action: &str, query: &str) -> OpResult {
+        store.transact(|staged| {
+            dispatch_iam_store(
+                staged,
+                "000000000000",
+                action,
+                &QueryRequest::parse(query.as_bytes()),
+            )
+        })
+    }
+
+    #[test]
+    fn encrypted_entities_credentials_sessions_and_revocations_survive_restart() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-iam-durable-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let p = persistence(db.clone(), 0x31);
+        let store = IamStore::durable(p.clone()).unwrap();
+        dispatch(&store, "CreateUser", "UserName=alice").unwrap();
+        dispatch(&store, "CreateGroup", "GroupName=developers").unwrap();
+        dispatch(
+            &store,
+            "AddUserToGroup",
+            "UserName=alice&GroupName=developers",
+        )
+        .unwrap();
+        let allow = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:PutItem","Resource":"*"}]}"#;
+        dispatch(
+            &store,
+            "CreatePolicy",
+            &format!(
+                "PolicyName=writer&PolicyDocument={}",
+                crate::model::urlencode_doc(allow)
+            ),
+        )
+        .unwrap();
+        dispatch(
+            &store,
+            "AttachGroupPolicy",
+            "GroupName=developers&PolicyArn=arn%3Aaws%3Aiam%3A%3A000000000000%3Apolicy%2Fwriter",
+        )
+        .unwrap();
+        let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Principal":{"Service":"lambda.amazonaws.com"}}]}"#;
+        dispatch(
+            &store,
+            "CreateRole",
+            &format!(
+                "RoleName=executor&AssumeRolePolicyDocument={}",
+                crate::model::urlencode_doc(trust)
+            ),
+        )
+        .unwrap();
+        dispatch(
+            &store,
+            "PutRolePolicy",
+            &format!(
+                "RoleName=executor&PolicyName=writer&PolicyDocument={}",
+                crate::model::urlencode_doc(allow)
+            ),
+        )
+        .unwrap();
+        dispatch(&store, "CreateAccessKey", "UserName=alice").unwrap();
+        let access = store.get_user("000000000000", "alice").unwrap().access_keys[0].clone();
+        let sessions = SessionStore::durable(p.clone()).unwrap();
+        let credentials = sts::issue_service_role_credentials(
+            &store,
+            &sessions,
+            "000000000000",
+            "arn:aws:iam::000000000000:role/executor",
+        )
+        .unwrap();
+        let session = sessions.resolve(&credentials.access_key_id).unwrap();
+        let mut expired = session.clone();
+        expired.expires_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        p.save_session("ASIAEXPIRED", &expired).unwrap();
+        store
+            .transact(|staged| {
+                seed_durable_bootstrap(staged, "000000000000", bootstrap_credentials());
+                Ok(())
+            })
+            .unwrap();
+        dispatch(
+            &store,
+            "DeleteAccessKey",
+            "UserName=locallycloud-bootstrap&AccessKeyId=AKIAABCDEFGHIJKLMNOP",
+        )
+        .unwrap();
+        dispatch(
+            &store,
+            "DeleteUserPolicy",
+            "UserName=locallycloud-bootstrap&PolicyName=LocallyCloudBootstrapAdministrator",
+        )
+        .unwrap();
+        dispatch(&store, "DeleteUser", "UserName=locallycloud-bootstrap").unwrap();
+        drop(sessions);
+        drop(store);
+        drop(p);
+        let p = persistence(db.clone(), 0x31);
+        let store = Arc::new(IamStore::durable(p.clone()).unwrap());
+        store
+            .transact(|staged| {
+                seed_durable_bootstrap(staged, "000000000000", bootstrap_credentials());
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.bootstrap_initialized("000000000000"));
+        assert!(!store.bootstrap_initialized("111111111111"));
+        assert!(store
+            .get_user("000000000000", "locallycloud-bootstrap")
+            .is_none());
+        let sessions = Arc::new(SessionStore::durable(p.clone()).unwrap());
+        assert!(sessions.resolve("ASIAEXPIRED").is_none());
+        let restored = sessions.resolve(&credentials.access_key_id).unwrap();
+        assert_eq!(restored.secret_access_key, credentials.secret_access_key);
+        assert_eq!(restored.session_token, credentials.session_token);
+        assert_eq!(
+            restored.expires_at.unix_timestamp(),
+            session.expires_at.unix_timestamp()
+        );
+        let state = IamStsState::new(store.clone(), sessions);
+        let identity = RequestIdentity {
+            account_id: "000000000000".into(),
+            access_key_id: Some(access.access_key_id.clone()),
+            arn: None,
+        };
+        assert_eq!(
+            state.resolve_caller_arn(&identity).unwrap(),
+            Some("arn:aws:iam::000000000000:user/alice".into())
+        );
+        assert_eq!(
+            store
+                .get_group("000000000000", "developers")
+                .unwrap()
+                .members,
+            vec!["alice"]
+        );
+        assert!(store
+            .get_role("000000000000", "executor")
+            .unwrap()
+            .inline_policies
+            .contains_key("writer"));
+        assert!(store.get_user("111111111111", "alice").is_none());
+        dispatch(
+            &store,
+            "UpdateAccessKey",
+            &format!(
+                "UserName=alice&AccessKeyId={}&Status=Inactive",
+                access.access_key_id
+            ),
+        )
+        .unwrap();
+        let reopened = Arc::new(IamStore::durable(p.clone()).unwrap());
+        let state = IamStsState::new(
+            reopened,
+            Arc::new(SessionStore::durable(p.clone()).unwrap()),
+        );
+        assert_eq!(state.resolve_caller_arn(&identity).unwrap(), None);
+        for table in ["iam_resources", "iam_sessions"] {
+            let connection = db.connection().unwrap();
+            let mut stmt = connection
+                .prepare(&format!("SELECT payload FROM {table}"))
+                .unwrap();
+            for bytes in stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)).unwrap() {
+                let bytes = bytes.unwrap();
+                for secret in [
+                    &access.secret_access_key,
+                    &credentials.secret_access_key,
+                    &credentials.session_token,
+                ] {
+                    assert!(!bytes
+                        .windows(secret.len())
+                        .any(|part| part == secret.as_bytes()));
+                }
+            }
+        }
+        assert!(IamStore::durable(persistence(db.clone(), 0x32)).is_err());
+        db.connection()
+            .unwrap()
+            .execute(
+                "UPDATE iam_resources SET payload=zeroblob(32) WHERE kind='user'",
+                [],
+            )
+            .unwrap();
+        assert!(IamStore::durable(persistence(db, 0x31)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_commit_never_publishes_staged_iam_or_issues_sts_credentials() {
+        let root = std::env::temp_dir().join(format!(
+            "locallycloud-iam-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let p = persistence(db.clone(), 0x41);
+        let store = IamStore::durable(p.clone()).unwrap();
+        dispatch(&store, "CreateUser", "UserName=alice").unwrap();
+        db.connection().unwrap().execute_batch("CREATE TRIGGER reject_iam BEFORE INSERT ON iam_resources BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        let result = store.transact(|staged| {
+            let response = dispatch_iam_store(
+                staged,
+                "000000000000",
+                "CreateUser",
+                &QueryRequest::parse(b"UserName=tentative"),
+            )?;
+            assert!(store.get_user("000000000000", "tentative").is_none());
+            Ok(response)
+        });
+        assert!(matches!(result, Err(IamStsError::InternalFailure(_))));
+        assert!(store.get_user("000000000000", "tentative").is_none());
+        assert!(IamStore::durable(p.clone())
+            .unwrap()
+            .get_user("000000000000", "tentative")
+            .is_none());
+        assert!(store.get_user("000000000000", "alice").is_some());
+        assert!(store
+            .transact(|staged| {
+                seed_durable_bootstrap(staged, "000000000000", bootstrap_credentials());
+                Ok(())
+            })
+            .is_err());
+        assert!(!store.bootstrap_initialized("000000000000"));
+        assert!(store
+            .get_user("000000000000", "locallycloud-bootstrap")
+            .is_none());
+        assert!(!IamStore::durable(p.clone())
+            .unwrap()
+            .bootstrap_initialized("000000000000"));
+
+        db.connection().unwrap().execute_batch("DROP TRIGGER reject_iam; CREATE TRIGGER reject_session BEFORE INSERT ON iam_sessions BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Principal":{"Service":"lambda.amazonaws.com"}}]}"#;
+        dispatch(
+            &store,
+            "CreateRole",
+            &format!(
+                "RoleName=executor&AssumeRolePolicyDocument={}",
+                crate::model::urlencode_doc(trust)
+            ),
+        )
+        .unwrap();
+        let sessions = SessionStore::durable(p.clone()).unwrap();
+        assert!(matches!(
+            sts::issue_service_role_credentials(
+                &store,
+                &sessions,
+                "000000000000",
+                "arn:aws:iam::000000000000:role/executor"
+            ),
+            Err(IamStsError::InternalFailure(_))
+        ));
+        assert!(p.load_sessions().unwrap().is_empty());
+        db.connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_session;")
+            .unwrap();
+        dispatch(&store, "CreateUser", "UserName=tentative").unwrap();
+        assert!(store.get_user("000000000000", "tentative").is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

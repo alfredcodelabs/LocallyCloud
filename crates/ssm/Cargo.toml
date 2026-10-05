@@ -20,6 +20,4 @@ http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
 uuid.workspace = true

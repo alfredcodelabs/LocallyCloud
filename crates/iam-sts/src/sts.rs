@@ -5,7 +5,10 @@
 //! are registered in the `SessionStore` keyed by their AccessKeyId so `GetCallerIdentity`
 //! and strict-mode enforcement can resolve the caller.
 
+use crate::persistence::IamPersistence;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
@@ -54,7 +57,7 @@ impl Credentials {
 }
 
 /// A registered temporary-credential session.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub account: String,
     pub secret_access_key: String,
@@ -63,13 +66,15 @@ pub struct Session {
     pub user_id: String,
     pub role_arn: Option<String>,
     pub session_policy: Option<String>,
-    expires_at: OffsetDateTime,
+    #[serde(with = "session_timestamp")]
+    pub(crate) expires_at: OffsetDateTime,
 }
 
 /// Sessions keyed by AccessKeyId. Expired sessions are removed on resolve.
 #[derive(Default)]
 pub struct SessionStore {
     sessions: DashMap<String, Session>,
+    persistence: Option<Arc<IamPersistence>>,
 }
 
 impl SessionStore {
@@ -77,8 +82,19 @@ impl SessionStore {
         Self::default()
     }
 
-    fn register(&self, access_key_id: &str, session: Session) {
+    pub(crate) fn durable(persistence: Arc<IamPersistence>) -> Result<Self, IamStsError> {
+        let sessions = persistence.load_sessions()?.into_iter().collect();
+        Ok(Self {
+            sessions,
+            persistence: Some(persistence),
+        })
+    }
+    fn register(&self, access_key_id: &str, session: Session) -> Result<(), IamStsError> {
+        if let Some(persistence) = &self.persistence {
+            persistence.save_session(access_key_id, &session)?;
+        }
         self.sessions.insert(access_key_id.to_string(), session);
+        Ok(())
     }
 
     /// Resolve a caller by AccessKeyId, removing and ignoring an expired session.
@@ -90,6 +106,9 @@ impl SessionStore {
             .unwrap_or(false);
         if expired {
             self.sessions.remove(access_key_id);
+            if let Some(persistence) = &self.persistence {
+                let _ = persistence.remove_session(access_key_id);
+            }
             return None;
         }
         self.sessions.get(access_key_id).map(|s| s.clone())
@@ -115,7 +134,7 @@ fn register_session(
     sessions: &SessionStore,
     creds: &Credentials,
     registration: SessionRegistration<'_>,
-) {
+) -> Result<(), IamStsError> {
     sessions.register(
         &creds.access_key_id,
         Session {
@@ -128,7 +147,23 @@ fn register_session(
             session_policy: registration.session_policy.map(str::to_string),
             expires_at: OffsetDateTime::now_utc() + Duration::seconds(registration.duration),
         },
-    );
+    )
+}
+
+mod session_timestamp {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &time::OffsetDateTime,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(value.unix_timestamp())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<time::OffsetDateTime, D::Error> {
+        time::OffsetDateTime::from_unix_timestamp(i64::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Short role name from a role ARN (`...:role/path/name` → `name`).
@@ -172,7 +207,7 @@ pub fn issue_service_role_credentials(
             role_arn: Some(role_arn),
             session_policy: None,
         },
-    );
+    )?;
     Ok(creds)
 }
 
@@ -211,7 +246,7 @@ pub fn assume_role(
             role_arn: Some(role_arn),
             session_policy,
         },
-    );
+    )?;
 
     Ok(format!(
         "{}<AssumedRoleUser>{}{}</AssumedRoleUser>",
@@ -248,7 +283,7 @@ pub fn assume_role_with_web_identity(
             role_arn: Some(role_arn),
             session_policy,
         },
-    );
+    )?;
     let subject = q.get("SubjectFromWebIdentityToken").unwrap_or("subject");
     let provider = q.get("ProviderId").unwrap_or("provider");
     Ok(format!(
@@ -289,7 +324,7 @@ pub fn assume_role_with_saml(
             role_arn: Some(role_arn),
             session_policy,
         },
-    );
+    )?;
     Ok(format!(
         "{}<AssumedRoleUser>{}{}</AssumedRoleUser>{}",
         creds.xml(),
@@ -322,7 +357,11 @@ pub fn get_iam_caller_identity(account: &str, user: &IamUser) -> String {
     )
 }
 
-pub fn get_session_token(sessions: &SessionStore, account: &str, q: &QueryRequest) -> String {
+pub fn get_session_token(
+    sessions: &SessionStore,
+    account: &str,
+    q: &QueryRequest,
+) -> Result<String, IamStsError> {
     let duration = duration_or(q, SESSION_TOKEN_DEFAULT);
     let creds = Credentials::generate(duration);
     let arn = format!("arn:aws:iam::{account}:root");
@@ -337,8 +376,8 @@ pub fn get_session_token(sessions: &SessionStore, account: &str, q: &QueryReques
             role_arn: None,
             session_policy: None,
         },
-    );
-    creds.xml()
+    )?;
+    Ok(creds.xml())
 }
 
 pub fn get_federation_token(
@@ -363,7 +402,7 @@ pub fn get_federation_token(
             role_arn: None,
             session_policy,
         },
-    );
+    )?;
     Ok(format!(
         "{}<FederatedUser>{}{}</FederatedUser>",
         creds.xml(),

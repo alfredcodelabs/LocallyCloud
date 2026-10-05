@@ -20,6 +20,8 @@ enum CognitoError {
     UsernameExists,
     InvalidPassword,
     NotAuthorized,
+    UserNotConfirmed,
+    AccessDenied,
     Unsupported,
     UnknownOperation,
     Internal,
@@ -28,6 +30,12 @@ enum CognitoError {
 impl CognitoError {
     fn into_aws(self) -> AwsError {
         let (code, message, status) = match self {
+            Self::AccessDenied => (
+                "AccessDeniedException",
+                "Caller is not authorized for this Cognito operation",
+                403,
+            ),
+            Self::UserNotConfirmed => ("UserNotConfirmedException", "User is not confirmed", 400),
             Self::InvalidParameter => (
                 "InvalidParameterException",
                 "Invalid request parameter",
@@ -68,7 +76,7 @@ impl CognitoError {
 
 /// Register only `cognito-idp` as Native; `cognito-identity` remains untouched.
 pub fn register(registry: &Arc<ServiceRegistry>) -> Arc<CognitoHandler> {
-    let handler = Arc::new(CognitoHandler::new());
+    let handler = Arc::new(CognitoHandler::with_registry(Arc::downgrade(registry)));
     registry.register_native(
         ServiceName::new("cognito-idp"),
         ServiceMetadata::new(AwsProtocol::Json11, Some(TARGET_PREFIX)),

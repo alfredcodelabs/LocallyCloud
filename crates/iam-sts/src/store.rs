@@ -1,222 +1,330 @@
-//! Concurrency-safe IAM state store.
-//!
-//! Resources are keyed by `(account, name)` (IAM is partition-global, so region is not part
-//! of the key). Creation is atomic create-if-absent via the `DashMap` entry API: two
-//! same-name creates yield at most one resource, the loser observing the conflict.
-
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
-
+//! Committed IAM state and isolated mutation staging.
+use crate::error::IamStsError;
 use crate::model::{IamGroup, IamPolicy, IamRole, IamUser, InstanceProfile};
+use crate::persistence::IamPersistence;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 type Key = (String, String);
-
 fn key(account: &str, name: &str) -> Key {
     (account.to_string(), name.to_string())
 }
 
-/// The IAM resource store. All maps are concurrent; values are cloned on read.
+#[derive(Clone, Default)]
+pub(crate) struct IamRecords {
+    pub bootstrap_initialized: BTreeSet<String>,
+    pub users: BTreeMap<Key, IamUser>,
+    pub groups: BTreeMap<Key, IamGroup>,
+    pub roles: BTreeMap<Key, IamRole>,
+    pub policies: BTreeMap<Key, IamPolicy>,
+    pub instance_profiles: BTreeMap<Key, InstanceProfile>,
+}
 #[derive(Default)]
 pub struct IamStore {
-    users: DashMap<Key, IamUser>,
-    groups: DashMap<Key, IamGroup>,
-    roles: DashMap<Key, IamRole>,
-    policies: DashMap<Key, IamPolicy>,
-    instance_profiles: DashMap<Key, InstanceProfile>,
+    records: RwLock<IamRecords>,
+    mutation: Mutex<()>,
+    persistence: Option<Arc<IamPersistence>>,
 }
-
-/// Outcome of an atomic create-if-absent.
 pub enum Created<T> {
     Inserted(T),
     AlreadyExists,
 }
-
 impl IamStore {
     pub fn new() -> Self {
         Self::default()
     }
-
-    pub fn has_resources(&self, account: &str) -> bool {
-        self.users.iter().any(|e| e.key().0 == account)
-            || self.groups.iter().any(|e| e.key().0 == account)
-            || self.roles.iter().any(|e| e.key().0 == account)
-            || self.policies.iter().any(|e| e.key().0 == account)
-            || self.instance_profiles.iter().any(|e| e.key().0 == account)
+    pub(crate) fn durable(persistence: Arc<IamPersistence>) -> Result<Self, IamStsError> {
+        Ok(Self {
+            records: RwLock::new(persistence.load_resources()?),
+            mutation: Mutex::new(()),
+            persistence: Some(persistence),
+        })
     }
-
-    // ---- users ----------------------------------------------------------------
-    pub fn create_user(&self, account: &str, user: IamUser) -> Created<IamUser> {
-        match self.users.entry(key(account, &user.user_name)) {
-            Entry::Occupied(_) => Created::AlreadyExists,
-            Entry::Vacant(slot) => {
-                let stored = user.clone();
-                slot.insert(user);
-                Created::Inserted(stored)
+    pub(crate) fn transact<T>(
+        &self,
+        operation: impl FnOnce(&IamStore) -> Result<T, IamStsError>,
+    ) -> Result<T, IamStsError> {
+        let _mutation = self.mutation.lock().unwrap();
+        // ponytail: clone control-plane metadata; stage per entity if IAM scale warrants it.
+        let before = self.records.read().unwrap().clone();
+        let staged = Self {
+            records: RwLock::new(before.clone()),
+            ..Self::default()
+        };
+        let result = operation(&staged)?;
+        let after = staged.records.into_inner().unwrap();
+        if let Some(persistence) = &self.persistence {
+            persistence.commit_resources(&before, &after)?;
+        }
+        *self.records.write().unwrap() = after;
+        Ok(result)
+    }
+    pub(crate) fn bootstrap_initialized(&self, account: &str) -> bool {
+        self.records
+            .read()
+            .unwrap()
+            .bootstrap_initialized
+            .contains(account)
+    }
+    pub(crate) fn mark_bootstrap_initialized(&self, account: &str) {
+        self.records
+            .write()
+            .unwrap()
+            .bootstrap_initialized
+            .insert(account.into());
+    }
+    pub fn has_resources(&self, account: &str) -> bool {
+        let records = self.records.read().unwrap();
+        records
+            .users
+            .keys()
+            .chain(records.groups.keys())
+            .chain(records.roles.keys())
+            .chain(records.policies.keys())
+            .chain(records.instance_profiles.keys())
+            .any(|key| key.0 == account)
+    }
+    pub fn create_user(&self, account: &str, resource: IamUser) -> Created<IamUser> {
+        let mut records = self.records.write().unwrap();
+        match records.users.entry(key(account, &resource.user_name)) {
+            std::collections::btree_map::Entry::Occupied(_) => Created::AlreadyExists,
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(resource.clone());
+                Created::Inserted(resource)
             }
         }
     }
     pub fn get_user(&self, account: &str, name: &str) -> Option<IamUser> {
-        self.users.get(&key(account, name)).map(|u| u.clone())
+        self.records
+            .read()
+            .unwrap()
+            .users
+            .get(&key(account, name))
+            .cloned()
     }
     pub fn remove_user(&self, account: &str, name: &str) -> Option<IamUser> {
-        self.users.remove(&key(account, name)).map(|(_, v)| v)
+        self.records
+            .write()
+            .unwrap()
+            .users
+            .remove(&key(account, name))
     }
     pub fn list_users(&self, account: &str) -> Vec<IamUser> {
-        self.users
+        self.records
+            .read()
+            .unwrap()
+            .users
             .iter()
-            .filter(|e| e.key().0 == account)
-            .map(|e| e.value().clone())
+            .filter(|(key, _)| key.0 == account)
+            .map(|(_, value)| value.clone())
             .collect()
     }
-    /// Apply a mutation to a stored user; returns `false` when absent.
     pub fn update_user<F: FnOnce(&mut IamUser)>(&self, account: &str, name: &str, f: F) -> bool {
-        match self.users.get_mut(&key(account, name)) {
-            Some(mut u) => {
-                f(&mut u);
-                true
-            }
-            None => false,
+        if let Some(resource) = self
+            .records
+            .write()
+            .unwrap()
+            .users
+            .get_mut(&key(account, name))
+        {
+            f(resource);
+            true
+        } else {
+            false
         }
     }
-
-    // ---- groups ---------------------------------------------------------------
-    pub fn create_group(&self, account: &str, group: IamGroup) -> Created<IamGroup> {
-        match self.groups.entry(key(account, &group.group_name)) {
-            Entry::Occupied(_) => Created::AlreadyExists,
-            Entry::Vacant(slot) => {
-                let stored = group.clone();
-                slot.insert(group);
-                Created::Inserted(stored)
+    pub fn create_group(&self, account: &str, resource: IamGroup) -> Created<IamGroup> {
+        let mut records = self.records.write().unwrap();
+        match records.groups.entry(key(account, &resource.group_name)) {
+            std::collections::btree_map::Entry::Occupied(_) => Created::AlreadyExists,
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(resource.clone());
+                Created::Inserted(resource)
             }
         }
     }
     pub fn get_group(&self, account: &str, name: &str) -> Option<IamGroup> {
-        self.groups.get(&key(account, name)).map(|g| g.clone())
+        self.records
+            .read()
+            .unwrap()
+            .groups
+            .get(&key(account, name))
+            .cloned()
     }
     pub fn remove_group(&self, account: &str, name: &str) -> Option<IamGroup> {
-        self.groups.remove(&key(account, name)).map(|(_, v)| v)
+        self.records
+            .write()
+            .unwrap()
+            .groups
+            .remove(&key(account, name))
     }
     pub fn list_groups(&self, account: &str) -> Vec<IamGroup> {
-        self.groups
+        self.records
+            .read()
+            .unwrap()
+            .groups
             .iter()
-            .filter(|e| e.key().0 == account)
-            .map(|e| e.value().clone())
+            .filter(|(key, _)| key.0 == account)
+            .map(|(_, value)| value.clone())
             .collect()
     }
     pub fn update_group<F: FnOnce(&mut IamGroup)>(&self, account: &str, name: &str, f: F) -> bool {
-        match self.groups.get_mut(&key(account, name)) {
-            Some(mut g) => {
-                f(&mut g);
-                true
-            }
-            None => false,
+        if let Some(resource) = self
+            .records
+            .write()
+            .unwrap()
+            .groups
+            .get_mut(&key(account, name))
+        {
+            f(resource);
+            true
+        } else {
+            false
         }
     }
-
-    // ---- roles ----------------------------------------------------------------
-    pub fn create_role(&self, account: &str, role: IamRole) -> Created<IamRole> {
-        match self.roles.entry(key(account, &role.role_name)) {
-            Entry::Occupied(_) => Created::AlreadyExists,
-            Entry::Vacant(slot) => {
-                let stored = role.clone();
-                slot.insert(role);
-                Created::Inserted(stored)
+    pub fn create_role(&self, account: &str, resource: IamRole) -> Created<IamRole> {
+        let mut records = self.records.write().unwrap();
+        match records.roles.entry(key(account, &resource.role_name)) {
+            std::collections::btree_map::Entry::Occupied(_) => Created::AlreadyExists,
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(resource.clone());
+                Created::Inserted(resource)
             }
         }
     }
     pub fn get_role(&self, account: &str, name: &str) -> Option<IamRole> {
-        self.roles.get(&key(account, name)).map(|r| r.clone())
+        self.records
+            .read()
+            .unwrap()
+            .roles
+            .get(&key(account, name))
+            .cloned()
     }
     pub fn remove_role(&self, account: &str, name: &str) -> Option<IamRole> {
-        self.roles.remove(&key(account, name)).map(|(_, v)| v)
+        self.records
+            .write()
+            .unwrap()
+            .roles
+            .remove(&key(account, name))
     }
     pub fn list_roles(&self, account: &str) -> Vec<IamRole> {
-        self.roles
+        self.records
+            .read()
+            .unwrap()
+            .roles
             .iter()
-            .filter(|e| e.key().0 == account)
-            .map(|e| e.value().clone())
+            .filter(|(key, _)| key.0 == account)
+            .map(|(_, value)| value.clone())
             .collect()
     }
     pub fn update_role<F: FnOnce(&mut IamRole)>(&self, account: &str, name: &str, f: F) -> bool {
-        match self.roles.get_mut(&key(account, name)) {
-            Some(mut r) => {
-                f(&mut r);
-                true
-            }
-            None => false,
+        if let Some(resource) = self
+            .records
+            .write()
+            .unwrap()
+            .roles
+            .get_mut(&key(account, name))
+        {
+            f(resource);
+            true
+        } else {
+            false
         }
     }
-
-    // ---- policies (keyed by ARN within the account) ---------------------------
-    pub fn insert_policy(&self, account: &str, policy: IamPolicy) -> Created<IamPolicy> {
-        match self.policies.entry(key(account, &policy.arn)) {
-            Entry::Occupied(_) => Created::AlreadyExists,
-            Entry::Vacant(slot) => {
-                let stored = policy.clone();
-                slot.insert(policy);
-                Created::Inserted(stored)
+    pub fn insert_policy(&self, account: &str, resource: IamPolicy) -> Created<IamPolicy> {
+        let mut records = self.records.write().unwrap();
+        match records.policies.entry(key(account, &resource.arn)) {
+            std::collections::btree_map::Entry::Occupied(_) => Created::AlreadyExists,
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(resource.clone());
+                Created::Inserted(resource)
             }
         }
     }
-    /// Insert a policy unconditionally (used to seed the AWS-managed catalog idempotently).
-    pub fn seed_policy(&self, account: &str, policy: IamPolicy) {
-        self.policies
-            .entry(key(account, &policy.arn))
-            .or_insert(policy);
+    pub fn get_policy(&self, account: &str, name: &str) -> Option<IamPolicy> {
+        self.records
+            .read()
+            .unwrap()
+            .policies
+            .get(&key(account, name))
+            .cloned()
     }
-    pub fn get_policy(&self, account: &str, arn: &str) -> Option<IamPolicy> {
-        self.policies.get(&key(account, arn)).map(|p| p.clone())
-    }
-    pub fn remove_policy(&self, account: &str, arn: &str) -> Option<IamPolicy> {
-        self.policies.remove(&key(account, arn)).map(|(_, v)| v)
+    pub fn remove_policy(&self, account: &str, name: &str) -> Option<IamPolicy> {
+        self.records
+            .write()
+            .unwrap()
+            .policies
+            .remove(&key(account, name))
     }
     pub fn list_policies(&self, account: &str) -> Vec<IamPolicy> {
-        self.policies
+        self.records
+            .read()
+            .unwrap()
+            .policies
             .iter()
-            .filter(|e| e.key().0 == account)
-            .map(|e| e.value().clone())
+            .filter(|(key, _)| key.0 == account)
+            .map(|(_, value)| value.clone())
             .collect()
     }
-    pub fn update_policy<F: FnOnce(&mut IamPolicy)>(&self, account: &str, arn: &str, f: F) -> bool {
-        match self.policies.get_mut(&key(account, arn)) {
-            Some(mut p) => {
-                f(&mut p);
-                true
-            }
-            None => false,
+    pub fn update_policy<F: FnOnce(&mut IamPolicy)>(
+        &self,
+        account: &str,
+        name: &str,
+        f: F,
+    ) -> bool {
+        if let Some(resource) = self
+            .records
+            .write()
+            .unwrap()
+            .policies
+            .get_mut(&key(account, name))
+        {
+            f(resource);
+            true
+        } else {
+            false
         }
     }
-
-    // ---- instance profiles ----------------------------------------------------
     pub fn create_instance_profile(
         &self,
         account: &str,
-        profile: InstanceProfile,
+        resource: InstanceProfile,
     ) -> Created<InstanceProfile> {
-        match self.instance_profiles.entry(key(account, &profile.name)) {
-            Entry::Occupied(_) => Created::AlreadyExists,
-            Entry::Vacant(slot) => {
-                let stored = profile.clone();
-                slot.insert(profile);
-                Created::Inserted(stored)
+        let mut records = self.records.write().unwrap();
+        match records
+            .instance_profiles
+            .entry(key(account, &resource.name))
+        {
+            std::collections::btree_map::Entry::Occupied(_) => Created::AlreadyExists,
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(resource.clone());
+                Created::Inserted(resource)
             }
         }
     }
     pub fn get_instance_profile(&self, account: &str, name: &str) -> Option<InstanceProfile> {
-        self.instance_profiles
+        self.records
+            .read()
+            .unwrap()
+            .instance_profiles
             .get(&key(account, name))
-            .map(|p| p.clone())
+            .cloned()
     }
     pub fn remove_instance_profile(&self, account: &str, name: &str) -> Option<InstanceProfile> {
-        self.instance_profiles
+        self.records
+            .write()
+            .unwrap()
+            .instance_profiles
             .remove(&key(account, name))
-            .map(|(_, v)| v)
     }
     pub fn list_instance_profiles(&self, account: &str) -> Vec<InstanceProfile> {
-        self.instance_profiles
+        self.records
+            .read()
+            .unwrap()
+            .instance_profiles
             .iter()
-            .filter(|e| e.key().0 == account)
-            .map(|e| e.value().clone())
+            .filter(|(key, _)| key.0 == account)
+            .map(|(_, value)| value.clone())
             .collect()
     }
     pub fn update_instance_profile<F: FnOnce(&mut InstanceProfile)>(
@@ -225,16 +333,28 @@ impl IamStore {
         name: &str,
         f: F,
     ) -> bool {
-        match self.instance_profiles.get_mut(&key(account, name)) {
-            Some(mut p) => {
-                f(&mut p);
-                true
-            }
-            None => false,
+        if let Some(resource) = self
+            .records
+            .write()
+            .unwrap()
+            .instance_profiles
+            .get_mut(&key(account, name))
+        {
+            f(resource);
+            true
+        } else {
+            false
         }
     }
+    pub fn seed_policy(&self, account: &str, policy: IamPolicy) {
+        self.records
+            .write()
+            .unwrap()
+            .policies
+            .entry(key(account, &policy.arn))
+            .or_insert(policy);
+    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

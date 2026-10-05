@@ -11,12 +11,34 @@ pub(crate) enum SsmError {
     InvalidKeyId,
     InvalidResourceType,
     InvalidResourceId,
+    InvalidNextToken,
+    InvalidFilterKey,
+    InvalidFilterOption,
+    InvalidFilterValue,
     Internal,
 }
 
 impl From<SsmError> for AwsError {
     fn from(error: SsmError) -> Self {
         let (code, message, status) = match error {
+            SsmError::InvalidNextToken => {
+                ("InvalidNextToken", "The specified token is invalid", 400)
+            }
+            SsmError::InvalidFilterKey => (
+                "InvalidFilterKey",
+                "The specified filter key is unsupported",
+                400,
+            ),
+            SsmError::InvalidFilterOption => (
+                "InvalidFilterOption",
+                "The specified filter option is invalid",
+                400,
+            ),
+            SsmError::InvalidFilterValue => (
+                "InvalidFilterValue",
+                "The specified filter value is invalid",
+                400,
+            ),
             SsmError::Serialization => (
                 "SerializationException",
                 "The request could not be deserialized",

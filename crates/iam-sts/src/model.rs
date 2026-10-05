@@ -3,6 +3,7 @@
 //! Each struct serializes to the inner XML AWS returns for that resource (without the
 //! `<{Action}Result>` wrapper, which the Query layer adds). Timestamps are ISO-8601 UTC.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use time::format_description::well_known::Rfc3339;
@@ -35,7 +36,7 @@ pub fn tags_xml(tags: &BTreeMap<String, String>) -> String {
     format!("<Tags>{members}</Tags>")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IamUser {
     pub user_name: String,
     pub user_id: String,
@@ -69,7 +70,7 @@ impl IamUser {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IamGroup {
     pub group_name: String,
     pub group_id: String,
@@ -100,7 +101,7 @@ impl IamGroup {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IamRole {
     pub role_name: String,
     pub role_id: String,
@@ -144,7 +145,7 @@ impl IamRole {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IamPolicy {
     pub policy_name: String,
     pub policy_id: String,
@@ -193,7 +194,7 @@ impl IamPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyVersion {
     pub version_id: String,
     pub document: String,
@@ -213,7 +214,7 @@ impl PolicyVersion {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessKey {
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -221,7 +222,7 @@ pub struct AccessKey {
     pub create_date: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceProfile {
     pub name: String,
     pub id: String,

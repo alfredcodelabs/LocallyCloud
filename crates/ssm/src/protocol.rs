@@ -10,6 +10,7 @@ pub(crate) const MAX_REQUEST_BODY: usize = 64 * 1024;
 const OPERATIONS: &[&str] = &[
     "PutParameter",
     "GetParameter",
+    "GetParametersByPath",
     "DescribeParameters",
     "DeleteParameter",
     "AddTagsToResource",

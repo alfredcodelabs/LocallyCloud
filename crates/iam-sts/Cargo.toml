@@ -8,6 +8,9 @@ license.workspace = true
 description = "locallycloud AWS IAM and STS services (Query/XML), registered Native in the Core ServiceRegistry"
 
 [dependencies]
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+zeroize.workspace = true
 locallycloud-core.workspace = true
 tokio.workspace = true
 async-trait.workspace = true

@@ -13,6 +13,8 @@ use uuid::Uuid;
 use crate::crypto::{opaque_token, PasswordHash, SigningKey};
 use crate::{CognitoError, TARGET_PREFIX};
 
+mod auth;
+
 const MAX_BODY: usize = 128 * 1024;
 const TOKEN_LIFETIME: i64 = 3600;
 
@@ -27,6 +29,7 @@ struct AppClient {
     id: String,
     name: String,
     admin_password_auth: bool,
+    user_password_auth: bool,
     created: i64,
 }
 
@@ -55,11 +58,21 @@ struct Pool {
 #[derive(Default)]
 pub struct CognitoHandler {
     pools: RwLock<HashMap<PoolScope, Arc<Mutex<Pool>>>>,
+    registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
 }
 
 impl CognitoHandler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_registry(
+        registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
+    ) -> Self {
+        Self {
+            registry,
+            ..Self::new()
+        }
     }
 
     /// Public-only JWKS snapshot for an issuer path. Does not expose the pool store or keys.
@@ -120,6 +133,9 @@ impl CognitoHandler {
         let body: Value =
             serde_json::from_slice(&request.body).map_err(|_| CognitoError::InvalidParameter)?;
         let input = body.as_object().ok_or(CognitoError::InvalidParameter)?;
+        if !matches!(operation, "SignUp" | "InitiateAuth") {
+            self.authorize_management(request, operation, input)?;
+        }
         match operation {
             "CreateUserPool" => self.create_pool(request, input).await,
             "DescribeUserPool" => self.describe_pool(request, input),
@@ -135,6 +151,9 @@ impl CognitoHandler {
             "ListUsers" => self.list_users(request, input),
             "AdminDeleteUser" => self.admin_delete_user(request, input),
             "AdminInitiateAuth" => self.admin_auth(request, input),
+            "SignUp" => self.sign_up(request, input),
+            "AdminConfirmSignUp" => self.confirm_user(request, input),
+            "InitiateAuth" => self.initiate_auth(request, input),
             _ => Err(CognitoError::UnknownOperation),
         }
     }
@@ -270,7 +289,11 @@ impl CognitoHandler {
             if flows.iter().any(|flow| {
                 !matches!(
                     flow.as_str(),
-                    Some("ALLOW_ADMIN_USER_PASSWORD_AUTH" | "ALLOW_REFRESH_TOKEN_AUTH")
+                    Some(
+                        "ALLOW_ADMIN_USER_PASSWORD_AUTH"
+                            | "ALLOW_USER_PASSWORD_AUTH"
+                            | "ALLOW_REFRESH_TOKEN_AUTH"
+                    )
                 )
             }) {
                 return Err(CognitoError::Unsupported);
@@ -287,6 +310,11 @@ impl CognitoHandler {
             id: Uuid::new_v4().simple().to_string(),
             name: name.to_owned(),
             admin_password_auth,
+            user_password_auth: flows.is_some_and(|flows| {
+                flows
+                    .iter()
+                    .any(|flow| flow.as_str() == Some("ALLOW_USER_PASSWORD_AUTH"))
+            }),
             created: now()?,
         };
         let result = client_view(&client, pool_id);
@@ -479,11 +507,26 @@ impl CognitoHandler {
         request: &ServiceRequest,
         input: &Map<String, Value>,
     ) -> Result<Value, CognitoError> {
+        self.password_auth(request, input, true)
+    }
+
+    fn password_auth(
+        &self,
+        request: &ServiceRequest,
+        input: &Map<String, Value>,
+        admin: bool,
+    ) -> Result<Value, CognitoError> {
         allowed(
             input,
             &["UserPoolId", "ClientId", "AuthFlow", "AuthParameters"],
         )?;
-        if string(input, "AuthFlow")? != "ADMIN_USER_PASSWORD_AUTH" {
+        if string(input, "AuthFlow")?
+            != if admin {
+                "ADMIN_USER_PASSWORD_AUTH"
+            } else {
+                "USER_PASSWORD_AUTH"
+            }
+        {
             return Err(CognitoError::Unsupported);
         }
         let pool_id = string(input, "UserPoolId")?;
@@ -501,14 +544,20 @@ impl CognitoHandler {
             .clients
             .get(client_id)
             .ok_or(CognitoError::ResourceNotFound)?;
-        if !client.admin_password_auth {
+        if (admin && !client.admin_password_auth) || (!admin && !client.user_password_auth) {
             return Err(CognitoError::NotAuthorized);
         }
         let user = pool
             .users
             .get(username)
             .ok_or(CognitoError::NotAuthorized)?;
-        if !user.enabled || user.status != "CONFIRMED" || !user.password.verify(password) {
+        if !user.enabled || !user.password.verify(password) {
+            return Err(CognitoError::NotAuthorized);
+        }
+        if user.status == "UNCONFIRMED" {
+            return Err(CognitoError::UserNotConfirmed);
+        }
+        if user.status != "CONFIRMED" {
             return Err(CognitoError::NotAuthorized);
         }
         let issued = now()?;
@@ -722,10 +771,17 @@ fn pool_view(pool: &Pool) -> Value {
 }
 
 fn client_view(client: &AppClient, pool_id: &str) -> Value {
+    let mut flows = Vec::new();
+    if client.admin_password_auth {
+        flows.push("ALLOW_ADMIN_USER_PASSWORD_AUTH");
+    }
+    if client.user_password_auth {
+        flows.push("ALLOW_USER_PASSWORD_AUTH");
+    }
     json!({
         "ClientId": client.id, "ClientName": client.name, "UserPoolId": pool_id,
         "CreationDate": client.created, "LastModifiedDate": client.created,
-        "ExplicitAuthFlows": if client.admin_password_auth { vec!["ALLOW_ADMIN_USER_PASSWORD_AUTH"] } else { vec!["ALLOW_USER_SRP_AUTH", "ALLOW_CUSTOM_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"] },
+        "ExplicitAuthFlows": flows,
         "AccessTokenValidity": 60, "IdTokenValidity": 60,
         "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes"}
     })
