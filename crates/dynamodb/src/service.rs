@@ -675,6 +675,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_throughput_is_monotonic_atomic_and_durable() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-ddb-warm-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state.clone()).unwrap()),
+            Weak::new(),
+        );
+        let create = serde_json::json!({
+            "TableName":"t", "BillingMode":"PAY_PER_REQUEST",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}, {"AttributeName":"category","AttributeType":"S"}],
+            "GlobalSecondaryIndexes":[{"IndexName":"category", "KeySchema":[{"AttributeName":"category","KeyType":"HASH"}], "Projection":{"ProjectionType":"ALL"},
+                "WarmThroughput":{"ReadUnitsPerSecond":20000}}]
+        });
+        let (status, created) = call_json(&h, "CreateTable", &create.to_string()).await;
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(
+            created["TableDescription"]["WarmThroughput"],
+            serde_json::json!({"ReadUnitsPerSecond":12000,"WriteUnitsPerSecond":4000,"Status":"ACTIVE"})
+        );
+        assert_eq!(
+            created["TableDescription"]["GlobalSecondaryIndexes"][0]["WarmThroughput"]
+                ["ReadUnitsPerSecond"],
+            20000
+        );
+        let update = serde_json::json!({"TableName":"t", "WarmThroughput":{"ReadUnitsPerSecond":30000},
+            "GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"category", "WarmThroughput":{"WriteUnitsPerSecond":8000}}}]});
+        assert_eq!(
+            call(&h, "UpdateTable", &update.to_string()).await.status(),
+            200
+        );
+        for invalid in [
+            serde_json::json!({"ReadUnitsPerSecond":29999}),
+            serde_json::json!({"WriteUnitsPerSecond":0}),
+            serde_json::json!({"WriteUnitsPerSecond":2.5}),
+            serde_json::json!({"ReadUnitsPerSecond":"40000"}),
+            serde_json::json!({}),
+        ] {
+            let rejected = serde_json::json!({"TableName":"t", "WarmThroughput":invalid, "BillingMode":"PROVISIONED", "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}});
+            assert_eq!(
+                call(&h, "UpdateTable", &rejected.to_string())
+                    .await
+                    .status(),
+                400
+            );
+        }
+        drop(h);
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state).unwrap()),
+            Weak::new(),
+        );
+        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"t"}"#).await;
+        assert_eq!(
+            body["Table"]["BillingModeSummary"]["BillingMode"],
+            "PAY_PER_REQUEST"
+        );
+        assert_eq!(body["Table"]["WarmThroughput"]["ReadUnitsPerSecond"], 30000);
+        assert_eq!(body["Table"]["WarmThroughput"]["WriteUnitsPerSecond"], 4000);
+        assert_eq!(
+            body["Table"]["GlobalSecondaryIndexes"][0]["WarmThroughput"]["WriteUnitsPerSecond"],
+            8000
+        );
+        // Provisioned high-water marks remain after subsequently lowering capacity.
+        for read in [50000, 5] {
+            let update = serde_json::json!({"TableName":"t", "BillingMode":"PROVISIONED", "ProvisionedThroughput":{"ReadCapacityUnits":read,"WriteCapacityUnits":5}, "GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"category","ProvisionedThroughput":{"ReadCapacityUnits":read,"WriteCapacityUnits":5}}}]});
+            let (status, body) = call_json(&h, "UpdateTable", &update.to_string()).await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(
+                body["TableDescription"]["WarmThroughput"]["ReadUnitsPerSecond"],
+                50000
+            );
+            assert_eq!(
+                body["TableDescription"]["GlobalSecondaryIndexes"][0]["WarmThroughput"]
+                    ["ReadUnitsPerSecond"],
+                50000
+            );
+        }
+        drop(h);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_descriptions_and_replica_warm_updates() {
+        let h = DynamoHandler::new();
+        create_provisioned(&h).await;
+        let table = h.store.get("000000000000", "us-east-1", "t").unwrap();
+        // Deserialize the shape persisted before warm marks existed.
+        let mut old = serde_json::to_value(&table.read().await.def).unwrap();
+        old.as_object_mut().unwrap().remove("warm_throughput");
+        table.write().await.def = serde_json::from_value(old).unwrap();
+        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"t"}"#).await;
+        assert_eq!(body["Table"]["WarmThroughput"]["Status"], "ACTIVE");
+        assert_eq!(
+            call(
+                &h,
+                "UpdateTable",
+                r#"{"TableName":"t","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#
+            )
+            .await
+            .status(),
+            200
+        );
+        assert_eq!(
+            call(
+                &h,
+                "UpdateTable",
+                r#"{"TableName":"t","WarmThroughput":{"ReadUnitsPerSecond":40000}}"#
+            )
+            .await
+            .status(),
+            200
+        );
+        let peer = h.store.get("000000000000", "us-west-2", "t").unwrap();
+        assert_eq!(peer.read().await.def.warm_throughput.unwrap().read, 40000);
+    }
+
+    #[tokio::test]
     async fn update_table_throughput_and_gsi_lifecycle() {
         let h = DynamoHandler::new();
         create_provisioned(&h).await;
@@ -697,7 +815,7 @@ mod tests {
         );
 
         // Create a GSI (new attribute definition supplied).
-        let create_gsi = r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"gsk","AttributeType":"S"}],"GlobalSecondaryIndexUpdates":[{"Create":{"IndexName":"gsi1","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}}]}"#;
+        let create_gsi = r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"gsk","AttributeType":"S"}],"GlobalSecondaryIndexUpdates":[{"Create":{"IndexName":"gsi1","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]}"#;
         let (s, v) = call_json(&h, "UpdateTable", create_gsi).await;
         assert_eq!(s, 200);
         assert_eq!(

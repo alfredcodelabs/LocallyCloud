@@ -17,7 +17,7 @@ use locallycloud_state::StateDb;
 /// Default queue attribute values (seconds / bytes).
 pub const DEFAULT_VISIBILITY_TIMEOUT: i64 = 30;
 pub const DEFAULT_DELAY_SECONDS: i64 = 0;
-pub const DEFAULT_MAX_MESSAGE_SIZE: i64 = 262_144;
+pub const DEFAULT_MAX_MESSAGE_SIZE: i64 = 1_048_576;
 pub const DEFAULT_RETENTION_PERIOD: i64 = 345_600;
 pub const DEFAULT_WAIT_TIME_SECONDS: i64 = 0;
 pub const MAX_RECEIVE_WAIT_SECONDS: i64 = 20;

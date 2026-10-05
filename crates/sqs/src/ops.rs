@@ -31,7 +31,7 @@ use crate::store::{
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 /// Maximum batch entries per request.
 const MAX_BATCH: usize = 10;
-const MAX_BATCH_PAYLOAD: usize = 262_144;
+const MAX_BATCH_PAYLOAD: usize = DEFAULT_MAX_MESSAGE_SIZE as usize;
 const MAX_TAGS: usize = 50;
 const RECEIVE_ATTEMPT_WINDOW: Duration = Duration::from_secs(300);
 
@@ -465,7 +465,9 @@ fn validate_attributes(
         match name.as_str() {
             "VisibilityTimeout" => parse_bounded_attribute(name, value, 0, 43_200)?,
             "MessageRetentionPeriod" => parse_bounded_attribute(name, value, 60, 1_209_600)?,
-            "MaximumMessageSize" => parse_bounded_attribute(name, value, 1_024, 262_144)?,
+            "MaximumMessageSize" => {
+                parse_bounded_attribute(name, value, 1_024, DEFAULT_MAX_MESSAGE_SIZE)?
+            }
             "DelaySeconds" => parse_bounded_attribute(name, value, 0, 900)?,
             "ReceiveMessageWaitTimeSeconds" => {
                 parse_bounded_attribute(name, value, 0, MAX_RECEIVE_WAIT_SECONDS)?

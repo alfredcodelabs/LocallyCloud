@@ -464,12 +464,15 @@ pub async fn subscribe(
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    if protocol == "sqs"
-        && !sqs_target_exists(registry, &endpoint, ctx.region, ctx.account, ctx.request_id).await
-    {
-        return Err(SnsError::InvalidParameter(
-            "SQS endpoint must be an existing queue in the same region and account".into(),
-        ));
+    if protocol == "sqs" {
+        // Subscribe validates the endpoint ARN; queue delivery permissions do not grant
+        // SNS GetQueueAttributes and cannot establish whether the queue exists.
+        let parts: Vec<_> = endpoint.split(':').collect();
+        if parts[3] != ctx.region || parts[4] != ctx.account {
+            return Err(SnsError::InvalidParameter(
+                "SQS subscription endpoints currently require the same region and account".into(),
+            ));
+        }
     }
     if let Some(redrive) = provided.get("RedrivePolicy") {
         let target = redrive_target(redrive)?;

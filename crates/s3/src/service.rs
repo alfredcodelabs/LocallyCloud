@@ -3,8 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -26,13 +24,13 @@ use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use locallycloud_state::StateDb;
-use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::addr::{resolve, Shape};
 use crate::error::S3Error;
 use crate::notifications::{self, DeliveryTarget, EventType};
 use crate::ops::{self, Ctx};
+use crate::persistence::S3Persistence;
 use crate::presign;
 use crate::query::QueryParams;
 use crate::select;
@@ -46,13 +44,14 @@ pub struct S3Handler {
     notification_rx: Mutex<Option<mpsc::Receiver<NotificationJob>>>,
     persistence: Option<S3Persistence>,
     mutation_lock: tokio::sync::Mutex<()>,
+    namespace_gate: tokio::sync::RwLock<()>,
     persisted_in_route: AtomicBool,
     poisoned: AtomicBool,
 }
 
 // A bounded queue wakes the worker. Persistent handlers replay committed outbox rows.
 const NOTIFICATION_QUEUE_CAPACITY: usize = 1024;
-const MAX_PENDING_NOTIFICATIONS: i64 = 100_000;
+pub(super) const MAX_PENDING_NOTIFICATIONS: i64 = 100_000;
 
 struct NotificationJob {
     dispatcher: Arc<InternalDispatcher>,
@@ -62,7 +61,7 @@ struct NotificationJob {
     deliveries: Vec<notifications::DeliveryRequest>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct StoredDelivery {
+pub(super) struct StoredDelivery {
     request_id: String,
     account_id: String,
     region: String,
@@ -277,6 +276,7 @@ impl S3Handler {
             notification_rx: Mutex::new(Some(notification_rx)),
             persistence: None,
             mutation_lock: tokio::sync::Mutex::new(()),
+            namespace_gate: tokio::sync::RwLock::new(()),
             persisted_in_route: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
         }
@@ -346,6 +346,7 @@ impl S3Handler {
         request: &ServiceRequest,
     ) -> Result<usize, S3Error> {
         let _mutation = self.mutation_lock.lock().await;
+        let _namespace = self.namespace_gate.write().await;
         if self.poisoned.load(Ordering::Acquire) {
             return Err(S3Error::InternalError);
         }
@@ -435,7 +436,9 @@ impl S3Handler {
             }
             if count > 0 {
                 *bucket.write().await = updated;
-                if let Err(error) = self.persist(Vec::new()) {
+                if let Err(error) =
+                    self.persist_bucket(&request.account_id, Some(&name), Vec::new())
+                {
                     *bucket.write().await = original;
                     return Err(error);
                 }
@@ -445,16 +448,49 @@ impl S3Handler {
         Ok(migrated)
     }
 
+    fn persist_request(
+        &self,
+        req: &ServiceRequest,
+        notifications: Vec<StoredDelivery>,
+    ) -> Result<(), S3Error> {
+        let host = req.headers.get("host").and_then(|v| v.to_str().ok());
+        if is_s3_control(req, host) {
+            return self.persist_bucket(&control_account(req, host), None, notifications);
+        }
+        match resolve(host, req.uri.path()) {
+            Shape::Bucket(name) | Shape::Object(name, _) => {
+                self.persist_bucket(&req.account_id, Some(&name), notifications)
+            }
+            Shape::Service => Ok(()),
+        }
+    }
+    #[cfg(test)]
     fn persist(&self, notifications: Vec<StoredDelivery>) -> Result<(), S3Error> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
+        let payload = self.store.durable_snapshot(&persistence.blobs)?;
+        persistence
+            .save(&payload, &notifications)
+            .map_err(|_| S3Error::InternalError)
+    }
+    fn persist_bucket(
+        &self,
+        account: &str,
+        bucket: Option<&str>,
+        notifications: Vec<StoredDelivery>,
+    ) -> Result<(), S3Error> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
         // No yield after mutation: cancellation cannot release mutation_lock while a
-        // snapshot commit is still running and let a later request overwrite it.
+        // transaction is still running and let a later request overwrite it.
         let commit = || {
-            let payload = self.store.durable_snapshot(&persistence.blobs)?;
+            let rows = self
+                .store
+                .durable_delta(account, bucket, &persistence.blobs)?;
             persistence
-                .save(&payload, &notifications)
+                .save_delta(&rows, &notifications, self.store.durable_next_id())
                 .map_err(|_| S3Error::InternalError)
         };
         let result = if tokio::runtime::Handle::current().runtime_flavor()
@@ -650,7 +686,7 @@ impl S3Handler {
             .iter()
             .map(|delivery| StoredDelivery::from_request(req, delivery))
             .collect();
-        self.persist(stored)?;
+        self.persist_request(req, stored)?;
         if !deliveries.is_empty() && self.persistence.is_some() {
             self.start_notification_worker();
         }
@@ -1303,10 +1339,59 @@ impl NativeHandler for S3Handler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        // ponytail: one S3 mutation lock; split by bucket if throughput needs it.
-        let _guard = self.mutation_lock.lock().await;
+        let host = request.headers.get("host").and_then(|v| v.to_str().ok());
+        let shape = resolve(host, request.uri.path());
+        let q = QueryParams::parse(request.uri.query());
+        let mutating = matches!(request.method, Method::PUT | Method::POST | Method::DELETE)
+            && !(request.method == Method::POST && q.has("select"));
+        // ponytail: serialize writers through SQLite; independent bucket reads stay concurrent.
+        let _writer = if mutating {
+            Some(self.mutation_lock.lock().await)
+        } else {
+            None
+        };
+        let namespace_change = mutating
+            && (is_s3_control(&request, host)
+                || (matches!(shape, Shape::Bucket(_)) && request.uri.query().is_none()));
+        let _namespace_write = if namespace_change {
+            Some(self.namespace_gate.write().await)
+        } else {
+            None
+        };
+        let _namespace_read = if !namespace_change {
+            Some(self.namespace_gate.read().await)
+        } else {
+            None
+        };
+        let gate = match &shape {
+            Shape::Bucket(name) | Shape::Object(name, _) => {
+                match self.store.get(&request.account_id, name) {
+                    Some(bucket) => Some(bucket.read().await.transaction_gate.clone()),
+                    None => None,
+                }
+            }
+            Shape::Service => None,
+        };
+        let _bucket_write = if mutating {
+            match &gate {
+                Some(gate) => Some(gate.write().await),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let _bucket_read = if !mutating {
+            match &gate {
+                Some(gate) => Some(gate.read().await),
+                None => None,
+            }
+        } else {
+            None
+        };
         let resource = request.uri.path().to_string();
-        self.persisted_in_route.store(false, Ordering::Release);
+        if mutating {
+            self.persisted_in_route.store(false, Ordering::Release);
+        }
         let result = if self.poisoned.load(Ordering::Acquire) {
             Err(S3Error::InternalError)
         } else {
@@ -1314,11 +1399,12 @@ impl NativeHandler for S3Handler {
         };
         let result = match result {
             Ok(response)
-                if matches!(request.method, Method::PUT | Method::POST | Method::DELETE)
+                if mutating
                     && response.status().is_success()
                     && !self.persisted_in_route.load(Ordering::Acquire) =>
             {
-                self.persist(Vec::new()).map(|()| response)
+                self.persist_request(&request, Vec::new())
+                    .map(|()| response)
             }
             other => other,
         };
@@ -1361,176 +1447,6 @@ impl NativeHandler for S3Handler {
     }
 }
 
-#[derive(Clone)]
-struct S3Persistence {
-    state: Arc<StateDb>,
-    blobs: PathBuf,
-}
-
-impl S3Persistence {
-    fn new(state: Arc<StateDb>) -> Result<Self, String> {
-        let blobs = state.path().with_extension("s3-blobs");
-        let new_blobs = !blobs.exists();
-        std::fs::create_dir_all(&blobs).map_err(|error| error.to_string())?;
-        if new_blobs {
-            std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| error.to_string())?;
-        }
-        let metadata = std::fs::symlink_metadata(&blobs).map_err(|error| error.to_string())?;
-        if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err("S3 blob directory must be private and not a symlink".into());
-        }
-        let connection = state.connection().map_err(|error| error.to_string())?;
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS s3_state (id INTEGER PRIMARY KEY CHECK(id = 1), payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS s3_notification_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL)")
-            .map_err(|error| error.to_string())?;
-        Ok(Self { state, blobs })
-    }
-
-    fn load(&self) -> Result<Option<Vec<u8>>, String> {
-        self.state
-            .connection()
-            .map_err(|error| error.to_string())?
-            .query_row("SELECT payload FROM s3_state WHERE id = 1", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(|error| error.to_string())
-    }
-
-    fn remove_orphan_blobs(&self, payload: &[u8]) -> Result<(), String> {
-        fn collect(value: &serde_json::Value, paths: &mut std::collections::HashSet<PathBuf>) {
-            match value {
-                serde_json::Value::Object(map) => {
-                    if let Some(path) = map.get("File").and_then(serde_json::Value::as_str) {
-                        paths.insert(PathBuf::from(path));
-                    }
-                    for child in map.values() {
-                        collect(child, paths);
-                    }
-                }
-                serde_json::Value::Array(items) => {
-                    for item in items {
-                        collect(item, paths);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let snapshot: serde_json::Value =
-            serde_json::from_slice(payload).map_err(|error| error.to_string())?;
-        let mut referenced = std::collections::HashSet::new();
-        collect(&snapshot, &mut referenced);
-        for entry in std::fs::read_dir(&self.blobs).map_err(|error| error.to_string())? {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if !referenced.contains(&path) {
-                std::fs::remove_file(path).map_err(|error| error.to_string())?;
-            }
-        }
-        Ok(())
-    }
-
-    fn save(&self, payload: &[u8], notifications: &[StoredDelivery]) -> Result<(), String> {
-        let mut connection = self.state.connection().map_err(|error| error.to_string())?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        transaction.execute("INSERT INTO s3_state(id, payload) VALUES(1, ?1) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload", params![payload])
-            .map_err(|error| error.to_string())?;
-        let pending: i64 = transaction
-            .query_row("SELECT count(*) FROM s3_notification_outbox", [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| error.to_string())?;
-        if pending.saturating_add(notifications.len() as i64) > MAX_PENDING_NOTIFICATIONS {
-            return Err("S3 notification outbox is full".into());
-        }
-        for notification in notifications {
-            let encoded = serde_json::to_vec(notification).map_err(|error| error.to_string())?;
-            transaction
-                .execute(
-                    "INSERT INTO s3_notification_outbox(payload) VALUES(?1)",
-                    params![encoded],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        transaction.commit().map_err(|error| error.to_string())?;
-        if let Err(error) = self.remove_orphan_blobs(payload) {
-            tracing::warn!(%error, "S3 orphan blob cleanup failed");
-        }
-        Ok(())
-    }
-
-    fn has_capacity(&self, required: i64) -> Result<bool, String> {
-        let pending: i64 = self
-            .state
-            .connection()
-            .map_err(|error| error.to_string())?
-            .query_row("SELECT count(*) FROM s3_notification_outbox", [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| error.to_string())?;
-        Ok(pending.saturating_add(required) <= MAX_PENDING_NOTIFICATIONS)
-    }
-
-    fn has_pending(&self) -> Result<bool, String> {
-        let exists: i64 = self
-            .state
-            .connection()
-            .map_err(|error| error.to_string())?
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM s3_notification_outbox)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(exists != 0)
-    }
-
-    fn max_outbox_id(&self) -> Result<i64, String> {
-        self.state
-            .connection()
-            .map_err(|error| error.to_string())?
-            .query_row(
-                "SELECT coalesce(max(id), 0) FROM s3_notification_outbox",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())
-    }
-
-    fn load_outbox(&self, after: i64, through: i64) -> Result<Vec<(i64, StoredDelivery)>, String> {
-        let connection = self.state.connection().map_err(|error| error.to_string())?;
-        let mut statement = connection
-            .prepare(
-                "SELECT id,payload FROM s3_notification_outbox WHERE id>?1 AND id<=?2 ORDER BY id LIMIT 64",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(params![after, through], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|error| error.to_string())?;
-        let mut pending = Vec::new();
-        for row in rows {
-            let (id, payload) = row.map_err(|error| error.to_string())?;
-            pending.push((
-                id,
-                serde_json::from_slice(&payload).map_err(|error| error.to_string())?,
-            ));
-        }
-        Ok(pending)
-    }
-
-    fn delete_outbox(&self, id: i64) -> Result<(), String> {
-        self.state
-            .connection()
-            .map_err(|error| error.to_string())?
-            .execute("DELETE FROM s3_notification_outbox WHERE id=?1", [id])
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-}
-
 /// Register S3 as a `Native` REST-XML service in the Core registry.
 pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
@@ -1558,6 +1474,7 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -5178,6 +5095,7 @@ mod restart_persistence_tests {
     use super::*;
     use bytes::Bytes;
     use http::HeaderMap;
+    use std::os::unix::fs::PermissionsExt;
 
     fn request(method: Method, path: &str, body: Bytes) -> ServiceRequest {
         let mut headers = HeaderMap::new();
@@ -5191,6 +5109,43 @@ mod restart_persistence_tests {
             account_id: "000000000001".into(),
             request_id: "restart-gate".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn writes_touch_only_changed_objects_and_survive_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
+        let handler = super::tests::test_state_handler(Weak::new(), state.clone()).unwrap();
+        for path in ["/first", "/second", "/first/untouched", "/second/untouched"] {
+            assert!(handler
+                .handle(request(Method::PUT, path, Bytes::from_static(b"old")))
+                .await
+                .status()
+                .is_success());
+        }
+        state.connection().unwrap().execute_batch("CREATE TRIGGER preserve_untouched BEFORE UPDATE ON s3_entries WHEN OLD.kind='object' AND OLD.key='untouched' BEGIN SELECT RAISE(FAIL, 'unrelated object rewritten'); END;").unwrap();
+        assert!(handler
+            .handle(request(
+                Method::PUT,
+                "/first/new",
+                Bytes::from_static(b"new")
+            ))
+            .await
+            .status()
+            .is_success());
+
+        drop(handler);
+        let reopened = super::tests::test_state_handler(Weak::new(), state).unwrap();
+        let response = reopened
+            .handle(request(Method::GET, "/first/new", Bytes::new()))
+            .await;
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"new")
+        );
     }
 
     #[tokio::test]
@@ -5305,12 +5260,14 @@ mod encryption_storage_tests {
             Bytes::from_static(b"old invoice bytes")
         );
         let migrate = request(Method::POST, "/", Bytes::new());
-        let before: Vec<u8> = state
-            .connection()
+        let before = handler
+            .persistence
+            .as_ref()
             .unwrap()
-            .query_row("SELECT payload FROM s3_state", [], |row| row.get(0))
+            .load()
+            .unwrap()
             .unwrap();
-        state.connection().unwrap().execute_batch("CREATE TRIGGER migration_failure BEFORE UPDATE ON s3_state BEGIN SELECT RAISE(FAIL, 'migration interrupted'); END;").unwrap();
+        state.connection().unwrap().execute_batch("CREATE TRIGGER migration_failure BEFORE UPDATE ON s3_entries BEGIN SELECT RAISE(FAIL, 'migration interrupted'); END;").unwrap();
         assert!(handler.migrate_legacy_encryption(&migrate).await.is_err());
         assert_eq!(
             bucket.read().await.objects["invoice"]
@@ -5319,10 +5276,12 @@ mod encryption_storage_tests {
                 .unwrap(),
             Bytes::from_static(b"old invoice bytes")
         );
-        let failed: Vec<u8> = state
-            .connection()
+        let failed = handler
+            .persistence
+            .as_ref()
             .unwrap()
-            .query_row("SELECT payload FROM s3_state", [], |row| row.get(0))
+            .load()
+            .unwrap()
             .unwrap();
         assert_eq!(before, failed);
         state
@@ -5341,10 +5300,12 @@ mod encryption_storage_tests {
             handler.migrate_legacy_encryption(&migrate).await.unwrap(),
             0
         );
-        let payload: Vec<u8> = state
-            .connection()
+        let payload = handler
+            .persistence
+            .as_ref()
             .unwrap()
-            .query_row("SELECT payload FROM s3_state", [], |row| row.get(0))
+            .load()
+            .unwrap()
             .unwrap();
         assert!(!payload
             .windows(17)
@@ -5423,3 +5384,7 @@ mod encryption_storage_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "visibility_tests.rs"]
+mod visibility_tests;

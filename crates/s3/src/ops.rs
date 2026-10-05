@@ -3008,7 +3008,7 @@ pub async fn create_multipart_upload(
         legal_hold,
         encryption: encryption.clone(),
         key_envelope,
-        parts: BTreeMap::new(),
+        parts: crate::dirty::DirtyMap::default(),
         parts_revision: 0,
     };
     guard.uploads.insert(upload_id.clone(), upload);

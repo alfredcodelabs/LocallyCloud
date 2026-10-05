@@ -30,6 +30,81 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
         })
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SourceContext<'a> {
+    pub arn: Option<&'a str>,
+    pub account: Option<&'a str>,
+}
+
+// ARN conditions are case sensitive and support IAM's '*' and '?' wildcards.
+fn arn_like(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.splitn(6, ':').collect::<Vec<_>>();
+    let value = value.splitn(6, ':').collect::<Vec<_>>();
+    pattern.len() == 6
+        && value.len() == 6
+        && pattern
+            .into_iter()
+            .zip(value)
+            .all(|(pattern, value)| component_like(pattern, value))
+}
+
+fn component_like(pattern: &str, value: &str) -> bool {
+    let (pattern, value) = (pattern.as_bytes(), value.as_bytes());
+    let (mut p, mut v, mut star, mut retry) = (0, 0, None, 0);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = v;
+        } else if let Some(last_star) = star {
+            p = last_star + 1;
+            retry += 1;
+            v = retry;
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|byte| *byte == b'*')
+}
+
+fn conditions_match(statement: &Value, source: SourceContext<'_>) -> Option<bool> {
+    let Some(condition) = statement.get("Condition") else {
+        return Some(true);
+    };
+    let operators = condition.as_object()?;
+    if operators.is_empty() {
+        return None;
+    }
+    let mut matches = true;
+    for (operator, raw_conditions) in operators {
+        let conditions = raw_conditions.as_object()?;
+        if conditions.is_empty() {
+            return None;
+        }
+        for (key, expected) in conditions {
+            let candidates = values(Some(expected))?;
+            let (actual, wildcard) = match (operator.as_str(), key.to_ascii_lowercase().as_str()) {
+                ("ArnEquals" | "ArnLike", "aws:sourcearn") => (source.arn, true),
+                ("StringEquals", "aws:sourceaccount") => (source.account, false),
+                _ => return None,
+            };
+            matches &= actual.is_some_and(|actual| {
+                candidates.into_iter().any(|candidate| {
+                    if wildcard {
+                        arn_like(candidate, actual)
+                    } else {
+                        candidate == actual
+                    }
+                })
+            });
+        }
+    }
+    Some(matches)
+}
+
 fn principal_matches(statement: &Value, principal: &str, account: &str) -> Option<bool> {
     let raw = statement.get("Principal")?;
     if raw.as_str() == Some("*") {
@@ -62,6 +137,7 @@ pub(crate) fn evaluate(
     account: &str,
     action: &str,
     resource: &str,
+    source: SourceContext<'_>,
 ) -> Decision {
     // ponytail: parse per request; cache by queue policy revision if profiling shows cost.
     let Ok(policy) = serde_json::from_str::<Value>(raw) else {
@@ -82,7 +158,6 @@ pub(crate) fn evaluate(
         if statement.get("NotAction").is_some()
             || statement.get("NotResource").is_some()
             || statement.get("NotPrincipal").is_some()
-            || statement.get("Condition").is_some()
         {
             return Decision::Deny;
         }
@@ -98,7 +173,11 @@ pub(crate) fn evaluate(
         let Some(principal_matches) = principal_matches(statement, principal, account) else {
             return Decision::Deny;
         };
-        if !principal_matches
+        let Some(conditions_match) = conditions_match(statement, source) else {
+            return Decision::Deny;
+        };
+        if !conditions_match
+            || !principal_matches
             || !actions
                 .into_iter()
                 .any(|item| matches_pattern(item, action))
@@ -136,7 +215,8 @@ mod tests {
                 "s3.amazonaws.com",
                 "000000000000",
                 "sqs:SendMessage",
-                "arn:aws:sqs:us-east-1:000000000000:q"
+                "arn:aws:sqs:us-east-1:000000000000:q",
+                SourceContext::default(),
             ),
             Decision::Allow
         ));
@@ -146,7 +226,8 @@ mod tests {
                 "lambda.amazonaws.com",
                 "000000000000",
                 "sqs:SendMessage",
-                "arn:aws:sqs:us-east-1:000000000000:q"
+                "arn:aws:sqs:us-east-1:000000000000:q",
+                SourceContext::default(),
             ),
             Decision::Unmatched
         ));
@@ -156,9 +237,100 @@ mod tests {
                 "s3.amazonaws.com",
                 "000000000000",
                 "sqs:DeleteMessage",
-                "arn:aws:sqs:us-east-1:000000000000:q"
+                "arn:aws:sqs:us-east-1:000000000000:q",
+                SourceContext::default(),
             ),
             Decision::Deny
         ));
+    }
+    #[test]
+    fn source_conditions_match_case_sensitive_values_and_keep_deny_precedence() {
+        assert!(!arn_like(
+            "arn:aws:sns:*orders-created",
+            "arn:aws:sns:us-east-1:000000000000:orders-created"
+        ));
+        assert!(arn_like(
+            "arn:aws:sns:*:*:orders-*",
+            "arn:aws:sns:us-east-1:000000000000:orders-created"
+        ));
+        let resource = "arn:aws:sqs:us-east-1:000000000000:q";
+        let source = SourceContext {
+            arn: Some("arn:aws:sns:us-east-1:000000000000:orders-created"),
+            account: Some("000000000000"),
+        };
+        let evaluate_policy = |condition: Value, effect: &str, context| {
+            let raw = serde_json::json!({"Statement":[
+                {"Effect":"Allow", "Principal":{"Service":"sns.amazonaws.com"}, "Action":"sqs:SendMessage", "Resource":resource, "Condition":condition},
+                {"Effect":effect, "Principal":"*", "Action":"sqs:SendMessage", "Resource":resource, "Condition":{"StringEquals":{"aws:SourceAccount":"000000000000"}}}
+            ]}).to_string();
+            evaluate(
+                &raw,
+                "sns.amazonaws.com",
+                "000000000000",
+                "sqs:SendMessage",
+                resource,
+                context,
+            )
+        };
+        // Both ARN operators have the same AWS wildcard semantics; arrays are OR,
+        // while separate keys/operators are AND. Missing context never grants.
+        for operator in ["ArnEquals", "ArnLike"] {
+            let condition = serde_json::json!({operator:{"AWS:SourceArn":["wrong", "arn:aws:sns:us-east-1:000000000000:orders-?reated"]}, "StringEquals":{"aws:SourceAccount":["wrong", "000000000000"]}});
+            assert!(matches!(
+                evaluate_policy(condition.clone(), "Deny", source),
+                Decision::Deny
+            ));
+            let raw = serde_json::json!({"Statement":{"Effect":"Allow", "Principal":{"Service":"sns.amazonaws.com"}, "Action":"sqs:SendMessage", "Resource":resource, "Condition":condition}}).to_string();
+            for (context, expected) in [
+                (source, Decision::Allow),
+                (SourceContext::default(), Decision::Unmatched),
+                (
+                    SourceContext {
+                        arn: Some("arn:aws:sns:us-east-1:000000000000:Orders-created"),
+                        ..source
+                    },
+                    Decision::Unmatched,
+                ),
+                (
+                    SourceContext {
+                        account: Some("111111111111"),
+                        ..source
+                    },
+                    Decision::Unmatched,
+                ),
+            ] {
+                assert!(
+                    evaluate(
+                        &raw,
+                        "sns.amazonaws.com",
+                        "000000000000",
+                        "sqs:SendMessage",
+                        resource,
+                        context
+                    ) == expected
+                );
+            }
+            assert!(matches!(
+                evaluate(
+                    &raw,
+                    "sns.amazonaws.com",
+                    "000000000000",
+                    "sqs:ReceiveMessage",
+                    resource,
+                    source
+                ),
+                Decision::Unmatched
+            ));
+        }
+        for condition in [
+            serde_json::json!({"Bool":{"aws:SecureTransport":"true"}}),
+            serde_json::json!({"ArnLike":{"aws:SourceArn":42}}),
+            serde_json::json!({}),
+        ] {
+            assert!(matches!(
+                evaluate_policy(condition, "Allow", source),
+                Decision::Deny
+            ));
+        }
     }
 }

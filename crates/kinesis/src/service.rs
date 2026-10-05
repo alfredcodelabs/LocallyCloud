@@ -1,6 +1,7 @@
+mod control;
 mod persistence;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,7 @@ const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_RECORDS: usize = 10_000;
 const MAX_GET_RECORD_BYTES: usize = 10 * 1024 * 1024;
+#[cfg(test)]
 const RETENTION_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 const DEFAULT_MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
@@ -81,6 +83,8 @@ struct Stream {
     created_at: f64,
     next_sequence: u64,
     shards: Vec<Shard>,
+    retention_hours: i64,
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -116,24 +120,23 @@ struct Store {
 
 impl Store {
     fn trim_expired(&mut self, now: f64) {
-        for shard in self
-            .streams
-            .values_mut()
-            .flat_map(|stream| &mut stream.shards)
-        {
-            let mut trimmed = false;
-            while shard
-                .records
-                .front()
-                .is_some_and(|record| record.arrival_time <= now - RETENTION_SECONDS)
-            {
-                let record = shard.records.pop_front().expect("nonempty front");
-                self.buffered_bytes -= record_charge(&record.data, &record.partition_key);
-                shard.first_position += 1;
-                trimmed = true;
-            }
-            if trimmed {
-                shard.records.shrink_to_fit();
+        for stream in self.streams.values_mut() {
+            let retention_seconds = stream.retention_hours as f64 * 3600.0;
+            for shard in &mut stream.shards {
+                let mut trimmed = false;
+                while shard
+                    .records
+                    .front()
+                    .is_some_and(|record| record.arrival_time <= now - retention_seconds)
+                {
+                    let record = shard.records.pop_front().expect("nonempty front");
+                    self.buffered_bytes -= record_charge(&record.data, &record.partition_key);
+                    shard.first_position += 1;
+                    trimmed = true;
+                }
+                if trimmed {
+                    shard.records.shrink_to_fit();
+                }
             }
         }
     }
@@ -204,6 +207,17 @@ impl KinesisHandler {
         let operation = operation(&request.headers)?;
         let scope = Scope::new(request);
         match operation {
+            "ListStreams"
+            | "DescribeStreamSummary"
+            | "DescribeLimits"
+            | "IncreaseStreamRetentionPeriod"
+            | "DecreaseStreamRetentionPeriod"
+            | "ListTagsForStream"
+            | "AddTagsToStream"
+            | "RemoveTagsFromStream"
+            | "ListTagsForResource"
+            | "TagResource"
+            | "UntagResource" => self.control(operation, &request.body, &scope),
             "CreateStream" => self.create_stream(decode(&request.body)?, &scope),
             "DescribeStream" => self.describe_stream(decode(&request.body)?, &scope),
             "ListShards" => self.list_shards(decode(&request.body)?, &scope),
@@ -226,6 +240,24 @@ impl KinesisHandler {
                 "ShardCount must be between 1 and {MAX_SHARDS} for this local backend"
             )));
         }
+        if request
+            .stream_mode_details
+            .as_ref()
+            .is_some_and(|m| m.stream_mode != "PROVISIONED")
+        {
+            return Err(KinesisError::InvalidArgument(
+                "Only PROVISIONED streams are supported".into(),
+            ));
+        }
+        if request
+            .max_record_size_in_ki_b
+            .is_some_and(|size| size != 1024)
+        {
+            return Err(KinesisError::InvalidArgument(
+                "The maximum record size supported is 1024 KiB".into(),
+            ));
+        }
+        control::validate_tags(&request.tags)?;
         let key = StreamKey::new(scope, &request.stream_name);
         let mut store = self.lock_store()?;
         if store.streams.contains_key(&key) {
@@ -234,11 +266,24 @@ impl KinesisHandler {
                 request.stream_name
             )));
         }
+        let open_shards: usize = store
+            .streams
+            .iter()
+            .filter(|(key, _)| key.scope == *scope)
+            .map(|(_, stream)| stream.shards.len())
+            .sum();
+        if open_shards + request.shard_count as usize > MAX_SHARDS as usize {
+            return Err(KinesisError::LimitExceeded(
+                "The local account shard limit has been reached".into(),
+            ));
+        }
         let stream = Stream {
             generation: Uuid::new_v4().to_string(),
             created_at: now_epoch()?,
             next_sequence: 1,
             shards: (0..request.shard_count).map(|_| Shard::default()).collect(),
+            retention_hours: 24,
+            tags: request.tags,
         };
         if let Some(persistence) = &self.persistence {
             persistence
@@ -251,10 +296,11 @@ impl KinesisHandler {
 
     fn describe_stream(
         &self,
-        request: StreamNameRequest,
+        mut request: StreamNameRequest,
         scope: &Scope,
     ) -> Result<Success, KinesisError> {
-        validate_stream_name(&request.stream_name)?;
+        request.stream_name =
+            control::resolve_name(&request.stream_name, request.stream_arn.as_deref(), scope)?;
         let store = self.lock_store()?;
         let stream = store
             .streams
@@ -267,7 +313,9 @@ impl KinesisHandler {
                 "StreamStatus": "ACTIVE",
                 "Shards": (0..stream.shards.len()).map(|index| shard_value(index, stream.shards.len())).collect::<Vec<_>>(),
                 "HasMoreShards": false,
-                "RetentionPeriodHours": 24,
+                "RetentionPeriodHours": stream.retention_hours,
+                "StreamModeDetails": {"StreamMode": "PROVISIONED"},
+                "EncryptionType": "NONE",
                 "StreamCreationTimestamp": stream.created_at,
                 "EnhancedMonitoring": [{ "ShardLevelMetrics": [] }]
             }
@@ -276,10 +324,11 @@ impl KinesisHandler {
 
     fn list_shards(
         &self,
-        request: StreamNameRequest,
+        mut request: StreamNameRequest,
         scope: &Scope,
     ) -> Result<Success, KinesisError> {
-        validate_stream_name(&request.stream_name)?;
+        request.stream_name =
+            control::resolve_name(&request.stream_name, request.stream_arn.as_deref(), scope)?;
         let store = self.lock_store()?;
         let stream = store
             .streams
@@ -397,37 +446,52 @@ impl KinesisHandler {
             stream_name: request.stream_name,
             generation: stream.generation.clone(),
             shard_id: request.shard_id,
-            position: if request.shard_iterator_type == "TRIM_HORIZON" {
-                shard.first_position
-            } else if request.shard_iterator_type == "LATEST" {
-                shard.first_position + shard.records.len()
-            } else if request.shard_iterator_type == "AT_TIMESTAMP" {
-                let timestamp = request
-                    .timestamp
-                    .filter(|value| value.is_finite() && *value >= 0.0)
-                    .ok_or_else(|| KinesisError::InvalidArgument("Timestamp is required".into()))?;
-                shard.first_position
-                    + shard
+            position: match request.shard_iterator_type.as_str() {
+                "TRIM_HORIZON" => shard.first_position,
+                "LATEST" => shard.first_position + shard.records.len(),
+                "AT_TIMESTAMP" => {
+                    let timestamp = request
+                        .timestamp
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .ok_or_else(|| {
+                            KinesisError::InvalidArgument("Timestamp is required".into())
+                        })?;
+                    shard.first_position
+                        + shard
+                            .records
+                            .iter()
+                            .position(|record| record.arrival_time >= timestamp)
+                            .unwrap_or(shard.records.len())
+                }
+                "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER" => {
+                    let sequence =
+                        request.starting_sequence_number.as_deref().ok_or_else(|| {
+                            KinesisError::InvalidArgument(
+                                "StartingSequenceNumber is required".into(),
+                            )
+                        })?;
+                    shard
                         .records
                         .iter()
-                        .position(|record| record.arrival_time >= timestamp)
-                        .unwrap_or(shard.records.len())
-            } else {
-                let sequence = request.starting_sequence_number.as_deref().ok_or_else(|| {
-                    KinesisError::InvalidArgument("StartingSequenceNumber is required".into())
-                })?;
-                shard
-                    .records
-                    .iter()
-                    .position(|record| record.sequence_number == sequence)
-                    .map(|position| {
-                        shard.first_position
-                            + position
-                            + usize::from(request.shard_iterator_type == "AFTER_SEQUENCE_NUMBER")
-                    })
-                    .ok_or_else(|| {
-                        KinesisError::InvalidArgument("StartingSequenceNumber was not found".into())
-                    })?
+                        .position(|record| record.sequence_number == sequence)
+                        .map(|position| {
+                            shard.first_position
+                                + position
+                                + usize::from(
+                                    request.shard_iterator_type == "AFTER_SEQUENCE_NUMBER",
+                                )
+                        })
+                        .ok_or_else(|| {
+                            KinesisError::InvalidArgument(
+                                "StartingSequenceNumber was not found".into(),
+                            )
+                        })?
+                }
+                _ => {
+                    return Err(KinesisError::Validation(
+                        "Unsupported ShardIteratorType".into(),
+                    ))
+                }
             },
             expires_at: now_epoch_seconds()?.saturating_add(ITERATOR_LIFETIME_SECONDS),
         })?;
@@ -520,10 +584,11 @@ impl KinesisHandler {
 
     fn delete_stream(
         &self,
-        request: StreamNameRequest,
+        mut request: StreamNameRequest,
         scope: &Scope,
     ) -> Result<Success, KinesisError> {
-        validate_stream_name(&request.stream_name)?;
+        request.stream_name =
+            control::resolve_name(&request.stream_name, request.stream_arn.as_deref(), scope)?;
         let mut store = self.lock_store()?;
         let key = StreamKey::new(scope, &request.stream_name);
         if !store.streams.contains_key(&key) {
@@ -548,6 +613,10 @@ impl KinesisHandler {
     }
 
     fn encode_iterator(&self, payload: IteratorPayload) -> Result<String, KinesisError> {
+        self.encode_token(&payload)
+    }
+
+    fn encode_token<T: Serialize>(&self, payload: &T) -> Result<String, KinesisError> {
         let payload = serde_json::to_vec(&payload).map_err(|_| KinesisError::Internal)?;
         let mut mac = HmacSha256::new_from_slice(&self.iterator_secret)
             .map_err(|_| KinesisError::Internal)?;
@@ -561,6 +630,10 @@ impl KinesisHandler {
     }
 
     fn decode_iterator(&self, token: &str) -> Result<IteratorPayload, KinesisError> {
+        self.decode_token(token)
+    }
+
+    fn decode_token<T: DeserializeOwned>(&self, token: &str) -> Result<T, KinesisError> {
         if token.is_empty() || token.len() > MAX_ITERATOR_BYTES {
             return Err(invalid_iterator());
         }
@@ -640,6 +713,8 @@ enum KinesisError {
     ResourceNotFound(String),
     InvalidArgument(String),
     ExpiredIterator(String),
+    ExpiredNextToken,
+    LimitExceeded(String),
     Capacity(String),
     Internal,
 }
@@ -651,13 +726,19 @@ impl From<KinesisError> for AwsError {
             KinesisError::Validation(message) => ("ValidationException", message, 400),
             KinesisError::UnknownOperation => (
                 "UnknownOperationException",
-                "The requested Kinesis operation is not supported by this milestone".into(),
+                "The requested Kinesis operation is not supported".into(),
                 400,
             ),
             KinesisError::ResourceInUse(message) => ("ResourceInUseException", message, 400),
             KinesisError::ResourceNotFound(message) => ("ResourceNotFoundException", message, 400),
             KinesisError::InvalidArgument(message) => ("InvalidArgumentException", message, 400),
             KinesisError::ExpiredIterator(message) => ("ExpiredIteratorException", message, 400),
+            KinesisError::LimitExceeded(message) => ("LimitExceededException", message, 400),
+            KinesisError::ExpiredNextToken => (
+                "ExpiredNextTokenException",
+                "The pagination token has expired".into(),
+                400,
+            ),
             KinesisError::Capacity(message) => {
                 ("ProvisionedThroughputExceededException", message, 400)
             }
@@ -671,17 +752,27 @@ impl From<KinesisError> for AwsError {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct CreateStreamRequest {
     stream_name: String,
     shard_count: i64,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    stream_mode_details: Option<control::StreamModeDetails>,
+    #[serde(rename = "MaxRecordSizeInKiB")]
+    max_record_size_in_ki_b: Option<i64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct StreamNameRequest {
+    #[serde(default)]
     stream_name: String,
+    #[serde(rename = "StreamARN")]
+    stream_arn: Option<String>,
+    #[serde(default, rename = "EnforceConsumerDeletion")]
+    _enforce_consumer_deletion: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -843,26 +934,27 @@ fn now_epoch_seconds() -> Result<i64, KinesisError> {
 mod tests {
     use super::*;
 
-    fn scope() -> Scope {
+    pub(super) fn scope() -> Scope {
         Scope {
             account_id: "000000000000".into(),
             region: "us-east-1".into(),
         }
     }
 
-    fn create(handler: &KinesisHandler) {
+    pub(super) fn create(handler: &KinesisHandler) {
         handler
             .create_stream(
                 CreateStreamRequest {
                     stream_name: "events".into(),
                     shard_count: 1,
+                    ..Default::default()
                 },
                 &scope(),
             )
             .unwrap_or_else(|_| panic!("create stream"));
     }
 
-    fn put(handler: &KinesisHandler, data: &[u8]) -> Result<Success, KinesisError> {
+    pub(super) fn put(handler: &KinesisHandler, data: &[u8]) -> Result<Success, KinesisError> {
         handler.put_record(
             PutRecordRequest {
                 stream_name: "events".into(),
@@ -963,6 +1055,8 @@ mod tests {
             .delete_stream(
                 StreamNameRequest {
                     stream_name: "events".into(),
+                    _enforce_consumer_deletion: None,
+                    stream_arn: None,
                 },
                 &scope(),
             )
@@ -1064,6 +1158,7 @@ mod tests {
                 CreateStreamRequest {
                     stream_name: "events".into(),
                     shard_count: 3,
+                    ..Default::default()
                 },
                 &scope(),
             )
@@ -1096,6 +1191,8 @@ mod tests {
             .describe_stream(
                 StreamNameRequest {
                     stream_name: "events".into(),
+                    _enforce_consumer_deletion: None,
+                    stream_arn: None,
                 },
                 &scope(),
             )

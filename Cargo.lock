@@ -2837,6 +2837,7 @@ dependencies = [
 name = "locallycloud-state"
 version = "0.1.0-beta.1"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.22.1",
  "libc",
  "rusqlite",

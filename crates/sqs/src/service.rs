@@ -154,7 +154,43 @@ impl SqsHandler {
             "anonymous".to_string()
         };
         if let Some(raw) = policy {
-            match policy::evaluate(&raw, &principal, &request.account_id, action, &resource) {
+            // Core removes these headers at external ingress and creates the internal
+            // attestation only for trusted in-process scoped dispatch.
+            let source = if internal && !external && principal == "sns.amazonaws.com" {
+                let arn = request
+                    .headers
+                    .get("x-locallycloud-source-arn")
+                    .and_then(|value| value.to_str().ok());
+                let account = request
+                    .headers
+                    .get("x-locallycloud-source-account")
+                    .and_then(|value| value.to_str().ok());
+                let valid = arn.zip(account).is_some_and(|(arn, source_account)| {
+                    let components = arn.splitn(6, ':').collect::<Vec<_>>();
+                    components.len() == 6
+                        && components[0] == "arn"
+                        && components[2] == "sns"
+                        && components[3] == request.region
+                        && components[4] == source_account
+                        && source_account == request.account_id
+                        && !components[5].is_empty()
+                });
+                if valid {
+                    policy::SourceContext { arn, account }
+                } else {
+                    policy::SourceContext::default()
+                }
+            } else {
+                policy::SourceContext::default()
+            };
+            match policy::evaluate(
+                &raw,
+                &principal,
+                &request.account_id,
+                action,
+                &resource,
+                source,
+            ) {
                 Decision::Deny => return Err(SqsError::AccessDenied),
                 Decision::Unmatched if !external => return Err(SqsError::AccessDenied),
                 _ => {}
@@ -268,48 +304,55 @@ impl SqsHandler {
         body: &Value,
         request: &ServiceRequest,
     ) -> Result<(String, Option<QueueArn>), SqsError> {
-        if op == "ListQueues" {
-            return Ok(("*".into(), None));
-        }
-        let arn = if matches!(op, "CreateQueue" | "GetQueueUrl") {
-            let name = body
-                .get("QueueName")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| SqsError::MissingParameter("QueueName is required".into()))?;
-            let account = if op == "GetQueueUrl" {
-                body.get("QueueOwnerAWSAccountId")
+        let arn = match op {
+            "ListQueues" => return Ok(("*".into(), None)),
+            "CreateQueue" | "GetQueueUrl" => {
+                let name = body
+                    .get("QueueName")
                     .and_then(Value::as_str)
-                    .unwrap_or(&request.account_id)
-            } else {
-                &request.account_id
-            };
-            QueueArn::new(&request.region, account, name)
-        } else if matches!(op, "StartMessageMoveTask" | "ListMessageMoveTasks") {
-            let source = body
-                .get("SourceArn")
-                .and_then(Value::as_str)
-                .ok_or_else(|| SqsError::InvalidParameterValue("SourceArn is required".into()))?;
-            ops::arn_from_str(source).ok_or_else(|| {
-                SqsError::InvalidParameterValue("SourceArn must be an SQS queue ARN".into())
-            })?
-        } else if op == "CancelMessageMoveTask" {
-            let handle = body
-                .get("TaskHandle")
-                .and_then(Value::as_str)
-                .ok_or_else(|| SqsError::InvalidParameterValue("TaskHandle is required".into()))?;
-            let source = self.store.move_task_source_arn(handle).ok_or_else(|| {
-                SqsError::ResourceNotFound("the specified task handle does not exist".into())
-            })?;
-            ops::arn_from_str(&source).ok_or_else(|| {
-                SqsError::InvalidParameterValue("SourceArn must be an SQS queue ARN".into())
-            })?
-        } else {
-            let url = body
-                .get("QueueUrl")
-                .and_then(Value::as_str)
-                .ok_or_else(|| SqsError::MissingParameter("QueueUrl is required".into()))?;
-            QueueArn::from_url(url)?
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| SqsError::MissingParameter("QueueName is required".into()))?;
+                let account = if op == "GetQueueUrl" {
+                    body.get("QueueOwnerAWSAccountId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&request.account_id)
+                } else {
+                    &request.account_id
+                };
+                QueueArn::new(&request.region, account, name)
+            }
+            "StartMessageMoveTask" | "ListMessageMoveTasks" => {
+                let source = body
+                    .get("SourceArn")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        SqsError::InvalidParameterValue("SourceArn is required".into())
+                    })?;
+                ops::arn_from_str(source).ok_or_else(|| {
+                    SqsError::InvalidParameterValue("SourceArn must be an SQS queue ARN".into())
+                })?
+            }
+            "CancelMessageMoveTask" => {
+                let handle = body
+                    .get("TaskHandle")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        SqsError::InvalidParameterValue("TaskHandle is required".into())
+                    })?;
+                let source = self.store.move_task_source_arn(handle).ok_or_else(|| {
+                    SqsError::ResourceNotFound("the specified task handle does not exist".into())
+                })?;
+                ops::arn_from_str(&source).ok_or_else(|| {
+                    SqsError::InvalidParameterValue("SourceArn must be an SQS queue ARN".into())
+                })?
+            }
+            _ => {
+                let url = body
+                    .get("QueueUrl")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| SqsError::MissingParameter("QueueUrl is required".into()))?;
+                QueueArn::from_url(url)?
+            }
         };
         Ok((arn.to_arn(), Some(arn)))
     }
@@ -437,6 +480,109 @@ mod tests {
             account_id: "000000000000".to_string(),
             request_id: "rid".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn source_policy_requires_core_internal_sns_context() {
+        let h = SqsHandler::new();
+        let policy = json!({"Statement":{"Effect":"Allow", "Principal":{"Service":"sns.amazonaws.com"}, "Action":"sqs:SendMessage", "Resource":"arn:aws:sqs:us-east-1:000000000000:source-guard", "Condition":{"ArnEquals":{"aws:SourceArn":"arn:aws:sns:us-east-1:000000000000:orders"}, "StringEquals":{"aws:SourceAccount":"000000000000"}}}}).to_string();
+        let (status, created) = call(
+            &h,
+            "CreateQueue",
+            json!({"QueueName":"source-guard", "Attributes":{"Policy":policy}}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let body = json!({"QueueUrl":created["QueueUrl"], "MessageBody":"order"});
+        let mut req = request("SendMessage", body.clone());
+        for (key, value) in [
+            ("x-locallycloud-caller-principal", "sns.amazonaws.com"),
+            (
+                "x-locallycloud-source-arn",
+                "arn:aws:sns:us-east-1:000000000000:orders",
+            ),
+            ("x-locallycloud-source-account", "000000000000"),
+        ] {
+            req.headers.insert(key, value.parse().unwrap());
+        }
+        // Unverified caller-provided service/source headers cannot grant access.
+        assert!(h
+            .authorize_queue_operation("SendMessage", &body, &req, None)
+            .await
+            .is_err());
+        req.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        assert!(h
+            .authorize_queue_operation("SendMessage", &body, &req, None)
+            .await
+            .is_ok());
+        for (key, value) in [
+            (
+                "x-locallycloud-source-arn",
+                "arn:aws:sns:us-west-2:000000000000:orders",
+            ),
+            (
+                "x-locallycloud-source-arn",
+                "arn:aws:sns:us-east-1:111111111111:orders",
+            ),
+            ("x-locallycloud-source-account", "111111111111"),
+            ("x-locallycloud-caller-principal", "s3.amazonaws.com"),
+            ("x-locallycloud-verified-external-sigv4", "1"),
+        ] {
+            let mut invalid = req.clone();
+            invalid.headers.insert(key, value.parse().unwrap());
+            assert!(
+                h.authorize_queue_operation("SendMessage", &body, &invalid, None)
+                    .await
+                    .is_err(),
+                "{key}: {value}"
+            );
+        }
+        req.headers.remove("x-locallycloud-source-account");
+        assert!(h
+            .authorize_queue_operation("SendMessage", &body, &req, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_queue_size_limit_survives_restart() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-sqs-size-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let registry = Arc::new(ServiceRegistry::new());
+        let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+        let (status, created) = call(
+            &h,
+            "CreateQueue",
+            json!({"QueueName": "legacy-limit", "Attributes": {"MaximumMessageSize": "262144"}}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let url = created["QueueUrl"].as_str().unwrap().to_string();
+        drop(h);
+        let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+        let (_, attrs) = call(
+            &h,
+            "GetQueueAttributes",
+            json!({"QueueUrl": url, "AttributeNames": ["MaximumMessageSize"]}),
+        )
+        .await;
+        assert_eq!(attrs["Attributes"]["MaximumMessageSize"], "262144");
+        for (bytes, expected) in [(262_144, 200), (262_145, 400)] {
+            let (status, _) = call(
+                &h,
+                "SendMessage",
+                json!({"QueueUrl": url, "MessageBody": "a".repeat(bytes)}),
+            )
+            .await;
+            assert_eq!(status, expected);
+        }
+        drop(h);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

@@ -643,3 +643,69 @@ async fn malformed_policy_is_rejected_without_replacing_the_previous_policy() {
     .await;
     assert_eq!(attributes["Attributes"]["Policy"], valid);
 }
+
+#[tokio::test]
+async fn current_message_and_batch_size_limits() {
+    let h = SqsHandler::new();
+    let (_, created) = json_call(&h, "CreateQueue", json!({"QueueName": "size-current"})).await;
+    let url = created["QueueUrl"].as_str().unwrap();
+    let (_, attrs) = json_call(
+        &h,
+        "GetQueueAttributes",
+        json!({"QueueUrl": url, "AttributeNames": ["MaximumMessageSize"]}),
+    )
+    .await;
+    assert_eq!(attrs["Attributes"]["MaximumMessageSize"], "1048576");
+    for (bytes, expected) in [(1_048_576, 200), (1_048_577, 400)] {
+        let (status, _) = json_call(
+            &h,
+            "SendMessage",
+            json!({"QueueUrl": url, "MessageBody": "a".repeat(bytes)}),
+        )
+        .await;
+        assert_eq!(status, expected);
+    }
+    // Query uses the same attribute validation without changing explicitly configured limits.
+    let (status, _) = query_call(&h, &format!("Action=SetQueueAttributes&QueueUrl={url}&Attribute.1.Name=MaximumMessageSize&Attribute.1.Value=1048576")).await;
+    assert_eq!(status, 200);
+    let (status, _) = json_call(
+        &h,
+        "SetQueueAttributes",
+        json!({"QueueUrl": url, "Attributes": {"MaximumMessageSize": "1048577"}}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    json_call(&h, "PurgeQueue", json!({"QueueUrl": url})).await;
+    let (status, response) = json_call(
+        &h,
+        "SendMessageBatch",
+        json!({"QueueUrl": url, "Entries": [
+            {"Id": "a", "MessageBody": "a".repeat(524_288)},
+            {"Id": "b", "MessageBody": "b".repeat(524_288)}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(response["Successful"].as_array().unwrap().len(), 2);
+    let (status, response) = json_call(
+        &h,
+        "SendMessageBatch",
+        json!({"QueueUrl": url, "Entries": [
+            {"Id": "c", "MessageBody": "c".repeat(524_288)},
+            {"Id": "d", "MessageBody": "d".repeat(524_289)}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(response["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("BatchRequestTooLong"));
+    let (_, attrs) = json_call(
+        &h,
+        "GetQueueAttributes",
+        json!({"QueueUrl": url, "AttributeNames": ["ApproximateNumberOfMessages"]}),
+    )
+    .await;
+    assert_eq!(attrs["Attributes"]["ApproximateNumberOfMessages"], "2");
+}

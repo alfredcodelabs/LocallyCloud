@@ -18,6 +18,7 @@ use crate::expression::{ConditionExpression, ProjectionExpression, UpdateExpress
 use crate::store::{
     AttributeDefinition, KeySchemaElement, KeyType, KinesisDestination, Projection, ProjectionType,
     SecondaryIndex, StoredKey, StreamSpecification, TableData, TableDefinition, TableStore,
+    WarmThroughput,
 };
 use crate::value::{
     item_from_json, item_size, item_to_json, number_cmp, AttributeValue, Item, MAX_ITEM_SIZE,
@@ -160,6 +161,11 @@ fn parse_indexes(req: &Value, field: &str, global: bool) -> Result<Vec<Secondary
     let mut out = Vec::new();
     if let Some(arr) = req.get(field).and_then(Value::as_array) {
         for idx in arr {
+            if !global && idx.get("WarmThroughput").is_some() {
+                return Err(DdbError::Validation(
+                    "WarmThroughput applies to tables and GSIs only".into(),
+                ));
+            }
             let name = req_str(idx, "IndexName")?.to_string();
             let key_schema = parse_key_schema(
                 idx.get("KeySchema")
@@ -169,11 +175,22 @@ fn parse_indexes(req: &Value, field: &str, global: bool) -> Result<Vec<Secondary
                 idx.get("Projection")
                     .ok_or_else(|| DdbError::Validation("index Projection required".into()))?,
             )?;
+            let (read_capacity, write_capacity) = throughput_pair(idx.get("ProvisionedThroughput"));
             out.push(SecondaryIndex {
                 name,
                 key_schema,
                 projection,
                 global,
+                read_capacity,
+                write_capacity,
+                warm_throughput: if global {
+                    Some(parse_warm_throughput(
+                        idx.get("WarmThroughput"),
+                        WarmThroughput::baseline(read_capacity, write_capacity),
+                    )?)
+                } else {
+                    None
+                },
             });
         }
     }
@@ -332,6 +349,10 @@ pub async fn create_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
         billing_mode: billing_mode.to_string(),
         read_capacity,
         write_capacity,
+        warm_throughput: Some(parse_warm_throughput(
+            req.get("WarmThroughput"),
+            WarmThroughput::baseline(read_capacity, write_capacity),
+        )?),
         stream_spec,
         creation_date: now_epoch_secs().to_string(),
         status: "ACTIVE".to_string(),
@@ -345,6 +366,56 @@ pub async fn create_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
     let data = TableData::new(def.clone(), tags, None, false);
     ctx.store.create(ctx.account, ctx.region, data)?;
     Ok(json!({ "TableDescription": describe(&def, 0) }))
+}
+
+fn describe_warm(warm: WarmThroughput) -> Value {
+    json!({ "ReadUnitsPerSecond": warm.read, "WriteUnitsPerSecond": warm.write, "Status": "ACTIVE" })
+}
+
+fn parse_warm_throughput(
+    value: Option<&Value>,
+    current: WarmThroughput,
+) -> Result<WarmThroughput, DdbError> {
+    let Some(value) = value else {
+        return Ok(current);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| DdbError::Validation("WarmThroughput must be an object".into()))?;
+    if object.is_empty()
+        || object
+            .keys()
+            .any(|key| key != "ReadUnitsPerSecond" && key != "WriteUnitsPerSecond")
+    {
+        return Err(DdbError::Validation(
+            "WarmThroughput requires read or write units".into(),
+        ));
+    }
+    let parse = |name: &str, existing: u64| -> Result<u64, DdbError> {
+        match object.get(name) {
+            None => Ok(existing),
+            Some(value) => {
+                let units = value
+                    .as_u64()
+                    .filter(|units| *units > 0 && *units <= i64::MAX as u64)
+                    .ok_or_else(|| {
+                        DdbError::Validation(format!(
+                            "WarmThroughput.{name} must be a positive integer"
+                        ))
+                    })?;
+                if units < existing {
+                    return Err(DdbError::Validation(format!(
+                        "WarmThroughput.{name} cannot be decreased"
+                    )));
+                }
+                Ok(units)
+            }
+        }
+    };
+    Ok(WarmThroughput {
+        read: parse("ReadUnitsPerSecond", current.read)?,
+        write: parse("WriteUnitsPerSecond", current.write)?,
+    })
 }
 
 fn parse_stream_spec(value: &Value) -> Result<StreamSpecification, DdbError> {
@@ -406,6 +477,7 @@ fn describe(def: &TableDefinition, item_count: usize) -> Value {
         "TableArn": def.arn,
         "TableId": def.arn,
         "TableStatus": def.status,
+        "WarmThroughput": describe_warm(def.warm_throughput.unwrap_or_else(|| WarmThroughput::baseline(def.read_capacity, def.write_capacity))),
         "KeySchema": key_schema,
         "AttributeDefinitions": attr_defs,
         "CreationDateTime": def.creation_date.parse::<f64>().unwrap_or(0.0),
@@ -472,7 +544,7 @@ fn describe_index(idx: &SecondaryIndex) -> Value {
         ProjectionType::KeysOnly => "KEYS_ONLY",
         ProjectionType::Include => "INCLUDE",
     };
-    json!({
+    let mut out = json!({
         "IndexName": idx.name,
         "KeySchema": key_schema,
         "Projection": {
@@ -481,8 +553,15 @@ fn describe_index(idx: &SecondaryIndex) -> Value {
         },
         "IndexStatus": "ACTIVE",
         "ItemCount": 0,
-        "ProvisionedThroughput": { "ReadCapacityUnits": 0, "WriteCapacityUnits": 0 }
-    })
+        "ProvisionedThroughput": { "ReadCapacityUnits": idx.read_capacity, "WriteCapacityUnits": idx.write_capacity }
+    });
+    if idx.global {
+        out["WarmThroughput"] =
+            describe_warm(idx.warm_throughput.unwrap_or_else(|| {
+                WarmThroughput::baseline(idx.read_capacity, idx.write_capacity)
+            }));
+    }
+    out
 }
 
 pub async fn describe_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
@@ -625,8 +704,15 @@ pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
     if req.get("ReplicaUpdates").is_some() {
         return update_replicas(ctx, req, &table).await;
     }
+    let _topology = ctx.store.replica_topology.lock().await;
     let mut guard = table.write().await;
-    if !guard.def.replicas.is_empty() {
+    let warm_only = req.get("WarmThroughput").is_some()
+        && req.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| key == "TableName" || key == "WarmThroughput")
+        });
+    if !guard.def.replicas.is_empty() && !warm_only {
         return Err(DdbError::Validation(
             "Schema and billing updates on MREC tables are not supported".into(),
         ));
@@ -656,6 +742,19 @@ pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
     if let Some(mode) = req.get("BillingMode").and_then(Value::as_str) {
         match mode {
             "PAY_PER_REQUEST" => {
+                if req.get("ProvisionedThroughput").is_some() {
+                    return Err(DdbError::Validation(
+                        "ProvisionedThroughput cannot be specified with PAY_PER_REQUEST billing"
+                            .into(),
+                    ));
+                }
+                for index in updated.indexes.iter_mut().filter(|index| index.global) {
+                    index.warm_throughput = Some(index.warm_throughput.unwrap_or_else(|| {
+                        WarmThroughput::baseline(index.read_capacity, index.write_capacity)
+                    }));
+                    index.read_capacity = 0;
+                    index.write_capacity = 0;
+                }
                 updated.billing_mode = mode.to_string();
                 updated.read_capacity = 0;
                 updated.write_capacity = 0;
@@ -676,6 +775,11 @@ pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
             other => return Err(DdbError::Validation(format!("invalid BillingMode {other}"))),
         }
     } else if let Some(pt) = req.get("ProvisionedThroughput") {
+        if updated.billing_mode != "PROVISIONED" {
+            return Err(DdbError::Validation(
+                "ProvisionedThroughput requires PROVISIONED billing".into(),
+            ));
+        }
         // Throughput update without a billing-mode change.
         let (r, w) = throughput_pair(Some(pt));
         if r == 0 || w == 0 {
@@ -703,6 +807,34 @@ pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
         }
     }
 
+    if guard.def.billing_mode == "PAY_PER_REQUEST"
+        && updated.billing_mode == "PROVISIONED"
+        && updated
+            .indexes
+            .iter()
+            .any(|index| index.global && (index.read_capacity == 0 || index.write_capacity == 0))
+    {
+        return Err(DdbError::Validation(
+            "ProvisionedThroughput is required for every GSI when switching billing mode".into(),
+        ));
+    }
+
+    let previous = guard.def.warm_throughput.unwrap_or_else(|| {
+        WarmThroughput::baseline(guard.def.read_capacity, guard.def.write_capacity)
+    });
+    updated.warm_throughput = Some(parse_warm_throughput(
+        req.get("WarmThroughput"),
+        previous.raised(updated.read_capacity, updated.write_capacity),
+    )?);
+    if warm_only {
+        for region in &updated.replicas {
+            if region != ctx.region {
+                if let Some(peer) = ctx.store.get(ctx.account, region, name) {
+                    peer.write().await.def.warm_throughput = updated.warm_throughput;
+                }
+            }
+        }
+    }
     guard.def = updated;
     let count = guard.items.len();
     Ok(json!({ "TableDescription": describe(&guard.def, count) }))
@@ -893,11 +1025,26 @@ fn apply_gsi_update(def: &mut TableDefinition, update: &Value) -> Result<(), Ddb
                 .get("Projection")
                 .ok_or_else(|| DdbError::Validation("index Projection required".into()))?,
         )?;
+        let (read, write) = throughput_pair(create.get("ProvisionedThroughput"));
+        if (def.billing_mode == "PROVISIONED" && (read == 0 || write == 0))
+            || (def.billing_mode == "PAY_PER_REQUEST"
+                && create.get("ProvisionedThroughput").is_some())
+        {
+            return Err(DdbError::Validation(
+                "GSI provisioned capacity must match table billing mode".into(),
+            ));
+        }
         def.indexes.push(SecondaryIndex {
             name: index_name,
             key_schema,
             projection,
             global: true,
+            read_capacity: read,
+            write_capacity: write,
+            warm_throughput: Some(parse_warm_throughput(
+                create.get("WarmThroughput"),
+                WarmThroughput::baseline(read, write),
+            )?),
         });
     } else if let Some(upd) = update.get("Update") {
         let index_name = req_str(upd, "IndexName")?;
@@ -906,8 +1053,30 @@ fn apply_gsi_update(def: &mut TableDefinition, update: &Value) -> Result<(), Ddb
                 "index {index_name} does not exist"
             )));
         }
-        // Only throughput is mutable on a GSI; capacities are not surfaced, so this is a no-op
-        // beyond existence validation.
+        let index = def
+            .indexes
+            .iter_mut()
+            .find(|index| index.global && index.name == index_name)
+            .ok_or_else(|| {
+                DdbError::ResourceNotFound(format!("GSI {index_name} does not exist"))
+            })?;
+        let previous = index
+            .warm_throughput
+            .unwrap_or_else(|| WarmThroughput::baseline(index.read_capacity, index.write_capacity));
+        if let Some(pt) = upd.get("ProvisionedThroughput") {
+            let (read, write) = throughput_pair(Some(pt));
+            if def.billing_mode != "PROVISIONED" || read == 0 || write == 0 {
+                return Err(DdbError::Validation(
+                    "GSI throughput requires PROVISIONED billing and positive capacity".into(),
+                ));
+            }
+            index.read_capacity = read;
+            index.write_capacity = write;
+        }
+        index.warm_throughput = Some(parse_warm_throughput(
+            upd.get("WarmThroughput"),
+            previous.raised(index.read_capacity, index.write_capacity),
+        )?);
     } else if let Some(del) = update.get("Delete") {
         let index_name = req_str(del, "IndexName")?;
         if def.index(index_name).is_none() {

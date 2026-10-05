@@ -1,5 +1,8 @@
 //! Shared SQLite connection settings for durable local service state.
 
+mod cipher;
+pub use cipher::{StateCipher, StateCipherError};
+
 use std::fs::{self, OpenOptions, Permissions};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};

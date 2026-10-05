@@ -7,7 +7,7 @@ use std::fmt;
 pub const METRIC_SINK_VERSION: u16 = 1;
 
 /// One fully resolved metric sample.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MetricObservation {
     pub account_id: String,
     pub region: String,
@@ -41,7 +41,7 @@ impl fmt::Debug for MetricObservation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetricOrigin {
     CloudWatchLogs,
     PublicPutMetricData,
@@ -49,7 +49,7 @@ pub enum MetricOrigin {
     AwsService,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MetricUnit {
     Seconds,
     Microseconds,
@@ -147,7 +147,8 @@ impl MetricUnit {
     }
 }
 
-/// Result of a non-blocking submission to a concrete Monitoring receiver.
+/// Receiver outcome. For `emit_durable`, `Accepted` acknowledges a committed batch;
+/// for `try_emit`, it only acknowledges bounded queue acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmitOutcome {
     Accepted,
@@ -157,13 +158,21 @@ pub enum EmitOutcome {
     IncompatibleVersion,
 }
 
-/// Bounded, non-blocking metric receiver capability.
+/// Bounded metric receiver capability.
+#[async_trait::async_trait]
 pub trait MetricSink: Send + Sync {
     fn version(&self) -> u16 {
         METRIC_SINK_VERSION
     }
 
     fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome;
+
+    /// Acknowledge only after the receiver commits every observation to durable state.
+    /// Queue acceptance from `try_emit` does not satisfy this contract. Receivers
+    /// without durable storage deliberately leave an outbox delivery pending.
+    async fn emit_durable(&self, _observations: Vec<MetricObservation>) -> EmitOutcome {
+        EmitOutcome::Unavailable
+    }
 }
 
 #[derive(Debug, Default)]

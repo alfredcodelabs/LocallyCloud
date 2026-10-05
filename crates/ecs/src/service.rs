@@ -154,6 +154,7 @@ impl EcsHandler {
         match target {
             "CreateCluster" => self.create_cluster(decode(&request.body)?, &scope),
             "DescribeClusters" => self.describe_clusters(decode(&request.body)?, &scope),
+            "ListClusters" => self.list_clusters(decode(&request.body)?, &scope),
             "DeleteCluster" => self.delete_cluster(decode(&request.body)?, &scope),
             "RegisterTaskDefinition" => {
                 self.register_task_definition(decode(&request.body)?, &scope)
@@ -837,7 +838,59 @@ impl EcsHandler {
         state.clusters.insert((scope.clone(), name.clone()), true);
         Ok(json!({"cluster": cluster_value(scope, &name, true)}))
     }
+    fn list_clusters(&self, input: ListClusters, scope: &Scope) -> Result<Value, EcsError> {
+        let maximum = input.max_results.unwrap_or(100);
+        if !(1..=100).contains(&maximum) {
+            return Err(EcsError::InvalidParameter(
+                "maxResults must be between 1 and 100".into(),
+            ));
+        }
+        let cursor = match input.next_token {
+            Some(token) => {
+                if !token.starts_with(&scope.cluster_arn("")) {
+                    return Err(EcsError::InvalidParameter("Invalid nextToken".into()));
+                }
+                Some(
+                    cluster_name(scope, &token)
+                        .map_err(|_| EcsError::InvalidParameter("Invalid nextToken".into()))?,
+                )
+            }
+            None => None,
+        };
+        let state = self.state.lock().map_err(|_| EcsError::Internal)?;
+        let mut names = state
+            .clusters
+            .iter()
+            .filter(|((entry_scope, name), active)| {
+                entry_scope == scope
+                    && **active
+                    && cursor.as_ref().is_none_or(|cursor| name > cursor)
+            })
+            .map(|((_, name), _)| name);
+        let page: Vec<_> = names
+            .by_ref()
+            .take(maximum as usize)
+            .map(|name| scope.cluster_arn(name))
+            .collect();
+        let mut response = json!({"clusterArns": page});
+        if names.next().is_some() {
+            response["nextToken"] = json!(page.last().expect("nonempty page before continuation"));
+        }
+        Ok(response)
+    }
     fn describe_clusters(&self, input: DescribeClusters, scope: &Scope) -> Result<Value, EcsError> {
+        if input.include.as_ref().is_some_and(|include| {
+            include.iter().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "TAGS" | "CONFIGURATIONS" | "SETTINGS" | "STATISTICS" | "ATTACHMENTS"
+                )
+            })
+        }) {
+            return Err(EcsError::InvalidParameter(
+                "Invalid cluster include field".into(),
+            ));
+        }
         let requested = input.clusters.unwrap_or_else(|| vec!["default".into()]);
         if requested.len() > 100 {
             return Err(EcsError::Client(
@@ -1183,6 +1236,13 @@ struct CreateCluster {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DescribeClusters {
     clusters: Option<Vec<String>>,
+    include: Option<Vec<String>>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListClusters {
+    max_results: Option<i64>,
+    next_token: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1312,6 +1372,7 @@ struct ListTasks {
 enum EcsError {
     Serialization(String),
     Client(String),
+    InvalidParameter(String),
     ClusterNotFound(String),
     UnknownOperation,
     Internal,
@@ -1323,6 +1384,9 @@ impl From<EcsError> for AwsError {
                 AwsError::new("SerializationException", message, 400)
             }
             EcsError::Client(message) => AwsError::new("ClientException", message, 400),
+            EcsError::InvalidParameter(message) => {
+                AwsError::new("InvalidParameterException", message, 400)
+            }
             EcsError::ClusterNotFound(name) => AwsError::new(
                 "ClusterNotFoundException",
                 format!("Cluster {name} was not found"),
@@ -1518,6 +1582,138 @@ mod tests {
             .ok()
             .unwrap();
         assert_eq!(described["tasks"][0]["lastStatus"], "STOPPED");
+    }
+
+    #[tokio::test]
+    async fn list_clusters_paginates_active_scope_and_describe_accepts_provider_projection() {
+        async fn call(
+            handler: &EcsHandler,
+            op: &str,
+            payload: Value,
+            account: &str,
+            region: &str,
+        ) -> (u16, Value) {
+            let response = handler.handle(request(op, payload, account, region)).await;
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&body).unwrap())
+        }
+        let handler = EcsHandler::new();
+        let account = "111111111111";
+        let region = "us-east-1";
+        for (name, owner, location) in [
+            ("alpha", account, region),
+            ("beta", account, region),
+            ("deleted", account, region),
+            ("foreign", "222222222222", region),
+            ("west", account, "us-west-2"),
+        ] {
+            assert_eq!(
+                call(
+                    &handler,
+                    "CreateCluster",
+                    json!({"clusterName":name}),
+                    owner,
+                    location
+                )
+                .await
+                .0,
+                200
+            );
+        }
+        assert_eq!(
+            call(
+                &handler,
+                "DeleteCluster",
+                json!({"cluster":"deleted"}),
+                account,
+                region
+            )
+            .await
+            .0,
+            200
+        );
+        let (status, first) = call(
+            &handler,
+            "ListClusters",
+            json!({"maxResults":1}),
+            account,
+            region,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            first["clusterArns"],
+            json!(["arn:aws:ecs:us-east-1:111111111111:cluster/alpha"])
+        );
+        let token = first["nextToken"].as_str().unwrap();
+        let (status, second) = call(
+            &handler,
+            "ListClusters",
+            json!({"maxResults":1,"nextToken":token}),
+            account,
+            region,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            second["clusterArns"],
+            json!(["arn:aws:ecs:us-east-1:111111111111:cluster/beta"])
+        );
+        assert!(second.get("nextToken").is_none());
+        for (owner, location) in [("222222222222", region), (account, "us-west-2")] {
+            let (status, error) = call(
+                &handler,
+                "ListClusters",
+                json!({"nextToken":token}),
+                owner,
+                location,
+            )
+            .await;
+            assert_eq!(status, 400);
+            assert!(error["__type"]
+                .as_str()
+                .unwrap()
+                .ends_with("InvalidParameterException"));
+        }
+        for payload in [
+            json!({"maxResults":0}),
+            json!({"maxResults":101}),
+            json!({"nextToken":"invalid"}),
+        ] {
+            assert_eq!(
+                call(&handler, "ListClusters", payload, account, region)
+                    .await
+                    .0,
+                400
+            );
+        }
+        let (_, all) = call(&handler, "ListClusters", json!({}), account, region).await;
+        assert_eq!(all["clusterArns"].as_array().unwrap().len(), 2);
+        let (status, described) = call(
+            &handler,
+            "DescribeClusters",
+            json!({"clusters":["beta"],"include":["TAGS","CONFIGURATIONS","SETTINGS"]}),
+            account,
+            region,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(described["clusters"][0]["status"], "ACTIVE");
+        assert_eq!(
+            call(
+                &handler,
+                "DescribeClusters",
+                json!({"include":["UNKNOWN"]}),
+                account,
+                region
+            )
+            .await
+            .0,
+            400
+        );
     }
 
     #[test]

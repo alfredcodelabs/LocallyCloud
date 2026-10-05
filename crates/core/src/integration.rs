@@ -596,7 +596,6 @@ impl InternalDispatcher {
         let ecr_token_request = decision.service_name.as_str() == "ecr"
             && x_amz_target.as_deref()
                 == Some("AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken");
-        let ecs_verified_request = decision.service_name.as_str() == "ecs";
         let evaluator = registry.authorization_evaluator(&ServiceName::new("iam"));
         let strict_external = scope.is_none()
             && evaluator
@@ -619,7 +618,7 @@ impl InternalDispatcher {
             && (!public_request
                 || claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref()));
         let mut signature_rejected = false;
-        if ecr_token_request || ecs_verified_request || verify_external {
+        if ecr_token_request || verify_external {
             // DynamoDB Streams is routed separately but signed with the dynamodb service name.
             let signing_service = if decision.service_name.as_str() == "streams.dynamodb" {
                 "dynamodb"
@@ -690,6 +689,8 @@ impl InternalDispatcher {
                             native_headers.remove("x-locallycloud-verified-internal-scope");
                             if scope.is_none() {
                                 native_headers.remove(identity::PRINCIPAL_HEADER);
+                                native_headers.remove("x-locallycloud-source-arn");
+                                native_headers.remove("x-locallycloud-source-account");
                             }
                             if scope.is_some() {
                                 native_headers.insert(
@@ -976,8 +977,21 @@ fn unsigned_public_request(
     match service {
         "s3" => *method == Method::OPTIONS,
         "cognito-idp" => {
-            cognito_public_region(uri.path()).is_some()
-                && matches!(*method, Method::GET | Method::HEAD)
+            (cognito_public_region(uri.path()).is_some()
+                && matches!(*method, Method::GET | Method::HEAD))
+                || (*method == Method::POST
+                    && uri.path() == "/"
+                    && uri.query().is_none()
+                    && headers
+                        .get("x-amz-target")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|target| {
+                            matches!(
+                                target,
+                                "AWSCognitoIdentityProviderService.SignUp"
+                                    | "AWSCognitoIdentityProviderService.InitiateAuth"
+                            )
+                        }))
         }
         "execute-api" => {
             !execute_api_management_path(uri.path())
@@ -1124,13 +1138,14 @@ mod tests {
         }
     }
 
-    struct StrictVerifier {
+    struct ModeVerifier {
+        strict: bool,
         accepts_signature: bool,
     }
 
-    impl authorization::AuthorizationEvaluator for StrictVerifier {
+    impl authorization::AuthorizationEvaluator for ModeVerifier {
         fn strict_sigv4_required(&self) -> bool {
-            true
+            self.strict
         }
 
         fn authorize(
@@ -1199,7 +1214,10 @@ mod tests {
             ServiceName::new("iam"),
             ServiceMetadata::new(AwsProtocol::Query, None),
             Arc::new(OkHandler),
-            Arc::new(StrictVerifier { accepts_signature }),
+            Arc::new(ModeVerifier {
+                strict: true,
+                accepts_signature,
+            }),
         );
         registry.register_native(
             ServiceName::new("sqs"),
@@ -1234,6 +1252,10 @@ mod tests {
             }
             async fn handle(&self, request: ServiceRequest) -> Response {
                 assert!(!request.headers.contains_key(identity::PRINCIPAL_HEADER));
+                assert!(!request.headers.contains_key("x-locallycloud-source-arn"));
+                assert!(!request
+                    .headers
+                    .contains_key("x-locallycloud-source-account"));
                 assert!(!request
                     .headers
                     .contains_key("x-locallycloud-verified-internal-scope"));
@@ -1249,6 +1271,14 @@ mod tests {
         let path = "/execute-api/west/dev/orders".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(identity::PRINCIPAL_HEADER, "forged".parse().unwrap());
+        headers.insert(
+            "x-locallycloud-source-arn",
+            "arn:aws:sns:us-east-1:000000000000:forged".parse().unwrap(),
+        );
+        headers.insert(
+            "x-locallycloud-source-account",
+            "000000000000".parse().unwrap(),
+        );
         headers.insert("x-amz-target", "AmazonSQS.ListQueues".parse().unwrap());
         let response = dispatcher
             .dispatch(&Method::GET, &path, &headers, Bytes::new(), "rid")
@@ -1397,6 +1427,10 @@ mod tests {
                 );
             } else {
                 assert!(!request.headers.contains_key(identity::PRINCIPAL_HEADER));
+                assert!(!request.headers.contains_key("x-locallycloud-source-arn"));
+                assert!(!request
+                    .headers
+                    .contains_key("x-locallycloud-source-account"));
             }
             let marker = request
                 .headers
@@ -1418,7 +1452,8 @@ mod tests {
             ServiceName::new("iam"),
             ServiceMetadata::new(AwsProtocol::Query, None),
             Arc::new(OkHandler),
-            Arc::new(StrictVerifier {
+            Arc::new(ModeVerifier {
+                strict: true,
                 accepts_signature: true,
             }),
         );
@@ -1438,6 +1473,14 @@ mod tests {
             "000000000000".into(),
         );
         let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-locallycloud-source-arn",
+            "arn:aws:sns:us-east-1:000000000000:forged".parse().unwrap(),
+        );
+        headers.insert(
+            "x-locallycloud-source-account",
+            "000000000000".parse().unwrap(),
+        );
         headers.insert("x-amz-target", "AmazonSQS.SendMessage".parse().unwrap());
         headers.insert(
             "x-locallycloud-verified-external-sigv4",
@@ -1720,14 +1763,6 @@ mod tests {
             ),
             Arc::new(OkHandler),
         );
-        registry.register_native(
-            ServiceName::new("ecs"),
-            ServiceMetadata::new(
-                AwsProtocol::Json11,
-                Some("AmazonEC2ContainerServiceV20141113"),
-            ),
-            Arc::new(OkHandler),
-        );
         let dispatcher = InternalDispatcher::new(
             registry,
             ProxyConfig {
@@ -1764,29 +1799,71 @@ mod tests {
         assert!(std::str::from_utf8(&body)
             .unwrap()
             .contains("SignatureDoesNotMatch"));
-        headers.insert(
-            "x-amz-target",
-            "AmazonEC2ContainerServiceV20141113.DescribeTaskDefinition"
-                .parse()
-                .unwrap(),
-        );
-        headers.insert("authorization", "AWS4-HMAC-SHA256 Credential=AKIAFORGED/20260101/us-east-1/ecs/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=0000000000000000000000000000000000000000000000000000000000000000".parse().unwrap());
-        let response = dispatcher
-            .dispatch(
-                &Method::POST,
-                &"/".parse().unwrap(),
-                &headers,
-                Bytes::from_static(b"{\"taskDefinition\":\"secret\"}"),
-                "rid-ecs",
-            )
-            .await;
-        assert_eq!(response.status(), 403);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        assert!(std::str::from_utf8(&body)
-            .unwrap()
-            .contains("SignatureDoesNotMatch"));
+    }
+
+    #[tokio::test]
+    async fn ecs_ingress_uses_iam_mode_without_accepting_forged_attestation() {
+        for strict in [false, true] {
+            for accepts_signature in [false, true] {
+                let registry = ServiceRegistry::with_known_services();
+                registry.register_native_with_authorization_evaluator(
+                    ServiceName::new("iam"),
+                    ServiceMetadata::new(AwsProtocol::Query, None),
+                    Arc::new(OkHandler),
+                    Arc::new(ModeVerifier {
+                        strict,
+                        accepts_signature,
+                    }),
+                );
+                registry.register_native(
+                    ServiceName::new("ecs"),
+                    ServiceMetadata::new(
+                        AwsProtocol::Json11,
+                        Some("AmazonEC2ContainerServiceV20141113"),
+                    ),
+                    Arc::new(OkHandler),
+                );
+                let dispatcher = InternalDispatcher::new(
+                    registry,
+                    ProxyConfig {
+                        backend_url: "http://127.0.0.1:1".into(),
+                        upstream_timeout: Duration::from_secs(2),
+                    },
+                    LegacyHealth::new(false),
+                    "us-east-1".into(),
+                    "000000000000".into(),
+                );
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-amz-target",
+                    "AmazonEC2ContainerServiceV20141113.ListClusters"
+                        .parse()
+                        .unwrap(),
+                );
+                headers.insert("authorization", auth("ecs").parse().unwrap());
+                headers.insert(
+                    "x-locallycloud-verified-external-sigv4",
+                    "1".parse().unwrap(),
+                );
+                let response = dispatcher
+                    .dispatch(
+                        &Method::POST,
+                        &"/".parse().unwrap(),
+                        &headers,
+                        Bytes::from_static(b"{}"),
+                        "ecs-mode",
+                    )
+                    .await;
+                assert_eq!(
+                    response.status(),
+                    if strict && !accepts_signature {
+                        403
+                    } else {
+                        200
+                    }
+                );
+            }
+        }
     }
 
     struct PeerCapture;

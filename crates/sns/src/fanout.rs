@@ -233,6 +233,47 @@ async fn dispatch(registry: &ServiceRegistry, service: &str, request: ServiceReq
     }
 }
 
+async fn dispatch_sqs_delivery(
+    registry: &ServiceRegistry,
+    mut request: ServiceRequest,
+    delivery: &Delivery,
+) -> bool {
+    let Some(dispatcher) = registry.internal_dispatcher() else {
+        return false;
+    };
+    let Ok(source_arn) = HeaderValue::from_str(&delivery.topic_arn) else {
+        return false;
+    };
+    let Ok(source_account) = HeaderValue::from_str(&delivery.account) else {
+        return false;
+    };
+    request
+        .headers
+        .insert("x-locallycloud-source-arn", source_arn);
+    request
+        .headers
+        .insert("x-locallycloud-source-account", source_account);
+    let call = locallycloud_core::integration::delivery::CrossServiceCall {
+        source_service: ServiceName::new("sns"),
+        account_id: request.account_id,
+        region: request.region,
+        method: request.method,
+        uri: request.uri,
+        headers: request.headers,
+        body: request.body,
+        identity: locallycloud_core::integration::identity::CallerIdentity::ServicePrincipal {
+            service: "sns".into(),
+        },
+        correlation: locallycloud_core::integration::correlation::CorrelationContext::root(),
+        pattern: None,
+    };
+    locallycloud_core::integration::delivery::DeliveryEngine::new(dispatcher)
+        .deliver_sync(call)
+        .await
+        .status()
+        .is_success()
+}
+
 pub async fn sqs_target_exists(
     registry: &ServiceRegistry,
     queue_arn: &str,
@@ -313,7 +354,7 @@ async fn deliver_to_sqs(registry: &ServiceRegistry, sub: &Subscription, d: &Deli
         &d.account,
         &d.request_id,
     );
-    dispatch(registry, "sqs", request).await
+    dispatch_sqs_delivery(registry, request, d).await
 }
 
 /// Send a plain body to an SQS queue identified by ARN (used for dead-letter delivery).
@@ -337,7 +378,7 @@ async fn send_to_sqs_arn(
         &d.account,
         &d.request_id,
     );
-    dispatch(registry, "sqs", request).await
+    dispatch_sqs_delivery(registry, request, d).await
 }
 
 /// POST the notification (non-raw envelope, or bare body for raw delivery) to an http/https

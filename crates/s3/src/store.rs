@@ -17,10 +17,12 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::RwLock;
 use tokio_util::io::ReaderStream;
 
+use crate::dirty::DirtyMap;
 use crate::encryption::{EncryptedBody, StorageKeys, CHUNK};
 use crate::error::S3Error;
 use crate::integrity::ChecksumAlgorithm;
 use crate::notifications::NotificationConfiguration;
+use crate::persistence::StateRow;
 use locallycloud_core::integration::kms::SensitiveBytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +126,10 @@ pub enum StoredBody {
     Opened(Arc<EncryptedBody>, Arc<SensitiveBytes>),
     Parts(Vec<StoredBody>),
     Range(Box<StoredBody>, usize, usize),
+    DurableFile {
+        path: PathBuf,
+        len: usize,
+    },
     File {
         file: Arc<std::fs::File>,
         len: usize,
@@ -177,7 +183,7 @@ impl StoredBody {
             Self::Encrypted(body) | Self::Opened(body, _) => body.logical_len,
             Self::Parts(parts) => parts.iter().map(Self::len).sum(),
             Self::Range(_, _, len) => *len,
-            Self::File { len, .. } => *len,
+            Self::File { len, .. } | Self::DurableFile { len, .. } => *len,
         }
     }
 
@@ -220,6 +226,7 @@ impl StoredBody {
             Self::Opened(_, _) | Self::Parts(_) | Self::Range(_, _, _) => {
                 self.read_range(0, self.len())
             }
+            Self::DurableFile { .. } => self.read_range(0, self.len()),
             Self::File { file, .. } => {
                 let mut reader = reopen(file).map_err(|_| S3Error::InternalError)?;
                 let mut body = Vec::new();
@@ -232,6 +239,9 @@ impl StoredBody {
     }
 
     pub fn read_range(&self, start: usize, end: usize) -> Result<Bytes, S3Error> {
+        if start > end || end > self.len() {
+            return Err(S3Error::InternalError);
+        }
         match self {
             Self::Inline(body) => Ok(body.slice(start..end)),
             Self::Encrypted(_) => Err(S3Error::InternalError),
@@ -257,6 +267,17 @@ impl StoredBody {
                 }
                 Ok(Bytes::from(output))
             }
+            Self::DurableFile { path, .. } => {
+                let mut reader = std::fs::File::open(path).map_err(|_| S3Error::InternalError)?;
+                reader
+                    .seek(SeekFrom::Start(start as u64))
+                    .map_err(|_| S3Error::InternalError)?;
+                let mut bytes = vec![0; end - start];
+                reader
+                    .read_exact(&mut bytes)
+                    .map_err(|_| S3Error::InternalError)?;
+                Ok(Bytes::from(bytes))
+            }
             Self::File { file, .. } => {
                 let mut reader = reopen(file).map_err(|_| S3Error::InternalError)?;
                 reader
@@ -271,12 +292,48 @@ impl StoredBody {
         }
     }
 
+    /// Acquire readers before response headers while the service holds its bucket gate.
+    /// The returned transient body retains open files through unlink/overwrite and streaming.
+    fn pin_readers(&self) -> Result<Self, S3Error> {
+        Ok(match self {
+            Self::DurableFile { path, len } => Self::File {
+                file: Arc::new(std::fs::File::open(path).map_err(|_| S3Error::InternalError)?),
+                len: *len,
+                path: Some(path.clone()),
+            },
+            Self::Encrypted(body) => {
+                let mut pinned = (**body).clone();
+                pinned.ciphertext = Box::new(body.ciphertext.pin_readers()?);
+                Self::Encrypted(Arc::new(pinned))
+            }
+            Self::Opened(body, key) => {
+                let mut pinned = (**body).clone();
+                pinned.ciphertext = Box::new(body.ciphertext.pin_readers()?);
+                Self::Opened(Arc::new(pinned), key.clone())
+            }
+            Self::Parts(parts) => Self::Parts(
+                parts
+                    .iter()
+                    .map(Self::pin_readers)
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Range(body, offset, len) => {
+                Self::Range(Box::new(body.pin_readers()?), *offset, *len)
+            }
+            _ => self.clone(),
+        })
+    }
+
     pub async fn response_body(&self, start: usize, len: usize) -> Result<Body, S3Error> {
-        match self {
+        if start.checked_add(len).is_none_or(|end| end > self.len()) {
+            return Err(S3Error::InternalError);
+        }
+        let pinned = self.pin_readers()?;
+        match &pinned {
             Self::Inline(body) => Ok(Body::from(body.slice(start..start + len))),
             Self::Encrypted(_) => Err(S3Error::InternalError),
             Self::Opened(_, _) | Self::Parts(_) | Self::Range(_, _, _) => {
-                let body = self.clone();
+                let body = pinned.clone();
                 let end = start + len;
                 // Verify the first chunk before sending success headers, including empty objects.
                 let first_body = body.clone();
@@ -307,6 +364,7 @@ impl StoredBody {
                 );
                 Ok(Body::from_stream(stream))
             }
+            Self::DurableFile { .. } => Err(S3Error::InternalError),
             Self::File { file, .. } => {
                 let reader = reopen(file).map_err(|_| S3Error::InternalError)?;
                 let mut reader = tokio::fs::File::from_std(reader);
@@ -387,13 +445,15 @@ pub struct MultipartUpload {
     pub encryption: ServerSideEncryption,
     #[serde(default)]
     pub key_envelope: Option<StoredBody>,
-    pub parts: BTreeMap<u16, StoredPart>,
+    pub parts: DirtyMap<u16, StoredPart>,
     pub parts_revision: u64,
 }
 
 /// Live bucket state behind a per-bucket lock.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BucketState {
+    #[serde(skip)]
+    pub(crate) transaction_gate: Arc<RwLock<()>>,
     pub name: String,
     pub region: String,
     pub creation_date: OffsetDateTime,
@@ -406,11 +466,11 @@ pub struct BucketState {
     pub public_access_block: Option<PublicAccessBlock>,
     pub encryption: ServerSideEncryption,
     /// Current readable objects. A latest delete marker removes the key from this index.
-    pub objects: BTreeMap<String, StoredObject>,
+    pub objects: DirtyMap<String, StoredObject>,
     /// Version chains, newest first. Unversioned objects use the `null` sentinel.
-    pub versions: BTreeMap<String, Vec<StoredVersion>>,
+    pub versions: DirtyMap<String, Vec<StoredVersion>>,
     pub versioning: VersioningState,
-    pub uploads: BTreeMap<String, MultipartUpload>,
+    pub uploads: DirtyMap<String, MultipartUpload>,
 }
 
 /// Globally named buckets with account-scoped access.
@@ -486,6 +546,7 @@ impl AccountStore {
                 slot.insert((
                     account.to_string(),
                     Arc::new(RwLock::new(BucketState {
+                        transaction_gate: Arc::new(RwLock::new(())),
                         name: name.to_string(),
                         region: region.to_string(),
                         creation_date: OffsetDateTime::now_utc(),
@@ -499,14 +560,14 @@ impl AccountStore {
                         }),
                         public_access_block: None,
                         encryption: ServerSideEncryption::default(),
-                        objects: BTreeMap::new(),
-                        versions: BTreeMap::new(),
+                        objects: DirtyMap::default(),
+                        versions: DirtyMap::default(),
                         versioning: if object_lock_enabled {
                             VersioningState::Enabled
                         } else {
                             VersioningState::NeverEnabled
                         },
-                        uploads: BTreeMap::new(),
+                        uploads: DirtyMap::default(),
                     })),
                 ));
                 Ok(())
@@ -601,6 +662,86 @@ mod tests {
 mod body_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn durable_bodies_retain_no_idle_readers_and_pin_encrypted_composite_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = StorageKeys::ephemeral().unwrap();
+        let context = BTreeMap::new();
+        let (key, wrapped) = keys.generate(&context).unwrap();
+        let key = Arc::new(key);
+        let mut small = Vec::new();
+        for _ in 0..1000 {
+            let encrypted = EncryptedBody::encrypt(
+                &StoredBody::Inline(Bytes::from_static(b"small private object")),
+                &key,
+                wrapped.clone(),
+                None,
+                context.clone(),
+            )
+            .unwrap();
+            let mut stored = StoredBody::Encrypted(Arc::new(encrypted));
+            stored.make_durable(dir.path()).unwrap();
+            let restored: StoredBody =
+                serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+            let StoredBody::Encrypted(encrypted) = &restored else {
+                panic!("encrypted storage envelope required");
+            };
+            assert!(
+                matches!(&*encrypted.ciphertext, StoredBody::Inline(_)),
+                "small durable ciphertext must not keep a file descriptor"
+            );
+            small.push(restored);
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let mut opened = Vec::new();
+        let mut paths = Vec::new();
+        let inputs = [
+            Bytes::from(vec![b'a'; CHUNK * 2 + 17]),
+            Bytes::from(vec![b'b'; CHUNK + 29]),
+        ];
+        for input in &inputs {
+            let encrypted = EncryptedBody::encrypt(
+                &StoredBody::Inline(input.clone()),
+                &key,
+                wrapped.clone(),
+                None,
+                context.clone(),
+            )
+            .unwrap();
+            let mut stored = StoredBody::Encrypted(Arc::new(encrypted));
+            stored.make_durable(dir.path()).unwrap();
+            let restored: StoredBody =
+                serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+            let StoredBody::Encrypted(encrypted) = restored else {
+                panic!("encrypted storage envelope required");
+            };
+            let StoredBody::DurableFile { path, .. } = &*encrypted.ciphertext else {
+                panic!("durable large ciphertext must use a path without retaining an open file");
+            };
+            paths.push(path.clone());
+            opened.push(StoredBody::Opened(encrypted, key.clone()));
+        }
+        assert!(opened[0].read_range(2, 1).is_err());
+        assert!(opened[0].read_range(0, inputs[0].len() + 1).is_err());
+        let composite = StoredBody::Parts(vec![
+            opened[0].clone(),
+            StoredBody::Range(Box::new(opened[1].clone()), 3, inputs[1].len() - 3),
+        ]);
+        let response = composite.response_body(0, composite.len()).await.unwrap();
+        // GC may unlink both blobs as soon as the response headers are returned.
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(opened[0].read_range(CHUNK, CHUNK + 1).is_err());
+        let received = axum::body::to_bytes(response, composite.len())
+            .await
+            .unwrap();
+        let mut expected = inputs[0].to_vec();
+        expected.extend_from_slice(&inputs[1][3..]);
+        assert_eq!(received, Bytes::from(expected));
+        assert_eq!(small.len(), 1000);
+    }
+
     #[test]
     fn multipart_body_spills_without_assembling_in_memory() {
         let parts = [
@@ -667,7 +808,8 @@ impl Serialize for StoredBody {
             Self::Parts(_) | Self::Range(_, _, _) => {
                 return Err(serde::ser::Error::custom("transient S3 composite body"))
             }
-            Self::File {
+            Self::DurableFile { path, .. }
+            | Self::File {
                 path: Some(path), ..
             } => DurableBody::File(path.clone()),
             Self::File { path: None, .. } => {
@@ -699,14 +841,9 @@ impl<'de> Deserialize<'de> for StoredBody {
             DurableBody::Encrypted(body) => Ok(Self::Encrypted(Arc::new(body))),
             DurableBody::Inline(bytes) => Ok(Self::Inline(Bytes::from(bytes))),
             DurableBody::File(path) => {
-                let file = std::fs::File::open(&path).map_err(serde::de::Error::custom)?;
-                let len = usize::try_from(file.metadata().map_err(serde::de::Error::custom)?.len())
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Self::File {
-                    file: Arc::new(file),
-                    len,
-                    path: Some(path),
-                })
+                let metadata = std::fs::metadata(&path).map_err(serde::de::Error::custom)?;
+                let len = usize::try_from(metadata.len()).map_err(serde::de::Error::custom)?;
+                Ok(Self::DurableFile { path, len })
             }
         }
     }
@@ -722,15 +859,27 @@ impl StoredBody {
             Self::Parts(_) | Self::Range(_, _, _) => return Err(S3Error::InternalError),
             _ => {}
         }
-        if matches!(self, Self::File { path: Some(_), .. }) {
-            return Ok(());
+        match self {
+            Self::Inline(_) | Self::DurableFile { .. } => return Ok(()),
+            Self::File {
+                path: Some(path),
+                len,
+                ..
+            } => {
+                *self = Self::DurableFile {
+                    path: path.clone(),
+                    len: *len,
+                };
+                return Ok(());
+            }
+            _ => {}
         }
         let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|_| S3Error::InternalError)?;
         match self {
             Self::Encrypted(_) | Self::Opened(_, _) | Self::Parts(_) | Self::Range(_, _, _) => {
                 unreachable!("handled above")
             }
-            Self::Inline(bytes) => temp.write_all(bytes).map_err(|_| S3Error::InternalError)?,
+            Self::Inline(_) | Self::DurableFile { .. } => unreachable!("already durable"),
             Self::File { file, .. } => {
                 let mut reader = reopen(file).map_err(|_| S3Error::InternalError)?;
                 std::io::copy(&mut reader, &mut temp).map_err(|_| S3Error::InternalError)?;
@@ -743,11 +892,9 @@ impl StoredBody {
         std::fs::File::open(dir)
             .and_then(|file| file.sync_all())
             .map_err(|_| S3Error::InternalError)?;
-        let file = std::fs::File::open(&path).map_err(|_| S3Error::InternalError)?;
-        *self = Self::File {
-            file: Arc::new(file),
+        *self = Self::DurableFile {
             len: self.len(),
-            path: Some(path),
+            path,
         };
         Ok(())
     }
@@ -809,5 +956,164 @@ impl AccountStore {
         }
         self.next_id.store(snapshot.next_id, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+impl BucketState {
+    fn metadata(&self) -> Result<Vec<u8>, S3Error> {
+        #[derive(Serialize)]
+        struct Metadata<'a> {
+            name: &'a String,
+            region: &'a String,
+            creation_date: &'a OffsetDateTime,
+            notification_configuration: &'a NotificationConfiguration,
+            bucket_tags: &'a Option<BTreeMap<String, String>>,
+            cors: &'a Option<Vec<CorsRule>>,
+            policy: &'a Option<String>,
+            website: &'a Option<String>,
+            object_lock: &'a Option<ObjectLockConfiguration>,
+            public_access_block: &'a Option<PublicAccessBlock>,
+            encryption: &'a ServerSideEncryption,
+            versioning: &'a VersioningState,
+        }
+        serde_json::to_vec(&Metadata {
+            name: &self.name,
+            region: &self.region,
+            creation_date: &self.creation_date,
+            notification_configuration: &self.notification_configuration,
+            bucket_tags: &self.bucket_tags,
+            cors: &self.cors,
+            policy: &self.policy,
+            website: &self.website,
+            object_lock: &self.object_lock,
+            public_access_block: &self.public_access_block,
+            encryption: &self.encryption,
+            versioning: &self.versioning,
+        })
+        .map_err(|_| S3Error::InternalError)
+    }
+}
+
+impl MultipartUpload {
+    fn metadata(&self) -> Result<Vec<u8>, S3Error> {
+        #[derive(Serialize)]
+        struct Metadata<'a> {
+            id: &'a String,
+            key: &'a String,
+            initiated: &'a OffsetDateTime,
+            content_type: &'a String,
+            metadata: &'a BTreeMap<String, String>,
+            storage_class: &'a String,
+            tags: &'a BTreeMap<String, String>,
+            retention: &'a Option<ObjectRetention>,
+            legal_hold: &'a bool,
+            encryption: &'a ServerSideEncryption,
+            key_envelope: &'a Option<StoredBody>,
+            parts_revision: &'a u64,
+        }
+        serde_json::to_vec(&Metadata {
+            id: &self.id,
+            key: &self.key,
+            initiated: &self.initiated,
+            content_type: &self.content_type,
+            metadata: &self.metadata,
+            storage_class: &self.storage_class,
+            tags: &self.tags,
+            retention: &self.retention,
+            legal_hold: &self.legal_hold,
+            encryption: &self.encryption,
+            key_envelope: &self.key_envelope,
+            parts_revision: &self.parts_revision,
+        })
+        .map_err(|_| S3Error::InternalError)
+    }
+}
+
+impl AccountStore {
+    pub(crate) fn durable_delta(
+        &self,
+        account: &str,
+        name: Option<&str>,
+        blobs: &Path,
+    ) -> Result<Vec<StateRow>, S3Error> {
+        let mut rows = Vec::new();
+        let row = |kind: &str, key: String, subkey: String, payload: Option<Vec<u8>>| StateRow {
+            account: account.into(),
+            bucket: name.unwrap_or_default().into(),
+            kind: kind.into(),
+            key,
+            subkey,
+            payload,
+        };
+        let Some(name) = name else {
+            let payload = self
+                .account_public_access_blocks
+                .get(account)
+                .map(|v| serde_json::to_vec(v.value()).map_err(|_| S3Error::InternalError))
+                .transpose()?;
+            rows.push(row("account", account.into(), String::new(), payload));
+            return Ok(rows);
+        };
+        let Some(bucket) = self.get(account, name) else {
+            rows.push(row("bucket", String::new(), String::new(), None));
+            return Ok(rows);
+        };
+        let mut guard = bucket.try_write().map_err(|_| S3Error::InternalError)?;
+        rows.push(row(
+            "bucket",
+            String::new(),
+            String::new(),
+            Some(guard.metadata()?),
+        ));
+        for key in guard.objects.take_dirty() {
+            let payload = if let Some(object) = guard.objects.untracked_mut(&key) {
+                object.body.make_durable(blobs)?;
+                Some(serde_json::to_vec(object).map_err(|_| S3Error::InternalError)?)
+            } else {
+                None
+            };
+            rows.push(row("object", key, String::new(), payload));
+        }
+        for key in guard.versions.take_dirty() {
+            let payload = if let Some(chain) = guard.versions.untracked_mut(&key) {
+                for version in chain.iter_mut() {
+                    if let VersionValue::Object(object) = &mut version.value {
+                        object.body.make_durable(blobs)?;
+                    }
+                }
+                Some(serde_json::to_vec(chain).map_err(|_| S3Error::InternalError)?)
+            } else {
+                None
+            };
+            rows.push(row("versions", key, String::new(), payload));
+        }
+        for key in guard.uploads.take_dirty() {
+            if let Some(upload) = guard.uploads.untracked_mut(&key) {
+                if let Some(body) = &mut upload.key_envelope {
+                    body.make_durable(blobs)?;
+                }
+                rows.push(row(
+                    "upload",
+                    key.clone(),
+                    String::new(),
+                    Some(upload.metadata()?),
+                ));
+                for number in upload.parts.take_dirty() {
+                    let payload = if let Some(part) = upload.parts.untracked_mut(&number) {
+                        part.body.make_durable(blobs)?;
+                        Some(serde_json::to_vec(part).map_err(|_| S3Error::InternalError)?)
+                    } else {
+                        None
+                    };
+                    rows.push(row("part", key.clone(), number.to_string(), payload));
+                }
+            } else {
+                rows.push(row("upload", key, String::new(), None));
+            }
+        }
+        Ok(rows)
+    }
+    pub(crate) fn durable_next_id(&self) -> u64 {
+        self.next_id.load(Ordering::Relaxed)
     }
 }

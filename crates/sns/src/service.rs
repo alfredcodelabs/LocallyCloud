@@ -274,12 +274,11 @@ pub fn register_with_state(
 
 fn register_handler(registry: &Arc<ServiceRegistry>, handler: Arc<SnsHandler>) {
     let handler: Arc<dyn NativeHandler> = handler;
-    registry.register_native(
-        ServiceName::new("sns"),
-        // GA protocol is Query; JSON is detected per-request from X-Amz-Target.
-        ServiceMetadata::new(AwsProtocol::Query, None),
-        handler,
-    );
+    // Internal service-principal calls use Query routing without fabricated SigV4 credentials.
+    // Publish operations are unambiguous; identity authorization remains in the dispatcher.
+    let mut metadata = ServiceMetadata::new(AwsProtocol::Query, None);
+    metadata.known_actions = vec!["Publish".into(), "PublishBatch".into()];
+    registry.register_native(ServiceName::new("sns"), metadata, handler);
 }
 
 #[cfg(test)]
@@ -292,8 +291,44 @@ mod tests {
     fn registry() -> Arc<ServiceRegistry> {
         let reg = ServiceRegistry::with_known_services();
         locallycloud_sqs::register(&reg);
+        reg.set_internal_dispatcher(Arc::new(
+            locallycloud_core::integration::InternalDispatcher::new_shared(
+                &reg,
+                locallycloud_core::proxy::ProxyConfig {
+                    backend_url: "http://127.0.0.1:1".into(),
+                    upstream_timeout: std::time::Duration::from_secs(2),
+                },
+                locallycloud_core::proxy::LegacyHealth::new(false),
+                "us-east-1".into(),
+                "000000000000".into(),
+            ),
+        ));
+
         crate::register(&reg);
         reg
+    }
+
+    #[test]
+    fn internal_query_publish_resolves_native_sns_without_signature_hint() {
+        let registry = registry();
+        for action in ["Publish", "PublishBatch"] {
+            let body =
+                format!("Action={action}&TopicArn=arn:aws:sns:us-east-1:000000000000:alerts");
+            let input = locallycloud_core::router::RouteInput {
+                authorization: None,
+                x_amz_credential: None,
+                x_amz_target: None,
+                host: None,
+                path: "/",
+                body: body.as_bytes(),
+            };
+            let decision = locallycloud_core::router::resolve(&registry, &input).unwrap();
+            assert_eq!(decision.service_name, ServiceName::new("sns"));
+            assert_eq!(
+                decision.disposition,
+                locallycloud_core::router::RouteDisposition::HandledNatively
+            );
+        }
     }
 
     fn handler(reg: &Arc<ServiceRegistry>, service: &str) -> Arc<dyn NativeHandler> {
@@ -344,6 +379,63 @@ mod tests {
         let (status, body) = body_of(resp).await;
         assert_eq!(status, 200, "op {op} failed: {body}");
         serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn subscribe_accepts_queue_with_send_only_resource_policy() {
+        let reg = registry();
+        let sns = handler(&reg, "sns");
+        let sqs = handler(&reg, "sqs");
+        let queue = sns_json(
+            &sqs,
+            "CreateQueue",
+            json!({"QueueName":"restricted-subscription"}),
+        )
+        .await;
+        let url = queue["QueueUrl"].as_str().unwrap();
+        let queue_arn = "arn:aws:sqs:us-east-1:000000000000:restricted-subscription";
+        let topic = sns_json(
+            &sns,
+            "CreateTopic",
+            json!({"Name":"restricted-subscription"}),
+        )
+        .await;
+        let topic_arn = topic["TopicArn"].as_str().unwrap();
+        sns_json(&sqs,"SetQueueAttributes",json!({"QueueUrl":url,"Attributes":{"Policy":json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},"Action":"sqs:SendMessage","Resource":queue_arn,"Condition":{"ArnEquals":{"aws:SourceArn":topic_arn},"StringEquals":{"aws:SourceAccount":"000000000000"}}},{"Effect":"Allow","Principal":"*","Action":"sqs:ReceiveMessage","Resource":queue_arn}]}).to_string()}})).await;
+        assert_eq!(
+            sqs.handle(json_req(
+                "AmazonSQS",
+                "GetQueueAttributes",
+                json!({"QueueUrl":url,"AttributeNames":["QueueArn"]})
+            ))
+            .await
+            .status(),
+            http::StatusCode::FORBIDDEN
+        );
+        let response = sns_json(
+            &sns,
+            "Subscribe",
+            json!({"TopicArn":topic_arn,"Protocol":"sqs","Endpoint":queue_arn}),
+        )
+        .await;
+        assert!(response["SubscriptionArn"]
+            .as_str()
+            .unwrap()
+            .starts_with(topic_arn));
+        sns_json(
+            &sns,
+            "Publish",
+            json!({"TopicArn":topic_arn,"Message":"policy-first-delivery"}),
+        )
+        .await;
+        let received = receive_sqs(&sqs, url).await;
+        assert!(received["Messages"][0]["Body"]
+            .as_str()
+            .unwrap()
+            .contains("policy-first-delivery"));
+
+        let foreign=sns.handle(json_req("AmazonSimpleNotificationService","Subscribe",json!({"TopicArn":topic_arn,"Protocol":"sqs","Endpoint":"arn:aws:sqs:us-west-2:000000000000:restricted-subscription"}))).await;
+        assert_eq!(foreign.status(), http::StatusCode::BAD_REQUEST);
     }
 
     async fn receive_sqs(h: &Arc<dyn NativeHandler>, queue_url: &str) -> Value {
@@ -477,6 +569,19 @@ mod tests {
 
         let reg = ServiceRegistry::with_known_services();
         locallycloud_sqs::register(&reg);
+        reg.set_internal_dispatcher(Arc::new(
+            locallycloud_core::integration::InternalDispatcher::new_shared(
+                &reg,
+                locallycloud_core::proxy::ProxyConfig {
+                    backend_url: "http://127.0.0.1:1".into(),
+                    upstream_timeout: std::time::Duration::from_secs(2),
+                },
+                locallycloud_core::proxy::LegacyHealth::new(false),
+                "us-east-1".into(),
+                "000000000000".into(),
+            ),
+        ));
+
         let sqs = handler(&reg, "sqs");
         let queue = sns_json(&sqs, "CreateQueue", json!({ "QueueName": "replay-queue" })).await;
         let queue_url = queue["QueueUrl"].as_str().unwrap();

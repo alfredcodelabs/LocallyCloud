@@ -76,6 +76,19 @@ async fn spawn_blocked_notification_endpoint() -> (
 fn registry() -> Arc<ServiceRegistry> {
     let reg = ServiceRegistry::with_known_services();
     locallycloud_sqs::register(&reg);
+    reg.set_internal_dispatcher(Arc::new(
+        locallycloud_core::integration::InternalDispatcher::new_shared(
+            &reg,
+            locallycloud_core::proxy::ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: std::time::Duration::from_secs(2),
+            },
+            locallycloud_core::proxy::LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        ),
+    ));
+
     locallycloud_sns::register(&reg);
     reg
 }

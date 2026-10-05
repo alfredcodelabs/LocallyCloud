@@ -5,7 +5,7 @@ use locallycloud_state::{StateDb, StateError};
 use rusqlite::{params, OptionalExtension};
 use uuid::Uuid;
 
-use super::{record_charge, Record, Scope, Shard, Store, Stream, StreamKey, RETENTION_SECONDS};
+use super::{record_charge, Record, Scope, Shard, Store, Stream, StreamKey};
 
 pub(super) struct Persistence {
     state: Arc<StateDb>,
@@ -65,6 +65,20 @@ impl Persistence {
         } else if format.as_deref() != Some(b"2") {
             return Err(rusqlite::Error::InvalidQuery.into());
         }
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(kinesis_streams)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<_, _>>()?;
+        let transaction = connection.transaction()?;
+        if !columns.iter().any(|c| c == "retention_hours") {
+            transaction.execute_batch("ALTER TABLE kinesis_streams ADD COLUMN retention_hours INTEGER NOT NULL DEFAULT 24;")?;
+        }
+        if !columns.iter().any(|c| c == "tags") {
+            transaction.execute_batch(
+                "ALTER TABLE kinesis_streams ADD COLUMN tags TEXT NOT NULL DEFAULT '{}';",
+            )?;
+        }
+        transaction.commit()?;
         let mut generated_secret = [0_u8; 32];
         generated_secret[..16].copy_from_slice(Uuid::new_v4().as_bytes());
         generated_secret[16..].copy_from_slice(Uuid::new_v4().as_bytes());
@@ -82,7 +96,7 @@ impl Persistence {
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let mut streams = HashMap::new();
         let mut statement = connection.prepare(
-            "SELECT account, region, name, generation, created_at, next_sequence FROM kinesis_streams",
+            "SELECT account, region, name, generation, created_at, next_sequence, retention_hours, tags FROM kinesis_streams",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -92,6 +106,9 @@ impl Persistence {
                     created_at: row.get(4)?,
                     next_sequence: row.get::<_, i64>(5)? as u64,
                     shards: Vec::new(),
+                    retention_hours: row.get(6)?,
+                    tags: serde_json::from_str(&row.get::<_, String>(7)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                 },
             ))
         })?;
@@ -156,14 +173,16 @@ impl Persistence {
         let mut connection = self.state.connection()?;
         let transaction = connection.transaction()?;
         transaction.execute(
-            "INSERT INTO kinesis_streams VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            "INSERT INTO kinesis_streams (account,region,name,generation,created_at,next_sequence,first_position,retention_hours,tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
             params![
                 key.scope.account_id,
                 key.scope.region,
                 key.name,
                 stream.generation,
                 stream.created_at,
-                stream.next_sequence as i64
+                stream.next_sequence as i64,
+                stream.retention_hours,
+                serde_json::to_string(&stream.tags).map_err(|_| rusqlite::Error::InvalidQuery)?
             ],
         )?;
         for (index, shard) in stream.shards.iter().enumerate() {
@@ -208,8 +227,20 @@ impl Persistence {
         )?;
         transaction.execute("UPDATE kinesis_streams SET next_sequence=?4 WHERE account=?1 AND region=?2 AND name=?3", params![key.scope.account_id, key.scope.region, key.name, stream.next_sequence as i64 + 1])?;
         transaction.execute("UPDATE kinesis_shards SET first_position=?5 WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4", params![key.scope.account_id, key.scope.region, key.name, index as i64, shard.first_position as i64])?;
-        transaction.execute("DELETE FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position<?5 AND arrival_time<=?6", params![key.scope.account_id, key.scope.region, key.name, index as i64, shard.first_position as i64, record.arrival_time - RETENTION_SECONDS])?;
+        transaction.execute("DELETE FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position<?5 AND arrival_time<=?6", params![key.scope.account_id, key.scope.region, key.name, index as i64, shard.first_position as i64, record.arrival_time - stream.retention_hours as f64 * 3600.0])?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn configure(
+        &self,
+        key: &StreamKey,
+        retention: i64,
+        tags: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), StateError> {
+        self.state.connection()?.execute("UPDATE kinesis_streams SET retention_hours=?4, tags=?5 WHERE account=?1 AND region=?2 AND name=?3",
+            params![key.scope.account_id,key.scope.region,key.name,retention,
+            serde_json::to_string(tags).map_err(|_| rusqlite::Error::InvalidQuery)?])?;
         Ok(())
     }
 

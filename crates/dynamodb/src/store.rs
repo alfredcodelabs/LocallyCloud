@@ -58,6 +58,34 @@ pub struct SecondaryIndex {
     pub projection: Projection,
     /// `true` for a GSI, `false` for an LSI.
     pub global: bool,
+    #[serde(default)]
+    pub read_capacity: u64,
+    #[serde(default)]
+    pub write_capacity: u64,
+    #[serde(default)]
+    pub warm_throughput: Option<WarmThroughput>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WarmThroughput {
+    pub read: u64,
+    pub write: u64,
+}
+
+impl WarmThroughput {
+    pub fn baseline(read_capacity: u64, write_capacity: u64) -> Self {
+        Self {
+            read: read_capacity.max(12_000),
+            write: write_capacity.max(4_000),
+        }
+    }
+
+    pub fn raised(self, read_capacity: u64, write_capacity: u64) -> Self {
+        Self {
+            read: self.read.max(read_capacity),
+            write: self.write.max(write_capacity),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +118,8 @@ pub struct TableDefinition {
     pub billing_mode: String, // PROVISIONED | PAY_PER_REQUEST
     pub read_capacity: u64,
     pub write_capacity: u64,
+    #[serde(default)]
+    pub warm_throughput: Option<WarmThroughput>,
     pub stream_spec: Option<StreamSpecification>,
     pub creation_date: String,
     pub status: String,        // ACTIVE
@@ -855,6 +885,7 @@ mod tests {
             billing_mode: "PAY_PER_REQUEST".into(),
             read_capacity: 0,
             write_capacity: 0,
+            warm_throughput: None,
             stream_spec: None,
             creation_date: "now".into(),
             status: "ACTIVE".into(),

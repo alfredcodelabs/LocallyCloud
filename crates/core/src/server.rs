@@ -75,6 +75,11 @@ impl LocallyCloudServer {
 
     /// Bind, serve, and run until an OS termination signal, then shut down gracefully.
     pub async fn run(self) -> Result<(), ServerError> {
+        self.run_with_startup(|| {}).await
+    }
+
+    /// Resume restored producers after the internal dispatcher is available.
+    pub async fn run_with_startup(self, startup: impl FnOnce() + Send) -> Result<(), ServerError> {
         let addr = self.config.listen_addr;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -104,6 +109,7 @@ impl LocallyCloudServer {
             .with_meter(meter.clone()),
         );
         self.registry.set_internal_dispatcher(dispatcher.clone());
+        startup();
         let state = AppState {
             readiness: self.readiness.clone(),
             dispatcher,
@@ -400,8 +406,8 @@ async fn explorer_read_handler(
         return dashboard_error("dashboard reads require the local origin", 403);
     }
     let mut headers = http::HeaderMap::new();
-    let (method, uri, body) =
-        if read.service == "sts" && read.operation.as_deref() == Some("GetCallerIdentity") {
+    let (method, uri, body) = match read.service.as_str() {
+        "sts" if read.operation.as_deref() == Some("GetCallerIdentity") => {
             headers.insert(
                 "content-type",
                 http::HeaderValue::from_static("application/x-www-form-urlencoded"),
@@ -411,7 +417,8 @@ async fn explorer_read_handler(
                 http::Uri::from_static("/"),
                 bytes::Bytes::from_static(b"Action=GetCallerIdentity&Version=2011-06-15"),
             )
-        } else if read.service == "lambda" {
+        }
+        "lambda" => {
             let Some(path) = read.path.as_deref().filter(|path| lambda_read_path(path)) else {
                 return dashboard_error("unsupported Lambda read", 400);
             };
@@ -419,7 +426,8 @@ async fn explorer_read_handler(
                 return dashboard_error("invalid path", 400);
             };
             (http::Method::GET, uri, bytes::Bytes::new())
-        } else if matches!(read.service.as_str(), "sns" | "cloudformation") {
+        }
+        "sns" | "cloudformation" => {
             let body = match query_read(
                 &read.service,
                 read.operation.as_deref().unwrap_or(""),
@@ -437,13 +445,15 @@ async fn explorer_read_handler(
                 http::Uri::from_static("/"),
                 bytes::Bytes::from(body),
             )
-        } else if matches!(read.service.as_str(), "apigateway" | "scheduler" | "pipes") {
+        }
+        "apigateway" | "scheduler" | "pipes" => {
             let uri = match rest_read(&read.service, read.path.as_deref().unwrap_or("")) {
                 Ok(uri) => uri,
                 Err(message) => return dashboard_error(message, 400),
             };
             (http::Method::GET, uri, bytes::Bytes::new())
-        } else {
+        }
+        _ => {
             let Some((target, version)) =
                 read_target(&read.service, read.operation.as_deref().unwrap_or(""))
             else {
@@ -464,7 +474,8 @@ async fn explorer_read_handler(
                 http::Uri::from_static("/"),
                 bytes::Bytes::from(read.body.to_string()),
             )
-        };
+        }
+    };
     headers.insert("host", http::HeaderValue::from_static("localhost"));
     dashboard_read(
         &state,

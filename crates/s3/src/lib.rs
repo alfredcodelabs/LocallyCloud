@@ -5,11 +5,13 @@
 //! query-string sub-resource markers — never an `X-Amz-Target` header.
 
 pub mod addr;
+mod dirty;
 mod encryption;
 pub mod error;
 pub mod integrity;
 pub mod notifications;
 pub mod ops;
+mod persistence;
 pub mod presign;
 pub mod query;
 pub mod select;
