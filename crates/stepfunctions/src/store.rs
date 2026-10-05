@@ -5,7 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[path = "persistence.rs"]
+mod persistence;
+pub use persistence::ExecutionCell;
+pub(crate) use persistence::Persistence;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::Instant;
 
@@ -18,7 +25,7 @@ pub const MAX_OPEN_EXECUTIONS: usize = 1_000_000;
 pub struct QuotaExceeded;
 
 /// A history event recorded during a STANDARD execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEvent {
     pub id: u64,
     pub previous_event_id: Option<u64>,
@@ -28,7 +35,7 @@ pub struct HistoryEvent {
 }
 
 /// An immutable published snapshot of a state machine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateMachineVersion {
     pub arn: String,
     pub version: u64,
@@ -40,7 +47,7 @@ pub struct StateMachineVersion {
 }
 
 /// One weighted destination in a state-machine alias.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasRouting {
     pub state_machine_version_arn: String,
     pub version: u64,
@@ -48,7 +55,7 @@ pub struct AliasRouting {
 }
 
 /// A named alias routing executions to one or two immutable versions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateMachineAlias {
     pub arn: String,
     pub name: String,
@@ -60,7 +67,7 @@ pub struct StateMachineAlias {
 }
 
 /// Lifecycle status of a state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateMachineStatus {
     Active,
     Deleting,
@@ -76,7 +83,7 @@ impl StateMachineStatus {
 }
 
 /// A stored state machine and its published immutable versions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateMachineRecord {
     pub arn: String,
     pub name: String,
@@ -122,7 +129,7 @@ impl StateMachineRecord {
 }
 
 /// Execution status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Running,
     Succeeded,
@@ -147,7 +154,7 @@ impl Status {
 }
 
 /// A stored execution, including the immutable state-machine snapshot used for the run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Execution {
     pub arn: String,
     pub name: String,
@@ -274,20 +281,24 @@ impl ActivityRecord {
 type Key = (String, String, String);
 
 pub enum InsertExecutionResult {
-    Created(Arc<RwLock<Execution>>),
-    Existing(Arc<RwLock<Execution>>),
+    Created(Arc<ExecutionCell>),
+    Existing(Arc<ExecutionCell>),
     LimitExceeded,
+    PersistenceFailed,
 }
 
 #[derive(Clone, Default)]
 pub struct SfnStore {
     machines: Arc<DashMap<Key, Arc<RwLock<StateMachineRecord>>>>,
-    executions: Arc<DashMap<String, Arc<RwLock<Execution>>>>,
+    executions: Arc<DashMap<String, Arc<ExecutionCell>>>,
     activities: Arc<DashMap<Key, Arc<ActivityRecord>>>,
     pending_tasks: Arc<DashMap<String, Arc<PendingTask>>>,
     quota_lock: Arc<Mutex<()>>,
     execution_workers: Arc<DashMap<Key, usize>>,
     workers_changed: Arc<Notify>,
+    pub(crate) persistence: Option<Arc<Persistence>>,
+    pub(crate) persistence_failed: Arc<AtomicBool>,
+    pub(crate) configuration_gate: Arc<RwLock<()>>,
 }
 
 /// Holds machine deletion until its execution and final log delivery have finished.
@@ -438,8 +449,17 @@ impl SfnStore {
         out
     }
 
-    pub fn insert_execution(&self, exec: Execution) -> Arc<RwLock<Execution>> {
-        let handle = Arc::new(RwLock::new(exec.clone()));
+    pub fn insert_execution(&self, exec: Execution) -> Arc<ExecutionCell> {
+        if self.persistence.as_ref().is_some_and(|persistence| {
+            persistence::blocking_commit(|| persistence.save_execution(&exec)).is_err()
+        }) {
+            self.persistence_failed.store(true, Ordering::Release);
+        }
+        let handle = Arc::new(ExecutionCell::new(
+            exec.clone(),
+            self.persistence.clone(),
+            self.persistence_failed.clone(),
+        ));
         self.executions.insert(exec.arn.clone(), handle.clone());
         handle
     }
@@ -450,7 +470,17 @@ impl SfnStore {
         match self.executions.entry(exec.arn.clone()) {
             Entry::Occupied(entry) => InsertExecutionResult::Existing(entry.get().clone()),
             Entry::Vacant(entry) => {
-                let handle = Arc::new(RwLock::new(exec));
+                if self.persistence.as_ref().is_some_and(|persistence| {
+                    persistence::blocking_commit(|| persistence.save_execution(&exec)).is_err()
+                }) {
+                    self.persistence_failed.store(true, Ordering::Release);
+                    return InsertExecutionResult::PersistenceFailed;
+                }
+                let handle = Arc::new(ExecutionCell::new(
+                    exec,
+                    self.persistence.clone(),
+                    self.persistence_failed.clone(),
+                ));
                 entry.insert(handle.clone());
                 InsertExecutionResult::Created(handle)
             }
@@ -486,11 +516,11 @@ impl SfnStore {
         self.insert_execution_exclusive(exec)
     }
 
-    pub fn get_execution(&self, arn: &str) -> Option<Arc<RwLock<Execution>>> {
+    pub fn get_execution(&self, arn: &str) -> Option<Arc<ExecutionCell>> {
         self.executions.get(arn).map(|e| e.clone())
     }
 
-    pub fn list_executions(&self, state_machine_arn: &str) -> Vec<Arc<RwLock<Execution>>> {
+    pub fn list_executions(&self, state_machine_arn: &str) -> Vec<Arc<ExecutionCell>> {
         self.executions
             .iter()
             .filter(|e| {

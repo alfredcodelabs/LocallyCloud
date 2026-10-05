@@ -317,7 +317,7 @@ pub fn list_functions(store: &FunctionStore, region: &str, account: &str) -> OpR
 /// `DeleteFunction` — removes the function, returning HTTP 204.
 pub fn delete_function(store: &FunctionStore, region: &str, account: &str, name: &str) -> OpResult {
     let name = resolve_function_name(name, region)?;
-    if store.delete(account, region, &name) {
+    if store.delete(account, region, &name)? {
         Ok((204, None))
     } else {
         Err(not_found(&name))
@@ -796,7 +796,18 @@ pub fn get_function_concurrency(
     account: &str,
     name: &str,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
+    let reference = name;
+    let name = resolve_function_name(reference, region)?;
+    let referenced_account = if reference.starts_with("arn:") {
+        reference.split(':').nth(4)
+    } else {
+        reference
+            .split_once(":function:")
+            .map(|(account, _)| account)
+    };
+    if referenced_account.is_some_and(|referenced_account| referenced_account != account) {
+        return Err(not_found(reference));
+    }
     match store.get_reserved_concurrency(account, region, &name) {
         Some(Some(value)) => Ok((
             200,

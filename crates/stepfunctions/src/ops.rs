@@ -26,6 +26,27 @@ pub struct Ctx<'a> {
     pub request_id: &'a str,
 }
 
+impl Ctx<'_> {
+    fn execution(&self, arn: &str) -> Result<Arc<crate::store::ExecutionCell>, SfnError> {
+        let prefix = format!("arn:aws:states:{}:{}:execution:", self.region, self.account);
+        if !arn.starts_with(&prefix) {
+            return Err(SfnError::ExecutionDoesNotExist(format!(
+                "{arn} does not exist"
+            )));
+        }
+        self.store
+            .get_execution(arn)
+            .ok_or_else(|| SfnError::ExecutionDoesNotExist(format!("{arn} does not exist")))
+    }
+    fn pending_task(&self, token: &str) -> Result<Arc<crate::store::PendingTask>, SfnError> {
+        let prefix = format!("arn:aws:states:{}:{}:", self.region, self.account);
+        self.store
+            .get_pending_task(token)
+            .filter(|task| task.execution_arn.starts_with(&prefix))
+            .ok_or_else(|| SfnError::TaskDoesNotExist("task token does not exist".into()))
+    }
+}
+
 fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
@@ -463,7 +484,12 @@ pub async fn delete_state_machine(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
         store
             .wait_for_execution_workers(&account, &region, &name)
             .await;
+        let _configuration = store.configuration_gate.write().await;
+        if !store.healthy() {
+            return;
+        }
         store.remove_machine(&account, &region, &name);
+        let _ = store.persist_scope(&account, &region).await;
     });
     Ok(json!({}))
 }
@@ -1264,6 +1290,12 @@ fn interpreter_for(
 }
 
 pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
+    let configuration = ctx.store.configuration_gate.read().await;
+    if !ctx.store.healthy() {
+        return Err(SfnError::Internal(
+            "Step Functions durable state is unavailable".into(),
+        ));
+    }
     let state_machine_arn = req_str(v, "stateMachineArn")?.to_string();
     let target = resolve_execution_target(ctx, &state_machine_arn).await?;
     crate::logging::preflight_configuration(
@@ -1356,6 +1388,11 @@ pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
                     existing.arn
                 )));
             }
+            InsertExecutionResult::PersistenceFailed => {
+                return Err(SfnError::Internal(
+                    "Execution admission could not be committed".into(),
+                ))
+            }
             InsertExecutionResult::LimitExceeded => {
                 return Err(SfnError::ExecutionLimitExceeded(format!(
                     "Open execution quota exceeded for {} in {}",
@@ -1365,9 +1402,15 @@ pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
         }
     } else {
         // EXPRESS execution metadata and history are not durable or queryable in AWS.
-        Arc::new(tokio::sync::RwLock::new(execution))
+        Arc::new(crate::store::ExecutionCell::ephemeral(execution))
     };
 
+    drop(configuration);
+    if !ctx.store.healthy() {
+        return Err(SfnError::Internal(
+            "Execution admission could not be committed".into(),
+        ));
+    }
     let mut interpreter = interpreter_for(
         ctx,
         sm,
@@ -1397,8 +1440,15 @@ pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
 }
 
 pub async fn start_sync_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
+    let configuration = ctx.store.configuration_gate.read().await;
+    if !ctx.store.healthy() {
+        return Err(SfnError::Internal(
+            "Step Functions durable state is unavailable".into(),
+        ));
+    }
     let state_machine_arn = req_str(v, "stateMachineArn")?.to_string();
     let target = resolve_execution_target(ctx, &state_machine_arn).await?;
+    drop(configuration);
     if target.type_ != "EXPRESS" {
         return Err(SfnError::StateMachineTypeNotSupported(
             "StartSyncExecution is not supported for STANDARD workflows".into(),
@@ -1442,7 +1492,7 @@ pub async fn start_sync_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
     );
     let start = now_epoch();
     let start_time = now_iso();
-    let execution = Arc::new(tokio::sync::RwLock::new(Execution {
+    let execution = Arc::new(crate::store::ExecutionCell::ephemeral(Execution {
         arn: execution_arn.clone(),
         name: execution_name.clone(),
         state_machine_arn: state_machine_arn.clone(),
@@ -1507,10 +1557,7 @@ pub async fn start_sync_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
 
 pub async fn describe_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
     let arn = req_str(v, "executionArn")?;
-    let handle = ctx
-        .store
-        .get_execution(arn)
-        .ok_or_else(|| SfnError::ExecutionDoesNotExist(format!("{arn} does not exist")))?;
+    let handle = ctx.execution(arn)?;
     let e = handle.read().await;
     let mut out = json!({
         "executionArn": e.arn,
@@ -1541,10 +1588,7 @@ pub async fn describe_state_machine_for_execution(
     v: &Value,
 ) -> Result<Value, SfnError> {
     let arn = req_str(v, "executionArn")?;
-    let handle = ctx
-        .store
-        .get_execution(arn)
-        .ok_or_else(|| SfnError::ExecutionDoesNotExist(format!("{arn} does not exist")))?;
+    let handle = ctx.execution(arn)?;
     let execution = handle.read().await;
     let mut response = json!({
         "stateMachineArn": execution.state_machine_arn,
@@ -1567,10 +1611,7 @@ pub async fn describe_state_machine_for_execution(
 
 pub async fn stop_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
     let arn = req_str(v, "executionArn")?;
-    let handle = ctx
-        .store
-        .get_execution(arn)
-        .ok_or_else(|| SfnError::ExecutionDoesNotExist(format!("{arn} does not exist")))?;
+    let handle = ctx.execution(arn)?;
     let (stop_date, cancelled) = {
         let mut execution = handle.write().await;
         let cancelled = execution.status == Status::Running;
@@ -1667,10 +1708,7 @@ pub async fn list_executions(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
 
 pub async fn get_execution_history(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
     let arn = req_str(v, "executionArn")?;
-    let handle = ctx
-        .store
-        .get_execution(arn)
-        .ok_or_else(|| SfnError::ExecutionDoesNotExist(format!("{arn} does not exist")))?;
+    let handle = ctx.execution(arn)?;
     let execution = handle.read().await;
     if execution.state_machine_type != "STANDARD" {
         return Err(SfnError::Validation(
@@ -1754,11 +1792,14 @@ fn history_details_key(event_type: &str) -> String {
 }
 
 pub async fn redrive_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
+    let configuration = ctx.store.configuration_gate.read().await;
+    if !ctx.store.healthy() {
+        return Err(SfnError::Internal(
+            "Step Functions durable state is unavailable".into(),
+        ));
+    }
     let arn = req_str(v, "executionArn")?;
-    let handle = ctx
-        .store
-        .get_execution(arn)
-        .ok_or_else(|| SfnError::ExecutionDoesNotExist(format!("{arn} does not exist")))?;
+    let handle = ctx.execution(arn)?;
     let machine_name = handle
         .read()
         .await
@@ -1795,6 +1836,9 @@ pub async fn redrive_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
             return Err(SfnError::ExecutionNotRedrivable(format!(
                 "Execution {arn} is not eligible for redrive"
             )));
+        }
+        if execution.error.as_deref() == Some("LocallyCloud.ExecutionInterrupted") {
+            return Err(SfnError::ExecutionNotRedrivable("Interrupted executions cannot be redriven because external task effects may already have completed".into()));
         }
         let state = execution.current_state.clone().ok_or_else(|| {
             SfnError::ExecutionNotRedrivable(format!(
@@ -1836,6 +1880,12 @@ pub async fn redrive_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
             execution.start_time.clone(),
         )
     };
+    drop(configuration);
+    if !ctx.store.healthy() {
+        return Err(SfnError::Internal(
+            "Execution redrive could not be committed".into(),
+        ));
+    }
     let state_machine = Arc::new(StateMachine::parse(&definition)?);
     let mut interpreter = interpreter_for(
         ctx,
@@ -1980,10 +2030,7 @@ pub async fn send_task_success(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
     }
     let output: Value = serde_json::from_str(output_text)
         .map_err(|_| SfnError::Validation("output is not valid JSON".into()))?;
-    let task = ctx
-        .store
-        .get_pending_task(token)
-        .ok_or_else(|| SfnError::TaskDoesNotExist("task token does not exist".into()))?;
+    let task = ctx.pending_task(token)?;
     let mut outcome = task.outcome.lock().await;
     if ctx.store.get_pending_task(token).is_none() || outcome.is_some() {
         return Err(SfnError::TaskDoesNotExist(
@@ -2009,10 +2056,7 @@ pub async fn send_task_success(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
 
 pub async fn send_task_failure(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
     let token = req_str(v, "taskToken")?;
-    let task = ctx
-        .store
-        .get_pending_task(token)
-        .ok_or_else(|| SfnError::TaskDoesNotExist("task token does not exist".into()))?;
+    let task = ctx.pending_task(token)?;
     let mut outcome = task.outcome.lock().await;
     if ctx.store.get_pending_task(token).is_none() || outcome.is_some() {
         return Err(SfnError::TaskDoesNotExist(
@@ -2043,10 +2087,7 @@ pub async fn send_task_failure(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
 
 pub async fn send_task_heartbeat(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
     let token = req_str(v, "taskToken")?;
-    let task = ctx
-        .store
-        .get_pending_task(token)
-        .ok_or_else(|| SfnError::TaskDoesNotExist("task token does not exist".into()))?;
+    let task = ctx.pending_task(token)?;
     let mut outcome = task.outcome.lock().await;
     if ctx.store.get_pending_task(token).is_none() || outcome.is_some() {
         return Err(SfnError::TaskDoesNotExist(

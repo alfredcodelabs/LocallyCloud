@@ -15,7 +15,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+
 use uuid::Uuid;
 
 use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
@@ -30,7 +30,7 @@ use crate::error::{AslError, SfnError};
 use crate::jsonata;
 use crate::logging;
 use crate::path;
-use crate::store::{Execution, PendingTask, SfnStore, TaskOutcome};
+use crate::store::{PendingTask, SfnStore, TaskOutcome};
 
 /// Maximum state transitions before aborting (loop guard).
 const MAX_TRANSITIONS: u32 = 100_000;
@@ -104,7 +104,7 @@ impl Interpreter {
     /// Run a new execution to completion.
     async fn check_machine_deletion(
         &self,
-        execution: Option<&Arc<RwLock<Execution>>>,
+        execution: Option<&Arc<crate::store::ExecutionCell>>,
     ) -> Result<(), AslError> {
         if self.test_state_mode || self.execution_type != "STANDARD" {
             return Ok(());
@@ -139,7 +139,7 @@ impl Interpreter {
         ))
     }
 
-    pub async fn run(&self, exec: Arc<RwLock<Execution>>) -> Result<(), SfnError> {
+    pub async fn run(&self, exec: Arc<crate::store::ExecutionCell>) -> Result<(), SfnError> {
         let input = exec.read().await.input.clone();
         if self.record_history {
             let mut execution = exec.write().await;
@@ -149,17 +149,27 @@ impl Interpreter {
             execution.record("ExecutionStarted", json!({ "input": input }));
         }
         self.run_from(exec.clone(), None, input).await;
+        if !self.store.healthy() {
+            return Err(SfnError::Internal(
+                "Step Functions execution journal is unavailable".into(),
+            ));
+        }
         logging::deliver_execution(&self.registry, &self.region, &self.account, &exec).await
     }
 
     /// Resume a redriven execution at the unsuccessful state without replaying completed states.
     pub async fn redrive(
         &self,
-        exec: Arc<RwLock<Execution>>,
+        exec: Arc<crate::store::ExecutionCell>,
         state: String,
         input: Value,
     ) -> Result<(), SfnError> {
         self.run_from(exec.clone(), Some(state), input).await;
+        if !self.store.healthy() {
+            return Err(SfnError::Internal(
+                "Step Functions execution journal is unavailable".into(),
+            ));
+        }
         logging::deliver_execution(&self.registry, &self.region, &self.account, &exec).await
     }
 
@@ -222,7 +232,7 @@ impl Interpreter {
 
     async fn run_from(
         &self,
-        exec: Arc<RwLock<Execution>>,
+        exec: Arc<crate::store::ExecutionCell>,
         start_state: Option<String>,
         input: Value,
     ) {
@@ -320,8 +330,8 @@ impl Interpreter {
         &'a self,
         sm: &'a StateMachine,
         input: Value,
-        cursor: Option<&'a Arc<RwLock<Execution>>>,
-        events: Option<&'a Arc<RwLock<Execution>>>,
+        cursor: Option<&'a Arc<crate::store::ExecutionCell>>,
+        events: Option<&'a Arc<crate::store::ExecutionCell>>,
         start_state: Option<&'a str>,
         initial_variables: BTreeMap<String, Value>,
         mut previous_event_id: Option<u64>,
@@ -332,6 +342,11 @@ impl Interpreter {
             let mut variables = initial_variables;
             let mut transitions = 0u32;
             loop {
+                if !self.store.healthy() {
+                    return Err(AslError::task_failed(
+                        "Step Functions durable state is unavailable",
+                    ));
+                }
                 self.check_machine_deletion(events.or(cursor)).await?;
                 if let Some(execution) = events.or(cursor) {
                     if execution.read().await.status != crate::store::Status::Running {
@@ -387,6 +402,11 @@ impl Interpreter {
                     Ok(result) => result,
                     Err(error) => return Err(error),
                 };
+                if !self.store.healthy() {
+                    return Err(AslError::task_failed(
+                        "Step Functions durable state is unavailable",
+                    ));
+                }
                 self.check_machine_deletion(events.or(cursor)).await?;
                 validate_state_payload_size(&output)?;
                 variables = updated_variables;
@@ -426,10 +446,15 @@ impl Interpreter {
         state: &Value,
         input: Value,
         variables: &BTreeMap<String, Value>,
-        history: Option<&Arc<RwLock<Execution>>>,
+        history: Option<&Arc<crate::store::ExecutionCell>>,
         history_parent_id: Option<u64>,
         mut inspection: Option<&mut StateInspection>,
     ) -> Result<(Value, Transition, BTreeMap<String, Value>, Option<u64>), AslError> {
+        if !self.store.healthy() {
+            return Err(AslError::task_failed(
+                "Step Functions durable state is unavailable",
+            ));
+        }
         if let Some(data) = inspection.as_deref_mut() {
             data.input = Some(input.clone());
         }
@@ -966,7 +991,7 @@ impl Interpreter {
         jsonata: bool,
         variables: &BTreeMap<String, Value>,
         attempt: Attempt,
-        history: Option<&Arc<RwLock<Execution>>>,
+        history: Option<&Arc<crate::store::ExecutionCell>>,
         history_parent_id: Option<u64>,
         mut inspection: Option<&mut StateInspection>,
     ) -> Result<(Value, Transition, BTreeMap<String, Value>, Option<u64>), AslError> {
@@ -1288,7 +1313,7 @@ impl Interpreter {
         context: &Value,
         variables: &BTreeMap<String, Value>,
         jsonata: bool,
-        history: Option<&Arc<RwLock<Execution>>>,
+        history: Option<&Arc<crate::store::ExecutionCell>>,
         history_parent_id: Option<u64>,
     ) -> Result<Value, AslError> {
         if let Some(mock) = self.test_mock.as_ref().filter(|_| {
@@ -1536,7 +1561,7 @@ impl Interpreter {
         context: &Value,
         variables: &BTreeMap<String, Value>,
         jsonata: bool,
-        history: Option<&Arc<RwLock<Execution>>>,
+        history: Option<&Arc<crate::store::ExecutionCell>>,
         history_parent_id: Option<u64>,
     ) -> Result<Value, AslError> {
         let distributed = state
@@ -1783,7 +1808,7 @@ impl Interpreter {
         sub: Arc<StateMachine>,
         input: Value,
         variables: BTreeMap<String, Value>,
-        history: Option<Arc<RwLock<Execution>>>,
+        history: Option<Arc<crate::store::ExecutionCell>>,
         history_parent_id: Option<u64>,
     ) -> (usize, Result<Value, AslError>) {
         let started = if self.record_history {
@@ -2120,26 +2145,29 @@ impl Interpreter {
             if let Some(sdk) = rest.strip_prefix("aws-sdk:") {
                 return self.dispatch_aws_sdk(sdk, payload, pattern).await;
             }
-            if rest == "athena:startQueryExecution" {
-                if !matches!(pattern, IntegrationPattern::Sync) {
-                    return Err(AslError::runtime(
-                        "Athena startQueryExecution requires .sync",
-                    ));
+            return match rest {
+                "athena:startQueryExecution" => {
+                    if !matches!(pattern, IntegrationPattern::Sync) {
+                        return Err(AslError::runtime(
+                            "Athena startQueryExecution requires .sync",
+                        ));
+                    }
+                    self.dispatch_athena_sync(payload).await
                 }
-                return self.dispatch_athena_sync(payload).await;
-            }
-            if rest == "states:startExecution" {
-                return self
-                    .dispatch_nested_execution(payload, pattern, false)
-                    .await;
-            }
-            if !matches!(pattern, IntegrationPattern::RequestResponse) {
-                return Err(AslError::runtime(format!(
-                    "integration pattern {} is not supported for {rest}",
-                    pattern.label()
-                )));
-            }
-            return self.dispatch_optimized(rest, payload).await;
+                "states:startExecution" => {
+                    self.dispatch_nested_execution(payload, pattern, false)
+                        .await
+                }
+                _ => {
+                    if !matches!(pattern, IntegrationPattern::RequestResponse) {
+                        return Err(AslError::runtime(format!(
+                            "integration pattern {} is not supported for {rest}",
+                            pattern.label()
+                        )));
+                    }
+                    self.dispatch_optimized(rest, payload).await
+                }
+            };
         }
         if base.starts_with("arn:aws:lambda:") && base.contains(":function:") {
             if !matches!(pattern, IntegrationPattern::RequestResponse) {
@@ -2323,43 +2351,48 @@ impl Interpreter {
         let (service, action) = target
             .split_once(':')
             .ok_or_else(|| AslError::runtime(format!("invalid AWS SDK integration {target}")))?;
-        if service == "sfn" {
-            return match action {
-                "startExecution" => self.dispatch_nested_execution(payload, pattern, true).await,
-                "startSyncExecution" if matches!(pattern, IntegrationPattern::RequestResponse) => {
-                    let request = nested_request(payload);
-                    match self
-                        .dispatch_json("states", "AWSStepFunctions.StartSyncExecution", &request)
-                        .await
-                    {
-                        Ok(response) => Ok(pascalize_top_level(response)),
-                        Err(error) if error.error.ends_with("StateMachineTypeNotSupported") => {
-                            self.dispatch_nested_execution(payload, IntegrationPattern::Sync, true)
-                                .await
-                        }
-                        Err(error) => Err(error),
+        match (service, action) {
+            ("sfn", "startExecution") => {
+                return self.dispatch_nested_execution(payload, pattern, true).await;
+            }
+            ("sfn", "startSyncExecution")
+                if matches!(pattern, IntegrationPattern::RequestResponse) =>
+            {
+                let request = nested_request(payload);
+                return match self
+                    .dispatch_json("states", "AWSStepFunctions.StartSyncExecution", &request)
+                    .await
+                {
+                    Ok(response) => Ok(pascalize_top_level(response)),
+                    Err(error) if error.error.ends_with("StateMachineTypeNotSupported") => {
+                        self.dispatch_nested_execution(payload, IntegrationPattern::Sync, true)
+                            .await
                     }
-                }
-                _ => Err(AslError::runtime(format!(
+                    Err(error) => Err(error),
+                };
+            }
+            ("sfn", _) => {
+                return Err(AslError::runtime(format!(
                     "unsupported AWS SDK integration {target}"
-                ))),
-            };
-        }
-        if service == "s3" {
-            if !matches!(pattern, IntegrationPattern::RequestResponse) {
-                return Err(AslError::runtime(
-                    "S3 AWS SDK integrations do not support this pattern",
-                ));
+                )));
             }
-            return self.dispatch_s3(action, payload).await;
-        }
-        if service == "athena" && action == "startQueryExecution" {
-            if !matches!(pattern, IntegrationPattern::Sync) {
-                return Err(AslError::runtime(
-                    "Athena startQueryExecution requires .sync",
-                ));
+            ("s3", _) => {
+                if !matches!(pattern, IntegrationPattern::RequestResponse) {
+                    return Err(AslError::runtime(
+                        "S3 AWS SDK integrations do not support this pattern",
+                    ));
+                }
+                return self.dispatch_s3(action, payload).await;
             }
-            return self.dispatch_athena_sync(payload).await;
+            ("athena", "startQueryExecution") => {
+                if !matches!(pattern, IntegrationPattern::Sync) {
+                    return Err(AslError::runtime(
+                        "Athena startQueryExecution requires .sync",
+                    ));
+                }
+                return self.dispatch_athena_sync(payload).await;
+            }
+            _ => {}
         }
         if !matches!(pattern, IntegrationPattern::RequestResponse) {
             return Err(AslError::runtime(format!(
@@ -2697,6 +2730,11 @@ impl Interpreter {
     }
 
     async fn dispatch_s3(&self, action: &str, payload: &Value) -> Result<Value, AslError> {
+        if !self.store.healthy() {
+            return Err(AslError::task_failed(
+                "Step Functions durable state is unavailable",
+            ));
+        }
         let bucket = payload
             .get("Bucket")
             .and_then(Value::as_str)
@@ -2833,6 +2871,11 @@ impl Interpreter {
         payload: &Value,
         resource_override: Option<&str>,
     ) -> Result<Value, AslError> {
+        if !self.store.healthy() {
+            return Err(AslError::task_failed(
+                "Step Functions durable state is unavailable",
+            ));
+        }
         if let Some(resource) = resource_override {
             let operation = target.rsplit('.').next().unwrap_or("");
             self.authorize_task(&format!("{service}:{operation}"), resource)?;
@@ -2919,6 +2962,11 @@ impl Interpreter {
         invocation_type: Option<&str>,
         client_context: Option<&str>,
     ) -> Result<axum::response::Response, AslError> {
+        if !self.store.healthy() {
+            return Err(AslError::task_failed(
+                "Step Functions durable state is unavailable",
+            ));
+        }
         let function_arn = if name.starts_with("arn:") {
             name.to_string()
         } else {

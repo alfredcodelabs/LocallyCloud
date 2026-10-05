@@ -26,6 +26,21 @@ pub struct SfnHandler {
     registry: Weak<ServiceRegistry>,
 }
 
+// Cancelling an operation after a live mutation must not expose an uncommitted configuration.
+struct ConfigurationCommit<'a> {
+    store: &'a SfnStore,
+    completed: bool,
+}
+impl Drop for ConfigurationCommit<'_> {
+    fn drop(&mut self) {
+        if !self.completed && self.store.persistence.is_some() {
+            self.store
+                .persistence_failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 impl SfnHandler {
     fn new(registry: Weak<ServiceRegistry>) -> Self {
         SfnHandler {
@@ -93,6 +108,10 @@ impl SfnHandler {
 #[async_trait]
 impl NativeHandler for SfnHandler {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let _configuration = self.store.configuration_gate.read().await;
+        if !self.store.healthy() {
+            return Err("Step Functions durable state is unavailable");
+        }
         self.store.resource_regions(account)
     }
 
@@ -133,7 +152,67 @@ impl NativeHandler for SfnHandler {
         {
             return error.into_response(&request.request_id);
         }
-        match self.dispatch(&op, &ctx, &body).await {
+        let configuration_write = matches!(
+            op.as_str(),
+            "CreateStateMachine"
+                | "UpdateStateMachine"
+                | "DeleteStateMachine"
+                | "PublishStateMachineVersion"
+                | "CreateStateMachineAlias"
+                | "UpdateStateMachineAlias"
+                | "DeleteStateMachineAlias"
+                | "CreateActivity"
+                | "DeleteActivity"
+                | "TagResource"
+                | "UntagResource"
+        );
+        let configuration_read = op.starts_with("DescribeStateMachine")
+            || op.starts_with("ListStateMachine")
+            || matches!(
+                op.as_str(),
+                "DescribeActivity" | "ListActivities" | "ListTagsForResource"
+            );
+        let _write = if configuration_write {
+            Some(self.store.configuration_gate.write().await)
+        } else {
+            None
+        };
+        let _read = if configuration_read {
+            Some(self.store.configuration_gate.read().await)
+        } else {
+            None
+        };
+        if !self.store.healthy() {
+            return SfnError::Internal("Step Functions durable state is unavailable".into())
+                .into_response(&request.request_id);
+        }
+        let mut commit_guard = configuration_write.then(|| ConfigurationCommit {
+            store: &self.store,
+            completed: false,
+        });
+        let mut result = self.dispatch(&op, &ctx, &body).await;
+        if configuration_write
+            && result.is_ok()
+            && self
+                .store
+                .persist_scope(&request.account_id, &request.region)
+                .await
+                .is_err()
+        {
+            result = Err(SfnError::Internal(
+                "Step Functions configuration could not be committed".into(),
+            ));
+        }
+        if let Some(guard) = commit_guard.as_mut() {
+            guard.completed = true;
+        }
+        // Execution guard commits can fail inside a worker/operation; never acknowledge them.
+        if !self.store.healthy() {
+            result = Err(SfnError::Internal(
+                "Step Functions durable state is unavailable".into(),
+            ));
+        }
+        match result {
             Ok(value) => json_response(value),
             Err(err) => err.into_response(&request.request_id),
         }
@@ -149,7 +228,7 @@ fn json_response(value: Value) -> Response {
 }
 
 /// Register Step Functions (`states`) as a `Native` JSON 1.0 service.
-pub fn register(registry: &Arc<ServiceRegistry>) {
+fn ensure_dispatcher(registry: &Arc<ServiceRegistry>) {
     if registry.internal_dispatcher().is_none() {
         let dispatcher = Arc::new(InternalDispatcher::new_shared(
             registry,
@@ -163,7 +242,34 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
         ));
         registry.set_internal_dispatcher(dispatcher);
     }
-    let handler: Arc<dyn NativeHandler> = Arc::new(SfnHandler::new(Arc::downgrade(registry)));
+}
+
+pub fn register(registry: &Arc<ServiceRegistry>) {
+    ensure_dispatcher(registry);
+    register_handler(registry, SfnHandler::new(Arc::downgrade(registry)));
+}
+
+pub fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+) -> Result<(), String> {
+    let store = SfnStore::with_state(
+        state,
+        locallycloud_state::StateCipher::from_env().map_err(|e| e.to_string())?,
+    )?;
+    ensure_dispatcher(registry);
+    register_handler(
+        registry,
+        SfnHandler {
+            store: Arc::new(store),
+            registry: Arc::downgrade(registry),
+        },
+    );
+    Ok(())
+}
+
+fn register_handler(registry: &Arc<ServiceRegistry>, handler: SfnHandler) {
+    let handler: Arc<dyn NativeHandler> = Arc::new(handler);
     registry.register_native(
         ServiceName::new("states"),
         ServiceMetadata::new(AwsProtocol::Json10, Some(TARGET_PREFIX)),
@@ -182,6 +288,330 @@ mod tests {
     };
     use serde_json::json;
     use std::time::Duration;
+
+    fn durable_handler(
+        registry: &Arc<ServiceRegistry>,
+        state: Arc<locallycloud_state::StateDb>,
+    ) -> Arc<SfnHandler> {
+        Arc::new(SfnHandler {
+            store: Arc::new(
+                SfnStore::with_state(state, locallycloud_state::StateCipher::with_key(&[7; 32]))
+                    .unwrap(),
+            ),
+            registry: Arc::downgrade(registry),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn durable_standard_history_and_configuration_restore_without_replaying_effects() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-sfn-durable-{}", uuid::Uuid::new_v4()));
+        let state =
+            Arc::new(locallycloud_state::StateDb::open(root.join("state.sqlite3")).unwrap());
+        let registry = registry();
+        let concrete = durable_handler(&registry, state.clone());
+        let handler: Arc<dyn NativeHandler> = concrete.clone();
+        let definition = json!({"StartAt":"Done","States":{"Done":{"Type":"Pass","Result":{"durable":true},"End":true}}});
+        let arn = create_sm(&handler, "durable-completed", definition.clone()).await;
+        let version = sfn(
+            &handler,
+            "PublishStateMachineVersion",
+            json!({"stateMachineArn":arn}),
+        )
+        .await;
+        let alias=sfn(&handler,"CreateStateMachineAlias",json!({"name":"prod","routingConfiguration":[{"stateMachineVersionArn":version["stateMachineVersionArn"],"weight":100}]})).await;
+        let activity = sfn(
+            &handler,
+            "CreateActivity",
+            json!({"name":"durable-activity","tags":[{"key":"owner","value":"durable"}]}),
+        )
+        .await;
+        let started = sfn(
+            &handler,
+            "StartExecution",
+            json!({"stateMachineArn":arn,"name":"completed"}),
+        )
+        .await;
+        let completed = await_execution(&handler, started["executionArn"].as_str().unwrap()).await;
+        assert_eq!(completed["status"], "SUCCEEDED");
+        let sqs = registry.native_handler(&ServiceName::new("sqs")).unwrap();
+        let (_, queue) = body_of(
+            sqs.handle(req(
+                "AmazonSQS",
+                "CreateQueue",
+                json!({"QueueName":"durable-sfn-effects"}),
+            ))
+            .await,
+        )
+        .await;
+        let waiting_definition = json!({"StartAt":"Send","States":{
+            "Send":{"Type":"Task","Resource":"arn:aws:states:::sqs:sendMessage","Parameters":{"QueueUrl":queue["QueueUrl"],"MessageBody":"one effect"},"Next":"Wait"},
+            "Wait":{"Type":"Wait","Seconds":3600,"Next":"Done"},"Done":{"Type":"Pass","End":true}
+        }});
+        let waiting_arn = create_sm(&handler, "durable-interrupted", waiting_definition).await;
+        let waiting = sfn(
+            &handler,
+            "StartExecution",
+            json!({"stateMachineArn":waiting_arn,"name":"interrupted"}),
+        )
+        .await;
+        let execution_arn = waiting["executionArn"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let history = sfn(
+                    &handler,
+                    "GetExecutionHistory",
+                    json!({"executionArn":execution_arn}),
+                )
+                .await;
+                if history["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["type"] == "WaitStateEntered")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let restored: Arc<dyn NativeHandler> = durable_handler(&registry, state.clone());
+        assert_eq!(
+            sfn(
+                &restored,
+                "DescribeStateMachine",
+                json!({"stateMachineArn":arn})
+            )
+            .await["definition"],
+            definition.to_string()
+        );
+        assert_eq!(
+            sfn(
+                &restored,
+                "DescribeStateMachineAlias",
+                json!({"stateMachineAliasArn":alias["stateMachineAliasArn"]})
+            )
+            .await["name"],
+            "prod"
+        );
+        assert_eq!(
+            sfn(
+                &restored,
+                "DescribeActivity",
+                json!({"activityArn":activity["activityArn"]})
+            )
+            .await["name"],
+            "durable-activity"
+        );
+        assert_eq!(
+            sfn(
+                &restored,
+                "DescribeExecution",
+                json!({"executionArn":started["executionArn"]})
+            )
+            .await["status"],
+            "SUCCEEDED"
+        );
+        let interrupted = sfn(
+            &restored,
+            "DescribeExecution",
+            json!({"executionArn":execution_arn}),
+        )
+        .await;
+        assert_eq!(interrupted["status"], "ABORTED");
+        assert_eq!(interrupted["error"], "LocallyCloud.ExecutionInterrupted");
+        let history = sfn(
+            &restored,
+            "GetExecutionHistory",
+            json!({"executionArn":execution_arn}),
+        )
+        .await;
+        assert_eq!(
+            history["events"].as_array().unwrap().last().unwrap()["type"],
+            "ExecutionAborted"
+        );
+        assert_eq!(
+            body_of(
+                restored
+                    .handle(req(
+                        "AWSStepFunctions",
+                        "RedriveExecution",
+                        json!({"executionArn":execution_arn})
+                    ))
+                    .await
+            )
+            .await
+            .0,
+            400
+        );
+        let (_,attributes)=body_of(sqs.handle(req("AmazonSQS","GetQueueAttributes",json!({"QueueUrl":queue["QueueUrl"],"AttributeNames":["ApproximateNumberOfMessages"]}))).await).await;
+        assert_eq!(attributes["Attributes"]["ApproximateNumberOfMessages"], "1");
+        let mut other = req(
+            "AWSStepFunctions",
+            "DescribeExecution",
+            json!({"executionArn":execution_arn}),
+        );
+        other.region = "eu-west-1".into();
+        assert_eq!(restored.handle(other).await.status(), 400);
+        let raw: Vec<u8> = state
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload FROM sfn_scopes", [], |row| row.get(0))
+            .unwrap();
+        assert!(!raw
+            .windows(b"durable-completed".len())
+            .any(|window| window == b"durable-completed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn durable_commit_failure_rolls_back_execution_and_never_acknowledges_configuration() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-sfn-failure-{}", uuid::Uuid::new_v4()));
+        let state =
+            Arc::new(locallycloud_state::StateDb::open(root.join("state.sqlite3")).unwrap());
+        let registry = registry();
+        let concrete = durable_handler(&registry, state.clone());
+        let handler: Arc<dyn NativeHandler> = concrete.clone();
+        let definition =
+            json!({"StartAt":"Wait","States":{"Wait":{"Type":"Wait","Seconds":3600,"End":true}}});
+        let arn = create_sm(&handler, "durable-failure", definition.clone()).await;
+        let started = sfn(
+            &handler,
+            "StartExecution",
+            json!({"stateMachineArn":arn,"name":"blocked"}),
+        )
+        .await;
+        let execution_arn = started["executionArn"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let execution = concrete.store.get_execution(execution_arn).unwrap();
+                if execution
+                    .read()
+                    .await
+                    .history
+                    .iter()
+                    .any(|event| event.event_type == "WaitStateEntered")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut connection = state.connection().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let writer_handler = handler.clone();
+        let stop_request = req(
+            "AWSStepFunctions",
+            "StopExecution",
+            json!({"executionArn":execution_arn}),
+        );
+        let writer = tokio::spawn(async move { writer_handler.handle(stop_request).await });
+        let cell = concrete.store.get_execution(execution_arn).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cell.try_read().is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let reader_handler = handler.clone();
+        let read_request = req(
+            "AWSStepFunctions",
+            "DescribeExecution",
+            json!({"executionArn":execution_arn}),
+        );
+        let mut reader = tokio::spawn(async move { reader_handler.handle(read_request).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut reader)
+                .await
+                .is_err()
+        );
+        transaction.commit().unwrap();
+        assert_eq!(writer.await.unwrap().status(), 200);
+        assert_eq!(body_of(reader.await.unwrap()).await.1["status"], "ABORTED");
+        let again = sfn(
+            &handler,
+            "StartExecution",
+            json!({"stateMachineArn":arn,"name":"failed-stop"}),
+        )
+        .await;
+        let failed_arn = again["executionArn"].as_str().unwrap();
+        // Wait until the worker has completed its entry checkpoint before installing the fault.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cell = concrete.store.get_execution(failed_arn).unwrap();
+                if cell
+                    .read()
+                    .await
+                    .history
+                    .iter()
+                    .any(|event| event.event_type == "WaitStateEntered")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.connection().unwrap().execute_batch("CREATE TRIGGER reject_sfn_execution BEFORE UPDATE ON sfn_executions BEGIN SELECT RAISE(ABORT,'forced execution failure'); END;").unwrap();
+        assert_eq!(
+            body_of(
+                handler
+                    .handle(req(
+                        "AWSStepFunctions",
+                        "StopExecution",
+                        json!({"executionArn":failed_arn})
+                    ))
+                    .await
+            )
+            .await
+            .0,
+            500
+        );
+        assert_eq!(
+            concrete
+                .store
+                .get_execution(failed_arn)
+                .unwrap()
+                .read()
+                .await
+                .status,
+            crate::store::Status::Running
+        );
+        assert!(!concrete.store.healthy());
+        assert!(SfnStore::with_state(
+            state.clone(),
+            locallycloud_state::StateCipher::with_key(&[7; 32])
+        )
+        .is_err());
+        state
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_sfn_execution;")
+            .unwrap();
+        let restored: Arc<dyn NativeHandler> = durable_handler(&registry, state.clone());
+        state.connection().unwrap().execute_batch("CREATE TRIGGER reject_sfn_scope BEFORE UPDATE ON sfn_scopes BEGIN SELECT RAISE(ABORT,'forced configuration failure'); END;").unwrap();
+        assert_eq!(body_of(restored.handle(req("AWSStepFunctions","UpdateStateMachine",json!({"stateMachineArn":arn,"definition":"{\"StartAt\":\"Done\",\"States\":{\"Done\":{\"Type\":\"Pass\",\"End\":true}}}"}))).await).await.0,500);
+        let reopened: Arc<dyn NativeHandler> = durable_handler(&registry, state.clone());
+        assert_eq!(
+            sfn(
+                &reopened,
+                "DescribeStateMachine",
+                json!({"stateMachineArn":arn})
+            )
+            .await["definition"],
+            definition.to_string()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn registry() -> Arc<ServiceRegistry> {
         let reg = ServiceRegistry::with_known_services();

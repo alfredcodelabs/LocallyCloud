@@ -22,4 +22,4 @@ pub mod store;
 #[cfg(test)]
 mod property_tests;
 
-pub use service::register;
+pub use service::{register, register_with_state};

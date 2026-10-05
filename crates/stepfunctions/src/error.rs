@@ -7,6 +7,8 @@ use locallycloud_core::registry::AwsProtocol;
 /// An API-level error returned by control-plane / execution operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SfnError {
+    #[error("{0}")]
+    Internal(String),
     #[error("Access denied")]
     AccessDenied,
     #[error("{0}")]
@@ -62,6 +64,7 @@ pub enum SfnError {
 impl SfnError {
     pub fn code(&self) -> &'static str {
         match self {
+            SfnError::Internal(_) => "InternalServerError",
             SfnError::AccessDenied => "AccessDeniedException",
             SfnError::StateMachineDoesNotExist(_) => "StateMachineDoesNotExist",
             SfnError::StateMachineAlreadyExists(_) => "StateMachineAlreadyExists",
@@ -94,7 +97,9 @@ impl SfnError {
         AwsError::new(
             self.code(),
             self.to_string(),
-            if matches!(self, Self::AccessDenied) {
+            if matches!(self, Self::Internal(_)) {
+                500
+            } else if matches!(self, Self::AccessDenied) {
                 403
             } else {
                 400
@@ -142,19 +147,17 @@ impl AslError {
     /// Whether this error matches an `ErrorEquals` entry (`States.ALL` matches any
     /// `States.*` and non-`States.` errors; otherwise exact match).
     pub fn matches(&self, error_equals: &str) -> bool {
-        if error_equals == "States.ALL" {
-            return !matches!(
+        match error_equals {
+            "States.ALL" => !matches!(
                 self.error.as_str(),
                 "States.DataLimitExceeded" | "States.Runtime"
-            );
-        }
-        if error_equals == "States.TaskFailed" {
-            return !matches!(
+            ),
+            "States.TaskFailed" => !matches!(
                 self.error.as_str(),
                 "States.Timeout" | "States.DataLimitExceeded" | "States.Runtime"
-            );
+            ),
+            _ => self.error == error_equals,
         }
-        self.error == error_equals
     }
 }
 

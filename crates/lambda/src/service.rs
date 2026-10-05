@@ -1,6 +1,7 @@
 //! Lambda service handler: REST-JSON routing, registered `Native` in the Core registry.
 
 mod authorization;
+mod durability;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -67,6 +68,8 @@ pub struct LambdaHandler {
     executor: Option<Arc<Executor>>,
     concurrency: Arc<ConcurrencyLimiter>,
     esm_workers: Mutex<HashMap<String, JoinHandle<()>>>,
+    persistence: Mutex<Option<Arc<crate::persistence::LambdaPersistence>>>,
+    metadata_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for LambdaHandler {
@@ -98,11 +101,44 @@ impl LambdaHandler {
             executor,
             concurrency: ConcurrencyLimiter::new(DEFAULT_REGION_LIMIT),
             esm_workers: Mutex::new(HashMap::new()),
+            persistence: Mutex::new(None),
+            metadata_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub fn attach_state(&self, state: Arc<locallycloud_state::StateDb>) -> Result<(), LambdaError> {
-        self.esm.attach_state(state)
+        let persistence = Arc::new(crate::persistence::LambdaPersistence::new(state.clone())?);
+        self.initialize_state(state, persistence)
+    }
+
+    fn initialize_state(
+        &self,
+        state: Arc<locallycloud_state::StateDb>,
+        persistence: Arc<crate::persistence::LambdaPersistence>,
+    ) -> Result<(), LambdaError> {
+        persistence.restore(&self.store, &self.layers)?;
+        self.esm.attach_state(state)?;
+        for (account, region, name) in self.store.function_scopes() {
+            if let Some(Some(value)) = self
+                .store
+                .get_reserved_concurrency(&account, &region, &name)
+            {
+                self.concurrency
+                    .set_reserved(&function_arn(&region, &account, &name), value);
+            }
+        }
+        *self.persistence.lock().unwrap() = Some(persistence);
+        Ok(())
+    }
+
+    /// Resume configured workers only after sibling handlers have been registered.
+    pub fn resume_event_sources(&self) {
+        for mapping in self.esm.list(None, None) {
+            let parts = mapping.function_arn.split(':').collect::<Vec<_>>();
+            if parts.len() >= 7 {
+                self.reconcile_esm(parts[4], parts[3], &mapping);
+            }
+        }
     }
 
     /// Inject the EC2 control plane used to validate Lambda VPC selections.
@@ -110,6 +146,7 @@ impl LambdaHandler {
         if let Some(executor) = &self.executor {
             executor.attach_ec2(ec2.clone());
         }
+        self.store.restore_network_leases(&ec2);
         *self.ec2.lock().unwrap() = Some(ec2);
     }
 
@@ -501,6 +538,9 @@ impl LambdaHandler {
                 Method::GET => get_function_code_signing_config(&self.store, region, account, name),
                 _ => Err(unsupported()),
             },
+            ["2019-09-30", "functions", name, "concurrency"] if req.method == Method::GET => {
+                get_function_concurrency(&self.store, region, account, &percent_decode_path(name))
+            }
             ["2017-10-31", "functions", name, "concurrency"] => match req.method {
                 Method::PUT => {
                     let input = parse_json(&req.body)?;
@@ -517,7 +557,6 @@ impl LambdaHandler {
                     }
                     Ok(result)
                 }
-                Method::GET => get_function_concurrency(&self.store, region, account, name),
                 Method::DELETE => {
                     let result = delete_function_concurrency(&self.store, region, account, name)?;
                     if let Ok(rn) = resolve_function_name(name, region) {
@@ -1007,7 +1046,7 @@ impl NativeHandler for LambdaHandler {
         if is_invoke_path(&request) {
             return self.invoke(&request).await;
         }
-        match self.route(&request).await {
+        match self.route_durable(&request).await {
             Ok((status, body)) => json_response(status, body),
             Err(err) => err.into_response(&request.request_id),
         }
@@ -2008,32 +2047,85 @@ mod tests {
 
     #[tokio::test]
     async fn concurrency_routes_via_handler() {
+        async fn read(handler: &LambdaHandler, request: ServiceRequest) -> Value {
+            let response = handler.handle(request).await;
+            assert_eq!(response.status(), 200);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
         let handler = LambdaHandler::new();
         create_fn(&handler).await;
-        let resp = handler
-            .handle(request(
-                Method::PUT,
-                "/2017-10-31/functions/fn/concurrency",
-                r#"{"ReservedConcurrentExecutions":3}"#,
-            ))
-            .await;
-        assert_eq!(resp.status(), 200);
-        let resp = handler
-            .handle(request(
-                Method::GET,
-                "/2017-10-31/functions/fn/concurrency",
-                "",
-            ))
-            .await;
-        assert_eq!(resp.status(), 200);
-        let resp = handler
-            .handle(request(
-                Method::DELETE,
-                "/2017-10-31/functions/fn/concurrency",
-                "",
-            ))
-            .await;
-        assert_eq!(resp.status(), 204);
+        let get_path = "/2019-09-30/functions/fn/concurrency";
+        let write_path = "/2017-10-31/functions/fn/concurrency";
+        assert_eq!(
+            read(&handler, request(Method::GET, get_path, "")).await,
+            serde_json::json!({})
+        );
+        for value in [0, 3] {
+            let body = serde_json::json!({"ReservedConcurrentExecutions": value}).to_string();
+            assert_eq!(
+                handler
+                    .handle(request(Method::PUT, write_path, &body))
+                    .await
+                    .status(),
+                200
+            );
+            assert_eq!(
+                read(&handler, request(Method::GET, get_path, "")).await,
+                serde_json::json!({"ReservedConcurrentExecutions": value})
+            );
+        }
+        assert_eq!(read(&handler, request(Method::GET,
+            "/2019-09-30/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A000000000000%3Afunction%3Afn/concurrency", "")).await,
+            serde_json::json!({"ReservedConcurrentExecutions":3}));
+        assert_eq!(
+            read(
+                &handler,
+                request(
+                    Method::GET,
+                    "/2019-09-30/functions/000000000000%3Afunction%3Afn/concurrency",
+                    ""
+                )
+            )
+            .await,
+            serde_json::json!({"ReservedConcurrentExecutions":3})
+        );
+        for path in [
+            "/2019-09-30/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A111111111111%3Afunction%3Afn/concurrency",
+            "/2019-09-30/functions/111111111111%3Afunction%3Afn/concurrency",
+        ] {
+            assert_eq!(handler.handle(request(Method::GET,path, "")).await.status(),404);
+        }
+        for scope in [("111111111111", "us-east-1"), ("000000000000", "us-west-2")] {
+            let mut foreign = request(Method::GET, get_path, "");
+            foreign.account_id = scope.0.into();
+            foreign.region = scope.1.into();
+            assert_eq!(handler.handle(foreign).await.status(), 404);
+        }
+        assert_eq!(
+            handler
+                .handle(request(
+                    Method::GET,
+                    "/2019-09-30/functions/missing/concurrency",
+                    ""
+                ))
+                .await
+                .status(),
+            404
+        );
+        assert_eq!(
+            handler
+                .handle(request(Method::DELETE, write_path, ""))
+                .await
+                .status(),
+            204
+        );
+        assert_eq!(
+            read(&handler, request(Method::GET, get_path, "")).await,
+            serde_json::json!({})
+        );
     }
 
     #[tokio::test]
@@ -2282,3 +2374,6 @@ mod tests {
         assert_eq!(resp.status(), 404);
     }
 }
+
+#[cfg(test)]
+mod durability_tests;

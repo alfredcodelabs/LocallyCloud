@@ -10,10 +10,8 @@ use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::RwLock;
 
 use crate::error::SfnError;
-use crate::store::Execution;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoggingLevel {
@@ -69,7 +67,7 @@ pub async fn deliver_execution(
     registry: &Weak<ServiceRegistry>,
     region: &str,
     account: &str,
-    execution: &Arc<RwLock<Execution>>,
+    execution: &Arc<crate::store::ExecutionCell>,
 ) -> Result<(), SfnError> {
     let (configuration, group_name, stream_name, identity, events) = {
         let execution = execution.read().await;

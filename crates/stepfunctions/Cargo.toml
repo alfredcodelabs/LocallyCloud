@@ -9,6 +9,9 @@ description = "locallycloud AWS Step Functions service (JSON 1.0), registered Na
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 axum.workspace = true

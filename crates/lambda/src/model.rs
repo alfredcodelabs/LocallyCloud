@@ -1,11 +1,14 @@
 //! Lambda domain model and the region/account-scoped function store.
 
+use crate::persistence::LambdaPersistence;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use dashmap::DashMap;
 use locallycloud_ec2::LambdaNetworkLease;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::error::LambdaError;
 
@@ -33,13 +36,14 @@ pub const MAX_TIMEOUT_SECS: u32 = 900;
 pub const MIN_EPHEMERAL_MB: u32 = 512;
 pub const MAX_EPHEMERAL_MB: u32 = 10240;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpcConfig {
     pub subnet_ids: Vec<String>,
     pub security_group_ids: Vec<String>,
     pub vpc_id: String,
     pub ipv6_allowed_for_dual_stack: bool,
     // Retains EC2 dependencies for $LATEST and every published version.
+    #[serde(skip)]
     pub lease: Option<LambdaNetworkLease>,
 }
 
@@ -54,7 +58,7 @@ impl VpcConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LambdaFunction {
     pub function_name: String,
     pub function_arn: String,
@@ -78,6 +82,7 @@ pub struct LambdaFunction {
     pub state: String, // "Active"
     /// Raw Zip package bytes (inline `Code.ZipFile`), retained so the data plane can extract
     /// and execute the function. `None` for image packages or when set from a non-inline source.
+    #[serde(with = "crate::persistence::optional_archive")]
     pub code_zip: Option<Vec<u8>>,
     /// `DeadLetterConfig.TargetArn` for asynchronous invocation failures, if configured.
     pub dead_letter_arn: Option<String>,
@@ -189,7 +194,7 @@ pub fn decode_inline_zip(zip_base64: &str) -> Option<Vec<u8>> {
     BASE64.decode(zip_base64.as_bytes()).ok()
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FunctionKey {
     pub account_id: String,
     pub region: String,
@@ -197,7 +202,7 @@ pub struct FunctionKey {
 }
 
 /// A function alias pointing at a published version (or `$LATEST`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alias {
     pub name: String,
     pub function_version: String,
@@ -220,7 +225,7 @@ impl Alias {
 
 /// Reserved-concurrency / URL / event-invoke configuration is faithfully echoed back, so we
 /// keep the parsed values on the function record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionUrlConfig {
     pub function_url: String,
     pub auth_type: String,
@@ -246,7 +251,7 @@ impl FunctionUrlConfig {
 }
 
 /// Per-function asynchronous-invocation configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventInvokeConfig {
     pub maximum_retry_attempts: Option<u32>,
     pub maximum_event_age_in_seconds: Option<u32>,
@@ -268,7 +273,7 @@ impl EventInvokeConfig {
 }
 
 /// Per-qualifier provisioned-concurrency configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionedConfig {
     pub requested: u32,
     pub last_modified: String,
@@ -290,7 +295,8 @@ impl ProvisionedConfig {
 
 /// All state for one function name in a scope: the mutable `$LATEST`, immutable published
 /// versions, aliases, tags, and the reserved-concurrency / URL / event-invoke configs.
-struct FunctionRecord {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FunctionRecord {
     latest: LambdaFunction,
     versions: BTreeMap<u64, LambdaFunction>,
     next_version: u64,
@@ -306,7 +312,8 @@ struct FunctionRecord {
 /// Region/account-scoped function store. No unsynchronized global mutable state.
 #[derive(Default)]
 pub struct FunctionStore {
-    records: DashMap<FunctionKey, FunctionRecord>,
+    pub(crate) records: DashMap<FunctionKey, FunctionRecord>,
+    pub(crate) persistence: Mutex<Option<Arc<LambdaPersistence>>>,
 }
 
 impl FunctionStore {
@@ -319,10 +326,38 @@ impl FunctionStore {
             .collect())
     }
 
-    pub fn new() -> Self {
-        FunctionStore {
-            records: DashMap::new(),
+    pub(crate) fn function_scopes(&self) -> Vec<(String, String, String)> {
+        self.records
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().account_id.clone(),
+                    entry.key().region.clone(),
+                    entry.key().name.clone(),
+                )
+            })
+            .collect()
+    }
+    pub(crate) fn restore_network_leases(&self, ec2: &locallycloud_ec2::Ec2Handler) {
+        for mut entry in self.records.iter_mut() {
+            let key = entry.key().clone();
+            let record = entry.value_mut();
+            for function in std::iter::once(&mut record.latest).chain(record.versions.values_mut())
+            {
+                if let Some(config) = &mut function.vpc_config {
+                    config.lease = ec2.network_selection_lease(
+                        &key.account_id,
+                        &key.region,
+                        &config.subnet_ids,
+                        &config.security_group_ids,
+                    );
+                }
+            }
         }
+    }
+
+    pub fn new() -> Self {
+        Self::default()
     }
 
     fn key(account_id: &str, region: &str, name: &str) -> FunctionKey {
@@ -408,10 +443,19 @@ impl FunctionStore {
             .and_then(|r| r.versions.get(&version).cloned())
     }
 
-    pub fn delete(&self, account_id: &str, region: &str, name: &str) -> bool {
-        self.records
-            .remove(&Self::key(account_id, region, name))
-            .is_some()
+    pub fn delete(&self, account_id: &str, region: &str, name: &str) -> Result<bool, LambdaError> {
+        use dashmap::mapref::entry::Entry;
+        let key = Self::key(account_id, region, name);
+        match self.records.entry(key) {
+            Entry::Vacant(_) => Ok(false),
+            Entry::Occupied(entry) => {
+                if let Some(persistence) = self.persistence.lock().unwrap().as_ref() {
+                    persistence.delete_function(account_id, region, name)?;
+                }
+                entry.remove();
+                Ok(true)
+            }
+        }
     }
 
     /// Mutate `$LATEST` in place, returning the updated clone, or `None` if absent.
@@ -810,7 +854,7 @@ impl FunctionStore {
 }
 
 /// A published layer version snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerVersion {
     pub version: u64,
     pub description: String,
@@ -818,6 +862,7 @@ pub struct LayerVersion {
     pub code_sha256: String,
     pub code_size: u64,
     /// Published ZIP payload retained for execution.
+    #[serde(with = "crate::persistence::archive")]
     pub code_zip: Vec<u8>,
     pub compatible_runtimes: Vec<String>,
     pub compatible_architectures: Vec<String>,
@@ -866,15 +911,16 @@ impl LayerVersion {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct LayerKey {
-    account_id: String,
-    region: String,
-    name: String,
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct LayerKey {
+    pub(crate) account_id: String,
+    pub(crate) region: String,
+    pub(crate) name: String,
 }
 
 /// All published versions for one layer name in a scope.
-struct LayerRecord {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct LayerRecord {
     next_version: u64,
     /// Versions visible through the Lambda control plane.
     versions: BTreeMap<u64, LayerVersion>,
@@ -885,7 +931,7 @@ struct LayerRecord {
 /// Account/region-scoped layer store, independent of the function store.
 #[derive(Default)]
 pub struct LayerStore {
-    records: DashMap<LayerKey, LayerRecord>,
+    pub(crate) records: DashMap<LayerKey, LayerRecord>,
 }
 
 impl LayerStore {

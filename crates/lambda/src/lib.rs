@@ -13,6 +13,7 @@ pub mod exec_env;
 pub mod executor;
 pub mod function_url;
 pub mod model;
+mod persistence;
 pub mod rootfs;
 pub mod runtime_api;
 pub mod runtime_api_server;

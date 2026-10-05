@@ -10,6 +10,7 @@ description = "locallycloud AWS Lambda service (REST-JSON), registered Native in
 [dependencies]
 locallycloud-state.workspace = true
 rusqlite.workspace = true
+zeroize.workspace = true
 locallycloud-core.workspace = true
 locallycloud-compute.workspace = true
 locallycloud-ec2.workspace = true

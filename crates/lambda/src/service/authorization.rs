@@ -128,7 +128,7 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
         (["2017-10-31", "functions", name, "concurrency"], "PUT") => {
             ("PutFunctionConcurrency", function(name)?)
         }
-        (["2017-10-31", "functions", name, "concurrency"], "GET") => {
+        (["2019-09-30", "functions", name, "concurrency"], "GET") => {
             ("GetFunctionConcurrency", function(name)?)
         }
         (["2017-10-31", "functions", name, "concurrency"], "DELETE") => {
