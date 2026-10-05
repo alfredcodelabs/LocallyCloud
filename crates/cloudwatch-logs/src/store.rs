@@ -1,5 +1,8 @@
+use crate::persistence::{remove, row, unavailable, Change, Persistence};
+use locallycloud_state::{StateCipher, StateDb};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -28,28 +31,127 @@ pub(crate) struct NewQuery {
 }
 
 #[derive(Default)]
-struct StoreState {
-    revision: u64,
-    next_put_ordinals: BTreeMap<ScopeKey, u64>,
-    next_metric_effect_id: u64,
-    next_subscription_delivery_id: u64,
-    next_query_revision: u64,
-    groups: BTreeMap<GroupKey, LogGroup>,
-    queries: BTreeMap<(ScopeKey, String), InsightsQuery>,
-    metric_effects: BTreeMap<u64, PendingMetricEffect>,
-    subscription_deliveries: BTreeMap<u64, PendingSubscriptionDelivery>,
-    metric_default_minutes: BTreeSet<(GroupKey, String, u64, i64)>,
+pub(crate) struct StoreState {
+    pub(crate) revision: u64,
+    pub(crate) next_put_ordinals: BTreeMap<ScopeKey, u64>,
+    pub(crate) next_metric_effect_id: u64,
+    pub(crate) next_subscription_delivery_id: u64,
+    pub(crate) next_query_revision: u64,
+    pub(crate) groups: BTreeMap<GroupKey, LogGroup>,
+    pub(crate) queries: BTreeMap<(ScopeKey, String), InsightsQuery>,
+    pub(crate) metric_effects: BTreeMap<u64, PendingMetricEffect>,
+    pub(crate) subscription_deliveries: BTreeMap<u64, PendingSubscriptionDelivery>,
+    pub(crate) metric_default_minutes: BTreeSet<(GroupKey, String, u64, i64)>,
 }
 
 #[derive(Default)]
 pub struct LogsStore {
     state: RwLock<StoreState>,
+    persistence: Option<Arc<Persistence>>,
+    faulted: AtomicBool,
 }
 
 impl LogsStore {
+    pub(crate) fn durable(db: Arc<StateDb>, cipher: StateCipher) -> Result<Self, LogsError> {
+        let persistence = Persistence::open(db, cipher)?;
+        let state = persistence.load()?;
+        Ok(Self {
+            state: RwLock::new(state),
+            persistence: Some(persistence),
+            faulted: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn persistence(&self) -> Option<Arc<Persistence>> {
+        self.persistence.clone()
+    }
+
+    fn commit(&self, state: &mut StoreState, mut changes: Vec<Change>) -> Result<(), LogsError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let key = GroupKey {
+            scope: ScopeKey::new("", ""),
+            name: String::new(),
+        };
+        changes.push(row(
+            "counters",
+            &key,
+            "",
+            "",
+            0,
+            &(
+                state.revision,
+                state.next_metric_effect_id,
+                state.next_subscription_delivery_id,
+                state.next_query_revision,
+            ),
+        )?);
+        if persistence.commit(changes).is_err() {
+            // Mutations are hidden by the write lock until SQLite commits. A cold
+            // reload on failure rolls them back without cloning the entire inventory
+            // on every successful append. If recovery fails, fail closed.
+            match persistence.load() {
+                Ok(previous) => *state = previous,
+                Err(_) => self.faulted.store(true, Ordering::Release),
+            }
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
+    fn group_row(state: &StoreState, key: &GroupKey) -> Result<Change, LogsError> {
+        let metadata = state
+            .groups
+            .get(key)
+            .ok_or_else(unavailable)?
+            .metadata_without_streams();
+        row("group", key, "", "", 0, &metadata)
+    }
+
+    fn stream_row(state: &StoreState, key: &GroupKey, stream: &str) -> Result<Change, LogsError> {
+        row(
+            "stream",
+            key,
+            stream,
+            "",
+            0,
+            state
+                .groups
+                .get(key)
+                .and_then(|g| g.streams.get(stream))
+                .ok_or_else(unavailable)?,
+        )
+    }
+
+    fn commit_group(&self, state: &mut StoreState, key: &GroupKey) -> Result<(), LogsError> {
+        let change = Self::group_row(state, key)?;
+        self.commit(state, vec![change])
+    }
+
+    fn commit_query(
+        &self,
+        state: &mut StoreState,
+        scope: &ScopeKey,
+        id: &str,
+    ) -> Result<(), LogsError> {
+        let query = state
+            .queries
+            .get(&(scope.clone(), id.to_owned()))
+            .ok_or_else(unavailable)?;
+        let key = GroupKey {
+            scope: scope.clone(),
+            name: String::new(),
+        };
+        let change = row("query", &key, "", id, 0, query)?;
+        self.commit(state, vec![change])
+    }
+
     pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
         Ok(self
-            .state
             .read()
             .map_err(|_| "log inventory unavailable")?
             .groups
@@ -88,7 +190,8 @@ impl LogsStore {
         }
         state.revision = next_revision(state.revision)?;
         group.revision = state.revision;
-        state.groups.insert(key, group);
+        state.groups.insert(key.clone(), group);
+        self.commit_group(&mut state, &key)?;
         Ok(())
     }
 
@@ -104,7 +207,7 @@ impl LogsStore {
             .filter(|(key, _)| {
                 &key.scope == scope && prefix.is_none_or(|prefix| key.name.starts_with(prefix))
             })
-            .map(|(_, group)| group.clone())
+            .map(|(_, group)| group.metadata())
             .collect();
         Ok((state.revision, groups))
     }
@@ -129,6 +232,7 @@ impl LogsStore {
             .metric_default_minutes
             .retain(|(group_key, _, _, _)| group_key != key);
         state.revision = revision;
+        self.commit(&mut state, vec![remove(None, key, None, None)])?;
         Ok(())
     }
 
@@ -145,6 +249,7 @@ impl LogsStore {
         group.retention_days = retention_days;
         group.revision = revision;
         state.revision = revision;
+        self.commit_group(&mut state, key)?;
         Ok(())
     }
 
@@ -176,6 +281,7 @@ impl LogsStore {
         group.tags.extend(tags);
         group.revision = revision;
         state.revision = revision;
+        self.commit_group(&mut state, key)?;
         Ok(())
     }
 
@@ -197,6 +303,7 @@ impl LogsStore {
         }
         group.revision = revision;
         state.revision = revision;
+        self.commit_group(&mut state, key)?;
         Ok(())
     }
 
@@ -245,9 +352,15 @@ impl LogsStore {
             .groups
             .get_mut(key)
             .expect("group existence was checked");
+        let stream_name = stream.name.clone();
         group.streams.insert(stream.name.clone(), stream);
         group.revision = revision;
         state.revision = revision;
+        let changes = vec![
+            Self::group_row(&state, key)?,
+            Self::stream_row(&state, key, &stream_name)?,
+        ];
+        self.commit(&mut state, changes)?;
         Ok(())
     }
 
@@ -264,7 +377,7 @@ impl LogsStore {
             .streams
             .values()
             .filter(|stream| prefix.is_none_or(|prefix| stream.name.starts_with(prefix)))
-            .cloned()
+            .map(LogStream::metadata)
             .collect();
         Ok((state.revision, streams))
     }
@@ -311,6 +424,18 @@ impl LogsStore {
             .expect("group existence was checked");
         group.metric_filters.insert(filter_name.clone(), filter);
         group.revision = revision;
+        let discarded: Vec<_> = state
+            .metric_effects
+            .values()
+            .filter(|e| &e.group_key == key && e.source.is_filter(&filter_name))
+            .map(|e| remove(Some("metric"), key, Some(""), Some(&e.id.to_string())))
+            .collect();
+        let defaults: Vec<_> = state
+            .metric_default_minutes
+            .iter()
+            .filter(|(g, n, _, _)| g == key && n == &filter_name)
+            .map(|value| remove(Some("default"), key, Some(""), Some(&default_id(value))))
+            .collect();
         state
             .metric_effects
             .retain(|_, effect| &effect.group_key != key || !effect.source.is_filter(&filter_name));
@@ -318,6 +443,10 @@ impl LogsStore {
             .metric_default_minutes
             .retain(|(group_key, name, _, _)| group_key != key || name != &filter_name);
         state.revision = revision;
+        let mut changes = discarded;
+        changes.extend(defaults);
+        changes.push(Self::group_row(&state, key)?);
+        self.commit(&mut state, changes)?;
         Ok(())
     }
 
@@ -347,6 +476,18 @@ impl LogsStore {
             .expect("group existence was checked");
         group.metric_filters.remove(filter_name);
         group.revision = revision;
+        let discarded: Vec<_> = state
+            .metric_effects
+            .values()
+            .filter(|e| &e.group_key == key && e.source.is_filter(filter_name))
+            .map(|e| remove(Some("metric"), key, Some(""), Some(&e.id.to_string())))
+            .collect();
+        let defaults: Vec<_> = state
+            .metric_default_minutes
+            .iter()
+            .filter(|(g, n, _, _)| g == key && n == filter_name)
+            .map(|value| remove(Some("default"), key, Some(""), Some(&default_id(value))))
+            .collect();
         state
             .metric_effects
             .retain(|_, effect| &effect.group_key != key || !effect.source.is_filter(filter_name));
@@ -354,6 +495,10 @@ impl LogsStore {
             .metric_default_minutes
             .retain(|(group_key, name, _, _)| group_key != key || name != filter_name);
         state.revision = revision;
+        let mut changes = discarded;
+        changes.extend(defaults);
+        changes.push(Self::group_row(&state, key)?);
+        self.commit(&mut state, changes)?;
         Ok(())
     }
 
@@ -401,10 +546,26 @@ impl LogsStore {
             .subscription_filters
             .insert(filter_name.clone(), filter);
         group.revision = revision;
+        let discarded: Vec<_> = state
+            .subscription_deliveries
+            .values()
+            .filter(|delivery| &delivery.group_key == key && delivery.filter_name == filter_name)
+            .map(|d| {
+                remove(
+                    Some("subscription"),
+                    key,
+                    Some(&d.log_stream_name),
+                    Some(&d.id.to_string()),
+                )
+            })
+            .collect();
         state.subscription_deliveries.retain(|_, delivery| {
             &delivery.group_key != key || delivery.filter_name != filter_name
         });
         state.revision = revision;
+        let mut changes = discarded;
+        changes.push(Self::group_row(&state, key)?);
+        self.commit(&mut state, changes)?;
         Ok(())
     }
 
@@ -441,10 +602,26 @@ impl LogsStore {
             .expect("group existence was checked");
         group.subscription_filters.remove(filter_name);
         group.revision = revision;
+        let discarded: Vec<_> = state
+            .subscription_deliveries
+            .values()
+            .filter(|delivery| &delivery.group_key == key && delivery.filter_name == filter_name)
+            .map(|d| {
+                remove(
+                    Some("subscription"),
+                    key,
+                    Some(&d.log_stream_name),
+                    Some(&d.id.to_string()),
+                )
+            })
+            .collect();
         state.subscription_deliveries.retain(|_, delivery| {
             &delivery.group_key != key || delivery.filter_name != filter_name
         });
         state.revision = revision;
+        let mut changes = discarded;
+        changes.push(Self::group_row(&state, key)?);
+        self.commit(&mut state, changes)?;
         Ok(())
     }
 
@@ -456,7 +633,6 @@ impl LogsStore {
         Ok(state
             .subscription_deliveries
             .values()
-            .filter(|delivery| delivery.status == SubscriptionDeliveryStatus::Pending)
             .filter(|delivery| {
                 state
                     .groups
@@ -471,12 +647,41 @@ impl LogsStore {
 
     pub fn finish_subscription_delivery(&self, id: u64, delivered: bool) -> Result<(), LogsError> {
         let mut state = self.write()?;
+        let Some(delivery) = state.subscription_deliveries.get(&id) else {
+            return Ok(());
+        };
+        if !delivered && delivery.status == SubscriptionDeliveryStatus::Failed {
+            return Ok(());
+        }
+        let change = if delivered {
+            remove(
+                Some("subscription"),
+                &delivery.group_key,
+                Some(&delivery.log_stream_name),
+                Some(&id.to_string()),
+            )
+        } else {
+            let mut failed = delivery.clone();
+            failed.status = SubscriptionDeliveryStatus::Failed;
+            row(
+                "subscription",
+                &failed.group_key,
+                &failed.log_stream_name,
+                &id.to_string(),
+                0,
+                &failed,
+            )?
+        };
         if delivered {
             state.subscription_deliveries.remove(&id);
-        } else if let Some(delivery) = state.subscription_deliveries.get_mut(&id) {
-            delivery.status = SubscriptionDeliveryStatus::Failed;
+        } else {
+            state
+                .subscription_deliveries
+                .get_mut(&id)
+                .expect("delivery checked")
+                .status = SubscriptionDeliveryStatus::Failed;
         }
-        Ok(())
+        self.commit(&mut state, vec![change])
     }
 
     pub fn pending_metric_effects(
@@ -487,7 +692,6 @@ impl LogsStore {
         Ok(state
             .metric_effects
             .values()
-            .filter(|effect| effect.status == MetricEffectStatus::Pending)
             .filter(|effect| match &effect.source {
                 MetricEffectSource::Filter { name, revision } => state
                     .groups
@@ -503,25 +707,42 @@ impl LogsStore {
 
     pub fn finish_metric_effects(&self, ids: &[u64], delivered: bool) -> Result<(), LogsError> {
         let mut state = self.write()?;
-        if delivered {
-            for id in ids {
-                state.metric_effects.remove(id);
+        let mut changes = Vec::new();
+        for id in ids {
+            let Some(effect) = state.metric_effects.get(id) else {
+                continue;
+            };
+            if !delivered && effect.status == MetricEffectStatus::Failed {
+                continue;
             }
-        } else {
-            for id in ids {
-                let Some(effect) = state.metric_effects.get_mut(id) else {
-                    continue;
-                };
-                // EMF effects are never redelivered and nothing references them once failed,
-                // so retaining them would only grow memory with every undelivered EMF line.
-                if effect.source == MetricEffectSource::EmbeddedMetricFormat {
-                    state.metric_effects.remove(id);
-                } else {
-                    effect.status = MetricEffectStatus::Failed;
-                }
+            if delivered {
+                changes.push(remove(
+                    Some("metric"),
+                    &effect.group_key,
+                    Some(""),
+                    Some(&id.to_string()),
+                ));
+            } else {
+                let mut failed = effect.clone();
+                failed.status = MetricEffectStatus::Failed;
+                changes.push(row(
+                    "metric",
+                    &failed.group_key,
+                    "",
+                    &id.to_string(),
+                    0,
+                    &failed,
+                )?);
             }
         }
-        Ok(())
+        for id in ids {
+            if delivered {
+                state.metric_effects.remove(id);
+            } else if let Some(effect) = state.metric_effects.get_mut(id) {
+                effect.status = MetricEffectStatus::Failed;
+            }
+        }
+        self.commit(&mut state, changes)
     }
 
     pub fn put_events(
@@ -646,6 +867,19 @@ impl LogsStore {
                 })
             })
             .collect();
+        let new_defaults: Vec<_> = metric_candidates
+            .iter()
+            .filter_map(|c| {
+                c.default_minute.map(|minute| {
+                    (
+                        key.clone(),
+                        c.filter_name.clone(),
+                        c.filter_revision,
+                        minute,
+                    )
+                })
+            })
+            .collect();
         let embedded_observations = emf::observations_for_events(key, &accepted, now_ms);
         let final_effect_id = state
             .next_metric_effect_id
@@ -666,6 +900,28 @@ impl LogsStore {
                 )
             })?;
 
+        const MAX_PENDING_METRIC_EFFECTS: usize = 10_000;
+        const MAX_PENDING_SUBSCRIPTION_BATCHES: usize = 256;
+        if state
+            .metric_effects
+            .len()
+            .saturating_add(metric_candidates.len())
+            .saturating_add(embedded_observations.len())
+            > MAX_PENDING_METRIC_EFFECTS
+            || state
+                .subscription_deliveries
+                .len()
+                .saturating_add(subscription_candidates.len())
+                > MAX_PENDING_SUBSCRIPTION_BATCHES
+        {
+            return Err(LogsError::ServiceUnavailable(
+                "CloudWatch Logs delivery backlog is full; retry after its receivers recover"
+                    .into(),
+            ));
+        }
+        let new_events = accepted.clone();
+        let previous_effect_id = state.next_metric_effect_id;
+        let previous_delivery_id = state.next_subscription_delivery_id;
         {
             let group = state
                 .groups
@@ -750,6 +1006,56 @@ impl LogsStore {
         }
         state.next_subscription_delivery_id = final_subscription_delivery_id;
         state.revision = revision;
+        let mut changes = vec![
+            Self::group_row(&state, key)?,
+            Self::stream_row(&state, key, stream_name)?,
+        ];
+        for event in &new_events {
+            changes.push(row(
+                "event",
+                key,
+                stream_name,
+                &event.id,
+                event.timestamp_ms,
+                event,
+            )?);
+        }
+        for effect in state
+            .metric_effects
+            .range((
+                std::ops::Bound::Excluded(previous_effect_id),
+                std::ops::Bound::Included(final_effect_id),
+            ))
+            .map(|(_, e)| e)
+        {
+            changes.push(row("metric", key, "", &effect.id.to_string(), 0, effect)?);
+        }
+        for delivery in state
+            .subscription_deliveries
+            .range((
+                std::ops::Bound::Excluded(previous_delivery_id),
+                std::ops::Bound::Included(final_subscription_delivery_id),
+            ))
+            .map(|(_, d)| d)
+        {
+            changes.push(row(
+                "subscription",
+                key,
+                stream_name,
+                &delivery.id.to_string(),
+                0,
+                delivery,
+            )?);
+        }
+        for value in &new_defaults {
+            changes.push(row("default", key, "", &default_id(value), 0, value)?);
+        }
+        let scope_key = GroupKey {
+            scope: key.scope.clone(),
+            name: String::new(),
+        };
+        changes.push(row("ordinal", &scope_key, "", "", 0, &put_ordinal)?);
+        self.commit(&mut state, changes)?;
         Ok(PutEventsResult {
             next_sequence_token: sequence_token(revision),
             rejected,
@@ -853,7 +1159,7 @@ impl LogsStore {
             (scope.clone(), query_id.clone()),
             InsightsQuery {
                 id: query_id.clone(),
-                scope,
+                scope: scope.clone(),
                 group_names,
                 query_string,
                 plan,
@@ -868,6 +1174,7 @@ impl LogsStore {
             },
         );
         state.next_query_revision = revision;
+        self.commit_query(&mut state, &scope, &query_id)?;
         Ok(query_id)
     }
 
@@ -894,6 +1201,7 @@ impl LogsStore {
         query.revision = revision;
         let claimed = query.clone();
         state.next_query_revision = revision;
+        self.commit_query(&mut state, &key.0, &key.1)?;
         Ok(Some(claimed))
     }
 
@@ -924,6 +1232,7 @@ impl LogsStore {
         query.duration_ms = now_ms.saturating_sub(query.creation_time_ms).max(0);
         query.revision = revision;
         state.next_query_revision = revision;
+        self.commit_query(&mut state, scope, query_id)?;
         Ok(true)
     }
 
@@ -963,6 +1272,7 @@ impl LogsStore {
         query.duration_ms = now_ms.saturating_sub(query.creation_time_ms).max(0);
         query.revision = revision;
         state.next_query_revision = revision;
+        self.commit_query(&mut state, scope, query_id)?;
         Ok(true)
     }
 
@@ -1021,6 +1331,7 @@ impl LogsStore {
         query.duration_ms = now_ms.saturating_sub(query.creation_time_ms).max(0);
         query.revision = revision;
         state.next_query_revision = revision;
+        self.commit_query(&mut state, scope, query_id)?;
         Ok(())
     }
 
@@ -1090,6 +1401,23 @@ impl LogsStore {
         }
         if let Some(revision) = revision {
             state.revision = revision;
+        }
+        if let Some(revision) = revision {
+            let mut changes = Vec::new();
+            for (key, group) in state.groups.iter().filter(|(_, g)| g.revision == revision) {
+                let cutoff = now_ms.saturating_sub(
+                    i64::from(group.retention_days.expect("retained group")).saturating_mul(DAY_MS),
+                );
+                changes.push(Change::Expire {
+                    key: key.clone(),
+                    cutoff,
+                });
+                changes.push(Self::group_row(&state, key)?);
+                for stream in group.streams.values().filter(|s| s.revision == revision) {
+                    changes.push(Self::stream_row(&state, key, &stream.name)?);
+                }
+            }
+            self.commit(&mut state, changes)?;
         }
         Ok(next_expiration_ms)
     }
@@ -1170,23 +1498,53 @@ impl LogsStore {
             .expect("group existence was checked");
         group.streams.remove(stream_name);
         group.revision = revision;
+        let discarded: Vec<_> = state
+            .subscription_deliveries
+            .values()
+            .filter(|delivery| {
+                &delivery.group_key == key && delivery.log_stream_name == stream_name
+            })
+            .map(|d| {
+                remove(
+                    Some("subscription"),
+                    key,
+                    Some(&d.log_stream_name),
+                    Some(&d.id.to_string()),
+                )
+            })
+            .collect();
         state.subscription_deliveries.retain(|_, delivery| {
             &delivery.group_key != key || delivery.log_stream_name != stream_name
         });
         state.revision = revision;
+        let mut changes = discarded;
+        changes.push(Self::group_row(&state, key)?);
+        changes.push(remove(Some("stream"), key, Some(stream_name), None));
+        changes.push(remove(Some("event"), key, Some(stream_name), None));
+        self.commit(&mut state, changes)?;
         Ok(())
     }
 
     fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, StoreState>, LogsError> {
-        self.state.read().map_err(|_| {
-            LogsError::ServiceUnavailable("CloudWatch Logs storage is unavailable".into())
-        })
+        if self.faulted.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        let guard = self.state.read().map_err(|_| unavailable())?;
+        if self.faulted.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        Ok(guard)
     }
 
     fn write(&self) -> Result<std::sync::RwLockWriteGuard<'_, StoreState>, LogsError> {
-        self.state.write().map_err(|_| {
-            LogsError::ServiceUnavailable("CloudWatch Logs storage is unavailable".into())
-        })
+        if self.faulted.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        let guard = self.state.write().map_err(|_| unavailable())?;
+        if self.faulted.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        Ok(guard)
     }
 }
 
@@ -1246,6 +1604,10 @@ fn next_revision(current: u64) -> Result<u64, LogsError> {
     })
 }
 
+fn default_id(value: &(GroupKey, String, u64, i64)) -> String {
+    format!("{}:{}:{}", value.1, value.2, value.3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_emf_effects_are_dropped_while_failed_filter_effects_are_kept() {
+    fn failed_emf_and_filter_effects_remain_retryable_until_acknowledged() {
         use locallycloud_core::integration::metrics::{MetricObservation, MetricOrigin};
         let key = GroupKey {
             scope: ScopeKey::new("account", "region"),
@@ -1331,7 +1693,7 @@ mod tests {
         store.finish_metric_effects(&[1, 2], false).unwrap();
 
         let state = store.state.read().unwrap();
-        assert!(!state.metric_effects.contains_key(&1));
+        assert_eq!(state.metric_effects[&1].status, MetricEffectStatus::Failed);
         assert_eq!(state.metric_effects[&2].status, MetricEffectStatus::Failed);
     }
 }

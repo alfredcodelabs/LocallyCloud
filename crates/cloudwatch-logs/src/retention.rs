@@ -78,10 +78,12 @@ async fn run(
                 return;
             }
             let now_ms = clock.now_ms();
-            let next_expiration_ms = match store.purge_expired(now_ms) {
-                Ok(next) => next,
-                Err(_) => break,
-            };
+            let owned = store.clone();
+            let next_expiration_ms =
+                match tokio::task::spawn_blocking(move || owned.purge_expired(now_ms)).await {
+                    Ok(Ok(next)) => next,
+                    _ => break,
+                };
             let Some(deadline_ms) = next_expiration_ms else {
                 break;
             };

@@ -58,28 +58,39 @@ async fn run(store: Arc<LogsStore>, clock: Arc<dyn Clock>, notify: Arc<Notify>) 
         // Keep Scheduled observable and give StopQuery a deterministic cancellation window.
         tokio::time::sleep(Duration::from_millis(5)).await;
         loop {
-            let query = match store.claim_scheduled_query() {
-                Ok(Some(query)) => query,
-                Ok(None) => break,
-                Err(_) => return,
-            };
+            let owned = store.clone();
+            let query =
+                match tokio::task::spawn_blocking(move || owned.claim_scheduled_query()).await {
+                    Ok(Ok(Some(query))) => query,
+                    Ok(Ok(None)) => break,
+                    _ => return,
+                };
             match execute_query(&store, &query).await {
                 Some((rows, statistics)) => {
-                    if store
-                        .complete_query(&query.scope, &query.id, rows, statistics, clock.now_ms())
-                        .is_err()
-                    {
+                    let owned = store.clone();
+                    let scope = query.scope.clone();
+                    let id = query.id.clone();
+                    let now = clock.now_ms();
+                    if !matches!(
+                        tokio::task::spawn_blocking(
+                            move || owned.complete_query(&scope, &id, rows, statistics, now)
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    ) {
                         return;
                     }
                 }
                 None => {
-                    if store
-                        .query_is_running(&query.scope, &query.id)
-                        .unwrap_or(false)
-                        && store
-                            .fail_query(&query.scope, &query.id, clock.now_ms())
-                            .is_err()
-                    {
+                    let owned = store.clone();
+                    let scope = query.scope.clone();
+                    let id = query.id.clone();
+                    let now = clock.now_ms();
+                    if !matches!(
+                        tokio::task::spawn_blocking(move || owned.fail_query(&scope, &id, now))
+                            .await,
+                        Ok(Ok(()))
+                    ) {
                         return;
                     }
                 }

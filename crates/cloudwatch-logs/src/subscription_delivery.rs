@@ -71,20 +71,27 @@ impl Drop for SubscriptionDeliveryWorker {
 
 async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc<Notify>) {
     loop {
-        notify.notified().await;
+        tokio::select! { _=notify.notified()=>{}, _=tokio::time::sleep(std::time::Duration::from_secs(5))=>{} }
         loop {
             let deliveries = match store.pending_subscription_deliveries(DELIVERY_BATCH_SIZE) {
                 Ok(deliveries) if !deliveries.is_empty() => deliveries,
                 _ => break,
             };
+            let mut failed = false;
             for delivery in deliveries {
                 let delivered = deliver(&registry, &delivery).await;
-                if store
-                    .finish_subscription_delivery(delivery.id, delivered)
-                    .is_err()
-                {
+                let owned = store.clone();
+                let finished = tokio::task::spawn_blocking(move || {
+                    owned.finish_subscription_delivery(delivery.id, delivered)
+                })
+                .await;
+                if !matches!(finished, Ok(Ok(()))) {
                     return;
                 }
+                failed |= !delivered;
+            }
+            if failed {
+                break;
             }
         }
     }

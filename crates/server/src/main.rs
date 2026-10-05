@@ -238,15 +238,6 @@ async fn main() {
         }
     }
 
-    let registry = ServiceRegistry::with_known_services();
-    if let Err(error) =
-        locallycloud_iam_sts::service::register_with_account(&registry, &config.account_id)
-    {
-        tracing::error!(%error, "invalid IAM bootstrap configuration");
-        std::process::exit(2);
-    }
-    let lambda_handler =
-        locallycloud_lambda::register_with_execution(&registry, endpoint.guest_endpoint()).await;
     let state = match tokio::task::spawn_blocking(|| {
         locallycloud_state::StateDb::default_path().and_then(locallycloud_state::StateDb::open)
     })
@@ -269,9 +260,20 @@ async fn main() {
             std::process::exit(5);
         }
     };
+    let registry = ServiceRegistry::with_known_services();
+    if let Err(error) = locallycloud_iam_sts::service::register_with_state(
+        &registry,
+        &config.account_id,
+        state.clone(),
+    ) {
+        tracing::error!(%error, "failed to initialize durable IAM state");
+        std::process::exit(2);
+    }
+    let lambda_handler =
+        locallycloud_lambda::register_with_execution(&registry, endpoint.guest_endpoint()).await;
     if let Some(lambda) = &lambda_handler {
         if let Err(error) = lambda.attach_state(state.clone()) {
-            tracing::error!(%error, "failed to load Lambda event source mappings");
+            tracing::error!(%error, "failed to load durable Lambda state");
             std::process::exit(4);
         }
     }
@@ -299,9 +301,27 @@ async fn main() {
         tracing::error!(%error, "failed to register EventBridge Schemas");
         std::process::exit(4);
     }
-    locallycloud_stepfunctions::register(&registry);
-    let acm = locallycloud_acm::register(&registry);
-    let gateway_waf = locallycloud_apigateway::register_with_acm(&registry, acm.clone());
+    if let Err(error) = locallycloud_stepfunctions::register_with_state(&registry, state.clone()) {
+        tracing::error!(%error, "failed to load durable Step Functions state");
+        std::process::exit(4);
+    }
+    let acm = match locallycloud_acm::register_with_state(&registry, state.clone()) {
+        Ok(acm) => acm,
+        Err(error) => {
+            tracing::error!(error = %error.message, "failed to load durable ACM state");
+            std::process::exit(4);
+        }
+    };
+    let gateway_waf =
+        match locallycloud_apigateway::register_with_state(&registry, state.clone(), acm.clone())
+            .await
+        {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                tracing::error!(%error, "failed to load durable API Gateway state");
+                std::process::exit(4);
+            }
+        };
     locallycloud_cloudformation::register(&registry);
     let ecr = locallycloud_ecr::register_with_handle(&registry);
     let ec2 = locallycloud_ec2::register_with_instance_runtime(
@@ -345,7 +365,12 @@ async fn main() {
             std::process::exit(4);
         }
     };
-    locallycloud_cloudwatch_monitoring::register(&registry);
+    if let Err(error) =
+        locallycloud_cloudwatch_monitoring::register_with_state(&registry, state.clone())
+    {
+        tracing::error!(%error, "failed to initialize durable CloudWatch Monitoring");
+        std::process::exit(4);
+    }
     locallycloud_xray::register(&registry);
     let arc = locallycloud_arc::register(&registry);
     registry.register_native(
@@ -418,7 +443,8 @@ async fn main() {
         cloudtrail.clone(),
     );
     registry.set_completion_observer(cloudtrail);
-    if let Err(error) = locallycloud_cloudwatch_logs::register(&registry) {
+    if let Err(error) = locallycloud_cloudwatch_logs::register_with_state(&registry, state.clone())
+    {
         tracing::error!(error = %error, "failed to register CloudWatch Logs");
         std::process::exit(4);
     }
@@ -473,7 +499,14 @@ async fn main() {
     };
     let server = LocallyCloudServer::new(config, registry).with_tls_resolver(Arc::new(domain_tls));
 
-    let server_result = server.run().await;
+    let restored_lambda = lambda_handler.clone();
+    let server_result = server
+        .run_with_startup(move || {
+            if let Some(handler) = restored_lambda {
+                handler.resume_event_sources();
+            }
+        })
+        .await;
     ecs_runtime.shutdown().await;
     ec2.shutdown().await;
     if let Some(handler) = lambda_handler {

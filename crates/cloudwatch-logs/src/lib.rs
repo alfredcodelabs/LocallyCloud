@@ -11,6 +11,7 @@ mod metric_filters;
 mod model;
 mod pagination;
 mod pattern;
+mod persistence;
 mod producer_sink;
 mod protocol;
 mod query_worker;
@@ -32,6 +33,13 @@ use service::LogsHandler;
 
 pub fn register(registry: &Arc<ServiceRegistry>) -> Result<(), RegistrationError> {
     register_with_builder(registry, LogsHandler::new)
+}
+
+pub fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+) -> Result<(), RegistrationError> {
+    register_with_builder(registry, move |weak| LogsHandler::with_state(weak, state))
 }
 
 fn register_with_builder<F>(

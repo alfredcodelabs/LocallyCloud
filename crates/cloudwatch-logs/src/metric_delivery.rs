@@ -55,23 +55,38 @@ impl Drop for MetricDeliveryWorker {
 
 async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc<Notify>) {
     loop {
-        notify.notified().await;
+        tokio::select! { _=notify.notified()=>{}, _=tokio::time::sleep(std::time::Duration::from_secs(5))=>{} }
         loop {
             let effects = match store.pending_metric_effects(DELIVERY_BATCH_SIZE) {
                 Ok(effects) if !effects.is_empty() => effects,
                 _ => break,
             };
             let ids: Vec<_> = effects.iter().map(|effect| effect.id).collect();
+            let durable = store.persistence().is_some();
             let observations = effects
                 .into_iter()
-                .map(|effect| effect.observation)
+                .map(|effect| {
+                    let mut observation = effect.observation;
+                    if durable {
+                        observation.correlation_id = format!("logs-effect:{}", effect.id);
+                    }
+                    observation
+                })
                 .collect();
-            let outcome = registry
+            let sink = registry
                 .upgrade()
-                .and_then(|registry| registry.metric_sink(&ServiceName::new("monitoring")))
-                .map_or(EmitOutcome::Unavailable, |sink| sink.try_emit(observations));
+                .and_then(|registry| registry.metric_sink(&ServiceName::new("monitoring")));
+            let outcome = match sink {
+                Some(sink) if durable => sink.emit_durable(observations).await,
+                Some(sink) => sink.try_emit(observations),
+                None => EmitOutcome::Unavailable,
+            };
             let delivered = outcome == EmitOutcome::Accepted;
-            if store.finish_metric_effects(&ids, delivered).is_err() || !delivered {
+            let owned = store.clone();
+            let finished =
+                tokio::task::spawn_blocking(move || owned.finish_metric_effects(&ids, delivered))
+                    .await;
+            if !matches!(finished, Ok(Ok(()))) || !delivered {
                 break;
             }
         }

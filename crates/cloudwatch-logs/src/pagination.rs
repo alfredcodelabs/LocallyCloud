@@ -1,5 +1,6 @@
+use crate::persistence::Persistence;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -18,6 +19,7 @@ const MAX_SNAPSHOTS: usize = 1_024;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     scope: ScopeKey,
     prefix: Option<String>,
@@ -43,6 +45,7 @@ pub struct Page {
 
 pub struct DescribePaginator {
     secret: [u8; 32],
+    persistence: Option<Arc<Persistence>>,
     snapshots: Mutex<HashMap<String, Snapshot>>,
 }
 
@@ -55,12 +58,29 @@ impl Default for DescribePaginator {
         secret[16..].copy_from_slice(second.as_bytes());
         Self {
             secret,
+            persistence: None,
             snapshots: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl DescribePaginator {
+    pub(crate) fn with_persistence(
+        persistence: Option<Arc<Persistence>>,
+    ) -> Result<Self, LogsError> {
+        let mut result = Self::default();
+        if let Some(persistence) = persistence {
+            result.secret = persistence.secret("groups", result.secret)?;
+            let records: Vec<(String, Snapshot)> = persistence.records("groups")?;
+            *result
+                .snapshots
+                .get_mut()
+                .map_err(|_| crate::persistence::unavailable())? = records.into_iter().collect();
+            result.persistence = Some(persistence);
+        }
+        Ok(result)
+    }
+
     pub fn first_page(
         &self,
         groups: Vec<LogGroup>,
@@ -95,7 +115,7 @@ impl DescribePaginator {
             ));
         }
         snapshots.insert(
-            snapshot_id,
+            snapshot_id.clone(),
             Snapshot {
                 scope,
                 prefix,
@@ -105,6 +125,21 @@ impl DescribePaginator {
                 groups,
             },
         );
+        if let Some(persistence) = &self.persistence {
+            let snapshot = snapshots.get(&snapshot_id).expect("snapshot inserted");
+            let result = persistence.prune_cursors("groups", now_ms).and_then(|_| {
+                persistence.commit(vec![persistence.cursor(
+                    "groups",
+                    &snapshot_id,
+                    expires_at_ms,
+                    snapshot,
+                )?])
+            });
+            if let Err(error) = result {
+                snapshots.remove(&snapshot_id);
+                return Err(error);
+            }
+        }
         Ok(Page {
             groups: page,
             next_token: Some(token),
@@ -201,6 +236,7 @@ fn invalid_token() -> LogsError {
     LogsError::InvalidParameter("nextToken is invalid or expired".into())
 }
 
+#[derive(Serialize, Deserialize)]
 struct StreamSnapshot {
     scope: ScopeKey,
     group_name: String,
@@ -229,6 +265,7 @@ pub struct StreamPage {
 
 pub struct StreamDescribePaginator {
     secret: [u8; 32],
+    persistence: Option<Arc<Persistence>>,
     snapshots: Mutex<HashMap<String, StreamSnapshot>>,
 }
 
@@ -241,12 +278,29 @@ impl Default for StreamDescribePaginator {
         secret[16..].copy_from_slice(second.as_bytes());
         Self {
             secret,
+            persistence: None,
             snapshots: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl StreamDescribePaginator {
+    pub(crate) fn with_persistence(
+        persistence: Option<Arc<Persistence>>,
+    ) -> Result<Self, LogsError> {
+        let mut result = Self::default();
+        if let Some(persistence) = persistence {
+            result.secret = persistence.secret("streams", result.secret)?;
+            let records: Vec<(String, StreamSnapshot)> = persistence.records("streams")?;
+            *result
+                .snapshots
+                .get_mut()
+                .map_err(|_| crate::persistence::unavailable())? = records.into_iter().collect();
+            result.persistence = Some(persistence);
+        }
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn first_page(
         &self,
@@ -285,7 +339,7 @@ impl StreamDescribePaginator {
             ));
         }
         snapshots.insert(
-            snapshot_id,
+            snapshot_id.clone(),
             StreamSnapshot {
                 scope,
                 group_name,
@@ -298,6 +352,21 @@ impl StreamDescribePaginator {
                 streams,
             },
         );
+        if let Some(persistence) = &self.persistence {
+            let snapshot = snapshots.get(&snapshot_id).expect("snapshot inserted");
+            let result = persistence.prune_cursors("streams", now_ms).and_then(|_| {
+                persistence.commit(vec![persistence.cursor(
+                    "streams",
+                    &snapshot_id,
+                    expires_at_ms,
+                    snapshot,
+                )?])
+            });
+            if let Err(error) = result {
+                snapshots.remove(&snapshot_id);
+                return Err(error);
+            }
+        }
         Ok(StreamPage {
             streams: page,
             next_token: Some(token),
@@ -410,6 +479,7 @@ enum EventDirection {
     Backward,
 }
 
+#[derive(Serialize, Deserialize)]
 struct EventSnapshot {
     scope: ScopeKey,
     request_key: String,
@@ -449,6 +519,7 @@ pub(crate) struct EventNextPageRequest<'a> {
 
 pub struct EventPaginator {
     secret: [u8; 32],
+    persistence: Option<Arc<Persistence>>,
     snapshots: Mutex<HashMap<String, EventSnapshot>>,
 }
 
@@ -461,12 +532,29 @@ impl Default for EventPaginator {
         secret[16..].copy_from_slice(second.as_bytes());
         Self {
             secret,
+            persistence: None,
             snapshots: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl EventPaginator {
+    pub(crate) fn with_persistence(
+        persistence: Option<Arc<Persistence>>,
+    ) -> Result<Self, LogsError> {
+        let mut result = Self::default();
+        if let Some(persistence) = persistence {
+            result.secret = persistence.secret("events", result.secret)?;
+            let records: Vec<(String, EventSnapshot)> = persistence.records("events")?;
+            *result
+                .snapshots
+                .get_mut()
+                .map_err(|_| crate::persistence::unavailable())? = records.into_iter().collect();
+            result.persistence = Some(persistence);
+        }
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn first_page(
         &self,
@@ -506,7 +594,7 @@ impl EventPaginator {
             ));
         }
         snapshots.insert(
-            snapshot_id,
+            snapshot_id.clone(),
             EventSnapshot {
                 scope,
                 request_key,
@@ -515,6 +603,21 @@ impl EventPaginator {
                 events,
             },
         );
+        if let Some(persistence) = &self.persistence {
+            let snapshot = snapshots.get(&snapshot_id).expect("snapshot inserted");
+            let result = persistence.prune_cursors("events", now_ms).and_then(|_| {
+                persistence.commit(vec![persistence.cursor(
+                    "events",
+                    &snapshot_id,
+                    expires_at_ms,
+                    snapshot,
+                )?])
+            });
+            if let Err(error) = result {
+                snapshots.remove(&snapshot_id);
+                return Err(error);
+            }
+        }
         let snapshot = snapshots
             .get(&payload.snapshot_id)
             .expect("event snapshot was inserted");

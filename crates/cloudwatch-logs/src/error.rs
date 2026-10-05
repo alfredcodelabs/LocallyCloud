@@ -4,6 +4,10 @@ use locallycloud_core::error_mapping::AwsError;
 pub enum RegistrationError {
     #[error("service registry is unavailable while constructing CloudWatch Logs")]
     RegistryUnavailable,
+    #[error(
+        "CloudWatch Logs state could not be loaded; check the database and external master key"
+    )]
+    StateUnavailable,
 }
 
 #[derive(Debug, thiserror::Error)]

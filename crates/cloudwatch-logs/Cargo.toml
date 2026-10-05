@@ -9,6 +9,8 @@ description = "locallycloud AWS CloudWatch Logs service"
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 http.workspace = true

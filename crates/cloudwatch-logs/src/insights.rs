@@ -32,7 +32,7 @@ const MAX_TOKEN_BYTES: usize = 64 * 1_024;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum QueryStatus {
     Scheduled,
     Running,
@@ -74,7 +74,7 @@ impl QueryStatus {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct QuerySnapshotEvent {
     pub group_name: String,
     pub stream_name: String,
@@ -84,7 +84,7 @@ pub(crate) struct QuerySnapshotEvent {
     pub message: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct InsightsQuery {
     pub id: String,
     pub scope: ScopeKey,
@@ -116,12 +116,12 @@ impl InsightsQuery {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct QueryPlan {
     commands: Vec<Command>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 enum Command {
     Fields(Vec<String>),
     Display(Vec<String>),
@@ -137,14 +137,14 @@ enum Command {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Compare(String, CompareOp, Scalar),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum CompareOp {
     Eq,
     Ne,
@@ -154,7 +154,7 @@ enum CompareOp {
     Ge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Scalar {
     String(String),
     Number(f64),
@@ -171,6 +171,18 @@ struct WorkingRow {
 
 pub struct InsightsPaginator {
     secret: [u8; 32],
+}
+
+impl InsightsPaginator {
+    pub(crate) fn with_persistence(
+        persistence: Option<std::sync::Arc<crate::persistence::Persistence>>,
+    ) -> Result<Self, LogsError> {
+        let mut result = Self::default();
+        if let Some(persistence) = persistence {
+            result.secret = persistence.secret("insights", result.secret)?;
+        }
+        Ok(result)
+    }
 }
 
 impl Default for InsightsPaginator {

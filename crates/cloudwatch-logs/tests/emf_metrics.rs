@@ -186,7 +186,7 @@ async fn put_log_events_with_emf_publishes_metrics_and_keeps_every_event() {
 }
 
 #[tokio::test]
-async fn emf_ingest_succeeds_without_monitoring_and_later_puts_are_delivered_once() {
+async fn emf_ingest_retries_earlier_and_later_puts_once_when_monitoring_recovers() {
     let registry = ServiceRegistry::with_known_services();
     locallycloud_cloudwatch_logs::register(&registry).unwrap();
     let group = json!({ "logGroupName": "late" });
@@ -203,8 +203,8 @@ async fn emf_ingest_succeeds_without_monitoring_and_later_puts_are_delivered_onc
     };
     let (status, body) = call(&registry, "PutLogEvents", put(powertools_line(now))).await;
     assert_eq!(status, 200, "{body}");
-    // Let the lazily spawned worker observe the missing receiver; like metric-filter effects,
-    // EMF effects rejected by an unavailable receiver are not redelivered later.
+    // Let the worker observe the missing receiver. Earlier accepted events remain
+    // pending and must be delivered when Monitoring becomes available.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let sink = Arc::new(RecordingSink::default());
@@ -216,8 +216,8 @@ async fn emf_ingest_succeeds_without_monitoring_and_later_puts_are_delivered_onc
     );
     let (status, body) = call(&registry, "PutLogEvents", put(powertools_line(now))).await;
     assert_eq!(status, 200, "{body}");
-    let observations = wait_for(&sink, 2).await;
-    assert_eq!(observations.len(), 2, "{observations:?}");
+    let observations = wait_for(&sink, 4).await;
+    assert_eq!(observations.len(), 4, "{observations:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(sink.observations.lock().unwrap().len(), 2);
+    assert_eq!(sink.observations.lock().unwrap().len(), 4);
 }

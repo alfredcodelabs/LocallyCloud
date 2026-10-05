@@ -510,14 +510,14 @@ pub struct GetQueryResultsRequest {
     pub max_items: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultField {
     pub field: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryStatistics {
     pub records_matched: f64,

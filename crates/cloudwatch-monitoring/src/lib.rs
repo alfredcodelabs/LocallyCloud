@@ -1,5 +1,8 @@
 //! Native CloudWatch Monitoring subset used by locallycloud service integrations.
 
+mod alarms;
+mod persistence;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +26,7 @@ const CHANNEL_CAPACITY: usize = 64;
 const MAX_METRIC_DATA: usize = 1_000;
 const MAX_DIMENSIONS: usize = 30;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 struct ScopeKey {
     account_id: String,
     region: String,
@@ -49,6 +52,7 @@ struct MetricPoint {
 #[derive(Default)]
 struct MonitoringDomain {
     series: RwLock<BTreeMap<ScopeKey, BTreeMap<MetricKey, Vec<MetricPoint>>>>,
+    persistence: Option<Arc<persistence::Persistence>>,
 }
 
 impl MonitoringDomain {
@@ -65,6 +69,11 @@ impl MonitoringDomain {
             .series
             .write()
             .map_err(|_| MonitoringError::Internal("monitoring store lock poisoned".into()))?;
+        let observations = if let Some(persistence) = &self.persistence {
+            persistence.commit(&observations)?
+        } else {
+            observations
+        };
         for observation in observations {
             let scope = ScopeKey {
                 account_id: observation.account_id,
@@ -136,11 +145,76 @@ impl MonitoringDomain {
     }
 }
 
-struct MonitoringMetricSink {
-    sender: mpsc::Sender<Vec<MetricObservation>>,
+impl MonitoringDomain {
+    /// Restore authenticated committed samples; ingress timestamp limits are not retention.
+    fn restore(
+        observations: Vec<MetricObservation>,
+        persistence: Arc<persistence::Persistence>,
+    ) -> Result<Self, MonitoringError> {
+        let mut series: BTreeMap<ScopeKey, BTreeMap<MetricKey, Vec<MetricPoint>>> = BTreeMap::new();
+        for observation in observations {
+            validate_observation_shape(&observation)?;
+            let scope = ScopeKey {
+                account_id: observation.account_id,
+                region: observation.region,
+            };
+            let key = MetricKey {
+                namespace: observation.namespace,
+                metric_name: observation.metric_name,
+                dimensions: observation.dimensions,
+            };
+            series
+                .entry(scope)
+                .or_default()
+                .entry(key)
+                .or_default()
+                .push(MetricPoint {
+                    timestamp_ms: observation.timestamp_ms,
+                    value: observation.value,
+                    unit: observation.unit,
+                    _storage_resolution: observation.storage_resolution,
+                    _origin: observation.origin,
+                    _correlation_id: observation.correlation_id,
+                });
+        }
+        for metrics in series.values_mut() {
+            for points in metrics.values_mut() {
+                points.sort_by_key(|point| point.timestamp_ms);
+            }
+        }
+        Ok(Self {
+            series: RwLock::new(series),
+            persistence: Some(persistence),
+        })
+    }
 }
 
+struct WorkerGuard(Option<tokio::task::JoinHandle<()>>);
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+struct MonitoringMetricSink {
+    sender: mpsc::Sender<Vec<MetricObservation>>,
+    domain: Arc<MonitoringDomain>,
+}
+
+#[async_trait]
 impl MetricSink for MonitoringMetricSink {
+    async fn emit_durable(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
+        if self.domain.persistence.is_none() {
+            return EmitOutcome::Unavailable;
+        }
+        let domain = self.domain.clone();
+        match tokio::task::spawn_blocking(move || domain.commit(observations)).await {
+            Ok(Ok(())) => EmitOutcome::Accepted,
+            _ => EmitOutcome::Unavailable,
+        }
+    }
     fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
         if observations.is_empty()
             || observations
@@ -157,8 +231,11 @@ impl MetricSink for MonitoringMetricSink {
     }
 }
 
+#[derive(Clone)]
 struct MonitoringHandler {
     domain: Arc<MonitoringDomain>,
+    alarms: Arc<alarms::Alarms>,
+    _worker: Arc<WorkerGuard>,
 }
 
 enum WireResponse {
@@ -174,7 +251,12 @@ impl NativeHandler for MonitoringHandler {
         } else {
             AwsProtocol::Query
         };
-        match self.process(&request, protocol) {
+        let handler = self.clone();
+        let processing = request.clone();
+        let result = tokio::task::spawn_blocking(move || handler.process(&processing, protocol))
+            .await
+            .unwrap_or_else(|_| Err(MonitoringError::Internal("monitoring worker failed".into())));
+        match result {
             Ok(WireResponse::Query { action, body }) => {
                 success_response(&action, &body, &request.request_id)
             }
@@ -217,6 +299,11 @@ impl MonitoringHandler {
             }
             "ListMetrics" => self.list_metrics(&query, &scope)?,
             "GetMetricStatistics" => self.get_metric_statistics(&query, &scope)?,
+            _ if alarms::supported(&action) => {
+                let value = alarms::query_json(&query)?;
+                let response = self.alarms.process(&action, &value, &scope)?;
+                alarms::query_xml(&response)?
+            }
             _ => {
                 return Err(MonitoringError::InvalidAction(format!(
                     "unsupported CloudWatch action {action}"
@@ -249,6 +336,7 @@ impl MonitoringHandler {
             }
             "ListMetrics" => self.list_metrics_json(&body, scope),
             "GetMetricStatistics" => self.get_metric_statistics_json(&body, scope),
+            _ if alarms::supported(action) => self.alarms.process(action, &body, scope),
             _ => Err(MonitoringError::InvalidAction(format!(
                 "unsupported CloudWatch action {action}"
             ))),
@@ -601,15 +689,48 @@ impl MonitoringHandler {
 
 pub fn register(registry: &Arc<ServiceRegistry>) {
     let domain = Arc::new(MonitoringDomain::default());
+    register_domain(registry, domain).expect("in-memory monitoring initialization");
+}
+
+pub fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+) -> Result<(), String> {
+    let persistence = Arc::new(persistence::Persistence::new(state).map_err(|e| e.to_string())?);
+    let loaded = persistence.load().map_err(|e| e.to_string())?;
+    let domain = MonitoringDomain::restore(loaded, persistence).map_err(|e| e.to_string())?;
+    register_domain(registry, Arc::new(domain))?;
+    Ok(())
+}
+
+fn register_domain(
+    registry: &Arc<ServiceRegistry>,
+    domain: Arc<MonitoringDomain>,
+) -> Result<(), String> {
+    let alarms =
+        Arc::new(alarms::Alarms::new(domain.persistence.clone()).map_err(|e| e.to_string())?);
+    let worker = Arc::new(WorkerGuard(Some(alarms::start_worker(
+        registry,
+        domain.clone(),
+        alarms.clone(),
+    ))));
     let (sender, mut receiver) = mpsc::channel::<Vec<MetricObservation>>(CHANNEL_CAPACITY);
     let worker_domain = domain.clone();
     tokio::spawn(async move {
         while let Some(observations) = receiver.recv().await {
-            let _ = worker_domain.commit(observations);
+            let domain = worker_domain.clone();
+            let _ = tokio::task::spawn_blocking(move || domain.commit(observations)).await;
         }
     });
-    let handler: Arc<dyn NativeHandler> = Arc::new(MonitoringHandler { domain });
-    let sink: Arc<dyn MetricSink> = Arc::new(MonitoringMetricSink { sender });
+    let sink: Arc<dyn MetricSink> = Arc::new(MonitoringMetricSink {
+        sender,
+        domain: domain.clone(),
+    });
+    let handler: Arc<dyn NativeHandler> = Arc::new(MonitoringHandler {
+        domain,
+        alarms,
+        _worker: worker,
+    });
     let mut metadata =
         ServiceMetadata::new(AwsProtocol::Json10, Some("GraniteServiceVersion20100801"));
     metadata.known_actions = vec![
@@ -617,28 +738,38 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
         "ListMetrics".into(),
         "GetMetricStatistics".into(),
     ];
+    metadata
+        .known_actions
+        .extend(alarms::ACTIONS.iter().map(|action| (*action).to_owned()));
     registry.register_native_with_metric_sink(
         ServiceName::new("monitoring"),
         metadata,
         handler,
         sink,
     );
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
 enum MonitoringError {
     #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
     InvalidAction(String),
     #[error("{0}")]
     InvalidParameter(String),
+    #[error("{0}")]
+    InvalidNextToken(String),
     #[error("{0}")]
     Internal(String),
 }
 
 fn error_response(error: MonitoringError, request_id: &str, protocol: AwsProtocol) -> Response {
     let (code, status) = match error {
+        MonitoringError::NotFound(_) => ("ResourceNotFound", 404),
         MonitoringError::InvalidAction(_) => ("InvalidAction", 400),
         MonitoringError::InvalidParameter(_) => ("InvalidParameterValue", 400),
+        MonitoringError::InvalidNextToken(_) => ("InvalidNextToken", 400),
         MonitoringError::Internal(_) => ("InternalServiceError", 500),
     };
     let mut error = AwsError::new(code, error.to_string(), status).with_request_id(request_id);
@@ -740,7 +871,7 @@ fn parse_json_dimensions(
     Ok(result)
 }
 
-fn validate_observation(observation: &MetricObservation) -> Result<(), MonitoringError> {
+fn validate_observation_shape(observation: &MetricObservation) -> Result<(), MonitoringError> {
     if observation.account_id.is_empty()
         || observation.region.is_empty()
         || observation.namespace.is_empty()
@@ -769,6 +900,11 @@ fn validate_observation(observation: &MetricObservation) -> Result<(), Monitorin
             "public metrics cannot use a reserved AWS namespace".into(),
         ));
     }
+    Ok(())
+}
+
+fn validate_observation(observation: &MetricObservation) -> Result<(), MonitoringError> {
+    validate_observation_shape(observation)?;
     let current_time = now_ms();
     let oldest = current_time.saturating_sub(14 * 24 * 60 * 60 * 1_000);
     let newest = current_time.saturating_add(2 * 60 * 60 * 1_000);
@@ -1019,7 +1155,11 @@ mod tests {
         .collect();
         domain.commit(observations).expect("A16 fixtures are valid");
         (
-            MonitoringHandler { domain },
+            MonitoringHandler {
+                _worker: Arc::new(WorkerGuard(None)),
+                domain,
+                alarms: Arc::new(alarms::Alarms::new(None).unwrap()),
+            },
             ScopeKey {
                 account_id: TEST_ACCOUNT.to_owned(),
                 region: TEST_REGION.to_owned(),
@@ -1083,6 +1223,55 @@ mod tests {
             observed.get(&(base_ms + 60_000, "Count".to_owned())),
             Some(&(3.0, 1.0))
         );
+    }
+
+    #[tokio::test]
+    async fn retained_samples_and_idle_worker_release_survive_lifecycle() {
+        let path = std::env::temp_dir().join(format!(
+            "locallycloud-monitoring-retention-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Arc::new(locallycloud_state::StateDb::open(path.join("state.sqlite3")).unwrap());
+        let persistence = Arc::new(
+            persistence::Persistence::with_cipher(
+                db,
+                locallycloud_state::StateCipher::with_key(&[7; 32]),
+            )
+            .unwrap(),
+        );
+        let observation = MetricObservation {
+            account_id: "000000000000".into(),
+            region: "us-east-1".into(),
+            namespace: "Old".into(),
+            metric_name: "Retained".into(),
+            dimensions: Default::default(),
+            timestamp_ms: now_ms() - 15 * 86400000,
+            value: 1.0,
+            unit: None,
+            storage_resolution: 60,
+            origin: MetricOrigin::PublicPutMetricData,
+            correlation_id: "retained".into(),
+        };
+        assert!(validate_observation(&observation).is_err());
+        persistence.commit(&[observation]).unwrap();
+        let domain = Arc::new(
+            MonitoringDomain::restore(persistence.load().unwrap(), persistence.clone()).unwrap(),
+        );
+        assert_eq!(domain.series.read().unwrap().len(), 1);
+        let alarms = Arc::new(alarms::Alarms::new(Some(persistence)).unwrap());
+        let weak_domain = Arc::downgrade(&domain);
+        let weak_alarms = Arc::downgrade(&alarms);
+        let registry = Arc::new(ServiceRegistry::new());
+        let guard = WorkerGuard(Some(alarms::start_worker(&registry, domain, alarms)));
+        tokio::task::yield_now().await;
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(weak_domain.upgrade().is_none());
+        assert!(weak_alarms.upgrade().is_none());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

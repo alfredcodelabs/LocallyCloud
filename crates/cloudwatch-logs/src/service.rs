@@ -20,13 +20,17 @@ use crate::subscription_delivery::SubscriptionDeliveryWorker;
 use crate::{events, groups, insights, metric_filters, protocol, streams, subscriptions};
 
 pub struct LogsHandler {
-    registry: Weak<ServiceRegistry>,
-    store: Arc<LogsStore>,
-    clock: Arc<dyn Clock>,
+    api: Arc<LogsApi>,
     retention_worker: RetentionWorker,
     metric_delivery_worker: MetricDeliveryWorker,
     subscription_delivery_worker: SubscriptionDeliveryWorker,
     query_worker: QueryWorker,
+}
+
+struct LogsApi {
+    registry: Weak<ServiceRegistry>,
+    store: Arc<LogsStore>,
+    clock: Arc<dyn Clock>,
     insights_paginator: insights::InsightsPaginator,
     paginator: DescribePaginator,
     stream_paginator: StreamDescribePaginator,
@@ -42,30 +46,66 @@ impl LogsHandler {
         registry: Weak<ServiceRegistry>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, RegistrationError> {
+        Self::with_store(registry, clock, Arc::new(LogsStore::default()))
+    }
+
+    pub(crate) fn with_state(
+        registry: Weak<ServiceRegistry>,
+        state: Arc<locallycloud_state::StateDb>,
+    ) -> Result<Self, RegistrationError> {
+        let cipher = locallycloud_state::StateCipher::from_env()
+            .map_err(|_| RegistrationError::StateUnavailable)?;
+        let store = Arc::new(
+            LogsStore::durable(state, cipher).map_err(|_| RegistrationError::StateUnavailable)?,
+        );
+        Self::with_store(registry, Arc::new(SystemClock), store)
+    }
+
+    fn with_store(
+        registry: Weak<ServiceRegistry>,
+        clock: Arc<dyn Clock>,
+        store: Arc<LogsStore>,
+    ) -> Result<Self, RegistrationError> {
         registry
             .upgrade()
             .ok_or(RegistrationError::RegistryUnavailable)?;
-        let store = Arc::new(LogsStore::default());
         let retention_worker = RetentionWorker::new(store.clone(), clock.clone());
         let metric_delivery_worker = MetricDeliveryWorker::new(store.clone(), registry.clone());
         let subscription_delivery_worker =
             SubscriptionDeliveryWorker::new(store.clone(), registry.clone());
         let query_worker = QueryWorker::new(store.clone(), clock.clone());
-        Ok(Self {
+        let persistence = store.persistence();
+        let api = Arc::new(LogsApi {
             registry,
             store,
             clock,
+            insights_paginator: insights::InsightsPaginator::with_persistence(persistence.clone())
+                .map_err(|_| RegistrationError::StateUnavailable)?,
+            paginator: DescribePaginator::with_persistence(persistence.clone())
+                .map_err(|_| RegistrationError::StateUnavailable)?,
+            stream_paginator: StreamDescribePaginator::with_persistence(persistence.clone())
+                .map_err(|_| RegistrationError::StateUnavailable)?,
+            event_paginator: EventPaginator::with_persistence(persistence)
+                .map_err(|_| RegistrationError::StateUnavailable)?,
+        });
+        let handler = Self {
+            api,
             retention_worker,
             metric_delivery_worker,
             subscription_delivery_worker,
             query_worker,
-            insights_paginator: insights::InsightsPaginator::default(),
-            paginator: DescribePaginator::default(),
-            stream_paginator: StreamDescribePaginator::default(),
-            event_paginator: EventPaginator::default(),
-        })
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            handler.retention_worker.wake();
+            handler.metric_delivery_worker.wake();
+            handler.subscription_delivery_worker.wake();
+            handler.query_worker.wake();
+        }
+        Ok(handler)
     }
+}
 
+impl LogsApi {
     async fn process(&self, request: &ServiceRequest) -> Result<Value, LogsError> {
         if request.method != http::Method::POST {
             return Err(LogsError::UnknownOperation(
@@ -301,7 +341,7 @@ fn decode<T: DeserializeOwned>(body: Value) -> Result<T, LogsError> {
 #[async_trait]
 impl NativeHandler for LogsHandler {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
-        self.store.resource_regions(account)
+        self.api.store.resource_regions(account)
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
@@ -319,7 +359,16 @@ impl NativeHandler for LogsHandler {
         let wakes_metric_delivery = operation == Some("PutLogEvents");
         let wakes_subscription_delivery = operation == Some("PutLogEvents");
         let wakes_query_worker = operation == Some("StartQuery");
-        let result = self.process(&request).await;
+        let api = self.api.clone();
+        let owned = request.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || runtime.block_on(api.process(&owned)))
+            .await
+            .unwrap_or_else(|_| {
+                Err(LogsError::ServiceUnavailable(
+                    "CloudWatch Logs operation failed".into(),
+                ))
+            });
         if result.is_ok() {
             if wakes_retention {
                 self.retention_worker.wake();

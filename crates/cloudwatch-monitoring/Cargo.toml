@@ -9,6 +9,8 @@ description = "Native CloudWatch Monitoring emulation for locallycloud"
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
