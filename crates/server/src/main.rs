@@ -322,7 +322,10 @@ async fn main() {
                 std::process::exit(4);
             }
         };
-    locallycloud_cloudformation::register(&registry);
+    if let Err(error) = locallycloud_cloudformation::register_with_state(&registry, state.clone()) {
+        tracing::error!(%error, "failed to load durable CloudFormation state");
+        std::process::exit(4);
+    }
     let ecr = locallycloud_ecr::register_with_handle(&registry);
     let ec2 = locallycloud_ec2::register_with_instance_runtime(
         &registry,

@@ -22,6 +22,8 @@ pub enum CfnError {
     /// An unsupported operation was requested.
     #[error("{0}")]
     Unsupported(String),
+    #[error("{0}")]
+    LimitExceeded(String),
     #[error("Internal error.")]
     Internal,
 }
@@ -34,6 +36,7 @@ impl CfnError {
             CfnError::ResourceFailed(_) => "ResourceFailed",
             CfnError::InsufficientCapabilities(_) => "InsufficientCapabilities",
             CfnError::Unsupported(_) => "UnsupportedOperation",
+            CfnError::LimitExceeded(_) => "LimitExceededException",
             CfnError::Internal => "InternalFailure",
         }
     }
@@ -45,6 +48,7 @@ impl CfnError {
             CfnError::Unsupported(_) => 400,
             CfnError::ResourceFailed(_) => 400,
             CfnError::InsufficientCapabilities(_) => 400,
+            CfnError::LimitExceeded(_) => 400,
             CfnError::Internal => 500,
         }
     }

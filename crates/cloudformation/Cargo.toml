@@ -9,6 +9,9 @@ description = "locallycloud AWS CloudFormation service (Query/XML), registered N
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 axum.workspace = true
@@ -29,3 +32,5 @@ locallycloud-s3.workspace = true
 locallycloud-iam-sts.workspace = true
 locallycloud-lambda.workspace = true
 locallycloud-ec2.workspace = true
+locallycloud-kinesis.workspace = true
+locallycloud-sqs.workspace = true

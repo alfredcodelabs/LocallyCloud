@@ -3,9 +3,12 @@
 use std::collections::BTreeMap;
 
 /// Lifecycle status of a stack (subset of the AWS status set that this engine drives).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackStatus {
     ReviewInProgress,
+    CreateInProgress,
+    UpdateInProgress,
+    DeleteInProgress,
     CreateComplete,
     UpdateComplete,
     UpdateCompleteCleanupInProgress,
@@ -19,6 +22,9 @@ impl StackStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             StackStatus::ReviewInProgress => "REVIEW_IN_PROGRESS",
+            StackStatus::CreateInProgress => "CREATE_IN_PROGRESS",
+            StackStatus::UpdateInProgress => "UPDATE_IN_PROGRESS",
+            StackStatus::DeleteInProgress => "DELETE_IN_PROGRESS",
             StackStatus::CreateComplete => "CREATE_COMPLETE",
             StackStatus::UpdateComplete => "UPDATE_COMPLETE",
             StackStatus::UpdateCompleteCleanupInProgress => "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS",
@@ -31,14 +37,14 @@ impl StackStatus {
 }
 
 /// A retired physical network resource awaiting replacement cleanup.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ReplacementCleanup {
     pub physical_id: String,
     pub properties: serde_json::Value,
 }
 
 /// A provisioned stack resource.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct StackResource {
     pub logical_id: String,
     pub physical_id: String,
@@ -50,7 +56,7 @@ pub struct StackResource {
 }
 
 /// A recorded stack event (surfaced by `DescribeStackEvents`).
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct StackEvent {
     pub event_id: String,
     pub logical_id: String,
@@ -61,7 +67,7 @@ pub struct StackEvent {
 }
 
 /// A resolved stack output.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Output {
     pub key: String,
     pub value: String,
@@ -69,7 +75,7 @@ pub struct Output {
 }
 
 /// A CloudFormation stack.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Stack {
     pub stack_id: String,
     pub stack_name: String,

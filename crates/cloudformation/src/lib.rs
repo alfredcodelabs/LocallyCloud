@@ -12,6 +12,7 @@
 
 pub mod error;
 pub mod model;
+mod persistence;
 pub mod proto;
 pub mod provision;
 pub mod sam;
@@ -20,4 +21,4 @@ pub mod store;
 pub mod template;
 pub mod xml;
 
-pub use service::register;
+pub use service::{register, register_with_state};

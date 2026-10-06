@@ -434,6 +434,7 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
                         "MemorySize",
                         "Description",
                         "FunctionName",
+                        "ReservedConcurrentExecutions",
                         "Events",
                     ],
                     id,
@@ -449,6 +450,7 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
                     "MemorySize",
                     "Description",
                     "FunctionName",
+                    "ReservedConcurrentExecutions",
                 ] {
                     if let Some(value) = p.get(key) {
                         function.insert(key.into(), value.clone());
@@ -648,6 +650,24 @@ mod tests {
         let unchanged = invalid.clone();
         assert!(transform(&mut invalid).is_err());
         assert_eq!(invalid, unchanged);
+    }
+
+    #[test]
+    fn function_preserves_reserved_concurrency() {
+        let mut template = json!({"Transform":"AWS::Serverless-2016-10-31", "Resources":{
+        "Worker":{"Type":"AWS::Serverless::Function", "Properties":{
+            "CodeUri":"s3://artifacts/worker.zip", "Handler":"ledger.post", "Runtime":"python3.12",
+            "Role":"arn:aws:iam::000000000000:role/worker", "ReservedConcurrentExecutions":4
+        }}}});
+        transform(&mut template).unwrap();
+        assert_eq!(
+            template["Resources"]["Worker"]["Type"],
+            "AWS::Lambda::Function"
+        );
+        assert_eq!(
+            template["Resources"]["Worker"]["Properties"]["ReservedConcurrentExecutions"],
+            4
+        );
     }
 
     #[test]

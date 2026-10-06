@@ -22,6 +22,9 @@ use crate::template::{ResolvedResource, ResourcePolicy};
 
 mod custom_domains;
 mod ec2;
+mod kinesis;
+mod monitoring;
+mod scheduler;
 pub(crate) use ec2::validate_network_property_names;
 
 /// How an update that changes a resource's physical identity must handle the old instance.
@@ -45,6 +48,7 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::Route53::RecordSet",
     "AWS::S3::Bucket",
     "AWS::S3::BucketPolicy",
+    "AWS::Kinesis::Stream",
     "AWS::SQS::Queue",
     "AWS::SQS::QueuePolicy",
     "AWS::DynamoDB::Table",
@@ -58,6 +62,8 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::Events::EventBus",
     "AWS::Events::Rule",
     "AWS::Pipes::Pipe",
+    "AWS::Scheduler::Schedule",
+    "AWS::CloudWatch::Alarm",
     "AWS::Logs::LogGroup",
     "AWS::Logs::LogStream",
     "AWS::StepFunctions::StateMachine",
@@ -150,6 +156,10 @@ impl Provisioner {
             }
             "AWS::S3::Bucket" => self.s3_bucket(logical_id, stack_name, properties).await,
             "AWS::S3::BucketPolicy" => self.s3_bucket_policy(properties).await,
+            "AWS::Kinesis::Stream" => {
+                self.kinesis_stream(logical_id, stack_name, properties)
+                    .await
+            }
             "AWS::SQS::Queue" => self.sqs_queue(logical_id, stack_name, properties).await,
             "AWS::SQS::QueuePolicy" => {
                 self.sqs_queue_policy(logical_id, stack_name, properties)
@@ -172,6 +182,14 @@ impl Provisioner {
             "AWS::Events::EventBus" => self.events_event_bus(logical_id, properties).await,
             "AWS::Events::Rule" => self.events_rule(logical_id, stack_name, properties).await,
             "AWS::Pipes::Pipe" => self.pipes_pipe(logical_id, stack_name, properties).await,
+            "AWS::Scheduler::Schedule" => {
+                self.scheduler_schedule(logical_id, stack_name, properties)
+                    .await
+            }
+            "AWS::CloudWatch::Alarm" => {
+                self.monitoring_alarm(logical_id, stack_name, properties)
+                    .await
+            }
             "AWS::Logs::LogGroup" => self.logs_group(logical_id, stack_name, properties).await,
             "AWS::Logs::LogStream" => self.logs_stream(logical_id, stack_name, properties).await,
             "AWS::StepFunctions::StateMachine" => {
@@ -237,6 +255,9 @@ impl Provisioner {
         properties: &Value,
         replacement: Replacement,
     ) -> Result<ResolvedResource, CfnError> {
+        if previous_properties == properties {
+            return Ok(current.clone());
+        }
         match resource_type {
             "AWS::Route53::HostedZone" => {
                 self.update_custom_domain_resource(
@@ -334,6 +355,10 @@ impl Provisioner {
                 )
                 .await
             }
+            "AWS::Kinesis::Stream" => {
+                self.update_kinesis_stream(logical_id, current, previous_properties, properties)
+                    .await
+            }
             "AWS::DynamoDB::Table" => {
                 self.update_dynamodb_table(logical_id, current, previous_properties, properties)
                     .await
@@ -396,6 +421,19 @@ impl Provisioner {
                 )
                 .await
             }
+            "AWS::Scheduler::Schedule" => {
+                self.update_scheduler_schedule(
+                    logical_id,
+                    &current.ref_value,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
+            "AWS::CloudWatch::Alarm" => {
+                self.update_monitoring_alarm(logical_id, current, previous_properties, properties)
+                    .await
+            }
             "AWS::Pipes::Pipe" => {
                 self.update_pipes_pipe(
                     logical_id,
@@ -423,8 +461,13 @@ impl Provisioner {
                 .await
             }
             "AWS::Lambda::Function" => {
-                self.update_lambda_function(logical_id, &current.ref_value, properties)
-                    .await?;
+                self.update_lambda_function(
+                    logical_id,
+                    &current.ref_value,
+                    previous_properties,
+                    properties,
+                )
+                .await?;
                 Ok(current.clone())
             }
             "AWS::Lambda::Version" => self.lambda_version(properties).await,
@@ -681,6 +724,7 @@ impl Provisioner {
             }
             "AWS::S3::Bucket" => self.delete_bucket(physical_id).await,
             "AWS::S3::BucketPolicy" => self.delete_bucket_policy(physical_id).await,
+            "AWS::Kinesis::Stream" => self.delete_kinesis_stream(physical_id).await,
             "AWS::SQS::Queue" => self.delete_sqs_queue(physical_id).await,
             "AWS::SQS::QueuePolicy" => self.delete_sqs_queue_policy(properties).await,
             "AWS::DynamoDB::Table" => self.delete_dynamodb_table(physical_id).await,
@@ -697,6 +741,11 @@ impl Provisioner {
             "AWS::Events::EventBus" => self.delete_events_event_bus(physical_id).await,
             "AWS::Events::Rule" => self.delete_events_rule(physical_id, properties).await,
             "AWS::Pipes::Pipe" => self.delete_pipes_pipe(physical_id).await,
+            "AWS::Scheduler::Schedule" => {
+                self.delete_scheduler_schedule(physical_id, properties)
+                    .await
+            }
+            "AWS::CloudWatch::Alarm" => self.delete_monitoring_alarm(physical_id).await,
             "AWS::Logs::LogGroup" => self.delete_logs_group(physical_id).await,
             "AWS::Logs::LogStream" => {
                 self.delete_logs_stream(logs_stream_group(properties)?, physical_id)
@@ -2608,14 +2657,95 @@ impl Provisioner {
                 .replace_s3_bucket(logical_id, &current.ref_value, props, replacement)
                 .await;
         }
-        self.reconcile_s3_bucket_configuration(
-            logical_id,
-            &current.ref_value,
-            Some(previous),
-            props,
-        )
-        .await?;
+        self.update_s3_bucket_configuration(logical_id, &current.ref_value, previous, props)
+            .await?;
         Ok(current.clone())
+    }
+
+    async fn update_s3_bucket_configuration(
+        &self,
+        logical_id: &str,
+        bucket: &str,
+        previous: &Value,
+        props: &Value,
+    ) -> Result<(), CfnError> {
+        // Snapshot backend state, not template values: manual changes and defaults
+        // must also survive a failed in-place multi-operation update.
+        let mut changes = Vec::new();
+        for (property, query) in [
+            ("BucketEncryption", "encryption"),
+            ("VersioningConfiguration", "versioning"),
+            ("PublicAccessBlockConfiguration", "publicAccessBlock"),
+            ("Tags", "tagging"),
+            ("NotificationConfiguration", "notification"),
+        ] {
+            if previous.get(property) == props.get(property) {
+                continue;
+            }
+            let (status, body) = self
+                .call(
+                    "s3",
+                    Method::GET,
+                    &format!("/{bucket}?{query}"),
+                    path_host(),
+                    Bytes::new(),
+                )
+                .await?;
+            let snapshot = match status {
+                200..=299 => Some(body),
+                404 => None,
+                _ => {
+                    return Err(CfnError::ResourceFailed(format!(
+                        "S3 snapshot {query} for {logical_id} failed ({status}): {}",
+                        String::from_utf8_lossy(&body)
+                    )))
+                }
+            };
+            changes.push((property, query, snapshot));
+        }
+        let mut completed: Vec<(&str, Option<Bytes>)> = Vec::new();
+        for (property, query, snapshot) in changes {
+            let mut step = previous.clone();
+            let properties = step.as_object_mut().expect("validated S3 properties");
+            match props.get(property) {
+                Some(value) => {
+                    properties.insert(property.into(), value.clone());
+                }
+                None => {
+                    properties.remove(property);
+                }
+            }
+            if let Err(primary) = self
+                .reconcile_s3_bucket_configuration(logical_id, bucket, Some(previous), &step)
+                .await
+            {
+                let mut failure = primary;
+                for (query, snapshot) in completed.into_iter().rev() {
+                    let rollback = match snapshot {
+                        Some(xml) => {
+                            self.put_s3_bucket_configuration(
+                                logical_id,
+                                bucket,
+                                query,
+                                "RestoreBucketConfiguration",
+                                String::from_utf8_lossy(&xml).into_owned(),
+                            )
+                            .await
+                        }
+                        None => {
+                            self.delete_s3_call(&format!("/{bucket}?{query}"), bucket)
+                                .await
+                        }
+                    };
+                    if let Err(error) = rollback {
+                        failure = CfnError::ResourceFailed(format!("{failure}; S3 configuration rollback failed for {logical_id} ({query}): {error}"));
+                    }
+                }
+                return Err(failure);
+            }
+            completed.push((query, snapshot));
+        }
+        Ok(())
     }
 
     async fn replace_s3_bucket(
@@ -2758,6 +2888,33 @@ impl Provisioner {
                 xml,
             )
             .await?;
+        }
+
+        for (property, query, operation) in [
+            (
+                "PublicAccessBlockConfiguration",
+                "publicAccessBlock",
+                "PutPublicAccessBlock",
+            ),
+            ("Tags", "tagging", "PutBucketTagging"),
+        ] {
+            let value = props.get(property);
+            if previous.map_or(value.is_some(), |old| old.get(property) != value) {
+                match value {
+                    Some(value) => {
+                        let xml = match property {
+                            "Tags" => s3_bucket_tags_xml(logical_id, value)?,
+                            _ => s3_public_access_block_xml(logical_id, value)?,
+                        };
+                        self.put_s3_bucket_configuration(logical_id, bucket, query, operation, xml)
+                            .await?;
+                    }
+                    None => {
+                        self.delete_s3_call(&format!("/{bucket}?{query}"), bucket)
+                            .await?
+                    }
+                }
+            }
         }
 
         let notification = props.get("NotificationConfiguration");
@@ -3285,6 +3442,7 @@ impl Provisioner {
         stack_name: &str,
         props: &Value,
     ) -> Result<ResolvedResource, CfnError> {
+        let reserved = lambda_reserved_concurrency(logical_id, props)?;
         let name = props
             .get("FunctionName")
             .and_then(Value::as_str)
@@ -3337,6 +3495,17 @@ impl Provisioner {
                 String::from_utf8_lossy(&resp)
             )));
         }
+        if let Some(reserved) = reserved {
+            if let Err(error) = self
+                .set_lambda_reserved_concurrency(logical_id, &name, Some(reserved))
+                .await
+            {
+                return match self.delete_function(&name).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(with_cleanup_failure(error, cleanup)),
+                };
+            }
+        }
         let parsed: Value = serde_json::from_slice(&resp).unwrap_or(Value::Null);
         let arn = parsed
             .get("FunctionArn")
@@ -3361,40 +3530,107 @@ impl Provisioner {
         &self,
         logical_id: &str,
         function: &str,
+        previous_props: &Value,
         props: &Value,
     ) -> Result<(), CfnError> {
-        let code = self.resolve_code(props.get("Code")).await?;
-        self.call_json(
-            "lambda",
-            Method::PUT,
-            &format!("/2015-03-31/functions/{function}/code"),
-            code,
-            logical_id,
-        )
-        .await?;
+        let reserved = lambda_reserved_concurrency(logical_id, props)?;
+        let code = if previous_props.get("Code") != props.get("Code") {
+            Some(self.resolve_code(props.get("Code")).await?)
+        } else {
+            None
+        };
+        let previous = self
+            .call_json(
+                "lambda",
+                Method::GET,
+                &format!("/2019-09-30/functions/{function}/concurrency"),
+                json!({}),
+                logical_id,
+            )
+            .await?;
+        let previous = lambda_reserved_concurrency(logical_id, &previous)?;
+        let changed = previous != reserved;
+        if changed {
+            self.set_lambda_reserved_concurrency(logical_id, function, reserved)
+                .await?;
+        }
+        let result = async {
+            if let Some(code) = code {
+                self.call_json(
+                    "lambda",
+                    Method::PUT,
+                    &format!("/2015-03-31/functions/{function}/code"),
+                    code,
+                    logical_id,
+                )
+                .await?;
+            }
 
-        let mut configuration = mapped_properties(
-            props,
-            &[
-                ("Handler", "Handler"),
-                ("Runtime", "Runtime"),
-                ("Role", "Role"),
-                ("Description", "Description"),
-                ("Environment", "Environment"),
-                ("VpcConfig", "VpcConfig"),
-            ],
-        );
-        if let Some(memory) = props.get("MemorySize") {
-            configuration["MemorySize"] = coerce_number(memory);
+            let configuration = |properties: &Value| {
+                let mut configuration = mapped_properties(
+                    properties,
+                    &[
+                        ("Handler", "Handler"),
+                        ("Runtime", "Runtime"),
+                        ("Role", "Role"),
+                        ("Description", "Description"),
+                        ("Environment", "Environment"),
+                        ("VpcConfig", "VpcConfig"),
+                    ],
+                );
+                if let Some(memory) = properties.get("MemorySize") {
+                    configuration["MemorySize"] = coerce_number(memory);
+                }
+                if let Some(timeout) = properties.get("Timeout") {
+                    configuration["Timeout"] = coerce_number(timeout);
+                }
+                configuration
+            };
+            let next = configuration(props);
+            if next != configuration(previous_props) {
+                self.call_json(
+                    "lambda",
+                    Method::PUT,
+                    &format!("/2015-03-31/functions/{function}/configuration"),
+                    next,
+                    logical_id,
+                )
+                .await?;
+            }
+            Ok(())
         }
-        if let Some(timeout) = props.get("Timeout") {
-            configuration["Timeout"] = coerce_number(timeout);
+        .await;
+        if let Err(error) = result {
+            if changed {
+                if let Err(rollback) = self
+                    .set_lambda_reserved_concurrency(logical_id, function, previous)
+                    .await
+                {
+                    return Err(CfnError::ResourceFailed(format!(
+                        "{error}; Lambda concurrency rollback failed: {rollback}"
+                    )));
+                }
+            }
+            return Err(error);
         }
+        Ok(())
+    }
+
+    async fn set_lambda_reserved_concurrency(
+        &self,
+        logical_id: &str,
+        function: &str,
+        reserved: Option<u32>,
+    ) -> Result<(), CfnError> {
+        let (method, body) = match reserved {
+            Some(value) => (Method::PUT, json!({"ReservedConcurrentExecutions":value})),
+            None => (Method::DELETE, json!({})),
+        };
         self.call_json(
             "lambda",
-            Method::PUT,
-            &format!("/2015-03-31/functions/{function}/configuration"),
-            configuration,
+            method,
+            &format!("/2017-10-31/functions/{function}/concurrency"),
+            body,
             logical_id,
         )
         .await?;
@@ -3513,20 +3749,28 @@ impl Provisioner {
                 "AWS::Lambda::EventSourceMapping function, event source, and starting position require replacement for {logical_id}"
             )));
         }
+        let mut body = json!({
+            "BatchSize": props.get("BatchSize").cloned().unwrap_or_else(|| {
+                json!(lambda_event_source_mapping_default_batch_size(props))
+            }),
+            "Enabled": props.get("Enabled").cloned().unwrap_or(json!(true)),
+            "FunctionResponseTypes": props
+                .get("FunctionResponseTypes")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        });
+        body["MaximumBatchingWindowInSeconds"] = props
+            .get("MaximumBatchingWindowInSeconds")
+            .cloned()
+            .unwrap_or(json!(0));
+        if props.get("ScalingConfig").is_some() || previous.get("ScalingConfig").is_some() {
+            body["ScalingConfig"] = props.get("ScalingConfig").cloned().unwrap_or(json!({}));
+        }
         self.call_json(
             "lambda",
             Method::PUT,
             &format!("/2015-03-31/event-source-mappings/{}", current.ref_value),
-            json!({
-                "BatchSize": props.get("BatchSize").cloned().unwrap_or_else(|| {
-                    json!(lambda_event_source_mapping_default_batch_size(props))
-                }),
-                "Enabled": props.get("Enabled").cloned().unwrap_or(json!(true)),
-                "FunctionResponseTypes": props
-                    .get("FunctionResponseTypes")
-                    .cloned()
-                    .unwrap_or_else(|| json!([])),
-            }),
+            body,
             logical_id,
         )
         .await?;
@@ -4942,6 +5186,31 @@ impl Provisioner {
                 ))
                 .map_err(|_| CfnError::Internal)?,
             );
+            if let Some(access_key) = &self.caller_access_key {
+                let identity = locallycloud_core::integration::RequestIdentity {
+                    account_id: self.account.clone(),
+                    access_key_id: Some(access_key.clone()),
+                    arn: None,
+                };
+                match dispatcher.resolve_caller_arn(&identity) {
+                    Ok(Some(principal)) => {
+                        headers.insert(
+                            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+                            HeaderValue::from_str(&principal).map_err(|_| CfnError::Internal)?,
+                        );
+                    }
+                    _ if dispatcher.strict_sigv4_required() => {
+                        return Err(CfnError::ResourceFailed(
+                            "CloudFormation caller identity could not be resolved".into(),
+                        ))
+                    }
+                    _ => {}
+                }
+            } else if dispatcher.strict_sigv4_required() {
+                return Err(CfnError::ResourceFailed(
+                    "CloudFormation caller identity could not be resolved".into(),
+                ));
+            }
             dispatcher
                 .dispatch_scoped(
                     &request.method,
@@ -5262,6 +5531,8 @@ fn validate_lambda_event_source_mapping(logical_id: &str, props: &Value) -> Resu
             "Enabled",
             "FunctionResponseTypes",
             "StartingPosition",
+            "ScalingConfig",
+            "MaximumBatchingWindowInSeconds",
         ],
     )?;
     required_property(props, "FunctionName", logical_id)?;
@@ -5280,7 +5551,11 @@ fn validate_lambda_event_source_mapping(logical_id: &str, props: &Value) -> Resu
         )));
     };
     if let Some(batch_size) = props.get("BatchSize") {
-        let max = if source_type == "sqs" { 10 } else { 10_000 };
+        let max = if source_type == "sqs" && source.ends_with(".fifo") {
+            10
+        } else {
+            10_000
+        };
         if !batch_size
             .as_u64()
             .is_some_and(|batch_size| (1..=max).contains(&batch_size))
@@ -5289,6 +5564,37 @@ fn validate_lambda_event_source_mapping(logical_id: &str, props: &Value) -> Resu
                 "AWS::Lambda::EventSourceMapping resource {logical_id} requires BatchSize between 1 and {max}"
             )));
         }
+    }
+    if let Some(config) = props.get("ScalingConfig") {
+        let valid = source_type == "sqs"
+            && config.as_object().is_some_and(|object| {
+                object.keys().all(|key| key == "MaximumConcurrency")
+                    && object.get("MaximumConcurrency").is_none_or(|value| {
+                        value
+                            .as_u64()
+                            .is_some_and(|maximum| (2..=1000).contains(&maximum))
+                    })
+            });
+        if !valid {
+            return Err(CfnError::Validation(format!(
+                "Invalid SQS ScalingConfig for {logical_id}"
+            )));
+        }
+    }
+    let window = props
+        .get("MaximumBatchingWindowInSeconds")
+        .map(|value| value.as_u64().filter(|window| *window <= 300))
+        .unwrap_or(Some(0));
+    if window.is_none()
+        || (source_type == "sqs"
+            && props
+                .get("BatchSize")
+                .and_then(Value::as_u64)
+                .is_some_and(|size| size > 10 && window == Some(0)))
+    {
+        return Err(CfnError::Validation(format!(
+            "Invalid MaximumBatchingWindowInSeconds for {logical_id}"
+        )));
     }
     if props
         .get("Enabled")
@@ -5347,6 +5653,11 @@ fn lambda_event_source_mapping_create_body(props: &Value) -> Value {
             ("Enabled", "Enabled"),
             ("FunctionResponseTypes", "FunctionResponseTypes"),
             ("StartingPosition", "StartingPosition"),
+            ("ScalingConfig", "ScalingConfig"),
+            (
+                "MaximumBatchingWindowInSeconds",
+                "MaximumBatchingWindowInSeconds",
+            ),
         ],
     )
 }
@@ -6592,6 +6903,8 @@ fn validate_s3_bucket_properties(logical_id: &str, props: &Value) -> Result<(), 
             "BucketName",
             "BucketNamePrefix",
             "BucketNamespace",
+            "PublicAccessBlockConfiguration",
+            "Tags",
             "BucketEncryption",
             "VersioningConfiguration",
             "NotificationConfiguration",
@@ -6630,6 +6943,12 @@ fn validate_s3_bucket_properties(logical_id: &str, props: &Value) -> Result<(), 
             )));
         }
     }
+    if let Some(value) = props.get("PublicAccessBlockConfiguration") {
+        s3_public_access_block_xml(logical_id, value)?;
+    }
+    if let Some(value) = props.get("Tags") {
+        s3_bucket_tags_xml(logical_id, value)?;
+    }
     if let Some(value) = props.get("BucketEncryption") {
         s3_bucket_encryption_xml(logical_id, value)?;
     }
@@ -6640,6 +6959,74 @@ fn validate_s3_bucket_properties(logical_id: &str, props: &Value) -> Result<(), 
         s3_bucket_notification_xml(logical_id, value)?;
     }
     Ok(())
+}
+
+fn s3_public_access_block_xml(logical_id: &str, value: &Value) -> Result<String, CfnError> {
+    let fields = [
+        "BlockPublicAcls",
+        "IgnorePublicAcls",
+        "BlockPublicPolicy",
+        "RestrictPublicBuckets",
+    ];
+    if !value.is_object() {
+        return Err(CfnError::Validation(format!(
+            "AWS::S3::Bucket {logical_id} PublicAccessBlockConfiguration must be an object"
+        )));
+    }
+    ensure_known_properties(
+        logical_id,
+        "AWS::S3::Bucket.PublicAccessBlockConfiguration",
+        value,
+        &fields,
+    )?;
+    let mut xml = String::from("<PublicAccessBlockConfiguration>");
+    for field in fields {
+        if let Some(value) = value.get(field) {
+            let boolean=match value { Value::Bool(v)=>*v, Value::String(v) if v=="true"=>true, Value::String(v) if v=="false"=>false, _=>return Err(CfnError::Validation(format!("AWS::S3::Bucket {logical_id} PublicAccessBlockConfiguration.{field} requires a boolean"))) };
+            xml.push_str(&format!("<{field}>{boolean}</{field}>"));
+        }
+    }
+    xml.push_str("</PublicAccessBlockConfiguration>");
+    Ok(xml)
+}
+
+fn s3_bucket_tags_xml(logical_id: &str, value: &Value) -> Result<String, CfnError> {
+    let invalid = || {
+        CfnError::Validation(format!(
+            "AWS::S3::Bucket {logical_id} Tags requires up to 50 unique string Key/Value entries"
+        ))
+    };
+    let tags = value
+        .as_array()
+        .filter(|tags| tags.len() <= 50)
+        .ok_or_else(invalid)?;
+    let mut keys = std::collections::BTreeSet::new();
+    let mut xml = String::from("<Tagging><TagSet>");
+    for tag in tags {
+        if !tag.is_object() {
+            return Err(invalid());
+        }
+        ensure_known_properties(logical_id, "AWS::S3::Bucket.Tags", tag, &["Key", "Value"])?;
+        let key = tag.get("Key").and_then(Value::as_str).ok_or_else(invalid)?;
+        let value = tag
+            .get("Value")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        if key.is_empty()
+            || key.chars().count() > 128
+            || value.chars().count() > 256
+            || !keys.insert(key)
+        {
+            return Err(invalid());
+        }
+        xml.push_str(&format!(
+            "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+            xml_escape(key),
+            xml_escape(value)
+        ));
+    }
+    xml.push_str("</TagSet></Tagging>");
+    Ok(xml)
 }
 
 fn s3_bucket_encryption_xml(logical_id: &str, value: &Value) -> Result<String, CfnError> {
@@ -6723,12 +7110,7 @@ fn s3_bucket_encryption_xml(logical_id: &str, value: &Value) -> Result<String, C
                 "AWS::S3::Bucket resource {logical_id} cannot use KMSMasterKeyID with AES256"
             )))
         }
-        "aws:kms" if kms_key.is_some() => {}
-        "aws:kms" => {
-            return Err(CfnError::Validation(format!(
-                "AWS::S3::Bucket resource {logical_id} requires KMSMasterKeyID with aws:kms"
-            )))
-        }
+        "aws:kms" => {}
         _ => {
             return Err(CfnError::Validation(format!(
                 "AWS::S3::Bucket resource {logical_id} supports only AES256 or aws:kms encryption"
@@ -7183,6 +7565,22 @@ fn ensure_delete_succeeded(
     )))
 }
 
+fn lambda_reserved_concurrency(logical_id: &str, props: &Value) -> Result<Option<u32>, CfnError> {
+    props
+        .get("ReservedConcurrentExecutions")
+        .map(|value| {
+            coerce_number(value)
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    CfnError::Validation(format!(
+                        "{logical_id} ReservedConcurrentExecutions must be a nonnegative integer"
+                    ))
+                })
+        })
+        .transpose()
+}
+
 /// Coerce a possibly-stringified number (CFN often stringifies) to a JSON number.
 fn coerce_number(v: &Value) -> Value {
     match v {
@@ -7244,6 +7642,419 @@ mod tests {
     use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
 
     use super::*;
+
+    #[tokio::test]
+    async fn lambda_reserved_concurrency_native_lifecycle_and_failure_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Faults {
+            inner: Arc<dyn NativeHandler>,
+            requests: Mutex<Vec<String>>,
+            fail_concurrency: AtomicBool,
+            fail_configuration: AtomicBool,
+            fail_restore: AtomicBool,
+        }
+        #[async_trait]
+        impl NativeHandler for Faults {
+            async fn handle(&self, req: ServiceRequest) -> axum::response::Response {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(format!("{} {}", req.method, req.uri.path()));
+                let configuration_failure = req.uri.path().ends_with("/configuration")
+                    && req.method == Method::PUT
+                    && self.fail_configuration.swap(false, Ordering::Relaxed);
+                let concurrency_failure = req.uri.path().ends_with("/concurrency")
+                    && (req.method == Method::PUT || req.method == Method::DELETE)
+                    && self.fail_concurrency.swap(false, Ordering::Relaxed);
+                if configuration_failure && self.fail_restore.swap(false, Ordering::Relaxed) {
+                    self.fail_concurrency.store(true, Ordering::Relaxed);
+                }
+                if configuration_failure || concurrency_failure {
+                    return http::Response::builder()
+                        .status(403)
+                        .body(Body::from("denied by fixture"))
+                        .unwrap();
+                }
+                self.inner.handle(req).await
+            }
+        }
+        let registry = Arc::new(ServiceRegistry::new());
+        let native = locallycloud_lambda::register(&registry);
+        let faults = Arc::new(Faults {
+            inner: native,
+            requests: Mutex::new(Vec::new()),
+            fail_concurrency: AtomicBool::new(false),
+            fail_configuration: AtomicBool::new(false),
+            fail_restore: AtomicBool::new(false),
+        });
+        registry.register_native(
+            ServiceName::new("lambda"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            faults.clone(),
+        );
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        let mut props = json!({"FunctionName":"reserved-native","Runtime":"python3.12","Handler":"ledger.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},"ReservedConcurrentExecutions":"4"});
+        let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
+        // The same deployed template must not republish versions or write other services.
+        faults.requests.lock().unwrap().clear();
+        for kind in [
+            "AWS::Lambda::Function",
+            "AWS::Lambda::Version",
+            "AWS::S3::Bucket",
+        ] {
+            let no_op = p
+                .update(
+                    "Worker",
+                    kind,
+                    &resource,
+                    &props,
+                    &props,
+                    Replacement::Update(ResourcePolicy::Delete),
+                )
+                .await
+                .unwrap();
+            assert_eq!(no_op.ref_value, resource.ref_value);
+        }
+        assert!(faults.requests.lock().unwrap().is_empty());
+        // A configuration-only change must not need its previous S3 artifact again.
+        let mut previous = props.clone();
+        previous["Code"] = json!({"S3Bucket":"deleted-source-artifacts","S3Key":"ledger.zip"});
+        let mut memory_only = previous.clone();
+        memory_only["MemorySize"] = json!(256);
+        p.update(
+            "Worker",
+            "AWS::Lambda::Function",
+            &resource,
+            &previous,
+            &memory_only,
+            Replacement::Update(ResourcePolicy::Delete),
+        )
+        .await
+        .unwrap();
+        {
+            let requests = faults.requests.lock().unwrap();
+            assert!(requests.iter().any(|r| r.ends_with("/configuration")));
+            assert!(!requests.iter().any(|r| r.ends_with("/code")));
+        }
+        faults.requests.lock().unwrap().clear();
+        let mut code_only = memory_only.clone();
+        code_only["Code"] = props["Code"].clone();
+        p.update(
+            "Worker",
+            "AWS::Lambda::Function",
+            &resource,
+            &memory_only,
+            &code_only,
+            Replacement::Update(ResourcePolicy::Delete),
+        )
+        .await
+        .unwrap();
+        assert!(faults
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.ends_with("/code")));
+        assert!(!faults
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.ends_with("/configuration")));
+        let concurrency_path = format!("/2019-09-30/functions/{}/concurrency", resource.ref_value);
+        let current = p
+            .call_json(
+                "lambda",
+                Method::GET,
+                &concurrency_path,
+                json!({}),
+                "Worker",
+            )
+            .await
+            .unwrap();
+        assert_eq!(current["ReservedConcurrentExecutions"], 4);
+        faults.requests.lock().unwrap().clear();
+        props["ReservedConcurrentExecutions"] = json!(2);
+        p.update_lambda_function("Worker", &resource.ref_value, &props, &props)
+            .await
+            .unwrap();
+        {
+            let requests = faults.requests.lock().unwrap();
+            assert!(!requests
+                .iter()
+                .any(|r| r.ends_with("/code") || r.ends_with("/configuration")));
+        }
+        assert_eq!(
+            p.call_json(
+                "lambda",
+                Method::GET,
+                &concurrency_path,
+                json!({}),
+                "Worker"
+            )
+            .await
+            .unwrap()["ReservedConcurrentExecutions"],
+            2
+        );
+        props
+            .as_object_mut()
+            .unwrap()
+            .remove("ReservedConcurrentExecutions");
+        p.update_lambda_function("Worker", &resource.ref_value, &props, &props)
+            .await
+            .unwrap();
+        assert!(p
+            .call_json(
+                "lambda",
+                Method::GET,
+                &concurrency_path,
+                json!({}),
+                "Worker"
+            )
+            .await
+            .unwrap()
+            .get("ReservedConcurrentExecutions")
+            .is_none());
+        props["ReservedConcurrentExecutions"] = json!(0);
+        p.update_lambda_function("Worker", &resource.ref_value, &props, &props)
+            .await
+            .unwrap();
+        assert_eq!(
+            p.call_json(
+                "lambda",
+                Method::GET,
+                &concurrency_path,
+                json!({}),
+                "Worker"
+            )
+            .await
+            .unwrap()["ReservedConcurrentExecutions"],
+            0
+        );
+        for invalid in [
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!("no"),
+            json!(4294967296u64),
+        ] {
+            props["ReservedConcurrentExecutions"] = invalid;
+            assert!(p
+                .update_lambda_function("Worker", &resource.ref_value, &props, &props)
+                .await
+                .is_err());
+            let mut create = props.clone();
+            create["FunctionName"] = json!("invalid-reservation");
+            assert!(p
+                .lambda_function("Invalid", "stack", &create)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            p.call(
+                "lambda",
+                Method::GET,
+                "/2015-03-31/functions/invalid-reservation",
+                json_host(),
+                Bytes::new()
+            )
+            .await
+            .unwrap()
+            .0,
+            404
+        );
+        props["ReservedConcurrentExecutions"] = json!(2);
+        let previous_configuration = props.clone();
+        props["MemorySize"] = json!(512);
+        faults.fail_configuration.store(true, Ordering::Relaxed);
+        assert!(p
+            .update_lambda_function(
+                "Worker",
+                &resource.ref_value,
+                &previous_configuration,
+                &props
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            p.call_json(
+                "lambda",
+                Method::GET,
+                &concurrency_path,
+                json!({}),
+                "Worker"
+            )
+            .await
+            .unwrap()["ReservedConcurrentExecutions"],
+            0
+        );
+        faults.fail_configuration.store(true, Ordering::Relaxed);
+        faults.fail_restore.store(true, Ordering::Relaxed);
+        let error = p
+            .update_lambda_function(
+                "Worker",
+                &resource.ref_value,
+                &previous_configuration,
+                &props,
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Lambda concurrency rollback failed"));
+        assert_eq!(
+            p.call_json(
+                "lambda",
+                Method::GET,
+                &concurrency_path,
+                json!({}),
+                "Worker"
+            )
+            .await
+            .unwrap()["ReservedConcurrentExecutions"],
+            2
+        );
+        let mut create = props.clone();
+        create["FunctionName"] = json!("failed-reservation");
+        faults.fail_concurrency.store(true, Ordering::Relaxed);
+        assert!(p.lambda_function("Failed", "stack", &create).await.is_err());
+        assert_eq!(
+            p.call(
+                "lambda",
+                Method::GET,
+                "/2015-03-31/functions/failed-reservation",
+                json_host(),
+                Bytes::new()
+            )
+            .await
+            .unwrap()
+            .0,
+            404
+        );
+        p.delete_function(&resource.ref_value).await.unwrap();
+        assert_eq!(
+            p.call(
+                "lambda",
+                Method::GET,
+                &concurrency_path,
+                json_host(),
+                Bytes::new()
+            )
+            .await
+            .unwrap()
+            .0,
+            404
+        );
+    }
+
+    #[tokio::test]
+    async fn sam_bootstrap_bucket_configurations_reach_native_s3_and_validate_before_creation() {
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_s3::register(&registry);
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        let props = json!({"PublicAccessBlockConfiguration":{"BlockPublicPolicy":"true","BlockPublicAcls":"true","IgnorePublicAcls":true,"RestrictPublicBuckets":true},"BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]},"VersioningConfiguration":{"Status":"Enabled"},"Tags":[{"Key":"ManagedStackSource","Value":"AwsSamCli & test"}]});
+        let default_kms = json!({"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]});
+        let xml = s3_bucket_encryption_xml("Bucket", &default_kms).unwrap();
+        assert!(xml.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"));
+        assert!(!xml.contains("KMSMasterKeyID"));
+        assert!(s3_bucket_encryption_xml("Bucket",&json!({"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256","KMSMasterKeyID":"key"}}]})).is_err());
+        let bucket = p
+            .provision(
+                "SamCliSourceBucket",
+                "aws-sam-cli-managed-default",
+                "AWS::S3::Bucket",
+                &props,
+            )
+            .await
+            .unwrap();
+        for (query, expected) in [
+            (
+                "publicAccessBlock",
+                "<BlockPublicPolicy>true</BlockPublicPolicy>",
+            ),
+            ("tagging", "AwsSamCli &amp; test"),
+            ("versioning", "<Status>Enabled</Status>"),
+            ("encryption", "<SSEAlgorithm>AES256</SSEAlgorithm>"),
+        ] {
+            let (status, body) = p
+                .call(
+                    "s3",
+                    Method::GET,
+                    &format!("/{}?{query}", bucket.ref_value),
+                    json_host(),
+                    Bytes::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, 200, "{query}: {}", String::from_utf8_lossy(&body));
+            assert!(
+                String::from_utf8_lossy(&body).contains(expected),
+                "{query}: expected {expected}, received {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        let mut updated = props.clone();
+        updated.as_object_mut().unwrap().remove("Tags");
+        updated
+            .as_object_mut()
+            .unwrap()
+            .remove("PublicAccessBlockConfiguration");
+        p.update(
+            "SamCliSourceBucket",
+            "AWS::S3::Bucket",
+            &bucket,
+            &props,
+            &updated,
+            Replacement::Update(ResourcePolicy::Delete),
+        )
+        .await
+        .unwrap();
+        for query in ["publicAccessBlock", "tagging"] {
+            let (status, _) = p
+                .call(
+                    "s3",
+                    Method::GET,
+                    &format!("/{}?{query}", bucket.ref_value),
+                    json_host(),
+                    Bytes::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, 404);
+        }
+        for invalid in [
+            json!({"BucketName":"invalid-bootstrap","UnsupportedProperty":true}),
+            json!({"BucketName":"invalid-bootstrap","PublicAccessBlockConfiguration":{"BlockPublicACLs":true}}),
+            json!({"BucketName":"invalid-bootstrap","PublicAccessBlockConfiguration":{"BlockPublicAcls":"yes"}}),
+            json!({"BucketName":"invalid-bootstrap","Tags":[{"Key":"x","Value":1}]}),
+        ] {
+            assert!(p
+                .provision("Invalid", "stack", "AWS::S3::Bucket", &invalid)
+                .await
+                .is_err());
+        }
+        let (status, _) = p
+            .call(
+                "s3",
+                Method::HEAD,
+                "/invalid-bootstrap",
+                json_host(),
+                Bytes::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 404);
+        p.delete_bucket(&bucket.ref_value).await.unwrap();
+    }
 
     #[tokio::test]
     async fn api_v2_attributes_match_native_api_and_survive_update() {
@@ -7592,6 +8403,149 @@ mod tests {
         );
     }
 
+    struct S3UpdateFault {
+        native: Arc<dyn NativeHandler>,
+        fault: Mutex<Option<bool>>,
+    }
+    #[async_trait]
+    impl NativeHandler for S3UpdateFault {
+        async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+            let fault = *self.fault.lock().unwrap();
+            let denied = request.method == Method::PUT
+                && match request.uri.query() {
+                    Some("tagging") => fault.is_some(),
+                    Some("encryption") if fault == Some(true) => {
+                        String::from_utf8_lossy(&request.body)
+                            .contains("<BucketKeyEnabled>false</BucketKeyEnabled>")
+                    }
+                    _ => false,
+                };
+            if denied {
+                return http::Response::builder()
+                    .status(403)
+                    .body(Body::from("AccessDenied: injected configuration operation"))
+                    .unwrap();
+            }
+            self.native.handle(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_in_place_update_restores_native_configuration_and_reports_rollback_denial() {
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_s3::register(&registry);
+        let fault = Arc::new(S3UpdateFault {
+            native: registry.native_handler(&ServiceName::new("s3")).unwrap(),
+            fault: Mutex::new(None),
+        });
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            fault.clone(),
+        );
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "123456789012".into(),
+        );
+        let old = json!({"BucketName":"rollback-config", "BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":false}]}, "VersioningConfiguration":{"Status":"Enabled"}, "PublicAccessBlockConfiguration":{"BlockPublicAcls":true}, "Tags":[{"Key":"stage","Value":"old"}]});
+        let bucket = p
+            .provision("Bucket", "stack", "AWS::S3::Bucket", &old)
+            .await
+            .unwrap();
+        let mut updated = old.clone();
+        updated.as_object_mut().unwrap().remove("BucketEncryption");
+        updated["VersioningConfiguration"]["Status"] = json!("Suspended");
+        updated["PublicAccessBlockConfiguration"]["BlockPublicAcls"] = json!(false);
+        updated["Tags"][0]["Value"] = json!("new");
+        // Preserve a real out-of-template setting as well as template-owned values.
+        p.put_s3_bucket_configuration("Bucket", "rollback-config", "publicAccessBlock", "PutPublicAccessBlock", "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><BlockPublicPolicy>true</BlockPublicPolicy></PublicAccessBlockConfiguration>".into()).await.unwrap();
+        let mut before = Vec::new();
+        for query in ["encryption", "versioning", "publicAccessBlock", "tagging"] {
+            before.push((
+                query,
+                p.call(
+                    "s3",
+                    Method::GET,
+                    &format!("/rollback-config?{query}"),
+                    path_host(),
+                    Bytes::new(),
+                )
+                .await
+                .unwrap(),
+            ));
+        }
+        *fault.fault.lock().unwrap() = Some(false);
+        let error = p
+            .update(
+                "Bucket",
+                "AWS::S3::Bucket",
+                &bucket,
+                &old,
+                &updated,
+                Replacement::Update(ResourcePolicy::Delete),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PutBucketTagging"), "{error}");
+        assert!(!error.contains("rollback failed"), "{error}");
+        for (query, original) in &before {
+            let actual = p
+                .call(
+                    "s3",
+                    Method::GET,
+                    &format!("/rollback-config?{query}"),
+                    path_host(),
+                    Bytes::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                &actual, original,
+                "{query} must restore actual backend state"
+            );
+        }
+        *fault.fault.lock().unwrap() = Some(true);
+        let error = p
+            .update(
+                "Bucket",
+                "AWS::S3::Bucket",
+                &bucket,
+                &old,
+                &updated,
+                Replacement::Update(ResourcePolicy::Delete),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("PutBucketTagging")
+                && error.contains("rollback failed")
+                && error.contains("encryption"),
+            "{error}"
+        );
+        for query in ["versioning", "publicAccessBlock"] {
+            let actual = p
+                .call(
+                    "s3",
+                    Method::GET,
+                    &format!("/rollback-config?{query}"),
+                    path_host(),
+                    Bytes::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                &actual,
+                &before.iter().find(|(name, _)| *name == query).unwrap().1,
+                "other completed steps still compensate"
+            );
+        }
+        *fault.fault.lock().unwrap() = None;
+        p.delete_bucket("rollback-config").await.unwrap();
+    }
+
     struct S3Recorder {
         existing: Vec<&'static str>,
         /// DELETE to these bucket paths answers 500.
@@ -7834,5 +8788,25 @@ mod tests {
             ["PUT /old", "DELETE /new"],
             "the preexisting adopted target must not be deleted"
         );
+    }
+    #[test]
+    fn sqs_mapping_scaling_and_batch_window_forwarded_and_validated() {
+        let props = json!({"FunctionName":"worker", "EventSourceArn":"arn:aws:sqs:us-east-1:000000000000:queue", "BatchSize":40, "MaximumBatchingWindowInSeconds":1, "ScalingConfig":{"MaximumConcurrency":2}});
+        validate_lambda_event_source_mapping("Mapping", &props).unwrap();
+        let body = lambda_event_source_mapping_create_body(&props);
+        assert_eq!(body["ScalingConfig"], props["ScalingConfig"]);
+        assert_eq!(body["MaximumBatchingWindowInSeconds"], 1);
+        let mut invalid = props.clone();
+        invalid["ScalingConfig"]["MaximumConcurrency"] = json!(1);
+        assert!(validate_lambda_event_source_mapping("Mapping", &invalid).is_err());
+        invalid = props.clone();
+        invalid["MaximumBatchingWindowInSeconds"] = json!(0);
+        assert!(validate_lambda_event_source_mapping("Mapping", &invalid).is_err());
+        invalid = props.clone();
+        invalid["EventSourceArn"] = json!("arn:aws:sqs:us-east-1:000000000000:queue.fifo");
+        assert!(validate_lambda_event_source_mapping("Mapping", &invalid).is_err());
+        let mut cleared = props;
+        cleared["ScalingConfig"] = json!({});
+        validate_lambda_event_source_mapping("Mapping", &cleared).unwrap();
     }
 }

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 /// A parsed Query request: the flat parameter map.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Query {
     pub params: BTreeMap<String, String>,
 }

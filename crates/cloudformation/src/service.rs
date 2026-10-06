@@ -78,6 +78,181 @@ impl CfnHandler {
         }
     }
 
+    /// Public lifecycle requests acknowledge durable admission, not backend completion.
+    async fn admit_public(
+        self,
+        op: &str,
+        q: &Query,
+        region: &str,
+        account: &str,
+    ) -> Result<String, CfnError> {
+        let change = if op == "ExecuteChangeSet" {
+            Some(self.lookup_change_set(q, region, account)?)
+        } else {
+            None
+        };
+        let operation = match change.as_ref() {
+            Some(cs) if cs.change_type == "CREATE" => "CreateStack",
+            Some(_) => "UpdateStack",
+            None => op,
+        };
+        let mut request = change
+            .as_ref()
+            .map(|cs| cs.request.clone())
+            .unwrap_or_else(|| q.clone());
+        let requested_name = request
+            .get("StackName")
+            .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
+        let existing = self.store.find(account, region, &requested_name);
+        if operation == "DeleteStack"
+            && existing
+                .as_ref()
+                .is_none_or(|s| s.status == StackStatus::DeleteComplete)
+        {
+            return Ok(String::new());
+        }
+        let name = existing
+            .as_ref()
+            .map(|s| s.stack_name.clone())
+            .unwrap_or(requested_name);
+        request.params.insert("StackName".into(), name.clone());
+        let permit = self.store.operation(account, region, &name)?;
+        // Re-read after taking ownership: a previous operation may have completed
+        // between the initial ARN/name lookup and this permit acquisition.
+        let existing = self.store.get(account, region, &name);
+        if operation == "DeleteStack" && existing.is_none() {
+            return Ok(String::new());
+        }
+        if existing.as_ref().is_some_and(|s| {
+            matches!(
+                s.status,
+                StackStatus::CreateInProgress
+                    | StackStatus::UpdateInProgress
+                    | StackStatus::DeleteInProgress
+            )
+        }) {
+            return Err(CfnError::Validation(format!(
+                "Stack [{name}] has an operation in progress"
+            )));
+        }
+        if operation == "CreateStack" && existing.is_some() {
+            return Err(CfnError::AlreadyExists(format!(
+                "Stack [{name}] already exists"
+            )));
+        }
+        if operation != "CreateStack"
+            && existing
+                .as_ref()
+                .is_none_or(|s| s.status == StackStatus::DeleteComplete)
+        {
+            return Err(CfnError::Validation(format!(
+                "Stack [{name}] does not exist"
+            )));
+        }
+        let mut stack = if operation == "CreateStack" {
+            Stack {
+                stack_id: change
+                    .as_ref()
+                    .map(|cs| cs.stack_id.clone())
+                    .unwrap_or_else(|| make_stack_id(region, account, &name)),
+                stack_name: name.clone(),
+                status: StackStatus::CreateInProgress,
+                template_body: String::new(),
+                parameters: Default::default(),
+                resources: Vec::new(),
+                outputs: Vec::new(),
+                events: Vec::new(),
+                tags: request.tags(),
+                creation_time: now_iso(),
+                last_updated_time: None,
+            }
+        } else {
+            existing.clone().unwrap()
+        };
+        if operation != "DeleteStack" {
+            let body = self
+                .resolve_template_body(&request, region, account)
+                .await?;
+            let template = Template::parse(&body)?;
+            check_capabilities(&request, &template)?;
+            let parameters = effective_parameters(&request, &template, existing.as_ref())?;
+            let conditions = template.evaluate_conditions(region, account, &parameters)?;
+            let active = template.active_resources(&conditions)?;
+            template.active_outputs(&conditions, &active)?;
+            if operation == "UpdateStack"
+                && stack.template_body == body
+                && stack.parameters == parameters
+                && (request.tags().is_empty() || stack.tags == request.tags())
+            {
+                return Err(CfnError::Validation(
+                    "No updates are to be performed.".into(),
+                ));
+            }
+            // Snapshot TemplateURL once. The worker must not fetch a different template later.
+            request.params.remove("TemplateURL");
+            request.params.insert("TemplateBody".into(), body.clone());
+            if operation == "CreateStack" {
+                stack.template_body = body;
+                stack.parameters = parameters;
+            }
+        } else {
+            Template::parse(&stack.template_body)?;
+        }
+        stack.status = match operation {
+            "CreateStack" => StackStatus::CreateInProgress,
+            "UpdateStack" => StackStatus::UpdateInProgress,
+            _ => StackStatus::DeleteInProgress,
+        };
+        if operation == "UpdateStack" {
+            stack.last_updated_time = Some(now_iso());
+        }
+        stack
+            .events
+            .push(event(&name, STACK_TYPE, stack.status.as_str(), None));
+        let stack_id = stack.stack_id.clone();
+        self.store.admit(account, region, stack, change.as_ref())?;
+        let response = if op == "CreateStack" || op == "UpdateStack" {
+            text_el("StackId", &stack_id)
+        } else {
+            String::new()
+        };
+        let operation = operation.to_owned();
+        let region = region.to_owned();
+        let account = account.to_owned();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = match operation.as_str() {
+                "CreateStack" => {
+                    self.create_stack(&request, &region, &account, Some(&stack_id))
+                        .await
+                }
+                "UpdateStack" => self.update_stack(&request, &region, &account).await,
+                _ => self.delete_stack(&request, &region, &account).await,
+            };
+            if let Err(error) = result {
+                if let Some(mut stack) = self.store.get(&account, &region, &name) {
+                    stack.status = match operation.as_str() {
+                        "CreateStack" => StackStatus::CreateFailed,
+                        "UpdateStack" => StackStatus::UpdateFailed,
+                        _ => StackStatus::DeleteFailed,
+                    };
+                    stack.events.push(event(
+                        &name,
+                        STACK_TYPE,
+                        stack.status.as_str(),
+                        Some(error.to_string()),
+                    ));
+                    if self.store.put(&account, &region, stack).is_err() {
+                        tracing::error!(
+                            "failed to persist CloudFormation background operation failure"
+                        );
+                    }
+                }
+            }
+        });
+        Ok(response)
+    }
+
     async fn resolve_template_body(
         &self,
         q: &Query,
@@ -202,7 +377,7 @@ impl CfnHandler {
                 request,
                 changes,
             },
-        );
+        )?;
         if !inserted {
             return Err(CfnError::AlreadyExists(format!(
                 "ChangeSet [{name}] already exists"
@@ -259,7 +434,24 @@ impl CfnHandler {
             text_el(
                 "ExecutionStatus",
                 if cs.executed {
-                    "EXECUTE_COMPLETE"
+                    match self
+                        .store
+                        .find(account, region, &cs.stack_id)
+                        .map(|stack| stack.status)
+                    {
+                        Some(
+                            StackStatus::CreateInProgress
+                            | StackStatus::UpdateInProgress
+                            | StackStatus::DeleteInProgress,
+                        ) => "EXECUTE_IN_PROGRESS",
+                        Some(
+                            StackStatus::CreateFailed
+                            | StackStatus::UpdateFailed
+                            | StackStatus::DeleteFailed,
+                        )
+                        | None => "EXECUTE_FAILED",
+                        _ => "EXECUTE_COMPLETE",
+                    }
                 } else if cs.status == "FAILED" {
                     "UNAVAILABLE"
                 } else {
@@ -279,7 +471,7 @@ impl CfnHandler {
         account: &str,
     ) -> Result<String, CfnError> {
         let cs = self.lookup_change_set(q, region, account)?;
-        if !self.store.claim_change_set(account, region, &cs) {
+        if !self.store.claim_change_set(account, region, &cs)? {
             return Err(CfnError::Validation(format!(
                 "ChangeSet [{}] is not executable",
                 cs.name
@@ -301,7 +493,7 @@ impl CfnHandler {
         account: &str,
     ) -> Result<String, CfnError> {
         let cs = self.lookup_change_set(q, region, account)?;
-        self.store.remove_change_set(account, region, &cs);
+        self.store.remove_change_set(account, region, &cs)?;
         Ok(String::new())
     }
 
@@ -315,7 +507,11 @@ impl CfnHandler {
         let name = q
             .get("StackName")
             .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
-        if self.store.get(account, region, &name).is_some() {
+        let admission = self.store.get(account, region, &name);
+        if admission.as_ref().is_some_and(|stack| {
+            !(stack.status == StackStatus::CreateInProgress
+                && change_set_stack_id == Some(stack.stack_id.as_str()))
+        }) {
             return Err(CfnError::AlreadyExists(format!(
                 "Stack [{name}] already exists"
             )));
@@ -331,7 +527,12 @@ impl CfnHandler {
             .map(str::to_string)
             .unwrap_or_else(|| make_stack_id(region, account, &name));
 
-        let (status, resources, outputs, events) = self
+        let now = admission
+            .as_ref()
+            .map(|stack| stack.creation_time.clone())
+            .unwrap_or_else(now_iso);
+
+        let (status, resources, outputs, mut events) = self
             .provision(
                 &name,
                 &stack_id,
@@ -348,7 +549,16 @@ impl CfnHandler {
             )
             .await;
 
-        let now = now_iso();
+        if let Some(admission) = &admission {
+            events.retain(|event| {
+                !(event.logical_id == name
+                    && event.resource_type == STACK_TYPE
+                    && event.status == "CREATE_IN_PROGRESS")
+            });
+            let mut recorded = admission.events.clone();
+            recorded.append(&mut events);
+            events = recorded;
+        }
         let stack = Stack {
             stack_id: stack_id.clone(),
             stack_name: name.clone(),
@@ -362,7 +572,7 @@ impl CfnHandler {
             creation_time: now,
             last_updated_time: None,
         };
-        self.store.put(account, region, stack);
+        self.store.put(account, region, stack)?;
         Ok(format!("<StackId>{}</StackId>", xml_escape(&stack_id)))
     }
 
@@ -399,7 +609,7 @@ impl CfnHandler {
                 &mut existing.events,
             )
             .await;
-            self.store.put(account, region, existing.clone());
+            self.store.put(account, region, existing.clone())?;
             if failed {
                 return Err(CfnError::Validation(
                     "Previous network replacement cleanup is still pending; inspect stack events"
@@ -460,7 +670,7 @@ impl CfnHandler {
             last_updated_time: Some(now_iso()),
         };
         let stack_id = stack.stack_id.clone();
-        self.store.put(account, region, stack);
+        self.store.put(account, region, stack)?;
         Ok(format!("<StackId>{}</StackId>", xml_escape(&stack_id)))
     }
 
@@ -695,7 +905,7 @@ impl CfnHandler {
                     "DELETE_COMPLETE",
                     None,
                 ));
-                self.store.archive(account, region, stack);
+                self.store.archive(account, region, stack)?;
             } else {
                 let reason = failures.join("; ");
                 stack.status = StackStatus::DeleteFailed;
@@ -706,7 +916,7 @@ impl CfnHandler {
                     "DELETE_FAILED",
                     Some(reason),
                 ));
-                self.store.put(account, region, stack);
+                self.store.put(account, region, stack)?;
             }
         }
         // Deleting a non-existent stack is a no-op success in AWS.
@@ -1591,10 +1801,19 @@ impl NativeHandler for CfnHandler {
                     locallycloud_core::integration::RequestIdentity::access_key_from_authorization,
                 ),
         };
-        match execution
-            .dispatch(&op, &q, &request.region, &request.account_id)
-            .await
-        {
+        let result = if matches!(
+            op.as_str(),
+            "CreateStack" | "UpdateStack" | "DeleteStack" | "ExecuteChangeSet"
+        ) {
+            execution
+                .admit_public(&op, &q, &request.region, &request.account_id)
+                .await
+        } else {
+            execution
+                .dispatch(&op, &q, &request.region, &request.account_id)
+                .await
+        };
+        match result {
             Ok(inner) => {
                 let body = query_envelope(&op, &inner, &request.request_id);
                 Response::builder()
@@ -1617,6 +1836,27 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
         ServiceMetadata::new(AwsProtocol::Query, None),
         handler,
     );
+}
+
+/// Restore encrypted ownership metadata before exposing the service.
+pub fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+) -> Result<(), String> {
+    let store = CfnStore::with_state(&state).map_err(|_| {
+        "CloudFormation state could not be loaded; check the state database and master key"
+            .to_owned()
+    })?;
+    registry.register_native(
+        ServiceName::new("cloudformation"),
+        ServiceMetadata::new(AwsProtocol::Query, None),
+        Arc::new(CfnHandler {
+            store,
+            registry: Arc::downgrade(registry),
+            caller_access_key: None,
+        }),
+    );
+    Ok(())
 }
 
 fn check_capabilities(q: &Query, template: &Template) -> Result<(), CfnError> {
@@ -1879,7 +2119,7 @@ fn change_set_changes(
             changes.push(ChangeSetChange {
                 logical_id: resource.logical_id.clone(),
                 resource_type: resource.resource_type.clone(),
-                action,
+                action: action.into(),
                 physical_id: existing
                     .and_then(|stack| stack.resource(&resource.logical_id))
                     .map(|resource| resource.physical_id.clone()),
@@ -1891,7 +2131,7 @@ fn change_set_changes(
             changes.push(ChangeSetChange {
                 logical_id: resource.logical_id.clone(),
                 resource_type: resource.resource_type,
-                action: "Remove",
+                action: "Remove".into(),
                 physical_id: existing
                     .and_then(|stack| stack.resource(&resource.logical_id))
                     .map(|resource| resource.physical_id.clone()),
@@ -2172,6 +2412,623 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    async fn wait_stack_terminal(store: &CfnStore, name: &str) -> Stack {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(stack) = store.find("000000000000", "us-east-1", name) {
+                    if !matches!(
+                        stack.status,
+                        StackStatus::CreateInProgress
+                            | StackStatus::UpdateInProgress
+                            | StackStatus::DeleteInProgress
+                    ) {
+                        return stack;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background stack completes")
+    }
+
+    #[tokio::test]
+    async fn public_lifecycle_admission_is_bounded_nonblocking_and_reports_real_progress() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct BarrierS3 {
+            inner: Arc<dyn NativeHandler>,
+            blocked: AtomicBool,
+            release: tokio::sync::Semaphore,
+            started: AtomicUsize,
+        }
+        #[async_trait]
+        impl NativeHandler for BarrierS3 {
+            async fn handle(&self, request: ServiceRequest) -> Response {
+                if self.blocked.load(Ordering::SeqCst)
+                    && matches!(request.method, Method::PUT | Method::DELETE)
+                {
+                    self.started.fetch_add(1, Ordering::SeqCst);
+                    self.release.acquire().await.unwrap().forget();
+                }
+                self.inner.handle(request).await
+            }
+        }
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_s3::register(&registry);
+        let backend = Arc::new(BarrierS3 {
+            inner: registry.native_handler(&ServiceName::new("s3")).unwrap(),
+            blocked: AtomicBool::new(true),
+            release: tokio::sync::Semaphore::new(0),
+            started: AtomicUsize::new(0),
+        });
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            backend.clone(),
+        );
+        let handler = CfnHandler::new(Arc::downgrade(&registry));
+        async fn started(backend: &BarrierS3, expected: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while backend.started.load(Ordering::SeqCst) < expected {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        async fn call(handler: &CfnHandler, action: &str, query: &Query) -> (u16, String) {
+            let mut params = query.params.clone();
+            params.insert("Action".into(), action.into());
+            let body = params
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{key}={}",
+                        value
+                            .bytes()
+                            .map(|byte| format!("%{byte:02X}"))
+                            .collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            let response = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                handler.handle(ServiceRequest {
+                    method: Method::POST,
+                    uri: "/".parse().unwrap(),
+                    headers: Default::default(),
+                    body: Bytes::from(body),
+                    region: "us-east-1".into(),
+                    account_id: "000000000000".into(),
+                    request_id: "async-gate".into(),
+                }),
+            )
+            .await
+            .expect("public response must not wait for blocked backend");
+            (
+                response.status().as_u16(),
+                String::from_utf8(
+                    axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap(),
+            )
+        }
+        let template = |name: &str, enabled: bool| {
+            serde_json::json!({"Resources":{"Bucket":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":format!("async-{name}"),"VersioningConfiguration":{"Status":if enabled {"Enabled"} else {"Suspended"}}}}}}).to_string()
+        };
+        let query = |name: &str, enabled: bool| Query {
+            params: [
+                ("StackName".into(), name.into()),
+                ("TemplateBody".into(), template(name, enabled)),
+            ]
+            .into(),
+        };
+        let mut creation_times = BTreeMap::new();
+        for name in ["first", "second", "third", "fourth"] {
+            let (status, body) = call(&handler, "CreateStack", &query(name, false)).await;
+            assert_eq!(status, 200);
+            assert!(body.contains("<StackId>"));
+            assert_eq!(
+                handler
+                    .store
+                    .get("000000000000", "us-east-1", name)
+                    .unwrap()
+                    .status,
+                StackStatus::CreateInProgress
+            );
+            creation_times.insert(
+                name,
+                handler
+                    .store
+                    .get("000000000000", "us-east-1", name)
+                    .unwrap()
+                    .creation_time,
+            );
+        }
+        let (status, body) = call(&handler, "CreateStack", &query("fifth", false)).await;
+        assert_eq!(status, 400);
+        assert!(body.contains("LimitExceededException"));
+        assert!(handler
+            .store
+            .get("000000000000", "us-east-1", "fifth")
+            .is_none());
+        assert_eq!(
+            call(&handler, "UpdateStack", &query("first", true)).await.0,
+            400
+        );
+        assert!(
+            call(&handler, "DescribeStackEvents", &query("first", false))
+                .await
+                .1
+                .contains("CREATE_IN_PROGRESS")
+        );
+        started(&backend, 4).await;
+        backend.blocked.store(false, Ordering::Release);
+        backend.release.add_permits(4);
+        for name in ["first", "second", "third", "fourth"] {
+            let completed = wait_stack_terminal(&handler.store, name).await;
+            assert_eq!(completed.status, StackStatus::CreateComplete);
+            assert_eq!(
+                completed.creation_time, creation_times[name],
+                "CreationTime must be stable across admission/completion"
+            );
+        }
+        // Validation errors never leave an in-progress placeholder or occupy a slot.
+        let mut invalid = query("invalid", false);
+        invalid
+            .params
+            .insert("TemplateBody".into(), "not a template".into());
+        assert_eq!(call(&handler, "CreateStack", &invalid).await.0, 400);
+        assert!(handler
+            .store
+            .get("000000000000", "us-east-1", "invalid")
+            .is_none());
+        assert_eq!(
+            call(&handler, "UpdateStack", &query("first", false))
+                .await
+                .0,
+            400
+        );
+        backend.blocked.store(true, Ordering::SeqCst);
+        assert_eq!(
+            call(&handler, "UpdateStack", &query("first", true)).await.0,
+            200
+        );
+        assert_eq!(
+            handler
+                .store
+                .get("000000000000", "us-east-1", "first")
+                .unwrap()
+                .status,
+            StackStatus::UpdateInProgress
+        );
+        started(&backend, 5).await;
+        backend.blocked.store(false, Ordering::Release);
+        backend.release.add_permits(1);
+        assert_eq!(
+            wait_stack_terminal(&handler.store, "first").await.status,
+            StackStatus::UpdateComplete
+        );
+        let mut change = query("first", false);
+        change
+            .params
+            .insert("ChangeSetName".into(), "disable-versioning".into());
+        change
+            .params
+            .insert("ChangeSetType".into(), "UPDATE".into());
+        assert_eq!(call(&handler, "CreateChangeSet", &change).await.0, 200);
+        backend.blocked.store(true, Ordering::SeqCst);
+        assert_eq!(call(&handler, "ExecuteChangeSet", &change).await.0, 200);
+        assert!(call(&handler, "DescribeChangeSet", &change)
+            .await
+            .1
+            .contains("EXECUTE_IN_PROGRESS"));
+        assert_eq!(call(&handler, "ExecuteChangeSet", &change).await.0, 400);
+        started(&backend, 6).await;
+        backend.blocked.store(false, Ordering::Release);
+        backend.release.add_permits(1);
+        assert_eq!(
+            wait_stack_terminal(&handler.store, "first").await.status,
+            StackStatus::UpdateComplete
+        );
+        assert!(call(&handler, "DescribeChangeSet", &change)
+            .await
+            .1
+            .contains("EXECUTE_COMPLETE"));
+        backend.blocked.store(true, Ordering::SeqCst);
+        let stack_id = handler
+            .store
+            .get("000000000000", "us-east-1", "first")
+            .unwrap()
+            .stack_id;
+        assert_eq!(
+            call(&handler, "DeleteStack", &query("first", false))
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            handler
+                .store
+                .get("000000000000", "us-east-1", "first")
+                .unwrap()
+                .status,
+            StackStatus::DeleteInProgress
+        );
+        started(&backend, 7).await;
+        backend.blocked.store(false, Ordering::Release);
+        backend.release.add_permits(1);
+        assert_eq!(
+            wait_stack_terminal(&handler.store, &stack_id).await.status,
+            StackStatus::DeleteComplete
+        );
+        assert_eq!(
+            call(&handler, "DeleteStack", &query("first", false))
+                .await
+                .0,
+            200
+        );
+        for name in ["second", "third", "fourth"] {
+            let id = handler
+                .store
+                .get("000000000000", "us-east-1", name)
+                .unwrap()
+                .stack_id;
+            assert_eq!(
+                call(&handler, "DeleteStack", &query(name, false)).await.0,
+                200
+            );
+            assert_eq!(
+                wait_stack_terminal(&handler.store, &id).await.status,
+                StackStatus::DeleteComplete
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_completed_stack_restart_updates_and_deletes_actual_queue() {
+        use locallycloud_state::{StateCipher, StateDb};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/cfn-durable-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let make_handler = || {
+            let registry = Arc::new(ServiceRegistry::new());
+            locallycloud_sqs::register_with_state(&registry, db.clone()).unwrap();
+            let handler = CfnHandler {
+                store: CfnStore::with_cipher(&db, StateCipher::with_key(&[31; 32])).unwrap(),
+                registry: Arc::downgrade(&registry),
+                caller_access_key: None,
+            };
+            (registry, handler)
+        };
+        let account = "000000000000";
+        let region = "us-east-1";
+        let template = serde_json::json!({
+            "Parameters":{"Password":{"Type":"String","NoEcho":true}},
+            "Resources":{"Queue":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":"durable-orders","VisibilityTimeout":30}}},
+            "Outputs":{"QueueUrl":{"Value":{"Ref":"Queue"},"Export":{"Name":"DurableOrdersQueue"}}}
+        });
+        let mut query = Query {
+            params: [
+                ("StackName".into(), "orders".into()),
+                ("TemplateBody".into(), template.to_string()),
+                ("Parameters.member.1.ParameterKey".into(), "Password".into()),
+                (
+                    "Parameters.member.1.ParameterValue".into(),
+                    "do-not-display".into(),
+                ),
+            ]
+            .into(),
+        };
+        let (registry, handler) = make_handler();
+        handler
+            .dispatch("CreateStack", &query, region, account)
+            .await
+            .unwrap();
+        let initial = handler.store.get(account, region, "orders").unwrap();
+        assert_eq!(initial.status, StackStatus::CreateComplete);
+        assert!(initial.resources[0].physical_id.contains("durable-orders"));
+        drop(handler);
+        drop(registry);
+        let (registry, handler) = make_handler();
+        let description = handler
+            .dispatch("DescribeStacks", &query, region, account)
+            .await
+            .unwrap();
+        assert!(description.contains("DurableOrdersQueue"));
+        assert!(description.contains("*****"));
+        assert!(!description.contains("do-not-display"));
+        assert!(handler
+            .dispatch("DescribeStackEvents", &query, region, account)
+            .await
+            .unwrap()
+            .contains("CREATE_COMPLETE"));
+        let mut next = template.clone();
+        next["Resources"]["Queue"]["Properties"]["VisibilityTimeout"] = serde_json::json!(45);
+        query.params.insert("TemplateBody".into(), next.to_string());
+        handler
+            .dispatch("UpdateStack", &query, region, account)
+            .await
+            .unwrap();
+        assert_eq!(
+            handler.store.get(account, region, "orders").unwrap().status,
+            StackStatus::UpdateComplete
+        );
+        drop(handler);
+        drop(registry);
+        let (registry, handler) = make_handler();
+        let provisioner = handler.provisioner(region, account);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-target",
+            "AmazonSQS.GetQueueAttributes".parse().unwrap(),
+        );
+        headers.insert(
+            "content-type",
+            "application/x-amz-json-1.0".parse().unwrap(),
+        );
+        let body = serde_json::json!({"QueueUrl":initial.resources[0].physical_id,"AttributeNames":["VisibilityTimeout"]});
+        let (status, response) = provisioner
+            .call(
+                "sqs",
+                Method::POST,
+                "/",
+                headers.clone(),
+                Bytes::from(body.to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response).unwrap()["Attributes"]["VisibilityTimeout"],
+            "45"
+        );
+        handler
+            .dispatch("DeleteStack", &query, region, account)
+            .await
+            .unwrap();
+        assert_eq!(
+            provisioner
+                .call(
+                    "sqs",
+                    Method::POST,
+                    "/",
+                    headers,
+                    Bytes::from(body.to_string())
+                )
+                .await
+                .unwrap()
+                .0,
+            400
+        );
+        drop(provisioner);
+        drop(handler);
+        drop(registry);
+        let (registry, handler) = make_handler();
+        assert!(handler.store.get(account, region, "orders").is_none());
+        assert_eq!(
+            handler
+                .store
+                .find(account, region, &initial.stack_id)
+                .unwrap()
+                .status,
+            StackStatus::DeleteComplete
+        );
+        drop(handler);
+        drop(registry);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_update_stack_preserves_operator_and_sqs_denial_prevents_creation() {
+        use locallycloud_core::integration::authorization::{
+            AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
+        };
+        use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
+        use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
+        struct OperatorAuthorization {
+            deny_create: AtomicBool,
+            seen: Mutex<Vec<AuthorizationRequest>>,
+        }
+        impl AuthorizationEvaluator for OperatorAuthorization {
+            fn strict_sigv4_required(&self) -> bool {
+                true
+            }
+            fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError> {
+                assert_eq!(request.request_identity.account_id, "000000000000");
+                assert_eq!(
+                    request.request_identity.access_key_id.as_deref(),
+                    Some("OPERATOR")
+                );
+                assert!(request.delegated_identity.is_none());
+                let deny =
+                    request.action == "sqs:CreateQueue" && self.deny_create.load(Ordering::Relaxed);
+                self.seen.lock().unwrap().push(request);
+                if deny {
+                    Err(AuthorizationError::Denied)
+                } else {
+                    Ok(())
+                }
+            }
+            fn resolve_caller_arn(
+                &self,
+                identity: &RequestIdentity,
+            ) -> Result<Option<String>, AuthorizationError> {
+                Ok((identity.access_key_id.as_deref() == Some("OPERATOR")
+                    && identity.account_id == "000000000000")
+                    .then(|| "arn:aws:iam::000000000000:user/operator".into()))
+            }
+        }
+        #[async_trait]
+        impl NativeHandler for OperatorAuthorization {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                http::Response::builder()
+                    .status(501)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }
+        let registry = Arc::new(ServiceRegistry::new());
+        let evaluator = Arc::new(OperatorAuthorization {
+            deny_create: AtomicBool::new(false),
+            seen: Mutex::new(vec![]),
+        });
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            evaluator.clone(),
+            evaluator.clone(),
+        );
+        locallycloud_s3::register(&registry);
+        locallycloud_sqs::register(&registry);
+        let dispatcher = Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        ));
+        registry.set_internal_dispatcher(dispatcher.clone());
+        let handler = CfnHandler::new(Arc::downgrade(&registry));
+        for denied in [false, true] {
+            let name = if denied { "denied" } else { "allowed" };
+            let mut template = serde_json::json!({"Resources":{"Artifacts":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":format!("{name}-artifacts")}}}});
+            for operation in ["CreateStack", "UpdateStack"] {
+                if operation == "UpdateStack" {
+                    template["Resources"]["Queue"] = serde_json::json!({"Type":"AWS::SQS::Queue","Properties":{"QueueName":format!("{name}-queue")}});
+                    evaluator.deny_create.store(denied, Ordering::Relaxed);
+                }
+                let encoded: String = template
+                    .to_string()
+                    .bytes()
+                    .map(|b| format!("%{b:02X}"))
+                    .collect();
+                let mut headers = http::HeaderMap::new();
+                headers.insert(http::header::AUTHORIZATION,"AWS4-HMAC-SHA256 Credential=OPERATOR/20261006/us-east-1/cloudformation/aws4_request".parse().unwrap());
+                let response = handler
+                    .handle(ServiceRequest {
+                        method: Method::POST,
+                        uri: "/".parse().unwrap(),
+                        headers,
+                        body: Bytes::from(format!(
+                            "Action={operation}&StackName={name}&TemplateBody={encoded}"
+                        )),
+                        region: "us-east-1".into(),
+                        account_id: "000000000000".into(),
+                        request_id: "operator-stack".into(),
+                    })
+                    .await;
+                assert_eq!(response.status(), 200);
+                wait_stack_terminal(&handler.store, name).await;
+            }
+            let stack = handler
+                .store
+                .find("000000000000", "us-east-1", name)
+                .unwrap();
+            assert_eq!(
+                stack.status,
+                if denied {
+                    StackStatus::UpdateFailed
+                } else {
+                    StackStatus::UpdateComplete
+                }
+            );
+            let p = handler
+                .provisioner("us-east-1", "000000000000")
+                .with_caller_access_key(Some("OPERATOR".into()));
+            let queue = p
+                .call(
+                    "sqs",
+                    Method::POST,
+                    "/",
+                    {
+                        let mut h = http::HeaderMap::new();
+                        h.insert("x-amz-target", "AmazonSQS.GetQueueUrl".parse().unwrap());
+                        h.insert(
+                            "content-type",
+                            "application/x-amz-json-1.0".parse().unwrap(),
+                        );
+                        h
+                    },
+                    Bytes::from(
+                        serde_json::json!({"QueueName":format!("{name}-queue")}).to_string(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(queue.0, if denied { 400 } else { 200 });
+        }
+        {
+            let seen = evaluator.seen.lock().unwrap();
+            assert_eq!(
+                seen.iter()
+                    .filter(|r| r.action == "sqs:CreateQueue")
+                    .count(),
+                2
+            );
+            assert!(seen
+                .iter()
+                .filter(|r| r.action == "sqs:CreateQueue")
+                .all(|r| r
+                    .resource
+                    .starts_with("arn:aws:sqs:us-east-1:000000000000:")));
+        }
+        let missing = handler
+            .provisioner("us-east-1", "000000000000")
+            .with_caller_access_key(Some("UNKNOWN".into()));
+        assert!(missing
+            .provision(
+                "Missing",
+                "stack",
+                "AWS::SQS::Queue",
+                &serde_json::json!({"QueueName":"unknown-caller"})
+            )
+            .await
+            .is_err());
+        // Even Core-attested scope cannot substitute a different principal for the operator.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-target", "AmazonSQS.CreateQueue".parse().unwrap());
+        headers.insert(
+            "content-type",
+            "application/x-amz-json-1.0".parse().unwrap(),
+        );
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=OPERATOR/20261006/us-east-1/sqs/aws4_request"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            "arn:aws:iam::000000000000:user/other".parse().unwrap(),
+        );
+        let response = dispatcher
+            .dispatch_scoped(
+                &Method::POST,
+                &"/".parse().unwrap(),
+                &headers,
+                Bytes::from(r#"{"QueueName":"mismatched-principal"}"#),
+                "mismatch",
+                "000000000000",
+                "us-east-1",
+            )
+            .await;
+        assert_eq!(response.status(), 403);
+    }
 
     struct TestS3 {
         failed_put: Option<&'static str>,
@@ -2470,30 +3327,33 @@ mod tests {
             }
         })
         .to_string();
-        handler.store.put(
-            "000000000000",
-            "us-east-1",
-            Stack {
-                stack_id: "stack-id".into(),
-                stack_name: "stack".into(),
-                status: StackStatus::CreateComplete,
-                template_body,
-                parameters: BTreeMap::new(),
-                resources: vec![StackResource {
-                    logical_id: "Bucket".into(),
-                    physical_id: "bucket".into(),
-                    resource_type: "AWS::S3::Bucket".into(),
-                    status: "CREATE_COMPLETE".into(),
-                    attributes: BTreeMap::new(),
-                    pending_cleanup: Vec::new(),
-                }],
-                outputs: Vec::new(),
-                events: Vec::new(),
-                tags: Vec::new(),
-                creation_time: now_iso(),
-                last_updated_time: None,
-            },
-        );
+        handler
+            .store
+            .put(
+                "000000000000",
+                "us-east-1",
+                Stack {
+                    stack_id: "stack-id".into(),
+                    stack_name: "stack".into(),
+                    status: StackStatus::CreateComplete,
+                    template_body,
+                    parameters: BTreeMap::new(),
+                    resources: vec![StackResource {
+                        logical_id: "Bucket".into(),
+                        physical_id: "bucket".into(),
+                        resource_type: "AWS::S3::Bucket".into(),
+                        status: "CREATE_COMPLETE".into(),
+                        attributes: BTreeMap::new(),
+                        pending_cleanup: Vec::new(),
+                    }],
+                    outputs: Vec::new(),
+                    events: Vec::new(),
+                    tags: Vec::new(),
+                    creation_time: now_iso(),
+                    last_updated_time: None,
+                },
+            )
+            .unwrap();
 
         handler
             .delete_stack(
@@ -2861,23 +3721,26 @@ mod tests {
             pending_cleanup: Vec::new(),
         })
         .collect();
-        handler.store.put(
-            "000000000000",
-            "us-east-1",
-            Stack {
-                stack_id: "drain-stack-id".into(),
-                stack_name: "drain-stack".into(),
-                status: StackStatus::CreateComplete,
-                template_body: body,
-                parameters: BTreeMap::new(),
-                resources,
-                outputs: Vec::new(),
-                events: Vec::new(),
-                tags: Vec::new(),
-                creation_time: now_iso(),
-                last_updated_time: None,
-            },
-        );
+        handler
+            .store
+            .put(
+                "000000000000",
+                "us-east-1",
+                Stack {
+                    stack_id: "drain-stack-id".into(),
+                    stack_name: "drain-stack".into(),
+                    status: StackStatus::CreateComplete,
+                    template_body: body,
+                    parameters: BTreeMap::new(),
+                    resources,
+                    outputs: Vec::new(),
+                    events: Vec::new(),
+                    tags: Vec::new(),
+                    creation_time: now_iso(),
+                    last_updated_time: None,
+                },
+            )
+            .unwrap();
         let query = Query::parse(b"StackName=drain-stack");
         handler
             .delete_stack(&query, "us-east-1", "000000000000")
@@ -2940,40 +3803,43 @@ mod tests {
             }
         })
         .to_string();
-        handler.store.put(
-            "000000000000",
-            "us-east-1",
-            Stack {
-                stack_id: "stack-id".into(),
-                stack_name: "stack".into(),
-                status: StackStatus::CreateComplete,
-                template_body,
-                parameters: BTreeMap::new(),
-                resources: vec![
-                    StackResource {
-                        logical_id: "Kept".into(),
-                        physical_id: "kept".into(),
-                        resource_type: "AWS::S3::Bucket".into(),
-                        status: "CREATE_COMPLETE".into(),
-                        attributes: BTreeMap::new(),
-                        pending_cleanup: Vec::new(),
-                    },
-                    StackResource {
-                        logical_id: "Eph".into(),
-                        physical_id: "eph".into(),
-                        resource_type: "AWS::S3::Bucket".into(),
-                        status: "CREATE_COMPLETE".into(),
-                        attributes: BTreeMap::new(),
-                        pending_cleanup: Vec::new(),
-                    },
-                ],
-                outputs: Vec::new(),
-                events: Vec::new(),
-                tags: Vec::new(),
-                creation_time: now_iso(),
-                last_updated_time: None,
-            },
-        );
+        handler
+            .store
+            .put(
+                "000000000000",
+                "us-east-1",
+                Stack {
+                    stack_id: "stack-id".into(),
+                    stack_name: "stack".into(),
+                    status: StackStatus::CreateComplete,
+                    template_body,
+                    parameters: BTreeMap::new(),
+                    resources: vec![
+                        StackResource {
+                            logical_id: "Kept".into(),
+                            physical_id: "kept".into(),
+                            resource_type: "AWS::S3::Bucket".into(),
+                            status: "CREATE_COMPLETE".into(),
+                            attributes: BTreeMap::new(),
+                            pending_cleanup: Vec::new(),
+                        },
+                        StackResource {
+                            logical_id: "Eph".into(),
+                            physical_id: "eph".into(),
+                            resource_type: "AWS::S3::Bucket".into(),
+                            status: "CREATE_COMPLETE".into(),
+                            attributes: BTreeMap::new(),
+                            pending_cleanup: Vec::new(),
+                        },
+                    ],
+                    outputs: Vec::new(),
+                    events: Vec::new(),
+                    tags: Vec::new(),
+                    creation_time: now_iso(),
+                    last_updated_time: None,
+                },
+            )
+            .unwrap();
 
         handler
             .delete_stack(
@@ -3319,25 +4185,28 @@ mod tests {
         assert!(updated
             .iter()
             .all(|resource| resource.pending_cleanup.is_empty()));
-        handler.store.put(
-            "000000000000",
-            "us-east-1",
-            Stack {
-                stack_id:
-                    "arn:aws:cloudformation:us-east-1:000000000000:stack/replacement-stack/id"
-                        .into(),
-                stack_name: "replacement-stack".into(),
-                status: StackStatus::UpdateComplete,
-                template_body: changed_body,
-                parameters: BTreeMap::new(),
-                resources: updated,
-                outputs: Vec::new(),
-                events,
-                tags: Vec::new(),
-                creation_time: now_iso(),
-                last_updated_time: None,
-            },
-        );
+        handler
+            .store
+            .put(
+                "000000000000",
+                "us-east-1",
+                Stack {
+                    stack_id:
+                        "arn:aws:cloudformation:us-east-1:000000000000:stack/replacement-stack/id"
+                            .into(),
+                    stack_name: "replacement-stack".into(),
+                    status: StackStatus::UpdateComplete,
+                    template_body: changed_body,
+                    parameters: BTreeMap::new(),
+                    resources: updated,
+                    outputs: Vec::new(),
+                    events,
+                    tags: Vec::new(),
+                    creation_time: now_iso(),
+                    last_updated_time: None,
+                },
+            )
+            .unwrap();
         handler
             .delete_stack(
                 &Query::parse(b"StackName=replacement-stack"),
