@@ -153,7 +153,7 @@ impl QueryResult {
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|value| csv_field(value.as_deref().unwrap_or("")))
+                    .map(|value| value.as_deref().map(csv_field).unwrap_or_default())
                     .collect::<Vec<_>>()
                     .join(",")
                     + "\n"
@@ -439,9 +439,150 @@ impl<'a> SqlParser<'a> {
 }
 
 fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\r', '\n']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+impl ResultColumn {
+    pub(super) fn metadata(&self) -> serde_json::Value {
+        let (kind, precision, scale) = match self.kind {
+            "bigint" => ("bigint", 19, 0),
+            "integer" => ("integer", 10, 0),
+            "varchar" => ("varchar", i32::MAX, 0),
+            "decimal(18,2)" => ("decimal", 18, 2),
+            "decimal(38,2)" => ("decimal", 38, 2),
+            "timestamp" => ("timestamp", 3, 0),
+            other => (other, 0, 0),
+        };
+        serde_json::json!({
+            "CatalogName": "hive", "SchemaName": "", "TableName": "",
+            "Name": self.name, "Label": self.name, "Type": kind,
+            "Precision": precision, "Scale": scale, "Nullable": "UNKNOWN",
+            "CaseSensitive": kind == "varchar"
+        })
+    }
+}
+
+/// Athena CSV preserves SQL NULL as an unquoted empty field and empty strings
+/// as quoted empty fields. Decode after reader authorization, within the caller's
+/// existing result-byte limit. A quoted field may contain commas and newlines.
+pub(super) fn result_csv_rows(
+    body: &[u8],
+    column_count: usize,
+) -> Result<Vec<Vec<Option<String>>>, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "Result CSV is not UTF-8")?;
+    let mut input = text.chars().peekable();
+    let mut rows = Vec::new();
+    while input.peek().is_some() {
+        if rows.len() > super::MAX_RESULT_ROWS {
+            return Err("Local Athena result exceeds the decoded row budget".into());
+        }
+        let mut row = Vec::new();
+        loop {
+            if row.len() >= column_count {
+                return Err("Result CSV column count does not match execution metadata".into());
+            }
+            let quoted = input.peek() == Some(&'"');
+            let mut value = String::new();
+            if quoted {
+                input.next();
+                loop {
+                    match input.next() {
+                        Some('"') if input.peek() == Some(&'"') => {
+                            input.next();
+                            value.push('"');
+                        }
+                        Some('"') => break,
+                        Some(character) => value.push(character),
+                        None => return Err("Result CSV contains an unterminated quote".into()),
+                    }
+                }
+            } else {
+                while input
+                    .peek()
+                    .is_some_and(|character| !matches!(character, ',' | '\r' | '\n'))
+                {
+                    let character = input.next().expect("peeked character exists");
+                    if character == '"' {
+                        return Err("Result CSV contains an invalid quote".into());
+                    }
+                    value.push(character);
+                }
+            }
+            row.push(if quoted || !value.is_empty() {
+                Some(value)
+            } else {
+                None
+            });
+            match input.next() {
+                Some(',') => continue,
+                Some('\n') | None => break,
+                Some('\r') if input.next() == Some('\n') => break,
+                _ => return Err("Result CSV contains an invalid field delimiter".into()),
+            }
+        }
+        if row.len() != column_count {
+            return Err("Result CSV column count does not match execution metadata".into());
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod result_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn aws_csv_distinguishes_null_empty_escaping_and_multiline() {
+        let result = QueryResult {
+            columns: vec![],
+            rows: vec![
+                vec![
+                    Some("missing".into()),
+                    Some("empty".into()),
+                    Some("payload".into()),
+                ],
+                vec![None, Some("".into()), Some("a,b\"c".into())],
+            ],
+        };
+        let csv = result.csv();
+        assert_eq!(
+            csv,
+            "\"missing\",\"empty\",\"payload\"\n,\"\",\"a,b\"\"c\"\n"
+        );
+        assert_eq!(result_csv_rows(csv.as_bytes(), 3).unwrap(), result.rows);
+        assert_eq!(
+            result_csv_rows(b"\"a\nb\",\"\"\r\n", 2).unwrap(),
+            vec![vec![Some("a\nb".into()), Some("".into())]]
+        );
+        assert!(result_csv_rows(b"\"unclosed", 1).is_err());
+        assert!(result_csv_rows(b"a,b\n", 1).is_err());
+        assert!(result_csv_rows(b",,,,,", 1).is_err());
+        let excessive = "\n".repeat(super::super::MAX_RESULT_ROWS + 2);
+        assert!(result_csv_rows(excessive.as_bytes(), 1)
+            .unwrap_err()
+            .contains("row budget"));
+    }
+
+    #[test]
+    fn aws_column_metadata_keeps_decimal_precision_separate() {
+        let metadata = ResultColumn {
+            name: "amount".into(),
+            kind: "decimal(18,2)",
+        }
+        .metadata();
+        assert_eq!(metadata["Type"], "decimal");
+        assert_eq!(metadata["Precision"], 18);
+        assert_eq!(metadata["Scale"], 2);
+        assert_eq!(metadata["CaseSensitive"], false);
+        assert_eq!(metadata["CatalogName"], "hive");
+        assert_eq!(
+            ResultColumn {
+                name: "text".into(),
+                kind: "varchar"
+            }
+            .metadata()["Precision"],
+            i32::MAX
+        );
     }
 }

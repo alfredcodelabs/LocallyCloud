@@ -391,8 +391,8 @@ impl InternalDispatcher {
             .await
     }
 
-    /// Dispatch an external request with the peer IP supplied by Axum ConnectInfo.
-    /// Client headers never supply this value.
+    /// Dispatch an external plain HTTP request with the peer supplied by Core.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_verified_peer(
         &self,
         method: &Method,
@@ -402,6 +402,22 @@ impl InternalDispatcher {
         request_id: &str,
         peer_ip: IpAddr,
     ) -> Response {
+        self.dispatch_verified_connection(method, uri, headers, body, request_id, peer_ip, false)
+            .await
+    }
+
+    /// Only the socket listener supplies transport security; forwarded headers cannot attest TLS.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_verified_connection(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: Bytes,
+        request_id: &str,
+        peer_ip: IpAddr,
+        secure_transport: bool,
+    ) -> Response {
         self.dispatch_in_scope(
             method,
             uri,
@@ -410,7 +426,7 @@ impl InternalDispatcher {
             request_id,
             None,
             false,
-            Some(peer_ip),
+            Some((peer_ip, secure_transport)),
             None,
         )
         .await
@@ -478,7 +494,7 @@ impl InternalDispatcher {
         request_id: &str,
         scope: Option<(&str, &str)>,
         suppressed: bool,
-        peer_ip: Option<IpAddr>,
+        peer_ip: Option<(IpAddr, bool)>,
         dashboard_service: Option<&str>,
     ) -> Response {
         let response = self
@@ -511,7 +527,7 @@ impl InternalDispatcher {
         request_id: &str,
         scope: Option<(&str, &str)>,
         suppressed: bool,
-        peer_ip: Option<IpAddr>,
+        peer_ip: Option<(IpAddr, bool)>,
         dashboard_service: Option<&str>,
     ) -> Response {
         let started_at = SystemTime::now();
@@ -520,7 +536,7 @@ impl InternalDispatcher {
         let host = header_str(headers, "host");
         let path = uri.path().to_string();
         let x_amz_credential = uri.query().and_then(extract_x_amz_credential);
-        let mut region = scope
+        let scope_region = scope
             .map(|(_, region)| region.to_owned())
             .unwrap_or_else(|| {
                 extract_region_from_credential_scope(
@@ -530,7 +546,7 @@ impl InternalDispatcher {
                 .or_else(|| cognito_public_region(&path).map(str::to_string))
                 .unwrap_or_else(|| self.default_region.clone())
             });
-        let account_id = scope
+        let scope_account = scope
             .map(|(account, _)| account.to_owned())
             .unwrap_or_else(|| self.account_id.clone());
         let input = RouteInput {
@@ -565,7 +581,7 @@ impl InternalDispatcher {
             match registry.native_handler(&ServiceName::new("execute-api")) {
                 Some(handler) => {
                     handler
-                        .public_invoke_region(&account_id, host.as_deref().unwrap_or(""), &path)
+                        .public_invoke_region(&scope_account, host.as_deref().unwrap_or(""), &path)
                         .await
                 }
                 None => None,
@@ -597,9 +613,9 @@ impl InternalDispatcher {
         };
         let public_invoke =
             decision.service_name.as_str() == "execute-api" && public_invoke_region.is_some();
-        if public_invoke {
-            region = public_invoke_region.expect("public invocation resolved a region");
-        }
+        let region = public_invoke_region
+            .filter(|_| public_invoke)
+            .unwrap_or(scope_region);
         log_routing_decision(&decision, request_id);
         if let Some(meter) = &self.meter {
             meter.record(decision.service_name.as_str(), body.len() as u64);
@@ -650,29 +666,34 @@ impl InternalDispatcher {
         let verify_external = strict_external
             && (!public_request
                 || claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref()));
-        let mut signature_rejected = false;
-        if ecr_token_request || verify_external {
-            // DynamoDB Streams is routed separately but signed with the dynamodb service name.
-            let signing_service = if decision.service_name.as_str() == "streams.dynamodb" {
-                "dynamodb"
-            } else {
-                decision.service_name.as_str()
+        let admitted_account = if ecr_token_request || verify_external {
+            let signing_service = match decision.service_name.as_str() {
+                "streams.dynamodb" => "dynamodb",
+                service => service,
             };
-            let verified = evaluator.as_ref().is_some_and(|evaluator| {
-                evaluator.verify_sigv4(
-                    &account_id,
-                    method,
-                    uri,
-                    headers,
-                    &body,
-                    &region,
-                    signing_service,
-                )
-            });
-            if !verified {
-                signature_rejected = true;
-            }
-        }
+            evaluator.as_deref().and_then(|evaluator| {
+                let candidate = match scope {
+                    Some((account, _)) => account.to_owned(),
+                    None => credential_account(evaluator, headers)?,
+                };
+                evaluator
+                    .verify_sigv4(
+                        &candidate,
+                        method,
+                        uri,
+                        headers,
+                        &body,
+                        &region,
+                        signing_service,
+                    )
+                    .then_some(candidate)
+            })
+        } else {
+            Some(scope_account.clone())
+        };
+        let signature_rejected = admitted_account.is_none();
+        // Rejected requests retain the configured/scoped audit account and never reach a handler.
+        let account_id = admitted_account.unwrap_or(scope_account);
         let response = if signature_rejected {
             invalid_signature(request_id, protocol)
         } else {
@@ -715,6 +736,24 @@ impl InternalDispatcher {
                         Some(handler) => {
                             let mut native_headers = headers.clone();
                             native_headers.remove("x-locallycloud-trusted-peer-ip");
+                            native_headers.remove("x-locallycloud-verified-secure-transport");
+                            // In-process AWS calls redact network context, even with role credentials.
+                            if scope.is_none() {
+                                if let Some((peer, secure)) = peer_ip {
+                                    native_headers.insert(
+                                        "x-locallycloud-verified-secure-transport",
+                                        HeaderValue::from_static(if secure {
+                                            "true"
+                                        } else {
+                                            "false"
+                                        }),
+                                    );
+                                    if let Ok(value) = HeaderValue::from_str(&peer.to_string()) {
+                                        native_headers
+                                            .insert("x-locallycloud-trusted-peer-ip", value);
+                                    }
+                                }
+                            }
                             native_headers.remove("x-locallycloud-verified-ecr-sigv4");
                             // Only Core can attest that an external caller passed strict SigV4.
                             // Strip any client-supplied value before native dispatch.
@@ -742,17 +781,6 @@ impl InternalDispatcher {
                                     "x-locallycloud-verified-ecr-sigv4",
                                     HeaderValue::from_static("1"),
                                 );
-                            }
-                            if matches!(
-                                decision.service_name.as_str(),
-                                "apigateway" | "apigatewayv2" | "execute-api"
-                            ) {
-                                if let Some(peer_ip) = peer_ip {
-                                    if let Ok(value) = HeaderValue::from_str(&peer_ip.to_string()) {
-                                        native_headers
-                                            .insert("x-locallycloud-trusted-peer-ip", value);
-                                    }
-                                }
                             }
                             handler
                                 .handle(ServiceRequest {
@@ -902,29 +930,33 @@ impl InternalDispatcher {
                 let strict = evaluator
                     .as_ref()
                     .is_some_and(|evaluator| evaluator.strict_sigv4_required());
-                // An upgrade is a long-lived connection; strict mode requires a verified
-                // caller even when the corresponding HTTP invoke route is public.
-                if strict {
-                    let signing_service = if decision.service_name.as_str() == "streams.dynamodb" {
-                        "dynamodb"
-                    } else {
-                        decision.service_name.as_str()
+                // Long-lived upgrades require verification even for public HTTP invoke routes.
+                let account_id = if strict {
+                    let signing_service = match decision.service_name.as_str() {
+                        "streams.dynamodb" => "dynamodb",
+                        service => service,
                     };
-                    let verified = evaluator.as_ref().is_some_and(|evaluator| {
-                        evaluator.verify_sigv4(
-                            &self.account_id,
-                            method,
-                            uri,
-                            headers,
-                            &body,
-                            &region,
-                            signing_service,
-                        )
+                    let verified_account = evaluator.as_deref().and_then(|evaluator| {
+                        let candidate = credential_account(evaluator, headers)?;
+                        evaluator
+                            .verify_sigv4(
+                                &candidate,
+                                method,
+                                uri,
+                                headers,
+                                &body,
+                                &region,
+                                signing_service,
+                            )
+                            .then_some(candidate)
                     });
-                    if !verified {
-                        return invalid_signature(request_id, protocol);
+                    match verified_account {
+                        Some(account) => account,
+                        None => return invalid_signature(request_id, protocol),
                     }
-                }
+                } else {
+                    self.account_id.clone()
+                };
                 match decision.disposition {
                     RouteDisposition::ProxiedToLegacy => {
                         let err = AwsError::new(
@@ -944,7 +976,7 @@ impl InternalDispatcher {
                                     headers: headers.clone(),
                                     body,
                                     region,
-                                    account_id: self.account_id.clone(),
+                                    account_id,
                                     request_id: request_id.to_string(),
                                 };
                                 handler.handle_websocket(request, upgrade).await
@@ -974,6 +1006,22 @@ impl InternalDispatcher {
             }
         }
     }
+}
+
+fn credential_account(
+    evaluator: &dyn authorization::AuthorizationEvaluator,
+    headers: &HeaderMap,
+) -> Option<String> {
+    let key = headers
+        .get(http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()
+        .and_then(RequestIdentity::access_key_from_authorization)?;
+    evaluator
+        .credential_account(&key)
+        .ok()
+        .flatten()
+        .filter(|account| account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn invalid_signature(request_id: &str, protocol: AwsProtocol) -> Response {
@@ -1213,6 +1261,13 @@ mod tests {
     impl authorization::AuthorizationEvaluator for ModeVerifier {
         fn strict_sigv4_required(&self) -> bool {
             self.strict
+        }
+
+        fn credential_account(
+            &self,
+            _: &str,
+        ) -> Result<Option<String>, authorization::AuthorizationError> {
+            Ok(Some("000000000000".into()))
         }
 
         fn authorize(
@@ -1978,6 +2033,125 @@ mod tests {
                 .body(Body::from(peer.to_string()))
                 .unwrap()
         }
+    }
+
+    struct TransportCapture;
+    #[async_trait::async_trait]
+    impl NativeHandler for TransportCapture {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            let transport = request
+                .headers
+                .get("x-locallycloud-verified-secure-transport")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("absent");
+            let peer = request
+                .headers
+                .get("x-locallycloud-trusted-peer-ip")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("absent");
+            Response::builder()
+                .status(200)
+                .body(Body::from(format!("{transport}/{peer}")))
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_attests_transport_and_scoped_calls_redact_network_context() {
+        let registry = ServiceRegistry::with_known_services();
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            Arc::new(TransportCapture),
+        );
+        let dispatcher = InternalDispatcher::new(
+            registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(2),
+            },
+            LegacyHealth::new(true),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", auth("s3").parse().unwrap());
+        headers.insert(
+            "x-locallycloud-verified-secure-transport",
+            HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            "x-locallycloud-trusted-peer-ip",
+            HeaderValue::from_static("203.0.113.7"),
+        );
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=203.0.113.7;proto=https"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let uri = "/bucket/key".parse().unwrap();
+        let untrusted = dispatcher
+            .dispatch(&Method::GET, &uri, &headers, Bytes::new(), "rid")
+            .await;
+        assert_eq!(
+            &axum::body::to_bytes(untrusted.into_body(), usize::MAX)
+                .await
+                .unwrap()[..],
+            b"absent/absent"
+        );
+        for secure in [false, true] {
+            let response = dispatcher
+                .dispatch_verified_connection(
+                    &Method::GET,
+                    &uri,
+                    &headers,
+                    Bytes::new(),
+                    "rid",
+                    "127.0.0.1".parse().unwrap(),
+                    secure,
+                )
+                .await;
+            assert_eq!(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()[..],
+                format!("{secure}/127.0.0.1").as_bytes()
+            );
+        }
+        let internal = dispatcher
+            .dispatch_scoped(
+                &Method::GET,
+                &uri,
+                &headers,
+                Bytes::new(),
+                "rid",
+                "000000000000",
+                "us-east-1",
+            )
+            .await;
+        assert_eq!(
+            &axum::body::to_bytes(internal.into_body(), usize::MAX)
+                .await
+                .unwrap()[..],
+            b"absent/absent"
+        );
+        let suppressed = dispatcher
+            .dispatch_scoped_suppressed(
+                &Method::GET,
+                &uri,
+                &headers,
+                Bytes::new(),
+                "rid",
+                "000000000000",
+                "us-east-1",
+            )
+            .await;
+        assert_eq!(
+            &axum::body::to_bytes(suppressed.into_body(), usize::MAX)
+                .await
+                .unwrap()[..],
+            b"absent/absent"
+        );
     }
 
     #[tokio::test]

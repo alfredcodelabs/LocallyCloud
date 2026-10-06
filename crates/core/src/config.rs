@@ -43,6 +43,15 @@ pub struct LocallyCloudConfig {
     pub account_id: String,
     /// Default AWS region applied when a request carries none. Default: `us-east-1`.
     pub default_region: String,
+    /// Optional AWS control-plane TLS identity, separate from API Gateway custom domains.
+    pub tls: Option<ControlPlaneTls>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneTls {
+    pub hostname: String,
+    pub certificate_path: String,
+    pub private_key_path: String,
 }
 
 /// A configuration parsing failure. Carries the setting and the offending value so the
@@ -186,6 +195,31 @@ impl LocallyCloudConfig {
         .map(|(v, _)| v)
         .unwrap_or_else(|| DEFAULT_REGION.to_string());
 
+        let tls = match (
+            get("LOCALLYCLOUD_TLS_HOSTNAME"),
+            get("LOCALLYCLOUD_TLS_CERT_PATH"),
+            get("LOCALLYCLOUD_TLS_KEY_PATH"),
+        ) {
+            (None, None, None) => None,
+            (Some(hostname), Some(certificate_path), Some(private_key_path))
+                if valid_tls_hostname(&hostname)
+                    && !certificate_path.is_empty()
+                    && !private_key_path.is_empty() =>
+            {
+                Some(ControlPlaneTls {
+                    hostname: hostname.to_ascii_lowercase(),
+                    certificate_path,
+                    private_key_path,
+                })
+            }
+            _ => {
+                return Err(ConfigError::new(
+                    "LOCALLYCLOUD_TLS_HOSTNAME",
+                    "TLS requires a DNS hostname, certificate path and PKCS#8 key path",
+                ))
+            }
+        };
+
         Ok(LocallyCloudConfig {
             listen_addr,
             legacy_backend_url,
@@ -197,8 +231,24 @@ impl LocallyCloudConfig {
             runtime_override,
             account_id,
             default_region,
+            tls,
         })
     }
+}
+
+fn valid_tls_hostname(hostname: &str) -> bool {
+    !hostname.is_empty()
+        && hostname.len() <= 253
+        && hostname.parse::<std::net::IpAddr>().is_err()
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 /// Probe the accepted names in precedence order, returning the first present non-empty
@@ -256,6 +306,40 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn control_plane_tls_is_explicit_and_validated() {
+        assert!(LocallyCloudConfig::resolve(&env(&[]))
+            .unwrap()
+            .tls
+            .is_none());
+        for invalid in [
+            "",
+            "https://localhost",
+            "*.localhost",
+            "127.0.0.1",
+            "bad_host",
+            "-bad.test",
+        ] {
+            assert!(LocallyCloudConfig::resolve(&env(&[
+                ("LOCALLYCLOUD_TLS_HOSTNAME", invalid),
+                ("LOCALLYCLOUD_TLS_CERT_PATH", "cert.pem"),
+                ("LOCALLYCLOUD_TLS_KEY_PATH", "key.pem")
+            ]))
+            .is_err());
+        }
+        assert!(
+            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_TLS_CERT_PATH", "cert.pem")]))
+                .is_err()
+        );
+        let config = LocallyCloudConfig::resolve(&env(&[
+            ("LOCALLYCLOUD_TLS_HOSTNAME", "LOCALHOST"),
+            ("LOCALLYCLOUD_TLS_CERT_PATH", "cert.pem"),
+            ("LOCALLYCLOUD_TLS_KEY_PATH", "key.pem"),
+        ]))
+        .unwrap();
+        assert_eq!(config.tls.unwrap().hostname, "localhost");
     }
 
     #[test]

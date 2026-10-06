@@ -50,7 +50,32 @@ pub fn evaluate(expr: &str, vars: &BTreeMap<String, Value>) -> Result<Value, Asl
     let result = evaluator
         .evaluate(&ast, &JValue::from(root))
         .map_err(|error| query_error(error.message()))?;
+    if result.is_undefined() {
+        return Err(query_error(
+            "JSONata expression returned nothing (undefined)",
+        ));
+    }
     Ok(normalize_integral_numbers(Value::from(&result)))
+}
+
+/// Add the ASL field context to errors observed from AWS JSONata evaluation.
+pub fn evaluate_for_field(
+    expr: &str,
+    vars: &BTreeMap<String, Value>,
+    field: &str,
+) -> Result<Value, AslError> {
+    evaluate(expr, vars).map_err(|mut error| {
+        let prefix = format!(
+            "The JSONata expression '{}' specified for the field '{field}'",
+            inner(expr)
+        );
+        if error.cause == "JSONata expression returned nothing (undefined)" {
+            error.cause = format!("{prefix} returned nothing (undefined).");
+        } else if error.cause.starts_with("T0410:") {
+            error.cause = format!("{prefix} threw an error during evaluation. {}", error.cause);
+        }
+        error
+    })
 }
 
 /// The engine represents every JSON number as f64. Serialize exactly
@@ -335,6 +360,34 @@ pub fn process(template: &Value, vars: &BTreeMap<String, Value>) -> Result<Value
     }
 }
 
+/// Process a whole-field expression while retaining the field's error context.
+pub fn process_for_field(
+    template: &Value,
+    vars: &BTreeMap<String, Value>,
+    field: &str,
+) -> Result<Value, AslError> {
+    match template {
+        Value::String(value) if is_expression(value) => evaluate_for_field(value, vars, field),
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    key.clone(),
+                    process_for_field(value, vars, &format!("{field}/{key}"))?,
+                ))
+            })
+            .collect::<Result<Map<_, _>, AslError>>()
+            .map(Value::Object),
+        Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| process_for_field(value, vars, &format!("{field}[{index}]")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        value => Ok(value.clone()),
+    }
+}
+
 fn register_aws_functions(evaluator: &mut Evaluator) -> Result<(), AslError> {
     evaluator.register_fn("hash", hash).map_err(engine_error)?;
     evaluator
@@ -461,35 +514,57 @@ fn partition(args: &[JValue]) -> Result<JValue, EvaluatorError> {
 }
 
 fn range(args: &[JValue]) -> Result<JValue, EvaluatorError> {
-    if !(2..=3).contains(&args.len()) {
+    let signature_error = |index| {
+        custom_error(format!(
+            "T0410: Argument {index} of function \"range\" does not match function signature"
+        ))
+    };
+    if args.len() > 3 {
+        return Err(signature_error(4));
+    }
+    for (index, value) in args.iter().enumerate() {
+        if !value.is_number() && !value.is_undefined() {
+            return Err(signature_error(index + 1));
+        }
+    }
+    if args.len() < 3 || args.iter().any(JValue::is_undefined) {
+        return Ok(JValue::Undefined);
+    }
+    let rounded_integer = |value: &JValue, name: &str| {
+        value
+            .as_f64()
+            .map(f64::trunc)
+            .filter(|number| {
+                number.is_finite() && *number >= i64::MIN as f64 && *number < -(i64::MIN as f64)
+            })
+            .map(|number| number as i64)
+            .ok_or_else(|| {
+                custom_error(format!(
+                    "Local $range limit: {name} must be a finite number within the supported integer range"
+                ))
+            })
+    };
+    let start = rounded_integer(&args[0], "$range start")?;
+    let end = rounded_integer(&args[1], "$range end")?;
+    let step = rounded_integer(&args[2], "$range step")?;
+    if step == 0 || (step > 0 && start > end) || (step < 0 && start < end) {
+        return Ok(JValue::Undefined);
+    }
+    let count = (i128::from(end) - i128::from(start)).abs() / i128::from(step).abs() + 1;
+    // Local allocation budget; AWS JSONata range accepts more than 1000 items.
+    if count > 100_000 {
         return Err(custom_error(
-            "$range accepts start, end, and an optional step",
+            "Local $range limit: result must not exceed 100000 items",
         ));
     }
-    let start = integer(&args[0], "$range start")?;
-    let end = integer(&args[1], "$range end")?;
-    let step = args
-        .get(2)
-        .map(|value| integer(value, "$range step"))
-        .transpose()?
-        .unwrap_or(1);
-    if step == 0 {
-        return Err(custom_error("$range step must not be zero"));
+    if count == 1 {
+        return Ok(JValue::from(start));
     }
-    let mut output = Vec::new();
-    let mut current = start;
-    while (step > 0 && current < end) || (step < 0 && current > end) {
-        if output.len() >= 1_000_000 {
-            return Err(custom_error(
-                "$range result exceeds the supported sequence limit",
-            ));
-        }
-        output.push(JValue::from(current));
-        current = current
-            .checked_add(step)
-            .ok_or_else(|| custom_error("$range overflows the integer range"))?;
-    }
-    Ok(JValue::array(output))
+    Ok(JValue::array(
+        (0..count)
+            .map(|index| JValue::from((i128::from(start) + index * i128::from(step)) as i64))
+            .collect(),
+    ))
 }
 
 fn random(args: &[JValue]) -> Result<JValue, EvaluatorError> {
@@ -541,6 +616,121 @@ fn query_error(message: impl Into<String>) -> AslError {
 }
 
 #[cfg(test)]
+mod range_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn inclusive_endpoints_and_observed_truncation() {
+        for (expression, expected) in [
+            ("$range(1, 9, 2)", json!([1, 3, 5, 7, 9])),
+            ("$range(9, 1, -2)", json!([9, 7, 5, 3, 1])),
+            ("$range(1, 8, 2)", json!([1, 3, 5, 7])),
+            ("$range(8, 1, -2)", json!([8, 6, 4, 2])),
+            ("$range(3, 3, 1)", json!(3)),
+            ("$range(3, 3, -1)", json!(3)),
+            ("$range(-1.2, 2.8, 1.9)", json!([-1, 0, 1, 2])),
+            ("$range(2.8, -1.2, -1.2)", json!([2, 1, 0, -1])),
+            ("$range(-1.1, -5.1, -1.1)", json!([-1, -2, -3, -4, -5])),
+        ] {
+            assert_eq!(
+                evaluate(&format!("{{% {expression} %}}"), &BTreeMap::new()).unwrap(),
+                expected,
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_arguments_and_sequence_limit_are_query_errors() {
+        for expression in [
+            "$range()",
+            "$range(1)",
+            "$range(1, 3)",
+            "$range(1, 3, 1, 1)",
+            "$range('1', 3, 1)",
+            "$range(1, null, 1)",
+            "$range(1, 3, true)",
+            "$range(1, 3, 0)",
+            "$range(1, 3, 0.9)",
+            "$range(1, 3, $missing)",
+            "$range(1, 3, -1)",
+            "$range(3, 1, 1)",
+            "$range(0, 100000, 1)",
+            "$range(9223372036854775808, 0, -1)",
+        ] {
+            assert_eq!(
+                evaluate(&format!("{{% {expression} %}}"), &BTreeMap::new())
+                    .unwrap_err()
+                    .error,
+                "States.QueryEvaluationError",
+                "{expression}"
+            );
+        }
+        let values = evaluate("{% $range(0, 999, 1) %}", &BTreeMap::new()).unwrap();
+        assert_eq!(values.as_array().unwrap().len(), 1000);
+        assert_eq!(values[999], json!(999));
+        let values = evaluate("{% $range(0, 1000, 1) %}", &BTreeMap::new()).unwrap();
+        assert_eq!(values.as_array().unwrap().len(), 1001);
+        assert_eq!(values[1000], json!(1000));
+    }
+
+    #[test]
+    fn stops_without_an_overflowing_final_increment() {
+        for (start, end, step) in [
+            (i64::MIN, i64::MIN, -1),
+            (i64::MIN + 1024, i64::MIN, -2048),
+            (i64::MAX - 1023, i64::MAX - 1023, 2048),
+            (i64::MAX - 2047, i64::MAX - 1023, 4096),
+        ] {
+            let result =
+                range(&[JValue::from(start), JValue::from(end), JValue::from(step)]).unwrap();
+            assert_eq!(result.as_f64(), Some(start as f64));
+        }
+        for number in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(range(&[JValue::from(number), JValue::from(0), JValue::from(1)]).is_err());
+        }
+    }
+
+    #[test]
+    fn undefined_and_singleton_ranges_follow_jsonata_composition() {
+        for expression in [
+            "$range(3,1,1)",
+            "$range(1,3,-1)",
+            "$range(0,4,0)",
+            "$range(0,4)",
+        ] {
+            assert_eq!(
+                evaluate(
+                    &format!("{{% $append([], {expression}) %}}"),
+                    &BTreeMap::new()
+                )
+                .unwrap(),
+                json!([])
+            );
+            let error =
+                evaluate_for_field(&format!("{{% {expression} %}}"), &BTreeMap::new(), "Output")
+                    .unwrap_err();
+            assert_eq!(error.cause, format!("The JSONata expression '{expression}' specified for the field 'Output' returned nothing (undefined)."));
+        }
+        assert_eq!(
+            evaluate("{% $append([], $range(7,7,1)) %}", &BTreeMap::new()).unwrap(),
+            json!([7])
+        );
+        let error = process_for_field(&json!("{% $range('0',4,1) %}"), &BTreeMap::new(), "Output")
+            .unwrap_err();
+        assert_eq!(error.cause, "The JSONata expression '$range('0',4,1)' specified for the field 'Output' threw an error during evaluation. T0410: Argument 1 of function \"range\" does not match function signature");
+        let error =
+            evaluate_for_field("{% $range(0,4,1,2) %}", &BTreeMap::new(), "Output").unwrap_err();
+        assert_eq!(error.cause, "The JSONata expression '$range(0,4,1,2)' specified for the field 'Output' threw an error during evaluation. T0410: Argument 4 of function \"range\" does not match function signature");
+        assert_eq!(
+            evaluate("{% null %}", &BTreeMap::new()).unwrap(),
+            Value::Null
+        );
+    }
+}
+
+#[cfg(test)]
 mod exists_tests {
     use super::*;
     use serde_json::json;
@@ -568,8 +758,9 @@ mod exists_tests {
                 "{% $filter($states.input.empty, function($v) {$v > 5}) %}",
                 &vars
             )
-            .unwrap(),
-            Value::Null
+            .unwrap_err()
+            .error,
+            "States.QueryEvaluationError"
         );
         assert_eq!(
             evaluate("{% ($x := 1; $exists($states.input.empty)) %}", &vars).unwrap(),

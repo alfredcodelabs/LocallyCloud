@@ -5,6 +5,19 @@ use crate::persistence::IamPersistence;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+/// Explicit account-root provisioning is process configuration, never an IAM user or DB entity.
+#[derive(Clone)]
+pub(crate) struct AccountRoot {
+    pub account: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+impl AccountRoot {
+    pub fn arn(&self) -> String {
+        format!("arn:aws:iam::{}:root", self.account)
+    }
+}
+
 type Key = (String, String);
 fn key(account: &str, name: &str) -> Key {
     (account.to_string(), name.to_string())
@@ -22,6 +35,7 @@ pub(crate) struct IamRecords {
 #[derive(Default)]
 pub struct IamStore {
     records: RwLock<IamRecords>,
+    root: RwLock<Option<AccountRoot>>,
     mutation: Mutex<()>,
     persistence: Option<Arc<IamPersistence>>,
 }
@@ -36,6 +50,7 @@ impl IamStore {
     pub(crate) fn durable(persistence: Arc<IamPersistence>) -> Result<Self, IamStsError> {
         Ok(Self {
             records: RwLock::new(persistence.load_resources()?),
+            root: RwLock::new(None),
             mutation: Mutex::new(()),
             persistence: Some(persistence),
         })
@@ -49,6 +64,7 @@ impl IamStore {
         let before = self.records.read().unwrap().clone();
         let staged = Self {
             records: RwLock::new(before.clone()),
+            root: RwLock::new(self.root.read().unwrap().clone()),
             ..Self::default()
         };
         let result = operation(&staged)?;
@@ -58,6 +74,33 @@ impl IamStore {
         }
         *self.records.write().unwrap() = after;
         Ok(result)
+    }
+    pub(crate) fn provision_root(&self, root: AccountRoot) -> Result<(), ()> {
+        if self.records.read().unwrap().users.values().any(|user| {
+            user.access_keys
+                .iter()
+                .any(|key| key.access_key_id == root.access_key_id)
+        }) {
+            return Err(());
+        }
+        *self.root.write().unwrap() = Some(root);
+        Ok(())
+    }
+    pub(crate) fn root_for_key(&self, account: &str, key: &str) -> Option<AccountRoot> {
+        self.root
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|root| root.account == account && root.access_key_id == key)
+            .cloned()
+    }
+    pub(crate) fn root_for_account(&self, account: &str) -> Option<AccountRoot> {
+        self.root
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|root| root.account == account)
+            .cloned()
     }
     pub(crate) fn bootstrap_initialized(&self, account: &str) -> bool {
         self.records
@@ -109,6 +152,32 @@ impl IamStore {
             .users
             .remove(&key(account, name))
     }
+    /// Resolve credential ownership across accounts without returning signing material.
+    /// Preserve duplicates so the caller rejects collisions even within one account.
+    pub(crate) fn active_key_accounts(&self, access_key_id: &str) -> Vec<String> {
+        self.records
+            .read()
+            .unwrap()
+            .users
+            .iter()
+            .flat_map(|((account, _), user)| {
+                user.access_keys
+                    .iter()
+                    .filter(move |key| key.access_key_id == access_key_id && key.status == "Active")
+                    .map(move |_| account.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn root_account_for_key(&self, access_key_id: &str) -> Option<String> {
+        self.root
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|root| root.access_key_id == access_key_id)
+            .map(|root| root.account.clone())
+    }
+
     pub fn list_users(&self, account: &str) -> Vec<IamUser> {
         self.records
             .read()

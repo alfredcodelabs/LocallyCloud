@@ -68,6 +68,8 @@ pub enum S3Error {
     #[error("The specified method is not allowed against this resource.")]
     MethodNotAllowed,
     #[error("{0}")]
+    MalformedPolicy(String),
+    #[error("{0}")]
     InvalidArgument(String),
     #[error("{0}")]
     InvalidRequest(String),
@@ -135,6 +137,7 @@ impl S3Error {
             S3Error::InvalidPart => "InvalidPart",
             S3Error::InvalidPartOrder => "InvalidPartOrder",
             S3Error::MethodNotAllowed => "MethodNotAllowed",
+            S3Error::MalformedPolicy(_) => "MalformedPolicy",
             S3Error::InvalidArgument(_) => "InvalidArgument",
             S3Error::InvalidRequest(_) => "InvalidRequest",
             S3Error::InvalidRequestParameter(_) => "InvalidRequestParameter",
@@ -179,6 +182,7 @@ impl S3Error {
             | S3Error::EntityTooSmall
             | S3Error::InvalidPart
             | S3Error::InvalidPartOrder
+            | S3Error::MalformedPolicy(_)
             | S3Error::InvalidArgument(_)
             | S3Error::InvalidRequest(_)
             | S3Error::InvalidRequestParameter(_)

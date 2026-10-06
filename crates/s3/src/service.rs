@@ -36,6 +36,29 @@ use crate::query::QueryParams;
 use crate::select;
 use crate::store::AccountStore;
 
+#[derive(Clone, Copy)]
+enum BucketRead {
+    Location,
+    Policy,
+    Versioning,
+    Versions,
+    Uploads,
+    Acl,
+    Cors,
+    Tagging,
+    Lifecycle,
+    Replication,
+    Encryption,
+    Website,
+    RequestPayment,
+    Accelerate,
+    Logging,
+    Notification,
+    ObjectLock,
+    OwnershipControls,
+    PublicAccessBlock,
+}
+
 /// The natively-implemented S3 service.
 pub struct S3Handler {
     store: Arc<AccountStore>,
@@ -74,10 +97,14 @@ pub(super) struct StoredDelivery {
 }
 
 impl StoredDelivery {
-    fn from_request(req: &ServiceRequest, delivery: &notifications::DeliveryRequest) -> Self {
+    fn from_request(
+        req: &ServiceRequest,
+        account: &str,
+        delivery: &notifications::DeliveryRequest,
+    ) -> Self {
         Self {
             request_id: req.request_id.clone(),
-            account_id: req.account_id.clone(),
+            account_id: account.into(),
             region: req.region.clone(),
             target: delivery.target,
             arn: delivery.arn.clone(),
@@ -360,6 +387,8 @@ impl S3Handler {
             let ctx = Ctx {
                 store: &self.store,
                 account: &request.account_id,
+                storage_account: &request.account_id,
+                copy_source_account: None,
                 region: &updated.region,
                 request_id: &request.request_id,
                 dispatcher,
@@ -446,6 +475,7 @@ impl S3Handler {
     fn persist_request(
         &self,
         req: &ServiceRequest,
+        storage_account: &str,
         notifications: Vec<StoredDelivery>,
     ) -> Result<(), S3Error> {
         let host = req.headers.get("host").and_then(|v| v.to_str().ok());
@@ -454,7 +484,7 @@ impl S3Handler {
         }
         match resolve(host, req.uri.path()) {
             Shape::Bucket(name) | Shape::Object(name, _) => {
-                self.persist_bucket(&req.account_id, Some(&name), notifications)
+                self.persist_bucket(storage_account, Some(&name), notifications)
             }
             Shape::Service => Ok(()),
         }
@@ -647,7 +677,11 @@ impl S3Handler {
         }
     }
 
-    async fn max_notification_rows(&self, req: &ServiceRequest) -> Result<i64, S3Error> {
+    async fn max_notification_rows(
+        &self,
+        req: &ServiceRequest,
+        storage_account: &str,
+    ) -> Result<i64, S3Error> {
         let host = req
             .headers
             .get("host")
@@ -663,7 +697,7 @@ impl S3Handler {
             }
             _ => return Ok(0),
         };
-        let Some(bucket) = self.store.get(&req.account_id, &bucket_name) else {
+        let Some(bucket) = self.store.get(storage_account, &bucket_name) else {
             return Ok(0);
         };
         let guard = bucket.read().await;
@@ -679,7 +713,12 @@ impl S3Handler {
         Ok(i64::try_from(direct.saturating_add(event_bridge)).unwrap_or(i64::MAX))
     }
 
-    async fn run_mutation<F>(&self, req: &ServiceRequest, mutation: F) -> Result<Response, S3Error>
+    async fn run_mutation<F>(
+        &self,
+        req: &ServiceRequest,
+        storage_account: &str,
+        mutation: F,
+    ) -> Result<Response, S3Error>
     where
         F: Future<Output = Result<ops::MutationResult, S3Error>>,
     {
@@ -691,7 +730,7 @@ impl S3Handler {
             Err(TrySendError::Closed(_)) => return Err(S3Error::InternalError),
         };
         if let Some(persistence) = &self.persistence {
-            let required = self.max_notification_rows(req).await?;
+            let required = self.max_notification_rows(req, storage_account).await?;
             let check = || persistence.has_capacity(required);
             let capacity = if tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
@@ -705,16 +744,16 @@ impl S3Handler {
             }
         }
         let result = mutation.await?;
-        let deliveries = Self::prepare_deliveries(req, &result.events);
+        let deliveries = Self::prepare_deliveries(req, storage_account, &result.events);
         let stored = deliveries
             .iter()
-            .map(|delivery| StoredDelivery::from_request(req, delivery))
+            .map(|delivery| StoredDelivery::from_request(req, storage_account, delivery))
             .collect();
-        self.persist_request(req, stored)?;
+        self.persist_request(req, storage_account, stored)?;
         if !deliveries.is_empty() && self.persistence.is_some() {
             self.start_notification_worker();
         }
-        self.publish_deliveries(req, deliveries, permit);
+        self.publish_deliveries(req, storage_account, deliveries, permit);
         Ok(result.response)
     }
 
@@ -737,49 +776,234 @@ impl S3Handler {
 
     /// Core inserts this marker only after verifying an external request in strict IAM mode.
     /// Internal scoped calls and permissive mode do not carry it.
-    fn authorize_object_write(
+    async fn authorize_object_write(
         &self,
         req: &ServiceRequest,
         bucket: &str,
         key: &str,
     ) -> Result<(), S3Error> {
         self.authorize_action(req, "s3:PutObject", &format!("arn:aws:s3:::{bucket}/{key}"))
+            .await
     }
 
-    fn authorize_action(
+    async fn authorize_action(
         &self,
         req: &ServiceRequest,
         action: &str,
         resource: &str,
     ) -> Result<(), S3Error> {
-        if !Self::strict_external(req) {
-            return Ok(());
-        }
-        let access_key_id = req
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(RequestIdentity::access_key_from_authorization)
-            .ok_or(S3Error::AccessDenied)?;
-        let dispatcher = self
+        let evaluator = self
             .registry
             .upgrade()
-            .and_then(|registry| registry.internal_dispatcher())
-            .ok_or(S3Error::AccessDenied)?;
-        dispatcher
-            .authorize(AuthorizationRequest {
-                request_identity: RequestIdentity {
-                    account_id: req.account_id.clone(),
-                    access_key_id: Some(access_key_id),
-                    arn: None,
-                },
-                delegated_identity: None,
-                source_service: "s3".to_string(),
-                action: action.to_string(),
-                resource: resource.to_string(),
-                context: BTreeMap::new(),
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")));
+        let strict = Self::strict_external(req)
+            || evaluator
+                .as_ref()
+                .is_some_and(|evaluator| evaluator.strict_sigv4_required());
+        if !strict {
+            return Ok(());
+        }
+        let evaluator = evaluator.ok_or(S3Error::AccessDenied)?;
+        let internal = req
+            .headers
+            .get("x-locallycloud-verified-internal-scope")
+            .is_some_and(|value| value == "1");
+        if !Self::strict_external(req) && !internal {
+            return Err(S3Error::AccessDenied);
+        }
+        let identity = RequestIdentity {
+            account_id: req.account_id.clone(),
+            access_key_id: req
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(RequestIdentity::access_key_from_authorization),
+            arn: None,
+        };
+        let delegated = locallycloud_core::integration::identity::trusted_role(req).or_else(|| {
+            if !internal {
+                return None;
+            }
+            let service = req
+                .headers
+                .get(locallycloud_core::integration::identity::PRINCIPAL_HEADER)?
+                .to_str()
+                .ok()?
+                .strip_suffix(".amazonaws.com")?;
+            (!service.is_empty() && !service.contains('/')).then(|| {
+                CallerIdentity::ServicePrincipal {
+                    service: service.to_string(),
+                }
             })
-            .map_err(|_| S3Error::AccessDenied)
+        });
+        let bucket = resource
+            .strip_prefix("arn:aws:s3:::")
+            .map(|value| value.split('/').next().unwrap_or(value));
+        let (owner, policy) = if action == "s3:CreateBucket" {
+            (req.account_id.clone(), None)
+        } else if let Some(bucket) = bucket {
+            if let Some((owner, state)) = self.store.resource_bucket(bucket) {
+                let policy = state.read().await.policy.clone();
+                (owner, policy)
+            } else {
+                (req.account_id.clone(), None)
+            }
+        } else {
+            (req.account_id.clone(), None)
+        };
+        // AWS preserves owner-root recovery even when the bucket policy denies it.
+        if matches!(
+            action,
+            "s3:GetBucketPolicy" | "s3:PutBucketPolicy" | "s3:DeleteBucketPolicy"
+        ) && delegated.is_none()
+            && identity.account_id == owner
+            && evaluator
+                .is_account_root(&identity)
+                .map_err(|_| S3Error::AccessDenied)?
+        {
+            return Ok(());
+        }
+        let mut context =
+            BTreeMap::from([("aws:requestedregion".into(), vec![req.region.clone()])]);
+        if req.method == Method::GET && matches!(action, "s3:ListBucket" | "s3:ListBucketVersions")
+        {
+            let query = QueryParams::parse(req.uri.query());
+            context.insert(
+                "s3:prefix".into(),
+                vec![query.get("prefix").unwrap_or("").into()],
+            );
+            let max_keys = query
+                .get("max-keys")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1000);
+            context.insert("s3:max-keys".into(), vec![max_keys.to_string()]);
+            if query.has("delimiter") {
+                context.insert(
+                    "s3:delimiter".into(),
+                    vec![query.get("delimiter").unwrap_or("").into()],
+                );
+            }
+        }
+        if let Some(transport) = req
+            .headers
+            .get("x-locallycloud-verified-secure-transport")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| matches!(*value, "true" | "false"))
+        {
+            context.insert("aws:securetransport".into(), vec![transport.into()]);
+        }
+        if let Some(ip) = req
+            .headers
+            .get("x-locallycloud-trusted-peer-ip")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.parse::<std::net::IpAddr>().is_ok())
+        {
+            context.insert("aws:sourceip".into(), vec![ip.into()]);
+        }
+        if internal && matches!(&delegated, Some(CallerIdentity::ServicePrincipal { .. })) {
+            for (header, key) in [
+                ("x-locallycloud-source-arn", "aws:sourcearn"),
+                ("x-locallycloud-source-account", "aws:sourceaccount"),
+            ] {
+                if let Some(value) = req
+                    .headers
+                    .get(header)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    context.insert(key.into(), vec![value.into()]);
+                }
+            }
+        }
+        evaluator
+            .authorize_resource_policy(
+                AuthorizationRequest {
+                    request_identity: identity,
+                    delegated_identity: delegated,
+                    source_service: "s3".into(),
+                    action: action.into(),
+                    resource: resource.into(),
+                    context,
+                },
+                policy.as_deref(),
+                &owner,
+            )
+            .map_err(|_| S3Error::AccessDenied)?;
+        if owner != req.account_id
+            && matches!(
+                action,
+                "s3:GetBucketPolicy" | "s3:PutBucketPolicy" | "s3:DeleteBucketPolicy"
+            )
+        {
+            return Err(S3Error::MethodNotAllowed);
+        }
+        Ok(())
+    }
+
+    fn validate_bucket_policy(&self, bucket: &str, body: &[u8]) -> Result<(), S3Error> {
+        if body.len() > 20 * 1024 {
+            return Err(S3Error::MalformedPolicy(
+                "Policy exceeded the maximum allowed size".into(),
+            ));
+        }
+        let document = std::str::from_utf8(body)
+            .map_err(|_| S3Error::MalformedPolicy("The policy is not valid UTF-8".into()))?;
+        let evaluator = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+            .ok_or_else(|| {
+                S3Error::NotImplemented(
+                    "bucket policy validation requires the IAM evaluator".into(),
+                )
+            })?;
+        evaluator
+            .validate_resource_policy(document)
+            .map_err(|error| match error {
+                locallycloud_core::integration::authorization::ResourcePolicyError::Malformed(
+                    message,
+                ) => S3Error::MalformedPolicy(message),
+                locallycloud_core::integration::authorization::ResourcePolicyError::Unsupported(
+                    message,
+                ) => S3Error::NotImplemented(message),
+            })?;
+        let value: serde_json::Value = serde_json::from_str(document)
+            .map_err(|_| S3Error::MalformedPolicy("Invalid policy JSON".into()))?;
+        let statements: Vec<&serde_json::Value> = match &value["Statement"] {
+            serde_json::Value::Array(values) => values.iter().collect(),
+            statement => vec![statement],
+        };
+        let bucket_arn = format!("arn:aws:s3:::{bucket}");
+        let object_prefix = format!("{bucket_arn}/");
+        for statement in statements {
+            for field in ["Resource", "NotResource"] {
+                if let Some(resources) = statement.get(field) {
+                    let values: Vec<&serde_json::Value> = match resources {
+                        serde_json::Value::Array(values) => values.iter().collect(),
+                        resource => vec![resource],
+                    };
+                    for resource in values {
+                        let resource = resource.as_str().ok_or_else(|| {
+                            S3Error::MalformedPolicy("Policy resource must be a string".into())
+                        })?;
+                        if resource != bucket_arn && !resource.starts_with(&object_prefix) {
+                            return Err(S3Error::MalformedPolicy(
+                                "Policy has invalid resource for this bucket".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn strict_request(&self, req: &ServiceRequest) -> bool {
+        Self::strict_external(req)
+            || self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+                .is_some_and(|evaluator| evaluator.strict_sigv4_required())
     }
 
     fn strict_external(req: &ServiceRequest) -> bool {
@@ -796,11 +1020,20 @@ impl S3Handler {
                 q.only_keys(&[])
                     || (q.only_keys(&["notification"]) && q.has("notification"))
                     || (q.only_keys(&["versioning"]) && q.has("versioning"))
+                    || (q.only_keys(&["policy"]) && q.has("policy"))
+                    || (q.only_keys(&["encryption"]) && q.has("encryption"))
             }
-            (&Method::DELETE | &Method::HEAD, Shape::Bucket(_)) => q.only_keys(&[]),
+            (&Method::DELETE, Shape::Bucket(_)) => {
+                q.only_keys(&[])
+                    || (q.only_keys(&["policy"]) && q.has("policy"))
+                    || (q.only_keys(&["encryption"]) && q.has("encryption"))
+            }
+            (&Method::HEAD, Shape::Bucket(_)) => q.only_keys(&[]),
             (&Method::GET, Shape::Bucket(_)) => {
                 (q.only_keys(&["notification"]) && q.has("notification"))
                     || (q.only_keys(&["versioning"]) && q.has("versioning"))
+                    || (q.only_keys(&["policy"]) && q.has("policy"))
+                    || (q.only_keys(&["encryption"]) && q.has("encryption"))
                     || (q.has("versions")
                         && q.only_keys(&[
                             "versions",
@@ -851,7 +1084,7 @@ impl S3Handler {
         }
     }
 
-    fn authorize_copy_source(&self, req: &ServiceRequest) -> Result<(), S3Error> {
+    async fn authorize_copy_source(&self, req: &ServiceRequest) -> Result<(), S3Error> {
         let source = req
             .headers
             .get("x-amz-copy-source")
@@ -863,11 +1096,47 @@ impl S3Handler {
         } else {
             "s3:GetObject"
         };
+        self.check_expected_owner(req, &bucket, "x-amz-source-expected-bucket-owner")?;
         self.authorize_action(req, action, &format!("arn:aws:s3:::{bucket}/{key}"))
+            .await
+    }
+
+    fn check_expected_owner(
+        &self,
+        req: &ServiceRequest,
+        bucket: &str,
+        header: &str,
+    ) -> Result<(), S3Error> {
+        let Some(expected) = req.headers.get(header) else {
+            return Ok(());
+        };
+        if self
+            .store
+            .resource_bucket(bucket)
+            .is_some_and(|(owner, _)| expected.to_str().ok() != Some(owner.as_str()))
+        {
+            return Err(S3Error::AccessDenied);
+        }
+        Ok(())
+    }
+
+    fn storage_account(&self, req: &ServiceRequest, shape: &Shape) -> String {
+        if !self.strict_request(req) {
+            return req.account_id.clone();
+        }
+        match shape {
+            Shape::Bucket(name) | Shape::Object(name, _) => self
+                .store
+                .resource_bucket(name)
+                .map(|(owner, _)| owner)
+                .unwrap_or_else(|| req.account_id.clone()),
+            Shape::Service => req.account_id.clone(),
+        }
     }
 
     fn prepare_deliveries(
         req: &ServiceRequest,
+        storage_account: &str,
         events: &[notifications::ObjectEvent],
     ) -> Vec<notifications::DeliveryRequest> {
         let source_ip = req
@@ -882,6 +1151,7 @@ impl S3Handler {
             .flat_map(|event| {
                 notifications::delivery_requests(
                     event,
+                    storage_account,
                     &req.account_id,
                     &req.region,
                     &req.request_id,
@@ -899,7 +1169,7 @@ impl S3Handler {
             };
             if let Ok(value) = HeaderValue::from_str(&format!(
                 "AWS4-HMAC-SHA256 Credential={}/19700101/{}/{}/aws4_request",
-                req.account_id, req.region, service
+                storage_account, req.region, service
             )) {
                 delivery.headers.insert("authorization", value);
             }
@@ -910,6 +1180,7 @@ impl S3Handler {
     fn publish_deliveries(
         &self,
         req: &ServiceRequest,
+        storage_account: &str,
         deliveries: Vec<notifications::DeliveryRequest>,
         permit: mpsc::Permit<'_, NotificationJob>,
     ) {
@@ -930,7 +1201,7 @@ impl S3Handler {
         let job = NotificationJob {
             dispatcher,
             request_id: req.request_id.clone(),
-            account_id: req.account_id.clone(),
+            account_id: storage_account.into(),
             region: req.region.clone(),
             deliveries,
         };
@@ -938,7 +1209,11 @@ impl S3Handler {
         permit.send(job);
     }
 
-    async fn route(&self, req: &ServiceRequest) -> Result<Response, S3Error> {
+    async fn route(
+        &self,
+        req: &ServiceRequest,
+        storage_account: &str,
+    ) -> Result<Response, S3Error> {
         if req.headers.keys().any(|name| {
             name.as_str().contains("server-side-encryption-customer")
                 || name == "x-amz-server-side-encryption-context"
@@ -947,15 +1222,37 @@ impl S3Handler {
                 "SSE-C and additional KMS encryption context are not implemented".into(),
             ));
         }
+        if self.strict_request(req)
+            && req
+                .headers
+                .keys()
+                .any(|name| name == "x-amz-acl" || name.as_str().starts_with("x-amz-grant-"))
+        {
+            return Err(S3Error::NotImplemented(
+                "strict object ACL grants and ownership modes are not implemented".into(),
+            ));
+        }
         let host = req.headers.get("host").and_then(|v| v.to_str().ok());
         let q = QueryParams::parse(req.uri.query());
         let dispatcher = self
             .registry
             .upgrade()
             .and_then(|registry| registry.internal_dispatcher());
+        let copy_source_account = if self.strict_request(req) {
+            req.headers
+                .get("x-amz-copy-source")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| ops::parse_copy_source(value).ok())
+                .and_then(|(bucket, _, _)| self.store.resource_bucket(&bucket))
+                .map(|(owner, _)| owner)
+        } else {
+            None
+        };
         let ctx = Ctx {
             store: &self.store,
             account: &req.account_id,
+            storage_account,
+            copy_source_account: copy_source_account.as_deref(),
             region: &req.region,
             request_id: &req.request_id,
             dispatcher,
@@ -972,7 +1269,7 @@ impl S3Handler {
             }),
         };
         if is_s3_control(req, host) {
-            if Self::strict_external(req) {
+            if self.strict_request(req) {
                 return Err(S3Error::NotImplemented(
                     "strict IAM authorization is not mapped for S3 Control".into(),
                 ));
@@ -1009,20 +1306,30 @@ impl S3Handler {
         }
 
         let shape = resolve(host, req.uri.path());
-        if Self::strict_external(req) && !Self::known_strict_operation(req, &shape, &q) {
+        if let Shape::Bucket(bucket) | Shape::Object(bucket, _) = &shape {
+            self.check_expected_owner(req, bucket, "x-amz-expected-bucket-owner")?;
+        }
+        if self.strict_request(req) && !Self::known_strict_operation(req, &shape, &q) {
             return Err(S3Error::NotImplemented(
                 "strict IAM authorization is not mapped for this S3 operation".into(),
             ));
         }
         match (&req.method, &shape) {
             (&Method::GET, Shape::Service) => {
-                self.authorize_action(req, "s3:ListAllMyBuckets", "*")?;
+                self.authorize_action(req, "s3:ListAllMyBuckets", "*")
+                    .await?;
                 ops::list_buckets(&ctx).await
             }
             (&Method::OPTIONS, Shape::Bucket(b) | Shape::Object(b, _)) => {
                 ops::options_bucket(&ctx, b, &req.headers).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("encryption") => {
+                self.authorize_action(
+                    req,
+                    "s3:PutEncryptionConfiguration",
+                    &format!("arn:aws:s3:::{b}"),
+                )
+                .await?;
                 ops::put_bucket_encryption(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("notification") => {
@@ -1030,11 +1337,13 @@ impl S3Handler {
                     req,
                     "s3:PutBucketNotification",
                     &format!("arn:aws:s3:::{b}"),
-                )?;
+                )
+                .await?;
                 ops::put_bucket_notification(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("versioning") => {
-                self.authorize_action(req, "s3:PutBucketVersioning", &format!("arn:aws:s3:::{b}"))?;
+                self.authorize_action(req, "s3:PutBucketVersioning", &format!("arn:aws:s3:::{b}"))
+                    .await?;
                 ops::put_bucket_versioning(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("tagging") => {
@@ -1044,6 +1353,9 @@ impl S3Handler {
                 ops::put_bucket_cors(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("policy") => {
+                self.authorize_action(req, "s3:PutBucketPolicy", &format!("arn:aws:s3:::{b}"))
+                    .await?;
+                self.validate_bucket_policy(b, &req.body)?;
                 ops::put_bucket_policy(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("website") => {
@@ -1056,10 +1368,17 @@ impl S3Handler {
                 ops::put_bucket_public_access_block(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) => {
-                self.authorize_action(req, "s3:CreateBucket", &format!("arn:aws:s3:::{b}"))?;
+                self.authorize_action(req, "s3:CreateBucket", &format!("arn:aws:s3:::{b}"))
+                    .await?;
                 ops::create_bucket(&ctx, b, &req.headers).await
             }
             (&Method::DELETE, Shape::Bucket(b)) if q.has("encryption") => {
+                self.authorize_action(
+                    req,
+                    "s3:PutEncryptionConfiguration",
+                    &format!("arn:aws:s3:::{b}"),
+                )
+                .await?;
                 ops::delete_bucket_encryption(&ctx, b).await
             }
             (&Method::DELETE, Shape::Bucket(b)) if q.has("tagging") => {
@@ -1069,6 +1388,8 @@ impl S3Handler {
                 ops::delete_bucket_cors(&ctx, b).await
             }
             (&Method::DELETE, Shape::Bucket(b)) if q.has("policy") => {
+                self.authorize_action(req, "s3:DeleteBucketPolicy", &format!("arn:aws:s3:::{b}"))
+                    .await?;
                 ops::delete_bucket_policy(&ctx, b).await
             }
             (&Method::DELETE, Shape::Bucket(b)) if q.has("publicAccessBlock") => {
@@ -1082,78 +1403,123 @@ impl S3Handler {
                 )))
             }
             (&Method::DELETE, Shape::Bucket(b)) => {
-                self.authorize_action(req, "s3:DeleteBucket", &format!("arn:aws:s3:::{b}"))?;
+                self.authorize_action(req, "s3:DeleteBucket", &format!("arn:aws:s3:::{b}"))
+                    .await?;
                 ops::delete_bucket(&ctx, b).await
             }
             (&Method::HEAD, Shape::Bucket(b)) => {
-                self.authorize_action(req, "s3:ListBucket", &format!("arn:aws:s3:::{b}"))?;
+                self.authorize_action(req, "s3:ListBucket", &format!("arn:aws:s3:::{b}"))
+                    .await?;
                 ops::head_bucket(&ctx, b).await
             }
             (&Method::GET, Shape::Bucket(b)) => {
-                if q.has("location") {
-                    ops::get_bucket_location(&ctx, b).await
-                } else if q.has("policy") {
-                    ops::get_bucket_policy(&ctx, b).await
-                } else if q.has("versioning") {
-                    self.authorize_action(
-                        req,
-                        "s3:GetBucketVersioning",
-                        &format!("arn:aws:s3:::{b}"),
-                    )?;
-                    ops::get_bucket_versioning(&ctx, b).await
-                } else if q.has("versions") {
-                    self.authorize_action(
-                        req,
-                        "s3:ListBucketVersions",
-                        &format!("arn:aws:s3:::{b}"),
-                    )?;
-                    ops::list_object_versions(&ctx, b, &q).await
-                } else if q.has("uploads") {
-                    self.authorize_action(
-                        req,
-                        "s3:ListBucketMultipartUploads",
-                        &format!("arn:aws:s3:::{b}"),
-                    )?;
-                    ops::list_multipart_uploads(&ctx, b, &q).await
-                } else if q.has("acl") {
-                    ops::get_bucket_acl(&ctx, b).await
-                } else if q.has("cors") {
-                    ops::get_bucket_cors(&ctx, b).await
-                } else if q.has("tagging") {
-                    ops::get_bucket_tagging(&ctx, b).await
-                } else if q.has("lifecycle") {
-                    ops::get_bucket_lifecycle(&ctx, b).await
-                } else if q.has("replication") {
-                    ops::get_bucket_replication(&ctx, b).await
-                } else if q.has("encryption") {
-                    ops::get_bucket_encryption(&ctx, b).await
-                } else if q.has("website") {
-                    ops::get_bucket_website(&ctx, b).await
-                } else if q.has("requestPayment") {
-                    ops::get_bucket_request_payment(&ctx, b).await
-                } else if q.has("accelerate") {
-                    ops::get_bucket_accelerate(&ctx, b).await
-                } else if q.has("logging") {
-                    ops::get_bucket_logging(&ctx, b).await
-                } else if q.has("notification") {
-                    self.authorize_action(
-                        req,
-                        "s3:GetBucketNotification",
-                        &format!("arn:aws:s3:::{b}"),
-                    )?;
-                    ops::get_bucket_notification(&ctx, b).await
-                } else if q.has("object-lock") {
-                    ops::get_bucket_object_lock(&ctx, b).await
-                } else if q.has("ownershipControls") {
-                    ops::get_bucket_ownership_controls(&ctx, b).await
-                } else if q.has("publicAccessBlock") {
-                    ops::get_bucket_public_access_block(&ctx, b).await
-                } else if q.get("list-type") == Some("2") {
-                    self.authorize_action(req, "s3:ListBucket", &format!("arn:aws:s3:::{b}"))?;
-                    ops::list_objects_v2(&ctx, b, &q).await
-                } else {
-                    self.authorize_action(req, "s3:ListBucket", &format!("arn:aws:s3:::{b}"))?;
-                    ops::list_objects_v1(&ctx, b, &q).await
+                const SUBRESOURCES: &[(&str, BucketRead)] = &[
+                    ("location", BucketRead::Location),
+                    ("policy", BucketRead::Policy),
+                    ("versioning", BucketRead::Versioning),
+                    ("versions", BucketRead::Versions),
+                    ("uploads", BucketRead::Uploads),
+                    ("acl", BucketRead::Acl),
+                    ("cors", BucketRead::Cors),
+                    ("tagging", BucketRead::Tagging),
+                    ("lifecycle", BucketRead::Lifecycle),
+                    ("replication", BucketRead::Replication),
+                    ("encryption", BucketRead::Encryption),
+                    ("website", BucketRead::Website),
+                    ("requestPayment", BucketRead::RequestPayment),
+                    ("accelerate", BucketRead::Accelerate),
+                    ("logging", BucketRead::Logging),
+                    ("notification", BucketRead::Notification),
+                    ("object-lock", BucketRead::ObjectLock),
+                    ("ownershipControls", BucketRead::OwnershipControls),
+                    ("publicAccessBlock", BucketRead::PublicAccessBlock),
+                ];
+                let subresource = SUBRESOURCES
+                    .iter()
+                    .find(|(key, _)| q.has(key))
+                    .map(|(_, operation)| *operation);
+                match subresource {
+                    Some(BucketRead::Location) => ops::get_bucket_location(&ctx, b).await,
+                    Some(BucketRead::Policy) => {
+                        self.authorize_action(
+                            req,
+                            "s3:GetBucketPolicy",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
+                        ops::get_bucket_policy(&ctx, b).await
+                    }
+                    Some(BucketRead::Versioning) => {
+                        self.authorize_action(
+                            req,
+                            "s3:GetBucketVersioning",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
+                        ops::get_bucket_versioning(&ctx, b).await
+                    }
+                    Some(BucketRead::Versions) => {
+                        self.authorize_action(
+                            req,
+                            "s3:ListBucketVersions",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
+                        ops::list_object_versions(&ctx, b, &q).await
+                    }
+                    Some(BucketRead::Uploads) => {
+                        self.authorize_action(
+                            req,
+                            "s3:ListBucketMultipartUploads",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
+                        ops::list_multipart_uploads(&ctx, b, &q).await
+                    }
+                    Some(BucketRead::Acl) => ops::get_bucket_acl(&ctx, b).await,
+                    Some(BucketRead::Cors) => ops::get_bucket_cors(&ctx, b).await,
+                    Some(BucketRead::Tagging) => ops::get_bucket_tagging(&ctx, b).await,
+                    Some(BucketRead::Lifecycle) => ops::get_bucket_lifecycle(&ctx, b).await,
+                    Some(BucketRead::Replication) => ops::get_bucket_replication(&ctx, b).await,
+                    Some(BucketRead::Encryption) => {
+                        self.authorize_action(
+                            req,
+                            "s3:GetEncryptionConfiguration",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
+                        ops::get_bucket_encryption(&ctx, b).await
+                    }
+                    Some(BucketRead::Website) => ops::get_bucket_website(&ctx, b).await,
+                    Some(BucketRead::RequestPayment) => {
+                        ops::get_bucket_request_payment(&ctx, b).await
+                    }
+                    Some(BucketRead::Accelerate) => ops::get_bucket_accelerate(&ctx, b).await,
+                    Some(BucketRead::Logging) => ops::get_bucket_logging(&ctx, b).await,
+                    Some(BucketRead::Notification) => {
+                        self.authorize_action(
+                            req,
+                            "s3:GetBucketNotification",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
+                        ops::get_bucket_notification(&ctx, b).await
+                    }
+                    Some(BucketRead::ObjectLock) => ops::get_bucket_object_lock(&ctx, b).await,
+                    Some(BucketRead::OwnershipControls) => {
+                        ops::get_bucket_ownership_controls(&ctx, b).await
+                    }
+                    Some(BucketRead::PublicAccessBlock) => {
+                        ops::get_bucket_public_access_block(&ctx, b).await
+                    }
+                    None => {
+                        self.authorize_action(req, "s3:ListBucket", &format!("arn:aws:s3:::{b}"))
+                            .await?;
+                        match q.get("list-type") {
+                            Some("2") => ops::list_objects_v2(&ctx, b, &q).await,
+                            _ => ops::list_objects_v1(&ctx, b, &q).await,
+                        }
+                    }
                 }
             }
             (&Method::POST, Shape::Bucket(b)) if q.has("delete") => {
@@ -1164,10 +1530,15 @@ impl S3Handler {
                     } else {
                         "s3:DeleteObject"
                     };
-                    self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{key}"))?;
+                    self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{key}"))
+                        .await?;
                 }
-                self.run_mutation(req, ops::delete_objects(&ctx, b, &req.headers, &req.body))
-                    .await
+                self.run_mutation(
+                    req,
+                    storage_account,
+                    ops::delete_objects(&ctx, b, &req.headers, &req.body),
+                )
+                .await
             }
             (&Method::POST, Shape::Bucket(b))
                 if req
@@ -1181,8 +1552,8 @@ impl S3Handler {
                     }) =>
             {
                 let upload = presign::parse_post(req, b)?;
-                self.authorize_object_write(req, b, &upload.key)?;
-                self.run_mutation(req, async {
+                self.authorize_object_write(req, b, &upload.key).await?;
+                self.run_mutation(req, storage_account, async {
                     let mut result = ops::put_object_with_event(
                         &ctx,
                         b,
@@ -1200,7 +1571,7 @@ impl S3Handler {
                 .await
             }
             (&Method::POST, Shape::Object(b, k)) if q.has("uploads") => {
-                self.authorize_object_write(req, b, k)?;
+                self.authorize_object_write(req, b, k).await?;
                 ops::create_multipart_upload(&ctx, b, k, &req.headers).await
             }
             (&Method::POST, Shape::Object(b, k))
@@ -1216,9 +1587,10 @@ impl S3Handler {
                     .expect("select object response is valid"))
             }
             (&Method::POST, Shape::Object(b, k)) if q.get("uploadId").is_some() => {
-                self.authorize_object_write(req, b, k)?;
+                self.authorize_object_write(req, b, k).await?;
                 self.run_mutation(
                     req,
+                    storage_account,
                     ops::complete_multipart_upload(
                         &ctx,
                         b,
@@ -1231,10 +1603,10 @@ impl S3Handler {
                 .await
             }
             (&Method::PUT, Shape::Object(b, k)) if q.get("uploadId").is_some() => {
-                self.authorize_object_write(req, b, k)?;
+                self.authorize_object_write(req, b, k).await?;
                 let upload_id = q.get("uploadId").expect("guarded upload id");
                 if req.headers.contains_key("x-amz-copy-source") {
-                    self.authorize_copy_source(req)?;
+                    self.authorize_copy_source(req).await?;
                     ops::upload_part_copy(&ctx, b, k, upload_id, q.get("partNumber"), &req.headers)
                         .await
                 } else {
@@ -1261,10 +1633,10 @@ impl S3Handler {
                 ops::put_object_legal_hold(&ctx, b, k, q.get("versionId"), &req.body).await
             }
             (&Method::PUT, Shape::Object(b, k)) => {
-                self.authorize_object_write(req, b, k)?;
-                self.run_mutation(req, async {
+                self.authorize_object_write(req, b, k).await?;
+                self.run_mutation(req, storage_account, async {
                     if req.headers.contains_key("x-amz-copy-source") {
-                        self.authorize_copy_source(req)?;
+                        self.authorize_copy_source(req).await?;
                         ops::copy_object(&ctx, b, k, &req.headers).await
                     } else {
                         ops::put_object(&ctx, b, k, &req.headers, req.body.clone()).await
@@ -1289,7 +1661,8 @@ impl S3Handler {
                     req,
                     "s3:ListMultipartUploadParts",
                     &format!("arn:aws:s3:::{b}/{k}"),
-                )?;
+                )
+                .await?;
                 ops::list_parts(
                     &ctx,
                     b,
@@ -1305,7 +1678,8 @@ impl S3Handler {
                 } else {
                     "s3:GetObject"
                 };
-                self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{k}"))?;
+                self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{k}"))
+                    .await?;
                 ops::get_object(&ctx, b, k, &req.headers, q.get("versionId")).await
             }
             (&Method::HEAD, Shape::Object(b, k)) => {
@@ -1314,7 +1688,8 @@ impl S3Handler {
                 } else {
                     "s3:GetObject"
                 };
-                self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{k}"))?;
+                self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{k}"))
+                    .await?;
                 ops::head_object(&ctx, b, k, &req.headers, q.get("versionId")).await
             }
             (&Method::DELETE, Shape::Object(b, k)) if q.has("tagging") => {
@@ -1325,7 +1700,8 @@ impl S3Handler {
                     req,
                     "s3:AbortMultipartUpload",
                     &format!("arn:aws:s3:::{b}/{k}"),
-                )?;
+                )
+                .await?;
                 ops::abort_multipart_upload(
                     &ctx,
                     b,
@@ -1340,9 +1716,11 @@ impl S3Handler {
                 } else {
                     "s3:DeleteObject"
                 };
-                self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{k}"))?;
+                self.authorize_action(req, action, &format!("arn:aws:s3:::{b}/{k}"))
+                    .await?;
                 self.run_mutation(
                     req,
+                    storage_account,
                     ops::delete_object(&ctx, b, k, q.get("versionId"), &req.headers),
                 )
                 .await
@@ -1398,9 +1776,10 @@ impl NativeHandler for S3Handler {
         if recovering && self.recover_committed_state().is_err() {
             return S3Error::InternalError.into_response(request.uri.path(), &request.request_id);
         }
+        let storage_account = self.storage_account(&request, &shape);
         let gate = match &shape {
             Shape::Bucket(name) | Shape::Object(name, _) => {
-                self.store.transaction_gate(&request.account_id, name)
+                self.store.transaction_gate(&storage_account, name)
             }
             Shape::Service => None,
         };
@@ -1427,7 +1806,7 @@ impl NativeHandler for S3Handler {
         let result = if self.poisoned.load(Ordering::Acquire) {
             Err(S3Error::InternalError)
         } else {
-            self.route(&request).await
+            self.route(&request, &storage_account).await
         };
         let result = match result {
             Ok(response)
@@ -1435,7 +1814,7 @@ impl NativeHandler for S3Handler {
                     && response.status().is_success()
                     && !self.persisted_in_route.load(Ordering::Acquire) =>
             {
-                self.persist_request(&request, Vec::new())
+                self.persist_request(&request, &storage_account, Vec::new())
                     .map(|()| response)
             }
             other => other,
@@ -1458,6 +1837,8 @@ impl NativeHandler for S3Handler {
                 let ctx = Ctx {
                     store: &self.store,
                     account: &request.account_id,
+                    storage_account: &storage_account,
+                    copy_source_account: None,
                     region: &request.region,
                     request_id: &request.request_id,
                     dispatcher: None,
@@ -1825,6 +2206,20 @@ mod tests {
     }
 
     impl locallycloud_core::integration::authorization::AuthorizationEvaluator for WritePolicyStub {
+        fn authorize_resource_policy(
+            &self,
+            request: AuthorizationRequest,
+            document: Option<&str>,
+            _: &str,
+        ) -> Result<(), locallycloud_core::integration::authorization::AuthorizationError> {
+            if document.is_some() {
+                return Err(
+                    locallycloud_core::integration::authorization::AuthorizationError::Denied,
+                );
+            }
+            self.authorize(request)
+        }
+
         fn authorize(
             &self,
             request: AuthorizationRequest,
@@ -2559,6 +2954,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bucket_reads_preserve_subresource_priority_and_listing_fallbacks() {
+        let handler = S3Handler::new();
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, "/bucket-read-priority", "", &[]))
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, "/bucket-read-priority/key", "value", &[]))
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::PUT,
+                    "/bucket-read-priority?versioning",
+                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                    &[],
+                ))
+                .await
+                .status(),
+            200
+        );
+        for (query, status, marker) in [
+            (
+                "versioning&location&list-type=2",
+                200,
+                "<LocationConstraint",
+            ),
+            ("versioning&policy", 404, "<Code>NoSuchBucketPolicy</Code>"),
+            (
+                "uploads&versioning&list-type=2",
+                200,
+                "<VersioningConfiguration",
+            ),
+            ("list-type=2", 200, "<KeyCount>1</KeyCount>"),
+            ("list-type=1", 200, "<Marker></Marker>"),
+            ("list-type=unknown", 200, "<Marker></Marker>"),
+        ] {
+            let (actual_status, body) = body_string(
+                handler
+                    .handle(req(
+                        Method::GET,
+                        &format!("/bucket-read-priority?{query}"),
+                        "",
+                        &[],
+                    ))
+                    .await,
+            )
+            .await;
+            assert_eq!(actual_status, status, "query: {query}");
+            assert!(body.contains(marker), "query: {query}; body: {body}");
+        }
+    }
+
     async fn body_string(resp: Response) -> (u16, String) {
         let status = resp.status().as_u16();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -2589,6 +3045,203 @@ mod tests {
             response.headers()["x-amz-server-side-encryption-bucket-key-enabled"],
             "false"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_bucket_encryption_authorizes_each_action_before_mutation() {
+        let (handler, registry, _kms) = kms_handler();
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, "/buck", "", &[]))
+                .await
+                .status(),
+            200
+        );
+        let configuration = concat!(
+            "<ServerSideEncryptionConfiguration><Rule>",
+            "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>",
+            "<KMSMasterKeyID>alias/data</KMSMasterKeyID>",
+            "</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+        );
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, "/buck?encryption", configuration, &[]))
+                .await
+                .status(),
+            200
+        );
+        let original = body_string(
+            handler
+                .handle(req(Method::GET, "/buck?encryption", "", &[]))
+                .await,
+        )
+        .await
+        .1;
+        assert!(original.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"));
+        // The fixture isolates admission; real IAM/resource-policy composition is
+        // covered by bucket_policy_enforcement's separate service-boundary tests.
+        let policy = Arc::new(WritePolicyStub {
+            allow: std::sync::atomic::AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
+        });
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(KmsHttpStub),
+            policy.clone(),
+        );
+        for (method, action) in [
+            (Method::GET, "s3:GetEncryptionConfiguration"),
+            (Method::PUT, "s3:PutEncryptionConfiguration"),
+            (Method::DELETE, "s3:PutEncryptionConfiguration"),
+        ] {
+            policy.requests.lock().unwrap().clear();
+            let (status, error) = body_string(
+                handler
+                    .handle(req(
+                        method,
+                        "/buck?encryption",
+                        "malformed",
+                        VERIFIED_WRITE_HEADERS,
+                    ))
+                    .await,
+            )
+            .await;
+            assert_eq!(status, 403);
+            assert!(error.contains("<Code>AccessDenied</Code>"));
+            {
+                let requests = policy.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].action, action);
+                assert_eq!(requests[0].resource, "arn:aws:s3:::buck");
+            }
+            assert_eq!(
+                body_string(
+                    handler
+                        .handle(req(Method::GET, "/buck?encryption", "", &[]))
+                        .await
+                )
+                .await
+                .1,
+                original
+            );
+        }
+        policy
+            .allow
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut wrong_owner = VERIFIED_WRITE_HEADERS.to_vec();
+        wrong_owner.push(("x-amz-expected-bucket-owner", "111111111111"));
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            assert_eq!(
+                handler
+                    .handle(req(
+                        method.clone(),
+                        "/buck?encryption",
+                        configuration,
+                        &wrong_owner
+                    ))
+                    .await
+                    .status(),
+                403
+            );
+            assert_eq!(
+                handler
+                    .handle(req(
+                        method,
+                        "/buck?encryption&unknown=1",
+                        configuration,
+                        VERIFIED_WRITE_HEADERS
+                    ))
+                    .await
+                    .status(),
+                501
+            );
+            assert_eq!(
+                body_string(
+                    handler
+                        .handle(req(Method::GET, "/buck?encryption", "", &[]))
+                        .await
+                )
+                .await
+                .1,
+                original
+            );
+        }
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::GET,
+                    "/buck?encryption",
+                    "",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            200
+        );
+        let aes = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::PUT,
+                    "/buck?encryption",
+                    aes,
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            200
+        );
+        assert!(body_string(
+            handler
+                .handle(req(
+                    Method::GET,
+                    "/buck?encryption",
+                    "",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+        )
+        .await
+        .1
+        .contains("<SSEAlgorithm>AES256</SSEAlgorithm>"));
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::PUT,
+                    "/buck?encryption",
+                    configuration,
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::DELETE,
+                    "/buck?encryption",
+                    "",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            204
+        );
+        assert!(body_string(
+            handler
+                .handle(req(
+                    Method::GET,
+                    "/buck?encryption",
+                    "",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+        )
+        .await
+        .1
+        .contains("<SSEAlgorithm>AES256</SSEAlgorithm>"));
     }
 
     #[tokio::test]
@@ -5034,18 +5687,18 @@ mod tests {
         .1;
         assert!(encryption.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"));
 
-        let policy = "not JSON, but opaque UTF-8";
+        // Standalone handlers cannot accept unvalidated opaque documents.
         assert_eq!(
-            h.handle(req(Method::PUT, "/buck?policy", policy, &[]))
+            h.handle(req(Method::PUT, "/buck?policy", "{}", &[]))
                 .await
                 .status(),
-            204
+            501
         );
         assert_eq!(
-            body_string(h.handle(req(Method::GET, "/buck?policy", "", &[])).await)
+            h.handle(req(Method::GET, "/buck?policy", "", &[]))
                 .await
-                .1,
-            policy
+                .status(),
+            404
         );
         h.handle(req(Method::DELETE, "/buck?policy", "", &[])).await;
         assert_eq!(
@@ -5257,6 +5910,108 @@ mod restart_persistence_tests {
             account_id: "000000000001".into(),
             request_id: "restart-gate".into(),
         }
+    }
+
+    struct StorageScopeEvaluator;
+    impl locallycloud_core::integration::authorization::AuthorizationEvaluator
+        for StorageScopeEvaluator
+    {
+        fn strict_sigv4_required(&self) -> bool {
+            true
+        }
+        fn authorize(
+            &self,
+            _: locallycloud_core::integration::authorization::AuthorizationRequest,
+        ) -> Result<(), locallycloud_core::integration::authorization::AuthorizationError> {
+            Ok(())
+        }
+        fn authorize_resource_policy(
+            &self,
+            _: locallycloud_core::integration::authorization::AuthorizationRequest,
+            _: Option<&str>,
+            _: &str,
+        ) -> Result<(), locallycloud_core::integration::authorization::AuthorizationError> {
+            Ok(())
+        }
+    }
+
+    // Authorization composition is covered by the real-IAM service-boundary suite.
+    // This fixture isolates durable owner scope and namespace deletion after admission.
+    #[tokio::test]
+    async fn admitted_foreign_mutations_persist_under_owner_and_delete_owner_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
+        let registry = Arc::new(ServiceRegistry::new());
+        let handler =
+            super::tests::test_state_handler(Arc::downgrade(&registry), state.clone()).unwrap();
+        assert_eq!(
+            handler
+                .handle(request(Method::PUT, "/owner-durable", Bytes::new()))
+                .await
+                .status(),
+            200
+        );
+        locallycloud_iam_sts::register(&registry);
+        let iam = registry.native_handler(&ServiceName::new("iam")).unwrap();
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            iam,
+            Arc::new(StorageScopeEvaluator),
+        );
+        let foreign = |method, path: &str, body| {
+            let mut req = request(method, path, body);
+            req.account_id = "111111111111".into();
+            req.headers.insert(
+                "x-locallycloud-verified-external-sigv4",
+                HeaderValue::from_static("1"),
+            );
+            req
+        };
+        assert_eq!(
+            handler
+                .handle(foreign(
+                    Method::PUT,
+                    "/owner-durable/key",
+                    Bytes::from_static(b"foreign-write")
+                ))
+                .await
+                .status(),
+            200
+        );
+        drop(handler);
+        let handler =
+            super::tests::test_state_handler(Arc::downgrade(&registry), state.clone()).unwrap();
+        let response = handler
+            .handle(foreign(Method::GET, "/owner-durable/key", Bytes::new()))
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"foreign-write")
+        );
+        assert!(handler.store.get("111111111111", "owner-durable").is_none());
+        assert!(handler.store.get("000000000001", "owner-durable").is_some());
+        assert_eq!(
+            handler
+                .handle(foreign(Method::DELETE, "/owner-durable/key", Bytes::new()))
+                .await
+                .status(),
+            204
+        );
+        assert_eq!(
+            handler
+                .handle(foreign(Method::DELETE, "/owner-durable", Bytes::new()))
+                .await
+                .status(),
+            204
+        );
+        drop(handler);
+        let handler = super::tests::test_state_handler(Arc::downgrade(&registry), state).unwrap();
+        assert!(handler.store.resource_bucket("owner-durable").is_none());
     }
 
     #[tokio::test]

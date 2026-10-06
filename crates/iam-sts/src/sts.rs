@@ -64,10 +64,27 @@ pub struct Session {
     pub session_token: String,
     pub arn: String,
     pub user_id: String,
+    #[serde(default)]
+    pub(crate) root_account: bool,
     pub role_arn: Option<String>,
     pub session_policy: Option<String>,
     #[serde(with = "session_timestamp")]
     pub(crate) expires_at: OffsetDateTime,
+}
+
+impl Session {
+    /// Ordinary sessions carry no root claim; malformed root claims fail closed.
+    pub(crate) fn root_provenance(&self, account: &str, store: &IamStore) -> Result<bool, ()> {
+        if !self.root_account && !self.arn.ends_with(":root") {
+            return Ok(false);
+        }
+        let valid = self.account == account
+            && self.root_account
+            && self.role_arn.is_none()
+            && store.root_for_account(account).is_some()
+            && self.arn == format!("arn:aws:iam::{account}:root");
+        valid.then_some(true).ok_or(())
+    }
 }
 
 /// Sessions keyed by AccessKeyId. Expired sessions are removed on resolve.
@@ -89,7 +106,11 @@ impl SessionStore {
             persistence: Some(persistence),
         })
     }
-    fn register(&self, access_key_id: &str, session: Session) -> Result<(), IamStsError> {
+    pub(crate) fn register(
+        &self,
+        access_key_id: &str,
+        session: Session,
+    ) -> Result<(), IamStsError> {
         if let Some(persistence) = &self.persistence {
             persistence.save_session(access_key_id, &session)?;
         }
@@ -126,6 +147,7 @@ struct SessionRegistration<'a> {
     arn: &'a str,
     user_id: &'a str,
     duration: i64,
+    root_account: bool,
     role_arn: Option<&'a str>,
     session_policy: Option<&'a str>,
 }
@@ -143,6 +165,7 @@ fn register_session(
             session_token: creds.session_token.clone(),
             arn: registration.arn.to_string(),
             user_id: registration.user_id.to_string(),
+            root_account: registration.root_account,
             role_arn: registration.role_arn.map(str::to_string),
             session_policy: registration.session_policy.map(str::to_string),
             expires_at: OffsetDateTime::now_utc() + Duration::seconds(registration.duration),
@@ -204,6 +227,7 @@ pub fn issue_service_role_credentials(
             arn: &assumed_arn,
             user_id: &user_id,
             duration: ASSUME_ROLE_DEFAULT,
+            root_account: false,
             role_arn: Some(role_arn),
             session_policy: None,
         },
@@ -243,6 +267,7 @@ pub fn assume_role(
             arn: &assumed_arn,
             user_id: &assumed_role_id,
             duration,
+            root_account: false,
             role_arn: Some(role_arn),
             session_policy,
         },
@@ -280,6 +305,7 @@ pub fn assume_role_with_web_identity(
             arn: &assumed_arn,
             user_id: &assumed_role_id,
             duration,
+            root_account: false,
             role_arn: Some(role_arn),
             session_policy,
         },
@@ -321,6 +347,7 @@ pub fn assume_role_with_saml(
             arn: &assumed_arn,
             user_id: &assumed_role_id,
             duration,
+            root_account: false,
             role_arn: Some(role_arn),
             session_policy,
         },
@@ -362,17 +389,52 @@ pub fn get_session_token(
     account: &str,
     q: &QueryRequest,
 ) -> Result<String, IamStsError> {
-    let duration = duration_or(q, SESSION_TOKEN_DEFAULT);
+    get_session_token_for_issuer(
+        sessions,
+        account,
+        q,
+        &format!("arn:aws:iam::{account}:root"),
+        account,
+        false,
+    )
+}
+
+pub(crate) fn get_session_token_for_issuer(
+    sessions: &SessionStore,
+    account: &str,
+    q: &QueryRequest,
+    arn: &str,
+    user_id: &str,
+    root_account: bool,
+) -> Result<String, IamStsError> {
+    let requested = q
+        .get("DurationSeconds")
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                IamStsError::ValidationError("DurationSeconds must be an integer".into())
+            })
+        })
+        .transpose()?;
+    if requested.is_some_and(|duration| !(900..=129600).contains(&duration)) {
+        return Err(IamStsError::ValidationError(
+            "DurationSeconds must be between 900 and 129600".into(),
+        ));
+    }
+    let duration = if root_account {
+        requested.unwrap_or(3600).min(3600)
+    } else {
+        requested.unwrap_or(SESSION_TOKEN_DEFAULT)
+    };
     let creds = Credentials::generate(duration);
-    let arn = format!("arn:aws:iam::{account}:root");
     register_session(
         sessions,
         &creds,
         SessionRegistration {
             account,
-            arn: &arn,
-            user_id: account,
+            arn,
+            user_id,
             duration,
+            root_account,
             role_arn: None,
             session_policy: None,
         },
@@ -399,6 +461,7 @@ pub fn get_federation_token(
             arn: &federated_arn,
             user_id: &federated_id,
             duration,
+            root_account: false,
             role_arn: None,
             session_policy,
         },

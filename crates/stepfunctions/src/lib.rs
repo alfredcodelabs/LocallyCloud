@@ -16,6 +16,7 @@ pub mod jsonata;
 pub mod logging;
 pub mod ops;
 pub mod path;
+mod s3_integration;
 pub mod service;
 pub mod store;
 

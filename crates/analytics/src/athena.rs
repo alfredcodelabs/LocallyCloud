@@ -11,7 +11,8 @@ use dashmap::DashMap;
 use http::{HeaderMap, HeaderValue, Method, Uri};
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
-use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::authorization::{AuthorizationError, AuthorizationRequest};
+use locallycloud_core::integration::identity::{trusted_role, CallerIdentity, IdentityPropagator};
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{AwsProtocol, ServiceName, ServiceRegistry};
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -87,6 +88,26 @@ impl QueryState {
     }
 }
 
+#[derive(Clone)]
+struct AthenaCaller {
+    request_identity: RequestIdentity,
+    delegated_identity: Option<CallerIdentity>,
+}
+
+impl AthenaCaller {
+    fn attach(&self, headers: &mut HeaderMap) {
+        if let Some(identity) = &self.delegated_identity {
+            IdentityPropagator::attach(headers, identity);
+        } else if let Some(access_key_id) = &self.request_identity.access_key_id {
+            if let Ok(value) = HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/19700101/us-east-1/s3/aws4_request"
+            )) {
+                headers.insert(http::header::AUTHORIZATION, value);
+            }
+        }
+    }
+}
+
 struct QueryRecord {
     id: String,
     spec: QuerySpec,
@@ -98,7 +119,7 @@ struct QueryRecord {
     scanned_bytes: u64,
     result: Option<QueryResult>,
     result_token: String,
-    caller: Option<RequestIdentity>,
+    caller: Option<AthenaCaller>,
 }
 
 pub(crate) struct AthenaHandler {
@@ -116,7 +137,7 @@ impl AthenaHandler {
         }
     }
 
-    fn process(&self, request: &ServiceRequest) -> Result<Value, AthenaError> {
+    async fn process(&self, request: &ServiceRequest) -> Result<Value, AthenaError> {
         if request.method != Method::POST
             || request.uri.path() != "/"
             || request.uri.query().is_some()
@@ -136,6 +157,7 @@ impl AthenaHandler {
             "StopQueryExecution" => self.stop_query_execution(decode(&request.body)?, request),
             "GetQueryResults" => {
                 self.get_query_results(decode(&request.body)?, request, caller.as_ref())
+                    .await
             }
             _ => Err(AthenaError::InvalidRequest(
                 "The requested Athena operation is not supported".into(),
@@ -147,7 +169,7 @@ impl AthenaHandler {
         &self,
         request: &ServiceRequest,
         operation: &str,
-    ) -> Result<Option<RequestIdentity>, AthenaError> {
+    ) -> Result<Option<AthenaCaller>, AthenaError> {
         let Some(registry) = self.registry.upgrade() else {
             return Err(AthenaError::Internal);
         };
@@ -157,28 +179,38 @@ impl AthenaHandler {
         if !evaluator.strict_sigv4_required() {
             return Ok(None);
         }
-        if request
-            .headers
-            .get("x-locallycloud-verified-external-sigv4")
-            != Some(&HeaderValue::from_static("1"))
-        {
-            return Err(AthenaError::AccessDenied);
-        }
-        let access_key_id = request
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(RequestIdentity::access_key_from_authorization)
-            .ok_or(AthenaError::AccessDenied)?;
-        let caller = RequestIdentity {
-            account_id: request.account_id.clone(),
-            access_key_id: Some(access_key_id),
-            arn: None,
+        let delegated_identity = trusted_role(request);
+        let access_key_id = if delegated_identity.is_some() {
+            None
+        } else {
+            if request
+                .headers
+                .get("x-locallycloud-verified-external-sigv4")
+                != Some(&HeaderValue::from_static("1"))
+            {
+                return Err(AthenaError::AccessDenied);
+            }
+            Some(
+                request
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(RequestIdentity::access_key_from_authorization)
+                    .ok_or(AthenaError::AccessDenied)?,
+            )
+        };
+        let caller = AthenaCaller {
+            request_identity: RequestIdentity {
+                account_id: request.account_id.clone(),
+                access_key_id,
+                arn: None,
+            },
+            delegated_identity,
         };
         evaluator
             .authorize(AuthorizationRequest {
-                request_identity: caller.clone(),
-                delegated_identity: None,
+                request_identity: caller.request_identity.clone(),
+                delegated_identity: caller.delegated_identity.clone(),
                 source_service: "athena".into(),
                 action: format!("athena:{operation}"),
                 resource: format!(
@@ -195,7 +227,7 @@ impl AthenaHandler {
         &self,
         input: StartQueryExecutionRequest,
         request: &ServiceRequest,
-        caller: Option<RequestIdentity>,
+        caller: Option<AthenaCaller>,
     ) -> Result<Value, AthenaError> {
         validate_start(&input)?;
         let scope = Scope::new(&request.account_id, &request.region);
@@ -240,7 +272,7 @@ impl AthenaHandler {
         &self,
         scope: Scope,
         spec: QuerySpec,
-        caller: Option<RequestIdentity>,
+        caller: Option<AthenaCaller>,
     ) -> Result<String, AthenaError> {
         let id = Uuid::new_v4().to_string();
         let output = parse_s3_location(&spec.result_configuration.output_location)
@@ -334,14 +366,35 @@ impl AthenaHandler {
         Ok(json!({}))
     }
 
-    fn get_query_results(
+    async fn get_query_results(
         &self,
         input: GetQueryResultsRequest,
         request: &ServiceRequest,
-        caller: Option<&RequestIdentity>,
+        caller: Option<&AthenaCaller>,
     ) -> Result<Value, AthenaError> {
+        match input.query_result_type.as_deref() {
+            None | Some("DATA_ROWS") => {}
+            Some("DATA_MANIFEST") => {
+                return Err(AthenaError::ModeledInvalidRequest {
+                    message: format!("Manifest files are only available for INSERT, CTAS (CREATE TABLE AS SELECT), and UNLOAD queries. query {} does not generate a manifest file.", input.query_execution_id),
+                    code: "RESULT_NOT_FOUND",
+                });
+            }
+            Some(_) => {
+                return Err(AthenaError::ModeledInvalidRequest {
+                    message: "1 validation error detected: Value at 'queryResultType' failed to satisfy constraint: Member must satisfy enum value set: [DATA_MANIFEST, DATA_ROWS]".into(),
+                    code: "INVALID_INPUT",
+                });
+            }
+        }
         let max_results = input.max_results.unwrap_or(1000);
-        if !(1..=1000).contains(&max_results) {
+        if max_results > 1000 {
+            return Err(AthenaError::ModeledInvalidRequest {
+                message: "MaxResults is more than maximum allowed length 1000".into(),
+                code: "INVALID_INPUT",
+            });
+        }
+        if max_results < 1 {
             return Err(AthenaError::InvalidRequest(
                 "MaxResults must be between 1 and 1000".into(),
             ));
@@ -351,60 +404,111 @@ impl AthenaHandler {
             &request.region,
             &input.query_execution_id,
         )?;
-        let record = record.lock().map_err(|_| AthenaError::Internal)?;
-        if record.state != QueryState::Succeeded {
-            return Err(AthenaError::InvalidRequest(
-                "Query results are available only for SUCCEEDED queries".into(),
-            ));
-        }
-        let output_arn = format!(
-            "arn:aws:s3:::{}/{}",
-            record.effective_output_location.bucket, record.effective_output_location.key
-        );
-        if !iam_allows(
+        let (columns, bucket, key, result_token) = {
+            let record = record.lock().map_err(|_| AthenaError::Internal)?;
+            if record.state != QueryState::Succeeded {
+                return Err(AthenaError::InvalidRequest(
+                    "Query results are available only for SUCCEEDED queries".into(),
+                ));
+            }
+            let result = record.result.as_ref().ok_or(AthenaError::Internal)?;
+            (
+                result
+                    .columns
+                    .iter()
+                    .map(ResultColumn::metadata)
+                    .collect::<Vec<_>>(),
+                record.effective_output_location.bucket.clone(),
+                record.effective_output_location.key.clone(),
+                record.result_token.clone(),
+            )
+        };
+        let uri = format!(
+            "/{}/{}",
+            percent_encode(&bucket, false),
+            percent_encode(&key, true)
+        )
+        .parse()
+        .map_err(|_| AthenaError::Internal)?;
+        let response = s3_request(
             &self.registry,
             &Scope::new(&request.account_id, &request.region),
             caller,
             "s3:GetObject",
-            &output_arn,
-        ) {
-            return Err(AthenaError::AccessDenied);
+            format!("arn:aws:s3:::{bucket}/{key}"),
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .map_err(|error| match error {
+            WorkerFailure::Failed {
+                access_denied: true,
+                ..
+            } => AthenaError::AccessDenied,
+            _ => AthenaError::Internal,
+        })?;
+        match response.status().as_u16() {
+            401 | 403 => return Err(AthenaError::AccessDenied),
+            404 => {
+                return Err(AthenaError::ModeledInvalidRequest {
+                    message: "Could not find results".into(),
+                    code: "RESULT_NOT_FOUND",
+                });
+            }
+            200..=299 => {}
+            _ => {
+                return Err(AthenaError::InvalidRequest(
+                    "Query result object could not be read from S3".into(),
+                ));
+            }
         }
-        let result = record.result.as_ref().ok_or(AthenaError::Internal)?;
-        let invalid_token =
-            || AthenaError::InvalidRequest("NextToken is invalid for this query".into());
-        let start = match input.next_token {
+        let body = axum::body::to_bytes(response.into_body(), MAX_RESULT_BYTES)
+            .await
+            .map_err(|_| AthenaError::Internal)?;
+        // Decode the currently authorized object, rather than cached execution rows.
+        // The existing S3 read retains reader identity and IAM/KMS checks.
+        let rows =
+            sql::result_csv_rows(&body, columns.len()).map_err(AthenaError::InvalidRequest)?;
+        let invalid_token = || AthenaError::ModeledInvalidRequest {
+            message: format!(
+                "Malformed nextPageToken {}",
+                input.next_token.as_deref().unwrap_or("")
+            ),
+            code: "INVALID_INPUT",
+        };
+        let start = match input.next_token.as_deref() {
             None => 0,
-            Some(token) if token == record.result_token => 1,
+            Some(token) if token == result_token => 1,
             Some(token) => token
-                .strip_prefix(&format!("{}:", record.result_token))
+                .strip_prefix(&format!("{result_token}:"))
                 .and_then(|offset| offset.parse::<usize>().ok())
-                .filter(|offset| *offset > 0 && *offset < result.rows.len())
+                .filter(|offset| *offset > 0 && *offset <= rows.len())
                 .ok_or_else(invalid_token)?,
         };
-        let end = start
-            .saturating_add(max_results as usize)
-            .min(result.rows.len());
-        let rows = result.rows[start..end]
+        if start > rows.len() {
+            return Err(invalid_token());
+        }
+        let end = start.saturating_add(max_results as usize).min(rows.len());
+        let page = rows[start..end]
             .iter()
             .map(|row| {
-                json!({ "Data": row.iter().map(|value| match value {
-                Some(value) => json!({ "VarCharValue": value }),
-                None => json!({}),
-            }).collect::<Vec<_>>() })
+                json!({
+                    "Data": row.iter().map(|value| match value {
+                        Some(value) => json!({"VarCharValue": value}),
+                        None => json!({}),
+                    }).collect::<Vec<_>>()
+                })
             })
             .collect::<Vec<_>>();
         let mut output = json!({
-            "ResultSet": {
-                "ResultSetMetadata": { "ColumnInfo": result.columns.iter().map(|column| json!({
-                    "Name": column.name, "Label": column.name, "Type": column.kind, "Nullable": "UNKNOWN"
-                })).collect::<Vec<_>>() },
-                "Rows": rows
-            },
+            "ResultSet": {"ResultSetMetadata": {"ColumnInfo": columns}, "Rows": page},
             "UpdateCount": 0
         });
-        if end < result.rows.len() {
-            output["NextToken"] = format!("{}:{end}", record.result_token).into();
+        // AWS may emit a cursor after a full final page; a shorter page terminates.
+        if end - start == max_results as usize {
+            output["NextToken"] = format!("{result_token}:{end}").into();
         }
         Ok(output)
     }
@@ -421,24 +525,39 @@ impl AthenaHandler {
                 id: query_id.to_owned(),
             })
             .map(|record| Arc::clone(record.value()))
-            .ok_or_else(|| AthenaError::InvalidRequest("QueryExecutionId was not found".into()))
+            .ok_or_else(|| AthenaError::ModeledInvalidRequest {
+                message: format!("QueryExecution {query_id} was not found"),
+                code: "QUERY_EXECUTION_NOT_FOUND",
+            })
     }
 }
 
 #[async_trait]
 impl NativeHandler for AthenaHandler {
     async fn handle(&self, request: ServiceRequest) -> Response {
-        match self.process(&request) {
+        match self.process(&request).await {
             Ok(value) => Response::builder()
                 .status(200)
                 .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
                 .header("x-amzn-RequestId", &request.request_id)
                 .body(Body::from(value.to_string()))
                 .expect("Athena JSON response is valid"),
-            Err(error) => AwsError::from(error)
-                .with_request_id(request.request_id)
-                .render(AwsProtocol::Json11)
-                .into_response(),
+            Err(error) => {
+                let detail = match &error {
+                    AthenaError::ModeledInvalidRequest { code, .. } => Some(*code),
+                    _ => None,
+                };
+                let mut rendered = AwsError::from(error)
+                    .with_request_id(request.request_id)
+                    .render(AwsProtocol::Json11);
+                if let Some(code) = detail {
+                    let mut body: Value =
+                        serde_json::from_str(&rendered.body).expect("rendered JSON error is valid");
+                    body["AthenaErrorCode"] = code.into();
+                    rendered.body = body.to_string();
+                }
+                rendered.into_response()
+            }
         }
     }
 }
@@ -446,6 +565,7 @@ impl NativeHandler for AthenaHandler {
 #[derive(Debug)]
 enum AthenaError {
     InvalidRequest(String),
+    ModeledInvalidRequest { message: String, code: &'static str },
     AccessDenied,
     Internal,
 }
@@ -453,7 +573,8 @@ enum AthenaError {
 impl From<AthenaError> for AwsError {
     fn from(error: AthenaError) -> Self {
         match error {
-            AthenaError::InvalidRequest(message) => {
+            AthenaError::ModeledInvalidRequest { message, .. }
+            | AthenaError::InvalidRequest(message) => {
                 AwsError::new("InvalidRequestException", message, 400)
             }
             AthenaError::AccessDenied => {
@@ -500,6 +621,7 @@ struct QueryExecutionRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct GetQueryResultsRequest {
+    query_result_type: Option<String>,
     query_execution_id: String,
     max_results: Option<i64>,
     next_token: Option<String>,
@@ -591,7 +713,11 @@ fn now_epoch() -> Result<f64, AthenaError> {
 #[derive(Debug)]
 enum WorkerFailure {
     Cancelled,
-    Failed { reason: String, scanned: u64 },
+    Failed {
+        reason: String,
+        scanned: u64,
+        access_denied: bool,
+    },
 }
 
 impl WorkerFailure {
@@ -599,57 +725,74 @@ impl WorkerFailure {
         Self::Failed {
             reason: reason.into(),
             scanned,
+            access_denied: false,
         }
     }
 }
 
+#[cfg(test)]
 fn iam_allows(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     action: &str,
     resource: &str,
 ) -> bool {
-    let Some(registry) = registry.upgrade() else {
-        return false;
-    };
-    let Some(evaluator) = registry.authorization_evaluator(&ServiceName::new("iam")) else {
-        return caller.is_none();
-    };
-    if !evaluator.strict_sigv4_required() {
-        return true;
-    }
-    let Some(caller) = caller.filter(|caller| caller.account_id == scope.account_id()) else {
-        return false;
-    };
-    evaluator
-        .authorize(AuthorizationRequest {
-            request_identity: caller.clone(),
-            delegated_identity: None,
-            source_service: "athena".into(),
-            action: action.into(),
-            resource: resource.into(),
-            context: Default::default(),
-        })
-        .is_ok()
+    require_iam(registry, scope, caller, action, resource, 0).is_ok()
 }
 
 fn require_iam(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     action: &str,
     resource: &str,
     scanned: u64,
 ) -> Result<(), WorkerFailure> {
-    if iam_allows(registry, scope, caller, action, resource) {
-        Ok(())
-    } else {
-        Err(WorkerFailure::failed(
-            format!("Access denied for {action} on {resource}"),
-            scanned,
-        ))
+    let denied = || WorkerFailure::Failed {
+        reason: format!("Access denied for {action} on {resource}"),
+        scanned,
+        access_denied: true,
+    };
+    let registry = registry
+        .upgrade()
+        .ok_or_else(|| WorkerFailure::failed("Service registry is unavailable", scanned))?;
+    let Some(evaluator) = registry.authorization_evaluator(&ServiceName::new("iam")) else {
+        return if caller.is_none() {
+            Ok(())
+        } else {
+            Err(WorkerFailure::failed(
+                "Authorization evaluator is unavailable",
+                scanned,
+            ))
+        };
+    };
+    if !evaluator.strict_sigv4_required() {
+        return Ok(());
     }
+    let caller = caller
+        .filter(|caller| caller.request_identity.account_id == scope.account_id())
+        .ok_or_else(denied)?;
+    if action.starts_with("s3:") && registry.native_handler(&ServiceName::new("s3")).is_some() {
+        // The verified caller remains attached to dispatch. Native S3 evaluates identity
+        // and bucket policy together, including revoked credentials and explicit Deny.
+        return Ok(());
+    }
+    evaluator
+        .authorize(AuthorizationRequest {
+            request_identity: caller.request_identity.clone(),
+            delegated_identity: caller.delegated_identity.clone(),
+            source_service: "athena".into(),
+            action: action.into(),
+            resource: resource.into(),
+            context: Default::default(),
+        })
+        .map_err(|error| match error {
+            AuthorizationError::Denied | AuthorizationError::InvalidRequest => denied(),
+            AuthorizationError::Internal | AuthorizationError::Unavailable => {
+                WorkerFailure::failed("Authorization evaluation is unavailable", scanned)
+            }
+        })
 }
 
 async fn run_query(registry: Weak<ServiceRegistry>, scope: Scope, record: Arc<Mutex<QueryRecord>>) {
@@ -679,7 +822,9 @@ async fn run_query(registry: Weak<ServiceRegistry>, scope: Scope, record: Arc<Mu
     .await
     {
         Ok(()) => {}
-        Err(WorkerFailure::Failed { reason, scanned }) => {
+        Err(WorkerFailure::Failed {
+            reason, scanned, ..
+        }) => {
             if let Ok(mut query) = record.lock() {
                 if query.state == QueryState::Running {
                     query.state = QueryState::Failed;
@@ -699,7 +844,7 @@ async fn run_query(registry: Weak<ServiceRegistry>, scope: Scope, record: Arc<Mu
 async fn execute_query(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     record: &Arc<Mutex<QueryRecord>>,
     spec: &QuerySpec,
     effective_output_location: &S3Location,
@@ -860,7 +1005,7 @@ fn is_iceberg_table(table: &GlueTableOutput) -> bool {
 async fn iceberg_count(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     record: &Arc<Mutex<QueryRecord>>,
     table: &GlueTableOutput,
 ) -> Result<(u64, u64), WorkerFailure> {
@@ -878,7 +1023,7 @@ async fn iceberg_count(
 async fn iceberg_manifest_list(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     record: &Arc<Mutex<QueryRecord>>,
     table: &GlueTableOutput,
 ) -> Result<(Value, Bytes, u64), WorkerFailure> {
@@ -1000,7 +1145,7 @@ const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 async fn iceberg_rows(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     record: &Arc<Mutex<QueryRecord>>,
     table: &GlueTableOutput,
     names: &[String],
@@ -1562,7 +1707,7 @@ fn avro_nonnegative(value: &AvroValue, scanned: u64) -> Result<u64, WorkerFailur
 async fn jsonl_count(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     record: &Arc<Mutex<QueryRecord>>,
     table: &GlueTableOutput,
 ) -> Result<(u64, u64), WorkerFailure> {
@@ -1641,7 +1786,7 @@ struct GlueGetPartitionsOutput {
 async fn glue_table_snapshot(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     database: &str,
     table: &str,
 ) -> Result<GlueTableOutput, WorkerFailure> {
@@ -1854,7 +1999,7 @@ fn output_key(prefix: &str, query_id: &str) -> String {
 async fn list_objects(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     location: &S3Location,
 ) -> Result<Vec<String>, WorkerFailure> {
     let mut keys = Vec::new();
@@ -1920,7 +2065,7 @@ async fn list_objects(
 async fn get_object(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     bucket: &str,
     key: &str,
     scanned: u64,
@@ -1961,7 +2106,7 @@ async fn get_object(
 async fn put_object(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     bucket: &str,
     key: &str,
     body: Bytes,
@@ -1975,7 +2120,10 @@ async fn put_object(
     .parse()
     .map_err(|_| WorkerFailure::failed("S3 result URI is invalid", scanned))?;
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("text/csv"));
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
     let response = s3_request(
         registry,
         scope,
@@ -2003,7 +2151,7 @@ async fn put_object(
 async fn delete_object(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     bucket: &str,
     key: &str,
     scanned: u64,
@@ -2042,7 +2190,7 @@ async fn delete_object(
 async fn glue_json_request<T: DeserializeOwned>(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     operation: &str,
     body: Value,
 ) -> Result<T, WorkerFailure> {
@@ -2122,6 +2270,9 @@ async fn glue_json_request<T: DeserializeOwned>(
             "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/us-east-1/glue/aws4_request",
         ),
     );
+    if let Some(identity) = caller.and_then(|caller| caller.delegated_identity.as_ref()) {
+        IdentityPropagator::attach(&mut headers, identity);
+    }
     let request_body = serde_json::to_vec(&body)
         .map(Bytes::from)
         .map_err(|_| WorkerFailure::failed("Failed to serialize Glue request", 0))?;
@@ -2157,7 +2308,7 @@ async fn glue_json_request<T: DeserializeOwned>(
 async fn s3_request(
     registry: &Weak<ServiceRegistry>,
     scope: &Scope,
-    caller: Option<&RequestIdentity>,
+    caller: Option<&AthenaCaller>,
     action: &str,
     resource: String,
     method: Method,
@@ -2178,6 +2329,9 @@ async fn s3_request(
             "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/us-east-1/s3/aws4_request",
         ),
     );
+    if let Some(caller) = caller {
+        caller.attach(&mut headers);
+    }
     let request_id = Uuid::new_v4().to_string();
     Ok(dispatcher
         .dispatch_scoped(
@@ -2316,10 +2470,13 @@ mod tests {
     fn missing_iam_evaluator_does_not_downgrade_authenticated_query() {
         let registry = ServiceRegistry::with_known_services();
         let scope = Scope::new(ACCOUNT_ID, REGION);
-        let caller = RequestIdentity {
-            account_id: ACCOUNT_ID.into(),
-            access_key_id: Some("AKIATEST".into()),
-            arn: None,
+        let caller = AthenaCaller {
+            request_identity: RequestIdentity {
+                account_id: ACCOUNT_ID.into(),
+                access_key_id: Some("AKIATEST".into()),
+                arn: None,
+            },
+            delegated_identity: None,
         };
         assert!(!iam_allows(
             &Arc::downgrade(&registry),
@@ -2335,6 +2492,449 @@ mod tests {
             "s3:GetObject",
             "arn:aws:s3:::data/object"
         ));
+    }
+
+    struct StrictAuthorization {
+        calls: Mutex<Vec<AuthorizationRequest>>,
+    }
+
+    impl locallycloud_core::integration::authorization::AuthorizationEvaluator for StrictAuthorization {
+        fn strict_sigv4_required(&self) -> bool {
+            true
+        }
+
+        fn authorize_resource_policy(
+            &self,
+            request: AuthorizationRequest,
+            _document: Option<&str>,
+            _owner: &str,
+        ) -> Result<(), AuthorizationError> {
+            self.authorize(request)
+        }
+
+        fn authorize(
+            &self,
+            request: AuthorizationRequest,
+        ) -> Result<(), locallycloud_core::integration::authorization::AuthorizationError> {
+            let allowed = match &request.delegated_identity {
+                Some(CallerIdentity::AssumedRole { role_arn, .. }) => {
+                    role_arn == "arn:aws:iam::000000000000:role/reader"
+                }
+                None => request.request_identity.access_key_id.as_deref() == Some("AKIAREADER"),
+                _ => false,
+            } && request.action != "s3:DeleteObject";
+            self.calls.lock().unwrap().push(request);
+            if allowed {
+                Ok(())
+            } else {
+                Err(locallycloud_core::integration::authorization::AuthorizationError::Denied)
+            }
+        }
+    }
+
+    fn strict_registry() -> (Arc<ServiceRegistry>, Arc<StrictAuthorization>) {
+        let (registry, _) = analytics_registry();
+        let evaluator = Arc::new(StrictAuthorization {
+            calls: Mutex::new(Vec::new()),
+        });
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(GlueHandler::new(Arc::new(AnalyticsState::new()))),
+            evaluator.clone(),
+        );
+        (registry, evaluator)
+    }
+
+    fn role_request() -> ServiceRequest {
+        let mut headers = HeaderMap::new();
+        IdentityPropagator::attach(
+            &mut headers,
+            &CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/reader".into(),
+                session_name: "sfn".into(),
+            },
+        );
+        headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            HeaderValue::from_static("1"),
+        );
+        ServiceRequest {
+            method: Method::POST,
+            uri: "/".parse().unwrap(),
+            headers,
+            body: Bytes::new(),
+            region: REGION.into(),
+            account_id: ACCOUNT_ID.into(),
+            request_id: "role-test".into(),
+        }
+    }
+
+    #[test]
+    fn delegated_query_authorization_requires_attested_matching_role() {
+        let (registry, evaluator) = strict_registry();
+        let handler = AthenaHandler::new(Arc::downgrade(&registry));
+        let mut request = role_request();
+        let caller = handler
+            .authorize(&request, "GetQueryResults")
+            .unwrap()
+            .unwrap();
+        let calls = evaluator.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].delegated_identity, caller.delegated_identity);
+        assert_eq!(
+            calls[0].resource,
+            "arn:aws:athena:us-east-1:000000000000:workgroup/primary"
+        );
+        drop(calls);
+        request
+            .headers
+            .remove("x-locallycloud-verified-internal-scope");
+        assert!(matches!(
+            handler.authorize(&request, "GetQueryResults"),
+            Err(AthenaError::AccessDenied)
+        ));
+        request.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            HeaderValue::from_static("1"),
+        );
+        request.account_id = "999999999999".into();
+        assert!(matches!(
+            handler.authorize(&request, "GetQueryResults"),
+            Err(AthenaError::AccessDenied)
+        ));
+        request.account_id = ACCOUNT_ID.into();
+        request.headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            HeaderValue::from_static("arn:aws:iam::000000000000:role/denied/sfn"),
+        );
+        assert!(matches!(
+            handler.authorize(&request, "GetQueryResults"),
+            Err(AthenaError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn delegated_query_worker_rechecks_permissions_and_scope() {
+        let (registry, evaluator) = strict_registry();
+        let handler = AthenaHandler::new(Arc::downgrade(&registry));
+        let caller = handler
+            .authorize(&role_request(), "StartQueryExecution")
+            .unwrap()
+            .unwrap();
+        let weak = Arc::downgrade(&registry);
+        let scope = Scope::new(ACCOUNT_ID, REGION);
+        assert!(iam_allows(
+            &weak,
+            &scope,
+            Some(&caller),
+            "glue:GetTable",
+            "arn:aws:glue:us-east-1:000000000000:table/db/table"
+        ));
+        assert!(iam_allows(
+            &weak,
+            &scope,
+            Some(&caller),
+            "s3:GetObject",
+            "arn:aws:s3:::data/result.csv"
+        ));
+        assert!(!iam_allows(
+            &weak,
+            &scope,
+            Some(&caller),
+            "s3:DeleteObject",
+            "arn:aws:s3:::data/result.csv"
+        ));
+        assert!(!iam_allows(
+            &weak,
+            &Scope::new("999999999999", REGION),
+            Some(&caller),
+            "s3:GetObject",
+            "arn:aws:s3:::data/result.csv"
+        ));
+        assert!(evaluator
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| call.delegated_identity == caller.delegated_identity));
+        let mut headers = HeaderMap::new();
+        caller.attach(&mut headers);
+        assert_eq!(
+            headers[locallycloud_core::integration::identity::PRINCIPAL_HEADER],
+            "arn:aws:iam::000000000000:role/reader/sfn"
+        );
+    }
+
+    #[test]
+    fn external_query_identity_requires_verification_and_ignores_spoofed_role() {
+        let (registry, evaluator) = strict_registry();
+        let handler = AthenaHandler::new(Arc::downgrade(&registry));
+        let mut request = role_request();
+        request
+            .headers
+            .remove("x-locallycloud-verified-internal-scope");
+        request.headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=AKIAREADER/20261006/us-east-1/athena/aws4_request",
+            ),
+        );
+        assert!(matches!(
+            handler.authorize(&request, "GetQueryResults"),
+            Err(AthenaError::AccessDenied)
+        ));
+        request.headers.insert(
+            "x-locallycloud-verified-external-sigv4",
+            HeaderValue::from_static("1"),
+        );
+        let caller = handler
+            .authorize(&request, "GetQueryResults")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            caller.request_identity.access_key_id.as_deref(),
+            Some("AKIAREADER")
+        );
+        assert_eq!(caller.delegated_identity, None);
+        assert_eq!(evaluator.calls.lock().unwrap()[0].delegated_identity, None);
+        let mut headers = HeaderMap::new();
+        caller.attach(&mut headers);
+        assert_eq!(
+            headers.get(locallycloud_core::integration::identity::PRINCIPAL_HEADER),
+            None
+        );
+        assert_eq!(
+            headers[http::header::AUTHORIZATION]
+                .to_str()
+                .unwrap()
+                .split("Credential=")
+                .nth(1)
+                .unwrap()
+                .split('/')
+                .next(),
+            Some("AKIAREADER")
+        );
+    }
+
+    #[tokio::test]
+    async fn query_results_authorize_reader_instead_of_query_creator() {
+        let (registry, evaluator) = strict_registry();
+        let object = result_object(&registry, "\"marker\"\n\"before\"\n");
+        let mut handler = AthenaHandler::new(Arc::downgrade(&registry));
+        let request = role_request();
+        let reader = handler
+            .authorize(&request, "GetQueryResults")
+            .unwrap()
+            .unwrap();
+        handler.queries.insert(
+            QueryKey {
+                scope: Scope::new(ACCOUNT_ID, REGION),
+                id: "result".into(),
+            },
+            Arc::new(Mutex::new(QueryRecord {
+                id: "result".into(),
+                spec: QuerySpec {
+                    query_string: "SELECT id FROM data".into(),
+                    context: None,
+                    result_configuration: ResultConfiguration {
+                        output_location: "s3://data/results/".into(),
+                    },
+                    work_group: None,
+                },
+                effective_output_location: S3Location {
+                    bucket: "data".into(),
+                    key: "results/result.csv".into(),
+                },
+                state: QueryState::Succeeded,
+                submission_time: 0.0,
+                completion_time: Some(1.0),
+                reason: None,
+                scanned_bytes: 0,
+                result: Some(QueryResult {
+                    columns: vec![ResultColumn {
+                        name: "marker".into(),
+                        kind: "varchar",
+                    }],
+                    rows: vec![vec![Some("marker".into())], vec![Some("before".into())]],
+                }),
+                result_token: "page".into(),
+                caller: Some(AthenaCaller {
+                    request_identity: RequestIdentity {
+                        account_id: ACCOUNT_ID.into(),
+                        access_key_id: None,
+                        arn: None,
+                    },
+                    delegated_identity: Some(CallerIdentity::AssumedRole {
+                        role_arn: "arn:aws:iam::000000000000:role/creator".into(),
+                        session_name: "old".into(),
+                    }),
+                }),
+            })),
+        );
+        let input = || GetQueryResultsRequest {
+            query_result_type: None,
+            query_execution_id: "result".into(),
+            max_results: None,
+            next_token: None,
+        };
+        assert!(handler
+            .get_query_results(input(), &request, Some(&reader))
+            .await
+            .is_ok());
+        let denied_reader = AthenaCaller {
+            request_identity: reader.request_identity.clone(),
+            delegated_identity: Some(CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/denied".into(),
+                session_name: "sfn".into(),
+            }),
+        };
+        assert!(matches!(
+            handler
+                .get_query_results(input(), &request, Some(&denied_reader))
+                .await,
+            Err(AthenaError::AccessDenied)
+        ));
+        {
+            let calls = evaluator.calls.lock().unwrap();
+            assert_eq!(calls[1].action, "s3:GetObject");
+            assert_eq!(calls[1].resource, "arn:aws:s3:::data/results/result.csv");
+            assert_eq!(calls[1].delegated_identity, reader.delegated_identity);
+            assert_eq!(
+                calls.last().unwrap().delegated_identity,
+                denied_reader.delegated_identity
+            );
+        }
+        {
+            let reads = object.reads.lock().unwrap();
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].uri.path(), "/data/results/result.csv");
+            assert_eq!(trusted_role(&reads[0]), reader.delegated_identity);
+        }
+        *object.response.lock().unwrap() = (200, Bytes::from_static(b"\"marker\"\n\"after!\"\n"));
+        let replaced = handler
+            .get_query_results(input(), &request, Some(&reader))
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced["ResultSet"]["Rows"][1]["Data"][0]["VarCharValue"],
+            "after!"
+        );
+        assert!(matches!(
+            handler
+                .get_query_results(input(), &request, Some(&denied_reader))
+                .await,
+            Err(AthenaError::AccessDenied)
+        ));
+        *object.response.lock().unwrap() = (
+            403,
+            Bytes::from_static(b"<Error><Code>KMS.AccessDeniedException</Code></Error>"),
+        );
+        assert!(matches!(
+            handler
+                .get_query_results(input(), &request, Some(&reader))
+                .await,
+            Err(AthenaError::AccessDenied)
+        ));
+        *object.response.lock().unwrap() = (
+            404,
+            Bytes::from_static(b"<Error><Code>NoSuchKey</Code></Error>"),
+        );
+        assert!(matches!(
+            handler
+                .get_query_results(input(), &request, Some(&reader))
+                .await,
+            Err(AthenaError::ModeledInvalidRequest {
+                code: "RESULT_NOT_FOUND",
+                ..
+            })
+        ));
+        *object.response.lock().unwrap() = (200, Bytes::from_static(b"\"unclosed"));
+        assert!(matches!(
+            handler
+                .get_query_results(input(), &request, Some(&reader))
+                .await,
+            Err(AthenaError::InvalidRequest(_))
+        ));
+        handler.registry = Weak::new();
+        assert!(matches!(
+            handler
+                .get_query_results(input(), &request, Some(&reader))
+                .await,
+            Err(AthenaError::Internal)
+        ));
+    }
+
+    struct ResultObject {
+        registry: Weak<ServiceRegistry>,
+        response: Mutex<(u16, Bytes)>,
+        reads: Mutex<Vec<ServiceRequest>>,
+    }
+
+    #[async_trait]
+    impl NativeHandler for ResultObject {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            if let Some(evaluator) = self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+                .filter(|evaluator| evaluator.strict_sigv4_required())
+            {
+                let identity = RequestIdentity {
+                    account_id: request.account_id.clone(),
+                    access_key_id: request
+                        .headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(RequestIdentity::access_key_from_authorization),
+                    arn: None,
+                };
+                let resource = format!(
+                    "arn:aws:s3:::{}",
+                    request.uri.path().trim_start_matches('/')
+                );
+                if evaluator
+                    .authorize_resource_policy(
+                        AuthorizationRequest {
+                            request_identity: identity,
+                            delegated_identity: trusted_role(&request),
+                            source_service: "s3".into(),
+                            action: "s3:GetObject".into(),
+                            resource,
+                            context: Default::default(),
+                        },
+                        None,
+                        &request.account_id,
+                    )
+                    .is_err()
+                {
+                    return Response::builder()
+                        .status(403)
+                        .body(Body::from("<Error><Code>AccessDenied</Code></Error>"))
+                        .unwrap();
+                }
+            }
+            self.reads.lock().unwrap().push(request);
+            let (status, body) = self.response.lock().unwrap().clone();
+            Response::builder()
+                .status(status)
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+
+    fn result_object(registry: &Arc<ServiceRegistry>, csv: &str) -> Arc<ResultObject> {
+        let handler = Arc::new(ResultObject {
+            registry: Arc::downgrade(registry),
+            response: Mutex::new((200, Bytes::copy_from_slice(csv.as_bytes()))),
+            reads: Mutex::new(Vec::new()),
+        });
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            handler.clone(),
+        );
+        handler
     }
 
     struct GlueTraceEntry {
@@ -2547,9 +3147,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn iceberg_result_pagination_preserves_null_cells() {
+    #[tokio::test]
+    async fn iceberg_result_pagination_preserves_null_cells() {
         let (registry, _) = analytics_registry();
+        let object = result_object(&registry, "id,payload\n1,first\n2,\n");
         let handler = AthenaHandler::new(Arc::downgrade(&registry));
         let id = "page-query".to_string();
         handler.queries.insert(
@@ -2609,6 +3210,7 @@ mod tests {
         let first = handler
             .get_query_results(
                 GetQueryResultsRequest {
+                    query_result_type: None,
                     query_execution_id: id.clone(),
                     max_results: Some(2),
                     next_token: None,
@@ -2616,25 +3218,70 @@ mod tests {
                 &request,
                 None,
             )
+            .await
             .unwrap();
         assert_eq!(first["ResultSet"]["Rows"].as_array().unwrap().len(), 2);
         let token = first["NextToken"].as_str().unwrap();
         let second = handler
             .get_query_results(
                 GetQueryResultsRequest {
+                    query_result_type: None,
                     query_execution_id: id,
-                    max_results: Some(2),
+                    max_results: Some(1),
                     next_token: Some(token.into()),
                 },
                 &request,
                 None,
             )
+            .await
             .unwrap();
         assert_eq!(
             second["ResultSet"]["Rows"][0]["Data"],
             json!([{ "VarCharValue": "2" }, {}])
         );
-        assert!(second.get("NextToken").is_none());
+        let terminal = handler
+            .get_query_results(
+                GetQueryResultsRequest {
+                    query_result_type: None,
+                    query_execution_id: "page-query".into(),
+                    max_results: Some(2),
+                    next_token: Some(second["NextToken"].as_str().unwrap().into()),
+                },
+                &request,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal["ResultSet"]["Rows"], json!([]));
+        assert!(terminal.get("NextToken").is_none());
+        *object.response.lock().unwrap() =
+            (200, Bytes::from_static(b"id,payload\n1,after\n2,\"\"\n"));
+        let changed = handler
+            .get_query_results(
+                GetQueryResultsRequest {
+                    query_result_type: None,
+                    query_execution_id: "page-query".into(),
+                    max_results: None,
+                    next_token: None,
+                },
+                &request,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            changed["ResultSet"]["Rows"][1]["Data"][1],
+            json!({"VarCharValue": "after"})
+        );
+        assert_eq!(
+            changed["ResultSet"]["Rows"][2]["Data"][1],
+            json!({"VarCharValue": ""})
+        );
+        assert!(changed.get("NextToken").is_none());
+        assert_eq!(
+            changed["ResultSet"]["ResultSetMetadata"],
+            first["ResultSet"]["ResultSetMetadata"]
+        );
     }
 
     #[tokio::test]
@@ -2753,8 +3400,100 @@ mod tests {
         )
         .await
         .expect("public S3 result");
-        assert_eq!(&result[..], b"n\n5\n");
+        assert_eq!(&result[..], b"\"n\"\n\"5\"\n");
         assert_eq!(record.lock().unwrap().state, QueryState::Succeeded);
+        let handler = AthenaHandler::new(weak.clone());
+        handler.queries.insert(
+            QueryKey {
+                scope: scope.clone(),
+                id: "query-iceberg".into(),
+            },
+            record.clone(),
+        );
+        let request = ServiceRequest {
+            method: Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+            region: REGION.into(),
+            account_id: ACCOUNT_ID.into(),
+            request_id: "persisted-result".into(),
+        };
+        let input = || GetQueryResultsRequest {
+            query_result_type: None,
+            query_execution_id: "query-iceberg".into(),
+            max_results: None,
+            next_token: None,
+        };
+        let page = handler
+            .get_query_results(input(), &request, None)
+            .await
+            .unwrap();
+        assert_eq!(page["ResultSet"]["Rows"][1]["Data"][0]["VarCharValue"], "5");
+        let data_rows: GetQueryResultsRequest = decode(
+            &serde_json::to_vec(&json!({
+                "QueryExecutionId": "query-iceberg",
+                "QueryResultType": "DATA_ROWS"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            handler
+                .get_query_results(data_rows, &request, None)
+                .await
+                .unwrap(),
+            page
+        );
+        let manifest: GetQueryResultsRequest = decode(
+            &serde_json::to_vec(&json!({
+                "QueryExecutionId": "query-iceberg",
+                "QueryResultType": "DATA_MANIFEST"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            handler.get_query_results(manifest, &request, None).await,
+            Err(AthenaError::ModeledInvalidRequest {
+                code: "RESULT_NOT_FOUND",
+                ..
+            })
+        ));
+        let invalid_type: GetQueryResultsRequest = decode(
+            &serde_json::to_vec(&json!({
+                "QueryExecutionId": "query-iceberg",
+                "QueryResultType": "ROWS"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            handler
+                .get_query_results(invalid_type, &request, None)
+                .await,
+            Err(AthenaError::ModeledInvalidRequest {
+                code: "INVALID_INPUT",
+                ..
+            })
+        ));
+        delete_object(
+            &weak,
+            &scope,
+            None,
+            "analytics-data",
+            "results/query-iceberg.csv",
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            handler.get_query_results(input(), &request, None).await,
+            Err(AthenaError::ModeledInvalidRequest {
+                code: "RESULT_NOT_FOUND",
+                ..
+            })
+        ));
         let ops = trace
             .entries
             .lock()

@@ -1,0 +1,527 @@
+{
+  "source": "AWS TestState observations, us-east-1, 2026-10-06; pure states and synthetic mocked Tasks only. Account-specific execution role removed.",
+  "cases": [
+    {
+      "name": "explicit_null",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% null %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "null",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "missing_output",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% $states.input.missing %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '$states.input.missing' specified for the field 'Output' returned nothing (undefined).",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "missing_object_member",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% {'present':1,'absent':$states.input.missing} %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "{\"present\":1}",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "exists_null_missing_empty",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% {'null':$exists(null),'missing':$exists($states.input.missing),'empty':$exists([])} %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "{\"null\":true,\"missing\":false,\"empty\":true}",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "singleton_map",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% $map([7],function($v){$v*2}) %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "14",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "singleton_map_append",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% $append([],$map([7],function($v){$v*2})) %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "[14]",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "empty_map_append",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% $append([],$map([],function($v){$v*2})) %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "[]",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "empty_filter_output",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% $filter([],function($v){true}) %}\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '$filter([],function($v){true})' specified for the field 'Output' returned nothing (undefined).",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "assign_undefined",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% 1 %}\", \"Assign\": {\"x\": \"{% $states.input.missing %}\"}}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '$states.input.missing' specified for the field 'Assign/x' returned nothing (undefined).",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "assign_output_simultaneous",
+      "request": {
+        "definition": "{\"Type\": \"Pass\", \"QueryLanguage\": \"JSONata\", \"End\": true, \"Output\": \"{% $x %}\", \"Assign\": {\"x\": 1}}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "variables": "{\"x\": 9}"
+      },
+      "response": {
+        "output": "9",
+        "inspectionData": {
+          "input": "{}",
+          "variables": "{\"x\":1}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "choice_true",
+      "request": {
+        "definition": "{\"Type\": \"Choice\", \"QueryLanguage\": \"JSONata\", \"Choices\": [{\"Condition\": \"{% true %}\", \"Next\": \"Matched\"}], \"Default\": \"Default\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "{}",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "nextState": "Matched",
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "choice_null",
+      "request": {
+        "definition": "{\"Type\": \"Choice\", \"QueryLanguage\": \"JSONata\", \"Choices\": [{\"Condition\": \"{% null %}\", \"Next\": \"Matched\"}], \"Default\": \"Default\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression 'null' specified for the field 'Choices[0]/Condition' returned an unexpected result type. Expected 'boolean', but was 'null' for value: null",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "choice_undefined",
+      "request": {
+        "definition": "{\"Type\": \"Choice\", \"QueryLanguage\": \"JSONata\", \"Choices\": [{\"Condition\": \"{% $states.input.missing %}\", \"Next\": \"Matched\"}], \"Default\": \"Default\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '$states.input.missing' specified for the field 'Choices[0]/Condition' returned nothing (undefined).",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "choice_number",
+      "request": {
+        "definition": "{\"Type\": \"Choice\", \"QueryLanguage\": \"JSONata\", \"Choices\": [{\"Condition\": \"{% 7 %}\", \"Next\": \"Matched\"}], \"Default\": \"Default\"}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '7' specified for the field 'Choices[0]/Condition' returned an unexpected result type. Expected 'boolean', but was 'number' for value: 7",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "wait_zero",
+      "request": {
+        "definition": "{\"Type\": \"Wait\", \"Seconds\": 0, \"End\": true}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "output": "{}",
+        "inspectionData": {
+          "input": "{}",
+          "afterInputPath": "{}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "wait_seconds_undefined",
+      "request": {
+        "definition": "{\"Type\": \"Wait\", \"QueryLanguage\": \"JSONata\", \"Seconds\": \"{% $states.input.missing %}\", \"End\": true}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '$states.input.missing' specified for the field 'Seconds' returned nothing (undefined).",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "mock_sdk_result_members",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1}, \"Output\": \"{% $states.result %}\", \"End\": true}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "result": "{\"ResultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}, \"NextToken\": \"opaque-generic-page\", \"UpdateCount\": 0}",
+          "fieldValidationMode": "STRICT"
+        }
+      },
+      "response": {
+        "output": "{\"ResultSet\":{\"Rows\":[{\"Data\":[{\"VarCharValue\":\"7\"},{}]}],\"ResultSetMetadata\":{\"ColumnInfo\":[{\"Name\":\"id\",\"Type\":\"bigint\"},{\"Name\":\"optional\",\"Type\":\"varchar\"}]}},\"NextToken\":\"opaque-generic-page\",\"UpdateCount\":0}",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1}",
+          "result": "{\"ResultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}, \"NextToken\": \"opaque-generic-page\", \"UpdateCount\": 0}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "mock_sdk_pagination_carry",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1, \"NextToken\": \"{% $states.input.token %}\"}, \"Output\": \"{% {'next':$states.result.NextToken,'input':$states.input.token,'rows':$states.result.ResultSet.Rows} %}\", \"End\": true}",
+        "input": "{\"token\": \"prior-page\"}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "result": "{\"ResultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}, \"NextToken\": \"opaque-generic-page\", \"UpdateCount\": 0}",
+          "fieldValidationMode": "STRICT"
+        }
+      },
+      "response": {
+        "output": "{\"next\":\"opaque-generic-page\",\"input\":\"prior-page\",\"rows\":[{\"Data\":[{\"VarCharValue\":\"7\"},{}]}]}",
+        "inspectionData": {
+          "input": "{\"token\": \"prior-page\"}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1,\"NextToken\":\"prior-page\"}",
+          "result": "{\"ResultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}, \"NextToken\": \"opaque-generic-page\", \"UpdateCount\": 0}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "mock_arguments_undefined",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"{% $states.input.missing %}\"}, \"Output\": \"{% $states.result %}\", \"End\": true}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "result": "{\"ResultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}, \"NextToken\": \"opaque-generic-page\", \"UpdateCount\": 0}",
+          "fieldValidationMode": "STRICT"
+        }
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '$states.input.missing' specified for the field 'Arguments/QueryExecutionId' returned nothing (undefined).",
+        "inspectionData": {
+          "input": "{}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "mock_output_undefined",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1}, \"Output\": \"{% $states.result.missing %}\", \"End\": true}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "result": "{\"ResultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}, \"NextToken\": \"opaque-generic-page\", \"UpdateCount\": 0}",
+          "fieldValidationMode": "STRICT"
+        }
+      },
+      "response": {
+        "error": "States.QueryEvaluationError",
+        "cause": "The JSONata expression '$states.result.missing' specified for the field 'Output' returned nothing (undefined).",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1}",
+          "result": "{\"ResultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}, \"NextToken\": \"opaque-generic-page\", \"UpdateCount\": 0}"
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "mock_wrong_sdk_member_casing",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1}, \"Output\": \"{% $states.result %}\", \"End\": true}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "result": "{\"resultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}}",
+          "fieldValidationMode": "STRICT"
+        }
+      },
+      "response": {
+        "output": "{\"resultSet\":{\"Rows\":[{\"Data\":[{\"VarCharValue\":\"7\"},{}]}],\"ResultSetMetadata\":{\"ColumnInfo\":[{\"Name\":\"id\",\"Type\":\"bigint\"},{\"Name\":\"optional\",\"Type\":\"varchar\"}]}}}",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1}",
+          "result": "{\"resultSet\": {\"Rows\": [{\"Data\": [{\"VarCharValue\": \"7\"}, {}]}], \"ResultSetMetadata\": {\"ColumnInfo\": [{\"Name\": \"id\", \"Type\": \"bigint\"}, {\"Name\": \"optional\", \"Type\": \"varchar\"}]}}}"
+        },
+        "status": "SUCCEEDED"
+      }
+    },
+    {
+      "name": "mock_named_catch",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1}, \"Output\": \"{% $states.result %}\", \"End\": true, \"Catch\": [{\"ErrorEquals\": [\"Athena.InvalidRequestException\"], \"Next\": \"Handled\", \"Output\": \"{% {'error':$states.errorOutput.Error,'cause':$states.errorOutput.Cause} %}\"}]}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "errorOutput": {
+            "error": "Athena.InvalidRequestException",
+            "cause": "generic modeled failure"
+          }
+        }
+      },
+      "response": {
+        "output": "{\"error\":\"Athena.InvalidRequestException\",\"cause\":\"generic modeled failure\"}",
+        "error": "Athena.InvalidRequestException",
+        "cause": "generic modeled failure",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1}",
+          "errorDetails": {
+            "catchIndex": 0
+          }
+        },
+        "nextState": "Handled",
+        "status": "CAUGHT_ERROR"
+      }
+    },
+    {
+      "name": "mock_retry_eligible",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1}, \"Output\": \"{% $states.result %}\", \"End\": true, \"Retry\": [{\"ErrorEquals\": [\"Athena.InternalServerException\"], \"IntervalSeconds\": 2, \"BackoffRate\": 2, \"MaxAttempts\": 2}]}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "errorOutput": {
+            "error": "Athena.InternalServerException",
+            "cause": "generic transient failure"
+          }
+        },
+        "stateConfiguration": {
+          "retrierRetryCount": 0
+        }
+      },
+      "response": {
+        "error": "Athena.InternalServerException",
+        "cause": "generic transient failure",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1}",
+          "errorDetails": {
+            "retryIndex": 0,
+            "retryBackoffIntervalSeconds": 2
+          }
+        },
+        "status": "RETRIABLE"
+      }
+    },
+    {
+      "name": "mock_retry_exhausted",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1}, \"Output\": \"{% $states.result %}\", \"End\": true, \"Retry\": [{\"ErrorEquals\": [\"Athena.InternalServerException\"], \"IntervalSeconds\": 2, \"BackoffRate\": 2, \"MaxAttempts\": 2}]}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "errorOutput": {
+            "error": "Athena.InternalServerException",
+            "cause": "generic transient failure"
+          }
+        },
+        "stateConfiguration": {
+          "retrierRetryCount": 2
+        }
+      },
+      "response": {
+        "error": "Athena.InternalServerException",
+        "cause": "generic transient failure",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1}",
+          "errorDetails": {
+            "retryIndex": 0
+          }
+        },
+        "status": "FAILED"
+      }
+    },
+    {
+      "name": "mock_retry_exhausted_catch",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::aws-sdk:athena:getQueryResults\", \"Arguments\": {\"QueryExecutionId\": \"generic-query\", \"MaxResults\": 1}, \"Output\": \"{% $states.result %}\", \"End\": true, \"Retry\": [{\"ErrorEquals\": [\"Athena.InternalServerException\"], \"IntervalSeconds\": 2, \"BackoffRate\": 2, \"MaxAttempts\": 2}], \"Catch\": [{\"ErrorEquals\": [\"States.ALL\"], \"Next\": \"Handled\", \"Output\": \"{% $states.errorOutput %}\"}]}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "errorOutput": {
+            "error": "Athena.InternalServerException",
+            "cause": "generic transient failure"
+          }
+        },
+        "stateConfiguration": {
+          "retrierRetryCount": 2
+        }
+      },
+      "response": {
+        "output": "{\"Error\":\"Athena.InternalServerException\",\"Cause\":\"generic transient failure\"}",
+        "error": "Athena.InternalServerException",
+        "cause": "generic transient failure",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryExecutionId\":\"generic-query\",\"MaxResults\":1}",
+          "errorDetails": {
+            "catchIndex": 0,
+            "retryIndex": 0
+          }
+        },
+        "nextState": "Handled",
+        "status": "CAUGHT_ERROR"
+      }
+    },
+    {
+      "name": "mock_optimized_sync_data_flow",
+      "request": {
+        "definition": "{\"Type\": \"Task\", \"QueryLanguage\": \"JSONata\", \"Resource\": \"arn:aws:states:::athena:startQueryExecution.sync\", \"Arguments\": {\"QueryString\": \"SELECT 1\"}, \"Output\": \"{% $states.result %}\", \"End\": true}",
+        "input": "{}",
+        "inspectionLevel": "DEBUG",
+        "revealSecrets": false,
+        "mock": {
+          "result": "{\"QueryExecution\": {\"QueryExecutionId\": \"generic-query\", \"Status\": {\"State\": \"SUCCEEDED\"}}}",
+          "fieldValidationMode": "NONE"
+        }
+      },
+      "response": {
+        "output": "{\"QueryExecution\":{\"QueryExecutionId\":\"generic-query\",\"Status\":{\"State\":\"SUCCEEDED\"}}}",
+        "inspectionData": {
+          "input": "{}",
+          "afterArguments": "{\"QueryString\":\"SELECT 1\"}",
+          "result": "{\"QueryExecution\": {\"QueryExecutionId\": \"generic-query\", \"Status\": {\"State\": \"SUCCEEDED\"}}}"
+        },
+        "status": "SUCCEEDED"
+      }
+    }
+  ]
+}

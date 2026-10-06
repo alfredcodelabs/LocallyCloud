@@ -39,6 +39,8 @@ pub enum ServerError {
     },
     #[error("server error: {0}")]
     Serve(#[source] std::io::Error),
+    #[error("invalid configured control-plane TLS identity: {0}")]
+    Tls(#[source] std::io::Error),
 }
 
 #[derive(Clone)]
@@ -49,6 +51,7 @@ struct AppState {
     meter: Arc<crate::metering::Meter>,
     max_request_body_bytes: usize,
     dashboard: Arc<DashboardContext>,
+    control_plane_tls_hostname: Option<String>,
 }
 
 pub struct LocallyCloudServer {
@@ -80,6 +83,15 @@ impl LocallyCloudServer {
 
     /// Resume restored producers after the internal dispatcher is available.
     pub async fn run_with_startup(self, startup: impl FnOnce() + Send) -> Result<(), ServerError> {
+        let tls_resolver: Option<Arc<dyn crate::tls::TlsIdentityResolver>> = match &self.config.tls
+        {
+            Some(config) => Some(Arc::new(
+                crate::tls::ControlPlaneResolver::load(config, self.tls_resolver)
+                    .await
+                    .map_err(ServerError::Tls)?,
+            )),
+            None => self.tls_resolver,
+        };
         let addr = self.config.listen_addr;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -116,6 +128,7 @@ impl LocallyCloudServer {
             registry: self.registry.clone(),
             meter,
             max_request_body_bytes: self.config.max_request_body_bytes,
+            control_plane_tls_hostname: self.config.tls.as_ref().map(|tls| tls.hostname.clone()),
             dashboard: Arc::new(
                 DashboardContext::load(
                     addr,
@@ -159,7 +172,7 @@ impl LocallyCloudServer {
 
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
         let serve = axum::serve(
-            crate::tls::DomainListener::new(listener, self.tls_resolver),
+            crate::tls::DomainListener::new(listener, tls_resolver),
             app.into_make_service_with_connect_info::<crate::tls::ConnectionInfo>(),
         )
         .with_graceful_shutdown(async move {
@@ -756,6 +769,15 @@ async fn tls_domain_handler(
     {
         return StatusCode::MISDIRECTED_REQUEST.into_response();
     }
+    if state.control_plane_tls_hostname.as_deref() == Some(server_name) {
+        // AWS control-plane TLS does not expose dashboard routes or reinterpret custom domains.
+        if req.uri().path().starts_with("/_locallycloud")
+            || req.uri().path().starts_with("/_localstack")
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        return dispatch_handler(State(state), req).await;
+    }
     let credential = req
         .uri()
         .query()
@@ -838,13 +860,14 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
         Some(ConnectInfo(addr)) => {
             state
                 .dispatcher
-                .dispatch_verified_peer(
+                .dispatch_verified_connection(
                     &parts.method,
                     &parts.uri,
                     &parts.headers,
                     body_bytes,
                     &request_id,
                     addr.peer.ip(),
+                    addr.server_name.is_some(),
                 )
                 .await
         }

@@ -84,6 +84,48 @@ struct StateInspection {
     after_result_path: Option<Value>,
     output: Option<Value>,
     caught_error: bool,
+    handled_error: Option<AslError>,
+    error_details: Option<Value>,
+}
+
+/// Dropping a timed-out/aborted task cancels its query without blocking Drop.
+struct AthenaQueryGuard {
+    interpreter: Interpreter,
+    query_id: String,
+    resource: String,
+    armed: bool,
+}
+
+impl Drop for AthenaQueryGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let interpreter = self.interpreter.clone();
+        let query_id = self.query_id.clone();
+        let resource = self.resource.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                interpreter.dispatch_json_with_resource(
+                    "athena",
+                    "AmazonAthena.StopQueryExecution",
+                    &json!({"QueryExecutionId":query_id}),
+                    Some(&resource),
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(execution_arn = %interpreter.exec_arn, query_id, error = %error.error, "Athena task cancellation failed")
+                }
+                Err(_) => {
+                    tracing::warn!(execution_arn = %interpreter.exec_arn, query_id, "Athena task cancellation timed out")
+                }
+            }
+        });
+    }
 }
 
 pub struct TestStateOutcome {
@@ -194,11 +236,12 @@ impl Interpreter {
                 Some(&mut inspection),
             )
             .await;
-        let inspection_data = (inspection_level != "INFO").then(|| render_inspection(&inspection));
+        let inspection_data = (inspection_level != "INFO")
+            .then(|| render_inspection(&inspection, self.is_jsonata(state), state));
         match result {
             Ok((output, transition, variables, _)) => TestStateOutcome {
                 output: Some(output),
-                error: None,
+                error: inspection.handled_error.clone(),
                 next_state: match transition {
                     Transition::Next(next) => Some(next),
                     Transition::End => None,
@@ -728,7 +771,12 @@ impl Interpreter {
         let vars = self.jsonata_vars(input, result, error_output, context, variables);
         let evaluated = assignments
             .iter()
-            .map(|(name, value)| Ok((name.clone(), jsonata::process(value, &vars)?)))
+            .map(|(name, value)| {
+                Ok((
+                    name.clone(),
+                    jsonata::process_for_field(value, &vars, &format!("Assign/{name}"))?,
+                ))
+            })
             .collect::<Result<Vec<_>, AslError>>()?;
         let mut updated = variables.clone();
         for (name, value) in evaluated {
@@ -746,10 +794,25 @@ impl Interpreter {
     ) -> Result<String, AslError> {
         let vars = self.jsonata_vars(input, None, None, context, variables);
         if let Some(choices) = state.get("Choices").and_then(Value::as_array) {
-            for choice in choices {
+            for (index, choice) in choices.iter().enumerate() {
                 if let Some(cond) = choice.get("Condition").and_then(Value::as_str) {
-                    let result = jsonata::evaluate(cond, &vars)?;
-                    if result.as_bool().unwrap_or(false) {
+                    let field = format!("Choices[{index}]/Condition");
+                    let result = jsonata::evaluate_for_field(cond, &vars, &field)?;
+                    let matched = result.as_bool().ok_or_else(|| {
+                        let actual = match &result {
+                            Value::Null => "null",
+                            Value::Number(_) => "number",
+                            Value::String(_) => "string",
+                            Value::Array(_) => "array",
+                            Value::Object(_) => "object",
+                            Value::Bool(_) => unreachable!(),
+                        };
+                        AslError::new("States.QueryEvaluationError", format!(
+                            "The JSONata expression '{}' specified for the field '{field}' returned an unexpected result type. Expected 'boolean', but was '{actual}' for value: {result}",
+                            cond.trim().trim_start_matches("{%").trim_end_matches("%}").trim()
+                        ))
+                    })?;
+                    if matched {
                         if let Some(next) = choice.get("Next").and_then(Value::as_str) {
                             return Ok(next.to_string());
                         }
@@ -780,9 +843,10 @@ impl Interpreter {
     ) -> Result<Value, AslError> {
         if jsonata {
             match state.get("Arguments") {
-                Some(args) => jsonata::process(
+                Some(args) => jsonata::process_for_field(
                     args,
                     &self.jsonata_vars(ip_input, None, None, context, variables),
+                    "Arguments",
                 ),
                 None => Ok(ip_input.clone()),
             }
@@ -811,7 +875,7 @@ impl Interpreter {
         }
         if jsonata {
             let output = match state.get("Output") {
-                Some(output) => jsonata::process(
+                Some(output) => jsonata::process_for_field(
                     output,
                     &self.jsonata_vars(
                         ip_input,
@@ -820,6 +884,7 @@ impl Interpreter {
                         context,
                         variables,
                     ),
+                    "Output",
                 ),
                 None => Ok(raw_result),
             }?;
@@ -928,21 +993,22 @@ impl Interpreter {
         jsonata_mode: bool,
         variables: &BTreeMap<String, Value>,
     ) -> Result<(), AslError> {
-        let evaluate = |value: &Value| -> Result<Value, AslError> {
+        let evaluate = |value: &Value, field: &str| -> Result<Value, AslError> {
             if jsonata_mode {
                 if let Some(expression) =
                     value.as_str().filter(|value| jsonata::is_expression(value))
                 {
-                    return jsonata::evaluate(
+                    return jsonata::evaluate_for_field(
                         expression,
                         &self.jsonata_vars(input, None, None, context, variables),
+                        field,
                     );
                 }
             }
             Ok(value.clone())
         };
         let duration = if let Some(seconds) = state.get("Seconds") {
-            let seconds = evaluate(seconds)?.as_u64().ok_or_else(|| {
+            let seconds = evaluate(seconds, "Seconds")?.as_u64().ok_or_else(|| {
                 AslError::runtime("Wait Seconds must resolve to a non-negative integer")
             })?;
             Duration::from_secs(seconds)
@@ -955,7 +1021,7 @@ impl Interpreter {
             Duration::from_secs(seconds)
         } else {
             let timestamp = if let Some(timestamp) = state.get("Timestamp") {
-                evaluate(timestamp)?
+                evaluate(timestamp, "Timestamp")?
                     .as_str()
                     .map(String::from)
                     .ok_or_else(|| AslError::runtime("Wait Timestamp must resolve to a string"))?
@@ -1243,10 +1309,26 @@ impl Interpreter {
                     ));
                 }
                 Err(err) => {
-                    if self.test_state_mode
-                        && retry_available(&retriers, &err, self.initial_retry_count)
-                    {
-                        return Err(err.with_history_event(last_history_event_id));
+                    if self.test_state_mode {
+                        if let Some(index) = retriers
+                            .iter()
+                            .position(|retrier| error_equals_match(retrier, &err))
+                        {
+                            let mut details = json!({"retryIndex": index});
+                            if retry_available(&retriers, &err, self.initial_retry_count) {
+                                let mut counts = vec![self.initial_retry_count; retriers.len()];
+                                if let Some(delay) = match_retry(&retriers, &err, &mut counts) {
+                                    details["retryBackoffIntervalSeconds"] = json!(delay.as_secs());
+                                }
+                                if let Some(data) = inspection.as_deref_mut() {
+                                    data.error_details = Some(details);
+                                }
+                                return Err(err.with_history_event(last_history_event_id));
+                            }
+                            if let Some(data) = inspection.as_deref_mut() {
+                                data.error_details = Some(details);
+                            }
+                        }
                     }
                     if !self.test_state_mode {
                         if let Some(delay) = match_retry(&retriers, &err, &mut retry_counts) {
@@ -1257,14 +1339,17 @@ impl Interpreter {
                             continue;
                         }
                     }
-                    if let Some((catcher, next, rp)) = match_catch(&catchers, &err) {
+                    if let Some((catch_index, catcher, next, rp)) = match_catch(&catchers, &err) {
                         if let Some(data) = inspection.as_deref_mut() {
                             data.caught_error = true;
+                            data.handled_error = Some(err.clone());
+                            let details = data.error_details.get_or_insert_with(|| json!({}));
+                            details["catchIndex"] = json!(catch_index);
                         }
                         let error_output = json!({ "Error": err.error, "Cause": err.cause });
                         let combined = if jsonata {
                             match catcher.get("Output") {
-                                Some(output) => jsonata::process(
+                                Some(output) => jsonata::process_for_field(
                                     output,
                                     &self.jsonata_vars(
                                         ip_input,
@@ -1273,6 +1358,7 @@ impl Interpreter {
                                         &attempt_context,
                                         variables,
                                     ),
+                                    "Output",
                                 )?,
                                 None => error_output.clone(),
                             }
@@ -2146,14 +2232,16 @@ impl Interpreter {
                 return self.dispatch_aws_sdk(sdk, payload, pattern).await;
             }
             return match rest {
-                "athena:startQueryExecution" => {
-                    if !matches!(pattern, IntegrationPattern::Sync) {
-                        return Err(AslError::runtime(
-                            "Athena startQueryExecution requires .sync",
-                        ));
+                "athena:startQueryExecution" => match pattern {
+                    IntegrationPattern::Sync => self.dispatch_athena_sync(payload).await,
+                    IntegrationPattern::RequestResponse => {
+                        self.dispatch_json("athena", "AmazonAthena.StartQueryExecution", payload)
+                            .await
                     }
-                    self.dispatch_athena_sync(payload).await
-                }
+                    _ => Err(AslError::runtime(
+                        "Athena startQueryExecution does not support this integration pattern",
+                    )),
+                },
                 "states:startExecution" => {
                     self.dispatch_nested_execution(payload, pattern, false)
                         .await
@@ -2184,6 +2272,18 @@ impl Interpreter {
 
     async fn dispatch_optimized(&self, op: &str, payload: &Value) -> Result<Value, AslError> {
         match op {
+            "athena:getQueryResults" => {
+                self.dispatch_json("athena", "AmazonAthena.GetQueryResults", payload)
+                    .await
+            }
+            "athena:getQueryExecution" => {
+                self.dispatch_json("athena", "AmazonAthena.GetQueryExecution", payload)
+                    .await
+            }
+            "athena:stopQueryExecution" => {
+                self.dispatch_json("athena", "AmazonAthena.StopQueryExecution", payload)
+                    .await
+            }
             "lambda:invoke" => {
                 let name = payload
                     .get("FunctionName")
@@ -2372,15 +2472,10 @@ impl Interpreter {
                         "S3 AWS SDK integrations do not support this pattern",
                     ));
                 }
-                return self.dispatch_s3(action, payload).await;
-            }
-            ("athena", "startQueryExecution") => {
-                if !matches!(pattern, IntegrationPattern::Sync) {
-                    return Err(AslError::runtime(
-                        "Athena startQueryExecution requires .sync",
-                    ));
-                }
-                return self.dispatch_athena_sync(payload).await;
+                return self
+                    .dispatch_s3(action, payload)
+                    .await
+                    .map_err(|error| sdk_error("s3", error));
             }
             _ => {}
         }
@@ -2413,6 +2508,16 @@ impl Interpreter {
                     "deleteMessageBatch",
                     "changeMessageVisibility",
                     "changeMessageVisibilityBatch",
+                ],
+            ),
+            "athena" => (
+                "athena",
+                "AmazonAthena",
+                &[
+                    "startQueryExecution",
+                    "getQueryExecution",
+                    "getQueryResults",
+                    "stopQueryExecution",
                 ],
             ),
             "sns" => ("sns", "AmazonSimpleNotificationService", &["publish"]),
@@ -2527,15 +2632,27 @@ impl Interpreter {
             .get("QueryExecutionId")
             .and_then(Value::as_str)
             .ok_or_else(|| AslError::task_failed("Athena response omitted QueryExecutionId"))?;
+        let workgroup = payload
+            .get("WorkGroup")
+            .and_then(Value::as_str)
+            .unwrap_or("primary");
+        let resource = format!(
+            "arn:aws:athena:{}:{}:workgroup/{workgroup}",
+            self.region, self.account
+        );
+        let mut guard = AthenaQueryGuard {
+            interpreter: self.clone(),
+            query_id: query_id.into(),
+            resource: resource.clone(),
+            armed: true,
+        };
         loop {
-            let workgroup = payload
-                .get("WorkGroup")
-                .and_then(Value::as_str)
-                .unwrap_or("primary");
-            let resource = format!(
-                "arn:aws:athena:{}:{}:workgroup/{workgroup}",
-                self.region, self.account
-            );
+            self.check_machine_deletion(None).await?;
+            if let Some(execution) = self.store.get_execution(&self.exec_arn) {
+                if execution.read().await.status != crate::store::Status::Running {
+                    return Err(AslError::task_failed("execution was stopped"));
+                }
+            }
             let response = self
                 .dispatch_json_with_resource(
                     "athena",
@@ -2548,6 +2665,9 @@ impl Interpreter {
                 .pointer("/QueryExecution/Status/State")
                 .and_then(Value::as_str)
                 .unwrap_or("QUEUED");
+            if !matches!(state, "QUEUED" | "RUNNING") {
+                guard.armed = false;
+            }
             match state {
                 "QUEUED" | "RUNNING" => tokio::time::sleep(Duration::from_millis(50)).await,
                 "SUCCEEDED" => return Ok(response),
@@ -2575,25 +2695,34 @@ impl Interpreter {
         if !evaluator.strict_sigv4_required() {
             return Ok(());
         }
-        evaluator
-            .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
-                source_arn: Some(self.sm_arn.clone()),
-                caller: RequestIdentity {
-                    account_id: self.account.clone(),
-                    access_key_id: None,
-                    arn: None,
-                },
-                role_arn: self.role_arn.clone(),
-                service_principal: "states.amazonaws.com".into(),
-                action: action.into(),
-                resource: resource.into(),
-            })
-            .map_err(|_| {
-                AslError::new(
-                    "States.Permissions",
-                    format!("execution role is not authorized for {action} on {resource}"),
-                )
-            })
+        let request = ServiceRoleAuthorizationRequest {
+            source_arn: Some(self.sm_arn.clone()),
+            caller: RequestIdentity {
+                account_id: self.account.clone(),
+                access_key_id: None,
+                arn: None,
+            },
+            role_arn: self.role_arn.clone(),
+            service_principal: "states.amazonaws.com".into(),
+            action: action.into(),
+            resource: resource.into(),
+        };
+        let authorization = if action.starts_with("s3:")
+            && registry
+                .native_handler(&locallycloud_core::registry::ServiceName::new("s3"))
+                .is_some()
+        {
+            // S3 composes identity and bucket policies; revalidate role trust here.
+            evaluator.authorize_service_role_trust(request)
+        } else {
+            evaluator.authorize_service_role_execution(request)
+        };
+        authorization.map_err(|_| {
+            AslError::new(
+                "States.Permissions",
+                format!("execution role is not authorized for {action} on {resource}"),
+            )
+        })
     }
 
     fn authorize_json_task(
@@ -2728,28 +2857,76 @@ impl Interpreter {
     }
 
     async fn dispatch_s3(&self, action: &str, payload: &Value) -> Result<Value, AslError> {
+        use crate::s3_integration as s3;
         if !self.store.healthy() {
             return Err(AslError::task_failed(
                 "Step Functions durable state is unavailable",
             ));
         }
-        let bucket = payload
-            .get("Bucket")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AslError::runtime("S3 integration requires Bucket"))?;
-        let key = payload
-            .get("Key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AslError::runtime("S3 integration requires Key"))?;
-        let iam_action = if action == "putObject" {
-            "s3:PutObject"
-        } else {
-            "s3:GetObject"
+        use s3::S3Action;
+        let action = S3Action::parse(action)?;
+        let bucket = s3::string(payload, "Bucket")?;
+        let (method, uri, body) = match action {
+            S3Action::ListObjectsV2 => {
+                self.authorize_task("s3:ListBucket", &format!("arn:aws:s3:::{bucket}"))?;
+                (Method::GET, s3::list_uri(payload, bucket)?, Bytes::new())
+            }
+            S3Action::PutObject
+            | S3Action::GetObject
+            | S3Action::HeadObject
+            | S3Action::CopyObject => {
+                let key = s3::string(payload, "Key")?;
+                let iam_action = match action {
+                    S3Action::PutObject | S3Action::CopyObject => "s3:PutObject",
+                    S3Action::GetObject | S3Action::HeadObject
+                        if payload.get("VersionId").is_some() =>
+                    {
+                        "s3:GetObjectVersion"
+                    }
+                    S3Action::GetObject | S3Action::HeadObject => "s3:GetObject",
+                    S3Action::ListObjectsV2 => unreachable!("list action handled separately"),
+                };
+                self.authorize_task(iam_action, &format!("arn:aws:s3:::{bucket}/{key}"))?;
+                let mut path = format!("/{}/{}", s3::encode(bucket, false), s3::encode(key, true));
+                if matches!(action, S3Action::GetObject | S3Action::HeadObject) {
+                    if let Some(version) = payload.get("VersionId") {
+                        let version = version
+                            .as_str()
+                            .ok_or_else(|| AslError::runtime("VersionId must be a string"))?;
+                        path.push_str(&format!("?versionId={}", s3::encode(version, false)));
+                    }
+                }
+                let uri = path
+                    .parse()
+                    .map_err(|_| AslError::runtime("S3 Bucket or Key is invalid"))?;
+                match action {
+                    S3Action::CopyObject => {
+                        let (source_bucket, source_key, versioned) = s3::copy_source(payload)?;
+                        self.authorize_task(
+                            if versioned {
+                                "s3:GetObjectVersion"
+                            } else {
+                                "s3:GetObject"
+                            },
+                            &format!("arn:aws:s3:::{source_bucket}/{source_key}"),
+                        )?;
+                        (Method::PUT, uri, Bytes::new())
+                    }
+                    S3Action::PutObject => {
+                        let body = match payload.get("Body") {
+                            Some(Value::String(value)) => value.as_bytes().to_vec(),
+                            None | Some(Value::Null) => Vec::new(),
+                            Some(value) => value.to_string().into_bytes(),
+                        };
+                        (Method::PUT, uri, Bytes::from(body))
+                    }
+                    S3Action::HeadObject => (Method::HEAD, uri, Bytes::new()),
+                    S3Action::GetObject => (Method::GET, uri, Bytes::new()),
+                    S3Action::ListObjectsV2 => unreachable!("list action handled separately"),
+                }
+            }
         };
-        self.authorize_task(iam_action, &format!("arn:aws:s3:::{bucket}/{key}"))?;
-        let uri: http::Uri = format!("/{}/{}", encode_path(bucket), encode_path(key))
-            .parse()
-            .map_err(|_| AslError::runtime("S3 Bucket or Key is invalid"))?;
+        s3::validate_fields(action, payload)?;
         let registry = self
             .registry
             .upgrade()
@@ -2766,20 +2943,7 @@ impl Interpreter {
             ))
             .expect("generated authorization header is valid"),
         );
-        for (field, header) in [
-            ("ContentMD5", "content-md5"),
-            ("ContentType", "content-type"),
-            ("IfNoneMatch", "if-none-match"),
-        ] {
-            if let Some(value) = payload.get(field).and_then(Value::as_str) {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(header.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    headers.insert(name, value);
-                }
-            }
-        }
+        s3::add_headers(&mut headers, payload)?;
         IdentityPropagator::attach(
             &mut headers,
             &CallerIdentity::AssumedRole {
@@ -2787,20 +2951,6 @@ impl Interpreter {
                 session_name: "stepfunctions".into(),
             },
         );
-        let (method, body) = match action {
-            "putObject" => {
-                let body = payload.get("Body").cloned().unwrap_or(Value::Null);
-                let bytes = match body {
-                    Value::String(value) => value.into_bytes(),
-                    Value::Null => Vec::new(),
-                    value => value.to_string().into_bytes(),
-                };
-                (Method::PUT, Bytes::from(bytes))
-            }
-            "getObject" => (Method::GET, Bytes::new()),
-            "headObject" => (Method::HEAD, Bytes::new()),
-            _ => return Err(AslError::runtime(format!("unsupported S3 action {action}"))),
-        };
         let response = dispatcher
             .dispatch_scoped(
                 &method,
@@ -2814,42 +2964,66 @@ impl Interpreter {
             .await;
         let status = response.status();
         let response_headers = response.headers().clone();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
-            .map_err(|_| AslError::task_failed("failed to read S3 response"))?;
+            .map_err(|_| AslError::task_failed("S3 wire response exceeds the local 1 MiB limit"))?;
         if !status.is_success() {
-            let xml = String::from_utf8_lossy(&body);
-            let code = xml_value(&xml, "Code").unwrap_or_else(|| "S3Error".into());
-            let message = xml_value(&xml, "Message").unwrap_or_else(|| status.to_string());
-            return Err(AslError::new(format!("S3.{code}"), message));
+            return Err(s3::error(&body, &status.to_string()));
         }
-        let mut result = serde_json::Map::new();
+        let mut result = match action {
+            S3Action::ListObjectsV2 => {
+                let result = s3::response(action, &body)?;
+                validate_state_payload_size(&result)?;
+                return Ok(result);
+            }
+            S3Action::CopyObject => s3::response(action, &body)?
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            S3Action::PutObject | S3Action::GetObject | S3Action::HeadObject => {
+                serde_json::Map::new()
+            }
+        };
         for (header, field) in [
             ("etag", "ETag"),
             ("content-type", "ContentType"),
             ("content-length", "ContentLength"),
             ("last-modified", "LastModified"),
             ("x-amz-version-id", "VersionId"),
+            ("x-amz-copy-source-version-id", "CopySourceVersionId"),
+            ("x-amz-server-side-encryption", "ServerSideEncryption"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "SSEKMSKeyId"),
         ] {
+            if action == S3Action::CopyObject
+                && matches!(
+                    field,
+                    "ETag" | "ContentType" | "ContentLength" | "LastModified"
+                )
+            {
+                continue;
+            }
             if let Some(value) = response_headers
                 .get(header)
                 .and_then(|value| value.to_str().ok())
             {
-                if field == "ContentLength" {
-                    if let Ok(number) = value.parse::<u64>() {
-                        result.insert(field.into(), json!(number));
-                        continue;
-                    }
-                }
-                result.insert(field.into(), json!(value));
+                let value = if field == "ContentLength" {
+                    json!(value
+                        .parse::<u64>()
+                        .map_err(|_| AslError::task_failed("Invalid S3 ContentLength"))?)
+                } else {
+                    json!(value)
+                };
+                result.insert(field.into(), value);
             }
         }
-        if action == "getObject" {
+        if action == S3Action::GetObject {
             let body = serde_json::from_slice(&body)
                 .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
             result.insert("Body".into(), body);
         }
-        Ok(Value::Object(result))
+        let result = Value::Object(result);
+        validate_state_payload_size(&result)?;
+        Ok(result)
     }
 
     async fn dispatch_json(
@@ -3054,6 +3228,26 @@ mod lambda_error_tests {
     use super::*;
 
     #[test]
+    fn s3_sdk_errors_append_exception_without_renaming_interpreter_errors() {
+        assert_eq!(
+            sdk_error("s3", AslError::new("S3.AccessDenied", "denied")).error,
+            "S3.AccessDeniedException"
+        );
+        assert_eq!(
+            sdk_error(
+                "s3",
+                AslError::new("S3.BucketAlreadyExistsException", "exists")
+            )
+            .error,
+            "S3.BucketAlreadyExistsException"
+        );
+        assert_eq!(
+            sdk_error("s3", AslError::new("States.Permissions", "trust denied")).error,
+            "States.Permissions"
+        );
+    }
+
+    #[test]
     fn function_error_preserves_error_type_and_full_payload() {
         let payload = json!({
             "errorType": "LedgerPhaseContentConflictError",
@@ -3093,6 +3287,18 @@ mod sqs_authorization_tests {
             }
             fn authorize(&self, _request: AuthorizationRequest) -> Result<(), AuthorizationError> {
                 Err(AuthorizationError::Denied)
+            }
+            fn authorize_service_role_trust(
+                &self,
+                request: ServiceRoleAuthorizationRequest,
+            ) -> Result<(), AuthorizationError> {
+                if request.service_principal == "states.amazonaws.com"
+                    && request.role_arn == "arn:aws:iam::111111111111:role/ledger"
+                {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::Denied)
+                }
             }
             fn authorize_service_role_execution(
                 &self,
@@ -3183,8 +3389,31 @@ mod sqs_authorization_tests {
                 );
             }
         }
+        // Proxied S3 retains the identity check; native S3 owns the resource-policy decision.
+        assert_eq!(
+            interpreter
+                .authorize_task("s3:GetObject", "arn:aws:s3:::bucket/key")
+                .unwrap_err()
+                .error,
+            "States.Permissions"
+        );
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            Arc::new(locallycloud_s3::service::S3Handler::new()),
+        );
+        assert!(interpreter
+            .authorize_task("s3:GetObject", "arn:aws:s3:::bucket/key")
+            .is_ok());
         let mut wrong_role = interpreter;
         wrong_role.role_arn = "arn:aws:iam::111111111111:role/other".into();
+        assert_eq!(
+            wrong_role
+                .authorize_task("s3:GetObject", "arn:aws:s3:::bucket/key")
+                .unwrap_err()
+                .error,
+            "States.Permissions"
+        );
         assert_eq!(
             wrong_role
                 .authorize_json_task(
@@ -3248,6 +3477,7 @@ async fn parse_target_response(
 
 fn sdk_error(service: &str, mut error: AslError) -> AslError {
     let prefix = match service {
+        "s3" => "S3",
         "states" => "Sfn",
         "sqs" => "Sqs",
         "sns" => "Sns",
@@ -3361,14 +3591,6 @@ fn encode_path(value: &str) -> String {
         }
     }
     encoded
-}
-
-fn xml_value(xml: &str, tag: &str) -> Option<String> {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let start = xml.find(&start_tag)? + start_tag.len();
-    let end = xml[start..].find(&end_tag)? + start;
-    Some(xml[start..end].to_string())
 }
 
 fn parse_item_reader_body(body: &Value, config: &Value) -> Result<Vec<Value>, String> {
@@ -3504,7 +3726,7 @@ fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
     Ok(fields)
 }
 
-fn render_inspection(inspection: &StateInspection) -> Value {
+fn render_inspection(inspection: &StateInspection, jsonata: bool, state: &Value) -> Value {
     fn encoded(value: &Option<Value>) -> Option<Value> {
         value.as_ref().map(|value| Value::String(value.to_string()))
     }
@@ -3520,11 +3742,23 @@ fn render_inspection(inspection: &StateInspection) -> Value {
             encoded(&inspection.after_result_selector),
         ),
         ("afterResultPath", encoded(&inspection.after_result_path)),
-        ("output", encoded(&inspection.output)),
     ] {
         if let Some(value) = value {
             data.insert(name.into(), value);
         }
+    }
+    if jsonata {
+        data.retain(|name, _| matches!(name.as_str(), "input" | "afterArguments" | "result"));
+        if state.get("Type").and_then(Value::as_str) != Some("Task") {
+            data.remove("afterArguments");
+            data.remove("result");
+        }
+        if inspection.caught_error {
+            data.remove("result");
+        }
+    }
+    if let Some(details) = &inspection.error_details {
+        data.insert("errorDetails".into(), details.clone());
     }
     Value::Object(data)
 }
@@ -3638,18 +3872,18 @@ fn match_retry(retriers: &[Value], err: &AslError, counts: &mut [u32]) -> Option
     None
 }
 
-/// Find a matching catcher and return `(catcher, Next, ResultPath option)`.
+/// Find a matching catcher and return `(index, catcher, Next, ResultPath option)`.
 fn match_catch<'a>(
     catchers: &'a [Value],
     err: &AslError,
-) -> Option<(&'a Value, String, Option<Option<&'a str>>)> {
-    for catcher in catchers {
+) -> Option<(usize, &'a Value, String, Option<Option<&'a str>>)> {
+    for (index, catcher) in catchers.iter().enumerate() {
         if !error_equals_match(catcher, err) {
             continue;
         }
         let next = catcher.get("Next").and_then(Value::as_str)?.to_string();
         let rp = result_path_option(catcher);
-        return Some((catcher, next, rp));
+        return Some((index, catcher, next, rp));
     }
     None
 }

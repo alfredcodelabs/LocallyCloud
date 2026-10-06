@@ -1015,9 +1015,11 @@ pub async fn test_state(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
 
     let mut response = json!({
         "status": outcome.status,
-        "nextState": outcome.next_state.unwrap_or_default(),
     });
     let object = response.as_object_mut().expect("response is an object");
+    if let Some(next) = outcome.next_state {
+        object.insert("nextState".into(), Value::String(next));
+    }
     if let Some(output) = outcome.output {
         object.insert("output".into(), Value::String(output.to_string()));
     }
@@ -1026,7 +1028,10 @@ pub async fn test_state(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
         object.insert("cause".into(), Value::String(error.cause));
     }
     if let Some(mut inspection) = outcome.inspection_data {
-        if let Some(data) = inspection.as_object_mut() {
+        if let Some(data) = inspection
+            .as_object_mut()
+            .filter(|_| !outcome.variables.is_empty())
+        {
             data.insert(
                 "variables".into(),
                 Value::String(Value::Object(outcome.variables.into_iter().collect()).to_string()),

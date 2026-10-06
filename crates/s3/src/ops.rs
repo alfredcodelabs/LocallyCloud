@@ -39,7 +39,12 @@ const MAX_OBJECT_SIZE: usize = 5 * 1024 * 1024 * 1024;
 /// Request context for an operation.
 pub struct Ctx<'a> {
     pub store: &'a AccountStore,
+    /// Caller account, retained for credentials and downstream authorization.
     pub account: &'a str,
+    /// Bucket owner selected by the service authorization boundary.
+    pub storage_account: &'a str,
+    /// Independently authorized owner of a copy source bucket.
+    pub copy_source_account: Option<&'a str>,
     pub region: &'a str,
     pub request_id: &'a str,
     pub dispatcher: Option<Arc<InternalDispatcher>>,
@@ -444,7 +449,13 @@ fn with_sse_headers(
 
 async fn bucket(ctx: &Ctx<'_>, name: &str) -> Result<Arc<RwLock<BucketState>>, S3Error> {
     ctx.store
-        .get(ctx.account, name)
+        .get(ctx.storage_account, name)
+        .ok_or(S3Error::NoSuchBucket)
+}
+
+fn copy_source_bucket(ctx: &Ctx<'_>, name: &str) -> Result<Arc<RwLock<BucketState>>, S3Error> {
+    ctx.store
+        .get(ctx.copy_source_account.unwrap_or(ctx.account), name)
         .ok_or(S3Error::NoSuchBucket)
 }
 
@@ -691,7 +702,7 @@ pub async fn delete_bucket(ctx: &Ctx<'_>, name: &str) -> Result<Response, S3Erro
         return Err(S3Error::BucketNotEmpty);
     }
     drop(guard);
-    ctx.store.remove(ctx.account, name);
+    ctx.store.remove(ctx.storage_account, name);
     Ok(status_only(204, ctx.request_id))
 }
 
@@ -1359,7 +1370,7 @@ pub async fn get_bucket_notification(ctx: &Ctx<'_>, name: &str) -> Result<Respon
 
 pub async fn get_bucket_acl(ctx: &Ctx<'_>, name: &str) -> Result<Response, S3Error> {
     bucket(ctx, name).await?;
-    let acct = ctx.account;
+    let acct = ctx.storage_account;
     let body = format!(
         "{DECL}<AccessControlPolicy xmlns=\"{S3_XMLNS}\"><Owner><ID>{acct}</ID><DisplayName>locallycloud</DisplayName></Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>{acct}</ID><DisplayName>locallycloud</DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"
     );
@@ -2380,7 +2391,7 @@ pub async fn apply_cors_headers(
     let Some(origin) = header(headers, "origin") else {
         return;
     };
-    let Some(bucket) = ctx.store.get(ctx.account, bucket_name) else {
+    let Some(bucket) = ctx.store.get(ctx.storage_account, bucket_name) else {
         return;
     };
     let guard = bucket.read().await;
@@ -2435,6 +2446,11 @@ fn check_write_conditions(
     headers: &HeaderMap,
     current: Option<&StoredObject>,
 ) -> Result<(), S3Error> {
+    if header(headers, "if-none-match").is_some_and(|value| value != "*") {
+        return Err(S3Error::InvalidArgument(
+            "If-None-Match only supports the '*' value for conditional writes".into(),
+        ));
+    }
     if let Some(if_match) = header(headers, "if-match") {
         if !current.is_some_and(|object| etag_matches(if_match, &object.etag)) {
             return Err(S3Error::PreconditionFailed);
@@ -2586,7 +2602,7 @@ pub async fn list_objects_v2(
         "{DECL}<ListBucketResult><Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>",
         escape(bucket_name),
         escape(&response_value(prefix)),
-        result.keys.len(),
+        result.keys.len() + result.common_prefixes.len(),
         max_keys,
         result.is_truncated,
     );
@@ -2599,6 +2615,9 @@ pub async fn list_objects_v2(
     if let Some(start_after) = q.get("start-after") {
         body.push_str(&text_el("StartAfter", &response_value(start_after)));
     }
+    if let Some(token) = q.get("continuation-token") {
+        body.push_str(&text_el("ContinuationToken", token));
+    }
     if let Some(token) = &result.next_token {
         body.push_str(&text_el("NextContinuationToken", token));
     }
@@ -2606,7 +2625,7 @@ pub async fn list_objects_v2(
         body.push_str(&contents_xml(
             &response_value(key),
             obj,
-            ctx.account,
+            ctx.storage_account,
             fetch_owner,
         ));
     }
@@ -2655,7 +2674,7 @@ pub async fn list_objects_v1(
         }
     }
     for (key, obj) in &result.keys {
-        body.push_str(&contents_xml(key, obj, ctx.account, true));
+        body.push_str(&contents_xml(key, obj, ctx.storage_account, true));
     }
     for cp in &result.common_prefixes {
         body.push_str(&format!(
@@ -2745,7 +2764,7 @@ pub async fn copy_object(
     {
         return Err(S3Error::InvalidArgument("invalid copy directive".into()));
     }
-    let src = bucket(ctx, &src_bucket).await?;
+    let src = copy_source_bucket(ctx, &src_bucket)?;
     let (source_object, source_is_current) = {
         let guard = src.read().await;
         let selected = selected_object(&guard, &src_key, src_version.as_deref())?.0;
@@ -2816,6 +2835,7 @@ pub async fn copy_object(
         copied_etag = copied_body.opaque_etag()?;
     }
     let mut guard = dest.write().await;
+    check_write_conditions(headers, guard.objects.get(dest_key))?;
     if let Some(current) = guard.objects.get(dest_key) {
         ensure_not_protected(current, bypass_governance(headers))?;
     }
@@ -3149,7 +3169,7 @@ pub async fn upload_part_copy(
     let source = header(headers, "x-amz-copy-source")
         .ok_or_else(|| S3Error::InvalidArgument("x-amz-copy-source is required".into()))?;
     let (src_bucket, src_key, src_version) = parse_copy_source(source)?;
-    let src = bucket(ctx, &src_bucket).await?;
+    let src = copy_source_bucket(ctx, &src_bucket)?;
     let source_object = {
         let guard = src.read().await;
         selected_object(&guard, &src_key, src_version.as_deref())?.0
@@ -3704,7 +3724,7 @@ pub async fn list_object_versions(
                     text_el("Key", key),
                     escape(&version.id),
                     iso8601(version.last_modified),
-                    escape(ctx.account),
+                    escape(ctx.storage_account),
                 );
                 match &version.value {
                     VersionValue::Object(object) => body.push_str(&format!(

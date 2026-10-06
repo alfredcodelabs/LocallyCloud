@@ -363,9 +363,14 @@ impl Statement {
             return false;
         }
         let resource_ok = if !self.resources.is_empty() {
-            any_glob(&self.resources, &req.resource)
+            self.resources
+                .iter()
+                .any(|pattern| glob_match_case_sensitive(pattern, &req.resource))
         } else if !self.not_resources.is_empty() {
-            !any_glob(&self.not_resources, &req.resource)
+            !self
+                .not_resources
+                .iter()
+                .any(|pattern| glob_match_case_sensitive(pattern, &req.resource))
         } else {
             // No resource constraint is treated as `*`.
             true
@@ -401,16 +406,36 @@ fn eval_condition(
         let present = context.get(key).map(|v| !v.is_empty()).unwrap_or(false);
         return values.iter().any(|v| (v == "true") != present);
     }
+    let negated = matches!(
+        base,
+        "StringNotEquals"
+            | "StringNotEqualsIgnoreCase"
+            | "StringNotLike"
+            | "ArnNotLike"
+            | "ArnNotEquals"
+            | "NumericNotEquals"
+            | "DateNotEquals"
+            | "NotIpAddress"
+    );
     let ctx_values = match context.get(key) {
         Some(v) if !v.is_empty() => v,
-        _ => return if_exists,
+        _ => return if_exists || negated,
     };
-    ctx_values
-        .iter()
-        .any(|cv| values.iter().any(|pv| apply_operator(base, pv, cv)))
+    if negated {
+        ctx_values
+            .iter()
+            .all(|cv| values.iter().all(|pv| apply_operator(base, pv, cv)))
+    } else {
+        ctx_values
+            .iter()
+            .any(|cv| values.iter().any(|pv| apply_operator(base, pv, cv)))
+    }
 }
 
 fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> bool {
+    if op.starts_with("Numeric") && (num(policy_value).is_none() || num(ctx_value).is_none()) {
+        return false;
+    }
     match op {
         "StringEquals" => policy_value == ctx_value,
         "StringNotEquals" => policy_value != ctx_value,
@@ -443,7 +468,7 @@ fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> bool {
 }
 
 fn num(s: &str) -> Option<f64> {
-    s.parse::<f64>().ok()
+    s.parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
 /// Whether `ip` (IPv4) falls within `cidr` (`a.b.c.d/n` or an exact address).
@@ -519,6 +544,42 @@ mod tests {
             resource: resource.to_string(),
             context: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn resource_case_and_negated_value_sets_are_preserved() {
+        let document = PolicyDocument::parse(r#"{"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/Key"}}"#).unwrap();
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&document),
+                None,
+                None,
+                &req("s3:getobject", "arn:aws:s3:::bucket/Key")
+            ),
+            Decision::Allowed
+        );
+        assert_eq!(
+            evaluate(
+                &[document],
+                None,
+                None,
+                &req("s3:GetObject", "arn:aws:s3:::bucket/key")
+            ),
+            Decision::ImplicitDeny
+        );
+        let context = BTreeMap::from([("key".into(), vec!["a".into()])]);
+        assert!(!eval_condition(
+            "StringNotEquals",
+            "key",
+            &["a".into(), "b".into()],
+            &context
+        ));
+        assert!(eval_condition(
+            "StringNotEquals",
+            "missing",
+            &["a".into()],
+            &context
+        ));
     }
 
     #[test]

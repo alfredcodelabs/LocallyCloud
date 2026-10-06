@@ -12,6 +12,7 @@ pub mod model;
 mod persistence;
 pub mod policy;
 pub mod query;
+mod resource_policy;
 pub mod service;
 pub mod store;
 pub mod sts;

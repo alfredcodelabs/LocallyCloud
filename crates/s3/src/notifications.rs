@@ -488,6 +488,7 @@ fn target_matches(target: &TargetConfiguration, event: &ObjectEvent) -> bool {
 pub fn delivery_requests(
     event: &ObjectEvent,
     account: &str,
+    caller_account: &str,
     region: &str,
     request_id: &str,
     source_ip: &str,
@@ -495,7 +496,15 @@ pub fn delivery_requests(
     let mut requests = Vec::new();
     for target in &event.configuration.lambdas {
         if target_matches(target, event) {
-            let payload = record_payload(event, target, account, region, request_id, source_ip);
+            let payload = record_payload(
+                event,
+                target,
+                account,
+                caller_account,
+                region,
+                request_id,
+                source_ip,
+            );
             if let Some(request) = lambda_request(&target.arn, payload) {
                 requests.push(request);
             }
@@ -503,7 +512,15 @@ pub fn delivery_requests(
     }
     for target in &event.configuration.queues {
         if target_matches(target, event) {
-            let payload = record_payload(event, target, account, region, request_id, source_ip);
+            let payload = record_payload(
+                event,
+                target,
+                account,
+                caller_account,
+                region,
+                request_id,
+                source_ip,
+            );
             if let Some(request) = queue_request(&target.arn, payload) {
                 requests.push(request);
             }
@@ -511,12 +528,25 @@ pub fn delivery_requests(
     }
     for target in &event.configuration.topics {
         if target_matches(target, event) {
-            let payload = record_payload(event, target, account, region, request_id, source_ip);
+            let payload = record_payload(
+                event,
+                target,
+                account,
+                caller_account,
+                region,
+                request_id,
+                source_ip,
+            );
             requests.push(topic_request(&target.arn, payload));
         }
     }
     if event.configuration.event_bridge {
-        requests.push(event_bridge_request(event, account, request_id, source_ip));
+        requests.push(event_bridge_request(
+            event,
+            caller_account,
+            request_id,
+            source_ip,
+        ));
     }
     requests
 }
@@ -554,6 +584,7 @@ fn record_payload(
     event: &ObjectEvent,
     target: &TargetConfiguration,
     account: &str,
+    caller_account: &str,
     region: &str,
     request_id: &str,
     source_ip: &str,
@@ -577,7 +608,7 @@ fn record_payload(
             "awsRegion": region,
             "eventTime": event.time.format(&Rfc3339).unwrap_or_default(),
             "eventName": event.event_type.event_name(),
-            "userIdentity": {"principalId": account},
+            "userIdentity": {"principalId": caller_account},
             "requestParameters": {"sourceIPAddress": source_ip},
             "responseElements": {"x-amz-request-id": request_id},
             "s3": {
@@ -820,6 +851,7 @@ mod tests {
         let requests = delivery_requests(
             &event(configuration.clone(), "in/a b.txt"),
             "123456789012",
+            "111111111111",
             "eu-west-1",
             "rid",
             "127.0.0.1",
@@ -844,6 +876,11 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&lambda.body).unwrap();
         let record = &body["Records"][0];
+        assert_eq!(record["userIdentity"]["principalId"], "111111111111");
+        assert_eq!(
+            record["s3"]["bucket"]["ownerIdentity"]["principalId"],
+            "123456789012"
+        );
         assert_eq!(record["eventVersion"], "2.1");
         assert_eq!(record["eventSource"], "aws:s3");
         assert_eq!(record["awsRegion"], "eu-west-1");
@@ -854,6 +891,7 @@ mod tests {
         let filtered = delivery_requests(
             &event(configuration, "out/a.txt"),
             "123456789012",
+            "111111111111",
             "eu-west-1",
             "rid",
             "127.0.0.1",

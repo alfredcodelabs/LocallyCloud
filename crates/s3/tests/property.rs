@@ -624,6 +624,7 @@ proptest! {
         let deliveries = notifications::delivery_requests(
             &object_event(key.clone(), configuration),
             "000000000000",
+            "000000000000",
             "us-east-1",
             "request",
             "127.0.0.1",
@@ -638,6 +639,7 @@ proptest! {
         let configuration = notification_configuration("", "");
         let mut deliveries = notifications::delivery_requests(
             &object_event(key.clone(), configuration),
+            "000000000000",
             "000000000000",
             "us-east-1",
             "request",
@@ -737,7 +739,7 @@ proptest! {
                 state.versioning = VersioningState::Enabled;
                 state.notification_configuration = configuration.clone();
             }
-            let concurrent_ctx = locallycloud_s3::ops::Ctx { store: &concurrent_store, account: account_a, region: "us-east-1", request_id: "concurrent", dispatcher: None, identity: None, delegated_identity: None, strict_external: false };
+            let concurrent_ctx = locallycloud_s3::ops::Ctx { store: &concurrent_store, account: account_a, storage_account: account_a, copy_source_account: None, region: "us-east-1", request_id: "concurrent", dispatcher: None, identity: None, delegated_identity: None, strict_external: false };
             let headers = HeaderMap::new();
             let (first, second) = tokio::join!(
                 locallycloud_s3::ops::put_object(&concurrent_ctx, "bucket", "a", &headers, Bytes::from(left.clone())),
@@ -753,7 +755,7 @@ proptest! {
                 state.versioning = VersioningState::Enabled;
                 state.notification_configuration = configuration;
             }
-            let sequential_ctx = locallycloud_s3::ops::Ctx { store: &sequential_store, account: account_a, region: "us-east-1", request_id: "sequential", dispatcher: None, identity: None, delegated_identity: None, strict_external: false };
+            let sequential_ctx = locallycloud_s3::ops::Ctx { store: &sequential_store, account: account_a, storage_account: account_a, copy_source_account: None, region: "us-east-1", request_id: "sequential", dispatcher: None, identity: None, delegated_identity: None, strict_external: false };
             let sequential_results = vec![
                 locallycloud_s3::ops::put_object(&sequential_ctx, "bucket", "a", &headers, Bytes::from(left)).await.expect("first sequential write"),
                 locallycloud_s3::ops::put_object(&sequential_ctx, "bucket", "b", &headers, Bytes::from(right)).await.expect("second sequential write"),

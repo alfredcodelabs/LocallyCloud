@@ -59,6 +59,14 @@ pub enum AuthorizationError {
     Internal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResourcePolicyError {
+    #[error("malformed resource policy: {0}")]
+    Malformed(String),
+    #[error("unsupported resource policy: {0}")]
+    Unsupported(String),
+}
+
 pub trait AuthorizationEvaluator: Send + Sync {
     fn version(&self) -> u16 {
         AUTHORIZATION_EVALUATOR_VERSION
@@ -72,6 +80,23 @@ pub trait AuthorizationEvaluator: Send + Sync {
 
     fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError>;
 
+    fn validate_resource_policy(&self, _document: &str) -> Result<(), ResourcePolicyError> {
+        Err(ResourcePolicyError::Unsupported(
+            "resource policies unavailable".into(),
+        ))
+    }
+
+    /// Compose identity and resource policies for a resource's owning account.
+    /// Delegated identities must originate from Core's attested internal dispatch.
+    fn authorize_resource_policy(
+        &self,
+        _request: AuthorizationRequest,
+        _document: Option<&str>,
+        _owner_account: &str,
+    ) -> Result<(), AuthorizationError> {
+        Err(AuthorizationError::Denied)
+    }
+
     /// Check caller PassRole, role trust, and the role's action/resource policy.
     /// The default denies so evaluators cannot silently grant a role.
     fn authorize_service_role(
@@ -83,6 +108,15 @@ pub trait AuthorizationEvaluator: Send + Sync {
 
     /// Check caller PassRole and service trust when assigning a role, before a target exists.
     fn authorize_service_role_assignment(
+        &self,
+        _request: ServiceRoleAuthorizationRequest,
+    ) -> Result<(), AuthorizationError> {
+        Err(AuthorizationError::Denied)
+    }
+
+    /// Recheck runtime role existence and service trust when the target service composes
+    /// identity permissions with its own resource policy. This grants no action permission.
+    fn authorize_service_role_trust(
         &self,
         _request: ServiceRoleAuthorizationRequest,
     ) -> Result<(), AuthorizationError> {
@@ -108,6 +142,15 @@ pub trait AuthorizationEvaluator: Send + Sync {
         Err(AuthorizationError::Denied)
     }
 
+    /// Resolve a unique credential account from trusted state. This is a verifier
+    /// lookup hint, not authenticated identity until the original signature passes.
+    fn credential_account(
+        &self,
+        _access_key_id: &str,
+    ) -> Result<Option<String>, AuthorizationError> {
+        Ok(None)
+    }
+
     /// Verify a request using an active, account-scoped key without exposing secret material.
     #[allow(clippy::too_many_arguments)]
     fn verify_sigv4(
@@ -130,6 +173,15 @@ pub trait AuthorizationEvaluator: Send + Sync {
         _request_identity: &RequestIdentity,
     ) -> Result<Option<String>, AuthorizationError> {
         Ok(None)
+    }
+
+    /// Identify an account root from credential provenance, never a supplied ARN.
+    /// Legacy sessions without an authenticated root issuer must return false.
+    fn is_account_root(
+        &self,
+        _request_identity: &RequestIdentity,
+    ) -> Result<bool, AuthorizationError> {
+        Ok(false)
     }
 
     /// Key-policy direct grants cannot override explicit IAM Deny, boundaries or session limits.

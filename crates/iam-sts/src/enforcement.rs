@@ -45,10 +45,10 @@ impl EnforcementMode {
 }
 
 /// The policy documents that bound a caller's authority.
-struct CallerContext {
-    identity: Vec<PolicyDocument>,
-    boundary: Option<Vec<PolicyDocument>>,
-    session: Option<Vec<PolicyDocument>>,
+pub(crate) struct CallerContext {
+    pub(crate) identity: Vec<PolicyDocument>,
+    pub(crate) boundary: Option<Vec<PolicyDocument>>,
+    pub(crate) session: Option<Vec<PolicyDocument>>,
 }
 
 /// Evaluates a request against the resolved caller's policies under the active mode.
@@ -88,6 +88,16 @@ impl EnforcementFilter {
         let access_key_id = identity.access_key_id.as_deref().ok_or_else(|| {
             IamStsError::AccessDenied("request has no resolvable access key".into())
         })?;
+        if self
+            .sessions
+            .resolve(access_key_id)
+            .is_some_and(|session| session.role_arn.is_none())
+            && (action.starts_with("iam:")
+                || (action.starts_with("sts:")
+                    && !matches!(action, "sts:AssumeRole" | "sts:GetCallerIdentity")))
+        {
+            return Err(IamStsError::AccessDenied("session credentials cannot perform this IAM/STS operation without supported MFA context".into()));
+        }
         let caller = self.resolve_caller(&identity.account_id, access_key_id)?;
         let req = EvalRequest {
             action: action.to_string(),
@@ -181,7 +191,11 @@ impl EnforcementFilter {
         context_denies(&caller, &request)
     }
 
-    fn role_context(&self, account: &str, role_arn: &str) -> Result<CallerContext, IamStsError> {
+    pub(crate) fn role_context(
+        &self,
+        account: &str,
+        role_arn: &str,
+    ) -> Result<CallerContext, IamStsError> {
         let name = role_arn.rsplit('/').next().unwrap_or(role_arn);
         let role = self
             .store
@@ -202,14 +216,23 @@ impl EnforcementFilter {
         })
     }
 
-    fn resolve_caller(
+    pub(crate) fn resolve_caller(
         &self,
         account: &str,
         access_key_id: &str,
     ) -> Result<CallerContext, IamStsError> {
+        if self.store.root_for_key(account, access_key_id).is_some() {
+            return Ok(root_context());
+        }
         if let Some(session) = self.sessions.resolve(access_key_id) {
             if session.account != account {
                 return Err(unresolvable_caller(access_key_id));
+            }
+            if session
+                .root_provenance(account, &self.store)
+                .map_err(|_| unresolvable_caller(access_key_id))?
+            {
+                return Ok(root_context());
             }
             let session_policy = session
                 .session_policy
@@ -337,6 +360,17 @@ fn unresolvable_caller(access_key_id: &str) -> IamStsError {
     IamStsError::AccessDenied(format!(
         "caller for access key {access_key_id} cannot be resolved"
     ))
+}
+
+fn root_context() -> CallerContext {
+    CallerContext {
+        identity: vec![PolicyDocument::parse(
+            r#"{"Statement":{"Effect":"Allow","Action":"*","Resource":"*"}}"#,
+        )
+        .expect("static root policy is valid")],
+        boundary: None,
+        session: None,
+    }
 }
 
 #[cfg(test)]

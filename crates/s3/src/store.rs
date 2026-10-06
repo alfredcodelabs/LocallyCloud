@@ -594,6 +594,13 @@ impl AccountStore {
         }
     }
 
+    /// Resolve ownership for authorization without exposing another account's state to operations.
+    pub(crate) fn resource_bucket(&self, name: &str) -> Option<(String, Arc<RwLock<BucketState>>)> {
+        self.buckets
+            .get(name)
+            .map(|entry| (entry.value().0.clone(), entry.value().1.state.clone()))
+    }
+
     pub fn get(&self, account: &str, name: &str) -> Option<Arc<RwLock<BucketState>>> {
         self.buckets
             .get(name)

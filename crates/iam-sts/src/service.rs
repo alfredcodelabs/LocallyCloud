@@ -10,7 +10,7 @@ use axum::response::Response;
 
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::{
-    AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
+    AuthorizationError, AuthorizationEvaluator, AuthorizationRequest, ResourcePolicyError,
     ServiceRoleAuthorizationRequest, ServiceRoleCredentials, SigningCredentials,
 };
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
@@ -20,7 +20,7 @@ use crate::error::IamStsError;
 use crate::iam::{self, Entity, OpResult};
 use crate::policy::service_trust_allows;
 use crate::query::{response_envelope, QueryRequest, IAM_XMLNS, STS_XMLNS};
-use crate::store::IamStore;
+use crate::store::{AccountRoot, IamStore};
 use crate::sts::{self, SessionStore};
 use crate::{
     arn::build_iam_arn,
@@ -46,6 +46,18 @@ impl IamStsState {
             enforcement,
             mode: EnforcementMode::from_env(),
         }
+    }
+
+    fn root_caller(&self, identity: &RequestIdentity) -> bool {
+        let Some(key) = identity.access_key_id.as_deref() else {
+            return false;
+        };
+        if self.store.root_for_key(&identity.account_id, key).is_some() {
+            return true;
+        }
+        self.sessions.resolve(key).is_some_and(|session| {
+            session.root_provenance(&identity.account_id, &self.store) == Ok(true)
+        })
     }
 
     fn validate_service_role(
@@ -125,6 +137,24 @@ impl IamStsState {
             access_key_id,
             arn: None,
         };
+        // GetSessionToken authenticates long-term credentials; IAM policies cannot deny issuance.
+        if self.mode == EnforcementMode::Strict && service == "sts" && action == "GetSessionToken" {
+            if identity
+                .access_key_id
+                .as_deref()
+                .is_some_and(|key| self.sessions.resolve(key).is_some())
+            {
+                return Err(IamStsError::AccessDenied(
+                    "GetSessionToken requires long-term credentials".into(),
+                ));
+            }
+            return match self.resolve_caller_arn(&identity) {
+                Ok(Some(_)) => Ok(()),
+                _ => Err(IamStsError::AccessDenied(
+                    "request has no active issuer identity".into(),
+                )),
+            };
+        }
         // STS GetCallerIdentity requires valid credentials, but no IAM permission,
         // even when an identity policy explicitly denies this action.
         if self.mode == EnforcementMode::Strict && service == "sts" && action == "GetCallerIdentity"
@@ -152,6 +182,198 @@ impl IamStsState {
 }
 
 impl AuthorizationEvaluator for IamStsState {
+    fn credential_account(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<String>, AuthorizationError> {
+        let mut accounts = self.store.active_key_accounts(access_key_id);
+        if let Some(account) = self.store.root_account_for_key(access_key_id) {
+            accounts.push(account);
+        }
+        if let Some(session) = self.sessions.resolve(access_key_id) {
+            session
+                .root_provenance(&session.account, &self.store)
+                .map_err(|_| AuthorizationError::Denied)?;
+            accounts.push(session.account);
+        }
+        match accounts.len() {
+            0 => Ok(None),
+            1 => Ok(accounts.pop()),
+            _ => Err(AuthorizationError::Denied),
+        }
+    }
+
+    fn is_account_root(&self, identity: &RequestIdentity) -> Result<bool, AuthorizationError> {
+        Ok(self.root_caller(identity))
+    }
+
+    fn validate_resource_policy(&self, document: &str) -> Result<(), ResourcePolicyError> {
+        crate::resource_policy::parse(document).map(|_| ())
+    }
+
+    fn authorize_resource_policy(
+        &self,
+        mut request: AuthorizationRequest,
+        document: Option<&str>,
+        owner_account: &str,
+    ) -> Result<(), AuthorizationError> {
+        use crate::policy::{evaluate, Decision, EvalRequest, PolicyDocument};
+        use locallycloud_core::integration::identity::CallerIdentity;
+        if request.action.is_empty() || request.resource.is_empty() || owner_account.is_empty() {
+            return Err(AuthorizationError::InvalidRequest);
+        }
+        // These attributes describe the resolved caller, never supplied condition values.
+        request.context.retain(|key, _| {
+            !matches!(
+                key.to_ascii_lowercase().as_str(),
+                "aws:principalarn"
+                    | "aws:principalaccount"
+                    | "aws:principaltype"
+                    | "aws:principalisawsservice"
+            )
+        });
+        let account = request.request_identity.account_id.clone();
+        let (arn, service, caller, principal_type) = match &request.delegated_identity {
+            Some(CallerIdentity::AssumedRole { role_arn, .. }) => (
+                Some(role_arn.clone()),
+                None,
+                Some(
+                    self.enforcement
+                        .role_context(&account, role_arn)
+                        .map_err(|_| AuthorizationError::Denied)?,
+                ),
+                "AssumedRole",
+            ),
+            Some(CallerIdentity::ServicePrincipal { service }) => (
+                None,
+                Some(if service.ends_with(".amazonaws.com") {
+                    service.clone()
+                } else {
+                    format!("{service}.amazonaws.com")
+                }),
+                None,
+                "AWSService",
+            ),
+            Some(CallerIdentity::Default) => return Err(AuthorizationError::Denied),
+            None => match request.request_identity.access_key_id.as_deref() {
+                Some(key) => {
+                    // The current session engine has no inherited user context for these
+                    // sessions; accepting direct grants could hide a user's explicit Deny.
+                    if !self.root_caller(&request.request_identity)
+                        && self
+                            .sessions
+                            .resolve(key)
+                            .is_some_and(|session| session.role_arn.is_none())
+                    {
+                        return Err(AuthorizationError::Denied);
+                    }
+                    let caller = self
+                        .enforcement
+                        .resolve_caller(&account, key)
+                        .map_err(|_| AuthorizationError::Denied)?;
+                    let arn = self
+                        .resolve_caller_arn(&request.request_identity)?
+                        .ok_or(AuthorizationError::Denied)?;
+                    let kind = if self.root_caller(&request.request_identity) {
+                        "Account"
+                    } else if arn.contains(":role/") {
+                        "AssumedRole"
+                    } else {
+                        "User"
+                    };
+                    (Some(arn), None, Some(caller), kind)
+                }
+                None => (None, None, None, "Anonymous"),
+            },
+        };
+        if let Some(arn) = &arn {
+            request
+                .context
+                .insert("aws:principalarn".into(), vec![arn.clone()]);
+            request
+                .context
+                .insert("aws:principalaccount".into(), vec![account.clone()]);
+        }
+        request
+            .context
+            .insert("aws:principaltype".into(), vec![principal_type.into()]);
+        request.context.insert(
+            "aws:principalisawsservice".into(),
+            vec![service.is_some().to_string()],
+        );
+        let evaluation = EvalRequest {
+            action: request.action,
+            resource: request.resource,
+            context: request.context,
+        };
+        let mut resource_allow = false;
+        let mut direct_allow = false;
+        let mut principal_arn_session_allow = false;
+        if let Some(document) = document {
+            for item in
+                crate::resource_policy::parse(document).map_err(|_| AuthorizationError::Denied)?
+            {
+                let Some(direct) =
+                    item.principal_match(&account, arn.as_deref(), service.as_deref())
+                else {
+                    continue;
+                };
+                let grants_session = item.grants_principal_arn_session();
+                match evaluate(
+                    &[PolicyDocument {
+                        statements: vec![item.statement],
+                    }],
+                    None,
+                    None,
+                    &evaluation,
+                ) {
+                    Decision::ExplicitDeny => return Err(AuthorizationError::Denied),
+                    Decision::Allowed => {
+                        resource_allow = true;
+                        direct_allow |= direct;
+                        principal_arn_session_allow |= grants_session;
+                    }
+                    Decision::ImplicitDeny => {}
+                }
+            }
+        }
+        let (identity_allow, limits_allow) = match caller {
+            Some(caller) => {
+                let decision = evaluate(
+                    &caller.identity,
+                    caller.boundary.as_deref(),
+                    caller.session.as_deref(),
+                    &evaluation,
+                );
+                if decision == Decision::ExplicitDeny {
+                    return Err(AuthorizationError::Denied);
+                }
+                let limits_allow = caller.boundary.as_ref().is_none_or(|policies| {
+                    evaluate(policies, None, None, &evaluation) == Decision::Allowed
+                }) && caller.session.as_ref().is_none_or(|policies| {
+                    evaluate(policies, None, None, &evaluation) == Decision::Allowed
+                });
+                (decision == Decision::Allowed, limits_allow)
+            }
+            None => (false, true),
+        };
+        let same_account = arn.is_some() && account == owner_account;
+        let allowed = if service.is_some() || arn.is_none() {
+            resource_allow
+        } else if same_account {
+            identity_allow
+                || principal_arn_session_allow
+                || (direct_allow && (principal_type == "User" || limits_allow))
+        } else {
+            identity_allow && resource_allow
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(AuthorizationError::Denied)
+        }
+    }
+
     fn issue_service_role_credentials(
         &self,
         account: &str,
@@ -202,7 +424,15 @@ impl AuthorizationEvaluator for IamStsState {
             region,
             service,
             |access_key| {
+                if let Some(root) = self.store.root_for_key(account, access_key) {
+                    return Some(SigningCredentials {
+                        secret_access_key: root.secret_access_key,
+                        session_token: None,
+                    });
+                }
+
                 if let Some(session) = self.sessions.resolve(access_key) {
+                    session.root_provenance(account, &self.store).ok()?;
                     return (session.account == account).then_some(SigningCredentials {
                         secret_access_key: session.secret_access_key,
                         session_token: Some(session.session_token),
@@ -305,6 +535,13 @@ impl AuthorizationEvaluator for IamStsState {
             .map_err(|_| AuthorizationError::Denied)
     }
 
+    fn authorize_service_role_trust(
+        &self,
+        request: ServiceRoleAuthorizationRequest,
+    ) -> Result<(), AuthorizationError> {
+        self.validate_service_role(&request)
+    }
+
     fn authorize_service_role_execution(
         &self,
         request: ServiceRoleAuthorizationRequest,
@@ -330,7 +567,13 @@ impl AuthorizationEvaluator for IamStsState {
         let Some(access_key_id) = identity.access_key_id.as_deref() else {
             return Ok(None);
         };
+        if let Some(root) = self.store.root_for_key(&identity.account_id, access_key_id) {
+            return Ok(Some(root.arn()));
+        }
         if let Some(session) = self.sessions.resolve(access_key_id) {
+            session
+                .root_provenance(&identity.account_id, &self.store)
+                .map_err(|_| AuthorizationError::Denied)?;
             return if session.account == identity.account_id {
                 Ok(Some(session.role_arn.unwrap_or(session.arn)))
             } else {
@@ -632,6 +875,9 @@ fn dispatch_sts(
             if let Some(session) = caller {
                 return Ok(sts::get_caller_identity(account, Some(session)));
             }
+            if let Some(root) = caller_key.and_then(|key| store.root_for_key(account, key)) {
+                return Ok(sts::get_caller_identity(&root.account, None));
+            }
             if let Some(user) = caller_key.and_then(|key| {
                 store.list_users(account).into_iter().find(|user| {
                     user.access_keys.iter().any(|access_key| {
@@ -645,7 +891,45 @@ fn dispatch_sts(
             // Strict mode already rejects missing/inactive keys in `enforce` above.
             Ok(sts::get_caller_identity(account, None))
         }
-        "GetSessionToken" => sts::get_session_token(sessions, account, q),
+        "GetSessionToken" => {
+            if let Some(key) = caller_key {
+                if sessions.resolve(key).is_some() {
+                    return Err(IamStsError::AccessDenied(
+                        "GetSessionToken requires long-term credentials".into(),
+                    ));
+                }
+                if let Some(root) = store.root_for_key(account, key) {
+                    return sts::get_session_token_for_issuer(
+                        sessions,
+                        account,
+                        q,
+                        &root.arn(),
+                        account,
+                        true,
+                    );
+                }
+                if let Some(user) = store.list_users(account).into_iter().find(|user| {
+                    user.access_keys.iter().any(|access_key| {
+                        access_key.access_key_id == key && access_key.status == "Active"
+                    })
+                }) {
+                    return sts::get_session_token_for_issuer(
+                        sessions,
+                        account,
+                        q,
+                        &user.arn,
+                        &user.user_id,
+                        false,
+                    );
+                }
+            }
+            if state.mode == EnforcementMode::Strict {
+                return Err(IamStsError::AccessDenied(
+                    "request has no active issuer identity".into(),
+                ));
+            }
+            sts::get_session_token(sessions, account, q)
+        }
         "GetFederationToken" => sts::get_federation_token(sessions, account, q),
         "DecodeAuthorizationMessage" => sts::decode_authorization_message(q),
         other => Err(IamStsError::InvalidAction(format!(
@@ -686,6 +970,10 @@ pub enum BootstrapError {
     MissingCredentials,
     #[error("invalid bootstrap access key ID or secret access key")]
     InvalidCredentials,
+    #[error("root provisioning requires a valid LocallyCloud root credential pair and account")]
+    InvalidRootCredentials,
+    #[error("root access key conflicts with an existing IAM credential")]
+    RootCredentialCollision,
 }
 
 impl BootstrapCredentials {
@@ -723,6 +1011,46 @@ impl BootstrapCredentials {
             _ => Err(BootstrapError::MissingCredentials),
         }
     }
+}
+
+fn root_from_lookup(
+    account: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<AccountRoot>, BootstrapError> {
+    let credentials = BootstrapCredentials::from_lookup(false, &|name| {
+        get(match name {
+            "LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID" => "LOCALLYCLOUD_ROOT_ACCESS_KEY_ID",
+            "LOCALLYCLOUD_BOOTSTRAP_SECRET_ACCESS_KEY" => "LOCALLYCLOUD_ROOT_SECRET_ACCESS_KEY",
+            _ => return None,
+        })
+    })
+    .map_err(|_| BootstrapError::InvalidRootCredentials)?;
+    let Some(credentials) = credentials else {
+        return Ok(None);
+    };
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BootstrapError::InvalidRootCredentials);
+    }
+    Ok(Some(AccountRoot {
+        account: account.into(),
+        access_key_id: credentials.access_key_id,
+        secret_access_key: credentials.secret_access_key,
+    }))
+}
+fn configured_root(account: &str) -> Result<Option<AccountRoot>, BootstrapError> {
+    root_from_lookup(account, &|name| std::env::var(name).ok())
+}
+fn validate_root_collision(
+    root: Option<&AccountRoot>,
+    bootstrap: Option<&BootstrapCredentials>,
+) -> Result<(), BootstrapError> {
+    if root
+        .zip(bootstrap)
+        .is_some_and(|(root, bootstrap)| root.access_key_id == bootstrap.access_key_id)
+    {
+        return Err(BootstrapError::RootCredentialCollision);
+    }
+    Ok(())
 }
 
 fn seed_bootstrap_user(store: &IamStore, account: &str, credentials: BootstrapCredentials) {
@@ -770,8 +1098,9 @@ pub fn register_with_account(
 ) -> Result<(), BootstrapError> {
     let credentials =
         BootstrapCredentials::from_env(EnforcementMode::from_env() == EnforcementMode::Strict)?;
-    register_inner(registry, account, credentials);
-    Ok(())
+    let root = configured_root(account)?;
+    validate_root_collision(root.as_ref(), credentials.as_ref())?;
+    register_inner(registry, account, credentials, root)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -789,9 +1118,16 @@ pub fn register_with_state(
 ) -> Result<(), RegistrationError> {
     let credentials =
         BootstrapCredentials::from_env(EnforcementMode::from_env() == EnforcementMode::Strict)?;
+    let root = configured_root(account)?;
+    validate_root_collision(root.as_ref(), credentials.as_ref())?;
     let persistence = Arc::new(crate::persistence::IamPersistence::new(db)?);
     let store = Arc::new(IamStore::durable(persistence.clone())?);
     let sessions = Arc::new(SessionStore::durable(persistence)?);
+    if let Some(root) = root {
+        store
+            .provision_root(root)
+            .map_err(|_| BootstrapError::RootCredentialCollision)?;
+    }
     store.transact(|staged| {
         iam::seed_aws_managed_policies(staged);
         if let Some(credentials) = credentials {
@@ -805,20 +1141,28 @@ pub fn register_with_state(
 
 /// Compatibility registration for standalone permissive tests.
 pub fn register(registry: &ServiceRegistry) {
-    register_inner(registry, "000000000000", None);
+    register_inner(registry, "000000000000", None, None)
+        .expect("standalone registration has no credentials");
 }
 
 fn register_inner(
     registry: &ServiceRegistry,
     account: &str,
     credentials: Option<BootstrapCredentials>,
-) {
+    root: Option<AccountRoot>,
+) -> Result<(), BootstrapError> {
     let store = Arc::new(IamStore::new());
     iam::seed_aws_managed_policies(&store);
     if let Some(credentials) = credentials {
         seed_bootstrap_user(&store, account, credentials);
     }
+    if let Some(root) = root {
+        store
+            .provision_root(root)
+            .map_err(|_| BootstrapError::RootCredentialCollision)?;
+    }
     publish_handlers(registry, store, Arc::new(SessionStore::new()));
+    Ok(())
 }
 
 fn publish_handlers(registry: &ServiceRegistry, store: Arc<IamStore>, sessions: Arc<SessionStore>) {
@@ -880,6 +1224,300 @@ mod tests {
             registry.lookup_by_action("AssumeRole"),
             Some(ServiceName::new("sts"))
         );
+    }
+
+    fn root_fixture() -> (IamStsState, RequestIdentity) {
+        let store = Arc::new(IamStore::new());
+        store
+            .provision_root(AccountRoot {
+                account: "000000000000".into(),
+                access_key_id: "AKIARRRRRRRRRRRRRRRR".into(),
+                secret_access_key: "r".repeat(40),
+            })
+            .unwrap();
+        let mut state = IamStsState::new(store, Arc::new(SessionStore::new()));
+        state.mode = EnforcementMode::Strict;
+        (
+            state,
+            RequestIdentity {
+                account_id: "000000000000".into(),
+                access_key_id: Some("AKIARRRRRRRRRRRRRRRR".into()),
+                arn: None,
+            },
+        )
+    }
+    fn issued_key(xml: &str) -> &str {
+        xml.split("<AccessKeyId>")
+            .nth(1)
+            .unwrap()
+            .split("</AccessKeyId>")
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn explicit_root_is_account_scoped_and_resource_denies_still_apply() {
+        let (state, identity) = root_fixture();
+        assert!(state.is_account_root(&identity).unwrap());
+        assert_eq!(
+            state.resolve_caller_arn(&identity).unwrap().as_deref(),
+            Some("arn:aws:iam::000000000000:root")
+        );
+        let mut foreign = identity.clone();
+        foreign.account_id = "111111111111".into();
+        assert!(!state.is_account_root(&foreign).unwrap());
+        let request = AuthorizationRequest {
+            request_identity: identity,
+            delegated_identity: None,
+            source_service: "s3".into(),
+            action: "s3:GetObject".into(),
+            resource: "arn:aws:s3:::root-gate/key".into(),
+            context: BTreeMap::new(),
+        };
+        assert!(state
+            .authorize_resource_policy(request.clone(), None, "000000000000")
+            .is_ok());
+        assert_eq!(state.authorize_resource_policy(request, Some(r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::root-gate/*"}}"#), "000000000000"), Err(AuthorizationError::Denied));
+        assert!(state.store.list_users("000000000000").is_empty());
+    }
+
+    #[test]
+    fn session_token_preserves_user_issuer_and_cannot_become_root() {
+        let (state, _) = root_fixture();
+        let key = "AKIAABCDEFGHIJKLMNOP";
+        seed_bootstrap_user(
+            &state.store,
+            "000000000000",
+            BootstrapCredentials {
+                access_key_id: key.into(),
+                secret_access_key: "a".repeat(40),
+            },
+        );
+        state
+            .store
+            .update_user("000000000000", "locallycloud-bootstrap", |user| {
+                user.inline_policies.clear();
+                user.inline_policies.insert(
+                    "deny-sts".into(),
+                    r#"{"Statement":{"Effect":"Deny","Action":"sts:*","Resource":"*"}}"#.into(),
+                );
+            });
+        let mut req = request("Action=GetSessionToken");
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            format!("AWS4-HMAC-SHA256 Credential={key}/20260101/us-east-1/sts/aws4_request")
+                .parse()
+                .unwrap(),
+        );
+        assert!(state.enforce(&req, "sts", "GetSessionToken").is_ok());
+        let result = dispatch_sts(
+            &state,
+            "000000000000",
+            "GetSessionToken",
+            &QueryRequest::parse(b"Action=GetSessionToken"),
+            Some(key),
+        )
+        .unwrap();
+        let temporary = issued_key(&result);
+        let session = state.sessions.resolve(temporary).unwrap();
+        assert_eq!(
+            session.arn,
+            "arn:aws:iam::000000000000:user/locallycloud-bootstrap"
+        );
+        assert!(!session.root_account);
+        let identity = RequestIdentity {
+            account_id: "000000000000".into(),
+            access_key_id: Some(temporary.into()),
+            arn: Some("arn:aws:iam::000000000000:root".into()),
+        };
+        assert!(!state.is_account_root(&identity).unwrap());
+        assert_eq!(
+            state.resolve_caller_arn(&identity).unwrap(),
+            Some(session.arn)
+        );
+        assert!(dispatch_sts(
+            &state,
+            "000000000000",
+            "GetSessionToken",
+            &QueryRequest::parse(b"Action=GetSessionToken"),
+            Some(temporary)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn root_session_has_explicit_provenance_but_legacy_root_arn_does_not() {
+        let (state, root) = root_fixture();
+        let result = dispatch_sts(
+            &state,
+            "000000000000",
+            "GetSessionToken",
+            &QueryRequest::parse(b"DurationSeconds=129600"),
+            root.access_key_id.as_deref(),
+        )
+        .unwrap();
+        let key = issued_key(&result);
+        let session = state.sessions.resolve(key).unwrap();
+        assert!(session.root_account);
+        assert!((session.expires_at - time::OffsetDateTime::now_utc()).whole_seconds() <= 3600);
+        let identity = RequestIdentity {
+            access_key_id: Some(key.into()),
+            ..root.clone()
+        };
+        assert!(state.is_account_root(&identity).unwrap());
+        assert!(state
+            .enforcement
+            .check(EnforcementMode::Strict, &root, "iam:CreateUser", "*")
+            .is_ok());
+        assert!(state
+            .enforcement
+            .check(EnforcementMode::Strict, &identity, "iam:CreateUser", "*")
+            .is_err());
+        assert!(state
+            .enforcement
+            .check(
+                EnforcementMode::Strict,
+                &identity,
+                "sts:GetFederationToken",
+                "*"
+            )
+            .is_err());
+        assert!(state
+            .enforcement
+            .check(EnforcementMode::Strict, &identity, "sts:AssumeRole", "*")
+            .is_ok());
+        assert!(dispatch_sts(
+            &state,
+            "000000000000",
+            "GetSessionToken",
+            &QueryRequest::parse(b""),
+            Some(key)
+        )
+        .is_err());
+        let legacy =
+            sts::get_session_token(&state.sessions, "000000000000", &QueryRequest::parse(b""))
+                .unwrap();
+        let legacy_key = issued_key(&legacy);
+        let legacy_identity = RequestIdentity {
+            access_key_id: Some(legacy_key.into()),
+            ..root
+        };
+        assert!(!state.is_account_root(&legacy_identity).unwrap());
+        assert!(state.resolve_caller_arn(&legacy_identity).is_err());
+        assert!(state
+            .enforcement
+            .resolve_caller("000000000000", legacy_key)
+            .is_err());
+        let mut serialized =
+            serde_json::to_value(state.sessions.resolve(legacy_key).unwrap()).unwrap();
+        serialized.as_object_mut().unwrap().remove("root_account");
+        let restored: sts::Session = serde_json::from_value(serialized).unwrap();
+        assert!(!restored.root_account);
+    }
+
+    #[test]
+    fn malformed_root_sessions_are_rejected_by_account_arn_and_permission_resolution() {
+        let (state, root) = root_fixture();
+        let issued = dispatch_sts(
+            &state,
+            &root.account_id,
+            "GetSessionToken",
+            &QueryRequest::parse(b""),
+            root.access_key_id.as_deref(),
+        )
+        .unwrap();
+        let key = issued_key(&issued);
+        let original = state.sessions.resolve(key).unwrap();
+        let identity = RequestIdentity {
+            access_key_id: Some(key.into()),
+            ..root
+        };
+        assert!(state.is_account_root(&identity).unwrap());
+        assert_eq!(
+            state.credential_account(key),
+            Ok(Some(identity.account_id.clone()))
+        );
+        assert!(state.resolve_caller_arn(&identity).unwrap().is_some());
+        assert!(state
+            .enforcement
+            .resolve_caller(&identity.account_id, key)
+            .is_ok());
+        let mut cases = Vec::new();
+        let mut role_claim = original.clone();
+        role_claim.role_arn = Some("arn:aws:iam::000000000000:role/worker".into());
+        cases.push(role_claim);
+        let mut missing_provenance = original.clone();
+        missing_provenance.root_account = false;
+        cases.push(missing_provenance);
+        let mut foreign_root = original.clone();
+        foreign_root.arn = "arn:aws:iam::111111111111:root".into();
+        cases.push(foreign_root);
+        let mut user_claim = original;
+        user_claim.arn = "arn:aws:iam::000000000000:user/reader".into();
+        cases.push(user_claim);
+        for malformed in cases {
+            state.sessions.register(key, malformed).unwrap();
+            assert!(!state.is_account_root(&identity).unwrap());
+            assert_eq!(
+                state.credential_account(key),
+                Err(AuthorizationError::Denied)
+            );
+            assert!(state.resolve_caller_arn(&identity).is_err());
+            assert!(state
+                .enforcement
+                .resolve_caller(&identity.account_id, key)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn root_configuration_requires_complete_pair_and_rejects_user_collision() {
+        assert!(root_from_lookup("000000000000", &|_| None)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            root_from_lookup("000000000000", &|name| (name
+                == "LOCALLYCLOUD_ROOT_ACCESS_KEY_ID")
+                .then(|| "AKIARRRRRRRRRRRRRRRR".into())),
+            Err(BootstrapError::InvalidRootCredentials)
+        ));
+        let (state, _) = root_fixture();
+        seed_bootstrap_user(
+            &state.store,
+            "000000000000",
+            BootstrapCredentials {
+                access_key_id: "AKIAABCDEFGHIJKLMNOP".into(),
+                secret_access_key: "a".repeat(40),
+            },
+        );
+        assert!(state
+            .store
+            .provision_root(AccountRoot {
+                account: "000000000000".into(),
+                access_key_id: "AKIAABCDEFGHIJKLMNOP".into(),
+                secret_access_key: "r".repeat(40)
+            })
+            .is_err());
+        assert!(matches!(
+            validate_root_collision(
+                Some(&AccountRoot {
+                    account: "000000000000".into(),
+                    access_key_id: "AKIAABCDEFGHIJKLMNOP".into(),
+                    secret_access_key: "r".repeat(40)
+                }),
+                Some(&BootstrapCredentials {
+                    access_key_id: "AKIAABCDEFGHIJKLMNOP".into(),
+                    secret_access_key: "a".repeat(40)
+                })
+            ),
+            Err(BootstrapError::RootCredentialCollision)
+        ));
+        assert!(root_from_lookup("bad-account", &|name| match name {
+            "LOCALLYCLOUD_ROOT_ACCESS_KEY_ID" => Some("AKIARRRRRRRRRRRRRRRR".into()),
+            "LOCALLYCLOUD_ROOT_SECRET_ACCESS_KEY" => Some("r".repeat(40)),
+            _ => None,
+        })
+        .is_err());
     }
 
     #[test]
@@ -985,6 +1623,233 @@ mod tests {
     }
 
     #[test]
+    fn credential_accounts_require_unique_active_provenance() {
+        let store = Arc::new(IamStore::new());
+        let sessions = Arc::new(SessionStore::new());
+        let state = IamStsState::new(store.clone(), sessions.clone());
+        for (account, key) in [
+            ("000000000000", "first-key"),
+            ("111111111111", "second-key"),
+        ] {
+            seed_bootstrap_user(
+                &store,
+                account,
+                BootstrapCredentials {
+                    access_key_id: key.into(),
+                    secret_access_key: "secret".into(),
+                },
+            );
+            assert_eq!(state.credential_account(key), Ok(Some(account.into())));
+        }
+        assert_eq!(state.credential_account("unknown"), Ok(None));
+        store.update_user("111111111111", "locallycloud-bootstrap", |user| {
+            user.access_keys[0].status = "Inactive".into()
+        });
+        assert_eq!(state.credential_account("second-key"), Ok(None));
+        store.update_user("111111111111", "locallycloud-bootstrap", |user| {
+            user.access_keys[0].status = "Active".into();
+            user.access_keys[0].access_key_id = "first-key".into();
+        });
+        assert_eq!(
+            state.credential_account("first-key"),
+            Err(AuthorizationError::Denied)
+        );
+        let mut session = sts::Session {
+            account: "222222222222".into(),
+            secret_access_key: "secret".into(),
+            session_token: "token".into(),
+            arn: "arn:aws:sts::222222222222:assumed-role/worker/run".into(),
+            user_id: "AROA:run".into(),
+            root_account: false,
+            role_arn: Some("arn:aws:iam::222222222222:role/worker".into()),
+            session_policy: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        };
+        sessions.register("session-key", session.clone()).unwrap();
+        assert_eq!(
+            state.credential_account("session-key"),
+            Ok(Some("222222222222".into()))
+        );
+        sessions.register("first-key", session.clone()).unwrap();
+        assert_eq!(
+            state.credential_account("first-key"),
+            Err(AuthorizationError::Denied)
+        );
+        session.expires_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        sessions.register("expired", session.clone()).unwrap();
+        assert_eq!(state.credential_account("expired"), Ok(None));
+        store
+            .provision_root(AccountRoot {
+                account: "333333333333".into(),
+                access_key_id: "root-key".into(),
+                secret_access_key: "secret".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            state.credential_account("root-key"),
+            Ok(Some("333333333333".into()))
+        );
+        session.account = "333333333333".into();
+        session.arn = "arn:aws:iam::333333333333:root".into();
+        session.role_arn = None;
+        session.expires_at = time::OffsetDateTime::now_utc() + time::Duration::minutes(5);
+        sessions.register("legacy-root", session.clone()).unwrap();
+        assert_eq!(
+            state.credential_account("legacy-root"),
+            Err(AuthorizationError::Denied)
+        );
+        session.root_account = true;
+        sessions.register("root-session", session.clone()).unwrap();
+        assert_eq!(
+            state.credential_account("root-session"),
+            Ok(Some("333333333333".into()))
+        );
+        sessions.register("root-key", session).unwrap();
+        assert_eq!(
+            state.credential_account("root-key"),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn s3_resource_policy_composition_resolves_principal_and_preserves_denies() {
+        let account = "000000000000";
+        let store = Arc::new(IamStore::new());
+        seed_bootstrap_user(
+            &store,
+            account,
+            BootstrapCredentials {
+                access_key_id: "resource-key".into(),
+                secret_access_key: "secret".into(),
+            },
+        );
+        let state = IamStsState::new(store.clone(), Arc::new(SessionStore::new()));
+        let arn = format!("arn:aws:iam::{account}:user/locallycloud-bootstrap");
+        let request = AuthorizationRequest {
+            request_identity: RequestIdentity {
+                account_id: account.into(),
+                access_key_id: Some("resource-key".into()),
+                arn: Some("spoofed".into()),
+            },
+            delegated_identity: None,
+            source_service: "s3".into(),
+            action: "s3:GetObject".into(),
+            resource: "arn:aws:s3:::bucket/Key".into(),
+            context: BTreeMap::from([("aws:principalarn".into(), vec!["spoofed".into()])]),
+        };
+        assert!(state
+            .authorize_resource_policy(request.clone(), None, account)
+            .is_ok());
+        let deny = serde_json::json!({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"*","Condition":{"ArnEquals":{"aws:PrincipalArn":arn}}}}).to_string();
+        assert_eq!(
+            state.authorize_resource_policy(request.clone(), Some(&deny), account),
+            Err(AuthorizationError::Denied)
+        );
+        store.update_user(account, "locallycloud-bootstrap", |user| {
+            user.inline_policies.clear()
+        });
+        let direct = serde_json::json!({"Statement":{"Effect":"Allow","Principal":{"AWS":arn},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/Key"}}).to_string();
+        assert!(state
+            .authorize_resource_policy(request.clone(), Some(&direct), account)
+            .is_ok());
+        assert_eq!(
+            state.authorize_resource_policy(request.clone(), Some(&direct), "111111111111"),
+            Err(AuthorizationError::Denied)
+        );
+        let delegated = serde_json::json!({"Statement":{"Effect":"Allow","Principal":{"AWS":account},"Action":"s3:GetObject","Resource":"*"}}).to_string();
+        assert_eq!(
+            state.authorize_resource_policy(request.clone(), Some(&delegated), account),
+            Err(AuthorizationError::Denied)
+        );
+        let boundary_arn = format!("arn:aws:iam::{account}:policy/limits");
+        store.insert_policy(account, crate::model::IamPolicy {
+            policy_name: "limits".into(), policy_id: "ANPA".into(), arn: boundary_arn.clone(),
+            path: "/".into(), create_date: now_iso8601(), default_version_id: "v1".into(),
+            versions: vec![crate::model::PolicyVersion { version_id: "v1".into(), document: r#"{"Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}}"#.into(), is_default: true, create_date: now_iso8601() }],
+            attachment_count: 0, description: None, tags: BTreeMap::new(), is_aws_managed: false,
+        });
+        store.update_user(account, "locallycloud-bootstrap", |user| {
+            user.permission_boundary = Some(boundary_arn.clone())
+        });
+        // A same-account direct user grant bypasses an implicit boundary deny.
+        assert!(state
+            .authorize_resource_policy(request.clone(), Some(&direct), account)
+            .is_ok());
+        let role_arn = format!("arn:aws:iam::{account}:role/reader");
+        store.create_role(
+            account,
+            crate::model::IamRole {
+                role_name: "reader".into(),
+                role_id: "AROA".into(),
+                arn: role_arn.clone(),
+                path: "/".into(),
+                create_date: now_iso8601(),
+                assume_role_policy_document: "{}".into(),
+                description: None,
+                max_session_duration: 3600,
+                tags: BTreeMap::new(),
+                attached_policies: Vec::new(),
+                inline_policies: BTreeMap::new(),
+                permission_boundary: Some(boundary_arn),
+            },
+        );
+        let role_grant = serde_json::json!({"Statement":{"Effect":"Allow","Principal":{"AWS":role_arn},"Action":"s3:GetObject","Resource":"*"}}).to_string();
+        let role_request = AuthorizationRequest {
+            delegated_identity: Some(
+                locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                    role_arn,
+                    session_name: "worker".into(),
+                },
+            ),
+            ..request.clone()
+        };
+        assert_eq!(
+            state.authorize_resource_policy(role_request, Some(&role_grant), account),
+            Err(AuthorizationError::Denied)
+        );
+        let role_request = AuthorizationRequest {
+            delegated_identity: Some(
+                locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                    role_arn: format!("arn:aws:iam::{account}:role/reader"),
+                    session_name: "worker".into(),
+                },
+            ),
+            ..request.clone()
+        };
+        let wildcard_grant = serde_json::json!({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"*","Condition":{"ArnEquals":{"aws:PrincipalArn":format!("arn:aws:iam::{account}:role/reader")}}}}).to_string();
+        assert!(state
+            .authorize_resource_policy(role_request.clone(), Some(&wildcard_grant), account)
+            .is_ok());
+        store.update_role(account, "reader", |role| {
+            role.inline_policies.insert(
+                "deny".into(),
+                r#"{"Statement":{"Effect":"Deny","Action":"s3:GetObject","Resource":"*"}}"#.into(),
+            );
+        });
+        assert_eq!(
+            state.authorize_resource_policy(role_request, Some(&wildcard_grant), account),
+            Err(AuthorizationError::Denied)
+        );
+        store.update_user(account, "locallycloud-bootstrap", |user| {
+            user.inline_policies.insert(
+                "deny".into(),
+                r#"{"Statement":{"Effect":"Deny","Action":"s3:GetObject","Resource":"*"}}"#.into(),
+            );
+        });
+        assert_eq!(
+            state.authorize_resource_policy(request.clone(), Some(&direct), account),
+            Err(AuthorizationError::Denied)
+        );
+        store.update_user(account, "locallycloud-bootstrap", |user| {
+            user.access_keys[0].status = "Inactive".into()
+        });
+        assert_eq!(
+            state.authorize_resource_policy(request, Some(&direct), account),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
     fn kms_identity_decisions_preserve_permissive_mode_without_faking_allow() {
         let mut state = IamStsState::new(Arc::new(IamStore::new()), Arc::new(SessionStore::new()));
         let request = AuthorizationRequest {
@@ -1064,6 +1929,31 @@ mod tests {
             resource: stream_arn.clone(),
         };
         assert_eq!(state.authorize_service_role(request.clone()), Ok(()));
+        assert_eq!(state.authorize_service_role_trust(request.clone()), Ok(()));
+        let mut no_identity_grant = request.clone();
+        no_identity_grant.action = "s3:GetObject".into();
+        no_identity_grant.resource = "arn:aws:s3:::bucket/object".into();
+        assert_eq!(
+            state.authorize_service_role_execution(no_identity_grant.clone()),
+            Err(AuthorizationError::Denied)
+        );
+        assert_eq!(
+            state.authorize_service_role_trust(no_identity_grant.clone()),
+            Ok(())
+        );
+        let original_trust = store
+            .get_role(account, "firehose")
+            .unwrap()
+            .assume_role_policy_document;
+        store.update_role(account, "firehose", |role| role.assume_role_policy_document = r#"{"Statement":{"Effect":"Deny","Principal":{"Service":"firehose.amazonaws.com"},"Action":"sts:AssumeRole"}}"#.into());
+        assert_eq!(
+            state.authorize_service_role_trust(no_identity_grant),
+            Err(AuthorizationError::Denied)
+        );
+        store.update_role(account, "firehose", |role| {
+            role.assume_role_policy_document = original_trust
+        });
+
         let delegated = AuthorizationRequest {
             request_identity: RequestIdentity {
                 account_id: account.into(),
