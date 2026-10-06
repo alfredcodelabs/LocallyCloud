@@ -9,6 +9,8 @@ pub(crate) fn query_json(query: &QueryRequest) -> Result<Value, MonitoringError>
         if key.contains(".member.") {
             if [
                 "Dimensions",
+                "Tags",
+                "TagKeys",
                 "AlarmNames",
                 "AlarmTypes",
                 "AlarmActions",
@@ -42,11 +44,26 @@ pub(crate) fn query_json(query: &QueryRequest) -> Result<Value, MonitoringError>
         "AlarmActions",
         "OKActions",
         "InsufficientDataActions",
+        "TagKeys",
     ] {
         let values = query.list(&format!("{key}.member"));
         if !values.is_empty() {
             body.insert(key.into(), json!(values));
         }
+    }
+    let mut tags = Vec::new();
+    for index in 1.. {
+        let Some(key) = query.get(&format!("Tags.member.{index}.Key")) else {
+            break;
+        };
+        let value = query
+            .params
+            .get(&format!("Tags.member.{index}.Value"))
+            .ok_or_else(|| invalid("Tag Value is required"))?;
+        tags.push(json!({"Key":key,"Value":value}));
+    }
+    if !tags.is_empty() {
+        body.insert("Tags".into(), json!(tags));
     }
     let dimensions = parse_dimensions(query, "Dimensions.member")?;
     if !dimensions.is_empty() {

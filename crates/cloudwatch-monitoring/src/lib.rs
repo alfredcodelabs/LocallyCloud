@@ -1,7 +1,9 @@
 //! Native CloudWatch Monitoring subset used by locallycloud service integrations.
 
 mod alarms;
+mod authorization;
 mod persistence;
+mod rpc_cbor;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -233,6 +235,7 @@ impl MetricSink for MonitoringMetricSink {
 
 #[derive(Clone)]
 struct MonitoringHandler {
+    registry: std::sync::Weak<ServiceRegistry>,
     domain: Arc<MonitoringDomain>,
     alarms: Arc<alarms::Alarms>,
     _worker: Arc<WorkerGuard>,
@@ -246,6 +249,21 @@ enum WireResponse {
 #[async_trait]
 impl NativeHandler for MonitoringHandler {
     async fn handle(&self, request: ServiceRequest) -> Response {
+        if rpc_cbor::is_request(&request) {
+            let handler = self.clone();
+            let processing = request.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let (action, body) = rpc_cbor::decode(&processing)?;
+                let scope = ScopeKey {
+                    account_id: processing.account_id.clone(),
+                    region: processing.region.clone(),
+                };
+                handler.process_value(&action, &body, &scope, &processing)
+            })
+            .await
+            .unwrap_or_else(|_| Err(MonitoringError::Internal("monitoring worker failed".into())));
+            return rpc_cbor::response(result, &request.request_id);
+        }
         let protocol = if request.headers.contains_key("x-amz-target") {
             AwsProtocol::Json10
         } else {
@@ -294,14 +312,28 @@ impl MonitoringHandler {
             .to_owned();
         let body = match action.as_str() {
             "PutMetricData" => {
+                self.authorize_metric(request, &action, query.get("Namespace"))?;
                 self.put_metric_data(&query, &scope, &request.request_id)?;
                 String::new()
             }
-            "ListMetrics" => self.list_metrics(&query, &scope)?,
-            "GetMetricStatistics" => self.get_metric_statistics(&query, &scope)?,
+            "ListMetrics" => {
+                self.authorize_metric(request, &action, None)?;
+                self.list_metrics(&query, &scope)?
+            }
+            "GetMetricStatistics" => {
+                self.authorize_metric(request, &action, None)?;
+                self.get_metric_statistics(&query, &scope)?
+            }
             _ if alarms::supported(&action) => {
                 let value = alarms::query_json(&query)?;
-                let response = self.alarms.process(&action, &value, &scope)?;
+                let response = self.alarms.process_authorized(
+                    &action,
+                    &value,
+                    &scope,
+                    |action, resource, context| {
+                        authorization::check(&self.registry, request, action, resource, context)
+                    },
+                )?;
                 alarms::query_xml(&response)?
             }
             _ => {
@@ -329,18 +361,58 @@ impl MonitoringHandler {
             .ok_or_else(|| MonitoringError::InvalidAction("invalid x-amz-target".into()))?;
         let body: Value = serde_json::from_slice(&request.body)
             .map_err(|_| MonitoringError::InvalidParameter("request body must be JSON".into()))?;
+        self.process_value(action, &body, scope, request)
+    }
+
+    fn process_value(
+        &self,
+        action: &str,
+        body: &Value,
+        scope: &ScopeKey,
+        request: &ServiceRequest,
+    ) -> Result<Value, MonitoringError> {
         match action {
             "PutMetricData" => {
-                self.put_metric_data_json(&body, scope, &request.request_id)?;
+                self.authorize_metric(
+                    request,
+                    action,
+                    body.get("Namespace").and_then(Value::as_str),
+                )?;
+                self.put_metric_data_json(body, scope, &request.request_id)?;
                 Ok(json!({}))
             }
-            "ListMetrics" => self.list_metrics_json(&body, scope),
-            "GetMetricStatistics" => self.get_metric_statistics_json(&body, scope),
-            _ if alarms::supported(action) => self.alarms.process(action, &body, scope),
+            "ListMetrics" => {
+                self.authorize_metric(request, action, None)?;
+                self.list_metrics_json(body, scope)
+            }
+            "GetMetricStatistics" => {
+                self.authorize_metric(request, action, None)?;
+                self.get_metric_statistics_json(body, scope)
+            }
+            _ if alarms::supported(action) => {
+                self.alarms
+                    .process_authorized(action, body, scope, |action, resource, context| {
+                        authorization::check(&self.registry, request, action, resource, context)
+                    })
+            }
             _ => Err(MonitoringError::InvalidAction(format!(
                 "unsupported CloudWatch action {action}"
             ))),
         }
+    }
+
+    fn authorize_metric(
+        &self,
+        request: &ServiceRequest,
+        action: &str,
+        namespace: Option<&str>,
+    ) -> Result<(), MonitoringError> {
+        let context = namespace
+            .map(|namespace| {
+                BTreeMap::from([("cloudwatch:namespace".into(), vec![namespace.into()])])
+            })
+            .unwrap_or_default();
+        authorization::check(&self.registry, request, action, "*", context)
     }
 
     fn put_metric_data_json(
@@ -727,6 +799,7 @@ fn register_domain(
         domain: domain.clone(),
     });
     let handler: Arc<dyn NativeHandler> = Arc::new(MonitoringHandler {
+        registry: Arc::downgrade(registry),
         domain,
         alarms,
         _worker: worker,
@@ -752,8 +825,12 @@ fn register_domain(
 
 #[derive(Debug, thiserror::Error)]
 enum MonitoringError {
+    #[error("Access denied for CloudWatch operation")]
+    AccessDenied,
     #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    ResourceNotFoundException(String),
     #[error("{0}")]
     InvalidAction(String),
     #[error("{0}")]
@@ -766,7 +843,9 @@ enum MonitoringError {
 
 fn error_response(error: MonitoringError, request_id: &str, protocol: AwsProtocol) -> Response {
     let (code, status) = match error {
+        MonitoringError::AccessDenied => ("AccessDenied", 403),
         MonitoringError::NotFound(_) => ("ResourceNotFound", 404),
+        MonitoringError::ResourceNotFoundException(_) => ("ResourceNotFoundException", 404),
         MonitoringError::InvalidAction(_) => ("InvalidAction", 400),
         MonitoringError::InvalidParameter(_) => ("InvalidParameterValue", 400),
         MonitoringError::InvalidNextToken(_) => ("InvalidNextToken", 400),
@@ -1156,6 +1235,7 @@ mod tests {
         domain.commit(observations).expect("A16 fixtures are valid");
         (
             MonitoringHandler {
+                registry: std::sync::Weak::new(),
                 _worker: Arc::new(WorkerGuard(None)),
                 domain,
                 alarms: Arc::new(alarms::Alarms::new(None).unwrap()),

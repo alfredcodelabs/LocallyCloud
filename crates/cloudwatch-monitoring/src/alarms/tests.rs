@@ -28,7 +28,11 @@ fn evaluator_durable_transitions_outbox_restart_and_commit_failure() {
     };
     let alarms = Alarms::new(Some(persistence.clone())).unwrap();
     let config = json!({"AlarmName":"orders","Namespace":"Orders","MetricName":"Errors","Statistic":"Sum","Period":10,"EvaluationPeriods":3,"DatapointsToAlarm":2,"Threshold":2,"ComparisonOperator":"GreaterThanThreshold","TreatMissingData":"notBreaching","AlarmActions":["arn:aws:sns:us-east-1:000000000000:alerts"]});
-    alarms.process("PutMetricAlarm", &config, &scope).unwrap();
+    let mut tagged_config = config.clone();
+    tagged_config["Tags"] = json!([{"Key":"team","Value":"durable"}]);
+    alarms
+        .process("PutMetricAlarm", &tagged_config, &scope)
+        .unwrap();
     let end = now_ms() / 10000 * 10000;
     let observations: Vec<_> = [(end - 1000, 4.0), (end - 11000, 5.0)]
         .into_iter()
@@ -73,6 +77,13 @@ fn evaluator_durable_transitions_outbox_restart_and_commit_failure() {
     let pending = alarms.pending().unwrap();
     assert_eq!(pending.len(), 1);
     let restored = Alarms::new(Some(persistence.clone())).unwrap();
+    let tag_selector = json!({"ResourceARN":arn(&scope,"orders")});
+    assert_eq!(
+        restored
+            .process("ListTagsForResource", &tag_selector, &scope)
+            .unwrap()["Tags"],
+        json!([{"Key":"team","Value":"durable"}])
+    );
     assert_eq!(restored.pending().unwrap().len(), 1);
     assert_eq!(persistence.load().unwrap().len(), 2);
     let mut log_one = persistence.load().unwrap()[0].clone();
@@ -91,6 +102,13 @@ fn evaluator_durable_transitions_outbox_restart_and_commit_failure() {
     let mut changed = config.clone();
     changed["Threshold"] = json!(100);
     db.connection().unwrap().execute_batch("CREATE TRIGGER fail_alarm BEFORE UPDATE ON monitoring_alarms BEGIN SELECT RAISE(ABORT,'injected');END;").unwrap();
+    assert!(restored.process("TagResource", &json!({"ResourceARN":arn(&scope,"orders"),"Tags":[{"Key":"team","Value":"uncommitted"}]}), &scope).is_err());
+    assert_eq!(
+        restored
+            .process("ListTagsForResource", &tag_selector, &scope)
+            .unwrap()["Tags"],
+        json!([{"Key":"team","Value":"durable"}])
+    );
     assert!(restored
         .process("PutMetricAlarm", &changed, &scope)
         .is_err());
@@ -344,4 +362,126 @@ fn missing_data_positions_and_delivery_backlog_are_not_silently_lost() {
         .commit_batch(&mut state, &scope, &[], vec![pending], None, vec![])
         .is_err());
     assert_eq!(state.history.len(), before);
+}
+
+#[test]
+fn alarm_tags_creation_update_validation_and_legacy_record() {
+    let scope = ScopeKey {
+        account_id: "000000000000".into(),
+        region: "us-east-1".into(),
+    };
+    let alarms = Alarms::new(None).unwrap();
+    let resource = arn(&scope, "tagged");
+    let selector = json!({"ResourceARN":resource});
+    let query =
+        QueryRequest::parse(b"Action=TagResource&Tags.member.1.Key=empty&Tags.member.1.Value=");
+    assert_eq!(
+        query_json(&query).unwrap()["Tags"],
+        json!([{"Key":"empty","Value":""}])
+    );
+    let query = QueryRequest::parse(b"Action=UntagResource&TagKeys.member.1=empty");
+    assert_eq!(query_json(&query).unwrap()["TagKeys"], json!(["empty"]));
+    let mut config = json!({"AlarmName":"tagged","Namespace":"Orders","MetricName":"Errors","Statistic":"Sum","Period":60,"EvaluationPeriods":1,"Threshold":2,"ComparisonOperator":"GreaterThanThreshold","Tags":[{"Key":"team","Value":"orders"}]});
+    alarms.process("PutMetricAlarm", &config, &scope).unwrap();
+    assert_eq!(
+        alarms
+            .process("ListTagsForResource", &selector, &scope)
+            .unwrap()["Tags"],
+        json!([{"Key":"team","Value":"orders"}])
+    );
+    config["Tags"] = json!([{"Key":"ignored","Value":"update"}]);
+    alarms.process("PutMetricAlarm", &config, &scope).unwrap();
+    assert_eq!(
+        alarms
+            .process("ListTagsForResource", &selector, &scope)
+            .unwrap()["Tags"],
+        json!([{"Key":"team","Value":"orders"}])
+    );
+    assert!(alarms
+        .process("DescribeAlarms", &json!({}), &scope)
+        .unwrap()["MetricAlarms"][0]
+        .get("Tags")
+        .is_none());
+    alarms.process("TagResource",&json!({"ResourceARN":resource,"Tags":[{"Key":"team","Value":"etl"},{"Key":"empty","Value":""}]}),&scope).unwrap();
+    alarms
+        .process(
+            "UntagResource",
+            &json!({"ResourceARN":resource,"TagKeys":["empty","absent"]}),
+            &scope,
+        )
+        .unwrap();
+    assert_eq!(
+        alarms
+            .process("ListTagsForResource", &selector, &scope)
+            .unwrap()["Tags"],
+        json!([{"Key":"team","Value":"etl"}])
+    );
+    for tags in [
+        json!([{"Key":"aws:reserved","Value":"x"}]),
+        json!([{"Key":"k","Value":"x".repeat(257)}]),
+        json!([{"Key":"k","Value":"a"},{"Key":"k","Value":"b"}]),
+        json!((0..51)
+            .map(|n| json!({"Key":format!("k{n}"),"Value":"x"}))
+            .collect::<Vec<_>>()),
+    ] {
+        assert!(alarms
+            .process(
+                "TagResource",
+                &json!({"ResourceARN":resource,"Tags":tags}),
+                &scope
+            )
+            .is_err());
+    }
+    let tags = json!((0..50)
+        .map(|n| json!({"Key":format!("k{n}"),"Value":"x"}))
+        .collect::<Vec<_>>());
+    assert!(alarms
+        .process(
+            "TagResource",
+            &json!({"ResourceARN":resource,"Tags":tags}),
+            &scope
+        )
+        .is_err()); // Existing team plus fifty new tags is invalid atomically.
+    assert_eq!(
+        alarms
+            .process("ListTagsForResource", &selector, &scope)
+            .unwrap()["Tags"],
+        json!([{"Key":"team","Value":"etl"}])
+    );
+    assert!(matches!(
+        alarms.process(
+            "ListTagsForResource",
+            &json!({"ResourceARN":"not-an-arn"}),
+            &scope
+        ),
+        Err(MonitoringError::InvalidParameter(_))
+    ));
+    for resource in [
+        "arn:aws:cloudwatch:us-west-2:000000000000:alarm:tagged",
+        "arn:aws:cloudwatch:us-east-1:111111111111:alarm:tagged",
+    ] {
+        assert!(matches!(
+            alarms.process(
+                "ListTagsForResource",
+                &json!({"ResourceARN":resource}),
+                &scope
+            ),
+            Err(MonitoringError::ResourceNotFoundException(_))
+        ));
+    }
+    let mut legacy = serde_json::to_value(
+        alarms
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .get(&(scope.clone(), "tagged".into()))
+            .unwrap(),
+    )
+    .unwrap();
+    legacy.as_object_mut().unwrap().remove("tags");
+    assert!(serde_json::from_value::<Record>(legacy)
+        .unwrap()
+        .tags
+        .is_empty());
 }

@@ -825,7 +825,12 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
                 413,
             )
             .with_request_id(new_request_id());
-            return render(err.render(AwsProtocol::RestJson));
+            let response = render(err.render(AwsProtocol::RestJson));
+            return if crate::error_mapping::cloudwatch_cbor_request(&parts.uri, &parts.headers) {
+                crate::error_mapping::cloudwatch_cbor_error(response).await
+            } else {
+                response
+            };
         }
     };
     let request_id = new_request_id();

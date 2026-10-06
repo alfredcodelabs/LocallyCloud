@@ -481,6 +481,39 @@ impl InternalDispatcher {
         peer_ip: Option<IpAddr>,
         dashboard_service: Option<&str>,
     ) -> Response {
+        let response = self
+            .dispatch_in_scope_inner(
+                method,
+                uri,
+                headers,
+                body,
+                request_id,
+                scope,
+                suppressed,
+                peer_ip,
+                dashboard_service,
+            )
+            .await;
+        if crate::error_mapping::cloudwatch_cbor_request(uri, headers) {
+            crate::error_mapping::cloudwatch_cbor_error(response).await
+        } else {
+            response
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_in_scope_inner(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: Bytes,
+        request_id: &str,
+        scope: Option<(&str, &str)>,
+        suppressed: bool,
+        peer_ip: Option<IpAddr>,
+        dashboard_service: Option<&str>,
+    ) -> Response {
         let started_at = SystemTime::now();
         let authorization = header_str(headers, "authorization");
         let x_amz_target = header_str(headers, "x-amz-target");
@@ -1034,6 +1067,19 @@ fn safe_operation(
     target: Option<&str>,
     body: &[u8],
 ) -> String {
+    if service == "monitoring" && *method == Method::POST {
+        if let Some(operation) = uri
+            .path()
+            .strip_prefix("/service/GraniteServiceVersion20100801/operation/")
+            .filter(|operation| {
+                !operation.is_empty()
+                    && operation.len() <= 80
+                    && operation.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        {
+            return operation.to_owned();
+        }
+    }
     if service == "lambda" {
         let path: Vec<_> = uri.path().trim_matches('/').split('/').collect();
         return match (method, path.as_slice()) {
@@ -1127,6 +1173,25 @@ mod tests {
     use axum::routing::any;
     use axum::Router;
     use std::time::Duration;
+
+    #[test]
+    fn cloudwatch_rpc_operation_is_taken_from_exact_service_path() {
+        let uri = "/service/GraniteServiceVersion20100801/operation/PutMetricAlarm"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            safe_operation("monitoring", &Method::POST, &uri, None, &[0xa0]),
+            "PutMetricAlarm"
+        );
+        assert_eq!(
+            safe_operation("monitoring", &Method::GET, &uri, None, &[0xa0]),
+            "Unknown"
+        );
+        assert_eq!(
+            safe_operation("sqs", &Method::POST, &uri, None, &[0xa0]),
+            "Unknown"
+        );
+    }
 
     struct OkHandler;
 
@@ -1336,6 +1401,36 @@ mod tests {
             403,
             "WebSocket management requires a verified caller"
         );
+    }
+
+    #[tokio::test]
+    async fn cloudwatch_cbor_ingress_signature_errors_keep_rpc_wire_contract() {
+        let dispatcher = strict_dispatcher(false);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/cbor".parse().unwrap());
+        headers.insert("smithy-protocol", "rpc-v2-cbor".parse().unwrap());
+        headers.insert("authorization", auth("monitoring").parse().unwrap());
+        let response = dispatcher
+            .dispatch(
+                &Method::POST,
+                &"/service/GraniteServiceVersion20100801/operation/PutMetricAlarm"
+                    .parse()
+                    .unwrap(),
+                &headers,
+                Bytes::from_static(&[0xa0]),
+                "cbor-signature",
+            )
+            .await;
+        assert_eq!(response.status(), 403);
+        assert_eq!(response.headers()["smithy-protocol"], "rpc-v2-cbor");
+        assert_eq!(response.headers()["content-type"], "application/cbor");
+        assert_eq!(response.headers()["x-amzn-requestid"], "cbor-signature");
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body: serde_json::Value = ciborium::de::from_reader(bytes.as_ref()).unwrap();
+        assert_eq!(body["__type"], "SignatureDoesNotMatch");
+        assert!(body["message"].as_str().unwrap().contains("signature"));
     }
 
     #[tokio::test]

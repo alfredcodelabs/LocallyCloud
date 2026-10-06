@@ -56,7 +56,7 @@ pub(crate) fn sign(
     let canonical = format!(
         "{}\n{}\n{}\n{}\n{}\n{:x}",
         method,
-        canonical_uri(uri.path())?,
+        canonical_uri(uri.path(), service)?,
         canonical_query(uri.query())?,
         canonical_headers,
         signed,
@@ -90,6 +90,29 @@ pub fn verify(
     expected_region: &str,
     expected_service: &str,
     credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
+) -> bool {
+    verify_at(
+        method,
+        uri,
+        headers,
+        body,
+        expected_region,
+        expected_service,
+        credentials,
+        OffsetDateTime::now_utc(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_at(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    expected_region: &str,
+    expected_service: &str,
+    credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
+    now: OffsetDateTime,
 ) -> bool {
     let Some(auth) = header(headers, "authorization") else {
         return false;
@@ -144,9 +167,7 @@ pub fn verify(
     let Ok(request_time) = time::PrimitiveDateTime::parse(amz_date, &date_format) else {
         return false;
     };
-    let skew = (OffsetDateTime::now_utc() - request_time.assume_utc())
-        .whole_seconds()
-        .abs();
+    let skew = (now - request_time.assume_utc()).whole_seconds().abs();
     if skew > 900 {
         return false;
     }
@@ -199,7 +220,7 @@ pub fn verify(
             return false;
         }
     }
-    let Some(canonical_uri) = canonical_uri(uri.path()) else {
+    let Some(canonical_uri) = canonical_uri(uri.path(), expected_service) else {
         return false;
     };
     let Some(canonical_query) = canonical_query(uri.query()) else {
@@ -251,13 +272,13 @@ pub fn verify(
     verifier.verify_slice(&signature_bytes).is_ok()
 }
 
-/// Canonicalize an already encoded HTTP path without turning an encoded slash into a path
-/// separator. Query/JSON AWS calls normally use `/`; preserving escapes also covers REST paths.
-fn canonical_uri(path: &str) -> Option<String> {
+/// AWS SDKs escape the already encoded wire path again for ordinary SigV4 services.
+/// S3 preserves its single encoding; encoded slashes must never become path separators.
+fn canonical_uri(path: &str, service: &str) -> Option<String> {
     if path.is_empty() {
         return Some("/".to_string());
     }
-    percent_encode(path.as_bytes(), true)
+    percent_encode(path.as_bytes(), true, service == "s3")
 }
 
 /// SigV4 sorts encoded query names and values separately. `+` is a literal plus in the URI,
@@ -279,8 +300,8 @@ fn canonical_query(query: Option<&str>) -> Option<String> {
             return None;
         }
         pairs.push((
-            percent_encode(key.as_bytes(), false)?,
-            percent_encode(value.as_bytes(), false)?,
+            percent_encode(key.as_bytes(), false, true)?,
+            percent_encode(value.as_bytes(), false, true)?,
         ));
     }
     pairs.sort_unstable();
@@ -293,7 +314,7 @@ fn canonical_query(query: Option<&str>) -> Option<String> {
     )
 }
 
-fn percent_encode(input: &[u8], keep_slash: bool) -> Option<String> {
+fn percent_encode(input: &[u8], keep_slash: bool, preserve_escape: bool) -> Option<String> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::new();
     let mut index = 0;
@@ -302,11 +323,13 @@ fn percent_encode(input: &[u8], keep_slash: bool) -> Option<String> {
         if byte == b'%' {
             let hi = hex_nibble(*input.get(index + 1)?)?;
             let lo = hex_nibble(*input.get(index + 2)?)?;
-            out.push('%');
-            out.push(HEX[usize::from(hi)] as char);
-            out.push(HEX[usize::from(lo)] as char);
-            index += 3;
-            continue;
+            if preserve_escape {
+                out.push('%');
+                out.push(HEX[usize::from(hi)] as char);
+                out.push(HEX[usize::from(lo)] as char);
+                index += 3;
+                continue;
+            }
         }
         if byte.is_ascii_alphanumeric()
             || matches!(byte, b'-' | b'_' | b'.' | b'~')
@@ -442,7 +465,7 @@ mod tests {
         headers.insert("x-amz-date", HeaderValue::from_str(&date).unwrap());
         let canonical = format!(
             "GET\n{}\n{}\nhost:localhost:4566\nx-amz-date:{date}\n\nhost;x-amz-date\n{:x}",
-            canonical_uri(uri.path()).unwrap(),
+            canonical_uri(uri.path(), service).unwrap(),
             canonical_query(uri.query()).unwrap(),
             Sha256::digest([]),
         );
@@ -532,8 +555,40 @@ mod tests {
                 })
             }
         ));
-        assert_eq!(canonical_uri("/bad%XX"), None);
+        assert_eq!(canonical_uri("/bad%XX", "lambda"), None);
         assert_eq!(canonical_query(Some("a=%XX")), None);
+    }
+
+    #[test]
+    fn sdk_encoded_arn_signatures_reject_wrong_secret_tampered_path_and_expiry() {
+        // Prepared by real boto3 Lambda/Pipes serializers and SigV4 signers, AKID/secret,
+        // 2026-10-06T07:00:00Z. Go v2 signs these same escaped wire paths a second time.
+        let date_format =
+            format_description::parse_borrowed::<3>("[year][month][day]T[hour][minute][second]Z")
+                .unwrap();
+        let now = time::PrimitiveDateTime::parse("20261006T070000Z", &date_format)
+            .unwrap()
+            .assume_utc();
+        for (service,path,signature) in [
+            ("lambda","/2017-03-31/tags/arn%3Aaws%3Alambda%3Aus-east-1%3A000000000000%3Aevent-source-mapping%3A6c47c6c7-b7b5-4ddc-abdc-3e516305a4ef","3f232f4360f3aa5ecccc0c2c505f2a314b61fe579439bb6864fe735a39087531"),
+            ("pipes","/tags/arn%3Aaws%3Apipes%3Aus-east-1%3A000000000000%3Apipe%2Forder-ledger-dev-pipe","d533f0d66d98b6674917c511d7a7bfe2ebe0bca36b9eccd132223929b81882bc"),
+        ] {
+            let uri=path.parse::<Uri>().unwrap();
+            let mut headers=HeaderMap::new();
+            headers.insert("host",HeaderValue::from_static("localhost:4566"));
+            headers.insert("x-amz-date",HeaderValue::from_static("20261006T070000Z"));
+            headers.insert("authorization",format!("AWS4-HMAC-SHA256 Credential=AKID/20261006/us-east-1/{service}/aws4_request, SignedHeaders=host;x-amz-date, Signature={signature}").parse().unwrap());
+            let credentials=|secret:&str|SigningCredentials{secret_access_key:secret.into(),session_token:None};
+            assert!(verify_at(&Method::GET,&uri,&headers,b"","us-east-1",service,|_|Some(credentials("secret")),now));
+            assert!(!verify_at(&Method::GET,&uri,&headers,b"","us-east-1",service,|_|Some(credentials("wrong")),now));
+            let changed=path.replace("000000000000","000000000001").parse::<Uri>().unwrap();
+            assert!(!verify_at(&Method::GET,&changed,&headers,b"","us-east-1",service,|_|Some(credentials("secret")),now));
+            assert!(!verify_at(&Method::GET,&uri,&headers,b"","us-east-1",service,|_|Some(credentials("secret")),now+time::Duration::minutes(16)));
+        }
+        assert_eq!(
+            canonical_uri("/bucket/key%3Asegment%2Ffile", "s3").unwrap(),
+            "/bucket/key%3Asegment%2Ffile"
+        );
     }
 
     #[test]
@@ -577,6 +632,18 @@ mod dashboard_signing_tests {
             session_token: Some("local-token".into()),
         };
         for (service, uri, method, body) in [
+            (
+                "lambda",
+                "/2017-03-31/tags/arn%3Aaws%3Alambda%3Aus-west-2%3A000000000000%3Afunction%3Ademo",
+                Method::GET,
+                b"".as_slice(),
+            ),
+            (
+                "pipes",
+                "/tags/arn%3Aaws%3Apipes%3Aus-west-2%3A000000000000%3Apipe%2Fdemo",
+                Method::GET,
+                b"".as_slice(),
+            ),
             ("dynamodb", "/", Method::POST, b"{}".as_slice()),
             (
                 "s3",

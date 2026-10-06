@@ -6,6 +6,71 @@
 
 use crate::registry::AwsProtocol;
 
+pub(crate) fn cloudwatch_cbor_request(uri: &http::Uri, headers: &http::HeaderMap) -> bool {
+    uri.path()
+        .starts_with("/service/GraniteServiceVersion20100801/operation/")
+        && headers
+            .get("content-type")
+            .is_some_and(|value| value == "application/cbor")
+        && headers
+            .get("smithy-protocol")
+            .is_some_and(|value| value == "rpc-v2-cbor")
+}
+
+/// Preserve early routing/signature errors for current CloudWatch SDK clients.
+pub(crate) async fn cloudwatch_cbor_error(
+    response: axum::response::Response,
+) -> axum::response::Response {
+    if response.status().is_success()
+        || response
+            .headers()
+            .get("content-type")
+            .is_some_and(|value| value == "application/cbor")
+    {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let code = value
+        .get("__type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            parts
+                .headers
+                .get("x-amzn-errortype")
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or("InternalServiceError")
+        .to_owned();
+    let message = value
+        .get("message")
+        .or_else(|| value.get("Message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("AWS request failed");
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(
+        &serde_json::json!({"__type":code,"message":message}),
+        &mut bytes,
+    )
+    .expect("CBOR error to Vec cannot fail");
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    parts.headers.insert(
+        "content-type",
+        http::HeaderValue::from_static("application/cbor"),
+    );
+    parts.headers.insert(
+        "smithy-protocol",
+        http::HeaderValue::from_static("rpc-v2-cbor"),
+    );
+    if let Ok(value) = code.parse() {
+        parts.headers.insert("x-amzn-errortype", value);
+    }
+    axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
 /// AWS error metadata, independent of protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsError {

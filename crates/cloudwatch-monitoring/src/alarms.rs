@@ -21,6 +21,9 @@ pub(super) const ACTIONS: &[&str] = &[
     "DescribeAlarmHistory",
     "EnableAlarmActions",
     "DisableAlarmActions",
+    "ListTagsForResource",
+    "TagResource",
+    "UntagResource",
 ];
 pub(super) fn supported(action: &str) -> bool {
     ACTIONS.contains(&action)
@@ -81,6 +84,8 @@ struct Record {
     next_eval: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     history: Vec<Value>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -136,16 +141,41 @@ fn arn(scope: &ScopeKey, name: &str) -> String {
 }
 
 impl Alarms {
+    #[cfg(test)]
     pub(super) fn process(
         &self,
         action: &str,
         body: &Value,
         scope: &ScopeKey,
     ) -> Result<Value, MonitoringError> {
+        self.process_authorized(action, body, scope, |_, _, _| Ok(()))
+    }
+
+    pub(super) fn process_authorized(
+        &self,
+        action: &str,
+        body: &Value,
+        scope: &ScopeKey,
+        mut authorize: impl FnMut(
+            &str,
+            &str,
+            BTreeMap<String, Vec<String>>,
+        ) -> Result<(), MonitoringError>,
+    ) -> Result<Value, MonitoringError> {
         let mut state = self.state.lock().map_err(|_| lock_error())?;
+        authorize_alarm(&state, action, body, scope, &mut authorize)?;
         match action {
             "PutMetricAlarm" => {
-                let mut config: Config = serde_json::from_value(body.clone()).map_err(|_|invalid("Basic alarms require one metric/statistic; unsupported properties are rejected"))?;
+                let tags = body
+                    .get("Tags")
+                    .map(parse_tags)
+                    .transpose()?
+                    .unwrap_or_default();
+                let mut properties = body.clone();
+                if let Some(properties) = properties.as_object_mut() {
+                    properties.remove("Tags");
+                }
+                let mut config: Config = serde_json::from_value(properties).map_err(|_|invalid("Basic alarms require one metric/statistic; unsupported properties are rejected"))?;
                 if config.namespace == "AWS/DynamoDB" && body.get("TreatMissingData").is_none() {
                     config.treat_missing_data = "ignore".into();
                 }
@@ -164,6 +194,7 @@ impl Alarms {
                         changed: now,
                         next_eval: 0,
                         history: Vec::new(),
+                        tags,
                     });
                 record.config = config;
                 record.updated = now;
@@ -182,6 +213,77 @@ impl Alarms {
                     Some(&record),
                     vec![],
                 )?;
+                Ok(json!({}))
+            }
+            "ListTagsForResource" | "TagResource" | "UntagResource" => {
+                let fields: &[&str] = match action {
+                    "TagResource" => &["ResourceARN", "Tags"],
+                    "UntagResource" => &["ResourceARN", "TagKeys"],
+                    _ => &["ResourceARN"],
+                };
+                allowed(body, fields)?;
+                let resource = json_string(body, "ResourceARN")?;
+                if resource.len() > 1024 {
+                    return Err(invalid("ResourceARN is too long"));
+                }
+                let parsed = locallycloud_core::integration::arn::Arn::parse(resource)
+                    .map_err(|_| invalid("ResourceARN must identify a CloudWatch alarm"))?;
+                if parsed.partition != "aws"
+                    || parsed.service != "cloudwatch"
+                    || parsed.region.is_empty()
+                    || parsed.account_id.len() != 12
+                    || !parsed.account_id.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(invalid("ResourceARN must identify a CloudWatch alarm"));
+                }
+                let name = parsed
+                    .resource
+                    .strip_prefix("alarm:")
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| invalid("ResourceARN must identify a CloudWatch alarm"))?;
+                if parsed.region != scope.region || parsed.account_id != scope.account_id {
+                    return Err(MonitoringError::ResourceNotFoundException(
+                        "Alarm does not exist in this account and region".into(),
+                    ));
+                }
+                let mut record = state
+                    .records
+                    .get(&(scope.clone(), name.into()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        MonitoringError::ResourceNotFoundException("Alarm does not exist".into())
+                    })?;
+                match action {
+                    "TagResource" => {
+                        let tags = parse_tags(
+                            body.get("Tags")
+                                .ok_or_else(|| invalid("Tags is required"))?,
+                        )?;
+                        record.tags.extend(tags);
+                        if record.tags.len() > 50 {
+                            return Err(invalid("Alarm may have at most 50 tags"));
+                        }
+                    }
+                    "UntagResource" => {
+                        let keys = body
+                            .get("TagKeys")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| invalid("TagKeys is required"))?;
+                        for key in keys {
+                            let key = key
+                                .as_str()
+                                .ok_or_else(|| invalid("TagKeys must contain strings"))?;
+                            validate_tag_text(key, true)?;
+                            record.tags.remove(key);
+                        }
+                    }
+                    _ => {
+                        return Ok(
+                            json!({"Tags":record.tags.iter().map(|(key,value)| json!({"Key":key,"Value":value})).collect::<Vec<_>>()}),
+                        )
+                    }
+                }
+                self.commit(&mut state, scope, name, Some(&record), vec![])?;
                 Ok(json!({}))
             }
             "DescribeAlarms" => {
@@ -694,4 +796,150 @@ fn optional_string<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, Mo
                 .ok_or_else(|| invalid(&format!("{key} must be a non-empty string")))
         })
         .transpose()
+}
+
+fn validate_tag_text(value: &str, key: bool) -> Result<(), MonitoringError> {
+    let length = value.chars().count();
+    if (key && (length == 0 || length > 128 || value.starts_with("aws:")))
+        || (!key && length > 256)
+        || !value.chars().all(|character| {
+            character.is_alphanumeric()
+                || (character.is_whitespace() && !character.is_control())
+                || ".:+=@_/-".contains(character)
+        })
+    {
+        return Err(invalid("Invalid tag key or value"));
+    }
+    Ok(())
+}
+
+fn parse_tags(value: &Value) -> Result<BTreeMap<String, String>, MonitoringError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid("Tags must be an array"))?;
+    if values.len() > 50 {
+        return Err(invalid("Tags may contain at most 50 members"));
+    }
+    let mut tags = BTreeMap::new();
+    for tag in values {
+        allowed(tag, &["Key", "Value"])?;
+        let key = tag
+            .get("Key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("Tag Key is required"))?;
+        let value = tag
+            .get("Value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("Tag Value is required"))?;
+        validate_tag_text(key, true)?;
+        validate_tag_text(value, false)?;
+        if tags.insert(key.into(), value.into()).is_some() {
+            return Err(invalid("Tag keys must be unique"));
+        }
+    }
+    Ok(tags)
+}
+
+fn authorize_alarm(
+    state: &State,
+    action: &str,
+    body: &Value,
+    scope: &ScopeKey,
+    authorize: &mut impl FnMut(&str, &str, BTreeMap<String, Vec<String>>) -> Result<(), MonitoringError>,
+) -> Result<(), MonitoringError> {
+    let mut names = match action {
+        "PutMetricAlarm" | "SetAlarmState" => vec![json_string(body, "AlarmName")?.to_owned()],
+        "DescribeAlarmHistory" => body
+            .get("AlarmName")
+            .and_then(Value::as_str)
+            .map(|name| vec![name.into()])
+            .unwrap_or_default(),
+        "DeleteAlarms" | "EnableAlarmActions" | "DisableAlarmActions" | "DescribeAlarms" => {
+            names(body, "AlarmNames")?
+        }
+        "TagResource" | "UntagResource" | "ListTagsForResource" => {
+            let resource = json_string(body, "ResourceARN")?;
+            let parsed = locallycloud_core::integration::arn::Arn::parse(resource)
+                .map_err(|_| invalid("Invalid ResourceARN"))?;
+            if parsed.partition != "aws"
+                || parsed.service != "cloudwatch"
+                || parsed.region != scope.region
+                || parsed.account_id != scope.account_id
+            {
+                return Err(MonitoringError::ResourceNotFoundException(
+                    "Alarm does not exist in this scope".into(),
+                ));
+            }
+            vec![parsed
+                .resource
+                .strip_prefix("alarm:")
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| invalid("Invalid alarm ARN"))?
+                .into()]
+        }
+        _ => return Err(invalid("Unsupported alarm action")),
+    };
+    if names.is_empty() {
+        names.push("*".into());
+    }
+    for name in names {
+        let record = state.records.get(&(scope.clone(), name.clone()));
+        let mut context = BTreeMap::new();
+        if let Some(record) = record {
+            for (key, value) in &record.tags {
+                if !key.starts_with("aws:") {
+                    context.insert(
+                        format!("aws:resourcetag/{}", key.to_ascii_lowercase()),
+                        vec![value.clone()],
+                    );
+                }
+            }
+        }
+        if action == "TagResource" || (action == "PutMetricAlarm" && record.is_none()) {
+            if let Some(tags) = body.get("Tags") {
+                let tags = parse_tags(tags)?;
+                context.insert("aws:tagkeys".into(), tags.keys().cloned().collect());
+                for (key, value) in tags {
+                    context.insert(
+                        format!("aws:requesttag/{}", key.to_ascii_lowercase()),
+                        vec![value],
+                    );
+                }
+            }
+        }
+        if action == "UntagResource" {
+            let keys = self::names(body, "TagKeys")?;
+            context.insert("aws:tagkeys".into(), keys);
+        }
+        if action == "PutMetricAlarm" {
+            if let Some(actions) = body.get("AlarmActions") {
+                context.insert(
+                    "cloudwatch:alarmactions".into(),
+                    actions
+                        .as_array()
+                        .ok_or_else(|| invalid("AlarmActions must be an array"))?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .ok_or_else(|| invalid("Invalid AlarmActions"))
+                        })
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+        }
+        let resource = arn(scope, &name);
+        authorize(action, &resource, context.clone())?;
+        if action == "PutMetricAlarm"
+            && record.is_none()
+            && body
+                .get("Tags")
+                .and_then(Value::as_array)
+                .is_some_and(|tags| !tags.is_empty())
+        {
+            authorize("TagResource", &resource, context)?;
+        }
+    }
+    Ok(())
 }
