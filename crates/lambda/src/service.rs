@@ -47,9 +47,9 @@ use crate::control_plane::{
 };
 use crate::error::LambdaError;
 use crate::esm::{
-    create_mapping, parse_batching_window, poll_once, update_response_types,
-    validate_batch_configuration, validate_batch_size, BatchSource, EsmStore, KinesisBatchSource,
-    SourceType, SqsBatchSource,
+    create_mapping, parse_batching_window, parse_scaling_config, poll_once, run_workers,
+    update_response_types, validate_batch_configuration, validate_batch_size, BatchSource,
+    EsmStore, KinesisBatchSource, SourceType, SqsBatchSource,
 };
 use crate::executor::{DestinationRouter, Executor};
 use crate::model::{function_arn, resolve_function_name, FunctionStore, LayerStore, VpcConfig};
@@ -67,9 +67,14 @@ pub struct LambdaHandler {
     /// Present when the data plane is wired; absent handlers reject invoke with 501.
     executor: Option<Arc<Executor>>,
     concurrency: Arc<ConcurrencyLimiter>,
-    esm_workers: Mutex<HashMap<String, JoinHandle<()>>>,
+    esm_workers: Mutex<HashMap<String, EsmWorker>>,
     persistence: Mutex<Option<Arc<crate::persistence::LambdaPersistence>>>,
     metadata_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct EsmWorker {
+    handle: JoinHandle<()>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Default for LambdaHandler {
@@ -371,58 +376,20 @@ impl LambdaHandler {
         &self,
         req: &ServiceRequest,
         source_arn: &str,
+        function_arn: &str,
     ) -> Result<(), LambdaError> {
-        let parts: Vec<&str> = source_arn.split(':').collect();
-        if parts.len() != 6 || parts[4].is_empty() || parts[5].is_empty() {
-            return Err(LambdaError::InvalidParameterValue(format!(
-                "invalid SQS event source ARN: {source_arn}"
-            )));
-        }
-        let registry = self
-            .registry
-            .upgrade()
-            .ok_or_else(|| LambdaError::InternalError("service registry is unavailable".into()))?;
-        let handler = registry
-            .native_handler(&ServiceName::new("sqs"))
-            .ok_or_else(|| LambdaError::InternalError("SQS service is unavailable".into()))?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-amz-target",
-            HeaderValue::from_static("AmazonSQS.GetQueueUrl"),
-        );
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/x-amz-json-1.0"),
-        );
-        let response = handler
-            .handle(ServiceRequest {
-                method: Method::POST,
-                uri: "/".parse().expect("static SQS URI"),
-                headers,
-                body: Bytes::from(
-                    json!({
-                        "QueueName": parts[5],
-                        "QueueOwnerAWSAccountId": parts[4],
-                    })
-                    .to_string(),
-                ),
-                region: req.region.clone(),
-                account_id: req.account_id.clone(),
-                request_id: req.request_id.clone(),
-            })
-            .await;
-        if response.status().is_success() {
-            Ok(())
-        } else if response.status().is_client_error() {
-            Err(LambdaError::InvalidParameterValue(format!(
-                "SQS event source does not exist: {source_arn}"
-            )))
-        } else {
-            Err(LambdaError::InternalError(format!(
-                "could not validate SQS event source: {}",
-                response.status()
-            )))
-        }
+        SqsBatchSource::new(
+            self.registry.clone(),
+            self.store.clone(),
+            function_arn,
+            source_arn,
+            &req.account_id,
+            &req.region,
+        )
+        .map_err(LambdaError::InvalidParameterValue)?
+        .validate()
+        .await
+        .map_err(LambdaError::InvalidParameterValue)
     }
 
     async fn route(&self, req: &ServiceRequest) -> Result<(u16, Option<Value>), LambdaError> {
@@ -681,8 +648,12 @@ impl LambdaHandler {
                     let arn = function.function_arn;
                     let esm = create_mapping(region, &arn, &input)?;
                     if SourceType::from_arn(&esm.event_source_arn) == Some(SourceType::Sqs) {
-                        self.validate_sqs_event_source(req, &esm.event_source_arn)
-                            .await?;
+                        self.validate_sqs_event_source(
+                            req,
+                            &esm.event_source_arn,
+                            &esm.function_arn,
+                        )
+                        .await?;
                     }
                     if SourceType::from_arn(&esm.event_source_arn) == Some(SourceType::Kinesis) {
                         KinesisBatchSource::new(
@@ -791,6 +762,7 @@ impl LambdaHandler {
                             batch_size.unwrap_or(existing.batch_size),
                             window,
                         )?;
+                        let maximum_concurrency = parse_scaling_config(&input, source_type)?;
                         let function_response_types = update_response_types(&input)?;
                         let updated = self
                             .esm
@@ -799,6 +771,9 @@ impl LambdaHandler {
                                     e.batch_size = batch_size;
                                 }
                                 e.maximum_batching_window_in_seconds = window;
+                                if let Some(maximum) = maximum_concurrency {
+                                    e.maximum_concurrency = maximum;
+                                }
                                 if let Some(types) = function_response_types {
                                     e.function_response_types = types;
                                 }
@@ -831,18 +806,75 @@ impl LambdaHandler {
                     _ => Err(unsupported()),
                 }
             }
-            ["2017-03-31", "tags", arn] => match req.method {
-                Method::GET => list_tags(&self.store, region, account, arn),
-                Method::POST => {
-                    let input = parse_json(&req.body)?;
-                    tag_resource(&self.store, region, account, arn, &input)
+            ["2017-03-31", "tags", arn] => {
+                let arn = percent_decode_path(arn);
+                if arn.contains(":event-source-mapping:") {
+                    let prefix = format!("arn:aws:lambda:{region}:{account}:event-source-mapping:");
+                    let uuid = arn
+                        .strip_prefix(&prefix)
+                        .filter(|uuid| !uuid.is_empty() && !uuid.contains(':'))
+                        .ok_or_else(|| {
+                            LambdaError::ResourceNotFound(
+                                "Event source mapping not found in this scope".into(),
+                            )
+                        })?;
+                    let mapping = self
+                        .esm
+                        .get(uuid)
+                        .filter(|mapping| {
+                            mapping.function_arn.starts_with(&format!(
+                                "arn:aws:lambda:{region}:{account}:function:"
+                            ))
+                        })
+                        .ok_or_else(|| {
+                            LambdaError::ResourceNotFound(format!(
+                                "Event source mapping not found: {uuid}"
+                            ))
+                        })?;
+                    match req.method {
+                        Method::GET => Ok((200, Some(json!({"Tags": mapping.tags})))),
+                        Method::POST => {
+                            let input = parse_json(&req.body)?;
+                            let tags = crate::esm::parse_tags(Some(
+                                input.get("Tags").ok_or_else(|| {
+                                    LambdaError::InvalidParameterValue("Tags is required".into())
+                                })?,
+                            ))?;
+                            self.esm.tag(uuid, tags)?;
+                            Ok((204, None))
+                        }
+                        Method::DELETE => {
+                            let keys = query_values(req.uri.query().unwrap_or(""), "tagKeys");
+                            self.esm.update(uuid, |mapping| {
+                                for key in keys {
+                                    mapping.tags.remove(&key);
+                                }
+                            })?;
+                            Ok((204, None))
+                        }
+                        _ => Err(unsupported()),
+                    }
+                } else {
+                    match req.method {
+                        Method::GET => list_tags(&self.store, region, account, &arn),
+                        Method::POST => tag_resource(
+                            &self.store,
+                            region,
+                            account,
+                            &arn,
+                            &parse_json(&req.body)?,
+                        ),
+                        Method::DELETE => untag_resource(
+                            &self.store,
+                            region,
+                            account,
+                            &arn,
+                            &query_values(req.uri.query().unwrap_or(""), "tagKeys"),
+                        ),
+                        _ => Err(unsupported()),
+                    }
                 }
-                Method::DELETE => {
-                    let keys = query_values(req.uri.query().unwrap_or(""), "tagKeys");
-                    untag_resource(&self.store, region, account, arn, &keys)
-                }
-                _ => Err(unsupported()),
-            },
+            }
             _ => Err(unsupported()),
         }
     }
@@ -850,7 +882,15 @@ impl LambdaHandler {
 
 impl LambdaHandler {
     fn reconcile_esm(&self, account: &str, region: &str, mapping: &crate::esm::EventSourceMapping) {
-        self.abort_esm(&mapping.uuid);
+        let Ok(mut workers) = self.esm_workers.lock() else {
+            return;
+        };
+        if let Some(cancel) = workers
+            .get_mut(&mapping.uuid)
+            .and_then(|worker| worker.cancel.take())
+        {
+            let _ = cancel.send(());
+        }
         if !mapping.enabled {
             return;
         }
@@ -876,6 +916,8 @@ impl LambdaHandler {
         let source: Arc<dyn BatchSource> = match SourceType::from_arn(&mapping.event_source_arn) {
             Some(SourceType::Sqs) => match SqsBatchSource::new(
                 self.registry.clone(),
+                self.store.clone(),
+                &mapping.function_arn,
                 &mapping.event_source_arn,
                 account,
                 region,
@@ -919,7 +961,25 @@ impl LambdaHandler {
         let account = account.to_string();
         let region = region.to_string();
         let functions = self.store.clone();
+        let worker_count = match SourceType::from_arn(&mapping.event_source_arn) {
+            Some(SourceType::Sqs) => mapping.maximum_concurrency.unwrap_or(5),
+            _ => 1,
+        };
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let previous = workers.remove(&uuid);
         let worker = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.handle.await;
+            }
+            run_workers(worker_count, cancelled, || {
+                let store = store.clone();
+                let registry = registry.clone();
+                let worker_uuid = worker_uuid.clone();
+                let account = account.clone();
+                let region = region.clone();
+                let functions = functions.clone();
+                let source = source.clone();
+                async move {
             while let Some(current) = store.get(&worker_uuid).filter(|item| item.enabled) {
                 let function_name = current
                     .function_arn
@@ -945,7 +1005,7 @@ impl LambdaHandler {
                         let registry = registry.upgrade()?;
                         let lambda = registry.lambda_api(&ServiceName::new("lambda"))?;
                         let payload = serde_json::to_vec(&event).ok()?;
-                        let output = lambda
+                        let output = match lambda
                             .invoke(LambdaInvokeRequest {
                                 call: LambdaCallContext {
                                     source_service: "lambda-esm".into(),
@@ -959,11 +1019,18 @@ impl LambdaHandler {
                                 payload: SensitivePayload::new(payload),
                             })
                             .await
-                            .ok()?;
-                        output
-                            .function_error
-                            .is_none()
-                            .then(|| output.payload.into_vec())
+                        {
+                            Ok(output) => output,
+                            Err(error) => {
+                                tracing::warn!(error_kind = ?error, "Event source mapping Lambda invocation rejected");
+                                return None;
+                            }
+                        };
+                        if let Some(error) = output.function_error {
+                            tracing::warn!(error_kind = ?error, "Event source mapping Lambda function failed");
+                            return None;
+                        }
+                        Some(output.payload.into_vec())
                     }
                 })
                 .await;
@@ -978,18 +1045,27 @@ impl LambdaHandler {
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
+                }
+            }).await;
         });
-        if let Ok(mut workers) = self.esm_workers.lock() {
-            workers.retain(|_, worker| !worker.is_finished());
-            workers.insert(uuid, worker);
-        }
+        workers.retain(|_, worker| !worker.handle.is_finished());
+        workers.insert(
+            uuid,
+            EsmWorker {
+                handle: worker,
+                cancel: Some(cancel),
+            },
+        );
     }
 
     fn abort_esm(&self, uuid: &str) {
         if let Ok(mut workers) = self.esm_workers.lock() {
-            workers.retain(|_, worker| !worker.is_finished());
-            if let Some(worker) = workers.remove(uuid) {
-                worker.abort();
+            workers.retain(|_, worker| !worker.handle.is_finished());
+            if let Some(cancel) = workers
+                .get_mut(uuid)
+                .and_then(|worker| worker.cancel.take())
+            {
+                let _ = cancel.send(());
             }
         }
     }
@@ -1008,11 +1084,15 @@ impl LambdaHandler {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for worker in &workers {
-            worker.abort();
+        let mut handles = Vec::with_capacity(workers.len());
+        for mut worker in workers {
+            if let Some(cancel) = worker.cancel.take() {
+                let _ = cancel.send(());
+            }
+            handles.push(worker.handle);
         }
-        for worker in workers {
-            let _ = worker.await;
+        for handle in handles {
+            let _ = handle.await;
         }
         if let Some(executor) = &self.executor {
             executor.shutdown().await;
@@ -1023,8 +1103,10 @@ impl LambdaHandler {
 impl Drop for LambdaHandler {
     fn drop(&mut self) {
         if let Ok(mut workers) = self.esm_workers.lock() {
-            for (_, worker) in workers.drain() {
-                worker.abort();
+            for (_, mut worker) in workers.drain() {
+                if let Some(cancel) = worker.cancel.take() {
+                    let _ = cancel.send(());
+                }
             }
         }
     }
@@ -2234,6 +2316,63 @@ mod tests {
     async fn event_source_mapping_crud_via_handler() {
         let registry = ServiceRegistry::with_known_services();
         locallycloud_sqs::register(&registry);
+        // Exercise real scoped SQS dispatch with a service-only SNS resource policy.
+        // This evaluator checks role/action boundaries; queue-policy evaluation is native.
+        use locallycloud_core::integration::authorization::{
+            AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
+            ServiceRoleAuthorizationRequest,
+        };
+        use locallycloud_core::integration::InternalDispatcher;
+        use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ExecutionAuthorization(AtomicBool);
+        impl AuthorizationEvaluator for ExecutionAuthorization {
+            fn authorize(&self, _: AuthorizationRequest) -> Result<(), AuthorizationError> {
+                Ok(())
+            }
+            fn authorize_service_role_execution(
+                &self,
+                req: ServiceRoleAuthorizationRequest,
+            ) -> Result<(), AuthorizationError> {
+                assert_eq!(req.service_principal, "lambda.amazonaws.com");
+                assert!(req.source_arn.is_none());
+                assert_eq!(req.resource, "arn:aws:sqs:us-east-1:000000000000:q");
+                assert!(matches!(
+                    req.action.as_str(),
+                    "sqs:GetQueueAttributes" | "sqs:ReceiveMessage" | "sqs:DeleteMessage"
+                ));
+                if self.0.load(Ordering::Relaxed)
+                    && req.role_arn == "arn:aws:iam::000000000000:role/r"
+                {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::Denied)
+                }
+            }
+        }
+        #[async_trait]
+        impl NativeHandler for ExecutionAuthorization {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                http::Response::new(Body::empty())
+            }
+        }
+        let authorization = Arc::new(ExecutionAuthorization(AtomicBool::new(true)));
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            authorization.clone(),
+            authorization.clone(),
+        );
+        registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )));
         let handler = LambdaHandler::with_parts(Arc::downgrade(&registry), None);
         create_fn(&handler).await;
         let source_arn = "arn:aws:sqs:us-east-1:000000000000:q";
@@ -2252,14 +2391,23 @@ mod tests {
         assert!(handler.esm.list(None, None).is_empty());
 
         let sqs = registry.native_handler(&ServiceName::new("sqs")).unwrap();
-        let mut queue_request = request(Method::POST, "/", r#"{"QueueName":"q"}"#);
+        let resource_policy = json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},"Action":"sqs:SendMessage","Resource":source_arn}]}).to_string();
+        let mut queue_request = request(
+            Method::POST,
+            "/",
+            &json!({"QueueName":"q","Attributes":{"Policy":resource_policy}}).to_string(),
+        );
         queue_request.headers.insert(
             "x-amz-target",
             HeaderValue::from_static("AmazonSQS.CreateQueue"),
         );
         assert_eq!(sqs.handle(queue_request).await.status(), 200);
 
-        // Create an SQS ESM.
+        authorization.0.store(false, Ordering::Relaxed);
+        assert_eq!(handler.handle(create_request.clone()).await.status(), 400);
+        assert!(handler.esm.list(None, None).is_empty());
+        authorization.0.store(true, Ordering::Relaxed);
+        // Create an SQS ESM with the function role, not an anonymous/service caller.
         let create = handler.handle(create_request).await;
         assert_eq!(create.status(), 202);
         let bytes = axum::body::to_bytes(create.into_body(), usize::MAX)
@@ -2270,6 +2418,39 @@ mod tests {
         assert_eq!(v["BatchSize"], 5);
         assert_eq!(v["State"], "Disabled");
         assert_eq!(v["LastProcessingResult"], "ComputeUnavailable");
+
+        let source = SqsBatchSource::new(
+            Arc::downgrade(&registry),
+            handler.store.clone(),
+            "arn:aws:lambda:us-east-1:000000000000:function:fn",
+            source_arn,
+            "000000000000",
+            "us-east-1",
+        )
+        .unwrap();
+        let mut send = request(Method::POST, "/", &json!({"QueueUrl":"https://sqs.us-east-1.amazonaws.com/000000000000/q","MessageBody":"notification"}).to_string());
+        send.headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("AmazonSQS.SendMessage"),
+        );
+        send.headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=test/20261006/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=test"));
+        assert_eq!(sqs.handle(send).await.status(), 200);
+        let records = source.poll(1, Duration::ZERO).await.unwrap();
+        assert_eq!(records.len(), 1);
+        authorization.0.store(false, Ordering::Relaxed);
+        assert!(source.ack(&[records[0].ack_token.clone()]).await.is_err());
+        authorization.0.store(true, Ordering::Relaxed);
+        source.ack(&[records[0].ack_token.clone()]).await.unwrap();
+        crate::control_plane::update_function_configuration(
+            &handler.store,
+            "us-east-1",
+            "000000000000",
+            "fn",
+            &json!({"Role":"arn:aws:iam::000000000000:role/revoked"}),
+            None,
+        )
+        .unwrap();
+        assert!(source.validate().await.is_err());
 
         // Get, list, update (disable), delete.
         let get = handler
@@ -2335,6 +2516,96 @@ mod tests {
             ))
             .await;
         assert_eq!(get2.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn event_source_mapping_tags_encoded_scope_and_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("lambda-esm-tags-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state =
+            Arc::new(locallycloud_state::StateDb::open(directory.join("state.sqlite")).unwrap());
+        let handler = LambdaHandler::new();
+        handler.esm.attach_state(state.clone()).unwrap();
+        let mapping=create_mapping("us-east-1","arn:aws:lambda:us-east-1:000000000000:function:fn",
+            &json!({"EventSourceArn":"arn:aws:sqs:us-east-1:000000000000:q","Tags":{"created":"yes"}})).unwrap();
+        let arn = mapping.to_json()["EventSourceMappingArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        handler.esm.insert(mapping.clone()).unwrap();
+        let path = format!("/2017-03-31/tags/{}", arn.replace(':', "%3A"));
+        let list = handler.handle(request(Method::GET, &path, "")).await;
+        assert_eq!(list.status(), 200);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["Tags"]["created"], "yes");
+        assert_eq!(
+            handler
+                .handle(request(
+                    Method::POST,
+                    &path,
+                    r#"{"Tags":{"team":"ledger","created":"updated"}}"#
+                ))
+                .await
+                .status(),
+            204
+        );
+        assert_eq!(
+            handler
+                .handle(request(Method::POST, &path, r#"{"Tags":{"bad":7}}"#))
+                .await
+                .status(),
+            400
+        );
+        let mut cross = request(Method::GET, &path, "");
+        cross.region = "eu-west-1".into();
+        assert_eq!(handler.handle(cross).await.status(), 404);
+        let mut cross = request(Method::POST, &path, r#"{"Tags":{"intruder":"yes"}}"#);
+        cross.account_id = "111111111111".into();
+        assert_eq!(handler.handle(cross).await.status(), 404);
+        assert_eq!(
+            handler
+                .handle(request(
+                    Method::DELETE,
+                    &format!("{path}?tagKeys=created"),
+                    ""
+                ))
+                .await
+                .status(),
+            204
+        );
+        drop(handler);
+        let restored = LambdaHandler::new();
+        restored.esm.attach_state(state.clone()).unwrap();
+        let list = restored.handle(request(Method::GET, &path, "")).await;
+        assert_eq!(list.status(), 200);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body, json!({"Tags":{"team":"ledger"}}));
+        restored.esm.remove(&mapping.uuid).unwrap();
+        assert_eq!(
+            restored
+                .handle(request(Method::GET, &path, ""))
+                .await
+                .status(),
+            404
+        );
+        drop(restored);
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

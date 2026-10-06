@@ -196,7 +196,17 @@ mod tests {
                 .unwrap(),
             rid
         );
-        assert!(next.headers().get("Lambda-Runtime-Deadline-Ms").is_some());
+        let deadline_ms: i64 = next.headers()["Lambda-Runtime-Deadline-Ms"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let now_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        assert!(i128::from(deadline_ms) > now_ms);
+        assert_eq!(
+            next.headers()["Lambda-Runtime-Invoked-Function-Arn"],
+            "arn:aws:lambda:...:fn"
+        );
         let trace = next.headers()["Lambda-Runtime-Trace-Id"].to_str().unwrap();
         assert!(trace.starts_with("Root=1-"), "{trace}");
         assert!(trace.ends_with(";Sampled=0"), "{trace}");

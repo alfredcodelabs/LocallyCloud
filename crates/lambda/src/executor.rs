@@ -740,6 +740,9 @@ impl Executor {
         );
 
         let mut timed_out = false;
+        let mut timeout_logs = None;
+        let mut timeout_broker_logs = None;
+        let mut timeout_elapsed = None;
         let outcome =
             match tokio::time::timeout(Duration::from_millis(timeout_ms.max(0) as u64), rx).await {
                 Ok(Ok(outcome)) => outcome,
@@ -749,8 +752,18 @@ impl Executor {
                 },
                 Err(_) => {
                     timed_out = true;
+                    timeout_elapsed = Some(started.elapsed());
                     self.broker
                         .fail_unhandled(&request_id, b"timed out".to_vec());
+                    timeout_broker_logs = self.broker.take_logs(&request_id);
+                    let has_extensions = self.broker.has_extensions(&env_key);
+                    // Fence the guest before any log/metric delivery can await and let
+                    // timed-out user code perform more application writes.
+                    if let Some((fallback, stream)) =
+                        self.stop_env_reason_inner(&env_key, "TIMEOUT", true).await
+                    {
+                        timeout_logs = Some((fallback, stream, has_extensions));
+                    }
                     Outcome::Error {
                         error_type: FunctionErrorType::Unhandled,
                         payload: format!(
@@ -762,7 +775,7 @@ impl Executor {
                 }
             };
         // Billed duration covers the invoke phase only (no accrual while frozen).
-        let invoke_elapsed = started.elapsed();
+        let invoke_elapsed = timeout_elapsed.unwrap_or_else(|| started.elapsed());
         let billed_duration_ms = invoke_elapsed.as_millis() as u64;
         self.publish_invocation_metrics(
             account,
@@ -772,9 +785,23 @@ impl Executor {
             matches!(outcome, Outcome::Error { .. }),
             Some(invoke_elapsed.as_secs_f64() * 1000.0),
         );
-        let broker_logs = self.broker.take_logs(&request_id);
-        let (fallback_logs, log_stream_name) = self.read_environment_logs(&env_key).await;
-        let has_extensions = self.broker.has_extensions(&env_key);
+        let (broker_logs, fallback_logs, log_stream_name, has_extensions) =
+            if let Some((fallback, stream, extensions)) = timeout_logs {
+                (timeout_broker_logs, fallback, stream, extensions)
+            } else {
+                let broker_logs = if timed_out {
+                    timeout_broker_logs
+                } else {
+                    self.broker.take_logs(&request_id)
+                };
+                let (fallback, stream) = self.read_environment_logs(&env_key).await;
+                (
+                    broker_logs,
+                    fallback,
+                    stream,
+                    self.broker.has_extensions(&env_key),
+                )
+            };
         let logs = if has_extensions || crate::rootfs::is_custom(func.runtime.as_deref()) {
             fallback_logs
         } else {
@@ -851,7 +878,7 @@ impl Executor {
             self.return_warm(&pool_key, &env_key, generation).await;
         } else {
             let reason = if timed_out { "TIMEOUT" } else { "FAILURE" };
-            if has_extensions {
+            if has_extensions && !timed_out {
                 if let Some(executor) = self.self_ref.get().and_then(Weak::upgrade) {
                     let env_key = env_key.clone();
                     tokio::spawn(async move {
@@ -1989,6 +2016,15 @@ impl Executor {
     }
 
     async fn stop_env_reason(&self, env_key: &str, reason: &str) {
+        self.stop_env_reason_inner(env_key, reason, false).await;
+    }
+
+    async fn stop_env_reason_inner(
+        &self,
+        env_key: &str,
+        reason: &str,
+        capture_logs: bool,
+    ) -> Option<(String, Option<String>)> {
         let gate = self.stopping.entry(env_key.to_owned()).or_default().clone();
         let mut finalized = gate.lock().await;
         if !self.owned_envs.contains_key(env_key) {
@@ -1997,7 +2033,7 @@ impl Executor {
             self.environment_functions.remove(env_key);
             self.memory_reservations.lock().unwrap().remove(env_key);
             self.stopping.remove(env_key);
-            return;
+            return None;
         }
         if self.broker.has_extensions(env_key) {
             let grace = Duration::from_secs(2);
@@ -2012,8 +2048,10 @@ impl Executor {
             self.broker.begin_shutdown(env_key, reason, deadline_ms);
             // External extensions receive SHUTDOWN from their outstanding Next request.
             // The current guest supervisor has no process-exit channel to the host, so the
-            // full grace period is needed before the sandbox is terminated.
-            tokio::time::sleep(grace).await;
+            // normal shutdown grace is skipped on timeout: user code must already stop.
+            if reason != "TIMEOUT" {
+                tokio::time::sleep(grace).await;
+            }
         }
         self.broker.stop(env_key);
         let stopped = if *finalized {
@@ -2034,14 +2072,21 @@ impl Executor {
                 },
             }
         };
+        let captured = if stopped && capture_logs {
+            Some(self.read_environment_logs(env_key).await)
+        } else {
+            None
+        };
         if stopped {
             if !*finalized {
-                if let Err(error) = self.publish_environment_tail(env_key).await {
-                    tracing::warn!(%env_key, %error, "final guest logs could not be published");
+                if !capture_logs {
+                    if let Err(error) = self.publish_environment_tail(env_key).await {
+                        tracing::warn!(%env_key, %error, "final guest logs could not be published");
+                    }
                 }
                 if let Err(error) = self.runtime.release_task(env_key).await {
                     tracing::warn!(%env_key, %error, "guest runtime cleanup deferred; ownership retained");
-                    return;
+                    return captured;
                 }
                 *finalized = true;
             }
@@ -2057,6 +2102,7 @@ impl Executor {
                 self.stopping.remove(env_key);
             }
         }
+        captured
     }
 
     pub(crate) async fn delete_function_resources(
@@ -2435,7 +2481,7 @@ mod tests {
             last_modified: "now".into(),
             revision_id: "rev".into(),
             state: "Active".into(),
-            code_zip: Some(code),
+            code_zip: Some(code.into()),
             dead_letter_arn: None,
             vpc_config: None,
         }
@@ -3105,6 +3151,85 @@ mod tests {
             }
             other => panic!("expected timeout error, got {other:?}"),
         }
+    }
+
+    struct TimeoutFenceGuest {
+        guest: InProcessGuest,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ComputeRuntime for TimeoutFenceGuest {
+        async fn start_task(&self, id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
+            self.stopped.store(false, Ordering::Release);
+            self.guest.start_task(id, spec).await
+        }
+        async fn stop_task(&self, id: &str) -> Result<TaskHandle, RuntimeError> {
+            self.stopped.store(true, Ordering::Release);
+            self.guest.stop_task(id).await
+        }
+        async fn release_task(&self, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        async fn get_output(&self, _: &str) -> Result<String, RuntimeError> {
+            assert!(
+                self.stopped.load(Ordering::Acquire),
+                "timed-out guest must stop before awaited log capture"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok("captured before timeout\n".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_stops_before_log_capture_and_extension_grace() {
+        let broker = Arc::new(InvocationBroker::new());
+        let mut exec = build_executor(broker.clone(), GuestBehavior::Hang).await;
+        let stopped = Arc::new(AtomicBool::new(false));
+        exec.runtime = Arc::new(TimeoutFenceGuest {
+            guest: InProcessGuest {
+                behavior: GuestBehavior::Hang,
+                starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            stopped: stopped.clone(),
+        });
+        let f = func("nodejs22.x", 1, zip_with(&[("index.js", b"x")]));
+        let invocation_started = Instant::now();
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(
+            invocation_started.elapsed().as_millis() >= u128::from(result.billed_duration_ms) + 80,
+            "timeout log capture/cleanup must not accrue billed invoke duration"
+        );
+        assert!(matches!(result.outcome, Outcome::Error { .. }));
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(exec.owned_envs.is_empty());
+        // Registered extensions must receive shutdown notification without leaving
+        // the timed-out handler alive for the normal two-second shutdown grace.
+        let env = "timeout-extension";
+        stopped.store(false, Ordering::Release);
+        exec.reserve_rootfs(env).unwrap();
+        std::fs::create_dir_all(exec.rootfs_root.join(env).join("tmp")).unwrap();
+        exec.mark_rootfs_starting(env).unwrap();
+        exec.mark_rootfs_running(env).unwrap();
+        broker
+            .discover_expected_extensions(env, vec!["extension".into()], "fn", "1", "handler")
+            .unwrap();
+        broker
+            .register_extension(env, "extension", vec!["SHUTDOWN".into()])
+            .unwrap();
+        let captured = tokio::time::timeout(
+            Duration::from_secs(1),
+            exec.stop_env_reason_inner(env, "TIMEOUT", true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(captured.0, "captured before timeout\n");
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(!exec.owned_envs.contains_key(env));
     }
 
     #[derive(Default)]

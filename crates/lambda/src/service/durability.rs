@@ -119,10 +119,17 @@ fn metadata_target(req: &ServiceRequest) -> Result<Option<MetadataTarget>, Lambd
             name,
             &req.region,
         )?))),
-        ["2017-03-31", "tags", arn] => Ok(Some(MetadataTarget::Function(resolve_function_name(
-            arn,
-            &req.region,
-        )?))),
+        ["2017-03-31", "tags", arn] => {
+            let arn = percent_decode_path(arn);
+            if arn.contains(":event-source-mapping:") {
+                Ok(None)
+            } else {
+                Ok(Some(MetadataTarget::Function(resolve_function_name(
+                    &arn,
+                    &req.region,
+                )?)))
+            }
+        }
         ["2018-10-31", "layers", name, ..] => Ok(Some(MetadataTarget::Layer((*name).into()))),
         _ => Ok(None),
     }

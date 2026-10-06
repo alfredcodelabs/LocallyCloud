@@ -86,7 +86,8 @@ pub fn create_function(
         .get("Code")
         .and_then(|c| c.get("ZipFile"))
         .and_then(Value::as_str)
-        .and_then(crate::model::decode_inline_zip);
+        .and_then(crate::model::decode_inline_zip)
+        .map(std::sync::Arc::<[u8]>::from);
 
     let timeout = u32_field(input, "Timeout").unwrap_or(DEFAULT_TIMEOUT_SECS);
     let memory_size = u32_field(input, "MemorySize").unwrap_or(DEFAULT_MEMORY_MB);
@@ -286,10 +287,13 @@ pub fn get_function(store: &FunctionStore, region: &str, account: &str, name: &s
         "RepositoryType": "S3",
         "Location": format!("{}/code", f.function_arn)
     });
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "Configuration": f.to_configuration_json(),
         "Code": code,
     });
+    if let Some(Some(value)) = store.get_reserved_concurrency(account, region, &f.function_name) {
+        body["Concurrency"] = serde_json::json!({"ReservedConcurrentExecutions": value});
+    }
     Ok((200, Some(body)))
 }
 
@@ -527,7 +531,8 @@ pub fn update_function_code(
     let code_zip = input
         .get("ZipFile")
         .and_then(Value::as_str)
-        .and_then(crate::model::decode_inline_zip);
+        .and_then(crate::model::decode_inline_zip)
+        .map(std::sync::Arc::<[u8]>::from);
     let updated = store
         .update(account, region, &name, |f| {
             f.code_sha256 = code_sha256;
@@ -1665,6 +1670,33 @@ mod tests {
         let cfg = body.unwrap();
         assert!(cfg["CodeSize"].as_u64().unwrap() > 0);
         assert_ne!(cfg["CodeSha256"].as_str().unwrap(), sha0);
+        assert_eq!(cfg["LastUpdateStatus"], "Successful");
+        let (_, read) =
+            get_function_configuration(&store, "us-east-1", "000000000000", "fn").unwrap();
+        assert_eq!(read.unwrap()["LastUpdateStatus"], "Successful");
+        let (_, configured) = update_function_configuration(
+            &store,
+            "us-east-1",
+            "000000000000",
+            "fn",
+            &serde_json::json!({"Timeout": 15}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(configured.unwrap()["LastUpdateStatus"], "Successful");
+        // Rejected requests never start an asynchronous update or alter stored code.
+        assert!(update_function_code(
+            &store,
+            "us-east-1",
+            "000000000000",
+            "fn",
+            &serde_json::json!({"ZipFile":"not-base64"})
+        )
+        .is_err());
+        let (_, read) = get_function(&store, "us-east-1", "000000000000", "fn").unwrap();
+        let read = read.unwrap();
+        assert_eq!(read["Configuration"]["LastUpdateStatus"], "Successful");
+        assert_eq!(read["Configuration"]["CodeSha256"], cfg["CodeSha256"]);
     }
 
     #[test]

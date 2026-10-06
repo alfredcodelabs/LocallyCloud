@@ -224,7 +224,76 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
             })
             .map_err(|_| denied())
     };
-    authorize(&format!("lambda:{action}"), resource, context)?;
+    context.insert("aws:requestedregion".into(), vec![req.region.clone()]);
+    if action == "CreateEventSourceMapping" || action == "TagResource" {
+        let input = parse_json(&req.body)?;
+        if let Some(tags) = input.get("Tags") {
+            let tags = crate::esm::parse_tags(Some(tags))?;
+            context.insert("aws:tagkeys".into(), tags.keys().cloned().collect());
+            for (key, value) in tags {
+                context.insert(
+                    format!("aws:requesttag/{}", key.to_ascii_lowercase()),
+                    vec![value],
+                );
+            }
+        }
+    }
+    if action == "UntagResource" {
+        context.insert(
+            "aws:tagkeys".into(),
+            query_values(req.uri.query().unwrap_or(""), "tagKeys"),
+        );
+    }
+    let mapping_prefix = format!(
+        "arn:aws:lambda:{}:{}:event-source-mapping:",
+        req.region, req.account_id
+    );
+    let tags = if let Some(uuid) = resource.strip_prefix(&mapping_prefix) {
+        handler
+            .esm
+            .get(uuid)
+            .filter(|mapping| {
+                mapping.function_arn.starts_with(&format!(
+                    "arn:aws:lambda:{}:{}:function:",
+                    req.region, req.account_id
+                ))
+            })
+            .map(|mapping| mapping.tags)
+    } else if let Some(name) = resource.strip_prefix(&format!(
+        "arn:aws:lambda:{}:{}:function:",
+        req.region, req.account_id
+    )) {
+        handler.store.get_tags(
+            &req.account_id,
+            &req.region,
+            name.split(':').next().unwrap_or(name),
+        )
+    } else {
+        None
+    };
+    for (key, value) in tags.unwrap_or_default() {
+        if !key.to_ascii_lowercase().starts_with("aws:") {
+            context.insert(
+                format!("aws:resourcetag/{}", key.to_ascii_lowercase()),
+                vec![value],
+            );
+        }
+    }
+    let context: BTreeMap<_, _> = context
+        .into_iter()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .collect();
+    authorize(&format!("lambda:{action}"), resource, context.clone())?;
+    if action == "CreateEventSourceMapping" {
+        let input = parse_json(&req.body)?;
+        if input
+            .get("Tags")
+            .and_then(Value::as_object)
+            .is_some_and(|tags| !tags.is_empty())
+        {
+            authorize("lambda:TagResource", "*".into(), context)?;
+        }
+    }
     // AWS requires PassRole when creating a function or changing its execution role.
     if action == "CreateFunction" || action == "UpdateFunctionConfiguration" {
         let body = parse_json(&req.body)?;
@@ -245,4 +314,123 @@ fn mapping_arn(req: &ServiceRequest, uuid: &str) -> String {
         "arn:aws:lambda:{}:{}:event-source-mapping:{uuid}",
         req.region, req.account_id
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use locallycloud_core::integration::authorization::{
+        AuthorizationError, AuthorizationEvaluator,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct TaggedPolicy {
+        dependent: AtomicBool,
+        seen: std::sync::Mutex<Vec<AuthorizationRequest>>,
+    }
+    impl AuthorizationEvaluator for TaggedPolicy {
+        fn strict_sigv4_required(&self) -> bool {
+            true
+        }
+        fn authorize(&self, req: AuthorizationRequest) -> Result<(), AuthorizationError> {
+            let request_tag = req.context.get("aws:requesttag/team");
+            // Actual IfExists behavior: missing permits, present wrong value denies.
+            let valid = request_tag.is_none_or(|values| values == &vec!["orders".to_string()]);
+            let dependent = req.action != "lambda:TagResource"
+                || req.resource != "*"
+                || self.dependent.load(Ordering::SeqCst);
+            self.seen.lock().unwrap().push(req);
+            if valid && dependent {
+                Ok(())
+            } else {
+                Err(AuthorizationError::Denied)
+            }
+        }
+    }
+    fn request(method: Method, path: &str, body: &str) -> ServiceRequest {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-locallycloud-verified-external-sigv4",
+            "1".parse().unwrap(),
+        );
+        headers.insert("authorization","AWS4-HMAC-SHA256 Credential=KEY/20261006/us-east-1/lambda/aws4_request, SignedHeaders=host, Signature=test".parse().unwrap());
+        ServiceRequest {
+            method,
+            uri: path.parse().unwrap(),
+            headers,
+            body: Bytes::from(body.to_owned()),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            request_id: "tags-policy".into(),
+        }
+    }
+    #[tokio::test]
+    async fn esm_tags_iam_receives_real_context_and_denial_has_no_effect() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let handler = Arc::new(LambdaHandler::with_parts(Arc::downgrade(&registry), None));
+        let policy = Arc::new(TaggedPolicy::default());
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            locallycloud_core::registry::ServiceMetadata::new(
+                locallycloud_core::registry::AwsProtocol::Query,
+                None,
+            ),
+            handler.clone(),
+            policy.clone(),
+        );
+        let create = request(
+            Method::POST,
+            "/2015-03-31/event-source-mappings",
+            r#"{"FunctionName":"fn","Tags":{"team":"orders"}}"#,
+        );
+        assert!(check(&handler, &create).is_err());
+        policy.dependent.store(true, Ordering::SeqCst);
+        check(&handler, &create).unwrap();
+        let seen = policy.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(
+            seen.context["lambda:functionarn"],
+            vec!["arn:aws:lambda:us-east-1:000000000000:function:fn"]
+        );
+        assert_eq!(seen.context["aws:requesttag/team"], vec!["orders"]);
+        assert_eq!(seen.context["aws:tagkeys"], vec!["team"]);
+        assert_eq!(seen.context["aws:requestedregion"], vec!["us-east-1"]);
+        let mapping=create_mapping("us-east-1","arn:aws:lambda:us-east-1:000000000000:function:fn",&json!({"EventSourceArn":"arn:aws:sqs:us-east-1:000000000000:q","Tags":{"owner":"orders"}})).unwrap();
+        let resource = format!(
+            "arn:aws:lambda:us-east-1:000000000000:event-source-mapping:{}",
+            mapping.uuid
+        );
+        let path = format!("/2017-03-31/tags/{}", resource.replace(':', "%3A"));
+        handler.esm.insert(mapping.clone()).unwrap();
+        let denied = handler
+            .handle(request(Method::POST, &path, r#"{"Tags":{"team":"evil"}}"#))
+            .await;
+        assert_eq!(denied.status(), 403);
+        assert!(!handler
+            .esm
+            .get(&mapping.uuid)
+            .unwrap()
+            .tags
+            .contains_key("team"));
+        assert_eq!(
+            handler
+                .handle(request(
+                    Method::POST,
+                    &path,
+                    r#"{"Tags":{"team":"orders"}}"#
+                ))
+                .await
+                .status(),
+            204
+        );
+        let seen = policy.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(seen.resource, resource);
+        assert_eq!(seen.context["aws:resourcetag/owner"], vec!["orders"]);
+        let untag = request(Method::DELETE, &format!("{path}?tagKeys=team"), "");
+        check(&handler, &untag).unwrap();
+        assert_eq!(
+            policy.seen.lock().unwrap().last().unwrap().context["aws:tagkeys"],
+            vec!["team"]
+        );
+    }
 }

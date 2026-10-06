@@ -337,3 +337,152 @@ async fn failed_commit_preserves_metadata_and_version_numbers() {
         .is_some());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn reserved_concurrency_get_function_restart_failure_and_delete() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!("lambda-reservation-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+    let handler = restore_handler(db.clone(), 0x63).unwrap();
+    assert_eq!(
+        call(
+            &handler,
+            Method::POST,
+            "/2015-03-31/functions",
+            create("reserved", &package("exports.handler=async()=>true"))
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        call(
+            &handler,
+            Method::PUT,
+            "/2017-10-31/functions/reserved/concurrency",
+            json!({"ReservedConcurrentExecutions":4})
+        )
+        .await
+        .0,
+        200
+    );
+    drop(handler);
+    let restored = restore_handler(db.clone(), 0x63).unwrap();
+    let (status, body) = call(
+        &restored,
+        Method::GET,
+        "/2015-03-31/functions/reserved",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["Concurrency"]["ReservedConcurrentExecutions"], 4);
+    assert_eq!(
+        call(
+            &restored,
+            Method::GET,
+            "/2019-09-30/functions/reserved/concurrency",
+            Value::Null
+        )
+        .await
+        .1["ReservedConcurrentExecutions"],
+        4
+    );
+    let arn = "arn:aws:lambda:us-east-1:000000000000:function:reserved";
+    let slots = (0..4)
+        .map(|_| restored.concurrency.acquire(arn).unwrap())
+        .collect::<Vec<_>>();
+    assert!(restored.concurrency.acquire(arn).is_none());
+    drop(slots);
+    db.connection().unwrap().execute_batch("CREATE TRIGGER reject_reservation BEFORE INSERT ON lambda_entities BEGIN SELECT RAISE(ABORT,'injected reservation failure'); END;").unwrap();
+    assert_eq!(
+        call(
+            &restored,
+            Method::PUT,
+            "/2017-10-31/functions/reserved/concurrency",
+            json!({"ReservedConcurrentExecutions":1})
+        )
+        .await
+        .0,
+        500
+    );
+    assert_eq!(
+        call(
+            &restored,
+            Method::GET,
+            "/2015-03-31/functions/reserved",
+            Value::Null
+        )
+        .await
+        .1["Concurrency"]["ReservedConcurrentExecutions"],
+        4
+    );
+    let slots = (0..4)
+        .map(|_| restored.concurrency.acquire(arn).unwrap())
+        .collect::<Vec<_>>();
+    assert!(restored.concurrency.acquire(arn).is_none());
+    drop(slots);
+    db.connection()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_reservation")
+        .unwrap();
+    assert_eq!(
+        call(
+            &restored,
+            Method::DELETE,
+            "/2017-10-31/functions/reserved/concurrency",
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
+    drop(restored);
+    let cleared = restore_handler(db.clone(), 0x63).unwrap();
+    assert!(call(
+        &cleared,
+        Method::GET,
+        "/2015-03-31/functions/reserved",
+        Value::Null
+    )
+    .await
+    .1
+    .get("Concurrency")
+    .is_none());
+    let slots = (0..5)
+        .map(|_| cleared.concurrency.acquire(arn).unwrap())
+        .collect::<Vec<_>>();
+    drop(slots);
+    assert_eq!(
+        call(
+            &cleared,
+            Method::DELETE,
+            "/2015-03-31/functions/reserved",
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
+    drop(cleared);
+    let deleted = restore_handler(db.clone(), 0x63).unwrap();
+    assert_eq!(
+        call(
+            &deleted,
+            Method::GET,
+            "/2015-03-31/functions/reserved",
+            Value::Null
+        )
+        .await
+        .0,
+        404
+    );
+    drop(deleted);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}

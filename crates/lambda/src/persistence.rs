@@ -201,20 +201,26 @@ pub(crate) mod archive {
 pub(crate) mod optional_archive {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{Deserialize, Deserializer, Serializer};
+    use std::sync::Arc;
     pub fn serialize<S: Serializer>(
-        bytes: &Option<Vec<u8>>,
+        bytes: &Option<Arc<[u8]>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         match bytes {
-            Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+            Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes.as_ref())),
             None => serializer.serialize_none(),
         }
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
+    ) -> Result<Option<Arc<[u8]>>, D::Error> {
         Option::<String>::deserialize(deserializer)?
-            .map(|text| STANDARD.decode(text).map_err(serde::de::Error::custom))
+            .map(|text| {
+                STANDARD
+                    .decode(text)
+                    .map(Arc::<[u8]>::from)
+                    .map_err(serde::de::Error::custom)
+            })
             .transpose()
     }
 }

@@ -83,7 +83,7 @@ pub struct LambdaFunction {
     /// Raw Zip package bytes (inline `Code.ZipFile`), retained so the data plane can extract
     /// and execute the function. `None` for image packages or when set from a non-inline source.
     #[serde(with = "crate::persistence::optional_archive")]
-    pub code_zip: Option<Vec<u8>>,
+    pub code_zip: Option<Arc<[u8]>>,
     /// `DeadLetterConfig.TargetArn` for asynchronous invocation failures, if configured.
     pub dead_letter_arn: Option<String>,
     pub vpc_config: Option<VpcConfig>,
@@ -111,6 +111,8 @@ impl LambdaFunction {
             "LastModified": self.last_modified,
             "RevisionId": self.revision_id,
             "State": self.state,
+            // Creation and supported updates finish synchronously before returning.
+            "LastUpdateStatus": "Successful",
         });
         if !self.environment.is_empty() {
             json["Environment"] = serde_json::json!({ "Variables": self.environment });
@@ -407,6 +409,17 @@ impl FunctionStore {
         self.records
             .get(&Self::key(account_id, region, name))
             .map(|r| r.latest.clone())
+    }
+
+    pub(crate) fn execution_role(
+        &self,
+        account_id: &str,
+        region: &str,
+        name: &str,
+    ) -> Option<String> {
+        self.records
+            .get(&Self::key(account_id, region, name))
+            .map(|record| record.latest.role.clone())
     }
 
     /// Check an execution snapshot without cloning its code archive.
@@ -1066,13 +1079,17 @@ mod tests {
     use std::io::{Cursor, Write};
 
     fn valid_zip() -> (String, u64) {
+        valid_zip_with(b"exports.handler=async()=>({})")
+    }
+
+    fn valid_zip_with(content: &[u8]) -> (String, u64) {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
             writer
                 .start_file("index.js", zip::write::SimpleFileOptions::default())
                 .unwrap();
-            writer.write_all(b"exports.handler=async()=>({})").unwrap();
+            writer.write_all(content).unwrap();
             writer.finish().unwrap();
         }
         let size = bytes.len() as u64;
@@ -1144,6 +1161,68 @@ mod tests {
     #[test]
     fn compute_zip_code_rejects_invalid_base64() {
         assert!(compute_zip_code("not base64!!!").is_err());
+    }
+
+    #[test]
+    fn function_archive_snapshots_share_bytes_and_published_code_survives_latest_update() {
+        let store = FunctionStore::new();
+        let account = "000000000000";
+        let region = "us-east-1";
+        let original = BASE64
+            .decode(valid_zip_with(b"exports.handler=async()=>({version:1})").0)
+            .unwrap();
+        crate::control_plane::create_function(&store, region, account, &serde_json::json!({
+            "FunctionName":"archive","Runtime":"nodejs22.x","Role":"arn:aws:iam::000000000000:role/r",
+            "Handler":"index.handler","Code":{"ZipFile":BASE64.encode(&original)}
+        }), None).unwrap();
+        let latest = store.get(account, region, "archive").unwrap();
+        let archive = latest.code_zip.as_ref().unwrap();
+        let published = store.publish_version(account, region, "archive").unwrap();
+        let staged = store.stage_one(account, region, "archive");
+        let snapshots = [
+            store.get(account, region, "archive").unwrap(),
+            store.get_version(account, region, "archive", 1).unwrap(),
+            store.list(account, region).pop().unwrap(),
+            staged.get(account, region, "archive").unwrap(),
+            published,
+        ];
+        for snapshot in snapshots {
+            assert!(Arc::ptr_eq(archive, snapshot.code_zip.as_ref().unwrap()));
+        }
+        for snapshot in store.list_versions(account, region, "archive").unwrap() {
+            assert!(Arc::ptr_eq(archive, snapshot.code_zip.as_ref().unwrap()));
+        }
+        // Existing persisted base64 data remains readable and the emitted shape is unchanged.
+        let legacy = serde_json::to_value(&latest).unwrap();
+        assert_eq!(legacy["code_zip"], BASE64.encode(&original));
+        let decoded: LambdaFunction = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.code_zip.as_deref(), Some(original.as_slice()));
+        let newer = BASE64
+            .decode(valid_zip_with(b"exports.handler=async()=>({version:2})").0)
+            .unwrap();
+        crate::control_plane::update_function_code(
+            &store,
+            region,
+            account,
+            "archive",
+            &serde_json::json!({"ZipFile":BASE64.encode(&newer)}),
+        )
+        .unwrap();
+        let changed = store.get(account, region, "archive").unwrap();
+        assert!(!Arc::ptr_eq(archive, changed.code_zip.as_ref().unwrap()));
+        assert_eq!(changed.code_zip.as_deref(), Some(newer.as_slice()));
+        let old = store.get_version(account, region, "archive", 1).unwrap();
+        assert!(Arc::ptr_eq(archive, old.code_zip.as_ref().unwrap()));
+        assert_eq!(old.code_zip.as_deref(), Some(original.as_slice()));
+        assert!(Arc::ptr_eq(
+            archive,
+            staged
+                .get(account, region, "archive")
+                .unwrap()
+                .code_zip
+                .as_ref()
+                .unwrap()
+        ));
     }
 
     #[test]

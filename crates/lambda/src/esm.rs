@@ -8,17 +8,20 @@ mod persistence;
 pub use kinesis::KinesisBatchSource;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::model::FunctionStore;
 use async_trait::async_trait;
 use axum::body::to_bytes;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::{HeaderMap, HeaderValue, Method, Uri};
+use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
 use locallycloud_core::integration::identity::{CallerIdentity, IdentityPropagator};
-use locallycloud_core::registry::ServiceRegistry;
+use locallycloud_core::integration::RequestIdentity;
+use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -76,6 +79,10 @@ pub struct EventSourceMapping {
     pub batch_size: u32,
     pub maximum_batching_window_in_seconds: u32,
     pub function_response_types: Vec<String>,
+    #[serde(default)]
+    pub maximum_concurrency: Option<u32>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
     pub state: String,
     pub last_modified: f64,
     pub starting_position: Option<String>,
@@ -105,6 +112,9 @@ impl EventSourceMapping {
             "StateTransitionReason": self.last_processing_result.as_deref().unwrap_or("USER_INITIATED"),
             "LastModified": self.last_modified,
         });
+        if let Some(maximum) = self.maximum_concurrency {
+            v["ScalingConfig"] = json!({"MaximumConcurrency": maximum});
+        }
         if let Some(result) = &self.last_processing_result {
             v["LastProcessingResult"] = json!(result);
         }
@@ -215,11 +225,17 @@ impl EsmStore {
     }
 
     pub fn remove(&self, uuid: &str) -> Result<Option<EventSourceMapping>, LambdaError> {
+        // Tag/update writers already hold this entry before saving; deletion must use
+        // the same order so an overlapping writer cannot recreate a deleted row.
+        let entry = self.mappings.entry(uuid.into());
         if let Some(state) = self.persistence.lock().map_err(|_| state_error())?.as_ref() {
             state.remove(uuid)?;
         }
         self.checkpoints.retain(|(id, _), _| id != uuid);
-        Ok(self.mappings.remove(uuid).map(|(_, v)| v))
+        Ok(match entry {
+            dashmap::mapref::entry::Entry::Occupied(entry) => Some(entry.remove()),
+            dashmap::mapref::entry::Entry::Vacant(_) => None,
+        })
     }
 
     pub fn update<F: FnOnce(&mut EventSourceMapping)>(
@@ -236,6 +252,22 @@ impl EsmStore {
         self.save(&next)?;
         *e = next.clone();
         Ok(Some(next))
+    }
+
+    pub fn tag(&self, uuid: &str, tags: BTreeMap<String, String>) -> Result<(), LambdaError> {
+        let mut mapping = self.mappings.get_mut(uuid).ok_or_else(|| {
+            LambdaError::ResourceNotFound(format!("Event source mapping not found: {uuid}"))
+        })?;
+        let mut next = mapping.clone();
+        next.tags.extend(tags);
+        if next.tags.len() > 50 {
+            return Err(LambdaError::InvalidParameterValue(
+                "Maximum 50 tags allowed".into(),
+            ));
+        }
+        self.save(&next)?;
+        *mapping = next;
+        Ok(())
     }
 
     pub fn set_processing_result(&self, uuid: &str, result: String) -> Result<(), LambdaError> {
@@ -315,7 +347,7 @@ pub fn validate_batch_configuration(
             "BatchSize for an SQS FIFO queue must be between 1 and 10".into(),
         ));
     }
-    if batch_size > 10 && window == 0 {
+    if source_type == SourceType::Sqs && batch_size > 10 && window == 0 {
         return Err(LambdaError::InvalidParameterValue(
             "MaximumBatchingWindowInSeconds must be at least 1 when BatchSize exceeds 10".into(),
         ));
@@ -399,6 +431,8 @@ pub fn create_mapping(
         batch_size,
         maximum_batching_window_in_seconds,
         function_response_types: response_types(input)?,
+        maximum_concurrency: parse_scaling_config(input, source_type)?.flatten(),
+        tags: parse_tags(input.get("Tags"))?,
         state: if enabled {
             "Enabled".into()
         } else {
@@ -409,6 +443,96 @@ pub fn create_mapping(
         starting_timestamp: now(),
         last_processing_result: None,
     })
+}
+
+pub fn parse_tags(value: Option<&Value>) -> Result<BTreeMap<String, String>, LambdaError> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let tags = value
+        .as_object()
+        .ok_or_else(|| LambdaError::InvalidParameterValue("Tags must be a string map".into()))?;
+    if tags.len() > 50 {
+        return Err(LambdaError::InvalidParameterValue(
+            "Maximum 50 tags allowed".into(),
+        ));
+    }
+    tags.iter()
+        .map(|(key, value)| {
+            let value = value.as_str().ok_or_else(|| {
+                LambdaError::InvalidParameterValue("Tag values must be strings".into())
+            })?;
+            if key.is_empty()
+                || key.chars().count() > 128
+                || value.chars().count() > 256
+                || key.to_ascii_lowercase().starts_with("aws:")
+            {
+                return Err(LambdaError::InvalidParameterValue(
+                    "Invalid tag key or value".into(),
+                ));
+            }
+            Ok((key.clone(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Outer Option distinguishes omitted updates from an explicit empty configuration.
+pub fn parse_scaling_config(
+    input: &Value,
+    source: SourceType,
+) -> Result<Option<Option<u32>>, LambdaError> {
+    let Some(config) = input.get("ScalingConfig") else {
+        return Ok(None);
+    };
+    let invalid = || {
+        LambdaError::InvalidParameterValue(
+            "ScalingConfig requires an SQS source and MaximumConcurrency between 2 and 1000".into(),
+        )
+    };
+    if source != SourceType::Sqs {
+        return Err(invalid());
+    }
+    let object = config.as_object().ok_or_else(invalid)?;
+    if object.keys().any(|key| key != "MaximumConcurrency") {
+        return Err(invalid());
+    }
+    let maximum = object
+        .get("MaximumConcurrency")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (2..=1000).contains(value))
+                .map(|value| value as u32)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    Ok(Some(maximum))
+}
+
+/// Cancellation drains aborted children before a replacement may admit new work.
+pub async fn run_workers<F, Fut>(count: u32, mut cancel: tokio::sync::oneshot::Receiver<()>, run: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    if !matches!(
+        cancel.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ) {
+        return;
+    }
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..count {
+        workers.spawn(run());
+    }
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut cancel => { workers.abort_all(); break; },
+            next = workers.join_next() => if next.is_none() { break; },
+        }
+    }
+    while workers.join_next().await.is_some() {}
 }
 
 pub fn update_response_types(input: &Value) -> Result<Option<Vec<String>>, LambdaError> {
@@ -554,6 +678,8 @@ where
 /// SQS adapter that talks through locallycloud's scoped in-process dispatcher.
 pub struct SqsBatchSource {
     registry: Weak<ServiceRegistry>,
+    functions: Arc<FunctionStore>,
+    function_name: String,
     queue_url: String,
     source_arn: String,
     account: String,
@@ -563,6 +689,8 @@ pub struct SqsBatchSource {
 impl SqsBatchSource {
     pub fn new(
         registry: Weak<ServiceRegistry>,
+        functions: Arc<FunctionStore>,
+        function_arn: &str,
         source_arn: &str,
         account: &str,
         region: &str,
@@ -576,8 +704,17 @@ impl SqsBatchSource {
         {
             return Err("invalid or cross-scope SQS event source ARN".into());
         }
+        let function_name = function_arn
+            .split(":function:")
+            .nth(1)
+            .and_then(|name| name.split(':').next())
+            .filter(|name| !name.is_empty())
+            .ok_or("invalid function ARN")?
+            .to_string();
         Ok(Self {
             registry,
+            functions,
+            function_name,
             queue_url: format!("https://sqs.{region}.amazonaws.com/{account}/{}", parts[5]),
             source_arn: source_arn.to_string(),
             account: account.to_string(),
@@ -585,8 +722,59 @@ impl SqsBatchSource {
         })
     }
 
+    pub async fn validate(&self) -> Result<(), String> {
+        self.dispatch(
+            "AmazonSQS.GetQueueAttributes",
+            json!({
+                "QueueUrl": self.queue_url, "AttributeNames": ["QueueArn"]
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn dispatch(&self, target: &str, body: Value) -> Result<Value, String> {
-        dispatch_source(&self.registry, &self.account, &self.region, target, body).await
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or("service registry is unavailable")?;
+        let role = self
+            .functions
+            .execution_role(&self.account, &self.region, &self.function_name)
+            .ok_or("FunctionUnavailable")?;
+        let operation = target.rsplit('.').next().ok_or("invalid SQS operation")?;
+        let action = match operation {
+            "DeleteMessageBatch" => "DeleteMessage",
+            operation => operation,
+        };
+        registry
+            .authorization_evaluator(&ServiceName::new("iam"))
+            .ok_or("IAM is unavailable")?
+            .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                source_arn: None,
+                caller: RequestIdentity {
+                    account_id: self.account.clone(),
+                    access_key_id: None,
+                    arn: None,
+                },
+                role_arn: role.clone(),
+                service_principal: "lambda.amazonaws.com".into(),
+                action: format!("sqs:{action}"),
+                resource: self.source_arn.clone(),
+            })
+            .map_err(|_| "SQS execution role is not authorized")?;
+        dispatch_source_as(
+            &self.registry,
+            &self.account,
+            &self.region,
+            target,
+            body,
+            CallerIdentity::AssumedRole {
+                role_arn: role,
+                session_name: "lambda-esm".into(),
+            },
+        )
+        .await
     }
 }
 
@@ -596,6 +784,27 @@ async fn dispatch_source(
     region: &str,
     target: &str,
     body: Value,
+) -> Result<Value, String> {
+    dispatch_source_as(
+        registry,
+        account,
+        region,
+        target,
+        body,
+        CallerIdentity::ServicePrincipal {
+            service: "lambda".into(),
+        },
+    )
+    .await
+}
+
+async fn dispatch_source_as(
+    registry: &Weak<ServiceRegistry>,
+    account: &str,
+    region: &str,
+    target: &str,
+    body: Value,
+    identity: CallerIdentity,
 ) -> Result<Value, String> {
     let registry = registry
         .upgrade()
@@ -619,12 +828,7 @@ async fn dispatch_source(
     let uri: Uri = "/"
         .parse()
         .map_err(|error: http::uri::InvalidUri| error.to_string())?;
-    IdentityPropagator::attach(
-        &mut headers,
-        &CallerIdentity::ServicePrincipal {
-            service: "lambda".into(),
-        },
-    );
+    IdentityPropagator::attach(&mut headers, &identity);
     let response = dispatcher
         .dispatch_scoped(
             &Method::POST,
@@ -873,12 +1077,238 @@ mod tests {
             batch_size: 10,
             maximum_batching_window_in_seconds: 0,
             function_response_types: response_types,
+            maximum_concurrency: None,
+            tags: BTreeMap::new(),
             state: "Enabled".into(),
             last_modified: 0.0,
             starting_position: None,
             starting_timestamp: now(),
             last_processing_result: None,
         }
+    }
+
+    #[test]
+    fn scaling_config_validates_clears_and_survives_state_reload() {
+        let source = SourceType::Sqs;
+        assert_eq!(parse_scaling_config(&json!({}), source).unwrap(), None);
+        assert_eq!(
+            parse_scaling_config(&json!({"ScalingConfig": {}}), source).unwrap(),
+            Some(None)
+        );
+        for value in [json!(1), json!(1001), json!(2.5), json!("2"), Value::Null] {
+            assert!(parse_scaling_config(
+                &json!({"ScalingConfig": {"MaximumConcurrency": value}}),
+                source
+            )
+            .is_err());
+        }
+        for config in [json!(null), json!([]), json!({"Other": 2})] {
+            assert!(parse_scaling_config(&json!({"ScalingConfig": config}), source).is_err());
+        }
+        assert!(parse_scaling_config(&json!({"ScalingConfig": {}}), SourceType::Kinesis).is_err());
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("lambda-scaling-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("state.sqlite");
+        let state = Arc::new(locallycloud_state::StateDb::open(path.clone()).unwrap());
+        let store = EsmStore::new();
+        store.attach_state(state.clone()).unwrap();
+        let mut mapping = mapping(vec![]);
+        mapping.maximum_concurrency = Some(2);
+        store.insert(mapping.clone()).unwrap();
+        assert_eq!(
+            store.list(None, None)[0].to_json()["ScalingConfig"]["MaximumConcurrency"],
+            2
+        );
+        let restored = EsmStore::new();
+        restored.attach_state(state.clone()).unwrap();
+        assert_eq!(
+            restored.get(&mapping.uuid).unwrap().maximum_concurrency,
+            Some(2)
+        );
+        restored
+            .update(&mapping.uuid, |item| item.maximum_concurrency = None)
+            .unwrap();
+        let cleared = EsmStore::new();
+        cleared.attach_state(state.clone()).unwrap();
+        assert!(cleared
+            .get(&mapping.uuid)
+            .unwrap()
+            .to_json()
+            .get("ScalingConfig")
+            .is_none());
+        drop((store, restored, cleared, state));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_tag_delete_cannot_restore_deleted_mapping_and_failure_preserves_it() {
+        let root = std::env::temp_dir().join(format!("lambda-esm-delete-race-{}", Uuid::new_v4()));
+        let state = Arc::new(locallycloud_state::StateDb::open(root.join("state.sqlite")).unwrap());
+        let store = Arc::new(EsmStore::new());
+        store.attach_state(state.clone()).unwrap();
+        for number in 0..64 {
+            let mut item = mapping(vec![]);
+            item.uuid = format!("race-{number}");
+            let uuid = item.uuid.clone();
+            store.insert(item).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            std::thread::scope(|threads| {
+                let tag_store = store.clone();
+                let tag_uuid = uuid.clone();
+                let tag_barrier = barrier.clone();
+                threads.spawn(move || {
+                    tag_barrier.wait();
+                    match tag_store.tag(
+                        &tag_uuid,
+                        BTreeMap::from([("team".into(), "orders".into())]),
+                    ) {
+                        Ok(()) | Err(LambdaError::ResourceNotFound(_)) => {}
+                        Err(error) => panic!("{error}"),
+                    }
+                });
+                let delete_store = store.clone();
+                let delete_uuid = uuid.clone();
+                let delete_barrier = barrier.clone();
+                threads.spawn(move || {
+                    delete_barrier.wait();
+                    delete_store.remove(&delete_uuid).unwrap();
+                });
+                barrier.wait();
+            });
+            assert!(store.get(&uuid).is_none());
+        }
+        let reopened = EsmStore::new();
+        reopened.attach_state(state.clone()).unwrap();
+        assert!(reopened.list(None, None).is_empty());
+        let mut item = mapping(vec![]);
+        item.uuid = "rollback".into();
+        store.insert(item).unwrap();
+        state.connection().unwrap().execute_batch("CREATE TRIGGER reject_esm_delete BEFORE DELETE ON lambda_event_source_mappings BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(store.remove("rollback").is_err());
+        assert!(store.get("rollback").is_some());
+        let reopened = EsmStore::new();
+        reopened.attach_state(state.clone()).unwrap();
+        assert!(reopened.get("rollback").is_some());
+        drop((store, reopened, state));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_workers_bound_real_invocations_and_cancel_without_ack() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mem = Arc::new(MemSource {
+            available: Mutex::new(
+                (0..8)
+                    .map(|id| SourceRecord {
+                        item_identifier: id.to_string(),
+                        ack_token: id.to_string(),
+                        body: json!({"messageId": id.to_string()}),
+                    })
+                    .collect(),
+            ),
+            acked: Mutex::new(vec![]),
+        });
+        let mut mapping = mapping(vec![]);
+        mapping.batch_size = 1;
+        mapping.maximum_concurrency = Some(2);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn({
+            let (active, peak, started, release, mem) = (
+                active.clone(),
+                peak.clone(),
+                started.clone(),
+                release.clone(),
+                mem.clone(),
+            );
+            async move {
+                run_workers(mapping.maximum_concurrency.unwrap(), cancelled, || {
+                    let (mapping, active, peak, started, release) = (
+                        mapping.clone(),
+                        active.clone(),
+                        peak.clone(),
+                        started.clone(),
+                        release.clone(),
+                    );
+                    let source: Arc<dyn BatchSource> = mem.clone();
+                    async move {
+                        loop {
+                            if !poll_once(&mapping, &source, |_| {
+                                let (active, peak, started, release) = (
+                                    active.clone(),
+                                    peak.clone(),
+                                    started.clone(),
+                                    release.clone(),
+                                );
+                                async move {
+                                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let _guard = Active(active);
+                                    peak.fetch_max(current, Ordering::SeqCst);
+                                    started.add_permits(1);
+                                    release.notified().await;
+                                    Some(vec![])
+                                }
+                            })
+                            .await
+                            .unwrap()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                })
+                .await;
+            }
+        });
+        let permits = tokio::time::timeout(Duration::from_secs(2), started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap();
+        permits.forget();
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        release.notify_waiters();
+        let permits = tokio::time::timeout(Duration::from_secs(2), started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap();
+        permits.forget();
+        assert_eq!(mem.acked.lock().unwrap().len(), 2);
+        cancel.send(()).unwrap();
+        // The same handoff used by reconcile_esm: replacement admission waits for drain.
+        let replacement = tokio::spawn({
+            let active = active.clone();
+            async move {
+                worker.await.unwrap();
+                assert_eq!(active.load(Ordering::SeqCst), 0);
+                let (cancel, cancelled) = tokio::sync::oneshot::channel();
+                cancel.send(()).unwrap();
+                // An update followed immediately by delete must not admit any work.
+                run_workers(2, cancelled, || async {
+                    panic!("cancelled replacement admitted work")
+                })
+                .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), replacement)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem.acked.lock().unwrap().len(), 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -899,6 +1329,12 @@ mod tests {
             acked: Mutex::new(Vec::new()),
         });
         let source: Arc<dyn BatchSource> = mem.clone();
+        let records = mem.available.lock().unwrap().clone();
+        let failed = poll_once(&mapping(vec![]), &source, |_| async { None }).await;
+        assert_eq!(failed.unwrap_err(), "Lambda invocation failed");
+        assert!(mem.acked.lock().unwrap().is_empty());
+        // Simulate the same unacknowledged batch becoming visible on its next poll.
+        *mem.available.lock().unwrap() = records;
         poll_once(
             &mapping(vec!["ReportBatchItemFailures".into()]),
             &source,

@@ -230,13 +230,9 @@ def post(path, payload, error_type=None):
         pass
 
 while True:
-    try:
-        response = urllib.request.urlopen(API + "/invocation/next")
-    except urllib.error.HTTPError as error:
-        if error.code == 204:
+    with urllib.request.urlopen(API + "/invocation/next") as response:
+        if response.status == 204:
             break
-        raise
-    with response:
         request_id = response.headers["lambda-runtime-aws-request-id"]
         invoked_function_arn = response.headers["lambda-runtime-invoked-function-arn"]
         deadline_ms = int(response.headers["lambda-runtime-deadline-ms"])
@@ -1467,8 +1463,22 @@ exports.handler = async (event, context) => {
             request_ids.push(request_id);
         }
         broker.stop(RIC_KEY);
-        let _ = child.kill();
-        let _ = child.wait();
+        let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "runtime must exit cleanly after HTTP 204: {status}"
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= shutdown_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("runtime did not exit after HTTP 204");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let error = outcomes.pop().unwrap();
         let responses = outcomes
