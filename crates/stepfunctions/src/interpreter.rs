@@ -2208,11 +2208,7 @@ impl Interpreter {
                     .get("x-amz-function-error")
                     .and_then(|value| value.to_str().ok())
                     .map(String::from);
-                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .map_err(|_| AslError::task_failed("failed to read Lambda response"))?;
-                let result: Value = serde_json::from_slice(&body)
-                    .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
+                let result = parse_target_response(response, Some("lambda")).await?;
                 if function_error.is_some() {
                     return Err(lambda_function_error(&result));
                 }
@@ -2359,17 +2355,11 @@ impl Interpreter {
                 if matches!(pattern, IntegrationPattern::RequestResponse) =>
             {
                 let request = nested_request(payload);
-                return match self
+                return self
                     .dispatch_json("states", "AWSStepFunctions.StartSyncExecution", &request)
                     .await
-                {
-                    Ok(response) => Ok(pascalize_top_level(response)),
-                    Err(error) if error.error.ends_with("StateMachineTypeNotSupported") => {
-                        self.dispatch_nested_execution(payload, IntegrationPattern::Sync, true)
-                            .await
-                    }
-                    Err(error) => Err(error),
-                };
+                    .map(pascalize_top_level)
+                    .map_err(|error| sdk_error("states", error));
             }
             ("sfn", _) => {
                 return Err(AslError::runtime(format!(
@@ -2413,7 +2403,18 @@ impl Interpreter {
                     "transactWriteItems",
                 ],
             ),
-            "sqs" => ("sqs", "AmazonSQS", &["sendMessage"]),
+            "sqs" => (
+                "sqs",
+                "AmazonSQS",
+                &[
+                    "sendMessage",
+                    "receiveMessage",
+                    "deleteMessage",
+                    "deleteMessageBatch",
+                    "changeMessageVisibility",
+                    "changeMessageVisibilityBatch",
+                ],
+            ),
             "sns" => ("sns", "AmazonSimpleNotificationService", &["publish"]),
             "eventbridge" | "events" => ("events", "AWSEvents", &["putEvents"]),
             _ => {
@@ -2431,16 +2432,7 @@ impl Interpreter {
         let result = self
             .dispatch_json(canonical, &format!("{prefix}.{operation}"), payload)
             .await;
-        if service == "dynamodb" {
-            result.map_err(|mut error| {
-                if let Some(name) = error.error.strip_prefix("DynamoDB.") {
-                    error.error = format!("DynamoDb.{name}");
-                }
-                error
-            })
-        } else {
-            result
-        }
+        result.map_err(|error| sdk_error(canonical, error))
     }
 
     async fn dispatch_nested_execution(
@@ -2641,9 +2633,15 @@ impl Interpreter {
                 let region = host
                     .strip_prefix("sqs.")
                     .and_then(|host| host.split('.').next())
-                    .unwrap_or("us-east-1");
+                    .unwrap_or(&self.region);
+                let action = match operation {
+                    "SendMessageBatch" => "SendMessage",
+                    "DeleteMessageBatch" => "DeleteMessage",
+                    "ChangeMessageVisibilityBatch" => "ChangeMessageVisibility",
+                    action => action,
+                };
                 (
-                    format!("sqs:{operation}"),
+                    format!("sqs:{action}"),
                     format!("arn:aws:sqs:{region}:{account}:{name}"),
                 )
             }
@@ -3078,11 +3076,140 @@ mod lambda_error_tests {
     }
 }
 
+#[cfg(test)]
+mod sqs_authorization_tests {
+    use super::*;
+    use locallycloud_core::integration::authorization::{
+        AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
+    };
+    use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName};
+
+    #[test]
+    fn batch_actions_use_real_iam_permissions_and_local_urls_use_execution_region() {
+        struct StrictRole;
+        impl AuthorizationEvaluator for StrictRole {
+            fn strict_sigv4_required(&self) -> bool {
+                true
+            }
+            fn authorize(&self, _request: AuthorizationRequest) -> Result<(), AuthorizationError> {
+                Err(AuthorizationError::Denied)
+            }
+            fn authorize_service_role_execution(
+                &self,
+                request: ServiceRoleAuthorizationRequest,
+            ) -> Result<(), AuthorizationError> {
+                let allowed = request.service_principal == "states.amazonaws.com"
+                    && request.role_arn == "arn:aws:iam::111111111111:role/ledger"
+                    && request.caller.account_id == "111111111111"
+                    && request.resource == "arn:aws:sqs:eu-west-1:111111111111:ledger"
+                    && matches!(
+                        request.action.as_str(),
+                        "sqs:ReceiveMessage"
+                            | "sqs:SendMessage"
+                            | "sqs:DeleteMessage"
+                            | "sqs:ChangeMessageVisibility"
+                    );
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::Denied)
+                }
+            }
+        }
+        let registry = ServiceRegistry::with_known_services();
+        // Only the typed IAM capability is used by authorize_json_task; no handler dispatch.
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(locallycloud_sqs::service::SqsHandler::new()),
+            Arc::new(StrictRole),
+        );
+        let interpreter = Interpreter {
+            sm: Arc::new(
+                StateMachine::parse(
+                    r#"{"StartAt":"Done","States":{"Done":{"Type":"Pass","End":true}}}"#,
+                )
+                .unwrap(),
+            ),
+            store: SfnStore::default(),
+            registry: Arc::downgrade(&registry),
+            region: "eu-west-1".into(),
+            account: "111111111111".into(),
+            sm_arn: "arn:aws:states:eu-west-1:111111111111:stateMachine:ledger".into(),
+            sm_name: "ledger".into(),
+            role_arn: "arn:aws:iam::111111111111:role/ledger".into(),
+            exec_arn: "execution".into(),
+            exec_name: "run".into(),
+            execution_type: "EXPRESS".into(),
+            record_history: false,
+            default_ql: "JSONPath".into(),
+            test_mock: None,
+            context_override: None,
+            execution_input: json!({}),
+            execution_start_time: String::new(),
+            initial_retry_count: 0,
+            test_state_mode: false,
+        };
+        for operation in [
+            "ReceiveMessage",
+            "SendMessageBatch",
+            "DeleteMessageBatch",
+            "ChangeMessageVisibilityBatch",
+        ] {
+            for host in ["127.0.0.1:4566", "sqs.eu-west-1.amazonaws.com"] {
+                assert!(interpreter
+                    .authorize_json_task(
+                        "sqs",
+                        &format!("AmazonSQS.{operation}"),
+                        &json!({"QueueUrl": format!("http://{host}/111111111111/ledger")})
+                    )
+                    .is_ok());
+            }
+            for url in [
+                "https://sqs.us-east-1.amazonaws.com/111111111111/ledger",
+                "http://127.0.0.1:4566/222222222222/ledger",
+                "http://127.0.0.1:4566/111111111111/other",
+            ] {
+                assert_eq!(
+                    interpreter
+                        .authorize_json_task(
+                            "sqs",
+                            &format!("AmazonSQS.{operation}"),
+                            &json!({"QueueUrl": url})
+                        )
+                        .unwrap_err()
+                        .error,
+                    "States.Permissions"
+                );
+            }
+        }
+        let mut wrong_role = interpreter;
+        wrong_role.role_arn = "arn:aws:iam::111111111111:role/other".into();
+        assert_eq!(
+            wrong_role
+                .authorize_json_task(
+                    "sqs",
+                    "AmazonSQS.DeleteMessageBatch",
+                    &json!({"QueueUrl":"http://127.0.0.1:4566/111111111111/ledger"})
+                )
+                .unwrap_err()
+                .error,
+            "States.Permissions"
+        );
+    }
+}
+
 async fn parse_target_response(
     response: axum::response::Response,
     service: Option<&str>,
 ) -> Result<Value, AslError> {
     let status = response.status();
+    let header_error = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(String::from);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .map_err(|_| AslError::task_failed("failed to read target response"))?;
@@ -3095,8 +3222,12 @@ async fn parse_target_response(
         .get("__type")
         .or_else(|| value.get("code"))
         .and_then(Value::as_str)
+        .or(header_error.as_deref())
         .unwrap_or("States.TaskFailed")
-        .rsplit(['#', ':'])
+        .split(':')
+        .next()
+        .unwrap_or("States.TaskFailed")
+        .rsplit('#')
         .next()
         .unwrap_or("States.TaskFailed");
     let error = if raw_error.starts_with("States.") || raw_error.contains('.') {
@@ -3113,6 +3244,31 @@ async fn parse_target_response(
         .map(String::from)
         .unwrap_or_else(|| value.to_string());
     Err(AslError::new(error, cause))
+}
+
+fn sdk_error(service: &str, mut error: AslError) -> AslError {
+    let prefix = match service {
+        "states" => "Sfn",
+        "sqs" => "Sqs",
+        "sns" => "Sns",
+        "dynamodb" => "DynamoDb",
+        "events" => "EventBridge",
+        _ => return error,
+    };
+    if let Some(code) = error
+        .error
+        .strip_prefix(&format!("{}.", service_error_prefix(service)))
+    {
+        error.error = format!(
+            "{prefix}.{code}{}",
+            if code.ends_with("Exception") {
+                ""
+            } else {
+                "Exception"
+            }
+        );
+    }
+    error
 }
 
 fn service_error_prefix(service: &str) -> &str {

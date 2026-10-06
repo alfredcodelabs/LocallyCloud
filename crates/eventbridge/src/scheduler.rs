@@ -265,6 +265,22 @@ fn validate_target(value: Option<&Value>) -> Result<Value, SchedulerError> {
     }
     Ok(value.clone())
 }
+fn schedule_description(body: &Value) -> Result<Option<String>, SchedulerError> {
+    body.get("Description")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| value.chars().count() <= 512)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    SchedulerError::Validation(
+                        "Description must be a string of at most 512 characters".into(),
+                    )
+                })
+        })
+        .transpose()
+}
+
 impl SchedulerService {
     async fn create_schedule(
         &self,
@@ -278,6 +294,7 @@ impl SchedulerService {
             return Err(SchedulerError::Validation("invalid schedule name".into()));
         }
         let group_name = group(body);
+        let description = schedule_description(body)?;
         let expression = body
             .get("ScheduleExpression")
             .and_then(Value::as_str)
@@ -334,6 +351,7 @@ impl SchedulerService {
         .to_string();
         let schedule = Schedule {
             name: schedule_name.into(),
+            description,
             arn: arn.clone(),
             group: group_name,
             expression,
@@ -385,6 +403,7 @@ impl SchedulerService {
     ) -> Result<Value, SchedulerError> {
         let schedule_name = name(path_name, "schedule")?;
         let group_name = group(body);
+        let description = schedule_description(body)?;
         let expression = body
             .get("ScheduleExpression")
             .and_then(Value::as_str)
@@ -427,6 +446,7 @@ impl SchedulerService {
             .ok_or_else(|| {
                 SchedulerError::ResourceNotFound(format!("Schedule {schedule_name} does not exist"))
             })?;
+        schedule.description = description;
         schedule.expression = expression;
         schedule.timezone = timezone;
         schedule.flexible_window = window;
@@ -709,7 +729,11 @@ fn schedule_summary(schedule: &Schedule) -> Value {
     json!({"Name":schedule.name,"Arn":schedule.arn,"GroupName":schedule.group,"State":schedule.state,"Target":{"Arn":schedule.target.get("Arn").cloned().unwrap_or(Value::Null)}})
 }
 fn schedule_json(schedule: &Schedule) -> Value {
-    json!({"Name":schedule.name,"Arn":schedule.arn,"GroupName":schedule.group,"ScheduleExpression":schedule.expression,"ScheduleExpressionTimezone":schedule.timezone,"FlexibleTimeWindow":schedule.flexible_window,"StartDate":schedule.start_date.map(OffsetDateTime::unix_timestamp),"EndDate":schedule.end_date.map(OffsetDateTime::unix_timestamp),"State":schedule.state,"ActionAfterCompletion":schedule.action_after_completion,"KmsKeyArn":schedule.kms_key_arn,"Target":schedule.target})
+    let mut value = json!({"Name":schedule.name,"Arn":schedule.arn,"GroupName":schedule.group,"ScheduleExpression":schedule.expression,"ScheduleExpressionTimezone":schedule.timezone,"FlexibleTimeWindow":schedule.flexible_window,"StartDate":schedule.start_date.map(OffsetDateTime::unix_timestamp),"EndDate":schedule.end_date.map(OffsetDateTime::unix_timestamp),"State":schedule.state,"ActionAfterCompletion":schedule.action_after_completion,"KmsKeyArn":schedule.kms_key_arn,"Target":schedule.target});
+    if let Some(description) = &schedule.description {
+        value["Description"] = json!(description);
+    }
+    value
 }
 impl SchedulerService {
     pub async fn resume_schedules(&self) {
@@ -1096,6 +1120,7 @@ mod tests {
         assert!(validate_target(Some(&target)).is_err());
 
         let schedule = Schedule {
+            description: None,
             name: "a".into(),
             arn: "a".into(),
             group: "default".into(),
@@ -1145,6 +1170,7 @@ mod tests {
     async fn recurring_completion_delete_removes_current_generation() {
         let store = EbStore::new();
         let schedule = Schedule {
+            description: None,
             name: "rate".into(),
             arn: "arn:aws:scheduler:r:a:schedule/default/rate".into(),
             group: "default".into(),
@@ -1186,13 +1212,20 @@ mod tests {
             Weak::new(),
             Arc::new(crate::schedule::SystemClock),
         );
-        let body = json!({"ScheduleExpression":"at(2099-01-01T00:00:00)",
+        let body = json!({"Description":"first description","ScheduleExpression":"at(2099-01-01T00:00:00)",
             "FlexibleTimeWindow":{"Mode":"OFF"},"Target":{"Arn":"arn:aws:sqs:r:a:q",
             "RoleArn":"arn:aws:iam::a:role/r","Input":"{}"}});
         service
             .dispatch("CreateSchedule", Some("job"), "a", "r", &body)
             .await
             .unwrap();
+        assert_eq!(
+            service
+                .dispatch("GetSchedule", Some("job"), "a", "r", &json!({}))
+                .await
+                .unwrap()["Description"],
+            "first description"
+        );
         let schedule = store.scope("a", "r").await.read().await.schedules
             [&("default".into(), "job".into())]
             .clone();
@@ -1208,10 +1241,25 @@ mod tests {
             .unwrap();
         let mut disabled = body.clone();
         disabled["State"] = json!("DISABLED");
+        disabled.as_object_mut().unwrap().remove("Description");
         service
             .dispatch("UpdateSchedule", Some("job"), "a", "r", &disabled)
             .await
             .unwrap();
+        assert!(service
+            .dispatch("GetSchedule", Some("job"), "a", "r", &json!({}))
+            .await
+            .unwrap()
+            .get("Description")
+            .is_none());
+        let mut invalid = disabled.clone();
+        invalid["Description"] = json!(false);
+        assert!(service
+            .dispatch("UpdateSchedule", Some("job"), "a", "r", &invalid)
+            .await
+            .is_err());
+        assert!(schedule_description(&json!({"Description":"x".repeat(513)})).is_err());
+        assert!(schedule_description(&json!({"Description":""})).is_ok());
         assert_eq!(
             store
                 .pending_firings("scheduler", &schedule.arn)
@@ -1250,7 +1298,7 @@ mod tests {
             .dispatch("CreateScheduleGroup", Some("etl"), "a", "r", &json!({}))
             .await
             .unwrap();
-        let body = json!({"GroupName":"etl","ScheduleExpression":"at(2099-01-01T00:00:00)",
+        let body = json!({"Description":"durable description","GroupName":"etl","ScheduleExpression":"at(2099-01-01T00:00:00)",
             "FlexibleTimeWindow":{"Mode":"OFF"},"Target":{"Arn":"arn:aws:sqs:r:a:q",
             "RoleArn":"arn:aws:iam::a:role/r","Input":"{}"}});
         service
@@ -1286,6 +1334,18 @@ mod tests {
         let scope = reopened.scope("a", "r").await;
         let guard = scope.read().await;
         assert!(guard.schedule_groups.contains_key("etl"));
+        assert_eq!(
+            guard.schedules[&("etl".into(), "job".into())]
+                .description
+                .as_deref(),
+            Some("durable description")
+        );
+        let mut legacy = serde_json::to_value(&schedule).unwrap();
+        legacy.as_object_mut().unwrap().remove("description");
+        assert!(serde_json::from_value::<Schedule>(legacy)
+            .unwrap()
+            .description
+            .is_none());
         assert_eq!(
             guard.schedules[&("etl".into(), "job".into())].target["Input"],
             "{}"

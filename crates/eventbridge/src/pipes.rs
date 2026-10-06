@@ -22,6 +22,8 @@ use crate::transform;
 
 #[path = "pipe_persistence.rs"]
 mod pipe_persistence;
+#[path = "pipe_stream.rs"]
+mod pipe_stream;
 
 pub struct PipesService {
     pub store: Arc<EbStore>,
@@ -209,6 +211,7 @@ fn validate_filters(parameters: &Value) -> Result<(), PipesError> {
 }
 
 fn validate_source_parameters(source: &str, parameters: &Value) -> Result<(), PipesError> {
+    pipe_stream::validate_parameters(source, parameters)?;
     let batch = find_number(parameters, "BatchSize");
     if source.contains(":sqs:") {
         if batch.is_some_and(|value| !(1..=10).contains(&value)) {
@@ -261,6 +264,9 @@ impl PipesService {
         let target = required(body, "Target")?.to_string();
         validate_target(&target)?;
         validate_enrichment(body.get("Enrichment").and_then(Value::as_str))?;
+        pipe_stream::validate_target_parameters(
+            body.get("TargetParameters").unwrap_or(&Value::Null),
+        )?;
         let role_arn = required(body, "RoleArn")?.to_string();
         let source_parameters = body
             .get("SourceParameters")
@@ -268,6 +274,11 @@ impl PipesService {
             .unwrap_or_else(|| json!({}));
         validate_filters(&source_parameters)?;
         validate_source_parameters(&source, &source_parameters)?;
+        pipe_stream::validate_enrichment_batch(
+            &source,
+            &source_parameters,
+            body.get("Enrichment").and_then(Value::as_str),
+        )?;
         let desired = body
             .get("DesiredState")
             .and_then(Value::as_str)
@@ -312,8 +323,10 @@ impl PipesService {
             desired_state: desired.into(),
             current_state: "CREATING".into(),
             tags: pipe_tags(body),
-            generation: 1,
+            generation: (uuid::Uuid::new_v4().as_u128() as u64) & (u64::MAX >> 1),
             source_checkpoints: BTreeMap::new(),
+            source_retry_attempts: BTreeMap::new(),
+            source_completed: Default::default(),
             source_creation_timestamp: None,
             source_start_timestamp: crate::model::source_start_timestamp(),
             source_cursor: 0,
@@ -355,6 +368,15 @@ impl PipesService {
             .get_mut(name)
             .ok_or_else(|| PipesError::NotFound(format!("Pipe {name} does not exist")))?;
         if let Some(value) = body.get("SourceParameters") {
+            for key in ["StartingPosition", "StartingPositionTimestamp"] {
+                if find_value(value, key)
+                    .is_some_and(|value| Some(value) != find_value(&pipe.source_parameters, key))
+                {
+                    return Err(PipesError::Validation(format!(
+                        "{key} cannot be changed on an existing pipe"
+                    )));
+                }
+            }
             validate_filters(value)?;
             validate_source_parameters(&pipe.source, value)?;
         }
@@ -381,6 +403,9 @@ impl PipesService {
                 return Err(PipesError::Validation("invalid DesiredState".into()));
             }
         }
+        if let Some(parameters) = body.get("TargetParameters") {
+            pipe_stream::validate_target_parameters(parameters)?;
+        }
         let mut pipe = pipe.clone();
         pipe.current_state = "UPDATING".into();
         if body.get("Description").is_some() {
@@ -390,11 +415,9 @@ impl PipesService {
                 .map(str::to_string);
         }
         if let Some(value) = body.get("SourceParameters") {
-            pipe.source_parameters = value.clone();
-            pipe.source_checkpoints.clear();
-            pipe.source_creation_timestamp = None;
-            pipe.source_start_timestamp = crate::model::source_start_timestamp();
-            pipe.source_cursor = 0;
+            merge_parameters(&mut pipe.source_parameters, value);
+            // Source identity/committed position survives configuration updates; generation cancellation fences old workers.
+            // Changing the initial position requires a new pipe, as AWS UpdatePipe has no StartingPosition field.
         }
         if body.get("Enrichment").is_some() {
             pipe.enrichment = body
@@ -417,6 +440,11 @@ impl PipesService {
         if let Some(value) = body.get("DesiredState").and_then(Value::as_str) {
             pipe.desired_state = value.into();
         }
+        pipe_stream::validate_enrichment_batch(
+            &pipe.source,
+            &pipe.source_parameters,
+            pipe.enrichment.as_deref(),
+        )?;
         pipe.generation += 1;
         pipe_persistence::save(self.store.state_db(), account, region, &pipe)
             .map_err(PipesError::Internal)?;
@@ -671,6 +699,19 @@ impl PipesService {
                 let Some(registry) = registry.upgrade() else {
                     break;
                 };
+                if current.source.contains(":kinesis:") || current.source.contains(":dynamodb:") {
+                    pipe_stream::run_round(
+                        registry.clone(),
+                        store.clone(),
+                        http.clone(),
+                        current,
+                        region.clone(),
+                        account.clone(),
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 let batch = match poll_source(&registry, &current, &region, &account).await {
                     Ok(batch) => batch,
                     Err(()) => {
@@ -784,6 +825,7 @@ struct PolledRecord {
     payload: Value,
     receipt: Option<String>,
     stream_checkpoint: Option<(String, String)>,
+    source_expires_at: Option<f64>,
 }
 
 struct PollBatch {
@@ -833,6 +875,7 @@ async fn poll_source(
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     stream_checkpoint: None,
+                    source_expires_at: None,
                 }
             })
             .collect();
@@ -843,6 +886,7 @@ async fn poll_source(
         });
     }
 
+    let mut source_retention_seconds = 24.0 * 3600.0;
     let source_creation_timestamp = if pipe.source.contains(":kinesis:") {
         let description = dispatch_json(
             registry,
@@ -854,6 +898,10 @@ async fn poll_source(
             region,
         )
         .await?;
+        source_retention_seconds = description["StreamDescription"]["RetentionPeriodHours"]
+            .as_f64()
+            .unwrap_or(24.0)
+            * 3600.0;
         let observed = description["StreamDescription"]["StreamCreationTimestamp"]
             .as_f64()
             .ok_or(())?;
@@ -884,29 +932,75 @@ async fn poll_source(
         .take(1)
     {
         let cursor = create_stream_iterator(registry, pipe, region, account, shard).await?;
-        let response = dispatch_json(
-            registry,
-            pipe,
-            account,
-            service,
-            target,
-            json!({"ShardIterator":cursor,"Limit":find_number(&pipe.source_parameters,"BatchSize").unwrap_or(100)}),
-            region,
-        )
-        .await?;
-        for payload in response
-            .get("Records")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .cloned()
-        {
-            let sequence = stream_sequence(pipe, &payload).ok_or(())?.to_string();
-            records.push(PolledRecord {
-                payload,
-                receipt: None,
-                stream_checkpoint: Some((shard.clone(), sequence)),
-            });
+        let limit = find_number(&pipe.source_parameters, "BatchSize")
+            .unwrap_or(100)
+            .saturating_mul(
+                find_number(&pipe.source_parameters, "ParallelizationFactor").unwrap_or(1),
+            )
+            .min(10_000);
+        let window =
+            find_number(&pipe.source_parameters, "MaximumBatchingWindowInSeconds").unwrap_or(0);
+        let mut cursor = cursor;
+        let started = tokio::time::Instant::now();
+        let mut payload_bytes = 2usize;
+        let mut full = false;
+        let payload_limit = if pipe.target.contains(":states:") {
+            262_144
+        } else {
+            6 * 1024 * 1024
+        } * find_number(&pipe.source_parameters, "ParallelizationFactor")
+            .unwrap_or(1) as usize;
+        loop {
+            let response = dispatch_json(
+            registry, pipe, account, service, target,
+            json!({"ShardIterator":cursor,"Limit":limit.saturating_sub(records.len() as u64).max(1)}), region,
+        ).await?;
+            for payload in response
+                .get("Records")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+            {
+                let sequence = stream_sequence(pipe, &payload).ok_or(())?.to_string();
+                let payload = if pipe.source.contains(":kinesis:") {
+                    json!({"kinesisSchemaVersion":"1.0","partitionKey":payload["PartitionKey"],"sequenceNumber":sequence,
+                    "data":payload["Data"],"approximateArrivalTimestamp":payload["ApproximateArrivalTimestamp"],
+                    "eventSource":"aws:kinesis","eventVersion":"1.0","eventID":format!("{shard}:{sequence}"),
+                    "eventName":"aws:kinesis:record","invokeIdentityArn":pipe.role_arn,"awsRegion":region,"eventSourceARN":pipe.source})
+                } else {
+                    payload
+                };
+                let bytes = payload.to_string().len() + 1;
+                if !records.is_empty() && payload_bytes.saturating_add(bytes) > payload_limit {
+                    full = true;
+                    break;
+                }
+                payload_bytes = payload_bytes.saturating_add(bytes);
+                let source_expires_at = payload
+                    .get("approximateArrivalTimestamp")
+                    .or_else(|| payload.pointer("/dynamodb/ApproximateCreationDateTime"))
+                    .and_then(Value::as_f64)
+                    .map(|timestamp| timestamp + source_retention_seconds);
+                records.push(PolledRecord {
+                    payload,
+                    receipt: None,
+                    stream_checkpoint: Some((shard.clone(), sequence)),
+                    source_expires_at,
+                });
+            }
+            if full
+                || records.is_empty()
+                || records.len() >= limit as usize
+                || started.elapsed() >= Duration::from_secs(window)
+            {
+                break;
+            }
+            let Some(next) = response.get("NextShardIterator").and_then(Value::as_str) else {
+                break;
+            };
+            cursor = next.to_string();
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     Ok(PollBatch {
@@ -1075,7 +1169,7 @@ async fn process_record(
         }) = EbArn::parse(enrichment)
         {
             if arn_region != region || arn_account != account {
-                return handle_record_failure(registry, pipe, record, region, account).await;
+                return false;
             }
             let scope = store.scope(account, region).await;
             let configuration = {
@@ -1089,7 +1183,7 @@ async fn process_record(
                 })
             };
             let Some((destination, connection)) = configuration else {
-                return handle_record_failure(registry, pipe, record, region, account).await;
+                return false;
             };
             match crate::events::invoke_api_destination(
                 http,
@@ -1100,7 +1194,7 @@ async fn process_record(
             .await
             {
                 crate::events::ApiDelivery::Success(value) => value,
-                _ => return handle_record_failure(registry, pipe, record, region, account).await,
+                _ => return false,
             }
         } else {
             let Ok(value) = invoke_sync_enrichment(
@@ -1113,7 +1207,7 @@ async fn process_record(
             )
             .await
             else {
-                return handle_record_failure(registry, pipe, record, region, account).await;
+                return false;
             };
             value
         };
@@ -1135,9 +1229,13 @@ async fn process_record(
         sqs_parameters: find_value(&pipe.target_parameters, "SqsQueueParameters").cloned(),
         target_parameters: Some(pipe.target_parameters.clone()),
         retry: RetryPolicy {
-            maximum_attempts: find_number(&pipe.source_parameters, "MaximumRetryAttempts")
-                .unwrap_or(0)
-                .min(u64::from(u32::MAX)) as u32,
+            maximum_attempts: if record.stream_checkpoint.is_some() {
+                0
+            } else {
+                find_number(&pipe.source_parameters, "MaximumRetryAttempts")
+                    .unwrap_or(0)
+                    .min(u64::from(u32::MAX)) as u32
+            },
             maximum_age_seconds: find_number(&pipe.source_parameters, "MaximumRecordAgeInSeconds"),
         },
         dead_letter_arn: None,
@@ -1152,7 +1250,7 @@ async fn process_record(
             None => true,
         };
     }
-    handle_record_failure(registry, pipe, record, region, account).await
+    false
 }
 
 async fn invoke_sync_enrichment(
@@ -1259,23 +1357,60 @@ fn record_matches(pipe: &Pipe, record: &Value) -> bool {
         })
 }
 fn apply_pipe_template(template: &str, payload: &Value) -> String {
-    let mut output = template.to_string();
-    while let Some(start) = output.find("<$") {
-        let Some(relative_end) = output[start..].find('>') else {
+    let mut output = String::with_capacity(template.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = template[cursor..].find("<$") {
+        let start = cursor + relative_start;
+        let Some(relative_end) = template[start..].find('>') else {
             break;
         };
         let end = start + relative_end;
-        let path = &output[start + 1..end];
-        let value = transform::extract(payload, path);
-        let replacement = match value {
-            Value::String(value) => value,
-            Value::Null => String::new(),
-            other => other.to_string(),
+        output.push_str(&template[cursor..start]);
+        let value = transform::extract(payload, &template[start + 1..end]);
+        let mut quoted = false;
+        let mut escaped = false;
+        for byte in template[..start].bytes() {
+            match (byte, escaped) {
+                (_, true) => escaped = false,
+                (b'\\', false) => escaped = true,
+                (b'"', false) => quoted = !quoted,
+                _ => {}
+            }
+        }
+        let replacement = if quoted {
+            let text = match value {
+                Value::String(value) => value,
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            let json = serde_json::to_string(&text).unwrap_or_default();
+            json[1..json.len() - 1].to_string()
+        } else {
+            value.to_string()
         };
-        output.replace_range(start..=end, &replacement);
+        output.push_str(&replacement);
+        cursor = end + 1;
     }
+    output.push_str(&template[cursor..]);
     output
 }
+
+fn merge_parameters(current: &mut Value, update: &Value) {
+    match (current, update) {
+        (Value::Object(current), Value::Object(update)) => {
+            for (key, value) in update {
+                match current.get_mut(key) {
+                    Some(current) => merge_parameters(current, value),
+                    None => {
+                        current.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (current, update) => *current = update.clone(),
+    }
+}
+
 fn find_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     if let Some(found) = value.get(key) {
         return Some(found);
@@ -1285,7 +1420,7 @@ fn find_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
         .values()
         .find_map(|child| find_value(child, key))
 }
-fn find_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn find_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     find_value(value, key).and_then(Value::as_str)
 }
 fn find_number(value: &Value, key: &str) -> Option<u64> {
@@ -1357,7 +1492,7 @@ async fn dispatch_json(
     if !response.status().is_success() {
         return Err(());
     }
-    let bytes = to_bytes(response.into_body(), usize::MAX)
+    let bytes = to_bytes(response.into_body(), 15 * 1024 * 1024)
         .await
         .map_err(|_| ())?;
     if bytes.is_empty() {
@@ -1909,6 +2044,8 @@ mod tests {
             tags: BTreeMap::new(),
             generation: 1,
             source_checkpoints: BTreeMap::new(),
+            source_retry_attempts: BTreeMap::new(),
+            source_completed: Default::default(),
             source_creation_timestamp: None,
             source_start_timestamp: crate::model::source_start_timestamp(),
             source_cursor: 0,
@@ -2063,6 +2200,8 @@ mod tests {
             tags: BTreeMap::new(),
             generation: 1,
             source_checkpoints: BTreeMap::new(),
+            source_retry_attempts: BTreeMap::new(),
+            source_completed: Default::default(),
             source_creation_timestamp: None,
             source_start_timestamp: crate::model::source_start_timestamp(),
             source_cursor: 0,

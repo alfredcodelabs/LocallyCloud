@@ -842,7 +842,7 @@ proptest! {
                 if matches_filter {
                     prop_assert_eq!(calls.len(), 2);
                     prop_assert_eq!(calls[0].0.as_str(), "RequestResponse");
-                    prop_assert_eq!(calls[1].0.as_str(), "Event");
+                    prop_assert_eq!(calls[1].0.as_str(), "RequestResponse");
                     prop_assert_eq!(&calls[1].1, &enriched);
                 } else {
                     prop_assert!(calls.is_empty());

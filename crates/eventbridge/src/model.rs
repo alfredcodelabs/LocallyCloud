@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -118,6 +118,8 @@ pub struct ScheduleGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub arn: String,
     pub group: String,
     pub expression: String,
@@ -151,6 +153,10 @@ pub struct Pipe {
     pub generation: u64,
     /// Last successfully processed sequence number for each stream shard.
     pub source_checkpoints: BTreeMap<String, String>,
+    #[serde(default)]
+    pub source_retry_attempts: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub source_completed: BTreeSet<String>,
     #[serde(default)]
     pub source_creation_timestamp: Option<f64>,
     #[serde(default = "source_start_timestamp")]

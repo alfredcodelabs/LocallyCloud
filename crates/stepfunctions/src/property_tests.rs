@@ -667,6 +667,27 @@ proptest! {
             let synced = ok(&states, "StartSyncExecution", json!({ "stateMachineArn": express })).await;
             assert_eq!(synced["status"], "SUCCEEDED", "{synced}");
             assert_eq!(serde_json::from_str::<Value>(synced["output"].as_str().expect("output")).unwrap(), value);
+            for (name, child, expected) in [("sdk-standard", standard, "FAILED"), ("sdk-express", express, "SUCCEEDED")] {
+                let parent = create_machine(&states, name, json!({"StartAt":"Run", "States":{"Run":{
+                    "Type":"Task", "Resource":"arn:aws:states:::aws-sdk:sfn:startSyncExecution",
+                    "Parameters":{"StateMachineArn":child,"Input":"{}"},"End":true
+                }}}), "STANDARD").await;
+                let result = start_and_wait(&states, &parent, json!({})).await;
+                assert_eq!(result["status"], expected, "{result}");
+                if expected == "FAILED" { assert_eq!(result["error"], "Sfn.StateMachineTypeNotSupportedException"); }
+            }
+            let business = create_machine(&states, "sync-business", json!({"StartAt":"Reject", "States":{"Reject":{
+                "Type":"Fail","Error":"BusinessRejected"
+            }}}), "EXPRESS").await;
+            let parent = create_machine(&states, "sdk-business", json!({"StartAt":"Run", "States":{"Run":{
+                "Type":"Task", "Resource":"arn:aws:states:::aws-sdk:sfn:startSyncExecution",
+                "Parameters":{"StateMachineArn":business,"Input":"{}"},"End":true
+            }}}), "STANDARD").await;
+            let result = start_and_wait(&states, &parent, json!({})).await;
+            assert_eq!(result["status"], "SUCCEEDED");
+            let output: Value = serde_json::from_str(result["output"].as_str().unwrap()).unwrap();
+            assert_eq!(output["Status"], "FAILED");
+            assert_eq!(output["Error"], "BusinessRejected");
         });
     }
 

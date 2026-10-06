@@ -793,11 +793,26 @@ mod tests {
         assert_eq!(rv["Messages"][0]["Body"], "from-sfn");
     }
 
-    struct FailingLambda;
+    struct FailingLambda(Option<(u16, &'static str)>);
 
     #[async_trait]
     impl NativeHandler for FailingLambda {
         async fn handle(&self, _request: ServiceRequest) -> Response {
+            if let Some((status, error)) = self.0 {
+                return Response::builder()
+                    .status(status)
+                    .header(
+                        "x-amzn-errortype",
+                        match status {
+                            429 => format!("com.amazonaws.lambda#{error}:http://legacy.invalid"),
+                            _ => error.to_string(),
+                        },
+                    )
+                    .body(Body::from(
+                        json!({"Message":"admission rejected"}).to_string(),
+                    ))
+                    .unwrap();
+            }
             Response::builder()
                 .status(200)
                 .header("x-amz-function-error", "Handled")
@@ -819,7 +834,7 @@ mod tests {
         reg.register_native(
             ServiceName::new("lambda"),
             ServiceMetadata::new(AwsProtocol::RestJson, None),
-            Arc::new(FailingLambda),
+            Arc::new(FailingLambda(None)),
         );
         let h = handler(&reg, "states");
         let def = json!({
@@ -862,6 +877,56 @@ mod tests {
             serde_json::from_str(output["failure"]["Cause"].as_str().unwrap()).unwrap();
         assert_eq!(cause["errorMessage"], "slot conflict");
         assert_eq!(cause["trace"], json!(["index.js:12"]));
+    }
+
+    #[tokio::test]
+    async fn lambda_http_errors_use_named_retry_and_catch_for_both_integrations() {
+        let reg = registry();
+        let h = handler(&reg, "states");
+        for (index, resource) in [
+            "arn:aws:states:::lambda:invoke",
+            "arn:aws:lambda:us-east-1:000000000000:function:ledger",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (status, code) in [(429, "TooManyRequestsException"), (500, "ServiceException")] {
+                reg.register_native(
+                    ServiceName::new("lambda"),
+                    ServiceMetadata::new(AwsProtocol::RestJson, None),
+                    Arc::new(FailingLambda(Some((status, code)))),
+                );
+                let error = format!("Lambda.{code}");
+                let def = json!({"StartAt":"Invoke","States":{
+                    "Invoke":{"Type":"Task","Resource":resource,"Parameters":{"FunctionName":"ledger","Payload":{}},
+                        "Retry":[{"ErrorEquals":[error],"IntervalSeconds":1,"MaxAttempts":1}],
+                        "Catch":[{"ErrorEquals":[error],"ResultPath":"$.failure","Next":"Handled"}],"End":true},
+                    "Handled":{"Type":"Pass","End":true}}});
+                let arn = create_sm(&h, &format!("lambda-http-{index}-{status}"), def).await;
+                let start = sfn(&h, "StartExecution", json!({"stateMachineArn":arn})).await;
+                let execution = await_execution(&h, start["executionArn"].as_str().unwrap()).await;
+                assert_eq!(execution["status"], "SUCCEEDED", "{execution}");
+                let output: Value =
+                    serde_json::from_str(execution["output"].as_str().unwrap()).unwrap();
+                assert_eq!(output["failure"]["Error"], error);
+                assert_eq!(output["failure"]["Cause"], "admission rejected");
+                let history = sfn(
+                    &h,
+                    "GetExecutionHistory",
+                    json!({"executionArn":start["executionArn"]}),
+                )
+                .await;
+                assert_eq!(
+                    history["events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| event["type"] == "TaskFailed")
+                        .count(),
+                    2
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1867,5 +1932,97 @@ mod tests {
         sink.release.notify_one();
         assert_eq!(sync.await.unwrap()["status"], "SUCCEEDED");
         await_machine_deleted(&h, &arn).await;
+    }
+    #[tokio::test]
+    async fn sdk_sqs_drainer_preserves_visibility_and_partial_delete() {
+        let reg = registry();
+        let states = handler(&reg, "states");
+        let sqs = handler(&reg, "sqs");
+        let url = "https://sqs.us-east-1.amazonaws.com/000000000000/sdk-drain";
+        sqs.handle(req(
+            "AmazonSQS",
+            "CreateQueue",
+            json!({"QueueName":"sdk-drain"}),
+        ))
+        .await;
+        sqs.handle(req(
+            "AmazonSQS",
+            "SendMessage",
+            json!({"QueueUrl":url,"MessageBody":"ledger"}),
+        ))
+        .await;
+        async fn task(h: &Arc<dyn NativeHandler>, action: &str, parameters: Value) -> Value {
+            let arn = create_sm(
+                h,
+                &format!("sdk-{action}"),
+                json!({
+                    "StartAt":"Call", "States":{"Call":{"Type":"Task",
+                    "Resource":format!("arn:aws:states:::aws-sdk:sqs:{action}"),
+                    "Parameters":parameters,"End":true}}
+                }),
+            )
+            .await;
+            let started = sfn(h, "StartExecution", json!({"stateMachineArn":arn})).await;
+            let result = await_execution(h, started["executionArn"].as_str().unwrap()).await;
+            assert_eq!(result["status"], "SUCCEEDED", "{result}");
+            serde_json::from_str(result["output"].as_str().unwrap()).unwrap()
+        }
+        let received = task(
+            &states,
+            "receiveMessage",
+            json!({"QueueUrl":url,"MaxNumberOfMessages":1,"WaitTimeSeconds":1}),
+        )
+        .await;
+        assert_eq!(received["Messages"][0]["Body"], "ledger");
+        let handle = received["Messages"][0]["ReceiptHandle"].clone();
+        task(
+            &states,
+            "changeMessageVisibility",
+            json!({"QueueUrl":url,"ReceiptHandle":handle,"VisibilityTimeout":60}),
+        )
+        .await;
+        let batch = task(&states, "changeMessageVisibilityBatch", json!({"QueueUrl":url,"Entries":[{"Id":"release","ReceiptHandle":handle,"VisibilityTimeout":0}]})).await;
+        assert_eq!(batch["Successful"][0]["Id"], "release");
+        let (_, received) = body_of(
+            sqs.handle(req("AmazonSQS", "ReceiveMessage", json!({"QueueUrl":url})))
+                .await,
+        )
+        .await;
+        let batch = task(
+            &states,
+            "deleteMessageBatch",
+            json!({"QueueUrl":url,"Entries":[
+                {"Id":"ok","ReceiptHandle":received["Messages"][0]["ReceiptHandle"]},
+                {"Id":"bad","ReceiptHandle":"malformed"}
+            ]}),
+        )
+        .await;
+        assert_eq!(batch["Successful"][0]["Id"], "ok");
+        assert_eq!(batch["Failed"][0]["Id"], "bad");
+        sqs.handle(req(
+            "AmazonSQS",
+            "SendMessage",
+            json!({"QueueUrl":url,"MessageBody":"second"}),
+        ))
+        .await;
+        let (_, received) = body_of(
+            sqs.handle(req("AmazonSQS", "ReceiveMessage", json!({"QueueUrl":url})))
+                .await,
+        )
+        .await;
+        task(
+            &states,
+            "deleteMessage",
+            json!({"QueueUrl":url,"ReceiptHandle":received["Messages"][0]["ReceiptHandle"]}),
+        )
+        .await;
+        let (_, empty) = body_of(
+            sqs.handle(req("AmazonSQS", "ReceiveMessage", json!({"QueueUrl":url})))
+                .await,
+        )
+        .await;
+        assert!(empty
+            .get("Messages")
+            .is_none_or(|messages| messages.as_array().unwrap().is_empty()));
     }
 }

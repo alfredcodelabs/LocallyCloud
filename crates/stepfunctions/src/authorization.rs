@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::authorization::{
-    AuthorizationRequest, ServiceRoleAuthorizationRequest,
+    AuthorizationEvaluator, AuthorizationRequest, ServiceRoleAuthorizationRequest,
 };
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
@@ -125,6 +125,55 @@ fn policy_resource(
     (resource, context)
 }
 
+// Operators retain IAM checks through Core's scoped dispatcher. Delegated service
+// calls have already been authorized by their source adapter.
+fn authenticated_caller(
+    evaluator: &dyn AuthorizationEvaluator,
+    request: &ServiceRequest,
+) -> Result<Option<RequestIdentity>, SfnError> {
+    let internal = request
+        .headers
+        .get("x-locallycloud-verified-internal-scope")
+        .is_some_and(|v| v == "1");
+    let external = request
+        .headers
+        .get("x-locallycloud-verified-external-sigv4")
+        .is_some_and(|v| v == "1");
+    if internal == external {
+        return Err(SfnError::AccessDenied);
+    }
+    let identity = RequestIdentity {
+        account_id: request.account_id.clone(),
+        access_key_id: request
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(RequestIdentity::access_key_from_authorization),
+        arn: None,
+    };
+    if external {
+        if identity.access_key_id.is_none() {
+            return Err(SfnError::AccessDenied);
+        }
+        return Ok(Some(identity));
+    }
+    let principal = request
+        .headers
+        .get(locallycloud_core::integration::identity::PRINCIPAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(SfnError::AccessDenied)?;
+    match evaluator.resolve_caller_arn(&identity) {
+        Ok(Some(resolved)) if resolved == principal => Ok(Some(identity)),
+        Ok(Some(_)) => Err(SfnError::AccessDenied),
+        _ if locallycloud_core::integration::identity::trusted_role(request).is_some()
+            || principal.ends_with(".amazonaws.com") =>
+        {
+            Ok(None)
+        }
+        _ => Err(SfnError::AccessDenied),
+    }
+}
+
 pub fn authorize(
     registry: &ServiceRegistry,
     request: &ServiceRequest,
@@ -141,34 +190,12 @@ pub fn authorize(
         return Ok(());
     };
     let (resource, context) = policy_resource(op, resource, request);
-    // Core removes client-supplied marker headers and sets exactly one after verification.
-    if request
-        .headers
-        .get("x-locallycloud-verified-internal-scope")
-        .is_some_and(|v| v == "1")
-    {
+    let Some(identity) = authenticated_caller(evaluator.as_ref(), request)? else {
         return Ok(());
-    }
-    if !request
-        .headers
-        .get("x-locallycloud-verified-external-sigv4")
-        .is_some_and(|v| v == "1")
-    {
-        return Err(SfnError::AccessDenied);
-    }
-    let access_key_id = request
-        .headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(RequestIdentity::access_key_from_authorization)
-        .ok_or(SfnError::AccessDenied)?;
+    };
     evaluator
         .authorize(AuthorizationRequest {
-            request_identity: RequestIdentity {
-                account_id: request.account_id.clone(),
-                access_key_id: Some(access_key_id),
-                arn: None,
-            },
+            request_identity: identity,
             delegated_identity: None,
             source_service: "states".into(),
             action: format!("states:{op}"),
@@ -196,27 +223,12 @@ pub fn authorize_role_assignment(
     if !evaluator.strict_sigv4_required() {
         return Ok(());
     }
-    if !request
-        .headers
-        .get("x-locallycloud-verified-external-sigv4")
-        .is_some_and(|value| value == "1")
-    {
-        return Err(SfnError::AccessDenied);
-    }
-    let access_key_id = request
-        .headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(RequestIdentity::access_key_from_authorization)
-        .ok_or(SfnError::AccessDenied)?;
+    let caller =
+        authenticated_caller(evaluator.as_ref(), request)?.ok_or(SfnError::AccessDenied)?;
     evaluator
         .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
             source_arn: resource(op, body, request)?,
-            caller: RequestIdentity {
-                account_id: request.account_id.clone(),
-                access_key_id: Some(access_key_id),
-                arn: None,
-            },
+            caller,
             role_arn: role_arn.into(),
             service_principal: "states.amazonaws.com".into(),
             action: "iam:PassRole".into(),
@@ -241,6 +253,142 @@ mod tests {
             region: "us-east-1".into(),
             account_id: "000000000000".into(),
             request_id: "test".into(),
+        }
+    }
+
+    #[test]
+    fn scoped_operator_requires_states_and_pass_role_permissions() {
+        use axum::response::Response;
+        use locallycloud_core::handler::NativeHandler;
+        use locallycloud_core::integration::authorization::AuthorizationError;
+        use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
+        use std::sync::{Arc, Mutex};
+        struct Evaluator(Mutex<Option<&'static str>>);
+        impl AuthorizationEvaluator for Evaluator {
+            fn strict_sigv4_required(&self) -> bool {
+                true
+            }
+            fn resolve_caller_arn(
+                &self,
+                identity: &RequestIdentity,
+            ) -> Result<Option<String>, AuthorizationError> {
+                Ok((identity.access_key_id.as_deref() == Some("OPERATOR"))
+                    .then(|| "arn:aws:iam::000000000000:user/operator".into()))
+            }
+            fn authorize(&self, req: AuthorizationRequest) -> Result<(), AuthorizationError> {
+                assert_eq!(
+                    req.request_identity.access_key_id.as_deref(),
+                    Some("OPERATOR")
+                );
+                assert_eq!(req.action, "states:CreateStateMachine");
+                assert!(req.delegated_identity.is_none());
+                if *self.0.lock().unwrap() == Some("states") {
+                    Err(AuthorizationError::Denied)
+                } else {
+                    Ok(())
+                }
+            }
+            fn authorize_service_role_assignment(
+                &self,
+                req: ServiceRoleAuthorizationRequest,
+            ) -> Result<(), AuthorizationError> {
+                assert_eq!(req.caller.access_key_id.as_deref(), Some("OPERATOR"));
+                assert_eq!(req.action, "iam:PassRole");
+                assert_eq!(req.service_principal, "states.amazonaws.com");
+                assert_eq!(req.role_arn, "arn:aws:iam::000000000000:role/workflow");
+                assert_eq!(
+                    req.source_arn.as_deref(),
+                    Some("arn:aws:states:us-east-1:000000000000:stateMachine:job")
+                );
+                if *self.0.lock().unwrap() == Some("pass-role") {
+                    Err(AuthorizationError::Denied)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl NativeHandler for Evaluator {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                http::Response::builder()
+                    .status(501)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        }
+        let registry = ServiceRegistry::new();
+        let evaluator = Arc::new(Evaluator(Mutex::new(None)));
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            evaluator.clone(),
+            evaluator.clone(),
+        );
+        let body = json!({"name":"job","roleArn":"arn:aws:iam::000000000000:role/workflow"});
+        let mut req = request();
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=OPERATOR/20261006/us-east-1/states/aws4_request"
+                .parse()
+                .unwrap(),
+        );
+        req.headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            "arn:aws:iam::000000000000:user/operator".parse().unwrap(),
+        );
+        // A principal header and access key alone are never trusted.
+        assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_err());
+        assert!(authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_err());
+        req.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_ok());
+        assert!(authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_ok());
+        *evaluator.0.lock().unwrap() = Some("states");
+        assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_err());
+        *evaluator.0.lock().unwrap() = Some("pass-role");
+        assert!(authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_err());
+        *evaluator.0.lock().unwrap() = None;
+        req.headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            "arn:aws:iam::000000000000:user/other".parse().unwrap(),
+        );
+        assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_err());
+        assert!(authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_err());
+        req.headers.insert(
+            "x-locallycloud-verified-external-sigv4",
+            "1".parse().unwrap(),
+        );
+        assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_err());
+        req.headers.remove("x-locallycloud-verified-internal-scope");
+        assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_ok());
+        assert!(authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_ok());
+        // Source-authorized service/role invocations keep their existing delegation path.
+        req.headers.remove("x-locallycloud-verified-external-sigv4");
+        req.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=locallycloud/20261006/us-east-1/states/aws4_request"
+                .parse()
+                .unwrap(),
+        );
+        for principal in [
+            "scheduler.amazonaws.com",
+            "arn:aws:iam::000000000000:role/worker/session",
+        ] {
+            req.headers.insert(
+                locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+                principal.parse().unwrap(),
+            );
+            assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_ok());
+            // Delegation does not authorize assigning a new execution role.
+            assert!(
+                authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_err()
+            );
         }
     }
 

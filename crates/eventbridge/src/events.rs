@@ -1041,8 +1041,10 @@ fn target_json(target: &Target) -> Value {
     if let Some(arn) = &target.dead_letter_arn {
         value["DeadLetterConfig"] = json!({"Arn":arn});
     }
-    if let Some(retry_policy) = target.extra.get("RetryPolicy") {
-        value["RetryPolicy"] = retry_policy.clone();
+    for field in ["RetryPolicy", "KinesisParameters"] {
+        if let Some(parameters) = target.extra.get(field) {
+            value[field] = parameters.clone();
+        }
     }
     value
 }
@@ -3290,6 +3292,55 @@ mod tests {
             Arc::new(FixedClock(now)),
             Arc::new(crate::http_client::CurlHttpClient),
         )
+    }
+
+    #[tokio::test]
+    async fn target_query_roundtrips_supported_parameters_without_extra_metadata() {
+        let service = test_service(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap());
+        let ctx = RequestContext {
+            account: "000000000000",
+            region: "us-east-1",
+            request_id: "roundtrip",
+        };
+        service
+            .put_rule(
+                &ctx,
+                &json!({"Name":"ledger", "EventPattern":"{\"source\":[\"order-app.ledger\"]}"}),
+            )
+            .await
+            .unwrap();
+        let targets = json!([
+            {"Id":"stream", "Arn":"arn:aws:kinesis:us-east-1:000000000000:stream/ledger",
+             "RoleArn":"arn:aws:iam::000000000000:role/events", "InputPath":"$.detail",
+             "KinesisParameters":{"PartitionKeyPath":"$.detail.ledgerId"},
+             "RetryPolicy":{"MaximumRetryAttempts":2,"MaximumEventAgeInSeconds":1800},
+             "DeadLetterConfig":{"Arn":"arn:aws:sqs:us-east-1:000000000000:errors"},
+             "InternalMetadata":"must-not-leak"},
+            {"Id":"queue", "Arn":"arn:aws:sqs:us-east-1:000000000000:ledger.fifo",
+             "SqsParameters":{"MessageGroupId":"ledger"}, "Input":"{\"ledgerId\":\"one\"}"}
+        ]);
+        let added = service
+            .put_targets(&ctx, &json!({"Rule":"ledger","Targets":targets}))
+            .await
+            .unwrap();
+        assert_eq!(added["FailedEntryCount"], 0);
+        let result = service
+            .list_targets(&ctx, &json!({"Rule":"ledger"}))
+            .await
+            .unwrap();
+        let returned = result["Targets"].as_array().unwrap();
+        assert_eq!(returned.len(), 2);
+        for target in returned {
+            let original = targets
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["Id"] == target["Id"])
+                .unwrap();
+            let mut expected = original.clone();
+            expected.as_object_mut().unwrap().remove("InternalMetadata");
+            assert_eq!(*target, expected);
+        }
     }
 
     #[tokio::test]

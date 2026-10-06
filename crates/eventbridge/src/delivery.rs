@@ -267,6 +267,19 @@ pub async fn deliver(
     region: &str,
     account: &str,
 ) -> Result<(), DeliveryFailure> {
+    if request.source_service == "pipes"
+        && matches!(arn_service(&request.arn), Some("states" | "lambda"))
+        && request
+            .target_parameters
+            .as_ref()
+            .and_then(|parameters| crate::pipes::find_string(parameters, "InvocationType"))
+            .unwrap_or("REQUEST_RESPONSE")
+            == "REQUEST_RESPONSE"
+    {
+        return deliver_sync(registry, request, region, account)
+            .await
+            .map(|_| ());
+    }
     let dispatcher = registry.internal_dispatcher().ok_or(DeliveryFailure)?;
     let engine = DeliveryEngine::new(dispatcher);
     let result = if event_expired(request, OffsetDateTime::now_utc()) {
@@ -361,10 +374,10 @@ pub async fn deliver_sync(
                 .map_err(|_| DeliveryFailure)?,
         )
         .await;
-    if !response.status().is_success() {
+    if !response.status().is_success() || response.headers().contains_key("x-amz-function-error") {
         return Err(DeliveryFailure);
     }
-    let bytes = to_bytes(response.into_body(), usize::MAX)
+    let bytes = to_bytes(response.into_body(), 6 * 1024 * 1024)
         .await
         .map_err(|_| DeliveryFailure)?;
     sync_output(request, &bytes).map_err(|_| DeliveryFailure)
@@ -531,6 +544,18 @@ fn target_call(
         }
         _ => return Err(()),
     };
+    if request.source_service == "events" && target_service == "sqs" {
+        if let Some(source_arn) = request.source_arn.as_deref() {
+            headers.insert(
+                "x-locallycloud-source-arn",
+                HeaderValue::from_str(source_arn).map_err(|_| ())?,
+            );
+            headers.insert(
+                "x-locallycloud-source-account",
+                HeaderValue::from_str(account).map_err(|_| ())?,
+            );
+        }
+    }
     headers.insert("authorization", authorization(region, target_service)?);
     let identity = request.role_arn.as_ref().map_or(
         CallerIdentity::ServicePrincipal {
@@ -692,6 +717,37 @@ mod tests {
             dead_letter_arn: Some("arn:aws:sqs:us-east-1:000000000000:dlq".into()),
             scheduled_at: None,
         }
+    }
+
+    #[test]
+    fn sqs_rule_delivery_carries_trusted_source_context() {
+        let mut req = request(
+            "arn:aws:sqs:us-east-1:000000000000:ingestion",
+            json!({"ledgerId":"one"}),
+        );
+        let source = "arn:aws:events:us-east-1:000000000000:rule/orders/ledger";
+        req.source_arn = Some(source.into());
+        let call = target_call(
+            &req,
+            "us-east-1",
+            "000000000000",
+            InvocationMode::AsyncTarget,
+        )
+        .unwrap();
+        assert_eq!(call.headers["x-locallycloud-source-arn"], source);
+        assert_eq!(
+            call.headers["x-locallycloud-source-account"],
+            "000000000000"
+        );
+        req.source_service = "pipes";
+        let call = target_call(
+            &req,
+            "us-east-1",
+            "000000000000",
+            InvocationMode::AsyncTarget,
+        )
+        .unwrap();
+        assert!(!call.headers.contains_key("x-locallycloud-source-arn"));
     }
 
     struct StrictIam;
