@@ -8,6 +8,7 @@ pub(crate) enum SsmError {
     UnsupportedParameterType,
     ParameterAlreadyExists,
     ParameterNotFound,
+    ParameterVersionNotFound,
     InvalidKeyId,
     InvalidResourceType,
     InvalidResourceId,
@@ -16,11 +17,17 @@ pub(crate) enum SsmError {
     InvalidFilterOption,
     InvalidFilterValue,
     Internal,
+    AccessDenied,
 }
 
 impl From<SsmError> for AwsError {
     fn from(error: SsmError) -> Self {
         let (code, message, status) = match error {
+            SsmError::AccessDenied => (
+                "AccessDeniedException",
+                "Not authorized to read the parameter",
+                403,
+            ),
             SsmError::InvalidNextToken => {
                 ("InvalidNextToken", "The specified token is invalid", 400)
             }
@@ -67,6 +74,11 @@ impl From<SsmError> for AwsError {
             SsmError::InvalidKeyId => {
                 ("InvalidKeyId", "The KMS key is invalid or unavailable", 400)
             }
+            SsmError::ParameterVersionNotFound => (
+                "ParameterVersionNotFound",
+                "The requested parameter version was not found",
+                400,
+            ),
             SsmError::ParameterNotFound => (
                 "ParameterNotFound",
                 "The requested parameter was not found",

@@ -199,6 +199,7 @@ fn parse_indexes(req: &Value, field: &str, global: bool) -> Result<Vec<Secondary
 
 pub async fn create_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let name = req_str(req, "TableName")?.to_string();
+    crate::store::validate_table_name(&name)?;
     let key_schema = parse_key_schema(
         req.get("KeySchema")
             .ok_or_else(|| DdbError::Validation("KeySchema is required".into()))?,

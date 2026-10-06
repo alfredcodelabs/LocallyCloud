@@ -31,6 +31,7 @@ use crate::protocol::{
 };
 use crate::store::ParameterStore;
 
+mod batch;
 mod by_path;
 
 const KMS_CALL_LIMIT: Duration = Duration::from_secs(2);
@@ -88,6 +89,10 @@ impl SsmHandler {
         }
         let scope = Scope::new(&request.account_id, &request.region);
         match operation {
+            "GetParameters" => {
+                self.get_parameters(decode(&request.body)?, &scope, request)
+                    .await
+            }
             "GetParametersByPath" => self.get_parameters_by_path(request, &scope).await,
             "PutParameter" => {
                 self.put_parameter(decode(&request.body)?, &scope, request)
@@ -203,8 +208,37 @@ impl SsmHandler {
         scope: &Scope,
         service_request: &ServiceRequest,
     ) -> Result<Value, SsmError> {
-        validate_name(&request.name)?;
-        let parameter = self.store.get(scope, &request.name)?;
+        let (name, selector) = batch::query_name(&request.name, scope)?;
+        locallycloud_core::integration::authorization::authorize_native_read(
+            &self.registry,
+            service_request,
+            "ssm",
+            if protocol::operation(&service_request.headers)
+                .is_ok_and(|operation| operation == "GetParameters")
+            {
+                "ssm:GetParameters"
+            } else {
+                "ssm:GetParameter"
+            },
+            &scope.parameter_arn(&name),
+        )
+        .map_err(|_| SsmError::AccessDenied)?;
+        let parameter = self.store.get(scope, &name).or_else(|error| {
+            if request.name.trim().starts_with("arn:") {
+                self.store.get(scope, name.trim_start_matches('/'))
+            } else {
+                Err(error)
+            }
+        })?;
+        if let Some(selector) = selector.as_deref() {
+            match selector[1..].parse::<u64>() {
+                Ok(version) if version != parameter.version => {
+                    return Err(SsmError::ParameterVersionNotFound)
+                }
+                Err(_) => return Err(SsmError::ParameterNotFound),
+                _ => {}
+            }
+        }
         let (parameter_type, value) = match parameter.value {
             ParameterValueSnapshot::Plain(value) => ("String", value),
             ParameterValueSnapshot::Encrypted {
@@ -233,7 +267,7 @@ impl SsmHandler {
                 }
             }
         };
-        serialize(GetParameterResponse {
+        let mut output = serialize(GetParameterResponse {
             parameter: ParameterOutput {
                 arn: scope.parameter_arn(&parameter.name),
                 name: parameter.name,
@@ -243,7 +277,11 @@ impl SsmHandler {
                 last_modified_date: parameter.last_modified_date,
                 data_type: "text",
             },
-        })
+        })?;
+        if let Some(selector) = selector {
+            output["Parameter"]["Selector"] = selector.into();
+        }
+        Ok(output)
     }
 
     fn describe_parameters(

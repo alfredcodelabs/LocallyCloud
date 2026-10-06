@@ -481,13 +481,13 @@ mod tests {
     #[tokio::test]
     async fn table_and_item_lifecycle() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         assert_eq!(call(&h, "CreateTable", create).await.status(), 200);
 
-        let put = r#"{"TableName":"t","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#;
+        let put = r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#;
         assert_eq!(call(&h, "PutItem", put).await.status(), 200);
 
-        let get = r#"{"TableName":"t","Key":{"id":{"S":"a"}}}"#;
+        let get = r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#;
         let resp = call(&h, "GetItem", get).await;
         assert_eq!(resp.status(), 200);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -512,19 +512,19 @@ mod tests {
             Arc::new(TableStore::with_state(state.clone()).unwrap()),
             Weak::new(),
         );
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#;
         assert_eq!(call(&h, "CreateTable", create).await.status(), 200);
         assert_eq!(
             call(
                 &h,
                 "PutItem",
-                r#"{"TableName":"t","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#
+                r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#
             )
             .await
             .status(),
             200
         );
-        let transaction = r#"{"ClientRequestToken":"restart-token","TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"b"}}}}]}"#;
+        let transaction = r#"{"ClientRequestToken":"restart-token","TransactItems":[{"Put":{"TableName":"tbl","Item":{"id":{"S":"b"}}}}]}"#;
         assert_eq!(
             call(&h, "TransactWriteItems", transaction).await.status(),
             200
@@ -534,15 +534,19 @@ mod tests {
             Arc::new(TableStore::with_state(state).unwrap()),
             Weak::new(),
         );
-        let (status, body) =
-            call_json(&h, "GetItem", r#"{"TableName":"t","Key":{"id":{"S":"a"}}}"#).await;
+        let (status, body) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
         assert_eq!(status, 200);
         assert_eq!(body["Item"]["n"]["N"], "1");
         assert_eq!(
             call(&h, "TransactWriteItems", transaction).await.status(),
             200
         );
-        let table = h.store.get("000000000000", "us-east-1", "t").unwrap();
+        let table = h.store.get("000000000000", "us-east-1", "tbl").unwrap();
         assert_eq!(table.read().await.stream_seq, 2);
         drop(h);
         std::fs::remove_dir_all(root).unwrap();
@@ -563,17 +567,17 @@ mod tests {
         let h = DynamoHandler::with_store(store.clone(), Weak::new());
         // Keep this test deterministic: no maintenance task can commit the simulated cancelled write.
         h.reaper_started.store(true, Ordering::Release);
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         assert_eq!(call(&h, "CreateTable", create).await.status(), 200);
         store.mark_uncommitted();
         store
-            .get("000000000000", "us-east-1", "t")
+            .get("000000000000", "us-east-1", "tbl")
             .unwrap()
             .write()
             .await
             .def
             .billing_mode = "PROVISIONED".into();
-        let (status, body) = call_json(&h, "DescribeTable", r#"{"TableName":"t"}"#).await;
+        let (status, body) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
         assert_eq!(status, 200);
         assert_eq!(
             body["Table"]["BillingModeSummary"]["BillingMode"],
@@ -585,7 +589,7 @@ mod tests {
         let reopened = TableStore::with_state(state).unwrap();
         assert_eq!(
             reopened
-                .get("000000000000", "us-east-1", "t")
+                .get("000000000000", "us-east-1", "tbl")
                 .unwrap()
                 .read()
                 .await
@@ -599,11 +603,11 @@ mod tests {
     #[tokio::test]
     async fn rejected_metadata_update_keeps_original_definition() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         assert_eq!(call(&h, "CreateTable", create).await.status(), 200);
-        let rejected = r#"{"TableName":"t","BillingMode":"PROVISIONED","ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"missing"}}]}"#;
+        let rejected = r#"{"TableName":"tbl","BillingMode":"PROVISIONED","ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"missing"}}]}"#;
         assert_eq!(call(&h, "UpdateTable", rejected).await.status(), 400);
-        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"t"}"#).await;
+        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
         assert_eq!(
             body["Table"]["BillingModeSummary"]["BillingMode"],
             "PAY_PER_REQUEST"
@@ -633,11 +637,11 @@ mod tests {
     #[tokio::test]
     async fn conditional_put_fails_when_exists() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
-        let put = r#"{"TableName":"t","Item":{"id":{"S":"a"}}}"#;
+        let put = r#"{"TableName":"tbl","Item":{"id":{"S":"a"}}}"#;
         call(&h, "PutItem", put).await;
-        let cond = r#"{"TableName":"t","Item":{"id":{"S":"a"}},"ConditionExpression":"attribute_not_exists(id)"}"#;
+        let cond = r#"{"TableName":"tbl","Item":{"id":{"S":"a"}},"ConditionExpression":"attribute_not_exists(id)"}"#;
         let resp = call(&h, "PutItem", cond).await;
         assert_eq!(resp.status(), 400);
     }
@@ -670,7 +674,7 @@ mod tests {
     }
 
     async fn create_provisioned(h: &DynamoHandler) {
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PROVISIONED","ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PROVISIONED","ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
         assert_eq!(call(h, "CreateTable", create).await.status(), 200);
     }
 
@@ -684,7 +688,7 @@ mod tests {
             Weak::new(),
         );
         let create = serde_json::json!({
-            "TableName":"t", "BillingMode":"PAY_PER_REQUEST",
+            "TableName":"tbl", "BillingMode":"PAY_PER_REQUEST",
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}, {"AttributeName":"category","AttributeType":"S"}],
             "GlobalSecondaryIndexes":[{"IndexName":"category", "KeySchema":[{"AttributeName":"category","KeyType":"HASH"}], "Projection":{"ProjectionType":"ALL"},
@@ -701,7 +705,7 @@ mod tests {
                 ["ReadUnitsPerSecond"],
             20000
         );
-        let update = serde_json::json!({"TableName":"t", "WarmThroughput":{"ReadUnitsPerSecond":30000},
+        let update = serde_json::json!({"TableName":"tbl", "WarmThroughput":{"ReadUnitsPerSecond":30000},
             "GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"category", "WarmThroughput":{"WriteUnitsPerSecond":8000}}}]});
         assert_eq!(
             call(&h, "UpdateTable", &update.to_string()).await.status(),
@@ -714,7 +718,7 @@ mod tests {
             serde_json::json!({"ReadUnitsPerSecond":"40000"}),
             serde_json::json!({}),
         ] {
-            let rejected = serde_json::json!({"TableName":"t", "WarmThroughput":invalid, "BillingMode":"PROVISIONED", "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}});
+            let rejected = serde_json::json!({"TableName":"tbl", "WarmThroughput":invalid, "BillingMode":"PROVISIONED", "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}});
             assert_eq!(
                 call(&h, "UpdateTable", &rejected.to_string())
                     .await
@@ -727,7 +731,7 @@ mod tests {
             Arc::new(TableStore::with_state(state).unwrap()),
             Weak::new(),
         );
-        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"t"}"#).await;
+        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
         assert_eq!(
             body["Table"]["BillingModeSummary"]["BillingMode"],
             "PAY_PER_REQUEST"
@@ -740,7 +744,7 @@ mod tests {
         );
         // Provisioned high-water marks remain after subsequently lowering capacity.
         for read in [50000, 5] {
-            let update = serde_json::json!({"TableName":"t", "BillingMode":"PROVISIONED", "ProvisionedThroughput":{"ReadCapacityUnits":read,"WriteCapacityUnits":5}, "GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"category","ProvisionedThroughput":{"ReadCapacityUnits":read,"WriteCapacityUnits":5}}}]});
+            let update = serde_json::json!({"TableName":"tbl", "BillingMode":"PROVISIONED", "ProvisionedThroughput":{"ReadCapacityUnits":read,"WriteCapacityUnits":5}, "GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"category","ProvisionedThroughput":{"ReadCapacityUnits":read,"WriteCapacityUnits":5}}}]});
             let (status, body) = call_json(&h, "UpdateTable", &update.to_string()).await;
             assert_eq!(status, 200, "{body}");
             assert_eq!(
@@ -761,18 +765,18 @@ mod tests {
     async fn legacy_descriptions_and_replica_warm_updates() {
         let h = DynamoHandler::new();
         create_provisioned(&h).await;
-        let table = h.store.get("000000000000", "us-east-1", "t").unwrap();
+        let table = h.store.get("000000000000", "us-east-1", "tbl").unwrap();
         // Deserialize the shape persisted before warm marks existed.
         let mut old = serde_json::to_value(&table.read().await.def).unwrap();
         old.as_object_mut().unwrap().remove("warm_throughput");
         table.write().await.def = serde_json::from_value(old).unwrap();
-        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"t"}"#).await;
+        let (_, body) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
         assert_eq!(body["Table"]["WarmThroughput"]["Status"], "ACTIVE");
         assert_eq!(
             call(
                 &h,
                 "UpdateTable",
-                r#"{"TableName":"t","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#
+                r#"{"TableName":"tbl","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#
             )
             .await
             .status(),
@@ -782,13 +786,13 @@ mod tests {
             call(
                 &h,
                 "UpdateTable",
-                r#"{"TableName":"t","WarmThroughput":{"ReadUnitsPerSecond":40000}}"#
+                r#"{"TableName":"tbl","WarmThroughput":{"ReadUnitsPerSecond":40000}}"#
             )
             .await
             .status(),
             200
         );
-        let peer = h.store.get("000000000000", "us-west-2", "t").unwrap();
+        let peer = h.store.get("000000000000", "us-west-2", "tbl").unwrap();
         assert_eq!(peer.read().await.def.warm_throughput.unwrap().read, 40000);
     }
 
@@ -801,7 +805,7 @@ mod tests {
         let (s, v) = call_json(
             &h,
             "UpdateTable",
-            r#"{"TableName":"t","ProvisionedThroughput":{"ReadCapacityUnits":10,"WriteCapacityUnits":20}}"#,
+            r#"{"TableName":"tbl","ProvisionedThroughput":{"ReadCapacityUnits":10,"WriteCapacityUnits":20}}"#,
         )
         .await;
         assert_eq!(s, 200);
@@ -815,7 +819,7 @@ mod tests {
         );
 
         // Create a GSI (new attribute definition supplied).
-        let create_gsi = r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"gsk","AttributeType":"S"}],"GlobalSecondaryIndexUpdates":[{"Create":{"IndexName":"gsi1","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]}"#;
+        let create_gsi = r#"{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"gsk","AttributeType":"S"}],"GlobalSecondaryIndexUpdates":[{"Create":{"IndexName":"gsi1","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]}"#;
         let (s, v) = call_json(&h, "UpdateTable", create_gsi).await;
         assert_eq!(s, 200);
         assert_eq!(
@@ -831,7 +835,7 @@ mod tests {
         let (s, v) = call_json(
             &h,
             "UpdateTable",
-            r#"{"TableName":"t","GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"gsi1"}}]}"#,
+            r#"{"TableName":"tbl","GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"gsi1"}}]}"#,
         )
         .await;
         assert_eq!(s, 200);
@@ -843,7 +847,7 @@ mod tests {
         let (s, _) = call_json(
             &h,
             "UpdateTable",
-            r#"{"TableName":"t","GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"nope"}}]}"#,
+            r#"{"TableName":"tbl","GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"nope"}}]}"#,
         )
         .await;
         assert_eq!(s, 400);
@@ -856,7 +860,7 @@ mod tests {
         let (s, v) = call_json(
             &h,
             "UpdateTable",
-            r#"{"TableName":"t","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+            r#"{"TableName":"tbl","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
         )
         .await;
         assert_eq!(s, 200);
@@ -868,7 +872,7 @@ mod tests {
         let (s, v) = call_json(
             &h,
             "UpdateTable",
-            r#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#,
+            r#"{"TableName":"tbl","StreamSpecification":{"StreamEnabled":false}}"#,
         )
         .await;
         assert_eq!(s, 200);
@@ -878,12 +882,12 @@ mod tests {
     #[tokio::test]
     async fn update_table_switch_to_provisioned_requires_throughput() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
         let (s, _) = call_json(
             &h,
             "UpdateTable",
-            r#"{"TableName":"t","BillingMode":"PROVISIONED"}"#,
+            r#"{"TableName":"tbl","BillingMode":"PROVISIONED"}"#,
         )
         .await;
         assert_eq!(s, 400);
@@ -892,22 +896,22 @@ mod tests {
     #[tokio::test]
     async fn legacy_expected_value_and_exists() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"t","Item":{"id":{"S":"a"},"v":{"N":"1"}}}"#,
+            r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"v":{"N":"1"}}}"#,
         )
         .await;
 
         // Expected: v == 1 → succeeds (update v to 2).
-        let ok = r#"{"TableName":"t","Item":{"id":{"S":"a"},"v":{"N":"2"}},"Expected":{"v":{"Value":{"N":"1"}}}}"#;
+        let ok = r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"v":{"N":"2"}},"Expected":{"v":{"Value":{"N":"1"}}}}"#;
         let (s, _) = call_json(&h, "PutItem", ok).await;
         assert_eq!(s, 200);
 
         // Expected: v == 1 now fails (v is 2).
-        let stale = r#"{"TableName":"t","Item":{"id":{"S":"a"},"v":{"N":"9"}},"Expected":{"v":{"Value":{"N":"1"}}}}"#;
+        let stale = r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"v":{"N":"9"}},"Expected":{"v":{"Value":{"N":"1"}}}}"#;
         let (s, v) = call_json(&h, "PutItem", stale).await;
         assert_eq!(s, 400);
         assert!(v["__type"]
@@ -917,7 +921,7 @@ mod tests {
 
         // Expected: id must not exist → fails for an existing item.
         let exists =
-            r#"{"TableName":"t","Item":{"id":{"S":"a"}},"Expected":{"id":{"Exists":false}}}"#;
+            r#"{"TableName":"tbl","Item":{"id":{"S":"a"}},"Expected":{"id":{"Exists":false}}}"#;
         let (s, _) = call_json(&h, "PutItem", exists).await;
         assert_eq!(s, 400);
     }
@@ -925,17 +929,17 @@ mod tests {
     #[tokio::test]
     async fn legacy_expected_comparison_operator_and_or() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"t","Item":{"id":{"S":"a"},"n":{"N":"5"}}}"#,
+            r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"n":{"N":"5"}}}"#,
         )
         .await;
 
         // GT 3 (true) AND NOT_NULL n (true) → delete succeeds.
-        let del = r#"{"TableName":"t","Key":{"id":{"S":"a"}},"Expected":{"n":{"ComparisonOperator":"GT","AttributeValueList":[{"N":"3"}]},"id":{"ComparisonOperator":"NOT_NULL"}}}"#;
+        let del = r#"{"TableName":"tbl","Key":{"id":{"S":"a"}},"Expected":{"n":{"ComparisonOperator":"GT","AttributeValueList":[{"N":"3"}]},"id":{"ComparisonOperator":"NOT_NULL"}}}"#;
         let (s, _) = call_json(&h, "DeleteItem", del).await;
         assert_eq!(s, 200);
 
@@ -943,10 +947,10 @@ mod tests {
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"t","Item":{"id":{"S":"a"},"n":{"N":"5"}}}"#,
+            r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"n":{"N":"5"}}}"#,
         )
         .await;
-        let or = r#"{"TableName":"t","Item":{"id":{"S":"a"},"n":{"N":"6"}},"ConditionalOperator":"OR","Expected":{"n":{"ComparisonOperator":"LT","AttributeValueList":[{"N":"0"}]},"id":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"a"}]}}}"#;
+        let or = r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"n":{"N":"6"}},"ConditionalOperator":"OR","Expected":{"n":{"ComparisonOperator":"LT","AttributeValueList":[{"N":"0"}]},"id":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"a"}]}}}"#;
         let (s, _) = call_json(&h, "PutItem", or).await;
         assert_eq!(s, 200);
     }
@@ -954,9 +958,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_condition_expression_with_expected() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
-        let mixed = r#"{"TableName":"t","Item":{"id":{"S":"a"}},"ConditionExpression":"attribute_not_exists(id)","Expected":{"id":{"Exists":false}}}"#;
+        let mixed = r#"{"TableName":"tbl","Item":{"id":{"S":"a"}},"ConditionExpression":"attribute_not_exists(id)","Expected":{"id":{"Exists":false}}}"#;
         let (s, v) = call_json(&h, "PutItem", mixed).await;
         assert_eq!(s, 400);
         assert!(v["__type"]
@@ -969,7 +973,7 @@ mod tests {
     async fn tag_lifecycle_and_invalid_arn() {
         let h = DynamoHandler::new();
         create_provisioned(&h).await;
-        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/t";
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/tbl";
         let tag = format!(r#"{{"ResourceArn":"{arn}","Tags":[{{"Key":"env","Value":"prod"}}]}}"#);
         assert_eq!(call(&h, "TagResource", &tag).await.status(), 200);
         let (s, v) = call_json(
@@ -1004,19 +1008,19 @@ mod tests {
     async fn continuous_backups_pitr_toggle() {
         let h = DynamoHandler::new();
         create_provisioned(&h).await;
-        let (s, v) = call_json(&h, "DescribeContinuousBackups", r#"{"TableName":"t"}"#).await;
+        let (s, v) = call_json(&h, "DescribeContinuousBackups", r#"{"TableName":"tbl"}"#).await;
         assert_eq!(s, 200);
         assert_eq!(
             v["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
                 ["PointInTimeRecoveryStatus"],
             "DISABLED"
         );
-        let enable = r#"{"TableName":"t","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#;
+        let enable = r#"{"TableName":"tbl","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#;
         let (s, v) = call_json(&h, "UpdateContinuousBackups", enable).await;
         assert_eq!(s, 400);
         assert!(v["message"].as_str().unwrap().contains("unavailable"));
         // Enabling PITR must not claim a recoverable backup.
-        let (_, v) = call_json(&h, "DescribeContinuousBackups", r#"{"TableName":"t"}"#).await;
+        let (_, v) = call_json(&h, "DescribeContinuousBackups", r#"{"TableName":"tbl"}"#).await;
         assert_eq!(
             v["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
                 ["PointInTimeRecoveryStatus"],
@@ -1025,7 +1029,7 @@ mod tests {
     }
 
     async fn create_streamed(h: &DynamoHandler) {
-        let create = r#"{"TableName":"s","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#;
+        let create = r#"{"TableName":"sbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#;
         assert_eq!(call(h, "CreateTable", create).await.status(), 200);
     }
 
@@ -1038,24 +1042,24 @@ mod tests {
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"s","Item":{"id":{"S":"a"},"v":{"N":"1"}}}"#,
+            r#"{"TableName":"sbl","Item":{"id":{"S":"a"},"v":{"N":"1"}}}"#,
         )
         .await;
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"s","Item":{"id":{"S":"a"},"v":{"N":"2"}}}"#,
+            r#"{"TableName":"sbl","Item":{"id":{"S":"a"},"v":{"N":"2"}}}"#,
         )
         .await;
         call(
             &h,
             "DeleteItem",
-            r#"{"TableName":"s","Key":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"sbl","Key":{"id":{"S":"a"}}}"#,
         )
         .await;
 
         // ListStreams returns the stream.
-        let (s, v) = call_json(&h, "ListStreams", r#"{"TableName":"s"}"#).await;
+        let (s, v) = call_json(&h, "ListStreams", r#"{"TableName":"sbl"}"#).await;
         assert_eq!(s, 200);
         let stream_arn = v["Streams"][0]["StreamArn"].as_str().unwrap().to_string();
         assert!(stream_arn.contains("/stream/"));
@@ -1112,10 +1116,10 @@ mod tests {
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"s","Item":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"sbl","Item":{"id":{"S":"a"}}}"#,
         )
         .await;
-        let (_, v) = call_json(&h, "ListStreams", r#"{"TableName":"s"}"#).await;
+        let (_, v) = call_json(&h, "ListStreams", r#"{"TableName":"sbl"}"#).await;
         let arn = v["Streams"][0]["StreamArn"].as_str().unwrap().to_string();
         let (_, d) = call_json(&h, "DescribeStream", &format!(r#"{{"StreamArn":"{arn}"}}"#)).await;
         let shard_id = d["StreamDescription"]["Shards"][0]["ShardId"]
@@ -1152,16 +1156,16 @@ mod tests {
     async fn gsi_query_applies_keys_only_projection() {
         let h = DynamoHandler::new();
         // Table with a KEYS_ONLY GSI on `gsk`.
-        let create = r#"{"TableName":"g","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"gsi","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"KEYS_ONLY"}}]}"#;
+        let create = r#"{"TableName":"gbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"gsi","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"KEYS_ONLY"}}]}"#;
         assert_eq!(call(&h, "CreateTable", create).await.status(), 200);
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"g","Item":{"id":{"S":"a"},"gsk":{"S":"x"},"extra":{"S":"hidden"}}}"#,
+            r#"{"TableName":"gbl","Item":{"id":{"S":"a"},"gsk":{"S":"x"},"extra":{"S":"hidden"}}}"#,
         )
         .await;
 
-        let q = r#"{"TableName":"g","IndexName":"gsi","KeyConditionExpression":"gsk = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
+        let q = r#"{"TableName":"gbl","IndexName":"gsi","KeyConditionExpression":"gsk = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
         let (s, v) = call_json(&h, "Query", q).await;
         assert_eq!(s, 200);
         let item = &v["Items"][0];
@@ -1171,17 +1175,17 @@ mod tests {
         assert!(item.get("extra").is_none());
 
         // GSI consistent read is rejected.
-        let qc = r#"{"TableName":"g","IndexName":"gsi","ConsistentRead":true,"KeyConditionExpression":"gsk = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
+        let qc = r#"{"TableName":"gbl","IndexName":"gsi","ConsistentRead":true,"KeyConditionExpression":"gsk = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
         assert_eq!(call(&h, "Query", qc).await.status(), 400);
     }
 
     #[tokio::test]
     async fn gsi_query_include_projection() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"g","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"gsi","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["keep"]}}]}"#;
+        let create = r#"{"TableName":"gbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"gsi","KeySchema":[{"AttributeName":"gsk","KeyType":"HASH"}],"Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["keep"]}}]}"#;
         call(&h, "CreateTable", create).await;
-        call(&h, "PutItem", r#"{"TableName":"g","Item":{"id":{"S":"a"},"gsk":{"S":"x"},"keep":{"S":"yes"},"drop":{"S":"no"}}}"#).await;
-        let q = r#"{"TableName":"g","IndexName":"gsi","KeyConditionExpression":"gsk = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
+        call(&h, "PutItem", r#"{"TableName":"gbl","Item":{"id":{"S":"a"},"gsk":{"S":"x"},"keep":{"S":"yes"},"drop":{"S":"no"}}}"#).await;
+        let q = r#"{"TableName":"gbl","IndexName":"gsi","KeyConditionExpression":"gsk = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
         let (_, v) = call_json(&h, "Query", q).await;
         let item = &v["Items"][0];
         assert_eq!(item["keep"]["S"], "yes");
@@ -1191,12 +1195,12 @@ mod tests {
     #[tokio::test]
     async fn ttl_reaps_expired_items_on_read() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"OLD_IMAGE"}}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"OLD_IMAGE"}}"#;
         call(&h, "CreateTable", create).await;
         let (s, _) = call_json(
             &h,
             "UpdateTimeToLive",
-            r#"{"TableName":"t","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"exp"}}"#,
+            r#"{"TableName":"tbl","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"exp"}}"#,
         )
         .await;
         assert_eq!(s, 200);
@@ -1204,13 +1208,13 @@ mod tests {
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"t","Item":{"id":{"S":"old"},"exp":{"N":"1"}}}"#,
+            r#"{"TableName":"tbl","Item":{"id":{"S":"old"},"exp":{"N":"1"}}}"#,
         )
         .await;
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"t","Item":{"id":{"S":"new"},"exp":{"N":"99999999999"}}}"#,
+            r#"{"TableName":"tbl","Item":{"id":{"S":"new"},"exp":{"N":"99999999999"}}}"#,
         )
         .await;
 
@@ -1218,7 +1222,7 @@ mod tests {
         let (_, v) = call_json(
             &h,
             "GetItem",
-            r#"{"TableName":"t","Key":{"id":{"S":"old"}}}"#,
+            r#"{"TableName":"tbl","Key":{"id":{"S":"old"}}}"#,
         )
         .await;
         assert!(v.get("Item").is_none());
@@ -1226,13 +1230,13 @@ mod tests {
         let (_, v) = call_json(
             &h,
             "GetItem",
-            r#"{"TableName":"t","Key":{"id":{"S":"new"}}}"#,
+            r#"{"TableName":"tbl","Key":{"id":{"S":"new"}}}"#,
         )
         .await;
         assert_eq!(v["Item"]["id"]["S"], "new");
 
         // A REMOVE stream record was emitted for the reaped item.
-        let (_, ls) = call_json(&h, "ListStreams", r#"{"TableName":"t"}"#).await;
+        let (_, ls) = call_json(&h, "ListStreams", r#"{"TableName":"tbl"}"#).await;
         let arn = ls["Streams"][0]["StreamArn"].as_str().unwrap().to_string();
         let (_, d) = call_json(&h, "DescribeStream", &format!(r#"{{"StreamArn":"{arn}"}}"#)).await;
         let shard = d["StreamDescription"]["Shards"][0]["ShardId"]
@@ -1267,10 +1271,9 @@ mod tests {
     async fn ttl_reenable_with_different_attribute_rejected() {
         let h = DynamoHandler::new();
         create_provisioned(&h).await;
-        let en =
-            r#"{"TableName":"t","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"exp"}}"#;
+        let en = r#"{"TableName":"tbl","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"exp"}}"#;
         assert_eq!(call(&h, "UpdateTimeToLive", en).await.status(), 200);
-        let other = r#"{"TableName":"t","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"different"}}"#;
+        let other = r#"{"TableName":"tbl","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"different"}}"#;
         assert_eq!(call(&h, "UpdateTimeToLive", other).await.status(), 400);
     }
 
@@ -1279,14 +1282,14 @@ mod tests {
         let h = DynamoHandler::new();
         create_provisioned(&h).await;
         let arn = "arn:aws:kinesis:us-east-1:000000000000:stream/s";
-        let en = format!(r#"{{"TableName":"t","StreamArn":"{arn}"}}"#);
+        let en = format!(r#"{{"TableName":"tbl","StreamArn":"{arn}"}}"#);
         let (s, v) = call_json(&h, "EnableKinesisStreamingDestination", &en).await;
         assert_eq!(s, 200);
         assert_eq!(v["DestinationStatus"], "ACTIVE");
         let (_, v) = call_json(
             &h,
             "DescribeKinesisStreamingDestination",
-            r#"{"TableName":"t"}"#,
+            r#"{"TableName":"tbl"}"#,
         )
         .await;
         assert_eq!(v["KinesisDataStreamDestinations"][0]["StreamArn"], arn);
@@ -1295,7 +1298,7 @@ mod tests {
         let (_, v) = call_json(
             &h,
             "DescribeKinesisStreamingDestination",
-            r#"{"TableName":"t"}"#,
+            r#"{"TableName":"tbl"}"#,
         )
         .await;
         assert!(v["KinesisDataStreamDestinations"]
@@ -1308,7 +1311,7 @@ mod tests {
     async fn export_rejects_without_materialized_backup() {
         let h = DynamoHandler::new();
         create_provisioned(&h).await;
-        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/t";
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/tbl";
         let req = format!(r#"{{"TableArn":"{arn}","S3Bucket":"my-bucket"}}"#);
         let (status, body) = call_json(&h, "ExportTableToPointInTime", &req).await;
         assert_eq!(status, 400);
@@ -1398,62 +1401,82 @@ mod tests {
     #[tokio::test]
     async fn partiql_insert_select_update_delete() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
 
         // INSERT with a parameter and literals.
-        let ins = r#"{"Statement":"INSERT INTO t VALUE {'id': ?, 'n': 1, 'live': true}","Parameters":[{"S":"a"}]}"#;
+        let ins = r#"{"Statement":"INSERT INTO tbl VALUE {'id': ?, 'n': 1, 'live': true}","Parameters":[{"S":"a"}]}"#;
         assert_eq!(call(&h, "ExecuteStatement", ins).await.status(), 200);
 
         // SELECT with a filter.
-        let sel = r#"{"Statement":"SELECT * FROM t WHERE n >= ?","Parameters":[{"N":"1"}]}"#;
+        let sel = r#"{"Statement":"SELECT * FROM tbl WHERE n >= ?","Parameters":[{"N":"1"}]}"#;
         let (s, v) = call_json(&h, "ExecuteStatement", sel).await;
         assert_eq!(s, 200);
         assert_eq!(v["Items"].as_array().unwrap().len(), 1);
         assert_eq!(v["Items"][0]["id"]["S"], "a");
 
         // UPDATE then verify.
-        let upd = r#"{"Statement":"UPDATE t SET n = ? WHERE id = ?","Parameters":[{"N":"42"},{"S":"a"}]}"#;
+        let upd = r#"{"Statement":"UPDATE tbl SET n = ? WHERE id = ?","Parameters":[{"N":"42"},{"S":"a"}]}"#;
         assert_eq!(call(&h, "ExecuteStatement", upd).await.status(), 200);
-        let (_, g) = call_json(&h, "GetItem", r#"{"TableName":"t","Key":{"id":{"S":"a"}}}"#).await;
+        let (_, g) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
         assert_eq!(g["Item"]["n"]["N"], "42");
 
         // DELETE then verify gone.
-        let del = r#"{"Statement":"DELETE FROM t WHERE id = ?","Parameters":[{"S":"a"}]}"#;
+        let del = r#"{"Statement":"DELETE FROM tbl WHERE id = ?","Parameters":[{"S":"a"}]}"#;
         assert_eq!(call(&h, "ExecuteStatement", del).await.status(), 200);
-        let (_, g) = call_json(&h, "GetItem", r#"{"TableName":"t","Key":{"id":{"S":"a"}}}"#).await;
+        let (_, g) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
         assert!(g.get("Item").is_none());
     }
 
     #[tokio::test]
     async fn partiql_transaction_is_atomic() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
         let tx = r#"{"TransactStatements":[
-            {"Statement":"INSERT INTO t VALUE {'id': ?}","Parameters":[{"S":"x"}]},
-            {"Statement":"INSERT INTO t VALUE {'id': ?}","Parameters":[{"S":"y"}]}
+            {"Statement":"INSERT INTO tbl VALUE {'id': ?}","Parameters":[{"S":"x"}]},
+            {"Statement":"INSERT INTO tbl VALUE {'id': ?}","Parameters":[{"S":"y"}]}
         ]}"#;
         assert_eq!(call(&h, "ExecuteTransaction", tx).await.status(), 200);
-        let (_, gx) = call_json(&h, "GetItem", r#"{"TableName":"t","Key":{"id":{"S":"x"}}}"#).await;
+        let (_, gx) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"x"}}}"#,
+        )
+        .await;
         assert_eq!(gx["Item"]["id"]["S"], "x");
-        let (_, gy) = call_json(&h, "GetItem", r#"{"TableName":"t","Key":{"id":{"S":"y"}}}"#).await;
+        let (_, gy) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"y"}}}"#,
+        )
+        .await;
         assert_eq!(gy["Item"]["id"]["S"], "y");
     }
 
     #[tokio::test]
     async fn partiql_batch_reports_per_statement() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"t","Item":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"tbl","Item":{"id":{"S":"a"}}}"#,
         )
         .await;
         let batch = r#"{"Statements":[
-            {"Statement":"SELECT * FROM t WHERE id = ?","Parameters":[{"S":"a"}]},
+            {"Statement":"SELECT * FROM tbl WHERE id = ?","Parameters":[{"S":"a"}]},
             {"Statement":"SELECT * FROM missing WHERE id = ?","Parameters":[{"S":"a"}]}
         ]}"#;
         let (s, v) = call_json(&h, "BatchExecuteStatement", batch).await;
@@ -1500,7 +1523,7 @@ mod tests {
     async fn transaction_token_replays_once_and_rejects_mismatch() {
         let h = DynamoHandler::new();
         create_streamed(&h).await;
-        let transaction = r#"{"ClientRequestToken":"token-1","TransactItems":[{"Put":{"TableName":"s","Item":{"id":{"S":"a"},"v":{"N":"1"}}}}]}"#;
+        let transaction = r#"{"ClientRequestToken":"token-1","TransactItems":[{"Put":{"TableName":"sbl","Item":{"id":{"S":"a"},"v":{"N":"1"}}}}]}"#;
         assert_eq!(
             call(&h, "TransactWriteItems", transaction).await.status(),
             200
@@ -1510,7 +1533,7 @@ mod tests {
             200
         );
 
-        let (_, listed) = call_json(&h, "ListStreams", r#"{"TableName":"s"}"#).await;
+        let (_, listed) = call_json(&h, "ListStreams", r#"{"TableName":"sbl"}"#).await;
         let arn = listed["Streams"][0]["StreamArn"].as_str().unwrap();
         let (_, described) =
             call_json(&h, "DescribeStream", &format!(r#"{{"StreamArn":"{arn}"}}"#)).await;
@@ -1534,7 +1557,7 @@ mod tests {
         .await;
         assert_eq!(records["Records"].as_array().unwrap().len(), 1);
 
-        let mismatch = r#"{"ClientRequestToken":"token-1","TransactItems":[{"Put":{"TableName":"s","Item":{"id":{"S":"b"}}}}]}"#;
+        let mismatch = r#"{"ClientRequestToken":"token-1","TransactItems":[{"Put":{"TableName":"sbl","Item":{"id":{"S":"b"}}}}]}"#;
         let (status, body) = call_json(&h, "TransactWriteItems", mismatch).await;
         assert_eq!(status, 400);
         assert!(body["__type"]
@@ -1546,24 +1569,28 @@ mod tests {
     #[tokio::test]
     async fn transaction_stages_late_update_errors_before_commit() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
         call(
             &h,
             "PutItem",
-            r#"{"TableName":"t","Item":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"tbl","Item":{"id":{"S":"a"}}}"#,
         )
         .await;
         let transaction = r#"{"TransactItems":[
-            {"Put":{"TableName":"t","Item":{"id":{"S":"b"}}}},
-            {"Update":{"TableName":"t","Key":{"id":{"S":"a"}},"UpdateExpression":"SET value = :missing"}}
+            {"Put":{"TableName":"tbl","Item":{"id":{"S":"b"}}}},
+            {"Update":{"TableName":"tbl","Key":{"id":{"S":"a"}},"UpdateExpression":"SET value = :missing"}}
         ]}"#;
         assert_eq!(
             call(&h, "TransactWriteItems", transaction).await.status(),
             400
         );
-        let (_, item) =
-            call_json(&h, "GetItem", r#"{"TableName":"t","Key":{"id":{"S":"b"}}}"#).await;
+        let (_, item) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"b"}}}"#,
+        )
+        .await;
         assert!(item.get("Item").is_none());
     }
 
@@ -1592,7 +1619,7 @@ mod tests {
         let handler = registry
             .native_handler(&ServiceName::new("dynamodb"))
             .unwrap();
-        let create = r#"{"TableName":"k","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"kbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         assert_eq!(
             handler
                 .handle(request("CreateTable", create))
@@ -1600,7 +1627,7 @@ mod tests {
                 .status(),
             200
         );
-        let destination = r#"{"TableName":"k","StreamArn":"arn:aws:kinesis:us-east-1:000000000000:stream/events"}"#;
+        let destination = r#"{"TableName":"kbl","StreamArn":"arn:aws:kinesis:us-east-1:000000000000:stream/events"}"#;
         assert_eq!(
             handler
                 .handle(request("EnableKinesisStreamingDestination", destination))
@@ -1612,7 +1639,7 @@ mod tests {
             handler
                 .handle(request(
                     "PutItem",
-                    r#"{"TableName":"k","Item":{"id":{"S":"one"}}}"#,
+                    r#"{"TableName":"kbl","Item":{"id":{"S":"one"}}}"#,
                 ))
                 .await
                 .status(),
@@ -1661,20 +1688,20 @@ mod tests {
     #[tokio::test]
     async fn partiql_next_token_resumes_without_duplicates() {
         let h = DynamoHandler::new();
-        let create = r#"{"TableName":"p","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        let create = r#"{"TableName":"pbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
         call(&h, "CreateTable", create).await;
         for id in ["a", "b", "c"] {
             call(
                 &h,
                 "PutItem",
-                &format!(r#"{{"TableName":"p","Item":{{"id":{{"S":"{id}"}}}}}}"#),
+                &format!(r#"{{"TableName":"pbl","Item":{{"id":{{"S":"{id}"}}}}}}"#),
             )
             .await;
         }
         let (_, first) = call_json(
             &h,
             "ExecuteStatement",
-            r#"{"Statement":"SELECT * FROM p","Limit":2}"#,
+            r#"{"Statement":"SELECT * FROM pbl","Limit":2}"#,
         )
         .await;
         assert_eq!(first["Items"].as_array().unwrap().len(), 2);
@@ -1682,7 +1709,7 @@ mod tests {
         let (_, second) = call_json(
             &h,
             "ExecuteStatement",
-            &format!(r#"{{"Statement":"SELECT * FROM p","Limit":2,"NextToken":"{token}"}}"#),
+            &format!(r#"{{"Statement":"SELECT * FROM pbl","Limit":2,"NextToken":"{token}"}}"#),
         )
         .await;
         assert_eq!(second["Items"].as_array().unwrap().len(), 1);

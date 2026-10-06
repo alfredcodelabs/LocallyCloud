@@ -322,14 +322,9 @@ impl S3Handler {
         Arc::get_mut(&mut handler.store)
             .expect("new S3 store")
             .storage_keys = Arc::new(storage_keys);
-        if let Some(payload) = persistence.load()? {
-            handler
-                .store
-                .restore_snapshot(&payload)
-                .map_err(|error| error.to_string())?;
-            if let Err(error) = persistence.remove_orphan_blobs(&payload) {
-                tracing::warn!(%error, "S3 orphan blob cleanup at startup failed");
-            }
+        persistence.restore(&handler.store)?;
+        if let Err(error) = persistence.remove_orphan_blobs() {
+            tracing::warn!(%error, "S3 orphan blob cleanup at startup failed");
         }
         let has_pending = persistence.has_pending()?;
         handler.persistence = Some(persistence);
@@ -5109,6 +5104,166 @@ mod restart_persistence_tests {
             account_id: "000000000001".into(),
             request_id: "restart-gate".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn compact_migration_preserves_null_versions_and_versioning_transitions() {
+        use crate::store::{StoredVersion, VersionValue};
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
+        let handler = super::tests::test_state_handler(Weak::new(), state.clone()).unwrap();
+        assert!(handler
+            .handle(request(Method::PUT, "/compact", Bytes::new()))
+            .await
+            .status()
+            .is_success());
+        let original = Bytes::from(vec![b'x'; 1024]);
+        assert!(handler
+            .handle(request(Method::PUT, "/compact/key", original.clone()))
+            .await
+            .status()
+            .is_success());
+        let connection = state.connection().unwrap();
+        let (account, payload): (String, Vec<u8>) = connection
+            .query_row(
+                "SELECT account,payload FROM s3_entries WHERE kind='object'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            payload.len() < 3000,
+            "inline ciphertext must use compact encoding"
+        );
+        let versions: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM s3_entries WHERE kind='versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 0);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let inline = &mut legacy["body"]["Encrypted"]["ciphertext"]["Inline"];
+        *inline = serde_json::json!(STANDARD.decode(inline.as_str().unwrap()).unwrap());
+        let object = serde_json::from_value(legacy.clone()).unwrap();
+        let version = StoredVersion {
+            id: "null".into(),
+            last_modified: serde_json::from_value(legacy["last_modified"].clone()).unwrap(),
+            value: VersionValue::Object(Box::new(object)),
+        };
+        let mut chain = serde_json::to_value(vec![version]).unwrap();
+        chain[0]["value"]["Object"] = legacy.clone();
+        let old_payload = serde_json::to_vec(&legacy).unwrap();
+        connection
+            .execute(
+                "UPDATE s3_entries SET payload=?1 WHERE kind='object'",
+                [&old_payload],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO s3_entries(account,bucket,kind,key,subkey,payload) VALUES(?1,'compact','versions','key','',?2)", rusqlite::params![account, serde_json::to_vec(&chain).unwrap()]).unwrap();
+        connection
+            .execute("UPDATE s3_metadata SET version=2", [])
+            .unwrap();
+        drop(handler);
+        connection.execute_batch("CREATE TRIGGER reject_compaction BEFORE UPDATE ON s3_entries BEGIN SELECT RAISE(ABORT,'injected migration failure'); END").unwrap();
+        assert!(super::tests::test_state_handler(Weak::new(), state.clone()).is_err());
+        let unchanged: Vec<u8> = connection
+            .query_row(
+                "SELECT payload FROM s3_entries WHERE kind='object'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, old_payload);
+        assert_eq!(
+            connection
+                .query_row("SELECT version FROM s3_metadata", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        connection
+            .execute_batch("DROP TRIGGER reject_compaction")
+            .unwrap();
+        let handler = super::tests::test_state_handler(Weak::new(), state.clone()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM s3_entries WHERE kind='versions'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        for uri in ["/compact/key", "/compact/key?versionId=null"] {
+            let response = handler
+                .handle(request(Method::GET, uri, Bytes::new()))
+                .await;
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 2000)
+                    .await
+                    .unwrap(),
+                original
+            );
+        }
+        let listed = handler
+            .handle(request(Method::GET, "/compact?versions", Bytes::new()))
+            .await;
+        let body = axum::body::to_bytes(listed.into_body(), 10000)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("<VersionId>null</VersionId>"));
+        assert!(handler
+            .handle(request(
+                Method::PUT,
+                "/compact?versioning",
+                Bytes::from_static(
+                    b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+                )
+            ))
+            .await
+            .status()
+            .is_success());
+        drop(handler);
+        let handler = super::tests::test_state_handler(Weak::new(), state.clone()).unwrap();
+        assert!(handler
+            .handle(request(
+                Method::PUT,
+                "/compact/key",
+                Bytes::from_static(b"new version")
+            ))
+            .await
+            .status()
+            .is_success());
+        assert!(handler.handle(request(Method::PUT, "/compact?versioning", Bytes::from_static(b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>"))).await.status().is_success());
+        assert!(handler
+            .handle(request(Method::DELETE, "/compact/key", Bytes::new()))
+            .await
+            .status()
+            .is_success());
+        drop(handler);
+        let handler = super::tests::test_state_handler(Weak::new(), state).unwrap();
+        assert_eq!(
+            handler
+                .handle(request(Method::GET, "/compact/key", Bytes::new()))
+                .await
+                .status(),
+            404
+        );
+        let listed = handler
+            .handle(request(Method::GET, "/compact?versions", Bytes::new()))
+            .await;
+        let body = axum::body::to_bytes(listed.into_body(), 10000)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(body.matches("<DeleteMarker>").count(), 1);
+        assert_eq!(body.matches("<Version>").count(), 1);
     }
 
     #[tokio::test]

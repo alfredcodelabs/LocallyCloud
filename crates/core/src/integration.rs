@@ -990,6 +990,8 @@ fn unsigned_public_request(
                                 target,
                                 "AWSCognitoIdentityProviderService.SignUp"
                                     | "AWSCognitoIdentityProviderService.InitiateAuth"
+                                    | "AWSCognitoIdentityProviderService.RespondToAuthChallenge"
+                                    | "AWSCognitoIdentityProviderService.ConfirmSignUp"
                             )
                         }))
         }

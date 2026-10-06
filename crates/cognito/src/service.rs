@@ -39,6 +39,8 @@ struct User {
     status: &'static str,
     enabled: bool,
     password: PasswordHash,
+    password_generation: String,
+    confirmation: Option<ConfirmationCode>,
     attributes: BTreeMap<String, String>,
     created: i64,
 }
@@ -49,16 +51,36 @@ struct Pool {
     name: String,
     region: String,
     created: i64,
+    auto_verify_email: bool,
+    deleted: bool,
     clients: HashMap<String, AppClient>,
+    challenges: HashMap<String, PasswordChallenge>,
     users: HashMap<String, User>,
     access_key: SigningKey,
     id_key: SigningKey,
+}
+
+struct ConfirmationCode {
+    client_id: String,
+    hash: PasswordHash,
+    expires: i64,
+    failures: u8,
+}
+
+struct PasswordChallenge {
+    client_id: String,
+    username: String,
+    sub: String,
+    generation: String,
+    admin: bool,
+    expires: i64,
 }
 
 #[derive(Default)]
 pub struct CognitoHandler {
     pools: RwLock<HashMap<PoolScope, Arc<Mutex<Pool>>>>,
     registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
+    mailbox: Option<Arc<crate::ConfirmationMailbox>>,
 }
 
 impl CognitoHandler {
@@ -71,6 +93,17 @@ impl CognitoHandler {
     ) -> Self {
         Self {
             registry,
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn with_registry_and_mailbox(
+        registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
+        mailbox: Option<Arc<crate::ConfirmationMailbox>>,
+    ) -> Self {
+        Self {
+            registry,
+            mailbox,
             ..Self::new()
         }
     }
@@ -133,7 +166,10 @@ impl CognitoHandler {
         let body: Value =
             serde_json::from_slice(&request.body).map_err(|_| CognitoError::InvalidParameter)?;
         let input = body.as_object().ok_or(CognitoError::InvalidParameter)?;
-        if !matches!(operation, "SignUp" | "InitiateAuth") {
+        if !matches!(
+            operation,
+            "SignUp" | "InitiateAuth" | "RespondToAuthChallenge" | "ConfirmSignUp"
+        ) {
             self.authorize_management(request, operation, input)?;
         }
         match operation {
@@ -151,9 +187,12 @@ impl CognitoHandler {
             "ListUsers" => self.list_users(request, input),
             "AdminDeleteUser" => self.admin_delete_user(request, input),
             "AdminInitiateAuth" => self.admin_auth(request, input),
-            "SignUp" => self.sign_up(request, input),
+            "SignUp" => self.sign_up_async(request, input).await,
+            "ConfirmSignUp" => self.confirm_sign_up(request, input),
             "AdminConfirmSignUp" => self.confirm_user(request, input),
             "InitiateAuth" => self.initiate_auth(request, input),
+            "RespondToAuthChallenge" => self.respond_to_challenge(request, input, false),
+            "AdminRespondToAuthChallenge" => self.respond_to_challenge(request, input, true),
             _ => Err(CognitoError::UnknownOperation),
         }
     }
@@ -163,7 +202,20 @@ impl CognitoHandler {
         request: &ServiceRequest,
         input: &Map<String, Value>,
     ) -> Result<Value, CognitoError> {
-        allowed(input, &["PoolName"])?;
+        allowed(input, &["PoolName", "AutoVerifiedAttributes"])?;
+        let auto_verify_email = match input.get("AutoVerifiedAttributes") {
+            None => false,
+            Some(value) => {
+                let values = value.as_array().ok_or(CognitoError::InvalidParameter)?;
+                if values.is_empty() {
+                    false
+                } else if values.len() == 1 && values[0] == "email" {
+                    true
+                } else {
+                    return Err(CognitoError::Unsupported);
+                }
+            }
+        };
         let name = string(input, "PoolName")?;
         if name.is_empty() || name.len() > 128 {
             return Err(CognitoError::InvalidParameter);
@@ -189,7 +241,10 @@ impl CognitoHandler {
             name: name.to_owned(),
             region: request.region.clone(),
             created,
+            auto_verify_email,
+            deleted: false,
             clients: HashMap::new(),
+            challenges: HashMap::new(),
             users: HashMap::new(),
             access_key,
             id_key,
@@ -250,15 +305,13 @@ impl CognitoHandler {
             region: request.region.clone(),
             id: id.to_owned(),
         };
-        if self
-            .pools
-            .write()
-            .map_err(|_| CognitoError::Internal)?
-            .remove(&key)
-            .is_none()
-        {
-            return Err(CognitoError::ResourceNotFound);
-        }
+        let mut pools = self.pools.write().map_err(|_| CognitoError::Internal)?;
+        let cell = pools
+            .get(&key)
+            .cloned()
+            .ok_or(CognitoError::ResourceNotFound)?;
+        cell.lock().map_err(|_| CognitoError::Internal)?.deleted = true;
+        pools.remove(&key);
         Ok(json!({}))
     }
 
@@ -405,6 +458,8 @@ impl CognitoHandler {
             status: "FORCE_CHANGE_PASSWORD",
             enabled: true,
             password: PasswordHash::new(password),
+            password_generation: opaque_token(),
+            confirmation: None,
             attributes: attrs,
             created: now()?,
         };
@@ -434,6 +489,8 @@ impl CognitoHandler {
             .get_mut(username)
             .ok_or(CognitoError::UserNotFound)?;
         user.password = PasswordHash::new(password);
+        user.password_generation = opaque_token();
+        user.confirmation = None;
         user.status = if permanent {
             "CONFIRMED"
         } else {
@@ -539,7 +596,7 @@ impl CognitoHandler {
         let username = string(params, "USERNAME")?;
         let password = string(params, "PASSWORD")?;
         let cell = self.pool(request, pool_id)?;
-        let pool = cell.lock().map_err(|_| CognitoError::Internal)?;
+        let mut pool = cell.lock().map_err(|_| CognitoError::Internal)?;
         let client = pool
             .clients
             .get(client_id)
@@ -557,40 +614,35 @@ impl CognitoHandler {
         if user.status == "UNCONFIRMED" {
             return Err(CognitoError::UserNotConfirmed);
         }
+        if user.status == "FORCE_CHANGE_PASSWORD" {
+            let issued = now()?;
+            let user_attributes =
+                serde_json::to_string(&user.attributes).map_err(|_| CognitoError::Internal)?;
+            let challenge = PasswordChallenge {
+                client_id: client_id.into(),
+                username: username.into(),
+                sub: user.sub.clone(),
+                generation: user.password_generation.clone(),
+                admin,
+                expires: issued + 180,
+            };
+            pool.challenges
+                .retain(|_, session| session.expires > issued);
+            // ponytail: bounded per-pool ephemeral sessions; no runtime state survives restart.
+            if pool.challenges.len() >= 10_000 {
+                return Err(CognitoError::Internal);
+            }
+            let session = opaque_token();
+            pool.challenges.insert(session.clone(), challenge);
+            return Ok(
+                json!({"ChallengeName":"NEW_PASSWORD_REQUIRED","Session":session,
+                "ChallengeParameters":{"USER_ID_FOR_SRP":username,"requiredAttributes":"[]","userAttributes":user_attributes}}),
+            );
+        }
         if user.status != "CONFIRMED" {
             return Err(CognitoError::NotAuthorized);
         }
-        let issued = now()?;
-        let issuer = issuer(&pool);
-        let access = json!({
-            "sub": user.sub, "iss": issuer, "client_id": client_id, "token_use": "access",
-            "auth_time": issued, "iat": issued, "exp": issued + TOKEN_LIFETIME,
-            "jti": Uuid::new_v4().to_string(), "username": username,
-            "scope": "aws.cognito.signin.user.admin"
-        });
-        let mut id = json!({
-            "sub": user.sub, "iss": issuer, "aud": client_id, "token_use": "id",
-            "auth_time": issued, "iat": issued, "exp": issued + TOKEN_LIFETIME,
-            "jti": Uuid::new_v4().to_string(), "cognito:username": username
-        });
-        for key in [
-            "email",
-            "name",
-            "phone_number",
-            "email_verified",
-            "phone_number_verified",
-        ] {
-            if let Some(value) = user.attributes.get(key) {
-                id[key] = value.clone().into();
-            }
-        }
-        Ok(json!({"AuthenticationResult": {
-            "AccessToken": pool.access_key.sign(&access)?,
-            "IdToken": pool.id_key.sign(&id)?,
-            "RefreshToken": opaque_token(),
-            "ExpiresIn": TOKEN_LIFETIME,
-            "TokenType": "Bearer"
-        }}))
+        authentication_result(&pool, user, client_id)
     }
 
     fn public_metadata_response(&self, request: &ServiceRequest) -> Result<Value, CognitoError> {
@@ -766,6 +818,7 @@ fn pool_view(pool: &Pool) -> Value {
         "Status": "Enabled", "CreationDate": pool.created,
         "LastModifiedDate": pool.created, "EstimatedNumberOfUsers": pool.users.len(),
         "Policies": {"PasswordPolicy": {"MinimumLength": 8, "RequireUppercase": true, "RequireLowercase": true, "RequireNumbers": true, "RequireSymbols": true}},
+        "AutoVerifiedAttributes": if pool.auto_verify_email { vec!["email"] } else { vec![] },
         "LambdaConfig": {}
     })
 }
@@ -799,4 +852,46 @@ fn user_view(user: &User) -> Value {
         "UserCreateDate": user.created, "UserLastModifiedDate": user.created,
         "Enabled": user.enabled, "UserStatus": user.status
     })
+}
+
+fn authentication_result(pool: &Pool, user: &User, client_id: &str) -> Result<Value, CognitoError> {
+    let username = &user.username;
+    let issued = now()?;
+    let issuer = issuer(pool);
+    let access = json!({
+        "sub": user.sub, "iss": issuer, "client_id": client_id, "token_use": "access",
+        "auth_time": issued, "iat": issued, "exp": issued + TOKEN_LIFETIME,
+        "jti": Uuid::new_v4().to_string(), "username": username,
+        "scope": "aws.cognito.signin.user.admin"
+    });
+    let mut id = json!({
+        "sub": user.sub, "iss": issuer, "aud": client_id, "token_use": "id",
+        "auth_time": issued, "iat": issued, "exp": issued + TOKEN_LIFETIME,
+        "jti": Uuid::new_v4().to_string(), "cognito:username": username
+    });
+    for key in [
+        "email",
+        "name",
+        "phone_number",
+        "email_verified",
+        "phone_number_verified",
+    ] {
+        if let Some(value) = user.attributes.get(key) {
+            id[key] = match key {
+                "email_verified" | "phone_number_verified" => match value.as_str() {
+                    "true" => json!(true),
+                    "false" => json!(false),
+                    _ => return Err(CognitoError::InvalidParameter),
+                },
+                _ => value.clone().into(),
+            };
+        }
+    }
+    Ok(json!({"AuthenticationResult": {
+        "AccessToken": pool.access_key.sign(&access)?,
+        "IdToken": pool.id_key.sign(&id)?,
+        "RefreshToken": opaque_token(),
+        "ExpiresIn": TOKEN_LIFETIME,
+        "TokenType": "Bearer"
+    }}))
 }

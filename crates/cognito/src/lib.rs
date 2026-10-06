@@ -1,6 +1,8 @@
 //! Native Cognito User Pools subset. Identity Pools are intentionally not registered.
 
 mod crypto;
+mod mailbox;
+pub use mailbox::ConfirmationMailbox;
 mod service;
 
 use std::sync::Arc;
@@ -15,6 +17,10 @@ const TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
 #[derive(Debug, Clone, Copy)]
 enum CognitoError {
     InvalidParameter,
+    CodeMismatch,
+    ExpiredCode,
+    CodeDeliveryFailure,
+    TooManyFailedAttempts,
     ResourceNotFound,
     UserNotFound,
     UsernameExists,
@@ -30,6 +36,18 @@ enum CognitoError {
 impl CognitoError {
     fn into_aws(self) -> AwsError {
         let (code, message, status) = match self {
+            Self::CodeMismatch => ("CodeMismatchException", "Invalid verification code", 400),
+            Self::ExpiredCode => ("ExpiredCodeException", "Verification code has expired", 400),
+            Self::CodeDeliveryFailure => (
+                "CodeDeliveryFailureException",
+                "Verification code delivery failed",
+                400,
+            ),
+            Self::TooManyFailedAttempts => (
+                "TooManyFailedAttemptsException",
+                "Too many failed verification attempts",
+                400,
+            ),
             Self::AccessDenied => (
                 "AccessDeniedException",
                 "Caller is not authorized for this Cognito operation",
@@ -83,4 +101,23 @@ pub fn register(registry: &Arc<ServiceRegistry>) -> Arc<CognitoHandler> {
         handler.clone(),
     );
     handler
+}
+
+/// Configure opt-in local delivery; invalid directory settings fail startup.
+pub fn register_with_mailbox(
+    registry: &Arc<ServiceRegistry>,
+) -> Result<Arc<CognitoHandler>, String> {
+    let mailbox = std::env::var_os("LOCALLYCLOUD_COGNITO_MAILBOX_DIR")
+        .map(|path| ConfirmationMailbox::new(path.into()).map(Arc::new))
+        .transpose()?;
+    let handler = Arc::new(CognitoHandler::with_registry_and_mailbox(
+        Arc::downgrade(registry),
+        mailbox,
+    ));
+    registry.register_native(
+        ServiceName::new("cognito-idp"),
+        ServiceMetadata::new(AwsProtocol::Json11, Some(TARGET_PREFIX)),
+        handler.clone(),
+    );
+    Ok(handler)
 }

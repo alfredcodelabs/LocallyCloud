@@ -106,13 +106,15 @@ impl LambdaFunction {
             "MemorySize": self.memory_size,
             "EphemeralStorage": { "Size": self.ephemeral_storage },
             "Architectures": self.architectures,
-            "Environment": { "Variables": self.environment },
             "Layers": self.layers.iter().map(|arn| serde_json::json!({"Arn": arn})).collect::<Vec<_>>(),
             "Version": self.version,
             "LastModified": self.last_modified,
             "RevisionId": self.revision_id,
             "State": self.state,
         });
+        if !self.environment.is_empty() {
+            json["Environment"] = serde_json::json!({ "Variables": self.environment });
+        }
         if let Some(config) = &self.vpc_config {
             json["VpcConfig"] = config.to_json();
         }
@@ -1171,6 +1173,16 @@ mod tests {
             dead_letter_arn: None,
             vpc_config: None,
         };
+        let mut configured = f("a");
+        assert!(configured
+            .to_configuration_json()
+            .get("Environment")
+            .is_none());
+        configured.environment.insert("EMPTY".into(), String::new());
+        assert_eq!(
+            configured.to_configuration_json()["Environment"]["Variables"]["EMPTY"],
+            ""
+        );
         store.create("000000000000", "us-east-1", f("a")).unwrap();
         // same name, different region is a distinct function
         store.create("000000000000", "eu-west-1", f("a")).unwrap();

@@ -435,6 +435,19 @@ pub struct TableStore {
     state: Option<Arc<StateDb>>,
 }
 
+pub(crate) fn validate_table_name(name: &str) -> Result<(), DdbError> {
+    if !(3..=255).contains(&name.len())
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(DdbError::Validation(
+            "TableName must contain 3 to 255 characters from A-Z, a-z, 0-9, _, -, or .".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl TableStore {
     pub fn new() -> Self {
         Self::default()
@@ -777,6 +790,7 @@ impl TableStore {
 
     /// Atomically create a table; `ResourceInUseException` if the name already exists.
     pub fn create(&self, account: &str, region: &str, data: TableData) -> Result<(), DdbError> {
+        validate_table_name(&data.def.name)?;
         let key = Self::key(account, region, &data.def.name);
         use dashmap::mapref::entry::Entry;
         match self.tables.entry(key) {
@@ -898,13 +912,28 @@ mod tests {
     }
 
     #[test]
+    fn table_name_validation_matches_aws_limits() {
+        for invalid in ["", "b", "ab", "bad/name", "bad name", "ééé"] {
+            assert!(matches!(
+                validate_table_name(invalid),
+                Err(DdbError::Validation(_))
+            ));
+        }
+        assert!(validate_table_name(&"a".repeat(256)).is_err());
+        for valid in ["abc", "Orders_2026-10.05"] {
+            assert!(validate_table_name(valid).is_ok());
+        }
+        assert!(validate_table_name(&"a".repeat(255)).is_ok());
+    }
+
+    #[test]
     fn create_is_exclusive() {
         let store = TableStore::new();
         assert!(store
-            .create("0", "us-east-1", data(simple_def("t")))
+            .create("0", "us-east-1", data(simple_def("tbl")))
             .is_ok());
         assert!(matches!(
-            store.create("0", "us-east-1", data(simple_def("t"))),
+            store.create("0", "us-east-1", data(simple_def("tbl"))),
             Err(DdbError::ResourceInUse(_))
         ));
     }
@@ -913,11 +942,11 @@ mod tests {
     fn scoped_by_account_and_region() {
         let store = TableStore::new();
         store
-            .create("0", "us-east-1", data(simple_def("t")))
+            .create("0", "us-east-1", data(simple_def("tbl")))
             .unwrap();
-        assert!(store.get("0", "us-east-1", "t").is_some());
-        assert!(store.get("0", "eu-west-1", "t").is_none());
-        assert!(store.get("1", "us-east-1", "t").is_none());
+        assert!(store.get("0", "us-east-1", "tbl").is_some());
+        assert!(store.get("0", "eu-west-1", "tbl").is_none());
+        assert!(store.get("1", "us-east-1", "tbl").is_none());
     }
 
     #[tokio::test]
@@ -987,9 +1016,9 @@ mod tests {
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         let store = TableStore::with_state(state.clone()).unwrap();
         store
-            .create("0", "us-east-1", data(simple_def("t")))
+            .create("0", "us-east-1", data(simple_def("tbl")))
             .unwrap();
-        let table = store.get("0", "us-east-1", "t").unwrap();
+        let table = store.get("0", "us-east-1", "tbl").unwrap();
         let mut item = Item::new();
         item.insert("pk".into(), AttributeValue::S("old".into()));
         {
@@ -1000,15 +1029,15 @@ mod tests {
         }
         store.persist().await.unwrap();
         // One commit sees the replacement incarnation directly, without persisting removal first.
-        store.remove("0", "us-east-1", "t");
+        store.remove("0", "us-east-1", "tbl");
         store
-            .create("0", "us-east-1", data(simple_def("t")))
+            .create("0", "us-east-1", data(simple_def("tbl")))
             .unwrap();
         store.persist().await.unwrap();
         drop(store);
         let reopened = TableStore::with_state(state).unwrap();
         assert!(reopened
-            .get("0", "us-east-1", "t")
+            .get("0", "us-east-1", "tbl")
             .unwrap()
             .read()
             .await

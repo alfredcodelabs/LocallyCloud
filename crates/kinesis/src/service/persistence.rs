@@ -208,26 +208,43 @@ impl Persistence {
         index: usize,
         record: &Record,
     ) -> Result<(), StateError> {
-        let shard = &stream.shards[index];
+        self.append_many(key, stream, &[(index, record)], stream.next_sequence + 1)
+    }
+
+    pub(super) fn append_many(
+        &self,
+        key: &StreamKey,
+        stream: &Stream,
+        records: &[(usize, &Record)],
+        next: u64,
+    ) -> Result<(), StateError> {
+        if records.is_empty() {
+            return Ok(());
+        }
         let mut connection = self.state.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO kinesis_shard_records VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                key.scope.account_id,
-                key.scope.region,
-                key.name,
-                index as i64,
-                (shard.first_position + shard.records.len()) as i64,
-                record.sequence_number,
-                record.data,
-                record.partition_key,
-                record.arrival_time
-            ],
-        )?;
-        transaction.execute("UPDATE kinesis_streams SET next_sequence=?4 WHERE account=?1 AND region=?2 AND name=?3", params![key.scope.account_id, key.scope.region, key.name, stream.next_sequence as i64 + 1])?;
-        transaction.execute("UPDATE kinesis_shards SET first_position=?5 WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4", params![key.scope.account_id, key.scope.region, key.name, index as i64, shard.first_position as i64])?;
-        transaction.execute("DELETE FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position<?5 AND arrival_time<=?6", params![key.scope.account_id, key.scope.region, key.name, index as i64, shard.first_position as i64, record.arrival_time - stream.retention_hours as f64 * 3600.0])?;
+        let mut offsets = vec![0usize; stream.shards.len()];
+        for (index, record) in records {
+            let shard = &stream.shards[*index];
+            transaction.execute(
+                "INSERT INTO kinesis_shard_records VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    key.scope.account_id,
+                    key.scope.region,
+                    key.name,
+                    *index as i64,
+                    (shard.first_position + shard.records.len() + offsets[*index]) as i64,
+                    record.sequence_number,
+                    record.data,
+                    record.partition_key,
+                    record.arrival_time
+                ],
+            )?;
+            offsets[*index] += 1;
+            transaction.execute("UPDATE kinesis_shards SET first_position=?5 WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4",params![key.scope.account_id,key.scope.region,key.name,*index as i64,shard.first_position as i64])?;
+            transaction.execute("DELETE FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position<?5 AND arrival_time<=?6",params![key.scope.account_id,key.scope.region,key.name,*index as i64,shard.first_position as i64,record.arrival_time-stream.retention_hours as f64*3600.0])?;
+        }
+        transaction.execute("UPDATE kinesis_streams SET next_sequence=?4 WHERE account=?1 AND region=?2 AND name=?3",params![key.scope.account_id,key.scope.region,key.name,next as i64])?;
         transaction.commit()?;
         Ok(())
     }

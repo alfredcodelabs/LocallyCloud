@@ -176,15 +176,15 @@ proptest! {
     fn query_pagination_is_complete(count in 1usize..15, page in 1usize..5) {
         let h = DynamoHandler::new();
         rt().block_on(async {
-            create_pk_sk(&h, "pg", false).await;
+            create_pk_sk(&h, "pgbl", false).await;
             for i in 0..count {
-                call(&h, "PutItem", json!({ "TableName": "pg", "Item": { "pk": {"S": "p"}, "sk": {"N": i.to_string()} } })).await;
+                call(&h, "PutItem", json!({ "TableName": "pgbl", "Item": { "pk": {"S": "p"}, "sk": {"N": i.to_string()} } })).await;
             }
             let mut seen = std::collections::BTreeSet::new();
             let mut start: Option<Value> = None;
             loop {
                 let mut q = json!({
-                    "TableName": "pg",
+                    "TableName": "pgbl",
                     "KeyConditionExpression": "pk = :p",
                     "ExpressionAttributeValues": { ":p": {"S": "p"} },
                     "Limit": page
@@ -210,13 +210,13 @@ proptest! {
     fn parallel_scan_covers_all_once(count in 1usize..20, segments in 1usize..4) {
         let h = DynamoHandler::new();
         rt().block_on(async {
-            create_pk_sk(&h, "ps", false).await;
+            create_pk_sk(&h, "psbl", false).await;
             for i in 0..count {
-                call(&h, "PutItem", json!({ "TableName": "ps", "Item": { "pk": {"S": format!("p{i}")}, "sk": {"N": "0"} } })).await;
+                call(&h, "PutItem", json!({ "TableName": "psbl", "Item": { "pk": {"S": format!("p{i}")}, "sk": {"N": "0"} } })).await;
             }
             let mut seen = std::collections::BTreeSet::new();
             for seg in 0..segments {
-                let (st, v) = call(&h, "Scan", json!({ "TableName": "ps", "TotalSegments": segments, "Segment": seg })).await;
+                let (st, v) = call(&h, "Scan", json!({ "TableName": "psbl", "TotalSegments": segments, "Segment": seg })).await;
                 prop_assert_eq!(st, 200);
                 for item in v["Items"].as_array().unwrap() {
                     let pk = item["pk"]["S"].as_str().unwrap().to_string();
@@ -308,11 +308,11 @@ proptest! {
     fn stream_records_are_ordered_and_complete(count in 1usize..12) {
         let h = DynamoHandler::new();
         rt().block_on(async {
-            create_pk_sk(&h, "st", true).await;
+            create_pk_sk(&h, "stbl", true).await;
             for i in 0..count {
-                call(&h, "PutItem", json!({ "TableName": "st", "Item": { "pk": {"S": "p"}, "sk": {"N": i.to_string()} } })).await;
+                call(&h, "PutItem", json!({ "TableName": "stbl", "Item": { "pk": {"S": "p"}, "sk": {"N": i.to_string()} } })).await;
             }
-            let (_, ls) = call(&h, "ListStreams", json!({ "TableName": "st" })).await;
+            let (_, ls) = call(&h, "ListStreams", json!({ "TableName": "stbl" })).await;
             let arn = ls["Streams"][0]["StreamArn"].as_str().unwrap().to_string();
             let (_, d) = call(&h, "DescribeStream", json!({ "StreamArn": arn })).await;
             let shard = d["StreamDescription"]["Shards"][0]["ShardId"].as_str().unwrap().to_string();
@@ -366,10 +366,10 @@ proptest! {
     fn partiql_matches_classic(val in "[a-zA-Z0-9]{1,12}") {
         let h = DynamoHandler::new();
         rt().block_on(async {
-            create_pk_sk(&h, "pq", false).await;
-            call(&h, "PutItem", json!({ "TableName": "pq", "Item": { "pk": {"S": "p"}, "sk": {"N": "1"}, "data": {"S": val.clone()} } })).await;
+            create_pk_sk(&h, "pqbl", false).await;
+            call(&h, "PutItem", json!({ "TableName": "pqbl", "Item": { "pk": {"S": "p"}, "sk": {"N": "1"}, "data": {"S": val.clone()} } })).await;
             let (st, v) = call(&h, "ExecuteStatement", json!({
-                "Statement": "SELECT * FROM pq WHERE pk = ? AND sk = ?",
+                "Statement": "SELECT * FROM pqbl WHERE pk = ? AND sk = ?",
                 "Parameters": [ {"S": "p"}, {"N": "1"} ]
             })).await;
             prop_assert_eq!(st, 200);
@@ -393,7 +393,7 @@ proptest! {
 
     /// Property 17: region/account scoping — a name in one scope is invisible from another.
     #[test]
-    fn scoping_isolates_names(name in "[a-z]{1,10}") {
+    fn scoping_isolates_names(name in "[a-z]{3,10}") {
         let h = DynamoHandler::new();
         rt().block_on(async {
             create_pk_sk(&h, &name, false).await;
@@ -437,17 +437,17 @@ proptest! {
 #[tokio::test]
 async fn transaction_is_atomic_on_failure() {
     let h = DynamoHandler::new();
-    create_pk_sk(&h, "tx", false).await;
+    create_pk_sk(&h, "txbl", false).await;
     // Pre-existing item so the conditional Put fails.
     call(
         &h,
         "PutItem",
-        json!({ "TableName": "tx", "Item": { "pk": {"S": "a"}, "sk": {"N": "0"} } }),
+        json!({ "TableName": "txbl", "Item": { "pk": {"S": "a"}, "sk": {"N": "0"} } }),
     )
     .await;
     let txn = json!({ "TransactItems": [
-        { "Put": { "TableName": "tx", "Item": { "pk": {"S": "b"}, "sk": {"N": "0"} } } },
-        { "Put": { "TableName": "tx", "Item": { "pk": {"S": "a"}, "sk": {"N": "0"} },
+        { "Put": { "TableName": "txbl", "Item": { "pk": {"S": "b"}, "sk": {"N": "0"} } } },
+        { "Put": { "TableName": "txbl", "Item": { "pk": {"S": "a"}, "sk": {"N": "0"} },
                    "ConditionExpression": "attribute_not_exists(pk)" } }
     ] });
     let (s, _) = call(&h, "TransactWriteItems", txn).await;
@@ -456,7 +456,7 @@ async fn transaction_is_atomic_on_failure() {
     let (_, g) = call(
         &h,
         "GetItem",
-        json!({ "TableName": "tx", "Key": { "pk": {"S": "b"}, "sk": {"N": "0"} } }),
+        json!({ "TableName": "txbl", "Key": { "pk": {"S": "b"}, "sk": {"N": "0"} } }),
     )
     .await;
     assert!(g.get("Item").is_none(), "atomicity: no partial writes");

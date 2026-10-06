@@ -445,6 +445,7 @@ pub struct MultipartUpload {
     pub encryption: ServerSideEncryption,
     #[serde(default)]
     pub key_envelope: Option<StoredBody>,
+    #[serde(default)]
     pub parts: DirtyMap<u16, StoredPart>,
     pub parts_revision: u64,
 }
@@ -466,10 +467,13 @@ pub struct BucketState {
     pub public_access_block: Option<PublicAccessBlock>,
     pub encryption: ServerSideEncryption,
     /// Current readable objects. A latest delete marker removes the key from this index.
+    #[serde(default)]
     pub objects: DirtyMap<String, StoredObject>,
     /// Version chains, newest first. Unversioned objects use the `null` sentinel.
+    #[serde(default)]
     pub versions: DirtyMap<String, Vec<StoredVersion>>,
     pub versioning: VersioningState,
+    #[serde(default)]
     pub uploads: DirtyMap<String, MultipartUpload>,
 }
 
@@ -790,9 +794,32 @@ struct DurableStore {
 
 #[derive(Serialize, Deserialize)]
 enum DurableBody {
-    Inline(Vec<u8>),
+    Inline(#[serde(with = "compact_bytes")] Vec<u8>),
     File(PathBuf),
     Encrypted(EncryptedBody),
+}
+
+// New rows use base64; existing JSON byte arrays remain readable.
+mod compact_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Encoded {
+            Base64(String),
+            Legacy(Vec<u8>),
+        }
+        match Encoded::deserialize(deserializer)? {
+            Encoded::Base64(value) => STANDARD.decode(value).map_err(serde::de::Error::custom),
+            Encoded::Legacy(bytes) => Ok(bytes),
+        }
+    }
 }
 
 impl Serialize for StoredBody {
@@ -943,6 +970,40 @@ impl AccountStore {
         .map_err(|_| S3Error::InternalError)
     }
 
+    pub(crate) fn restore_entries(
+        &self,
+        buckets: BTreeMap<(String, String), BucketState>,
+        blocks: Vec<(String, PublicAccessBlock)>,
+        next_id: u64,
+    ) {
+        for ((account, name), mut bucket) in buckets {
+            for (key, object) in &bucket.objects {
+                if !bucket.versions.contains_key(key) {
+                    bucket.versions.insert(
+                        key.clone(),
+                        vec![StoredVersion {
+                            id: "null".into(),
+                            last_modified: object.last_modified,
+                            value: VersionValue::Object(Box::new(object.clone())),
+                        }],
+                    );
+                }
+            }
+            bucket.objects.take_dirty();
+            bucket.versions.take_dirty();
+            for upload in bucket.uploads.values_mut() {
+                upload.parts.take_dirty();
+            }
+            bucket.uploads.take_dirty();
+            self.buckets
+                .insert(name, (account, Arc::new(RwLock::new(bucket))));
+        }
+        for (account, block) in blocks {
+            self.account_public_access_blocks.insert(account, block);
+        }
+        self.next_id.store(next_id, Ordering::Relaxed);
+    }
+
     pub fn restore_snapshot(&self, payload: &[u8]) -> Result<(), S3Error> {
         let snapshot: DurableStore =
             serde_json::from_slice(payload).map_err(|_| S3Error::InternalError)?;
@@ -1074,8 +1135,17 @@ impl AccountStore {
             };
             rows.push(row("object", key, String::new(), payload));
         }
+        let never_enabled = guard.versioning == VersioningState::NeverEnabled;
         for key in guard.versions.take_dirty() {
             let payload = if let Some(chain) = guard.versions.untracked_mut(&key) {
+                if never_enabled
+                    && chain.len() == 1
+                    && chain[0].id == "null"
+                    && matches!(chain[0].value, VersionValue::Object(_))
+                {
+                    rows.push(row("versions", key, String::new(), None));
+                    continue;
+                }
                 for version in chain.iter_mut() {
                     if let VersionValue::Object(object) = &mut version.value {
                         object.body.make_durable(blobs)?;

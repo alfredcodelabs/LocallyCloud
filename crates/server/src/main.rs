@@ -422,7 +422,13 @@ async fn main() {
             std::process::exit(6);
         }
     };
-    let cognito = locallycloud_cognito::register(&registry);
+    let cognito = match locallycloud_cognito::register_with_mailbox(&registry) {
+        Ok(handler) => handler,
+        Err(error) => {
+            tracing::error!(%error, "failed to initialize Cognito confirmation delivery");
+            std::process::exit(4);
+        }
+    };
     gateway_waf.set_cognito_jwks(cognito);
     locallycloud_cloudfront::register(&registry);
     let waf =

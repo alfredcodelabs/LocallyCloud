@@ -10,6 +10,11 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 
 use super::service::{StoredDelivery, MAX_PENDING_NOTIFICATIONS};
+use crate::store::{
+    AccountStore, BucketState, MultipartUpload, PublicAccessBlock, StoredObject, StoredPart,
+    StoredVersion,
+};
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 pub(crate) struct StateRow {
     pub account: String,
@@ -138,6 +143,64 @@ fn snapshot_rows(payload: &[u8]) -> Result<(Vec<StateRow>, u64), String> {
     ))
 }
 
+fn compact_inline_bytes(value: &mut Value) -> Result<(), String> {
+    match value {
+        Value::Object(fields) => {
+            if let Some(Value::Array(bytes)) = fields.get("Inline") {
+                let bytes = bytes
+                    .iter()
+                    .map(|byte| {
+                        byte.as_u64()
+                            .and_then(|byte| u8::try_from(byte).ok())
+                            .ok_or("invalid S3 inline byte")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                fields.insert("Inline".into(), Value::String(STANDARD.encode(bytes)));
+            }
+            for value in fields.values_mut() {
+                compact_inline_bytes(value)?;
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                compact_inline_bytes(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn canonical_null_version(
+    transaction: &Transaction<'_>,
+    account: &str,
+    bucket: &str,
+    key: &str,
+    value: &Value,
+) -> Result<bool, String> {
+    let Some(chain) = value
+        .as_array()
+        .filter(|chain| chain.len() == 1 && chain[0]["id"] == "null")
+    else {
+        return Ok(false);
+    };
+    let metadata: Option<Vec<u8>> = transaction.query_row("SELECT payload FROM s3_entries WHERE account=?1 AND bucket=?2 AND kind='bucket' AND key=''", params![account,bucket], |row| row.get(0)).optional().map_err(sql)?;
+    let Some(metadata) = metadata else {
+        return Err("S3 version has no bucket".into());
+    };
+    let metadata: Value = serde_json::from_slice(&metadata).map_err(|error| error.to_string())?;
+    if metadata["versioning"] != "NeverEnabled" {
+        return Ok(false);
+    }
+    let object: Option<Vec<u8>> = transaction.query_row("SELECT payload FROM s3_entries WHERE account=?1 AND bucket=?2 AND kind='object' AND key=?3", params![account,bucket,key], |row| row.get(0)).optional().map_err(sql)?;
+    let Some(object) = object else {
+        return Ok(false);
+    };
+    let object: Value = serde_json::from_slice(&object).map_err(|error| error.to_string())?;
+    Ok(chain[0]["value"]["Object"] == object
+        && chain[0]["last_modified"] == object["last_modified"])
+}
+
 impl S3Persistence {
     pub(super) fn new(state: Arc<StateDb>) -> Result<Self, String> {
         let blobs = state.path().with_extension("s3-blobs");
@@ -171,7 +234,7 @@ impl S3Persistence {
             .optional()
             .map_err(sql)?;
         match version {
-            Some(2) => {}
+            Some(2 | 3) => {}
             Some(_) => return Err("unsupported S3 persistent metadata version".into()),
             None => {
                 let legacy: Option<Vec<u8>> = transaction
@@ -197,10 +260,123 @@ impl S3Persistence {
                 transaction.execute("INSERT INTO s3_state(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", [b"{\"s3_incremental_schema\":2}".as_slice()]).map_err(sql)?;
             }
         }
+        if version != Some(3) {
+            // Rewrite one bounded row at a time, keeping migration and blob references atomic.
+            let mut statement = transaction.prepare("SELECT account,bucket,kind,key,subkey,payload FROM s3_entries ORDER BY account,bucket,kind,key,subkey").map_err(sql)?;
+            let mut rows = statement.query([]).map_err(sql)?;
+            while let Some(row) = rows.next().map_err(sql)? {
+                let account: String = row.get(0).map_err(sql)?;
+                let bucket: String = row.get(1).map_err(sql)?;
+                let kind: String = row.get(2).map_err(sql)?;
+                let key: String = row.get(3).map_err(sql)?;
+                let subkey: String = row.get(4).map_err(sql)?;
+                let payload: Vec<u8> = row.get(5).map_err(sql)?;
+                let mut value: Value =
+                    serde_json::from_slice(&payload).map_err(|error| error.to_string())?;
+                compact_inline_bytes(&mut value)?;
+                let payload = encoded(&value)?;
+                transaction.execute("UPDATE s3_entries SET payload=?6 WHERE account=?1 AND bucket=?2 AND kind=?3 AND key=?4 AND subkey=?5", params![account,bucket,kind,key,subkey,payload]).map_err(sql)?;
+                if kind == "versions"
+                    && canonical_null_version(&transaction, &account, &bucket, &key, &value)?
+                {
+                    transaction.execute("DELETE FROM s3_entries WHERE account=?1 AND bucket=?2 AND kind='versions' AND key=?3", params![account,bucket,key]).map_err(sql)?;
+                    transaction.execute("DELETE FROM s3_blob_refs WHERE account=?1 AND bucket=?2 AND kind='versions' AND key=?3", params![account,bucket,key]).map_err(sql)?;
+                }
+            }
+            drop(rows);
+            drop(statement);
+            transaction
+                .execute("UPDATE s3_metadata SET version=3 WHERE id=1", [])
+                .map_err(sql)?;
+            transaction
+                .execute(
+                    "UPDATE s3_state SET payload=?1 WHERE id=1",
+                    [b"{\"s3_incremental_schema\":3}".as_slice()],
+                )
+                .map_err(sql)?;
+        }
         transaction.commit().map_err(sql)?;
         Ok(Self { state, blobs })
     }
 
+    pub(super) fn restore(&self, store: &AccountStore) -> Result<(), String> {
+        let connection = self.state.connection().map_err(|error| error.to_string())?;
+        let mut buckets: BTreeMap<(String, String), BucketState> = BTreeMap::new();
+        let mut blocks: Vec<(String, PublicAccessBlock)> = Vec::new();
+        // Bucket/upload metadata precede their children; no aggregate JSON tree or body copies.
+        let mut statement = connection.prepare("SELECT account,bucket,kind,key,subkey,payload FROM s3_entries ORDER BY CASE kind WHEN 'bucket' THEN 0 WHEN 'upload' THEN 1 ELSE 2 END,account,bucket,kind,key,subkey").map_err(sql)?;
+        let mut rows = statement.query([]).map_err(sql)?;
+        while let Some(row) = rows.next().map_err(sql)? {
+            let account: String = row.get(0).map_err(sql)?;
+            let name: String = row.get(1).map_err(sql)?;
+            let kind: String = row.get(2).map_err(sql)?;
+            let key: String = row.get(3).map_err(sql)?;
+            let subkey: String = row.get(4).map_err(sql)?;
+            let payload: Vec<u8> = row.get(5).map_err(sql)?;
+            let decode = |error: serde_json::Error| error.to_string();
+            match kind.as_str() {
+                "bucket" => {
+                    let bucket: BucketState = serde_json::from_slice(&payload).map_err(decode)?;
+                    if bucket.name != name || buckets.keys().any(|(_, existing)| existing == &name)
+                    {
+                        return Err("invalid or duplicated S3 bucket identity".into());
+                    }
+                    buckets.insert((account, name), bucket);
+                }
+                "account" => {
+                    blocks.push((account, serde_json::from_slice(&payload).map_err(decode)?))
+                }
+                _ => {
+                    let bucket = buckets
+                        .get_mut(&(account, name))
+                        .ok_or("S3 metadata entity has no bucket")?;
+                    match kind.as_str() {
+                        "object" => {
+                            let object: StoredObject =
+                                serde_json::from_slice(&payload).map_err(decode)?;
+                            bucket.objects.insert(key, object);
+                        }
+                        "versions" => {
+                            let versions: Vec<StoredVersion> =
+                                serde_json::from_slice(&payload).map_err(decode)?;
+                            bucket.versions.insert(key, versions);
+                        }
+                        "upload" => {
+                            let upload: MultipartUpload =
+                                serde_json::from_slice(&payload).map_err(decode)?;
+                            if upload.id != key {
+                                return Err("invalid S3 upload identity".into());
+                            }
+                            bucket.uploads.insert(key, upload);
+                        }
+                        "part" => {
+                            let number: u16 =
+                                subkey.parse().map_err(|_| "invalid S3 part number")?;
+                            let part: StoredPart =
+                                serde_json::from_slice(&payload).map_err(decode)?;
+                            bucket
+                                .uploads
+                                .untracked_mut(&key)
+                                .ok_or("S3 part has no multipart upload")?
+                                .parts
+                                .insert(number, part);
+                        }
+                        _ => return Err("invalid S3 metadata entity kind".into()),
+                    }
+                }
+            }
+        }
+        let next: String = connection
+            .query_row("SELECT next_id FROM s3_metadata WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .map_err(sql)?;
+        let next_id = next.parse::<u64>().map_err(|error| error.to_string())?;
+        store.restore_entries(buckets, blocks, next_id);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(super) fn load(&self) -> Result<Option<Vec<u8>>, String> {
         let connection = self.state.connection().map_err(|error| error.to_string())?;
         let mut statement = connection.prepare("SELECT account,bucket,kind,key,subkey,payload FROM s3_entries ORDER BY account,bucket,kind,key,subkey").map_err(sql)?;
@@ -479,17 +655,16 @@ impl S3Persistence {
         transaction.commit().map_err(sql)
     }
 
-    pub(super) fn remove_orphan_blobs(&self, payload: &[u8]) -> Result<(), String> {
-        let snapshot: Value = serde_json::from_slice(payload).map_err(|error| error.to_string())?;
-        let mut referenced = BTreeSet::new();
-        file_references(&snapshot, &mut referenced);
-        for entry in std::fs::read_dir(&self.blobs).map_err(|error| error.to_string())? {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if !referenced.contains(&path) {
-                std::fs::remove_file(path).map_err(|error| error.to_string())?;
-            }
-        }
-        Ok(())
+    pub(super) fn remove_orphan_blobs(&self) -> Result<(), String> {
+        let candidates = std::fs::read_dir(&self.blobs)
+            .map_err(|error| error.to_string())?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        self.remove_candidates(&candidates)
     }
     pub(super) fn has_capacity(&self, required: i64) -> Result<bool, String> {
         if required <= 0 {
@@ -650,7 +825,7 @@ mod tests {
     #[test]
     fn legacy_migration_is_atomic_and_normalizes_multipart_parts() {
         let (root, db) = fixture();
-        let snapshot = json!({"buckets":[["000000000000","bucket",{
+        let mut snapshot = json!({"buckets":[["000000000000","bucket",{
             "region":"us-west-2", "objects":{"k":{"body":{"Inline":[1,2]}}},
             "versions":{"k":[{"version_id":"v"}]},
             "uploads":{"u":{"key":"k", "parts":{"1":{"etag":"e"}}}}
@@ -663,6 +838,7 @@ mod tests {
         )
         .unwrap();
         let persistence = S3Persistence::new(db.clone()).unwrap();
+        compact_inline_bytes(&mut snapshot).unwrap();
         let loaded: Value = serde_json::from_slice(&persistence.load().unwrap().unwrap()).unwrap();
         assert_eq!(loaded, snapshot);
         let legacy: Vec<u8> = conn
@@ -670,7 +846,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&legacy).unwrap()["s3_incremental_schema"],
-            2
+            3
         );
         let entries: i64 = conn
             .query_row("SELECT count(*) FROM s3_entries", [], |row| row.get(0))

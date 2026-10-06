@@ -1,3 +1,4 @@
+mod batch;
 mod control;
 mod persistence;
 
@@ -26,7 +27,7 @@ use uuid::Uuid;
 use crate::TARGET_PREFIX;
 
 const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
-const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
+const MAX_REQUEST_BODY: usize = 15 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_RECORDS: usize = 10_000;
 const MAX_GET_RECORD_BYTES: usize = 10 * 1024 * 1024;
@@ -221,6 +222,7 @@ impl KinesisHandler {
             "CreateStream" => self.create_stream(decode(&request.body)?, &scope),
             "DescribeStream" => self.describe_stream(decode(&request.body)?, &scope),
             "ListShards" => self.list_shards(decode(&request.body)?, &scope),
+            "PutRecords" => self.put_records(decode(&request.body)?, &scope),
             "PutRecord" => self.put_record(decode(&request.body)?, &scope),
             "GetShardIterator" => self.get_shard_iterator(decode(&request.body)?, &scope),
             "GetRecords" => self.get_records(decode(&request.body)?, &scope),
@@ -348,7 +350,7 @@ impl KinesisHandler {
         let data = STANDARD.decode(request.data.as_bytes()).map_err(|_| {
             KinesisError::Serialization("Data must be valid base64-encoded bytes".into())
         })?;
-        if data.len() > MAX_RECORD_BYTES {
+        if data.len() + request.partition_key.len() > MAX_RECORD_BYTES {
             return Err(KinesisError::InvalidArgument(
                 "The record exceeds the supported 1 MiB limit".into(),
             ));
@@ -1068,7 +1070,7 @@ mod tests {
     fn get_records_caps_page_bytes_and_keeps_next_cursor() {
         let handler = KinesisHandler::new();
         create(&handler);
-        let data = vec![b'X'; MAX_RECORD_BYTES];
+        let data = vec![b'X'; MAX_RECORD_BYTES - 1];
         for _ in 0..11 {
             assert!(put(&handler, &data).is_ok());
         }
