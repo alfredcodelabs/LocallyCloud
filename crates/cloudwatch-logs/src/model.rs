@@ -41,6 +41,19 @@ pub struct StoredEvent {
     pub put_ordinal: u64,
     pub event_ordinal: u32,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_bytes: Option<usize>,
+}
+
+impl StoredEvent {
+    pub(crate) fn body_len(&self) -> usize {
+        self.message_bytes.unwrap_or(self.message.len())
+    }
+
+    pub(crate) fn offload(&mut self) {
+        self.message_bytes = Some(self.body_len());
+        self.message = String::new();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

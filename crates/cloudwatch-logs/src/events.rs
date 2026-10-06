@@ -143,18 +143,18 @@ pub fn get(
             now_ms,
         })?
     } else {
-        let (revision, mut events) = store.visible_stream_events(
-            &GroupKey {
-                scope: scope.clone(),
-                name: group_name,
-            },
-            &request.log_stream_name,
-            now_ms,
-        )?;
+        let key = GroupKey {
+            scope: scope.clone(),
+            name: group_name,
+        };
+        let (revision, mut events) =
+            store.visible_event_metadata(&key, Some(&[request.log_stream_name]), None, now_ms)?;
         retain_time_range(&mut events, request.start_time, request.end_time);
         sort_events(&mut events);
-        paginator.first_page(
-            events,
+        paginator.first_page_iter(
+            events
+                .into_iter()
+                .map(|event| store.hydrate_event(&key, event)),
             scope,
             request_key,
             limit,
@@ -245,19 +245,27 @@ pub fn filter(
             now_ms,
         })?
     } else {
-        let (revision, mut events) = store.visible_events(
-            &GroupKey {
-                scope: scope.clone(),
-                name: group_name,
-            },
+        let key = GroupKey {
+            scope: scope.clone(),
+            name: group_name,
+        };
+        let (revision, mut events) = store.visible_event_metadata(
+            &key,
             stream_names.as_deref(),
             request.log_stream_name_prefix.as_deref(),
             now_ms,
         )?;
         retain_time_range(&mut events, request.start_time, request.end_time);
-        events.retain(|event| matcher.matches(&event.event.message));
         sort_events(&mut events);
-        paginator.first_page(
+        let events = events
+            .into_iter()
+            .map(|event| store.hydrate_event(&key, event))
+            .filter_map(|result| match result {
+                Ok(event) if matcher.matches(&event.event.message) => Some(Ok(event)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            });
+        paginator.first_page_iter(
             events,
             scope,
             request_key,

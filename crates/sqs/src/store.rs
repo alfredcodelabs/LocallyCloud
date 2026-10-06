@@ -1,6 +1,6 @@
 //! Region/account-scoped SQS store with per-queue guarded state and long-poll wakeups.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,7 +33,9 @@ pub struct ReceiveAttempt {
 pub struct QueueState {
     pub attributes: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
-    pub messages: Vec<Message>,
+    pub messages: VecDeque<Message>,
+    /// Lower bound used to avoid repeated full retention scans on fresh backlog.
+    pub oldest_sent_timestamp_ms: Option<i64>,
     /// dedup id → (inserted instant, original message id, original sequence number).
     pub dedup: BTreeMap<String, (Instant, String, u128)>,
     pub receive_attempts: BTreeMap<String, ReceiveAttempt>,
@@ -49,7 +51,8 @@ impl QueueState {
         QueueState {
             attributes,
             tags,
-            messages: Vec::new(),
+            messages: VecDeque::new(),
+            oldest_sent_timestamp_ms: None,
             dedup: BTreeMap::new(),
             receive_attempts: BTreeMap::new(),
             sequence: 0,
@@ -57,6 +60,16 @@ impl QueueState {
             created: now,
             last_modified: now,
         }
+    }
+
+    pub fn push_message(&mut self, message: Message) {
+        self.oldest_sent_timestamp_ms = Some(
+            self.oldest_sent_timestamp_ms
+                .map_or(message.sent_timestamp_ms, |oldest| {
+                    oldest.min(message.sent_timestamp_ms)
+                }),
+        );
+        self.messages.push_back(message);
     }
 
     /// Integer attribute with a default.

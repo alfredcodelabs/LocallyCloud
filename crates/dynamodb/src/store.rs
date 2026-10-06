@@ -219,6 +219,7 @@ pub struct ExportJob {
 /// Live table state behind a per-table lock.
 pub struct TableData {
     pub def: TableDefinition,
+    pub(crate) write_window: crate::capacity::WriteWindow,
     persist_id: String,
     pub items: BTreeMap<StoredKey, Item>,
     pub tags: BTreeMap<String, String>,
@@ -264,6 +265,7 @@ impl TableData {
             replica_pending: Vec::new(),
             dirty_keys: std::collections::BTreeSet::new(),
             stream_persisted: 0,
+            write_window: Default::default(),
         }
     }
 
@@ -431,6 +433,7 @@ pub struct TableStore {
     txn_tokens: DashMap<TxnTokenKey, Arc<Mutex<Option<TxnOutcome>>>>,
     pub replica_topology: Mutex<()>,
     pub operation_gate: Mutex<()>,
+    pub(crate) capacity: crate::capacity::CapacityModel,
     uncommitted: AtomicBool,
     state: Option<Arc<StateDb>>,
 }
@@ -850,20 +853,18 @@ impl TableStore {
     }
 
     pub fn purge_expired_txn_tokens(&self) {
-        let expired: Vec<TxnTokenKey> = self
-            .txn_tokens
-            .iter()
-            .filter_map(|entry| {
-                let outcome = entry.value().try_lock().ok()?;
-                outcome
-                    .as_ref()
-                    .filter(|outcome| outcome.created_at.elapsed() >= Duration::from_secs(600))
-                    .map(|_| entry.key().clone())
-            })
-            .collect();
-        for key in expired {
-            self.txn_tokens.remove(&key);
-        }
+        self.txn_tokens.retain(|_, slot| {
+            // Active/waiting requests must keep the shared idempotency mutex.
+            if Arc::strong_count(slot) != 1 {
+                return true;
+            }
+            let Ok(outcome) = slot.try_lock() else {
+                return true;
+            };
+            outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.created_at.elapsed() < Duration::from_secs(600))
+        });
     }
 
     /// Sorted table names in a scope.
@@ -1126,6 +1127,7 @@ impl PersistedTable {
             replica_pending: self.replica_pending,
             dirty_keys: Default::default(),
             stream_persisted: 0,
+            write_window: Default::default(),
         }
     }
 }

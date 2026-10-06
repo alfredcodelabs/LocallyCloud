@@ -2,7 +2,7 @@
 //! body (or an `SqsError`). Visibility, FIFO ordering/dedup, long polling, and dead-letter
 //! redrive are all enforced here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -758,12 +758,19 @@ fn expire_messages(
     state: &mut QueueState,
 ) -> Result<(), SqsError> {
     let cutoff_ms = now_ms().saturating_sub(state.retention_period().saturating_mul(1_000));
-    let expired: Vec<&str> = state
-        .messages
-        .iter()
-        .filter(|message| message.sent_timestamp_ms <= cutoff_ms)
-        .map(|message| message.id.as_str())
-        .collect();
+    let scan = state
+        .oldest_sent_timestamp_ms
+        .is_none_or(|oldest| oldest <= cutoff_ms);
+    let expired: Vec<&str> = if scan {
+        state
+            .messages
+            .iter()
+            .filter(|message| message.sent_timestamp_ms <= cutoff_ms)
+            .map(|message| message.id.as_str())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let now = Instant::now();
     let attempts: Vec<&str> = state
         .receive_attempts
@@ -779,9 +786,16 @@ fn expire_messages(
             db.delete_attempts(q, &attempts)?;
         }
     }
-    state
-        .messages
-        .retain(|message| message.sent_timestamp_ms > cutoff_ms);
+    if scan {
+        state
+            .messages
+            .retain(|message| message.sent_timestamp_ms > cutoff_ms);
+        state.oldest_sent_timestamp_ms = state
+            .messages
+            .iter()
+            .map(|message| message.sent_timestamp_ms)
+            .min();
+    }
     state
         .receive_attempts
         .retain(|_, attempt| attempt.expires_at > now);
@@ -1066,8 +1080,9 @@ fn enqueue(
     } else {
         input.delay_seconds.unwrap_or_else(|| state.delay_seconds())
     };
-    let message = Message {
+    let mut message = Message {
         id: id.clone(),
+        body_on_disk: false,
         body: if encrypted_body.is_some() {
             String::new()
         } else {
@@ -1082,6 +1097,7 @@ fn enqueue(
         dedup_id: effective_dedup.clone(),
         sequence_number,
         sent_timestamp_ms: now_ms(),
+        queue_arrival_ms: None,
         receive_count: 0,
         first_receive_ms: None,
         visible_at: Instant::now() + Duration::from_secs(delay as u64),
@@ -1101,6 +1117,7 @@ fn enqueue(
             }
             return Err(error);
         }
+        message.offload_body();
     }
     if let Some(dedup) = dedup_key {
         state.dedup.insert(
@@ -1112,7 +1129,7 @@ fn enqueue(
             ),
         );
     }
-    state.messages.push(message);
+    state.push_message(message);
     Ok(SendResult {
         id,
         sequence_number,
@@ -1550,37 +1567,37 @@ async fn redrive_expired(ctx: &Ctx<'_>, q: &Arc<GuardedQueue>) -> Result<(), Sqs
     }
     expire_messages(ctx, q, &mut state)?;
     let now = Instant::now();
-    let transfer: Vec<Message> = state
-        .messages
-        .iter()
-        .filter(|message| message.is_visible(now) && message.receive_count >= max_receive)
-        .map(|message| {
-            let mut message = message.clone();
-            message.receive_count = 0;
-            message.first_receive_ms = None;
-            message.receipt_handle = None;
-            message.visible_at = Instant::now();
-            message
-        })
-        .collect();
-    if let Some(db) = ctx.store.persistence() {
-        db.move_messages(q, &dlq, &transfer)?;
-    }
-    let mut index = 0;
     let mut moved = false;
-    while index < state.messages.len() {
-        let message = &state.messages[index];
-        if message.is_visible(now) && message.receive_count >= max_receive {
-            let mut message = state.messages.remove(index);
-            message.receive_count = 0;
-            message.first_receive_ms = None;
-            message.receipt_handle = None;
-            message.visible_at = Instant::now();
-            dlq_state.messages.push(message);
-            moved = true;
-        } else {
-            index += 1;
+    loop {
+        let transfer: Vec<Message> = state
+            .messages
+            .iter()
+            .filter(|message| message.is_visible(now) && message.receive_count >= max_receive)
+            .take(128)
+            .map(|message| {
+                let mut message = message.clone();
+                message.enter_queue(now_ms(), q.fifo);
+                message.receive_count = 0;
+                message.first_receive_ms = None;
+                message.receipt_handle = None;
+                message.visible_at = Instant::now();
+                message
+            })
+            .collect();
+        if transfer.is_empty() {
+            break;
         }
+        if let Some(db) = ctx.store.persistence() {
+            db.move_messages(q, &dlq, &transfer)?;
+        }
+        let ids: HashSet<&str> = transfer.iter().map(|message| message.id.as_str()).collect();
+        state
+            .messages
+            .retain(|message| !ids.contains(message.id.as_str()));
+        for message in transfer {
+            dlq_state.push_message(message);
+        }
+        moved = true;
     }
     drop(state);
     drop(dlq_state);
@@ -1836,7 +1853,20 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
             let mut state = q.state.lock().await;
             expire_messages(ctx, &q, &mut state)?;
             let visibility = vis_override.unwrap_or_else(|| state.visibility_timeout());
-            let selected = select_messages(&mut state, q.fifo, max, visibility);
+            let mut selected = select_messages(&mut state, q.fifo, max, visibility);
+            if let Some(db) = ctx.store.persistence() {
+                let hydrated = selected
+                    .iter()
+                    .map(|message| db.hydrate_message(&q, message))
+                    .collect::<Result<Vec<_>, _>>();
+                match hydrated {
+                    Ok(messages) => selected = messages,
+                    Err(error) => {
+                        restore_selection(&mut state, &selected);
+                        return Err(error);
+                    }
+                }
+            }
             if !selected.is_empty() {
                 if let Some(id) = &attempt_id {
                     state.receive_attempts.insert(
@@ -1866,11 +1896,15 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
                 }
             }
             let now = Instant::now();
-            let next_visibility = state
-                .messages
-                .iter()
-                .filter_map(|message| message.visible_at.checked_duration_since(now))
-                .min();
+            let next_visibility = if selected.is_empty() {
+                state
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.visible_at.checked_duration_since(now))
+                    .min()
+            } else {
+                None
+            };
             (selected, next_visibility)
         };
         if !selected.is_empty() {
@@ -1941,7 +1975,7 @@ fn delete_by_handle(
         if let Some(db) = db {
             db.delete_messages(q, &[id])?;
         }
-        state.messages.remove(pos);
+        let _ = state.messages.remove(pos);
     }
     Ok(())
 }
@@ -2080,6 +2114,7 @@ pub async fn purge_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
         }
     }
     state.messages.clear();
+    state.oldest_sent_timestamp_ms = None;
     state.dedup.clear();
     state.receive_attempts.clear();
     Ok(json!({}))
@@ -2425,6 +2460,14 @@ async fn move_one_message(
         };
         (message.clone(), queue_key_id(&state))
     };
+    let snapshot = if let Some(db) = ctx.store.persistence() {
+        match db.hydrate_message(source, &snapshot) {
+            Ok(message) => message,
+            Err(_) => return MoveOneResult::Retryable,
+        }
+    } else {
+        snapshot
+    };
     let destination_key = {
         let state = destination.state.lock().await;
         queue_key_id(&state)
@@ -2487,10 +2530,13 @@ async fn move_one_message(
         plaintext
     };
     message.encrypted_body = encrypted;
+    message.body_on_disk = false;
     message.receipt_handle = None;
     message.receive_count = 0;
     message.first_receive_ms = None;
     message.visible_at = Instant::now();
+    // Operator redrive is a new enqueue, unlike automatic Standard DLQ transfer.
+    message.enter_queue(now_ms(), true);
     if let Some(db) = ctx.store.persistence() {
         if db
             .move_messages(source, destination, std::slice::from_ref(&message))
@@ -2498,9 +2544,10 @@ async fn move_one_message(
         {
             return MoveOneResult::Retryable;
         }
+        message.offload_body();
     }
-    source_state.messages.remove(index);
-    destination_state.messages.push(message);
+    let _ = source_state.messages.remove(index);
+    destination_state.push_message(message);
     drop(source_state);
     drop(destination_state);
     destination.notify.notify_waiters();

@@ -114,7 +114,38 @@ impl SqsHandler {
         if strict && !external && !internal {
             return Err(SqsError::AccessDenied);
         }
-        let principal = if external {
+        let authenticated_operator = if internal && !external && dispatcher.is_some() {
+            let dispatcher = dispatcher.ok_or(SqsError::AccessDenied)?;
+            let principal = request
+                .headers
+                .get(locallycloud_core::integration::identity::PRINCIPAL_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(SqsError::AccessDenied)?;
+            let identity = RequestIdentity {
+                account_id: request.account_id.clone(),
+                access_key_id: request
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(RequestIdentity::access_key_from_authorization),
+                arn: None,
+            };
+            match dispatcher.resolve_caller_arn(&identity) {
+                Ok(Some(resolved)) if resolved == principal => true,
+                Ok(Some(_)) => return Err(SqsError::AccessDenied),
+                _ if !strict
+                    || locallycloud_core::integration::identity::trusted_role(request)
+                        .is_some()
+                    || principal.ends_with(".amazonaws.com") =>
+                {
+                    false
+                }
+                _ => return Err(SqsError::AccessDenied),
+            }
+        } else {
+            false
+        };
+        let principal = if external || authenticated_operator {
             let dispatcher = dispatcher.ok_or(SqsError::AccessDenied)?;
             let access_key_id = request
                 .headers
@@ -153,10 +184,33 @@ impl SqsHandler {
             // an anonymous wildcard principal, never a client-supplied internal header.
             "anonymous".to_string()
         };
+        let same_account_iam = arn.as_ref().is_some_and(|queue| {
+            if external || internal {
+                principal.starts_with(&format!("arn:aws:iam::{}:", queue.account))
+                    || principal.starts_with(&format!("arn:aws:sts::{}:", queue.account))
+            } else {
+                // Permissive mode models an ordinary SigV4 caller in Core's resolved
+                // account. This is not signature verification or service attestation.
+                !strict
+                    && queue.account == request.account_id
+                    && request
+                        .headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .filter(|value| value.starts_with("AWS4-HMAC-SHA256 "))
+                        .and_then(RequestIdentity::access_key_from_authorization)
+                        .is_some()
+            }
+        });
         if let Some(raw) = policy {
             // Core removes these headers at external ingress and creates the internal
             // attestation only for trusted in-process scoped dispatch.
-            let source = if internal && !external && principal == "sns.amazonaws.com" {
+            let source = if internal
+                && !external
+                && matches!(
+                    principal.as_str(),
+                    "sns.amazonaws.com" | "events.amazonaws.com"
+                ) {
                 let arn = request
                     .headers
                     .get("x-locallycloud-source-arn")
@@ -169,7 +223,18 @@ impl SqsHandler {
                     let components = arn.splitn(6, ':').collect::<Vec<_>>();
                     components.len() == 6
                         && components[0] == "arn"
-                        && components[2] == "sns"
+                        && match principal.as_str() {
+                            "sns.amazonaws.com" => {
+                                components[2] == "sns" && !components[5].is_empty()
+                            }
+                            "events.amazonaws.com" => {
+                                components[2] == "events"
+                                    && components[5]
+                                        .strip_prefix("rule/")
+                                        .is_some_and(|name| !name.is_empty())
+                            }
+                            _ => false,
+                        }
                         && components[3] == request.region
                         && components[4] == source_account
                         && source_account == request.account_id
@@ -192,7 +257,7 @@ impl SqsHandler {
                 source,
             ) {
                 Decision::Deny => return Err(SqsError::AccessDenied),
-                Decision::Unmatched if !external => return Err(SqsError::AccessDenied),
+                Decision::Unmatched if !same_account_iam => return Err(SqsError::AccessDenied),
                 _ => {}
             }
         }
@@ -548,6 +613,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eventbridge_source_policy_requires_attested_same_scope_rule() {
+        let h = SqsHandler::new();
+        let source = "arn:aws:events:us-east-1:000000000000:rule/orders/ledger";
+        let policy = json!({"Statement":{"Effect":"Allow", "Principal":{"Service":"events.amazonaws.com"}, "Action":"sqs:SendMessage", "Resource":"arn:aws:sqs:us-east-1:000000000000:events-source", "Condition":{"ArnEquals":{"aws:SourceArn":source}, "StringEquals":{"aws:SourceAccount":"000000000000"}}}}).to_string();
+        let (status, created) = call(
+            &h,
+            "CreateQueue",
+            json!({"QueueName":"events-source", "Attributes":{"Policy":policy}}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let body = json!({"QueueUrl":created["QueueUrl"], "MessageBody":"ledger"});
+        let mut req = request("SendMessage", body.clone());
+        for (key, value) in [
+            ("x-locallycloud-caller-principal", "events.amazonaws.com"),
+            ("x-locallycloud-source-arn", source),
+            ("x-locallycloud-source-account", "000000000000"),
+        ] {
+            req.headers.insert(key, value.parse().unwrap());
+        }
+        assert!(h
+            .authorize_queue_operation("SendMessage", &body, &req, None)
+            .await
+            .is_err());
+        req.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        assert!(h
+            .authorize_queue_operation("SendMessage", &body, &req, None)
+            .await
+            .is_ok());
+        for invalid in [
+            "arn:aws:events:us-west-2:000000000000:rule/orders/ledger",
+            "arn:aws:events:us-east-1:111111111111:rule/orders/ledger",
+            "arn:aws:events:us-east-1:000000000000:event-bus/orders",
+            "arn:aws:events:us-east-1:000000000000:rule/",
+        ] {
+            let mut forged = req.clone();
+            forged
+                .headers
+                .insert("x-locallycloud-source-arn", invalid.parse().unwrap());
+            assert!(h
+                .authorize_queue_operation("SendMessage", &body, &forged, None)
+                .await
+                .is_err());
+        }
+        req.headers.remove("x-locallycloud-source-account");
+        assert!(h
+            .authorize_queue_operation("SendMessage", &body, &req, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn service_policy_preserves_owner_access_but_deny_and_cross_account_win() {
+        let h = SqsHandler::new();
+        let resource = "arn:aws:sqs:us-east-1:000000000000:owner-policy";
+        let policy = json!({"Statement":{"Effect":"Allow", "Principal":{"Service":"sns.amazonaws.com"}, "Action":"sqs:SendMessage", "Resource":resource}}).to_string();
+        let (status, created) = call(
+            &h,
+            "CreateQueue",
+            json!({"QueueName":"owner-policy", "Attributes":{"Policy":policy}}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let body = json!({"QueueUrl":created["QueueUrl"], "AttributeNames":["Policy"]});
+        let mut req = request("GetQueueAttributes", body.clone());
+        assert!(h
+            .authorize_queue_operation("GetQueueAttributes", &body, &req, None)
+            .await
+            .is_err());
+        req.headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20261006/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=test".parse().unwrap());
+        assert!(h
+            .authorize_queue_operation("GetQueueAttributes", &body, &req, None)
+            .await
+            .is_ok());
+        let mut other = req.clone();
+        other.account_id = "111111111111".into();
+        assert!(h
+            .authorize_queue_operation("GetQueueAttributes", &body, &other, None)
+            .await
+            .is_err());
+        req.headers.remove(http::header::AUTHORIZATION);
+        req.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        req.headers.insert(
+            "x-locallycloud-caller-principal",
+            "arn:aws:iam::000000000000:role/worker".parse().unwrap(),
+        );
+        assert!(h
+            .authorize_queue_operation("GetQueueAttributes", &body, &req, None)
+            .await
+            .is_ok());
+        let mut other = req.clone();
+        other.headers.insert(
+            "x-locallycloud-caller-principal",
+            "arn:aws:iam::111111111111:role/worker".parse().unwrap(),
+        );
+        assert!(h
+            .authorize_queue_operation("GetQueueAttributes", &body, &other, None)
+            .await
+            .is_err());
+        let deny = json!({"Statement":{"Effect":"Deny", "Principal":"*", "Action":"sqs:GetQueueAttributes", "Resource":resource}}).to_string();
+        let arn = QueueArn::new("us-east-1", "000000000000", "owner-policy");
+        h.store
+            .get(&arn)
+            .unwrap()
+            .state
+            .lock()
+            .await
+            .attributes
+            .insert("Policy".into(), deny);
+        assert!(h
+            .authorize_queue_operation("GetQueueAttributes", &body, &req, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn legacy_queue_size_limit_survives_restart() {
         let root =
             std::env::temp_dir().join(format!("locallycloud-sqs-size-{}", uuid::Uuid::new_v4()));
@@ -638,6 +825,188 @@ mod tests {
         let (status, error) = call(&h, "CreateQueue", json!({"QueueName": "restart.fifo"})).await;
         assert_eq!(status, 400);
         assert!(error.to_string().contains("QueueDeletedRecently"));
+        drop(h);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disk_backlog_above_64_mib_preserves_restart_attempts_and_atomic_redrive() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("sqs-disk-backlog-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let registry = Arc::new(ServiceRegistry::new());
+        let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+        let url = create(&h, "backlog.fifo").await;
+        let dlq_url = create(&h, "backlog-dlq.fifo").await;
+        let arn = crate::model::QueueArn::new("us-east-1", "000000000000", "backlog.fifo");
+        let dlq_arn = "arn:aws:sqs:us-east-1:000000000000:backlog-dlq.fifo";
+        let filler = "x".repeat(1_048_570);
+        for index in 0..65 {
+            let body = format!("{index:06}{filler}");
+            let (status, _) = call(&h, "SendMessage", json!({"QueueUrl":url,"MessageBody":body,"MessageGroupId":format!("g-{index}"),"MessageDeduplicationId":format!("d-{index}")})).await;
+            assert_eq!(status, 200);
+        }
+        let q = h.store.get(&arn).unwrap();
+        {
+            let state = q.state.lock().await;
+            assert_eq!(state.messages.len(), 65);
+            assert!(state
+                .messages
+                .iter()
+                .all(|message| message.body_on_disk && message.body.capacity() == 0));
+        }
+        drop(q);
+        drop(h);
+        let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+        let q = h.store.get(&arn).unwrap();
+        assert!(q
+            .state
+            .lock()
+            .await
+            .messages
+            .iter()
+            .all(|message| message.body_on_disk && message.body.capacity() == 0));
+        // A failed durable receive cannot publish a receipt or lose its offloaded payload.
+        db.connection().unwrap().execute_batch("CREATE TRIGGER sqs_receive_failure BEFORE UPDATE ON sqs_messages BEGIN SELECT RAISE(FAIL,'injected receive failure'); END;").unwrap();
+        let (status, _) = call(&h, "ReceiveMessage", json!({"QueueUrl":url})).await;
+        assert_eq!(status, 500);
+        assert!(q
+            .state
+            .lock()
+            .await
+            .messages
+            .iter()
+            .all(|message| message.receipt_handle.is_none() && message.receive_count == 0));
+        db.connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER sqs_receive_failure;")
+            .unwrap();
+        let (status, received) = call(
+            &h,
+            "ReceiveMessage",
+            json!({"QueueUrl":url,"ReceiveRequestAttemptId":"first","VisibilityTimeout":0}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let expected = format!("000000{filler}");
+        assert_eq!(received["Messages"][0]["Body"].as_str().unwrap(), expected);
+        let receipt = received["Messages"][0]["ReceiptHandle"].as_str().unwrap();
+        assert_eq!(
+            call(
+                &h,
+                "DeleteMessage",
+                json!({"QueueUrl":url,"ReceiptHandle":receipt})
+            )
+            .await
+            .0,
+            200
+        );
+        drop(q);
+        drop(h);
+        let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+        let (status, replayed) = call(
+            &h,
+            "ReceiveMessage",
+            json!({"QueueUrl":url,"ReceiveRequestAttemptId":"first"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(replayed["Messages"][0]["Body"].as_str().unwrap(), expected);
+        let policy = json!({"deadLetterTargetArn":dlq_arn,"maxReceiveCount":1}).to_string();
+        assert_eq!(
+            call(
+                &h,
+                "SetQueueAttributes",
+                json!({"QueueUrl":url,"Attributes":{"RedrivePolicy":policy}})
+            )
+            .await
+            .0,
+            200
+        );
+        // Receive the next record once; the following receive attempts automatic redrive.
+        let (status, poison) = call(
+            &h,
+            "ReceiveMessage",
+            json!({"QueueUrl":url,"VisibilityTimeout":0}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let poison_id = poison["Messages"][0]["MessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let poison_body = poison["Messages"][0]["Body"].as_str().unwrap().to_string();
+        db.connection().unwrap().execute_batch(&format!("CREATE TRIGGER sqs_dlq_failure BEFORE INSERT ON sqs_messages WHEN NEW.arn='{dlq_arn}' BEGIN SELECT RAISE(FAIL,'injected DLQ failure'); END;")).unwrap();
+        assert_eq!(
+            call(&h, "ReceiveMessage", json!({"QueueUrl":url})).await.0,
+            500
+        );
+        let q = h.store.get(&arn).unwrap();
+        assert!(q
+            .state
+            .lock()
+            .await
+            .messages
+            .iter()
+            .any(|message| message.id == poison_id && message.body_on_disk));
+        db.connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER sqs_dlq_failure;")
+            .unwrap();
+        assert_eq!(
+            call(&h, "ReceiveMessage", json!({"QueueUrl":url})).await.0,
+            200
+        );
+        let expired_id = q.state.lock().await.messages.back().unwrap().id.clone();
+        drop(q);
+        drop(h);
+        // Legacy durable rows may already be expired at startup; the retention bound must
+        // derive from all restored timestamps, including messages moved out of send order.
+        db.connection().unwrap().execute("UPDATE sqs_messages SET payload=json_set(payload,'$.sent_timestamp_ms',0) WHERE arn=?1 AND id=?2", rusqlite::params![arn.to_arn(), expired_id]).unwrap();
+        let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+        assert_eq!(
+            call(&h, "GetQueueAttributes", json!({"QueueUrl":url}))
+                .await
+                .0,
+            200
+        );
+        assert!(!h
+            .store
+            .get(&arn)
+            .unwrap()
+            .state
+            .lock()
+            .await
+            .messages
+            .iter()
+            .any(|message| message.id == expired_id));
+        let remaining: i64 = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqs_messages WHERE arn=?1 AND id=?2",
+                rusqlite::params![arn.to_arn(), expired_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let (status, moved) = call(&h, "ReceiveMessage", json!({"QueueUrl":dlq_url})).await;
+        assert_eq!(status, 200);
+        assert_eq!(moved["Messages"][0]["MessageId"], poison_id);
+        assert_eq!(moved["Messages"][0]["Body"].as_str().unwrap(), poison_body);
+        assert_eq!(
+            call(&h, "DeleteQueue", json!({"QueueUrl":url})).await.0,
+            200
+        );
+        assert_eq!(
+            call(&h, "DeleteQueue", json!({"QueueUrl":dlq_url})).await.0,
+            200
+        );
         drop(h);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
@@ -1157,6 +1526,173 @@ mod tests {
 
         fn sum(sink: &RecordingSink, queue: &str, name: &str) -> f64 {
             points(sink, queue, name).iter().map(|o| o.value).sum()
+        }
+
+        #[tokio::test]
+        async fn queue_age_poison_redrive_restart_and_legacy_retention() {
+            let root = std::env::temp_dir().join(format!("sqs-age-{}", uuid::Uuid::new_v4()));
+            let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+            let mut queues = Vec::new();
+            for fifo in [false, true] {
+                let suffix = if fifo { ".fifo" } else { "" };
+                let source = format!("age-source{suffix}");
+                let dlq = format!("age-dlq{suffix}");
+                let dlq_url = create(&h, &dlq).await;
+                let dlq_arn = format!("arn:aws:sqs:us-east-1:000000000000:{dlq}");
+                let (status, created) = call(&h, "CreateQueue", json!({"QueueName":source,"Attributes":{
+                    "RedrivePolicy":json!({"deadLetterTargetArn":dlq_arn,"maxReceiveCount":4}).to_string()
+                }})).await;
+                assert_eq!(status, 200);
+                let url = created["QueueUrl"].as_str().unwrap().to_string();
+                let mut send = json!({"QueueUrl":url,"MessageBody":"old poison"});
+                if fifo {
+                    send["MessageGroupId"] = json!("group");
+                    send["MessageDeduplicationId"] = json!("dedup");
+                }
+                assert_eq!(call(&h, "SendMessage", send).await.0, 200);
+                queues.push((fifo, source, dlq, url, dlq_url));
+            }
+            drop(h);
+            let old = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64)
+                - 180_000;
+            // Legacy metadata has no queue-arrival field; hydration must preserve its age.
+            db.connection().unwrap().execute(
+                "UPDATE sqs_messages SET payload=json_remove(json_set(payload,'$.sent_timestamp_ms',?1),'$.queue_arrival_ms')", [old]
+            ).unwrap();
+            let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+            h.metrics.recorder().tick().await;
+            for (_, source, _, _, _) in &queues {
+                assert!(
+                    points(&sink, source, "ApproximateAgeOfOldestMessage")
+                        .last()
+                        .unwrap()
+                        .value
+                        >= 180.0
+                );
+            }
+            for (fifo, source, dlq, url, _) in &queues {
+                for _ in 0..3 {
+                    let (status, received) = call(
+                        &h,
+                        "ReceiveMessage",
+                        json!({"QueueUrl":url,"VisibilityTimeout":0}),
+                    )
+                    .await;
+                    assert_eq!(status, 200);
+                    assert_eq!(received["Messages"].as_array().unwrap().len(), 1);
+                }
+                h.metrics.recorder().tick().await;
+                let age = points(&sink, source, "ApproximateAgeOfOldestMessage")
+                    .last()
+                    .unwrap()
+                    .value;
+                if *fifo {
+                    assert!(age >= 180.0);
+                } else {
+                    assert_eq!(age, 0.0);
+                }
+                // The configured threshold is still four, independently of age exclusion.
+                assert_eq!(
+                    call(
+                        &h,
+                        "ReceiveMessage",
+                        json!({"QueueUrl":url,"VisibilityTimeout":0})
+                    )
+                    .await
+                    .1["Messages"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                let (status, moved) = call(
+                    &h,
+                    "ReceiveMessage",
+                    json!({"QueueUrl":url,"VisibilityTimeout":0}),
+                )
+                .await;
+                assert_eq!(status, 200);
+                assert!(moved.get("Messages").is_none());
+                let queue = h
+                    .store
+                    .get(&QueueArn::new("us-east-1", "000000000000", dlq))
+                    .unwrap();
+                let state = queue.state.lock().await;
+                let message = &state.messages[0];
+                assert!(message.queue_arrival_ms.unwrap() > old + 170_000);
+                assert_eq!(
+                    message.sent_timestamp_ms,
+                    if *fifo {
+                        message.queue_arrival_ms.unwrap()
+                    } else {
+                        old
+                    }
+                );
+                drop(state);
+                h.metrics.recorder().tick().await;
+                assert!(
+                    points(&sink, dlq, "ApproximateAgeOfOldestMessage")
+                        .last()
+                        .unwrap()
+                        .value
+                        < 10.0
+                );
+            }
+            drop(h);
+            let h = SqsHandler::with_state(&registry, db.clone()).unwrap();
+            for (fifo, _, dlq, _, dlq_url) in &queues {
+                let queue = h
+                    .store
+                    .get(&QueueArn::new("us-east-1", "000000000000", dlq))
+                    .unwrap();
+                let state = queue.state.lock().await;
+                let message = &state.messages[0];
+                assert!(message.queue_arrival_ms.unwrap() > old + 170_000);
+                assert_eq!(
+                    message.sent_timestamp_ms,
+                    if *fifo {
+                        message.queue_arrival_ms.unwrap()
+                    } else {
+                        old
+                    }
+                );
+                drop(state);
+                let (status, received) = call(
+                    &h,
+                    "ReceiveMessage",
+                    json!({"QueueUrl":dlq_url,"MessageSystemAttributeNames":["SentTimestamp"]}),
+                )
+                .await;
+                assert_eq!(status, 200);
+                let timestamp = received["Messages"][0]["Attributes"]["SentTimestamp"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap();
+                if *fifo {
+                    assert!(timestamp > old + 170_000);
+                } else {
+                    assert_eq!(timestamp, old);
+                }
+            }
+            h.metrics.recorder().tick().await;
+            for (_, _, dlq, _, _) in &queues {
+                assert!(
+                    points(&sink, dlq, "ApproximateAgeOfOldestMessage")
+                        .last()
+                        .unwrap()
+                        .value
+                        < 10.0
+                );
+            }
+            drop(h);
+            drop(db);
+            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[tokio::test]

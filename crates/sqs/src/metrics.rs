@@ -245,8 +245,13 @@ impl MetricsRecorder {
                 let oldest = state
                     .messages
                     .iter()
-                    .map(|message| message.sent_timestamp_ms)
-                    .filter(|sent| *sent > cutoff)
+                    .filter(|message| message.sent_timestamp_ms > cutoff)
+                    .filter(|message| queue.fifo || message.receive_count < 3)
+                    .map(|message| {
+                        message
+                            .queue_arrival_ms
+                            .unwrap_or(message.sent_timestamp_ms)
+                    })
                     .min();
                 (visible, not_visible, delayed, oldest)
             };

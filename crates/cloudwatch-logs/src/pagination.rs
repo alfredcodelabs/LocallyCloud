@@ -485,8 +485,35 @@ struct EventSnapshot {
     request_key: String,
     revision: u64,
     expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     events: Vec<PagedEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk_len: Option<usize>,
 }
+
+impl EventSnapshot {
+    fn len(&self) -> usize {
+        self.disk_len.unwrap_or(self.events.len())
+    }
+    fn charge(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.request_key.capacity()
+            + self.scope.account_id.capacity()
+            + self.scope.region.capacity()
+            + self.events.capacity() * std::mem::size_of::<PagedEvent>()
+            + self
+                .events
+                .iter()
+                .map(|event| {
+                    event.log_stream_name.capacity()
+                        + event.event.id.capacity()
+                        + event.event.message.capacity()
+                })
+                .sum::<usize>()
+    }
+}
+
+const MAX_EVENT_CURSOR_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct EventTokenPayload {
@@ -545,17 +572,73 @@ impl EventPaginator {
         let mut result = Self::default();
         if let Some(persistence) = persistence {
             result.secret = persistence.secret("events", result.secret)?;
-            let records: Vec<(String, EventSnapshot)> = persistence.records("events")?;
-            *result
+            let snapshots = result
                 .snapshots
                 .get_mut()
-                .map_err(|_| crate::persistence::unavailable())? = records.into_iter().collect();
+                .map_err(|_| crate::persistence::unavailable())?;
+            let mut cache_bytes = 0usize;
+            for id in persistence.cursor_ids("events")? {
+                let mut snapshot: EventSnapshot = persistence.cursor_record("events", &id)?;
+                if snapshot.disk_len.is_none() {
+                    let events = std::mem::take(&mut snapshot.events);
+                    snapshot.disk_len = Some(Self::persist_events(
+                        &persistence,
+                        &id,
+                        snapshot.expires_at_ms,
+                        events.into_iter().map(Ok),
+                    )?);
+                    persistence.commit(vec![persistence.cursor(
+                        "events",
+                        &id,
+                        snapshot.expires_at_ms,
+                        &snapshot,
+                    )?])?;
+                }
+                cache_bytes = cache_bytes
+                    .checked_add(snapshot.charge() + id.capacity())
+                    .ok_or_else(crate::persistence::unavailable)?;
+                if cache_bytes > MAX_EVENT_CURSOR_BYTES || snapshots.len() >= MAX_SNAPSHOTS {
+                    return Err(crate::persistence::unavailable());
+                }
+                snapshots.insert(id, snapshot);
+            }
             result.persistence = Some(persistence);
         }
         Ok(result)
     }
 
+    fn persist_events<I: Iterator<Item = Result<PagedEvent, LogsError>>>(
+        persistence: &Persistence,
+        id: &str,
+        expires: i64,
+        events: I,
+    ) -> Result<usize, LogsError> {
+        let mut changes = Vec::new();
+        let mut batch_bytes = 0usize;
+        let mut count = 0usize;
+        for event in events {
+            let event = event?;
+            if count >= MAX_EVENT_SNAPSHOT_EVENTS {
+                return Err(LogsError::ServiceUnavailable(
+                    "CloudWatch Logs event snapshot is too large".into(),
+                ));
+            }
+            batch_bytes = batch_bytes.saturating_add(event.event.body_len());
+            changes.push(persistence.cursor_event(id, count, expires, &event)?);
+            count += 1;
+            if batch_bytes >= 1024 * 1024 || changes.len() >= 256 {
+                persistence.commit(std::mem::take(&mut changes))?;
+                batch_bytes = 0;
+            }
+        }
+        if !changes.is_empty() {
+            persistence.commit(changes)?;
+        }
+        Ok(count)
+    }
+
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn first_page(
         &self,
         events: Vec<PagedEvent>,
@@ -567,18 +650,92 @@ impl EventPaginator {
         start_from_head: bool,
         now_ms: i64,
     ) -> Result<EventPage, LogsError> {
-        if events.len() > MAX_EVENT_SNAPSHOT_EVENTS {
-            return Err(LogsError::ServiceUnavailable(
-                "CloudWatch Logs event snapshot is too large".into(),
-            ));
-        }
+        self.first_page_iter(
+            events.into_iter().map(Ok),
+            scope,
+            request_key,
+            limit,
+            max_bytes,
+            revision,
+            start_from_head,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn first_page_iter<I: Iterator<Item = Result<PagedEvent, LogsError>>>(
+        &self,
+        events: I,
+        scope: ScopeKey,
+        request_key: String,
+        limit: usize,
+        max_bytes: usize,
+        revision: u64,
+        start_from_head: bool,
+        now_ms: i64,
+    ) -> Result<EventPage, LogsError> {
         let snapshot_id = Uuid::new_v4().simple().to_string();
         let expires_at_ms = now_ms.saturating_add(TOKEN_LIFETIME_MS);
+        let mut snapshots = self.lock()?;
+        snapshots.retain(|_, snapshot| snapshot.expires_at_ms > now_ms);
+        let mut snapshot = EventSnapshot {
+            scope,
+            request_key,
+            revision,
+            expires_at_ms,
+            events: Vec::new(),
+            disk_len: None,
+        };
+        let cache_bytes = snapshots
+            .iter()
+            .map(|(id, value)| id.capacity() + value.charge())
+            .sum::<usize>();
+        if snapshots.len() >= MAX_SNAPSHOTS
+            || cache_bytes.saturating_add(snapshot.charge() + snapshot_id.capacity())
+                > MAX_EVENT_CURSOR_BYTES
+        {
+            return Err(LogsError::ServiceUnavailable(
+                "CloudWatch Logs pagination snapshot capacity is exhausted".into(),
+            ));
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.prune_cursors("events", now_ms)?;
+            let persisted = (|| {
+                snapshot.disk_len = Some(Self::persist_events(
+                    persistence,
+                    &snapshot_id,
+                    expires_at_ms,
+                    events,
+                )?);
+                persistence.commit(vec![persistence.cursor(
+                    "events",
+                    &snapshot_id,
+                    expires_at_ms,
+                    &snapshot,
+                )?])
+            })();
+            if let Err(error) = persisted {
+                let _ = persistence.remove_cursor_events(&snapshot_id);
+                return Err(error);
+            }
+        } else {
+            for event in events {
+                snapshot.events.push(event?);
+                if snapshot.events.len() > MAX_EVENT_SNAPSHOT_EVENTS
+                    || cache_bytes.saturating_add(snapshot.charge() + snapshot_id.capacity())
+                        > MAX_EVENT_CURSOR_BYTES
+                {
+                    return Err(LogsError::ServiceUnavailable(
+                        "CloudWatch Logs pagination snapshot byte capacity is exhausted".into(),
+                    ));
+                }
+            }
+        }
         let payload = EventTokenPayload {
             version: TOKEN_VERSION,
             snapshot_id: snapshot_id.clone(),
             revision,
-            position: if start_from_head { 0 } else { events.len() },
+            position: if start_from_head { 0 } else { snapshot.len() },
             direction: if start_from_head {
                 EventDirection::Forward
             } else {
@@ -586,42 +743,15 @@ impl EventPaginator {
             },
             expires_at_ms,
         };
-        let mut snapshots = self.lock()?;
-        snapshots.retain(|_, snapshot| snapshot.expires_at_ms > now_ms);
-        if snapshots.len() >= MAX_SNAPSHOTS {
-            return Err(LogsError::ServiceUnavailable(
-                "CloudWatch Logs pagination snapshot capacity is exhausted".into(),
-            ));
-        }
-        snapshots.insert(
-            snapshot_id.clone(),
-            EventSnapshot {
-                scope,
-                request_key,
-                revision,
-                expires_at_ms,
-                events,
-            },
-        );
-        if let Some(persistence) = &self.persistence {
-            let snapshot = snapshots.get(&snapshot_id).expect("snapshot inserted");
-            let result = persistence.prune_cursors("events", now_ms).and_then(|_| {
-                persistence.commit(vec![persistence.cursor(
-                    "events",
-                    &snapshot_id,
-                    expires_at_ms,
-                    snapshot,
-                )?])
-            });
-            if let Err(error) = result {
-                snapshots.remove(&snapshot_id);
-                return Err(error);
-            }
-        }
-        let snapshot = snapshots
-            .get(&payload.snapshot_id)
-            .expect("event snapshot was inserted");
-        self.page(snapshot, payload, limit, max_bytes)
+        snapshots.insert(snapshot_id, snapshot);
+        self.page(
+            snapshots
+                .get(&payload.snapshot_id)
+                .expect("snapshot inserted"),
+            payload,
+            limit,
+            max_bytes,
+        )
     }
 
     pub fn next_page(&self, request: EventNextPageRequest<'_>) -> Result<EventPage, LogsError> {
@@ -643,7 +773,7 @@ impl EventPaginator {
             || snapshot.request_key != request.request_key
             || snapshot.revision != payload.revision
             || snapshot.expires_at_ms != payload.expires_at_ms
-            || payload.position > snapshot.events.len()
+            || payload.position > snapshot.len()
         {
             return Err(invalid_token());
         }
@@ -658,38 +788,59 @@ impl EventPaginator {
         max_bytes: usize,
     ) -> Result<EventPage, LogsError> {
         let backward = payload.direction == EventDirection::Backward;
-        let (start, end) = match payload.direction {
-            EventDirection::Forward => {
-                let mut end = payload.position;
-                let mut bytes = 0_usize;
-                while end < snapshot.events.len() && end - payload.position < limit {
-                    let charge = snapshot.events[end].event.message.len().saturating_add(26);
-                    if bytes.saturating_add(charge) > max_bytes {
-                        break;
+        let (start, end, events) = if snapshot.disk_len.is_some() {
+            let persistence = self.persistence.as_ref().ok_or_else(invalid_token)?;
+            let events = persistence.cursor_page(
+                &payload.snapshot_id,
+                payload.position,
+                backward,
+                limit,
+                max_bytes,
+            )?;
+            let (start, end) = if backward {
+                (
+                    payload.position.saturating_sub(events.len()),
+                    payload.position,
+                )
+            } else {
+                (payload.position, payload.position + events.len())
+            };
+            (start, end, events)
+        } else {
+            let (start, end) = match payload.direction {
+                EventDirection::Forward => {
+                    let mut end = payload.position;
+                    let mut bytes = 0_usize;
+                    while end < snapshot.events.len() && end - payload.position < limit {
+                        let charge = snapshot.events[end].event.message.len().saturating_add(26);
+                        if bytes.saturating_add(charge) > max_bytes {
+                            break;
+                        }
+                        bytes += charge;
+                        end += 1;
                     }
-                    bytes += charge;
-                    end += 1;
+                    (payload.position, end)
                 }
-                (payload.position, end)
-            }
-            EventDirection::Backward => {
-                let end = payload.position;
-                let mut start = end;
-                let mut bytes = 0_usize;
-                while start > 0 && end - start < limit {
-                    let charge = snapshot.events[start - 1]
-                        .event
-                        .message
-                        .len()
-                        .saturating_add(26);
-                    if bytes.saturating_add(charge) > max_bytes {
-                        break;
+                EventDirection::Backward => {
+                    let end = payload.position;
+                    let mut start = end;
+                    let mut bytes = 0_usize;
+                    while start > 0 && end - start < limit {
+                        let charge = snapshot.events[start - 1]
+                            .event
+                            .message
+                            .len()
+                            .saturating_add(26);
+                        if bytes.saturating_add(charge) > max_bytes {
+                            break;
+                        }
+                        bytes += charge;
+                        start -= 1;
                     }
-                    bytes += charge;
-                    start -= 1;
+                    (start, end)
                 }
-                (start, end)
-            }
+            };
+            (start, end, snapshot.events[start..end].to_vec())
         };
         let next_forward_token = self.encode(EventTokenPayload {
             version: payload.version,
@@ -708,14 +859,14 @@ impl EventPaginator {
             expires_at_ms: payload.expires_at_ms,
         })?;
         Ok(EventPage {
-            events: snapshot.events[start..end].to_vec(),
+            events,
             next_forward_token,
             next_backward_token,
             backward,
             has_more: if backward {
                 start > 0
             } else {
-                end < snapshot.events.len()
+                end < snapshot.len()
             },
         })
     }

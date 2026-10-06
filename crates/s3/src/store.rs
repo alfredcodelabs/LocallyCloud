@@ -477,9 +477,24 @@ pub struct BucketState {
     pub uploads: DirtyMap<String, MultipartUpload>,
 }
 
+// Gate identity is immutable and can be looked up without taking bucket metadata locks.
+struct StoredBucket {
+    state: Arc<RwLock<BucketState>>,
+    transaction_gate: Arc<RwLock<()>>,
+}
+
+impl StoredBucket {
+    fn new(bucket: BucketState) -> Self {
+        Self {
+            transaction_gate: bucket.transaction_gate.clone(),
+            state: Arc::new(RwLock::new(bucket)),
+        }
+    }
+}
+
 /// Globally named buckets with account-scoped access.
 pub struct AccountStore {
-    buckets: DashMap<String, (String, Arc<RwLock<BucketState>>)>,
+    buckets: DashMap<String, (String, StoredBucket)>,
     account_public_access_blocks: DashMap<String, PublicAccessBlock>,
     next_id: AtomicU64,
     pub(crate) storage_keys: Arc<StorageKeys>,
@@ -505,7 +520,7 @@ impl AccountStore {
             .buckets
             .iter()
             .filter(|e| e.value().0 == account)
-            .map(|e| e.value().1.clone())
+            .map(|e| e.value().1.state.clone())
             .collect();
         let mut regions = Vec::new();
         for bucket in buckets {
@@ -549,7 +564,7 @@ impl AccountStore {
             Entry::Vacant(slot) => {
                 slot.insert((
                     account.to_string(),
-                    Arc::new(RwLock::new(BucketState {
+                    StoredBucket::new(BucketState {
                         transaction_gate: Arc::new(RwLock::new(())),
                         name: name.to_string(),
                         region: region.to_string(),
@@ -572,7 +587,7 @@ impl AccountStore {
                             VersioningState::NeverEnabled
                         },
                         uploads: DirtyMap::default(),
-                    })),
+                    }),
                 ));
                 Ok(())
             }
@@ -582,7 +597,13 @@ impl AccountStore {
     pub fn get(&self, account: &str, name: &str) -> Option<Arc<RwLock<BucketState>>> {
         self.buckets
             .get(name)
-            .and_then(|entry| (entry.value().0 == account).then(|| entry.value().1.clone()))
+            .and_then(|entry| (entry.value().0 == account).then(|| entry.value().1.state.clone()))
+    }
+
+    pub(crate) fn transaction_gate(&self, account: &str, name: &str) -> Option<Arc<RwLock<()>>> {
+        self.buckets.get(name).and_then(|entry| {
+            (entry.value().0 == account).then(|| entry.value().1.transaction_gate.clone())
+        })
     }
 
     pub fn exists(&self, account: &str, name: &str) -> bool {
@@ -592,7 +613,7 @@ impl AccountStore {
     pub fn remove(&self, account: &str, name: &str) -> Option<Arc<RwLock<BucketState>>> {
         use dashmap::mapref::entry::Entry;
         match self.buckets.entry(name.to_string()) {
-            Entry::Occupied(slot) if slot.get().0 == account => Some(slot.remove().1),
+            Entry::Occupied(slot) if slot.get().0 == account => Some(slot.remove().1.state),
             _ => None,
         }
     }
@@ -932,7 +953,10 @@ impl AccountStore {
         let mut buckets = Vec::new();
         for entry in &self.buckets {
             let (account, bucket) = entry.value();
-            let mut guard = bucket.try_write().map_err(|_| S3Error::InternalError)?;
+            let mut guard = bucket
+                .state
+                .try_write()
+                .map_err(|_| S3Error::InternalError)?;
             for object in guard.objects.values_mut() {
                 object.body.make_durable(blobs)?;
             }
@@ -976,6 +1000,10 @@ impl AccountStore {
         blocks: Vec<(String, PublicAccessBlock)>,
         next_id: u64,
     ) {
+        // Restore is a complete committed snapshot, including absent namespaces.
+        // The live recovery caller holds the namespace write gate.
+        self.buckets.clear();
+        self.account_public_access_blocks.clear();
         for ((account, name), mut bucket) in buckets {
             for (key, object) in &bucket.objects {
                 if !bucket.versions.contains_key(key) {
@@ -996,7 +1024,7 @@ impl AccountStore {
             }
             bucket.uploads.take_dirty();
             self.buckets
-                .insert(name, (account, Arc::new(RwLock::new(bucket))));
+                .insert(name, (account, StoredBucket::new(bucket)));
         }
         for (account, block) in blocks {
             self.account_public_access_blocks.insert(account, block);
@@ -1010,7 +1038,7 @@ impl AccountStore {
         for (account, name, value) in snapshot.buckets {
             let bucket = serde_json::from_value(value).map_err(|_| S3Error::InternalError)?;
             self.buckets
-                .insert(name, (account, Arc::new(RwLock::new(bucket))));
+                .insert(name, (account, StoredBucket::new(bucket)));
         }
         for (account, block) in snapshot.account_public_access_blocks {
             self.account_public_access_blocks.insert(account, block);
@@ -1119,7 +1147,13 @@ impl AccountStore {
             rows.push(row("bucket", String::new(), String::new(), None));
             return Ok(rows);
         };
-        let mut guard = bucket.try_write().map_err(|_| S3Error::InternalError)?;
+        let mut guard = bucket.try_write().map_err(|_| {
+            tracing::error!(
+                stage = "bucket_lock",
+                "S3 metadata guard was held during durable commit"
+            );
+            S3Error::InternalError
+        })?;
         rows.push(row(
             "bucket",
             String::new(),

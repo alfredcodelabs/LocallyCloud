@@ -24,6 +24,8 @@ pub enum DdbError {
     Validation(String),
     #[error("{0}")]
     ProvisionedThroughputExceeded(String),
+    #[error("{0}")]
+    Throttling(String),
     #[error("transaction cancelled")]
     TransactionCanceled(Vec<CancellationReason>),
     #[error("{0}")]
@@ -69,6 +71,7 @@ impl DdbError {
             DdbError::ConditionalCheckFailed(_) => "ConditionalCheckFailedException",
             DdbError::Validation(_) => "ValidationException",
             DdbError::ProvisionedThroughputExceeded(_) => "ProvisionedThroughputExceededException",
+            DdbError::Throttling(_) => "ThrottlingException",
             DdbError::TransactionCanceled(_) => "TransactionCanceledException",
             DdbError::TransactionConflict(_) => "TransactionConflictException",
             DdbError::IdempotentParameterMismatch(_) => "IdempotentParameterMismatchException",
@@ -86,6 +89,7 @@ impl DdbError {
             | DdbError::ConditionalCheckFailed(_)
             | DdbError::Validation(_)
             | DdbError::ProvisionedThroughputExceeded(_)
+            | DdbError::Throttling(_)
             | DdbError::TransactionCanceled(_)
             | DdbError::TransactionConflict(_)
             | DdbError::IdempotentParameterMismatch(_)
@@ -106,6 +110,7 @@ impl DdbError {
             DdbError::ResourceNotFound(_) => "ResourceNotFound",
             DdbError::ConditionalCheckFailed(_) => "ConditionalCheckFailed",
             DdbError::ProvisionedThroughputExceeded(_) => "ProvisionedThroughputExceeded",
+            DdbError::Throttling(_) => "ThrottlingError",
             DdbError::TransactionConflict(_) => "TransactionConflict",
             DdbError::IdempotentParameterMismatch(_) => "IdempotentParameterMismatch",
             _ => "ValidationError",

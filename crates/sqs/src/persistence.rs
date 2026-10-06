@@ -70,6 +70,7 @@ impl From<&QueueState> for StoredQueue {
 #[derive(Serialize, Deserialize)]
 struct StoredMessage {
     id: String,
+    #[serde(default)]
     body: String,
     encrypted_body: Option<EncryptedBody>,
     md5_body: String,
@@ -80,6 +81,8 @@ struct StoredMessage {
     dedup_id: Option<String>,
     sequence_number: Option<u128>,
     sent_timestamp_ms: i64,
+    #[serde(default)]
+    queue_arrival_ms: Option<i64>,
     receive_count: u32,
     first_receive_ms: Option<i64>,
     visible_at_ms: i64,
@@ -100,6 +103,7 @@ impl From<&Message> for StoredMessage {
             dedup_id: m.dedup_id.clone(),
             sequence_number: m.sequence_number,
             sent_timestamp_ms: m.sent_timestamp_ms,
+            queue_arrival_ms: m.queue_arrival_ms,
             receive_count: m.receive_count,
             first_receive_ms: m.first_receive_ms,
             visible_at_ms: deadline_ms(m.visible_at),
@@ -113,6 +117,7 @@ impl From<StoredMessage> for Message {
         Self {
             id: m.id,
             body: m.body,
+            body_on_disk: false,
             encrypted_body: m.encrypted_body,
             md5_body: m.md5_body,
             attributes: m.attributes,
@@ -122,6 +127,7 @@ impl From<StoredMessage> for Message {
             dedup_id: m.dedup_id,
             sequence_number: m.sequence_number,
             sent_timestamp_ms: m.sent_timestamp_ms,
+            queue_arrival_ms: m.queue_arrival_ms,
             receive_count: m.receive_count,
             first_receive_ms: m.first_receive_ms,
             visible_at: instant(m.visible_at_ms),
@@ -220,7 +226,7 @@ impl SqsPersistence {
             .map_err(storage_error)?;
             let key = arn.to_arn();
             let mut statement = connection
-                .prepare("SELECT payload FROM sqs_messages WHERE arn=?1 ORDER BY rowid")
+                .prepare("SELECT json_remove(payload, '$.body', '$.encrypted_body.ciphertext') FROM sqs_messages WHERE arn=?1 ORDER BY rowid")
                 .map_err(storage_error)?;
             let messages = statement
                 .query_map([&key], |row| row.get::<_, String>(0))
@@ -228,7 +234,9 @@ impl SqsPersistence {
             for payload in messages {
                 let saved: StoredMessage = serde_json::from_str(&payload.map_err(storage_error)?)
                     .map_err(storage_error)?;
-                state.messages.push(saved.into());
+                let mut message: Message = saved.into();
+                message.offload_body();
+                state.push_message(message);
             }
             let mut statement = connection
                 .prepare(
@@ -369,6 +377,38 @@ impl SqsPersistence {
         Ok(())
     }
 
+    fn hydrate_locked(
+        connection: &rusqlite::Connection,
+        arn: &str,
+        message: &Message,
+    ) -> Result<Message, SqsError> {
+        if !message.body_on_disk {
+            return Ok(message.clone());
+        }
+        let payload: String = connection
+            .query_row(
+                "SELECT payload FROM sqs_messages WHERE arn=?1 AND id=?2",
+                params![arn, message.id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        let saved: StoredMessage = serde_json::from_str(&payload).map_err(storage_error)?;
+        let mut hydrated = message.clone();
+        hydrated.body = saved.body;
+        hydrated.encrypted_body = saved.encrypted_body;
+        hydrated.body_on_disk = false;
+        Ok(hydrated)
+    }
+
+    pub fn hydrate_message(
+        &self,
+        queue: &GuardedQueue,
+        message: &Message,
+    ) -> Result<Message, SqsError> {
+        let connection = self.connection.lock().map_err(storage_error)?;
+        Self::hydrate_locked(&connection, &queue.arn.to_arn(), message)
+    }
+
     pub fn save_message(
         &self,
         queue: &GuardedQueue,
@@ -409,10 +449,13 @@ impl SqsPersistence {
         attempt: Option<(&str, &ReceiveAttempt)>,
     ) -> Result<(), SqsError> {
         let mut connection = self.connection.lock().map_err(storage_error)?;
-        let transaction = connection.transaction().map_err(storage_error)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
         for message in messages {
+            let hydrated = Self::hydrate_locked(&transaction, &queue.arn.to_arn(), message)?;
             let json =
-                serde_json::to_string(&StoredMessage::from(message)).map_err(storage_error)?;
+                serde_json::to_string(&StoredMessage::from(&hydrated)).map_err(storage_error)?;
             let updated = transaction
                 .execute(
                     "UPDATE sqs_messages SET payload=?3 WHERE arn=?1 AND id=?2",
@@ -460,10 +503,13 @@ impl SqsPersistence {
         attempt_id: Option<&str>,
     ) -> Result<(), SqsError> {
         let mut connection = self.connection.lock().map_err(storage_error)?;
-        let transaction = connection.transaction().map_err(storage_error)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
         for message in messages {
+            let hydrated = Self::hydrate_locked(&transaction, &queue.arn.to_arn(), message)?;
             let json =
-                serde_json::to_string(&StoredMessage::from(message)).map_err(storage_error)?;
+                serde_json::to_string(&StoredMessage::from(&hydrated)).map_err(storage_error)?;
             let updated = transaction
                 .execute(
                     "UPDATE sqs_messages SET payload=?3 WHERE arn=?1 AND id=?2",
@@ -532,10 +578,13 @@ impl SqsPersistence {
         messages: &[Message],
     ) -> Result<(), SqsError> {
         let mut connection = self.connection.lock().map_err(storage_error)?;
-        let transaction = connection.transaction().map_err(storage_error)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
         for message in messages {
+            let hydrated = Self::hydrate_locked(&transaction, &source.arn.to_arn(), message)?;
             let json =
-                serde_json::to_string(&StoredMessage::from(message)).map_err(storage_error)?;
+                serde_json::to_string(&StoredMessage::from(&hydrated)).map_err(storage_error)?;
             let deleted = transaction
                 .execute(
                     "DELETE FROM sqs_messages WHERE arn=?1 AND id=?2",
@@ -554,5 +603,163 @@ impl SqsPersistence {
         }
         transaction.commit().map_err(storage_error)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    static WRITER_WAITED: AtomicBool = AtomicBool::new(false);
+
+    fn observe_writer_wait(_: i32) -> bool {
+        WRITER_WAITED.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+        true
+    }
+
+    #[test]
+    fn hydrated_mutations_wait_for_shared_wal_writer_and_preserve_message() {
+        let root =
+            std::env::temp_dir().join(format!("sqs-wal-contention-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let persistence = Arc::new(SqsPersistence::open(db.clone()).unwrap());
+        let store = SqsStore::new();
+        let source_arn = QueueArn::new("us-east-1", "111111111111", "source");
+        let destination_arn = QueueArn::new("us-east-1", "111111111111", "dlq");
+        for arn in [&source_arn, &destination_arn] {
+            store.insert_if_absent(arn.clone(), false, BTreeMap::new(), BTreeMap::new());
+            let queue = store.get(arn).unwrap();
+            persistence
+                .create_queue(arn, &queue.state.blocking_lock())
+                .unwrap();
+        }
+        let source = store.get(&source_arn).unwrap();
+        let destination = store.get(&destination_arn).unwrap();
+        let mut message = Message::from(StoredMessage {
+            id: "ledger".into(),
+            body: "canonical body".into(),
+            encrypted_body: None,
+            md5_body: "digest".into(),
+            attributes: BTreeMap::new(),
+            md5_attributes: None,
+            system_attributes: BTreeMap::new(),
+            group_id: None,
+            dedup_id: None,
+            sequence_number: None,
+            sent_timestamp_ms: now_ms(),
+            queue_arrival_ms: None,
+            receive_count: 1,
+            first_receive_ms: None,
+            visible_at_ms: now_ms(),
+            receipt_handle: None,
+        });
+        persistence
+            .save_message(&source, &source.state.blocking_lock(), &message, None)
+            .unwrap();
+        message.body.clear();
+        message.body_on_disk = true;
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .busy_handler(Some(observe_writer_wait))
+            .unwrap();
+        let mut other_service = db.connection().unwrap();
+        other_service
+            .execute_batch("CREATE TABLE other_service_write (value INTEGER)")
+            .unwrap();
+        for operation in 0..3 {
+            WRITER_WAITED.store(false, Ordering::Release);
+            let writer = other_service
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            writer
+                .execute("INSERT INTO other_service_write VALUES (?1)", [operation])
+                .unwrap();
+            let (send, receive) = mpsc::channel();
+            let (persistence, source, destination, mut message) = (
+                persistence.clone(),
+                source.clone(),
+                destination.clone(),
+                message.clone(),
+            );
+            let worker = std::thread::spawn(move || {
+                let result = match operation {
+                    0 => {
+                        message.receive_count = 2;
+                        message.receipt_handle = Some("receipt".into());
+                        persistence.update_messages(&source, &[message], None)
+                    }
+                    1 => persistence.restore_receive(&source, &[message], None),
+                    _ => persistence.move_messages(&source, &destination, &[message]),
+                };
+                send.send(result).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !WRITER_WAITED.load(Ordering::Acquire) {
+                assert!(
+                    matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                    "hydration must reserve the writer before reading its WAL snapshot"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "SQLite busy handler was not reached"
+                );
+                std::thread::yield_now();
+            }
+            assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            writer.commit().unwrap();
+            receive
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            worker.join().unwrap();
+            let arn = if operation == 2 {
+                &destination_arn
+            } else {
+                &source_arn
+            };
+            let payload: String = other_service
+                .query_row(
+                    "SELECT payload FROM sqs_messages WHERE arn=?1 AND id='ledger'",
+                    [arn.to_arn()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let saved: StoredMessage = serde_json::from_str(&payload).unwrap();
+            assert_eq!(saved.body, "canonical body");
+            assert_eq!(saved.receive_count, if operation == 0 { 2 } else { 1 });
+            assert_eq!(
+                saved.receipt_handle.as_deref(),
+                if operation == 0 {
+                    Some("receipt")
+                } else {
+                    None
+                }
+            );
+            if operation == 2 {
+                let count: i64 = other_service
+                    .query_row(
+                        "SELECT count(*) FROM sqs_messages WHERE arn=?1",
+                        [source_arn.to_arn()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .busy_handler(None)
+            .unwrap();
+        drop(other_service);
+        drop(persistence);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

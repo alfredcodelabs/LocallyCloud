@@ -89,16 +89,21 @@ impl KinesisHandler {
                 });
             decoded.push((data, entry.partition_key, hash));
         }
-        let now = now_epoch()?;
+        let now = (self.write_clock)()?;
         let mut store = self.lock_store()?;
         let key = StreamKey::new(scope, name);
         if !store.streams.contains_key(&key) {
             return Err(stream_not_found(name));
         }
-        store.trim_expired(now);
+        self.trim_expired(&mut store, now)?;
         let mut buffered = store.buffered_bytes;
         let stream = store.streams.get_mut(&key).ok_or(KinesisError::Internal)?;
         let mut next = stream.next_sequence;
+        let mut windows: Vec<_> = stream
+            .shards
+            .iter()
+            .map(|shard| shard.write_window.clone())
+            .collect();
         let mut accepted = Vec::new();
         let mut response = Vec::new();
         let mut failed = 0;
@@ -110,9 +115,18 @@ impl KinesisHandler {
                 })
                 .ok_or(KinesisError::Internal)?;
             let charge = record_charge(&data, &partition_key);
-            if buffered.saturating_add(charge) > self.max_buffered_bytes {
+            if self.persistence.is_none()
+                && buffered.saturating_add(charge) > self.max_buffered_bytes
+            {
                 failed += 1;
                 response.push(json!({"ErrorCode":"InternalFailure","ErrorMessage":"Local Kinesis buffer capacity is full; retry this entry after capacity is released"}));
+                continue;
+            }
+            if self.simulate_write_limits
+                && !windows[index].admit(now, data.len() + partition_key.len())
+            {
+                failed += 1;
+                response.push(json!({"ErrorCode":"ProvisionedThroughputExceededException","ErrorMessage":"The modeled provisioned shard write limit was exceeded"}));
                 continue;
             }
             let record = Record {
@@ -125,7 +139,9 @@ impl KinesisHandler {
                 .checked_add(1)
                 .filter(|n| *n <= i64::MAX as u64)
                 .ok_or(KinesisError::Internal)?;
-            buffered += charge;
+            if self.persistence.is_none() {
+                buffered += charge;
+            }
             response
                 .push(json!({"ShardId":shard_id(index),"SequenceNumber":record.sequence_number}));
             accepted.push((index, record));
@@ -140,7 +156,13 @@ impl KinesisHandler {
                 .map_err(|_| KinesisError::Internal)?;
         }
         for (index, record) in accepted {
-            stream.shards[index].records.push_back(record);
+            stream.shards[index].next_position += 1;
+            if self.persistence.is_none() {
+                stream.shards[index].records.push_back(record);
+            }
+        }
+        for (shard, window) in stream.shards.iter_mut().zip(windows) {
+            shard.write_window = window;
         }
         stream.next_sequence = next;
         store.buffered_bytes = buffered;
@@ -173,8 +195,22 @@ mod tests {
                 &scope,
             )
             .unwrap();
-        handler.max_buffered_bytes = 2 * record_charge(b"x", "p");
-        let records = json!([{ "Data":STANDARD.encode(b"x"),"PartitionKey":"p","ExplicitHashKey":"0"},{"Data":STANDARD.encode(vec![7u8;1024]),"PartitionKey":"p"},{"Data":STANDARD.encode(b"x"),"PartitionKey":"p","ExplicitHashKey":u128::MAX.to_string()}]);
+        handler.simulate_write_limits = true;
+        handler.write_clock = || Ok(1_900_000_000.0);
+        {
+            let mut store = handler.lock_store().unwrap();
+            let shard = &mut store
+                .streams
+                .get_mut(&StreamKey::new(&scope, "events"))
+                .unwrap()
+                .shards[0];
+            shard.write_window = WriteWindow {
+                started_at: 1_900_000_000.0,
+                records: 0,
+                bytes: 1024 * 1024 - 2,
+            };
+        }
+        let records = json!([{ "Data":STANDARD.encode(b"x"),"PartitionKey":"p","ExplicitHashKey":"0"},{"Data":STANDARD.encode(vec![7u8;1024]),"PartitionKey":"p","ExplicitHashKey":"0"},{"Data":STANDARD.encode(b"x"),"PartitionKey":"p","ExplicitHashKey":u128::MAX.to_string()}]);
         let Success::Json(value) = handler
             .put_records(request(&scope, records), &scope)
             .unwrap()
@@ -183,7 +219,10 @@ mod tests {
         };
         assert_eq!(value["FailedRecordCount"], 1);
         assert_eq!(value["Records"][0]["ShardId"], shard_id(0));
-        assert_eq!(value["Records"][1]["ErrorCode"], "InternalFailure");
+        assert_eq!(
+            value["Records"][1]["ErrorCode"],
+            "ProvisionedThroughputExceededException"
+        );
         assert_eq!(value["Records"][2]["ShardId"], shard_id(1));
         assert!(matches!(handler.put_records(request(&scope,json!([{"Data":STANDARD.encode(b"x"),"PartitionKey":"p"},{"Data":"!","PartitionKey":"p"}])),&scope),Err(KinesisError::Serialization(_))));
         let foreign = Scope {
@@ -198,18 +237,30 @@ mod tests {
             Err(KinesisError::ResourceNotFound(_))
         ));
         drop(handler);
-        let handler = KinesisHandler::with_state(db.clone()).unwrap();
+        let mut handler = KinesisHandler::with_state(db.clone()).unwrap();
+        handler.simulate_write_limits = true;
+        handler.write_clock = || Ok(1_900_000_000.0);
         {
             let store = handler.lock_store().unwrap();
             let stream = &store.streams[&StreamKey::new(&scope, "events")];
             assert_eq!(
-                stream.shards.iter().map(|s| s.records.len()).sum::<usize>(),
+                stream
+                    .shards
+                    .iter()
+                    .map(|s| s.next_position - s.first_position)
+                    .sum::<usize>(),
                 2
             );
             assert_eq!(stream.next_sequence, 3);
         }
         db.connection().unwrap().execute_batch("CREATE TRIGGER fail_batch BEFORE INSERT ON kinesis_shard_records WHEN NEW.partition_key='fail' BEGIN SELECT RAISE(ABORT,'injected');END;").unwrap();
         assert!(matches!(handler.put_records(request(&scope,json!([{"Data":"eA==","PartitionKey":"p"},{"Data":"eA==","PartitionKey":"fail"}])),&scope),Err(KinesisError::Internal)));
+        assert!(
+            handler.lock_store().unwrap().streams[&StreamKey::new(&scope, "events")]
+                .shards
+                .iter()
+                .all(|shard| shard.write_window.records == 0)
+        );
         drop(handler);
         let restored = KinesisHandler::with_state(db.clone()).unwrap();
         assert_eq!(

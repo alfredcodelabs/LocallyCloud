@@ -3,6 +3,7 @@
 //! Implements DynamoDB as a `Native` JSON 1.0 service registered in the Core
 //! `ServiceRegistry`. Operations are selected from the `X-Amz-Target` header.
 
+mod capacity;
 pub mod error;
 pub mod expression;
 pub mod ops;

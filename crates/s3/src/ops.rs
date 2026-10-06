@@ -460,7 +460,8 @@ fn parse_xml(body: &[u8]) -> Result<XmlNode, S3Error> {
     use quick_xml::Reader;
 
     let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
+    // XML entities split text events; trimming each event corrupts spaces around &amp;.
+    reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut stack: Vec<XmlNode> = Vec::new();
     let mut root = None;
@@ -501,7 +502,11 @@ fn parse_xml(body: &[u8]) -> Result<XmlNode, S3Error> {
                 None
             }
             Ok(Event::End(element)) => {
-                let node = stack.pop().ok_or(S3Error::MalformedXML)?;
+                let mut node = stack.pop().ok_or(S3Error::MalformedXML)?;
+                // Indentation belongs to container structure; leaf values retain exact text.
+                if !node.children.is_empty() && node.text.trim().is_empty() {
+                    node.text.clear();
+                }
                 if node.name != element.local_name().as_ref() {
                     return Err(S3Error::MalformedXML);
                 }
@@ -3853,6 +3858,21 @@ pub(crate) fn parse_delete_request(body: &[u8]) -> Result<(Vec<DeleteTarget>, bo
 #[cfg(test)]
 mod multipart_checksum_tests {
     use super::*;
+
+    #[test]
+    fn tagging_xml_preserves_leaf_whitespace_and_entity_text() {
+        let body=b"<Tagging>\n <TagSet>\n  <Tag><Key> team &amp; owner </Key><Value> AwsSamCli &amp; test &#32; </Value></Tag>\n </TagSet>\n</Tagging>";
+        let tags = parse_tagging_xml(body).unwrap();
+        assert_eq!(tags[" team & owner "], " AwsSamCli & test   ");
+        assert_eq!(
+            parse_tagging_xml(tagging_xml(&tags).as_bytes()).unwrap(),
+            tags
+        );
+        assert!(matches!(
+            parse_tagging_xml(b"<Tagging>invalid<TagSet/></Tagging>"),
+            Err(S3Error::MalformedXML)
+        ));
+    }
 
     #[test]
     fn completion_accepts_part_checksum_and_rejects_duplicate_field() {

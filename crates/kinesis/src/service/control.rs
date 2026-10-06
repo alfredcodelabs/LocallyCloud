@@ -189,7 +189,7 @@ impl KinesisHandler {
                         .map_err(|_| KinesisError::Internal)?;
                 }
                 stream.retention_hours = hours;
-                store.trim_expired(now_epoch()?);
+                self.trim_expired(&mut store, now_epoch()?)?;
                 Ok(Success::Empty)
             }
             "ListTagsForStream" | "ListTagsForResource" => {
@@ -431,24 +431,25 @@ mod tests {
             .unwrap()["Tags"],
             json!([{"Key":"project","Value":"orders"}])
         );
+        handler
+            .persistence
+            .as_ref()
+            .unwrap()
+            .state
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE kinesis_shard_records SET arrival_time=?1",
+                [now_epoch().unwrap() - 30.0 * 3600.0],
+            )
+            .unwrap();
         {
             let mut store = handler.lock_store().unwrap();
-            let record = store
-                .streams
-                .get_mut(&StreamKey::new(&scope(), "events"))
-                .unwrap()
-                .shards[0]
-                .records
-                .front_mut()
+            handler
+                .trim_expired(&mut store, now_epoch().unwrap())
                 .unwrap();
-            record.arrival_time = now_epoch().unwrap() - 30.0 * 3600.0;
-            store.trim_expired(now_epoch().unwrap());
-            assert_eq!(
-                store.streams[&StreamKey::new(&scope(), "events")].shards[0]
-                    .records
-                    .len(),
-                1
-            );
+            let shard = &store.streams[&StreamKey::new(&scope(), "events")].shards[0];
+            assert_eq!(shard.next_position - shard.first_position, 1);
         }
         call(
             &handler,

@@ -82,6 +82,7 @@ pub struct EncryptedBody {
     /// Queue ARN used as the KMS encryption context and AEAD associated data.
     /// Automatic dead-letter transfer retains this original context.
     pub encryption_context_arn: String,
+    #[serde(default)]
     pub ciphertext: Vec<u8>,
     pub encrypted_data_key: Vec<u8>,
     pub nonce: [u8; 12],
@@ -93,6 +94,8 @@ pub struct EncryptedBody {
 pub struct Message {
     pub id: String,
     pub body: String,
+    /// Internal payload locator: only committed durable rows may be offloaded.
+    pub body_on_disk: bool,
     pub encrypted_body: Option<EncryptedBody>,
     pub md5_body: String,
     pub attributes: BTreeMap<String, MessageAttribute>,
@@ -103,6 +106,8 @@ pub struct Message {
     pub dedup_id: Option<String>,
     pub sequence_number: Option<u128>,
     pub sent_timestamp_ms: i64,
+    /// Arrival in the current queue; Standard DLQ retention still uses SentTimestamp.
+    pub queue_arrival_ms: Option<i64>,
     pub receive_count: u32,
     pub first_receive_ms: Option<i64>,
     /// Monotonic instant at which the message becomes visible (delay/visibility deadline).
@@ -112,6 +117,21 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn enter_queue(&mut self, timestamp_ms: i64, reset_enqueue: bool) {
+        self.queue_arrival_ms = Some(timestamp_ms);
+        if reset_enqueue {
+            self.sent_timestamp_ms = timestamp_ms;
+        }
+    }
+
+    pub fn offload_body(&mut self) {
+        self.body = String::new();
+        if let Some(encrypted) = &mut self.encrypted_body {
+            encrypted.ciphertext = Vec::new();
+        }
+        self.body_on_disk = true;
+    }
+
     /// Whether the message is currently visible for delivery.
     pub fn is_visible(&self, now: Instant) -> bool {
         now >= self.visible_at

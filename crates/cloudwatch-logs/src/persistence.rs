@@ -168,6 +168,9 @@ impl Persistence {
             let group: String = r.get(3).map_err(|_| unavailable())?;
             let stream: String = r.get(4).map_err(|_| unavailable())?;
             let id: String = r.get(5).map_err(|_| unavailable())?;
+            if matches!(kind.as_str(), "cursor" | "cursor-event" | "secret") {
+                continue;
+            }
             let encrypted: Vec<u8> = r.get(6).map_err(|_| unavailable())?;
             let plaintext = self
                 .cipher
@@ -214,13 +217,15 @@ impl Persistence {
                         .insert(stream, decode(&plaintext)?);
                 }
                 "event" => {
+                    let mut event: StoredEvent = decode(&plaintext)?;
+                    event.offload();
                     state
                         .groups
                         .get_mut(&key)
                         .and_then(|g| g.streams.get_mut(&stream))
                         .ok_or_else(unavailable)?
                         .events
-                        .push(decode(&plaintext)?);
+                        .push(event);
                 }
                 "metric" => {
                     let effect: PendingMetricEffect = decode(&plaintext)?;
@@ -235,6 +240,9 @@ impl Persistence {
                 }
                 "query" => {
                     let mut query: InsightsQuery = decode(&plaintext)?;
+                    if query.status.is_terminal() {
+                        query.snapshot = Vec::new();
+                    }
                     if query.status == QueryStatus::Running {
                         query.status = QueryStatus::Scheduled;
                     }
@@ -298,6 +306,137 @@ impl Persistence {
         Ok(values)
     }
 
+    pub(crate) fn event(
+        &self,
+        key: &GroupKey,
+        stream: &str,
+        id: &str,
+    ) -> Result<StoredEvent, LogsError> {
+        let c = self.connection.lock().map_err(|_| unavailable())?;
+        let bytes: Vec<u8> = c.query_row("SELECT payload FROM cloudwatch_logs_rows WHERE kind='event' AND account=?1 AND region=?2 AND group_name=?3 AND stream_name=?4 AND id=?5", params![key.scope.account_id,key.scope.region,key.name,stream,id], |r| r.get(0)).map_err(|_| unavailable())?;
+        let plain = self
+            .cipher
+            .open(
+                &[
+                    "cloudwatch-logs",
+                    "event",
+                    &key.scope.account_id,
+                    &key.scope.region,
+                    &key.name,
+                    stream,
+                    id,
+                ],
+                &bytes,
+            )
+            .map_err(|_| unavailable())?;
+        decode(&plain)
+    }
+
+    pub(crate) fn cursor_ids(&self, namespace: &str) -> Result<Vec<String>, LogsError> {
+        let c = self.connection.lock().map_err(|_| unavailable())?;
+        let mut q = c.prepare("SELECT id FROM cloudwatch_logs_rows WHERE kind='cursor' AND account='' AND region='' AND group_name=?1 AND stream_name='' ORDER BY id").map_err(|_| unavailable())?;
+        let rows = q
+            .query_map([namespace], |r| r.get(0))
+            .map_err(|_| unavailable())?;
+        rows.collect::<Result<_, _>>().map_err(|_| unavailable())
+    }
+
+    pub(crate) fn cursor_record<T: DeserializeOwned>(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<T, LogsError> {
+        let c = self.connection.lock().map_err(|_| unavailable())?;
+        let bytes: Vec<u8> = c.query_row("SELECT payload FROM cloudwatch_logs_rows WHERE kind='cursor' AND account='' AND region='' AND group_name=?1 AND stream_name='' AND id=?2", params![namespace,id], |r| r.get(0)).map_err(|_| unavailable())?;
+        let plain = self
+            .cipher
+            .open(
+                &["cloudwatch-logs", "cursor", "", "", namespace, "", id],
+                &bytes,
+            )
+            .map_err(|_| unavailable())?;
+        decode(&plain)
+    }
+
+    pub(crate) fn cursor_event(
+        &self,
+        snapshot: &str,
+        position: usize,
+        expires: i64,
+        event: &PagedEvent,
+    ) -> Result<Change, LogsError> {
+        row(
+            "cursor-event",
+            &GroupKey {
+                scope: ScopeKey::new("", ""),
+                name: "events".into(),
+            },
+            snapshot,
+            &format!("{position:016}"),
+            expires,
+            event,
+        )
+    }
+
+    pub(crate) fn remove_cursor_events(&self, snapshot: &str) -> Result<(), LogsError> {
+        let c = self.connection.lock().map_err(|_| unavailable())?;
+        c.execute("DELETE FROM cloudwatch_logs_rows WHERE kind='cursor-event' AND account='' AND region='' AND group_name='events' AND stream_name=?1", [snapshot]).map_err(|_| unavailable())?;
+        Ok(())
+    }
+
+    pub(crate) fn cursor_page(
+        &self,
+        snapshot: &str,
+        position: usize,
+        backward: bool,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<PagedEvent>, LogsError> {
+        let c = self.connection.lock().map_err(|_| unavailable())?;
+        let (comparison, order) = if backward {
+            ("<", "DESC")
+        } else {
+            (">=", "ASC")
+        };
+        let sql = format!("SELECT id,payload FROM cloudwatch_logs_rows WHERE kind='cursor-event' AND account='' AND region='' AND group_name='events' AND stream_name=?1 AND id {comparison} ?2 ORDER BY id {order} LIMIT ?3");
+        let mut q = c.prepare(&sql).map_err(|_| unavailable())?;
+        let mut rows = q
+            .query(params![snapshot, format!("{position:016}"), limit as i64])
+            .map_err(|_| unavailable())?;
+        let mut result = Vec::new();
+        let mut used = 0usize;
+        while let Some(r) = rows.next().map_err(|_| unavailable())? {
+            let id: String = r.get(0).map_err(|_| unavailable())?;
+            let bytes: Vec<u8> = r.get(1).map_err(|_| unavailable())?;
+            let plain = self
+                .cipher
+                .open(
+                    &[
+                        "cloudwatch-logs",
+                        "cursor-event",
+                        "",
+                        "",
+                        "events",
+                        snapshot,
+                        &id,
+                    ],
+                    &bytes,
+                )
+                .map_err(|_| unavailable())?;
+            let event: PagedEvent = decode(&plain)?;
+            let charge = event.event.body_len().saturating_add(26);
+            if used.saturating_add(charge) > max_bytes {
+                break;
+            }
+            used += charge;
+            result.push(event);
+        }
+        if backward {
+            result.reverse();
+        }
+        Ok(result)
+    }
+
     pub(crate) fn secret(
         &self,
         namespace: &str,
@@ -339,7 +478,7 @@ impl Persistence {
 
     pub(crate) fn prune_cursors(&self, namespace: &str, now: i64) -> Result<(), LogsError> {
         let c = self.connection.lock().map_err(|_| unavailable())?;
-        c.execute("DELETE FROM cloudwatch_logs_rows WHERE kind='cursor' AND group_name=?1 AND id!='signing-secret' AND timestamp_ms<=?2",params![namespace,now]).map_err(|_|unavailable())?;
+        c.execute("DELETE FROM cloudwatch_logs_rows WHERE kind IN ('cursor','cursor-event') AND group_name=?1 AND id!='signing-secret' AND timestamp_ms<=?2",params![namespace,now]).map_err(|_|unavailable())?;
         Ok(())
     }
 }
@@ -356,10 +495,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn fixture() -> (std::path::PathBuf, Arc<StateDb>, LogsStore, GroupKey) {
-        let root = std::env::temp_dir().join(format!(
-            "locallycloud-logs-durable-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/logs-durable-tests")
+            .join(uuid::Uuid::new_v4().to_string());
         let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         let store = LogsStore::durable(db.clone(), StateCipher::with_key(&[29; 32])).unwrap();
         let key = GroupKey {
@@ -506,6 +644,24 @@ mod tests {
         let recovered = store.get_query(&key.scope, &query.query_id).unwrap();
         assert_eq!(recovered.status, QueryStatus::Scheduled);
         assert_eq!(recovered.snapshot.len(), 2);
+        store.claim_scheduled_query().unwrap().unwrap();
+        assert!(store
+            .complete_query(
+                &key.scope,
+                &query.query_id,
+                Vec::new(),
+                Default::default(),
+                1_700_000_000_003
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .get_query(&key.scope, &query.query_id)
+                .unwrap()
+                .snapshot
+                .capacity(),
+            0
+        );
 
         assert_eq!(
             store
@@ -535,6 +691,14 @@ mod tests {
             .1
             .is_empty());
         assert!(reopened.pending_metric_effects(10).unwrap().is_empty());
+        assert_eq!(
+            reopened
+                .get_query(&key.scope, &query.query_id)
+                .unwrap()
+                .snapshot
+                .capacity(),
+            0
+        );
         drop(reopened);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
@@ -637,6 +801,26 @@ mod tests {
             )
             .unwrap();
         let token = first.next_forward_token;
+        // Persist exactly the pre-indexed format, retaining this real signed token's
+        // manifest ID/revision/expiry and the existing durable signing secret.
+        let persistence = store.persistence().unwrap();
+        let id = persistence.cursor_ids("events").unwrap().remove(0);
+        let mut legacy: serde_json::Value = persistence.cursor_record("events", &id).unwrap();
+        let original = persistence.cursor_page(&id, 0, false, 10, 1024).unwrap();
+        legacy.as_object_mut().unwrap().remove("disk_len");
+        legacy["events"] = serde_json::to_value(original).unwrap();
+        persistence
+            .commit(vec![persistence
+                .cursor(
+                    "events",
+                    &id,
+                    legacy["expires_at_ms"].as_i64().unwrap(),
+                    &legacy,
+                )
+                .unwrap()])
+            .unwrap();
+        persistence.remove_cursor_events(&id).unwrap();
+        drop(persistence);
         drop(p);
         drop(store);
         let store = LogsStore::durable(db.clone(), StateCipher::with_key(&[29; 32])).unwrap();
@@ -692,6 +876,82 @@ mod tests {
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn durable_large_backlog_pages_keep_bodies_off_ram_and_preserve_deleted_snapshot() {
+        let (root, db, store, key) = fixture();
+        let now = 1_700_000_000_000;
+        // Over the entire ephemeral cursor budget, created one bounded API batch at a time.
+        let message = "x".repeat(1024 * 1024 - 100);
+        for index in 0..66 {
+            append(&store, &key, &message, now + index);
+        }
+        let (_, metadata) = store
+            .visible_event_metadata(&key, None, None, now + 100)
+            .unwrap();
+        assert_eq!(metadata.len(), 66);
+        assert!(metadata
+            .iter()
+            .all(|event| event.event.message.capacity() == 0));
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|event| event.event.body_len())
+                .sum::<usize>(),
+            message.len() * 66
+        );
+        let p = EventPaginator::with_persistence(store.persistence()).unwrap();
+        let request = || {
+            serde_json::from_value(serde_json::json!({
+                "logGroupName": "orders", "logStreamName": "worker", "startFromHead": true,
+            }))
+            .unwrap()
+        };
+        let first =
+            crate::events::get(&store, &p, request(), key.scope.clone(), now + 100).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].message, message);
+        let token = first.next_forward_token;
+        let persistence = store.persistence().unwrap();
+        let id = persistence.cursor_ids("events").unwrap().remove(0);
+        let manifest: serde_json::Value = persistence.cursor_record("events", &id).unwrap();
+        assert_eq!(manifest["disk_len"], 66);
+        assert!(manifest.get("events").is_none());
+        assert!(serde_json::to_vec(&manifest).unwrap().len() < 4096);
+        drop(p);
+        drop(store);
+        let store = LogsStore::durable(db.clone(), StateCipher::with_key(&[29; 32])).unwrap();
+        let (_, restored) = store
+            .visible_event_metadata(&key, None, None, now + 100)
+            .unwrap();
+        assert!(restored
+            .iter()
+            .all(|event| event.event.message.capacity() == 0));
+        store.delete_group(&key).unwrap();
+        let p = EventPaginator::with_persistence(store.persistence()).unwrap();
+        let mut next_request: crate::protocol::GetLogEventsRequest = request();
+        next_request.next_token = Some(token.clone());
+        let next =
+            crate::events::get(&store, &p, next_request, key.scope.clone(), now + 101).unwrap();
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].timestamp, now + 1);
+        assert_eq!(next.events[0].message, message);
+        let mut foreign_request: crate::protocol::GetLogEventsRequest = request();
+        foreign_request.next_token = Some(token);
+        assert!(crate::events::get(
+            &store,
+            &p,
+            foreign_request,
+            ScopeKey::new("111111111111", "us-east-1"),
+            now + 101
+        )
+        .is_err());
+        drop(p);
+        drop(store);
+        drop(persistence);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn concurrent_appends_commit_distinct_events_and_survive_restart() {
         let (root, db, store, key) = fixture();

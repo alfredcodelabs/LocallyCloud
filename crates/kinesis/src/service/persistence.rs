@@ -5,10 +5,10 @@ use locallycloud_state::{StateDb, StateError};
 use rusqlite::{params, OptionalExtension};
 use uuid::Uuid;
 
-use super::{record_charge, Record, Scope, Shard, Store, Stream, StreamKey};
+use super::{Record, Scope, Shard, Store, Stream, StreamKey, MAX_GET_RECORD_BYTES};
 
 pub(super) struct Persistence {
-    state: Arc<StateDb>,
+    pub(super) state: Arc<StateDb>,
 }
 
 impl Persistence {
@@ -79,6 +79,8 @@ impl Persistence {
             )?;
         }
         transaction.commit()?;
+        connection.execute_batch("CREATE INDEX IF NOT EXISTS kinesis_record_sequence ON kinesis_shard_records(account,region,name,shard,sequence);
+            CREATE INDEX IF NOT EXISTS kinesis_record_timestamp ON kinesis_shard_records(account,region,name,shard,arrival_time,position);")?;
         let mut generated_secret = [0_u8; 32];
         generated_secret[..16].copy_from_slice(Uuid::new_v4().as_bytes());
         generated_secret[16..].copy_from_slice(Uuid::new_v4().as_bytes());
@@ -133,40 +135,43 @@ impl Persistence {
             }
             stream.shards.push(Shard {
                 first_position,
+                next_position: first_position,
                 records: VecDeque::new(),
+                ..Default::default()
             });
         }
-        let mut statement = connection.prepare(
-            "SELECT account, region, name, shard, position, sequence, data, partition_key, arrival_time FROM kinesis_shard_records ORDER BY account, region, name, shard, position",
-        )?;
+        let mut statement = connection.prepare("SELECT account,region,name,shard,MIN(position),MAX(position),COUNT(*) FROM kinesis_shard_records GROUP BY account,region,name,shard")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 stream_key(row)?,
-                row.get::<_, u32>(3)? as usize,
-                Record {
-                    sequence_number: row.get(5)?,
-                    data: row.get(6)?,
-                    partition_key: row.get(7)?,
-                    arrival_time: row.get(8)?,
-                },
+                position(row, 3)?,
+                position(row, 4)?,
+                position(row, 5)?,
+                position(row, 6)?,
             ))
         })?;
+        for row in rows {
+            let (key, index, first, last, count) = row?;
+            let shard = streams
+                .get_mut(&key)
+                .and_then(|stream| stream.shards.get_mut(index))
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            if first != shard.first_position
+                || last.checked_sub(first).and_then(|n| n.checked_add(1)) != Some(count)
+            {
+                return Err(rusqlite::Error::InvalidQuery.into());
+            }
+            shard.next_position = last.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?;
+        }
         let mut store = Store {
             streams,
             buffered_bytes: 0,
         };
-        for row in rows {
-            let (key, index, record) = row?;
-            let shard = store
-                .streams
-                .get_mut(&key)
-                .and_then(|stream| stream.shards.get_mut(index))
-                .ok_or(rusqlite::Error::InvalidQuery)?;
-            store.buffered_bytes += record_charge(&record.data, &record.partition_key);
-            shard.records.push_back(record);
+        let persistence = Self { state };
+        for (key, stream) in &mut store.streams {
+            persistence.trim(key, stream, super::now_epoch().unwrap_or(0.0))?;
         }
-        store.trim_expired(super::now_epoch().unwrap_or(0.0));
-        Ok((Self { state }, store, secret))
+        Ok((persistence, store, secret))
     }
 
     pub(super) fn create(&self, key: &StreamKey, stream: &Stream) -> Result<(), StateError> {
@@ -233,7 +238,7 @@ impl Persistence {
                     key.scope.region,
                     key.name,
                     *index as i64,
-                    (shard.first_position + shard.records.len() + offsets[*index]) as i64,
+                    (shard.next_position + offsets[*index]) as i64,
                     record.sequence_number,
                     record.data,
                     record.partition_key,
@@ -242,11 +247,112 @@ impl Persistence {
             )?;
             offsets[*index] += 1;
             transaction.execute("UPDATE kinesis_shards SET first_position=?5 WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4",params![key.scope.account_id,key.scope.region,key.name,*index as i64,shard.first_position as i64])?;
-            transaction.execute("DELETE FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position<?5 AND arrival_time<=?6",params![key.scope.account_id,key.scope.region,key.name,*index as i64,shard.first_position as i64,record.arrival_time-stream.retention_hours as f64*3600.0])?;
         }
         transaction.execute("UPDATE kinesis_streams SET next_sequence=?4 WHERE account=?1 AND region=?2 AND name=?3",params![key.scope.account_id,key.scope.region,key.name,next as i64])?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(super) fn trim(
+        &self,
+        key: &StreamKey,
+        stream: &mut Stream,
+        now: f64,
+    ) -> Result<(), StateError> {
+        let mut connection = self.state.connection()?;
+        let transaction = connection.transaction()?;
+        let mut firsts = Vec::with_capacity(stream.shards.len());
+        let cutoff = now - stream.retention_hours as f64 * 3600.0;
+        for (index, shard) in stream.shards.iter().enumerate() {
+            let mut first = shard.first_position;
+            {
+                let mut statement = transaction.prepare("SELECT position,arrival_time FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position>=?5 ORDER BY position")?;
+                let mut rows = statement.query(params![
+                    key.scope.account_id,
+                    key.scope.region,
+                    key.name,
+                    index as i64,
+                    first as i64
+                ])?;
+                while let Some(row) = rows.next()? {
+                    if row.get::<_, f64>(1)? > cutoff {
+                        break;
+                    }
+                    first = position(row, 0)? + 1;
+                }
+            }
+            if first != shard.first_position {
+                transaction.execute("DELETE FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position<?5", params![key.scope.account_id,key.scope.region,key.name,index as i64,first as i64])?;
+                transaction.execute("UPDATE kinesis_shards SET first_position=?5 WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4",params![key.scope.account_id,key.scope.region,key.name,index as i64,first as i64])?;
+            }
+            firsts.push(first);
+        }
+        transaction.commit()?;
+        for (shard, first) in stream.shards.iter_mut().zip(firsts) {
+            shard.first_position = first;
+        }
+        Ok(())
+    }
+
+    pub(super) fn page(
+        &self,
+        key: &StreamKey,
+        index: usize,
+        position: usize,
+        limit: usize,
+    ) -> Result<Vec<Record>, StateError> {
+        let connection = self.state.connection()?;
+        let mut statement = connection.prepare("SELECT sequence,data,partition_key,arrival_time FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND position>=?5 ORDER BY position LIMIT ?6")?;
+        let mut rows = statement.query(params![
+            key.scope.account_id,
+            key.scope.region,
+            key.name,
+            index as i64,
+            position as i64,
+            limit as i64
+        ])?;
+        let mut records = Vec::new();
+        let mut bytes = 0;
+        while let Some(row) = rows.next()? {
+            let data: Vec<u8> = row.get(1)?;
+            if bytes + data.len() > MAX_GET_RECORD_BYTES {
+                break;
+            }
+            bytes += data.len();
+            records.push(Record {
+                sequence_number: row.get(0)?,
+                data,
+                partition_key: row.get(2)?,
+                arrival_time: row.get(3)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub(super) fn sequence_position(
+        &self,
+        key: &StreamKey,
+        index: usize,
+        sequence: &str,
+    ) -> Result<Option<usize>, StateError> {
+        Ok(self.state.connection()?.query_row("SELECT position FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND sequence=?5",params![key.scope.account_id,key.scope.region,key.name,index as i64,sequence], |row| position(row,0)).optional()?)
+    }
+
+    pub(super) fn timestamp_position(
+        &self,
+        key: &StreamKey,
+        index: usize,
+        timestamp: f64,
+    ) -> Result<Option<usize>, StateError> {
+        Ok(self.state.connection()?.query_row("SELECT MIN(position) FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 AND arrival_time>=?5",params![key.scope.account_id,key.scope.region,key.name,index as i64,timestamp], |row| row.get::<_,Option<i64>>(0)?.map(|value| usize::try_from(value).map_err(|_| rusqlite::Error::InvalidQuery)).transpose())?)
+    }
+
+    pub(super) fn latest_arrival(
+        &self,
+        key: &StreamKey,
+        index: usize,
+    ) -> Result<Option<f64>, StateError> {
+        Ok(self.state.connection()?.query_row("SELECT arrival_time FROM kinesis_shard_records WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4 ORDER BY position DESC LIMIT 1",params![key.scope.account_id,key.scope.region,key.name,index as i64], |row| row.get(0)).optional()?)
     }
 
     pub(super) fn configure(
@@ -278,4 +384,8 @@ fn stream_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamKey> {
         },
         name: row.get(2)?,
     })
+}
+
+fn position(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<usize> {
+    usize::try_from(row.get::<_, i64>(index)?).map_err(|_| rusqlite::Error::InvalidQuery)
 }

@@ -291,6 +291,7 @@ mod tests {
             put_ordinal: 1,
             event_ordinal: 0,
             message,
+            message_bytes: None,
         }
     }
 

@@ -19,6 +19,41 @@ use crate::model::{
 use crate::protocol::PUT_LOG_EVENTS_MAX_SPAN_MS;
 use crate::subscriptions::deliveries_for_events;
 
+fn query_event_owned_bytes(event: &QuerySnapshotEvent) -> usize {
+    event
+        .group_name
+        .capacity()
+        .saturating_add(event.stream_name.capacity())
+        .saturating_add(event.message.capacity())
+}
+
+fn query_snapshot_retained_bytes(capacity: usize, owned_bytes: usize) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<QuerySnapshotEvent>())
+        .saturating_add(owned_bytes)
+}
+
+fn push_query_snapshot(
+    snapshot: &mut Vec<QuerySnapshotEvent>,
+    owned_bytes: &mut usize,
+    event: QuerySnapshotEvent,
+    cached_bytes: usize,
+    budget: usize,
+) -> Result<(), LogsError> {
+    *owned_bytes = owned_bytes.saturating_add(query_event_owned_bytes(&event));
+    snapshot.push(event);
+    if cached_bytes.saturating_add(query_snapshot_retained_bytes(
+        snapshot.capacity(),
+        *owned_bytes,
+    )) > budget
+    {
+        return Err(LogsError::LimitExceeded(
+            "query snapshots exceed the retained-memory safety limit".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct NewQuery {
     pub scope: ScopeKey,
     pub group_names: Vec<String>,
@@ -843,7 +878,7 @@ impl LogsStore {
             .ok_or_else(|| {
                 LogsError::ServiceUnavailable("CloudWatch Logs stored byte count overflow".into())
             })?;
-        let accepted: Vec<_> = events[accepted_start..accepted_end]
+        let mut accepted: Vec<_> = events[accepted_start..accepted_end]
             .iter()
             .map(|event| StoredEvent {
                 id: event_id(key, stream_name, put_ordinal, event.event_ordinal),
@@ -852,6 +887,7 @@ impl LogsStore {
                 put_ordinal,
                 event_ordinal: event.event_ordinal,
                 message: event.message.clone(),
+                message_bytes: None,
             })
             .collect();
         let metric_candidates: Vec<_> = effects_for_events(key, &metric_filters, &accepted)
@@ -920,6 +956,11 @@ impl LogsStore {
             ));
         }
         let new_events = accepted.clone();
+        if self.persistence.is_some() {
+            for event in &mut accepted {
+                event.offload();
+            }
+        }
         let previous_effect_id = state.next_metric_effect_id;
         let previous_delivery_id = state.next_subscription_delivery_id;
         {
@@ -1101,7 +1142,17 @@ impl LogsStore {
             ));
         }
         let mut snapshot = Vec::new();
-        let mut snapshot_bytes = 0_usize;
+        let cached_bytes = state.queries.values().fold(0usize, |bytes, query| {
+            bytes.saturating_add(query_snapshot_retained_bytes(
+                query.snapshot.capacity(),
+                query
+                    .snapshot
+                    .iter()
+                    .map(query_event_owned_bytes)
+                    .fold(0usize, usize::saturating_add),
+            ))
+        });
+        let mut owned_bytes = 0usize;
         for group_name in &group_names {
             let key = GroupKey {
                 scope: scope.clone(),
@@ -1121,25 +1172,27 @@ impl LogsStore {
                     {
                         continue;
                     }
-                    snapshot_bytes =
-                        snapshot_bytes
-                            .checked_add(event.message.len())
-                            .ok_or_else(|| {
-                                LogsError::LimitExceeded("query snapshot is too large".into())
-                            })?;
-                    if snapshot_bytes > MAX_SNAPSHOT_BYTES {
-                        return Err(LogsError::LimitExceeded(
-                            "query snapshot exceeds the 64 MiB safety limit".into(),
-                        ));
-                    }
-                    snapshot.push(QuerySnapshotEvent {
-                        group_name: group_name.clone(),
-                        stream_name: stream.name.clone(),
-                        timestamp_ms: event.timestamp_ms,
-                        put_ordinal: event.put_ordinal,
-                        event_ordinal: event.event_ordinal,
-                        message: event.message.clone(),
-                    });
+                    let hydrated = self.hydrate_event(
+                        &key,
+                        PagedEvent {
+                            log_stream_name: stream.name.clone(),
+                            event: event.clone(),
+                        },
+                    )?;
+                    push_query_snapshot(
+                        &mut snapshot,
+                        &mut owned_bytes,
+                        QuerySnapshotEvent {
+                            group_name: group_name.clone(),
+                            stream_name: stream.name.clone(),
+                            timestamp_ms: event.timestamp_ms,
+                            put_ordinal: event.put_ordinal,
+                            event_ordinal: event.event_ordinal,
+                            message: hydrated.event.message,
+                        },
+                        cached_bytes,
+                        MAX_SNAPSHOT_BYTES,
+                    )?;
                 }
             }
         }
@@ -1227,6 +1280,7 @@ impl LogsStore {
         })?;
         let query = state.queries.get_mut(&key).expect("running query exists");
         query.status = QueryStatus::Complete;
+        query.snapshot = Vec::new();
         query.rows = rows;
         query.statistics = statistics;
         query.duration_ms = now_ms.saturating_sub(query.creation_time_ms).max(0);
@@ -1267,6 +1321,7 @@ impl LogsStore {
             .get_mut(&key)
             .expect("query existence was checked");
         query.status = QueryStatus::Cancelled;
+        query.snapshot = Vec::new();
         query.rows.clear();
         query.statistics = Default::default();
         query.duration_ms = now_ms.saturating_sub(query.creation_time_ms).max(0);
@@ -1326,6 +1381,7 @@ impl LogsStore {
         })?;
         let query = state.queries.get_mut(&key).expect("running query exists");
         query.status = status;
+        query.snapshot = Vec::new();
         query.rows.clear();
         query.statistics = Default::default();
         query.duration_ms = now_ms.saturating_sub(query.creation_time_ms).max(0);
@@ -1380,7 +1436,7 @@ impl LogsStore {
                     stream.stored_bytes = stream
                         .events
                         .iter()
-                        .map(|event| event.message.len() as u64)
+                        .map(|event| event.body_len() as u64)
                         .sum();
                     stream.revision = revision.expect("expired events require a revision");
                     group_changed = true;
@@ -1422,6 +1478,7 @@ impl LogsStore {
         Ok(next_expiration_ms)
     }
 
+    #[cfg(test)]
     pub fn visible_stream_events(
         &self,
         key: &GroupKey,
@@ -1431,7 +1488,37 @@ impl LogsStore {
         self.visible_events(key, Some(&[stream_name.to_string()]), None, now_ms)
     }
 
+    #[cfg(test)]
     pub fn visible_events(
+        &self,
+        key: &GroupKey,
+        stream_names: Option<&[String]>,
+        stream_prefix: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(u64, Vec<PagedEvent>), LogsError> {
+        let (revision, metadata) =
+            self.visible_event_metadata(key, stream_names, stream_prefix, now_ms)?;
+        Ok((
+            revision,
+            metadata
+                .into_iter()
+                .map(|event| self.hydrate_event(key, event))
+                .collect::<Result<_, _>>()?,
+        ))
+    }
+
+    pub(crate) fn hydrate_event(
+        &self,
+        key: &GroupKey,
+        mut event: PagedEvent,
+    ) -> Result<PagedEvent, LogsError> {
+        if let Some(persistence) = &self.persistence {
+            event.event = persistence.event(key, &event.log_stream_name, &event.event.id)?;
+        }
+        Ok(event)
+    }
+
+    pub(crate) fn visible_event_metadata(
         &self,
         key: &GroupKey,
         stream_names: Option<&[String]>,
@@ -1611,6 +1698,41 @@ fn default_id(value: &(GroupKey, String, u64, i64)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_budget_accounts_tiny_message_metadata_and_allocated_slack() {
+        let mut snapshot = Vec::with_capacity(8);
+        let mut owned_bytes = 0;
+        let event = || QuerySnapshotEvent {
+            group_name: String::with_capacity(256),
+            stream_name: String::with_capacity(256),
+            timestamp_ms: 0,
+            put_ordinal: 0,
+            event_ordinal: 0,
+            message: "x".into(),
+        };
+        let budget = 2048;
+        push_query_snapshot(&mut snapshot, &mut owned_bytes, event(), 0, budget).unwrap();
+        assert_eq!(
+            query_snapshot_retained_bytes(snapshot.capacity(), owned_bytes),
+            snapshot.capacity() * std::mem::size_of::<QuerySnapshotEvent>() + 513
+        );
+        let cached = query_snapshot_retained_bytes(snapshot.capacity(), owned_bytes);
+        let mut other = Vec::new();
+        let mut other_owned = 0;
+        assert!(matches!(
+            push_query_snapshot(&mut other, &mut other_owned, event(), cached, budget),
+            Err(LogsError::LimitExceeded(_))
+        ));
+        push_query_snapshot(&mut snapshot, &mut owned_bytes, event(), 0, budget).unwrap();
+        assert!(matches!(
+            push_query_snapshot(&mut snapshot, &mut owned_bytes, event(), 0, budget),
+            Err(LogsError::LimitExceeded(_))
+        ));
+        assert_eq!(snapshot.iter().map(|e| e.message.len()).sum::<usize>(), 3);
+        snapshot = Vec::new();
+        assert_eq!(query_snapshot_retained_bytes(snapshot.capacity(), 0), 0);
+    }
 
     #[test]
     fn delete_does_not_mutate_when_revision_cannot_advance() {

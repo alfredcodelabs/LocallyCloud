@@ -12,7 +12,9 @@ const TARGET_PREFIX: &str = "Kinesis_20131202";
 
 /// Register the native static multishard Kinesis backend.
 pub fn register(registry: &Arc<ServiceRegistry>) {
-    let handler: Arc<dyn NativeHandler> = Arc::new(KinesisHandler::new());
+    let mut handler = KinesisHandler::new();
+    handler.registry = Arc::downgrade(registry);
+    let handler: Arc<dyn NativeHandler> = Arc::new(handler);
     registry.register_native(
         ServiceName::new("kinesis"),
         ServiceMetadata::new(AwsProtocol::Json11, Some(TARGET_PREFIX)),
@@ -24,7 +26,9 @@ pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
 ) -> Result<(), locallycloud_state::StateError> {
-    let handler: Arc<dyn NativeHandler> = Arc::new(KinesisHandler::with_state(state)?);
+    let mut handler = KinesisHandler::with_state(state)?;
+    handler.registry = Arc::downgrade(registry);
+    let handler: Arc<dyn NativeHandler> = Arc::new(handler);
     registry.register_native(
         ServiceName::new("kinesis"),
         ServiceMetadata::new(AwsProtocol::Json11, Some(TARGET_PREFIX)),

@@ -38,10 +38,11 @@ impl QueryParams {
             .filter(|v| !v.is_empty())
     }
 
+    /// Operational query allowlist; SDK v3 x-id is advisory and never selects IAM permissions.
     pub fn only_keys(&self, allowed: &[&str]) -> bool {
         self.pairs
             .iter()
-            .all(|(key, _)| allowed.contains(&key.as_str()))
+            .all(|(key, _)| key == "x-id" || allowed.contains(&key.as_str()))
     }
 
     /// Whether `key` is present (even with an empty value, e.g. `?acl`).

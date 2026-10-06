@@ -483,10 +483,19 @@ impl S3Handler {
         let commit = || {
             let rows = self
                 .store
-                .durable_delta(account, bucket, &persistence.blobs)?;
+                .durable_delta(account, bucket, &persistence.blobs)
+                .inspect_err(|_| {
+                    tracing::error!(
+                        stage = "metadata_delta",
+                        "S3 durable commit failed before SQLite transaction"
+                    );
+                })?;
             persistence
                 .save_delta(&rows, &notifications, self.store.durable_next_id())
-                .map_err(|_| S3Error::InternalError)
+                .map_err(|error| {
+                    tracing::error!(stage = "sqlite_delta", %error, "S3 durable commit failed");
+                    S3Error::InternalError
+                })
         };
         let result = if tokio::runtime::Handle::current().runtime_flavor()
             == tokio::runtime::RuntimeFlavor::MultiThread
@@ -501,6 +510,26 @@ impl S3Handler {
             self.persisted_in_route.store(true, Ordering::Release);
         }
         result
+    }
+
+    /// Caller holds mutation admission and the namespace write gate. Failed writes
+    /// stay failed; reload committed metadata before allowing any dirty RAM reads.
+    fn recover_committed_state(&self) -> Result<(), S3Error> {
+        if !self.poisoned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let persistence = self.persistence.as_ref().ok_or(S3Error::InternalError)?;
+        let restore = || persistence.restore(&self.store);
+        let result = if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(restore)
+        } else {
+            restore()
+        };
+        result.map_err(|error| { tracing::error!(stage = "committed_restore", %error, "S3 failed commit recovery remains unavailable"); S3Error::InternalError })?;
+        self.poisoned.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn start_notification_worker(&self) {
@@ -1330,6 +1359,12 @@ impl S3Handler {
 #[async_trait]
 impl NativeHandler for S3Handler {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        let _admission = self.mutation_lock.lock().await;
+        if self.poisoned.load(Ordering::Acquire) {
+            let _namespace = self.namespace_gate.write().await;
+            self.recover_committed_state()
+                .map_err(|_| "S3 committed state is unavailable")?;
+        }
         self.store.resource_regions(account).await
     }
 
@@ -1339,8 +1374,10 @@ impl NativeHandler for S3Handler {
         let q = QueryParams::parse(request.uri.query());
         let mutating = matches!(request.method, Method::PUT | Method::POST | Method::DELETE)
             && !(request.method == Method::POST && q.has("select"));
-        // ponytail: serialize writers through SQLite; independent bucket reads stay concurrent.
-        let _writer = if mutating {
+        // Immutable gate lookup does not read bucket metadata. Independent bucket
+        // readers never wait on a different bucket's durable SQL mutation.
+        let recovering = self.poisoned.load(Ordering::Acquire);
+        let _writer = if mutating || recovering || matches!(shape, Shape::Service) {
             Some(self.mutation_lock.lock().await)
         } else {
             None
@@ -1348,22 +1385,22 @@ impl NativeHandler for S3Handler {
         let namespace_change = mutating
             && (is_s3_control(&request, host)
                 || (matches!(shape, Shape::Bucket(_)) && request.uri.query().is_none()));
-        let _namespace_write = if namespace_change {
+        let _namespace_write = if namespace_change || recovering {
             Some(self.namespace_gate.write().await)
         } else {
             None
         };
-        let _namespace_read = if !namespace_change {
+        let _namespace_read = if !namespace_change && !recovering {
             Some(self.namespace_gate.read().await)
         } else {
             None
         };
+        if recovering && self.recover_committed_state().is_err() {
+            return S3Error::InternalError.into_response(request.uri.path(), &request.request_id);
+        }
         let gate = match &shape {
             Shape::Bucket(name) | Shape::Object(name, _) => {
-                match self.store.get(&request.account_id, name) {
-                    Some(bucket) => Some(bucket.read().await.transaction_gate.clone()),
-                    None => None,
-                }
+                self.store.transaction_gate(&request.account_id, name)
             }
             Shape::Service => None,
         };
@@ -1834,6 +1871,122 @@ mod tests {
         ("x-locallycloud-verified-external-sigv4", "1"),
         ("authorization", "AWS4-HMAC-SHA256 Credential=AKIATEST/20260925/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000"),
     ];
+
+    #[tokio::test]
+    async fn sdk_v3_x_id_preserves_strict_action_authorization_and_unknown_rejection() {
+        let (handler, _registry, policy) = write_policy_handler();
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, "/bucket", "", &[]))
+                .await
+                .status(),
+            200
+        );
+        // SDK v3 ListBuckets must reach the existing IAM evaluator, including Deny.
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::GET,
+                    "/?x-id=ListBuckets",
+                    "",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            403
+        );
+        policy
+            .allow
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::GET,
+                    "/?x-id=ListBuckets",
+                    "",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            200
+        );
+        assert!(policy
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.action == "s3:ListAllMyBuckets" && request.resource == "*"));
+        // Spoofing the advisory value cannot substitute ListBuckets permission for PutObject.
+        policy
+            .allow
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::PUT,
+                    "/bucket/key?x-id=ListBuckets",
+                    "blocked",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            403
+        );
+        assert_eq!(
+            handler
+                .handle(req(Method::GET, "/bucket/key", "", &[]))
+                .await
+                .status(),
+            404
+        );
+        policy
+            .allow
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::PUT,
+                    "/bucket/key?x-id=PutObject",
+                    "payload",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            200
+        );
+        let before = {
+            let seen = policy.requests.lock().unwrap();
+            assert!(seen
+                .iter()
+                .skip(2)
+                .all(|request| request.action == "s3:PutObject"
+                    && request.resource == "arn:aws:s3:::bucket/key"));
+            seen.len()
+        };
+        assert_eq!(
+            handler
+                .handle(req(
+                    Method::GET,
+                    "/bucket?unsupported&x-id=ListBuckets",
+                    "",
+                    VERIFIED_WRITE_HEADERS
+                ))
+                .await
+                .status(),
+            501
+        );
+        assert_eq!(policy.requests.lock().unwrap().len(), before);
+        assert_eq!(
+            body_string(
+                handler
+                    .handle(req(Method::GET, "/bucket/key", "", &[]))
+                    .await
+            )
+            .await
+            .1,
+            "payload"
+        );
+    }
 
     #[tokio::test]
     async fn verified_external_object_writes_require_put_object_before_mutation() {
@@ -5300,6 +5453,78 @@ mod restart_persistence_tests {
                 .await
                 .unwrap(),
             Bytes::from_static(b"new")
+        );
+    }
+
+    #[tokio::test]
+    async fn readers_and_region_discovery_wait_for_durable_commit_admission() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
+        let handler =
+            Arc::new(super::tests::test_state_handler(Weak::new(), state.clone()).unwrap());
+        assert_eq!(
+            handler
+                .handle(request(Method::PUT, "/admission", Bytes::new()))
+                .await
+                .status(),
+            200
+        );
+        let writer = handler.mutation_lock.lock().await;
+        let gate = handler
+            .store
+            .transaction_gate("000000000001", "admission")
+            .unwrap();
+        let bucket_writer = gate.write().await;
+        let read_handler = handler.clone();
+        let mut read = tokio::spawn(async move {
+            read_handler
+                .handle(request(Method::HEAD, "/admission", Bytes::new()))
+                .await
+                .status()
+        });
+        let catalog_handler = handler.clone();
+        let mut catalog =
+            tokio::spawn(async move { catalog_handler.resource_regions("000000000001").await });
+        // Bucket readers wait on their commit gate; region discovery retains global admission.
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut read)
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut catalog)
+                .await
+                .is_err()
+        );
+        handler
+            .persist_bucket("000000000001", Some("admission"), Vec::new())
+            .unwrap();
+        drop(bucket_writer);
+        drop(writer);
+        assert_eq!(read.await.unwrap(), 200);
+        assert_eq!(catalog.await.unwrap().unwrap(), vec!["us-east-1"]);
+        assert!(!handler.poisoned.load(Ordering::Acquire));
+        assert_eq!(
+            handler
+                .handle(request(
+                    Method::PUT,
+                    "/admission/ledger",
+                    Bytes::from_static(b"canonical")
+                ))
+                .await
+                .status(),
+            200
+        );
+        drop(handler);
+        let reopened = super::tests::test_state_handler(Weak::new(), state).unwrap();
+        let response = reopened
+            .handle(request(Method::GET, "/admission/ledger", Bytes::new()))
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"canonical")
         );
     }
 

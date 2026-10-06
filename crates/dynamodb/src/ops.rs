@@ -1168,6 +1168,20 @@ fn evaluate_conditions(req: &Value, current: &Item) -> Result<(), DdbError> {
     check_condition(req, current)
 }
 
+/// Valid failed conditional writes consume existing-item WCU even without mutation.
+fn evaluate_write_conditions(
+    ctx: &Ctx<'_>,
+    req: &Value,
+    table: &mut TableData,
+    existing: Option<&Item>,
+) -> Result<(), DdbError> {
+    let result = evaluate_conditions(req, existing.unwrap_or(&Item::new()));
+    if matches!(&result, Err(DdbError::ConditionalCheckFailed(_))) {
+        ctx.store.capacity.admit(table, existing, None)?;
+    }
+    result
+}
+
 /// Evaluate the legacy `Expected` map under `ConditionalOperator` (`AND` default / `OR`).
 fn evaluate_expected(req: &Value, current: &Item) -> Result<(), DdbError> {
     let expected = req.get("Expected").and_then(Value::as_object).unwrap();
@@ -1341,7 +1355,10 @@ pub async fn put_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let mut guard = table.write().await;
     let key = guard.key_of(&item)?;
     let existing = guard.items.get(&key).cloned();
-    evaluate_conditions(req, existing.as_ref().unwrap_or(&Item::new()))?;
+    evaluate_write_conditions(ctx, req, &mut guard, existing.as_ref())?;
+    ctx.store
+        .capacity
+        .admit(&mut guard, existing.as_ref(), Some(&item))?;
     guard.emit_stream(existing.as_ref(), Some(&item));
     guard.items.insert(key, item);
     let mut out = Map::new();
@@ -1559,7 +1576,10 @@ pub async fn delete_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> 
     let mut guard = table.write().await;
     let key = guard.key_of(&key_item)?;
     let existing = guard.items.get(&key).cloned();
-    evaluate_conditions(req, existing.as_ref().unwrap_or(&Item::new()))?;
+    evaluate_write_conditions(ctx, req, &mut guard, existing.as_ref())?;
+    ctx.store
+        .capacity
+        .admit(&mut guard, existing.as_ref(), None)?;
     if existing.is_some() {
         guard.emit_stream(existing.as_ref(), None);
     } else {
@@ -1582,7 +1602,6 @@ pub async fn update_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> 
     let mut guard = table.write().await;
     let key = guard.key_of(&key_item)?;
     let existing = guard.items.get(&key).cloned();
-    evaluate_conditions(req, existing.as_ref().unwrap_or(&Item::new()))?;
 
     // Start from the existing item, or from the key when creating.
     let mut item = existing.clone().unwrap_or_else(|| key_item.clone());
@@ -1602,6 +1621,10 @@ pub async fn update_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> 
             "Item size has exceeded the maximum allowed size".into(),
         ));
     }
+    evaluate_write_conditions(ctx, req, &mut guard, existing.as_ref())?;
+    ctx.store
+        .capacity
+        .admit(&mut guard, existing.as_ref(), Some(&item))?;
     guard.emit_stream(existing.as_ref(), Some(&item));
     guard.items.insert(key, item.clone());
 
@@ -1929,6 +1952,8 @@ pub async fn batch_write_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbEr
             "Too many items requested (max 25)".into(),
         ));
     }
+    let mut unprocessed = Map::new();
+    let mut first_throttle = None;
     for (table_name, ops) in request_items {
         let ops = ops
             .as_array()
@@ -1950,6 +1975,25 @@ pub async fn batch_write_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbEr
                 }
                 seen.push(key.clone());
                 let existing = guard.items.get(&key).cloned();
+                if let Err(error) =
+                    ctx.store
+                        .capacity
+                        .admit(&mut guard, existing.as_ref(), Some(&item))
+                {
+                    match error {
+                        DdbError::ProvisionedThroughputExceeded(_) | DdbError::Throttling(_) => {
+                            first_throttle.get_or_insert(error);
+                            unprocessed
+                                .entry(table_name.clone())
+                                .or_insert_with(|| json!([]))
+                                .as_array_mut()
+                                .unwrap()
+                                .push(op.clone());
+                            continue;
+                        }
+                        other => return Err(other),
+                    }
+                }
                 guard.emit_stream(existing.as_ref(), Some(&item));
                 guard.items.insert(key, item);
             } else if let Some(del) = op.get("DeleteRequest") {
@@ -1965,6 +2009,25 @@ pub async fn batch_write_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbEr
                 }
                 seen.push(key.clone());
                 let existing = guard.items.get(&key).cloned();
+                if let Err(error) = ctx
+                    .store
+                    .capacity
+                    .admit(&mut guard, existing.as_ref(), None)
+                {
+                    match error {
+                        DdbError::ProvisionedThroughputExceeded(_) | DdbError::Throttling(_) => {
+                            first_throttle.get_or_insert(error);
+                            unprocessed
+                                .entry(table_name.clone())
+                                .or_insert_with(|| json!([]))
+                                .as_array_mut()
+                                .unwrap()
+                                .push(op.clone());
+                            continue;
+                        }
+                        other => return Err(other),
+                    }
+                }
                 if existing.is_some() {
                     guard.emit_stream(existing.as_ref(), None);
                 } else {
@@ -1974,7 +2037,16 @@ pub async fn batch_write_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbEr
             }
         }
     }
-    Ok(json!({ "UnprocessedItems": {} }))
+    if total > 0
+        && unprocessed
+            .values()
+            .map(|entries| entries.as_array().map_or(0, Vec::len))
+            .sum::<usize>()
+            == total
+    {
+        return Err(first_throttle.expect("all entries were throttled"));
+    }
+    Ok(json!({ "UnprocessedItems": unprocessed }))
 }
 
 pub async fn batch_get_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
@@ -2096,6 +2168,10 @@ pub async fn transact_write_items(ctx: &Ctx<'_>, req: &Value) -> Result<Value, D
             *outcome = None;
         }
         let result = transact_write_items_once(ctx, req).await;
+        if matches!(&result, Err(DdbError::TransactionCanceled(reasons)) if reasons.iter().any(|reason| matches!(reason.code.as_str(), "ProvisionedThroughputExceeded" | "ThrottlingError")))
+        {
+            return result;
+        }
         *outcome = Some(crate::store::TxnOutcome {
             fingerprint,
             result: result.clone(),
@@ -2234,6 +2310,70 @@ async fn transact_write_items_once(ctx: &Ctx<'_>, req: &Value) -> Result<Value, 
         staged.push(stage);
     }
 
+    // Canceled transactions still consume admitted attempted write capacity.
+    // Item/stream changes remain all-or-nothing; read/ConditionCheck units are not modeled.
+    let mut charges = std::collections::BTreeMap::<String, u64>::new();
+    for stage in &staged {
+        let (table, units) = match stage {
+            StagedWrite::Put {
+                table, old, new, ..
+            } => (
+                table,
+                crate::capacity::write_units(old.as_ref(), Some(new)) * 2,
+            ),
+            StagedWrite::Delete { table, old, .. } => {
+                (table, crate::capacity::write_units(old.as_ref(), None) * 2)
+            }
+            StagedWrite::Check => continue,
+        };
+        *charges.entry(table.clone()).or_default() += units;
+    }
+    let now = (ctx.store.capacity.clock)();
+    let mut plans = std::collections::BTreeMap::new();
+    let mut throttled = std::collections::BTreeMap::new();
+    for (name, units) in charges {
+        match ctx
+            .store
+            .capacity
+            .plan(guards.get(&name).unwrap(), units, now)
+        {
+            Ok(window) => {
+                plans.insert(name, window);
+            }
+            Err(error) => {
+                throttled.insert(name, error);
+            }
+        }
+    }
+    for (name, window) in plans {
+        guards.get_mut(&name).unwrap().write_window = window;
+    }
+    if !throttled.is_empty() {
+        let reasons = actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let (verb, inner) = transaction_action(action).expect("validated action");
+                if verb == "ConditionCheck" {
+                    return reasons[index].clone();
+                }
+                let name = inner["TableName"].as_str().expect("validated name");
+                match throttled.get(name) {
+                    Some(DdbError::ProvisionedThroughputExceeded(message)) => {
+                        CancellationReason::new(
+                            "ProvisionedThroughputExceeded",
+                            Some(message.clone()),
+                        )
+                    }
+                    Some(DdbError::Throttling(message)) => {
+                        CancellationReason::new("ThrottlingError", Some(message.clone()))
+                    }
+                    _ => reasons[index].clone(),
+                }
+            })
+            .collect();
+        return Err(DdbError::TransactionCanceled(reasons));
+    }
     if any_failed {
         return Err(DdbError::TransactionCanceled(reasons));
     }
