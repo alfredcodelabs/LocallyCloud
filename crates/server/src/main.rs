@@ -3,6 +3,7 @@
 //! Wires observability, configuration, endpoint resolution, compute-runtime selection, the
 //! service registry, and the Axum server together, then runs until a shutdown signal.
 
+mod cli;
 mod domain_tls;
 mod ec2_runtime;
 mod ecs_runtime;
@@ -192,6 +193,26 @@ impl locallycloud_elbv2::TargetEndpointResolver for Ec2TargetResolver {
 
 #[tokio::main]
 async fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let command = match cli::parse(&arguments) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("locallycloud: {error}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    match command {
+        cli::Command::Help => {
+            println!("{}", cli::USAGE);
+            return;
+        }
+        cli::Command::Version => {
+            println!("locallycloud {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        cli::Command::Serve | cli::Command::MigrateS3Encryption => {}
+    }
+
     observability::init_tracing();
 
     let config = match LocallyCloudConfig::from_env() {
@@ -202,15 +223,7 @@ async fn main() {
         }
     };
 
-    let arguments: Vec<_> = std::env::args().skip(1).collect();
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "migrate-s3-encryption")
-    {
-        if arguments.len() != 1 {
-            eprintln!("Usage: locallycloud migrate-s3-encryption (uses configured state, account and master key)");
-            std::process::exit(2);
-        }
+    if command == cli::Command::MigrateS3Encryption {
         if let Err(error) = migration::s3(&config).await {
             tracing::error!(%error, "S3 encryption migration failed");
             std::process::exit(5);

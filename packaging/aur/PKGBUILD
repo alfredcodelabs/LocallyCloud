@@ -1,0 +1,57 @@
+# Maintainer: Alfred Rodriguez G <alfredcode.dev@gmail.com>
+# AUR recipe built from a published release tag. Update pkgver, _tag and sha256sums with
+# packaging/aur/update.sh; packaging/arch/PKGBUILD builds the local checkout for CI instead.
+pkgname=locallycloud
+pkgver=0.1.0beta.1
+_tag=v0.1.0-beta.1
+pkgrel=1
+pkgdesc='Local AWS service emulator for serverless and data workflows'
+arch=('x86_64' 'aarch64')
+url='https://locallycloud.zentostudio.com'
+license=('Apache-2.0')
+depends=('glibc' 'libgcc' 'sqlite>=3.53.4' 'hicolor-icon-theme')
+makedepends=('cargo' 'cargo-about' 'clang' 'cmake')
+optdepends=('crun: daemonless compute runtime for Lambda, ECS and EC2'
+            'dbus: user D-Bus session required by rootless OCI execution'
+            'postgresql: local RDS runtime'
+            'xdg-utils: open the dashboard from the application menu')
+# GCC LTO objects from aws-lc-sys do not link with Rust's lld invocation.
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/alfredcodelabs/LocallyCloud/archive/refs/tags/$_tag.tar.gz")
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+_srcdir() {
+  printf '%s/LocallyCloud-%s' "$srcdir" "${_tag#v}"
+}
+
+prepare() {
+  cd "$(_srcdir)"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$(_srcdir)"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p locallycloud
+  bash scripts/third-party-licenses.sh target/THIRD_PARTY_LICENSES
+}
+
+check() {
+  cd "$(_srcdir)"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --frozen -p locallycloud-core -p locallycloud-state --lib
+}
+
+package() {
+  cd "$(_srcdir)"
+  install -Dm755 target/release/locallycloud "$pkgdir/usr/bin/locallycloud"
+  install -Dm644 LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+  install -Dm644 target/THIRD_PARTY_LICENSES "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES"
+  install -Dm644 packaging/assets/locallycloud.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/locallycloud.svg"
+  for size in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "packaging/assets/locallycloud-$size.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/locallycloud.png"
+  done
+  install -Dm644 packaging/assets/locallycloud.desktop "$pkgdir/usr/share/applications/locallycloud.desktop"
+  install -Dm644 packaging/assets/locallycloud.1 "$pkgdir/usr/share/man/man1/locallycloud.1"
+}

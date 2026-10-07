@@ -34,7 +34,20 @@ If you fix only the package for an already published version, increment its revi
 LOCALLYCLOUD_DEBIAN_REVISION=2 bash packaging/debian/build-deb.sh /path/to/sqlite-autoconf-3530400.tar.gz
 ```
 
-Keep revision 1 before the first publication. The current Arch recipe packages a local checkout; publication in AUR will require the resolved version and its `.SRCINFO`, with sources and checksums from the corresponding release.
+Keep revision 1 before the first publication.
+
+## AUR
+
+There are two Arch recipes. `packaging/arch/PKGBUILD` builds the local checkout and is what CI uses. `packaging/aur/PKGBUILD` is the AUR recipe: it downloads the release tag's source archive from GitHub, verifies its SHA-256, fetches crates in `prepare()` with `cargo fetch --locked`, builds offline with `--frozen`, runs the core library tests in `check()`, and installs the binary, license notices, man page, launcher, and icons.
+
+After the release tag is published, on an Arch machine:
+
+```sh
+bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0-beta.1
+cd packaging/aur && makepkg --cleanbuild && namcap PKGBUILD ./*.pkg.tar.zst
+```
+
+`update.sh` sets `pkgver`, `_tag`, `pkgrel=1`, and `sha256sums` from the published archive and regenerates `.SRCINFO`. Copy `PKGBUILD` and `.SRCINFO` into the AUR Git repository (`ssh://aur@aur.archlinux.org/locallycloud.git`) and push them; the AUR account and its SSH key are configured separately from GitHub. For a packaging-only fix of the same release, increment `pkgrel` in both recipes and regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`.
 
 References: [SemVer](https://semver.org/), [Debian](https://www.debian.org/doc/debian-policy/ch-controlfields.html#version), [Arch](https://man.archlinux.org/man/PKGBUILD.5.en).
 
@@ -44,7 +57,7 @@ The `.github/workflows/packages.yml` workflow runs on pull requests, pushes to `
 
 It validates version formats, tag matching, and the versions of all crates. It checks `cargo fmt`, builds and installs both packages, and runs library tests for `locallycloud-core` and `locallycloud-state`. It does not yet cover all service integrations, PostgreSQL, or OCI runtimes.
 
-Debian is built on Debian 13 amd64 using the Rust version declared in Cargo.toml. SQLite 3.53.4 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories.
+Debian is built natively on Debian 13 for `amd64` and `arm64` (GitHub `ubuntu-24.04` and `ubuntu-24.04-arm` runners) using the Rust version declared in Cargo.toml. SQLite 3.53.4 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. The `libc6` dependency is computed from the binary and must not exceed glibc 2.39, the oldest supported LTS. A follow-up job installs each `.deb` with `apt` on Debian 13, Ubuntu 24.04, and Ubuntu 26.04 and starts the server; releases wait for it. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories; the PKGBUILD also declares `aarch64` for Arch Linux ARM, which CI does not build yet.
 
 After saving and pushing the version and Cargo.lock changes:
 

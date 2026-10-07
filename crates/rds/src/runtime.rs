@@ -7,8 +7,10 @@ use thiserror::Error;
 use tokio::process::Command;
 
 const TOOLS: [&str; 5] = ["initdb", "pg_ctl", "postgres", "psql", "pg_basebackup"];
-/// Version pinned by the opt-in, checksum-verified native source build script.
-pub const CACHE_VERSION: &str = "16.15";
+/// Oldest supported PostgreSQL major version (Ubuntu 24.04 LTS ships 16).
+const MIN_MAJOR: u32 = 16;
+/// Debian and Ubuntu install each major version under `<root>/<major>/bin`, outside PATH.
+const DISTRIBUTION_ROOTS: [&str; 1] = ["/usr/lib/postgresql"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostgresRuntime {
@@ -24,10 +26,8 @@ impl PostgresRuntime {
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
-    #[error("PostgreSQL runtime unavailable: set LOCALLYCLOUD_PG_BIN_DIR to a PostgreSQL 16+ bin directory containing initdb, pg_ctl, postgres, psql and pg_basebackup; no distribution is cached")]
+    #[error("PostgreSQL runtime unavailable: install PostgreSQL 16 or later from your distribution (the newest it provides) or set LOCALLYCLOUD_PG_BIN_DIR to a bin directory containing initdb, pg_ctl, postgres, psql and pg_basebackup")]
     Missing,
-    #[error("PostgreSQL cache directory is unavailable or insecure: {0}")]
-    CacheDirectory(String),
     #[error("PostgreSQL toolchain in {directory} is incomplete: missing {tool}")]
     Incomplete {
         directory: PathBuf,
@@ -55,12 +55,12 @@ pub enum RuntimeError {
 }
 
 /// Resolve without installing anything. An explicit path is authoritative; PATH
-/// candidates must contain the entire toolchain in one directory. The cache is
-/// considered only after PATH and is never downloaded implicitly.
+/// candidates must contain the entire toolchain in one directory. Distribution roots
+/// (`<root>/<major>/bin`) are tried last, newest major version first.
 pub async fn resolve(
     explicit: Option<&Path>,
     path: Option<&OsStr>,
-    cache_root: &Path,
+    distribution_roots: &[PathBuf],
 ) -> Result<PostgresRuntime, RuntimeError> {
     if let Some(directory) = explicit {
         return validate(directory).await;
@@ -76,23 +76,29 @@ pub async fn resolve(
         }
     }
 
-    let cached = cache_root
-        .join("postgresql")
-        .join(CACHE_VERSION)
-        .join("bin");
-    if cached.exists() {
-        let runtime = validate(&cached).await?;
-        if runtime.version != CACHE_VERSION {
-            return Err(RuntimeError::MixedVersion {
-                directory: runtime.bin_dir,
-                tool: "postgres",
-                actual: runtime.version,
-                expected: CACHE_VERSION.to_owned(),
-            });
+    for directory in distribution_candidates(distribution_roots) {
+        if let Ok(runtime) = validate(&directory).await {
+            return Ok(runtime);
         }
-        return Ok(runtime);
     }
     Err(RuntimeError::Missing)
+}
+
+/// `<root>/<major>/bin` directories with a supported major version, newest first.
+fn distribution_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates: Vec<(u32, PathBuf)> = roots
+        .iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let major = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let bin = entry.path().join("bin");
+            (major >= MIN_MAJOR && bin.join("postgres").is_file()).then_some((major, bin))
+        })
+        .collect();
+    candidates.sort_by_key(|(major, _)| std::cmp::Reverse(*major));
+    candidates.into_iter().map(|(_, bin)| bin).collect()
 }
 
 /// Resolve from locallycloud configuration. A relative explicit path is resolved
@@ -100,22 +106,8 @@ pub async fn resolve(
 pub async fn resolve_from_env() -> Result<PostgresRuntime, RuntimeError> {
     let explicit = std::env::var_os("LOCALLYCLOUD_PG_BIN_DIR").map(PathBuf::from);
     let path: Option<OsString> = std::env::var_os("PATH");
-    let cache_base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(|| locallycloud_state::StateDb::work_dir("cache"));
-    let cache_root = cache_base.join("locallycloud");
-    locallycloud_state::StateDb::private_dir(&cache_root)
-        .map_err(|error| RuntimeError::CacheDirectory(error.to_string()))?;
-    resolve(explicit.as_deref(), path.as_deref(), &cache_root).await
+    let roots: Vec<PathBuf> = DISTRIBUTION_ROOTS.iter().map(PathBuf::from).collect();
+    resolve(explicit.as_deref(), path.as_deref(), &roots).await
 }
 
 async fn validate(directory: &Path) -> Result<PostgresRuntime, RuntimeError> {
@@ -185,7 +177,7 @@ fn parse_version(output: &str) -> Option<String> {
     let version = version.split_whitespace().next()?;
     let mut parts = version.split('.');
     let major = parts.next()?.parse::<u32>().ok()?;
-    if major < 16 || !parts.all(|part| part.parse::<u32>().is_ok()) {
+    if major < MIN_MAJOR || !parts.all(|part| part.parse::<u32>().is_ok()) {
         return None;
     }
     Some(version.to_owned())
@@ -236,50 +228,49 @@ mod tests {
     async fn explicit_toolchain_resolves_and_is_authoritative() {
         let temp = TempDir::new();
         let bin = temp.bin("16.4");
-        let runtime = resolve(Some(&bin), None, &temp.0).await.unwrap();
+        let runtime = resolve(Some(&bin), None, &[]).await.unwrap();
         assert_eq!(runtime.version, "16.4");
         std::fs::remove_file(bin.join("psql")).unwrap();
         assert!(matches!(
-            resolve(Some(&bin), None, &temp.0).await,
+            resolve(Some(&bin), None, &[]).await,
             Err(RuntimeError::Incomplete { tool: "psql", .. })
         ));
     }
 
     #[tokio::test]
-    async fn path_and_cache_fallback_are_version_checked() {
+    async fn path_toolchain_is_version_checked() {
         let temp = TempDir::new();
         let bin = temp.bin("17.2");
-        let runtime = resolve(None, Some(bin.as_os_str()), &temp.0).await.unwrap();
+        let runtime = resolve(None, Some(bin.as_os_str()), &[]).await.unwrap();
         assert_eq!(runtime.version, "17.2");
-        let cached = temp.0.join("postgresql").join(CACHE_VERSION).join("bin");
-        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
-        std::fs::rename(&bin, &cached).unwrap();
-        assert!(matches!(
-            resolve(None, None, &temp.0).await,
-            Err(RuntimeError::MixedVersion {
-                tool: "postgres",
-                ..
-            })
-        ));
-        for tool in TOOLS {
-            std::fs::write(
-                cached.join(tool),
-                format!("#!/bin/sh\necho '{tool} (PostgreSQL) {CACHE_VERSION}'\n"),
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            resolve(None, None, &temp.0).await.unwrap().version,
-            CACHE_VERSION
-        );
         std::fs::write(
-            cached.join("psql"),
+            bin.join("psql"),
             "#!/bin/sh\necho 'psql (PostgreSQL) 15.9'\n",
         )
         .unwrap();
         assert!(matches!(
-            resolve(None, None, &temp.0).await,
-            Err(RuntimeError::Version { tool: "psql", .. })
+            resolve(None, Some(bin.as_os_str()), &[]).await,
+            Err(RuntimeError::Missing)
+        ));
+    }
+
+    #[tokio::test]
+    async fn distribution_root_prefers_newest_supported_major() {
+        let temp = TempDir::new();
+        let root = temp.0.join("postgresql");
+        for (major, version) in [("15", "15.9"), ("17", "17.6"), ("18", "18.1")] {
+            let bin = temp.bin(version);
+            std::fs::create_dir_all(root.join(major)).unwrap();
+            std::fs::rename(&bin, root.join(major).join("bin")).unwrap();
+        }
+        let roots = [root.clone()];
+        assert_eq!(resolve(None, None, &roots).await.unwrap().version, "18.1");
+        std::fs::remove_file(root.join("18/bin/psql")).unwrap();
+        assert_eq!(resolve(None, None, &roots).await.unwrap().version, "17.6");
+        std::fs::remove_dir_all(root.join("17")).unwrap();
+        assert!(matches!(
+            resolve(None, None, &roots).await,
+            Err(RuntimeError::Missing)
         ));
     }
 
@@ -287,7 +278,7 @@ mod tests {
     async fn missing_runtime_is_typed() {
         let temp = TempDir::new();
         assert!(matches!(
-            resolve(None, None, &temp.0).await,
+            resolve(None, None, std::slice::from_ref(&temp.0)).await,
             Err(RuntimeError::Missing)
         ));
     }

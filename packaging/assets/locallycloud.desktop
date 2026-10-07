@@ -7,3 +7,4 @@ TryExec=xdg-open
 Icon=locallycloud
 Terminal=false
 Categories=Development;
+Keywords=AWS;cloud;emulator;serverless;Lambda;S3;DynamoDB;

@@ -1,13 +1,14 @@
+# Maintainer: Alfred Rodriguez G <alfredcode.dev@gmail.com>
 # Local checkout package for validating Arch before the first tagged release.
 pkgname=locallycloud
 pkgver=$(bash "$startdir/../../scripts/package-version.sh" arch)
 pkgrel=1
 pkgdesc='Local AWS service emulator for serverless and data workflows'
-arch=('x86_64')
-url='https://github.com/AlfredRodriguez2042/locallycloud'
+arch=('x86_64' 'aarch64')
+url='https://locallycloud.zentostudio.com'
 license=('Apache-2.0')
-depends=('glibc' 'gcc-libs' 'sqlite>=3.53.4')
-makedepends=('cargo' 'git')
+depends=('glibc' 'libgcc' 'sqlite>=3.53.4' 'hicolor-icon-theme')
+makedepends=('cargo' 'cargo-about' 'git')
 optdepends=('crun: daemonless compute runtime'
             'postgresql: local RDS runtime'
             'xdg-utils: open the dashboard from the application menu')
@@ -17,14 +18,17 @@ options=('!lto' '!debug')
 build() {
   cd "$startdir/../.."
   cargo build --release --locked -p locallycloud
+  bash scripts/third-party-licenses.sh target/THIRD_PARTY_LICENSES
 }
 
 package() {
   install -Dm755 "$startdir/../../target/release/locallycloud" "$pkgdir/usr/bin/locallycloud"
   install -Dm644 "$startdir/../../LICENSE.md" "$pkgdir/usr/share/licenses/locallycloud/LICENSE.md"
+  install -Dm644 "$startdir/../../target/THIRD_PARTY_LICENSES" "$pkgdir/usr/share/licenses/locallycloud/THIRD_PARTY_LICENSES"
   install -Dm644 "$startdir/../assets/locallycloud.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/locallycloud.svg"
   for size in 16 24 32 48 64 128 256 512; do
     install -Dm644 "$startdir/../assets/locallycloud-$size.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/locallycloud.png"
   done
   install -Dm644 "$startdir/../assets/locallycloud.desktop" "$pkgdir/usr/share/applications/locallycloud.desktop"
+  install -Dm644 "$startdir/../assets/locallycloud.1" "$pkgdir/usr/share/man/man1/locallycloud.1"
 }

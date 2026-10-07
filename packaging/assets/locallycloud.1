@@ -1,0 +1,99 @@
+.TH LOCALLYCLOUD 1 "2026" "LocallyCloud" "User Commands"
+.SH NAME
+locallycloud \- local AWS service emulator
+.SH SYNOPSIS
+.B locallycloud
+.RI [ COMMAND ]
+.br
+.B locallycloud
+.BR \-h | \-\-help | \-V | \-\-version
+.SH DESCRIPTION
+.B locallycloud
+emulates AWS services such as S3, DynamoDB, SQS, SNS, Lambda, API Gateway,
+EventBridge, Step Functions and CloudFormation on one local endpoint, for
+developing and testing applications with the AWS CLI, AWS SDKs, Terraform and
+AWS SAM. It runs as a regular user and does not need Docker.
+.PP
+Without a command, it starts the server on
+.I http://127.0.0.1:4566
+and keeps running until it receives SIGINT or SIGTERM. The dashboard is at
+.IR http://127.0.0.1:4566/_locallycloud/ui .
+.SH COMMANDS
+.TP
+.B migrate\-s3\-encryption
+Encrypt S3 object bodies stored by an earlier version with the configured
+master key, then exit. Stop the server first. Rerunning resumes the remaining
+buckets.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.SH ENVIRONMENT
+.TP
+.B LOCALLYCLOUD_KMS_MASTER_KEY
+Base64 encoding of a 32\-byte key that encrypts the stored state. Required.
+Reuse the same key with the same state database; data encrypted with another
+key cannot be read.
+.TP
+.B LOCALLYCLOUD_STATE_DB
+SQLite state file. Default:
+.IR ${XDG_DATA_HOME:\-~/.local/share}/locallycloud/state.sqlite3 .
+.TP
+.BR LOCALLYCLOUD_HOST ", " LOCALLYCLOUD_PORT
+Listen address and port. Default: 127.0.0.1 and 4566.
+.TP
+.BR LOCALLYCLOUD_DEFAULT_REGION ", " LOCALLYCLOUD_ACCOUNT_ID
+Region and account used in responses. Default: us\-east\-1 and 000000000000.
+.TP
+.B LOCALLYCLOUD_IAM_ENFORCEMENT
+Set to
+.B strict
+to evaluate IAM policies. Default: permissive.
+.TP
+.B LOCALLYCLOUD_RUNTIME
+Compute runtime for Lambda, ECS and EC2:
+.BR auto ", " firecracker " or " youki
+(OCI, through crun or youki). Default: auto.
+.TP
+.B LOCALLYCLOUD_WORK_DIR
+Lambda work files. Default:
+.IR ${XDG_CACHE_HOME:\-~/.cache}/locallycloud/lambda .
+.TP
+.B LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB
+Memory budget for Lambda environments, in MiB. Default: 1024.
+.TP
+.B LOCALLYCLOUD_PG_BIN_DIR
+Directory with the PostgreSQL 16 or later binaries used by RDS. By default
+RDS uses PATH, then the newest version under
+.IR /usr/lib/postgresql/ <version> /bin .
+.TP
+.B LOCALLYCLOUD_COGNITO_MAILBOX_DIR
+Private directory that receives Cognito confirmation codes as JSON files.
+.SH FILES
+.TP
+.I ~/.local/share/locallycloud/
+Persistent state and local RDS databases.
+.TP
+.I ~/.cache/locallycloud/
+Runtime caches. Restore write permission with
+.B chmod \-R u+w
+before deleting it.
+.SH EXIT STATUS
+0 on normal shutdown, 2 for invalid arguments or configuration, and other
+non\-zero values when startup or migration fails.
+.SH EXAMPLES
+.nf
+export LOCALLYCLOUD_KMS_MASTER_KEY="$(openssl rand \-base64 32)"
+locallycloud
+aws \-\-endpoint\-url http://127.0.0.1:4566 s3 ls
+.fi
+.SH SEE ALSO
+.BR aws (1),
+.BR crun (1)
+.PP
+https://locallycloud.zentostudio.com
+.br
+https://github.com/alfredcodelabs/LocallyCloud

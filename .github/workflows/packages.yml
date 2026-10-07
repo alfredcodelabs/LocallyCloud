@@ -48,7 +48,15 @@ jobs:
 
   debian:
     needs: version
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: debian:13
     timeout-minutes: 60
     steps:
@@ -66,6 +74,8 @@ jobs:
           curl --fail --show-error --silent --location https://sh.rustup.rs -o /tmp/rustup-init.sh
           bash /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_VERSION" --component rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-about for third-party license notices
+        run: cargo install --locked cargo-about@0.8.4
       - name: Check formatting and workspace versions
         run: |
           cargo fmt --all -- --check
@@ -77,24 +87,55 @@ jobs:
           members = set(data['workspace_members'])
           assert all(p['version'] == version for p in data['packages'] if p['id'] in members), 'Workspace versions differ'
           PY
-      - name: Build Debian 13 amd64 package
+      - name: Build Debian 13 ${{ matrix.arch }} package
         run: |
           curl --fail --show-error --silent --location https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz -o /tmp/sqlite-autoconf-3530400.tar.gz
           bash packaging/debian/build-deb.sh /tmp/sqlite-autoconf-3530400.tar.gz
-          package="target/debian-package/dist/locallycloud_$(bash scripts/package-version.sh debian)_amd64.deb"
+          [[ "$(dpkg --print-architecture)" == "${{ matrix.arch }}" ]]
+          package="target/debian-package/dist/locallycloud_$(bash scripts/package-version.sh debian)_${{ matrix.arch }}.deb"
           [[ "$(dpkg-deb -f "$package" Version)" == "$(bash scripts/package-version.sh debian)" ]]
           dpkg -i "$package"
       - name: Test core and state with packaged SQLite
         run: |
-          export SQLITE3_LIB_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4/lib"
-          export SQLITE3_INCLUDE_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4/include"
+          export SQLITE3_LIB_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4-${{ matrix.arch }}/lib"
+          export SQLITE3_INCLUDE_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4-${{ matrix.arch }}/include"
           export SQLITE3_STATIC=1
           cargo test --locked -p locallycloud-core -p locallycloud-state --lib
       - uses: actions/upload-artifact@v7
         with:
-          name: package-debian-amd64
+          name: package-debian-${{ matrix.arch }}
           path: target/debian-package/dist/*.deb
           if-no-files-found: error
+
+  debian-install:
+    needs: debian
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:13', 'ubuntu:24.04', 'ubuntu:26.04']
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-debian-${{ matrix.arch }}
+          path: dist
+      - name: Install with apt and start as an unprivileged user
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y curl openssl ./dist/*.deb
+          dpkg-query -W -f='${Status}\n' dbus-user-session | grep -q 'install ok installed'
+          useradd --create-home tester
+          runuser -u tester -- bash -c '
+            export LOCALLYCLOUD_KMS_MASTER_KEY="$(openssl rand -base64 32)"
+            locallycloud > /tmp/locallycloud.log 2>&1 &
+            pid=$!
+            for _ in $(seq 1 200); do curl -fs http://127.0.0.1:4566/_locallycloud/health && break; sleep 0.1; done
+            curl -fs http://127.0.0.1:4566/_locallycloud/status | grep -q "\"ready\":true" || { cat /tmp/locallycloud.log; exit 1; }
+            kill "$pid"'
 
   arch:
     needs: version
@@ -103,7 +144,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Install build dependencies
-        run: pacman -Syu --noconfirm --needed rust cargo git sqlite cmake clang
+        run: pacman -Syu --noconfirm --needed rust cargo cargo-about git sqlite cmake clang
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -125,7 +166,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [debian, arch]
+    needs: [debian, debian-install, arch]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
