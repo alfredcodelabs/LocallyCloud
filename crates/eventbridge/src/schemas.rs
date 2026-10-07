@@ -183,10 +183,10 @@ impl SchemasService {
         {
             return Ok(());
         }
-        if !request
+        if request
             .headers
             .get("x-locallycloud-verified-external-sigv4")
-            .is_some_and(|value| value == "1")
+            .is_none_or(|value| value != "1")
         {
             return Err(SchemasError::AccessDenied);
         }

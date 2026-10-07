@@ -667,7 +667,7 @@ impl Elbv2Handler {
         )?;
         let lb_arn = q.get("LoadBalancerArn");
         let listener_arns = q.list("ListenerArns.member")?;
-        if lb_arn.is_some() == !listener_arns.is_empty() {
+        if lb_arn.is_some() != listener_arns.is_empty() {
             return Err(Error::invalid("Specify load balancer ARN or listener ARNs"));
         }
         let size = page_size(q)?;

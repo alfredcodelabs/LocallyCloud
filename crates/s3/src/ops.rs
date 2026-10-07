@@ -666,9 +666,9 @@ pub async fn create_bucket(
             ));
         }
         let suffix = format!("-{}-{}-an", ctx.account, ctx.region);
-        if !name
+        if name
             .strip_suffix(&suffix)
-            .is_some_and(|prefix| !prefix.is_empty())
+            .is_none_or(|prefix| prefix.is_empty())
         {
             return Err(S3Error::InvalidBucketName);
         }
@@ -3076,10 +3076,10 @@ async fn ensure_upload(
     upload_id: &str,
 ) -> Result<(), S3Error> {
     let guard = bucket.read().await;
-    if !guard
+    if guard
         .uploads
         .get(upload_id)
-        .is_some_and(|upload| upload.key == key)
+        .is_none_or(|upload| upload.key != key)
     {
         return Err(S3Error::NoSuchUpload);
     }
@@ -3424,10 +3424,10 @@ pub async fn abort_multipart_upload(
 ) -> Result<Response, S3Error> {
     let b = bucket(ctx, bucket_name).await?;
     let mut guard = b.write().await;
-    if !guard
+    if guard
         .uploads
         .get(upload_id)
-        .is_some_and(|upload| upload.key == key)
+        .is_none_or(|upload| upload.key != key)
     {
         return Err(S3Error::NoSuchUpload);
     }

@@ -166,7 +166,7 @@ impl XrayHandler {
             ("ResourceARN", 500),
         ] {
             if let Some(value) = object.get(key) {
-                if !value.as_str().is_some_and(|text| text.len() <= limit) {
+                if value.as_str().is_none_or(|text| text.len() > limit) {
                     return Err(ApiError::InvalidRequest);
                 }
             }

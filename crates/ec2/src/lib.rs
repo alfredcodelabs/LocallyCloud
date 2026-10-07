@@ -440,10 +440,10 @@ impl Ec2Handler {
         let scope = state.get_mut(&key)?;
         let subnet = scope.subnets.get(subnet_id)?.clone();
         if group_ids.iter().any(|id| {
-            !scope
+            scope
                 .security_groups
                 .get(id)
-                .is_some_and(|group| group.vpc_id == subnet.vpc_id)
+                .is_none_or(|group| group.vpc_id != subnet.vpc_id)
         }) {
             return None;
         }

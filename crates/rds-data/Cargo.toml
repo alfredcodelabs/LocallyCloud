@@ -10,7 +10,7 @@ description = "locallycloud AWS RDS Data API service"
 [dependencies]
 locallycloud-core = { path = "../core" }
 locallycloud-state.workspace = true
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 axum.workspace = true
 base64 = "=0.22.1"
 bytes = "=1.12.1"

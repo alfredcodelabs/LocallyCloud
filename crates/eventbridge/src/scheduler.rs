@@ -248,7 +248,7 @@ fn validate_target(value: Option<&Value>) -> Result<Value, SchedulerError> {
         })?;
         if retry
             .get("MaximumRetryAttempts")
-            .is_some_and(|attempts| !attempts.as_u64().is_some_and(|attempts| attempts <= 185))
+            .is_some_and(|attempts| attempts.as_u64().is_none_or(|attempts| attempts > 185))
         {
             return Err(SchedulerError::Validation(
                 "Target.RetryPolicy.MaximumRetryAttempts must be between 0 and 185".into(),

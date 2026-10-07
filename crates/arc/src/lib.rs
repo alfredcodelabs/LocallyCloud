@@ -144,10 +144,10 @@ impl ArcService {
                 let cluster = required(&body, "ClusterArn")?;
                 let name = required(&body, "ControlPanelName")?;
                 valid_name(name)?;
-                if !state
+                if state
                     .clusters
                     .get(cluster)
-                    .is_some_and(|c| c.account == account)
+                    .is_none_or(|c| c.account != account)
                 {
                     return Err(Error::not_found());
                 }
@@ -226,11 +226,7 @@ impl ArcService {
                 let panel = required(rule, "ControlPanelArn")?;
                 let name = required(rule, "Name")?;
                 valid_name(name)?;
-                if !state
-                    .panels
-                    .get(panel)
-                    .is_some_and(|p| p.account == account)
-                {
+                if state.panels.get(panel).is_none_or(|p| p.account != account) {
                     return Err(Error::not_found());
                 }
                 let config = rule
@@ -387,11 +383,7 @@ fn update(state: &mut State, account: &str, updates: &[(String, bool)]) -> Resul
         if !seen.insert(arn) {
             return Err(Error::invalid("Duplicate routing control update"));
         }
-        if !state
-            .controls
-            .get(arn)
-            .is_some_and(|c| c.account == account)
-        {
+        if state.controls.get(arn).is_none_or(|c| c.account != account) {
             return Err(Error::not_found());
         }
     }

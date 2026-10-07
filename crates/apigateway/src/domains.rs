@@ -402,9 +402,9 @@ impl DomainTransaction<'_> {
         let retired: Vec<_> = original
             .iter()
             .filter(|(name, old)| {
-                !staged
+                staged
                     .get(*name)
-                    .is_some_and(|new| new.certificate_arn == old.certificate_arn)
+                    .is_none_or(|new| new.certificate_arn != old.certificate_arn)
             })
             .map(|(_, binding)| binding.clone())
             .collect();

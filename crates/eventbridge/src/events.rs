@@ -1780,10 +1780,10 @@ impl EventsService {
                     let scope = store.scope(&account, &region).await;
                     let rules = {
                         let state = scope.read().await;
-                        if !state
+                        if state
                             .replays
                             .get(&replay.name)
-                            .is_some_and(|item| item.state == "RUNNING")
+                            .is_none_or(|item| item.state != "RUNNING")
                         {
                             return;
                         }
@@ -2391,7 +2391,7 @@ impl EventsService {
             .store
             .pending_firings("rule", &rule.arn)
             .is_ok_and(|rows| !rows.is_empty());
-        if !(rule.enabled() && rule.schedule_expression.is_some()) && !has_pending {
+        if !(has_pending || (rule.enabled() && rule.schedule_expression.is_some())) {
             return;
         }
         let expression = rule

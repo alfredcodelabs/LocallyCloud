@@ -82,10 +82,10 @@ pub(super) fn check(
     {
         return Ok(());
     }
-    if !req
+    if req
         .headers
         .get("x-locallycloud-verified-external-sigv4")
-        .is_some_and(|v| v == "1")
+        .is_none_or(|v| v != "1")
     {
         return Err(denied());
     }

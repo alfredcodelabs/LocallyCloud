@@ -177,10 +177,10 @@ impl Ec2Handler {
             ));
         }
         if subnet_ids.iter().any(|id| {
-            !scope
+            scope
                 .subnets
                 .get(id)
-                .is_some_and(|subnet| subnet.vpc_id == vpc_id)
+                .is_none_or(|subnet| subnet.vpc_id != vpc_id)
         }) {
             return Err(Ec2Error::new(
                 "InvalidSubnetID.NotFound",
@@ -188,10 +188,10 @@ impl Ec2Handler {
             ));
         }
         if group_ids.iter().any(|id| {
-            !scope
+            scope
                 .security_groups
                 .get(id)
-                .is_some_and(|group| group.vpc_id == vpc_id)
+                .is_none_or(|group| group.vpc_id != vpc_id)
         }) {
             return Err(Ec2Error::new(
                 "InvalidGroup.NotFound",

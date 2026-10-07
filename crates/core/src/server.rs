@@ -787,11 +787,11 @@ async fn tls_domain_handler(
         .get(http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     if crate::integration::claims_sigv4_identity(authorization, credential.as_deref())
-        && !crate::router::extract_service_from_credential_scope(
+        && crate::router::extract_service_from_credential_scope(
             authorization,
             credential.as_deref(),
         )
-        .is_some_and(|service| service.as_str() == "execute-api")
+        .is_none_or(|service| service.as_str() != "execute-api")
     {
         return StatusCode::FORBIDDEN.into_response();
     }
