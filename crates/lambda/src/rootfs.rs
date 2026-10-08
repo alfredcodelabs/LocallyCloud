@@ -1184,7 +1184,8 @@ mod tests {
         );
 
         // A source revision gets a new immutable cache entry; old rootfses retain their data.
-        write_file(&source.join("pkg/module.py"), b"version = 2\n");
+        // Change length so metadata differs even within one filesystem timestamp tick.
+        write_file(&source.join("pkg/module.py"), b"version = 22\n");
         install_cached_stdlib(&source, &third, "python3.14", &python, &cache).unwrap();
         let third_file = third.join("pkg/module.py");
         assert_ne!(
@@ -1192,7 +1193,7 @@ mod tests {
             fs::metadata(&third_file).unwrap().ino()
         );
         assert_eq!(fs::read(source_file).unwrap(), b"version = 1\n");
-        assert_eq!(fs::read(third_file).unwrap(), b"version = 2\n");
+        assert_eq!(fs::read(third_file).unwrap(), b"version = 22\n");
         make_cache_removable(&cache);
         fs::remove_dir_all(base).unwrap();
     }

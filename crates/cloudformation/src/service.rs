@@ -2845,6 +2845,17 @@ mod tests {
             fn strict_sigv4_required(&self) -> bool {
                 true
             }
+            fn authorize_resource_policy(
+                &self,
+                request: AuthorizationRequest,
+                document: Option<&str>,
+                owner: &str,
+            ) -> Result<(), AuthorizationError> {
+                if document.is_some() || owner != request.request_identity.account_id {
+                    return Err(AuthorizationError::Denied);
+                }
+                self.authorize(request)
+            }
             fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError> {
                 assert_eq!(request.request_identity.account_id, "000000000000");
                 assert_eq!(
@@ -2934,6 +2945,18 @@ mod tests {
                     .await;
                 assert_eq!(response.status(), 200);
                 wait_stack_terminal(&handler.store, name).await;
+                if operation == "CreateStack" {
+                    let created = handler
+                        .store
+                        .find("000000000000", "us-east-1", name)
+                        .unwrap();
+                    assert_eq!(
+                        created.status,
+                        StackStatus::CreateComplete,
+                        "stack events: {:?}",
+                        created.events
+                    );
+                }
             }
             let stack = handler
                 .store
