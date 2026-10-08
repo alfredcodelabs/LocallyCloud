@@ -2015,6 +2015,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn python314_create_and_update_preserve_configuration_and_reject_unknown_runtime() {
+        let handler = LambdaHandler::new();
+        let mut body: Value = serde_json::from_str(&create_body(
+            "python-runtime",
+            serde_json::json!({"ZipFile": zip_base64()}),
+        ))
+        .unwrap();
+        body["Runtime"] = serde_json::json!("python3.14");
+        let response = handler
+            .handle(request(
+                Method::POST,
+                "/2015-03-31/functions",
+                &body.to_string(),
+            ))
+            .await;
+        assert_eq!(response.status(), 201);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["Runtime"], "python3.14");
+        let configuration = "/2015-03-31/functions/python-runtime/configuration";
+        for update in [
+            serde_json::json!({"Runtime": "python3.13", "MemorySize": 256}),
+            serde_json::json!({"Runtime": "python3.14"}),
+        ] {
+            let response = handler
+                .handle(request(Method::PUT, configuration, &update.to_string()))
+                .await;
+            assert_eq!(response.status(), 200);
+            let updated: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(updated["Runtime"], update["Runtime"]);
+            assert_eq!(updated["MemorySize"], 256);
+            for field in ["CodeSha256", "CodeSize", "Role", "Handler", "FunctionArn"] {
+                assert_eq!(updated[field], created[field], "{field}");
+            }
+        }
+        let rejected = handler
+            .handle(request(
+                Method::PUT,
+                configuration,
+                r#"{"Runtime":"python9.99"}"#,
+            ))
+            .await;
+        assert_eq!(rejected.status(), 400);
+        assert_eq!(
+            rejected.headers()["x-amzn-errortype"],
+            "InvalidParameterValueException"
+        );
+        let response = handler
+            .handle(request(Method::GET, configuration, ""))
+            .await;
+        assert_eq!(response.status(), 200);
+        let unchanged: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unchanged["Runtime"], "python3.14");
+        assert_eq!(unchanged["MemorySize"], 256);
+        assert_eq!(unchanged["CodeSha256"], created["CodeSha256"]);
+        body["FunctionName"] = serde_json::json!("unknown-runtime");
+        body["Runtime"] = serde_json::json!("python9.99");
+        let rejected = handler
+            .handle(request(
+                Method::POST,
+                "/2015-03-31/functions",
+                &body.to_string(),
+            ))
+            .await;
+        assert_eq!(rejected.status(), 400);
+        assert_eq!(
+            rejected.headers()["x-amzn-errortype"],
+            "InvalidParameterValueException"
+        );
+        assert_eq!(
+            handler
+                .handle(request(
+                    Method::GET,
+                    "/2015-03-31/functions/unknown-runtime",
+                    ""
+                ))
+                .await
+                .status(),
+            404
+        );
+    }
+
+    #[tokio::test]
     async fn get_missing_function_returns_404() {
         let handler = LambdaHandler::new();
         let resp = handler

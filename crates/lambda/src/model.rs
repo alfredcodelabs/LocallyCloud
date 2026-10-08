@@ -17,6 +17,7 @@ use crate::error::LambdaError;
 pub const SUPPORTED_RUNTIMES: &[&str] = &[
     "nodejs22.x",
     "nodejs20.x",
+    "python3.14",
     "python3.13",
     "python3.12",
     "provided.al2023",
@@ -1107,6 +1108,7 @@ mod tests {
     #[test]
     fn supported_runtime_set_excludes_go1x() {
         assert!(is_supported_runtime("nodejs22.x"));
+        assert!(is_supported_runtime("python3.14"));
         assert!(is_supported_runtime("provided.al2023"));
         assert!(!is_supported_runtime("go1.x"));
         assert!(!is_supported_runtime("python2.7"));
