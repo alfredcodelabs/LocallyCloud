@@ -779,10 +779,29 @@ impl RdsHandler {
                 )));
             }
         }
-        let class = input.get("DBInstanceClass").unwrap_or("db.t3.micro");
-        if class != "db.t3.micro" {
-            return Err(Error::invalid("Only db.t3.micro is supported"));
-        }
+        let class = match input
+            .get("DBInstanceClass")
+            .filter(|value| !value.is_empty())
+        {
+            None => {
+                return Err(Error::new(
+                    "MissingParameter",
+                    "Missing DBInstanceClass",
+                    400,
+                ))
+            }
+            Some("db.t3.medium") => "db.t3.medium",
+            Some("db.t3.micro") => {
+                return Err(Error::invalid(
+                    "DBInstanceClass=db.t3.micro is not compatible with Engine=aurora-postgresql",
+                ));
+            }
+            Some(_) => {
+                return Err(Error::invalid(
+                    "Local implementation supports only DBInstanceClass=db.t3.medium for Aurora PostgreSQL",
+                ));
+            }
+        };
         validate_scope(&req.account_id, &req.region)?;
         let cluster_key = (
             req.account_id.clone(),
@@ -2505,6 +2524,7 @@ async fn start_and_probe(
     instance: &Instance,
     password: Option<&str>,
 ) -> Result<(), String> {
+    prepare_socket_dir(instance).await?;
     let data = directory.join("data");
     let data_arg = data.to_string_lossy();
     if command(runtime, "pg_ctl", &["-D", &data_arg, "status"])
@@ -3015,6 +3035,98 @@ impl Error {
 }
 
 #[cfg(test)]
+mod aurora_class_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    fn request(class: &str) -> ServiceRequest {
+        ServiceRequest {
+            method: axum::http::Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: Default::default(),
+            body: format!(
+                "Action=CreateDBInstance&DBInstanceIdentifier=class-writer&DBClusterIdentifier=missing-cluster&Engine=aurora-postgresql{class}"
+            ).into(),
+            account_id: "000000000000".into(),
+            region: "us-east-1".into(),
+            request_id: "aurora-class-contract".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_aurora_classes_return_query_errors_without_resources() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-rds-class-{}", uuid::Uuid::new_v4()));
+        let handler = RdsHandler::new(root.clone());
+        for (class, code, message) in [
+            ("", "MissingParameter", "Missing DBInstanceClass"),
+            (
+                "&DBInstanceClass=",
+                "MissingParameter",
+                "Missing DBInstanceClass",
+            ),
+            (
+                "&DBInstanceClass=db.t3.micro",
+                "InvalidParameterCombination",
+                "not compatible with Engine=aurora-postgresql",
+            ),
+            (
+                "&DBInstanceClass=db.r6g.large",
+                "InvalidParameterCombination",
+                "Local implementation supports only",
+            ),
+        ] {
+            let response = handler.handle(request(class)).await;
+            assert_eq!(response.status(), 400);
+            assert!(response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .contains("xml"));
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 16 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains(&format!("<Code>{code}</Code>")), "{body}");
+            assert!(body.contains(message), "{body}");
+            assert!(body.contains("aurora-class-contract"), "{body}");
+            assert!(handler.instances.lock().await.is_empty());
+            assert!(handler.clusters.lock().await.is_empty());
+            assert!(!tokio::fs::try_exists(&root).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn medium_aurora_class_reaches_cluster_lookup_when_runtime_is_available() {
+        if runtime::resolve_from_env().await.is_err() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-rds-medium-{}", uuid::Uuid::new_v4()));
+        let handler = RdsHandler::new(root.clone());
+        let response = handler
+            .handle(request("&DBInstanceClass=db.t3.medium"))
+            .await;
+        assert_eq!(response.status(), 404);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            body.contains("<Code>DBClusterNotFoundFault</Code>"),
+            "{body}"
+        );
+        assert!(handler.instances.lock().await.is_empty());
+        assert!(!tokio::fs::try_exists(&root).await.unwrap());
+    }
+}
+
+#[cfg(test)]
 mod replica_tests {
     use super::*;
     use axum::body::Bytes;
@@ -3050,6 +3162,99 @@ mod replica_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("instance {id} did not become available");
+    }
+
+    #[tokio::test]
+    async fn aurora_restart_recreates_private_socket_and_preserves_rows() {
+        let Ok(runtime) = runtime::resolve_from_env().await else {
+            return;
+        };
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-rds-restart-{}", uuid::Uuid::new_v4()));
+        let handler = RdsHandler::new(root.clone());
+        let req = ServiceRequest {
+            method: Method::POST,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+            region: "us-east-1".to_owned(),
+            account_id: "000000000000".to_owned(),
+            request_id: "restart".to_owned(),
+        };
+        handler
+            .create_cluster(
+                &req,
+                &input(&[
+                    ("DBClusterIdentifier", "restart-cluster"),
+                    ("Engine", "aurora-postgresql"),
+                    ("MasterUsername", "releaseuser"),
+                    ("MasterUserPassword", "ReleaseFixture9!"),
+                    ("EnableHttpEndpoint", "true"),
+                ]),
+            )
+            .await
+            .unwrap();
+        handler
+            .create(
+                &req,
+                &input(&[
+                    ("DBInstanceIdentifier", "restart-writer"),
+                    ("DBClusterIdentifier", "restart-cluster"),
+                    ("Engine", "aurora-postgresql"),
+                    ("DBInstanceClass", "db.t3.medium"),
+                ]),
+            )
+            .await
+            .unwrap();
+        let writer = ready(&handler, "restart-writer").await;
+        sql_command(
+            &runtime,
+            &writer,
+            "postgres",
+            None,
+            "CREATE TABLE restart_probe (value integer); INSERT INTO restart_probe VALUES (42)",
+            &handler.directory(&writer),
+        )
+        .await
+        .unwrap();
+        handler.shutdown().await;
+        assert!(!tokio::fs::try_exists(socket_dir(&writer)).await.unwrap());
+        drop(handler);
+
+        let restored = RdsHandler::new(root.clone());
+        let endpoint = restored
+            .resolve_cluster(
+                &req.account_id,
+                &req.region,
+                "arn:aws:rds:us-east-1:000000000000:cluster:restart-cluster",
+            )
+            .await
+            .unwrap();
+        let restored_writer = restored
+            .instances
+            .lock()
+            .await
+            .get(&(
+                req.account_id.clone(),
+                req.region.clone(),
+                "restart-writer".to_owned(),
+            ))
+            .cloned()
+            .unwrap();
+        let rows = sql_query(
+            &runtime,
+            &restored_writer,
+            "SELECT value FROM restart_probe",
+            &restored.directory(&restored_writer),
+        )
+        .await;
+        restored.shutdown().await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
+        assert_eq!(endpoint.status, "available");
+        assert!(endpoint.http_endpoint_enabled);
+        assert_eq!(endpoint.socket_dir, socket_dir(&writer));
+        assert_eq!(restored_writer.class, "db.t3.medium");
+        assert_eq!(rows.unwrap().trim(), "42");
     }
 
     #[tokio::test]
