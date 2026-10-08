@@ -808,7 +808,7 @@ impl ComputeRuntime for YoukiRuntime {
             // `run` can remove its state after the owning server dies. Preserve
             // the rootfs on any error other than an explicit missing container.
             let stderr = String::from_utf8_lossy(&state.stderr);
-            if !stderr.contains("does not exist") && !stderr.contains("not found") {
+            if !oci_state_missing(&stderr, task_id) {
                 return Ok(false);
             }
             // A successful runtime inventory must also omit this exact ID.
@@ -859,9 +859,7 @@ impl ComputeRuntime for YoukiRuntime {
             // Confirm both exact state absence and inventory absence before accepting it.
             let state = self.oci_command(&["state", task_id]).await?;
             let missing = String::from_utf8_lossy(&state.stderr);
-            if !state.status.success()
-                && (missing.contains("does not exist") || missing.contains("not found"))
-            {
+            if !state.status.success() && oci_state_missing(&missing, task_id) {
                 let listed = self.oci_command(&["list", "--quiet"]).await?;
                 if listed.status.success()
                     && !String::from_utf8_lossy(&listed.stdout)
@@ -953,6 +951,39 @@ async fn stream_output(mut pipe: impl AsyncRead + Unpin, slot: Slot) {
             Ok(count) => slot.lock().await.output.extend_from_slice(&chunk[..count]),
         }
     }
+}
+
+fn oci_state_missing(stderr: &str, task_id: &str) -> bool {
+    if stderr.contains("does not exist") || stderr.contains("not found") {
+        return true;
+    }
+    // crun reports an absent container as ENOENT for its own status file.
+    // Other missing files, permission failures and another container are not absence.
+    let Some(path) = stderr
+        .trim()
+        .strip_prefix("error opening file `")
+        .and_then(|message| {
+            [
+                "': No such file or directory",
+                "`: No such file or directory",
+            ]
+            .iter()
+            .find_map(|suffix| message.strip_suffix(*suffix))
+        })
+    else {
+        return false;
+    };
+    let path = Path::new(path);
+    let Some(container) = path.parent() else {
+        return false;
+    };
+    path.is_absolute()
+        && path.file_name().is_some_and(|name| name == "status")
+        && container.file_name().is_some_and(|name| name == task_id)
+        && container
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "crun")
 }
 
 fn exec_failed(reason: impl Into<String>) -> RuntimeError {
@@ -1069,6 +1100,136 @@ mod tests {
         rt.release_task("retry").await.unwrap();
         assert!(rt.tasks.is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn crun_missing_status_requires_successful_exact_inventory_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "compute-crun-absence-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::private_dir::ensure(&root).unwrap();
+        for (index, inventory, released) in [
+            (0, "exit 0", true),
+            (1, "echo owned-other; exit 0", true),
+            (2, "echo owned; exit 0", false),
+            (3, "exit 1", false),
+        ] {
+            let binary = root.join(format!("runtime-{index}"));
+            let script = format!(
+                r#"#!/bin/sh
+case "$1" in
+state) printf "error opening file \`/run/user/1000/crun/$2/status': No such file or directory\n" >&2; exit 1 ;;
+list) {inventory} ;;
+*) exit 1 ;;
+esac
+"#
+            );
+            tokio::fs::write(&binary, script).await.unwrap();
+            tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let runtime = YoukiRuntime::new(binary);
+            let slot = slot_with(TaskState::Completed);
+            let bundle = root.join(format!("bundle-{index}"));
+            tokio::fs::create_dir(&bundle).await.unwrap();
+            slot.lock().await.bundle = bundle.clone();
+            runtime.tasks.insert("owned".into(), slot);
+            assert_eq!(runtime.release_task("owned").await.is_ok(), released);
+            assert_eq!(bundle.exists(), !released);
+            assert_eq!(runtime.tasks.contains_key("owned"), !released);
+        }
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn missing_state_classifier_rejects_unrelated_enoent_and_permission_errors() {
+        assert!(oci_state_missing("container owned does not exist", "owned"));
+        assert!(oci_state_missing("container owned not found", "owned"));
+        assert!(oci_state_missing(
+            "error opening file `/run/user/1000/crun/owned/status': No such file or directory\n",
+            "owned"
+        ));
+        assert!(oci_state_missing(
+            "error opening file `/run/user/1000/crun/owned/status`: No such file or directory\n",
+            "owned"
+        ));
+        for error in [
+            "No such file or directory",
+            "error opening file `/usr/bin/crun': No such file or directory",
+            "error opening file `/run/user/1000/crun/another/status': No such file or directory",
+            "error opening file `/run/user/1000/crun/owned/config.json': No such file or directory",
+            "error opening file `/run/user/1000/crun/owned/status': Permission denied",
+            "error opening file `/run/user/1000/other/owned/status': No such file or directory",
+            "error opening file `crun/owned/status': No such file or directory",
+        ] {
+            assert!(!oci_state_missing(error, "owned"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn crun_state_disappearing_during_delete_still_requires_inventory_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "compute-crun-delete-race-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir(&root).await.unwrap();
+        tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        for (index, inventory, released) in [
+            (0, "exit 0", true),
+            (1, "echo owned; exit 0", false),
+            (2, "exit 1", false),
+        ] {
+            let binary = root.join(format!("runtime-{index}"));
+            let bundle = root.join(format!("locallycloud-owned-{index}"));
+            tokio::fs::create_dir(&bundle).await.unwrap();
+            let initial_state = serde_json::json!({
+                "id": "owned", "status": "stopped", "bundle": bundle
+            });
+            let script = format!(
+                r#"#!/bin/sh
+case "$1" in
+state)
+    if test -f "$0.deleted"; then
+        printf "error opening file \`/run/user/1000/crun/$2/status': No such file or directory\n" >&2
+        exit 1
+    fi
+    printf '%s\n' '{initial_state}' ;;
+delete) touch "$0.deleted"; echo 'state disappeared during delete' >&2; exit 1 ;;
+list) {inventory} ;;
+*) exit 1 ;;
+esac
+"#
+            );
+            tokio::fs::write(&binary, script).await.unwrap();
+            tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let mut runtime = YoukiRuntime::new(&binary);
+            runtime.bundle_root = root.clone();
+            let slot = slot_with(TaskState::Completed);
+            slot.lock().await.bundle = bundle.clone();
+            runtime.tasks.insert("owned".into(), slot);
+            assert_eq!(runtime.release_task("owned").await.is_ok(), released);
+            assert!(tokio::fs::try_exists(binary.with_extension("deleted"))
+                .await
+                .unwrap());
+            assert_eq!(tokio::fs::try_exists(&bundle).await.unwrap(), !released);
+            assert_eq!(runtime.tasks.contains_key("owned"), !released);
+        }
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]
