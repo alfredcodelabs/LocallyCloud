@@ -13,3 +13,9 @@ cargo about generate --locked --fail \
   --config "$ROOT/packaging/licenses/about.toml" \
   --output-file "$OUTPUT" \
   "$ROOT/packaging/licenses/third-party-licenses.hbs"
+
+# A failed clarification can fall back to scanning only the Rust bindings.
+grep -Fq 'Copyright (c) Meta Platforms, Inc. and affiliates.' "$OUTPUT" || {
+  echo 'Bundled Zstandard BSD notice is missing; review the license clarification.' >&2
+  exit 1
+}

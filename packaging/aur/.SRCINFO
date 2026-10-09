@@ -1,0 +1,27 @@
+pkgbase = locallycloud
+	pkgdesc = Local AWS service emulator for serverless and data workflows
+	pkgver = 0.1.0beta.1
+	pkgrel = 1
+	url = https://locallycloud.zentostudio.com
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	makedepends = cargo
+	makedepends = cargo-about
+	makedepends = clang
+	makedepends = cmake
+	makedepends = git
+	depends = glibc
+	depends = libgcc
+	depends = sqlite>=3.53.4
+	depends = hicolor-icon-theme
+	optdepends = crun: daemonless compute runtime for Lambda, ECS and EC2
+	optdepends = dbus: user D-Bus session required by rootless OCI execution
+	optdepends = postgresql: local RDS runtime
+	optdepends = xdg-utils: open the dashboard from the application menu
+	options = !lto
+	options = !debug
+	source = locallycloud-0.1.0beta.1.tar.gz::https://github.com/alfredcodelabs/LocallyCloud/archive/refs/tags/v0.1.0-beta.1.tar.gz
+	sha256sums = e32625853f73ad1855cfa8ddca3ec17b5c4bda05b8c7a9490348cbaaba7cd909
+
+pkgname = locallycloud

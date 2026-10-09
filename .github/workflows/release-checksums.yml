@@ -1,0 +1,41 @@
+name: Repair release checksums
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag whose asset names must match SHA256SUMS
+        required: true
+        default: v0.1.0-beta.1
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-checksums-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Verify packages and replace only the checksum manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$ ]]
+          mkdir dist
+          cd dist
+          gh release download "$RELEASE_TAG" --pattern '*.deb' --pattern '*.pkg.tar.zst' --pattern SHA256SUMS
+          # The original manifest names Debian files before GitHub normalizes '~'.
+          sed -i 's/~/./g' SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          sha256sum -- *.deb *.pkg.tar.zst | sort -k2 > SHA256SUMS.corrected
+          sort -k2 SHA256SUMS | cmp - SHA256SUMS.corrected
+          mv SHA256SUMS.corrected SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          gh release upload "$RELEASE_TAG" SHA256SUMS --clobber

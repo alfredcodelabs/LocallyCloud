@@ -129,6 +129,7 @@ jobs:
           apt-get install -y curl openssl ./dist/*.deb
           dpkg-query -W -f='${Status}\n' dbus-user-session | grep -q 'install ok installed'
           useradd --create-home tester
+          # shellcheck disable=SC2016
           runuser -u tester -- bash -c '
             export LOCALLYCLOUD_KMS_MASTER_KEY="$(openssl rand -base64 32)"
             locallycloud > /tmp/locallycloud.log 2>&1 &
@@ -184,6 +185,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          # GitHub replaces '~' in asset names; checksums must use the published names.
+          for package in *.deb; do
+            published_name="${package//\~/.}"
+            if [[ "$package" != "$published_name" ]]; then
+              mv -- "$package" "$published_name"
+            fi
+          done
           sha256sum -- *.deb *.pkg.tar.zst > SHA256SUMS
           sha256sum --check SHA256SUMS
           flags=(--verify-tag --generate-notes --title "LocallyCloud $RELEASE_TAG")

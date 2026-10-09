@@ -4,6 +4,13 @@ The product version is chosen manually in `[workspace.package].version` in `Carg
 
 We use three components, `MAJOR.MINOR.PATCH`, with no leading zeros. Prerelease channels use `-alpha.N`, `-beta.N`, or `-rc.N`, with N starting at 1. The `v` prefix is used only for Git tags.
 
+Debian package versions retain `~` in their control metadata. GitHub Release
+asset names replace `~` with `.`, so the release workflow renames `.deb` files
+before calculating `SHA256SUMS`. For example, the public first-beta download is
+`locallycloud_0.1.0.beta.1-1_amd64.deb`, with internal version
+`0.1.0~beta.1-1`. This filename change does not change package contents or version
+ordering. Local build outputs and APT repository pool files retain `~`.
+
 | Release | Cargo | Git tag | Debian, revision 1 | Arch, pkgrel 1 |
 | --- | --- | --- | --- | --- |
 | First beta | `0.1.0-beta.1` | `v0.1.0-beta.1` | `0.1.0~beta.1-1` | `0.1.0beta.1-1` |
@@ -38,7 +45,7 @@ Keep revision 1 before the first publication.
 
 ## AUR
 
-There are two Arch recipes. `packaging/arch/PKGBUILD` builds the local checkout and is what CI uses. `packaging/aur/PKGBUILD` is the AUR recipe: it downloads the release tag's source archive from GitHub, verifies its SHA-256, fetches crates in `prepare()` with `cargo fetch --locked`, builds offline with `--frozen`, runs the core library tests in `check()`, and installs the binary, license notices, man page, launcher, and icons.
+There are two Arch recipes. `packaging/arch/PKGBUILD` builds the local checkout and is what CI uses. `packaging/aur/PKGBUILD` is the AUR recipe: it downloads the release tag's source archive from GitHub, verifies its SHA-256, fetches crates and generates license notices in `prepare()`, builds offline with `--frozen`, runs the core library tests in `check()`, and installs the binary, license notices, man page, launcher, and icons.
 
 After the release tag is published, on an Arch machine:
 
@@ -48,6 +55,28 @@ cd packaging/aur && makepkg --cleanbuild && namcap PKGBUILD ./*.pkg.tar.zst
 ```
 
 `update.sh` sets `pkgver`, `_tag`, `pkgrel=1`, and `sha256sums` from the published archive and regenerates `.SRCINFO`. Copy `PKGBUILD` and `.SRCINFO` into the AUR Git repository (`ssh://aur@aur.archlinux.org/locallycloud.git`) and push them; the AUR account and its SSH key are configured separately from GitHub. For a packaging-only fix of the same release, increment `pkgrel` in both recipes and regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`.
+
+Run the build and package inspection in a disposable Arch VM before submitting
+the recipe. The recipe builds from the published source archive, independently
+of the binary package produced by CI. Only the recipe and `.SRCINFO` belong in
+the AUR repository; build artifacts do not.
+
+The first-beta archive predates the Zstandard C-library notice correction. Its
+AUR `prepare()` applies the same verified two-file BSD clarification used in
+`packaging/licenses/about.toml`; remove that temporary patch when updating to a
+tag containing the correction. When updating `zstd-sys`, refresh both license
+hashes and check that generated notices retain the bindings and bundled-library
+copyrights. The license helper rejects missing bundled Zstandard notices.
+
+## APT repository
+
+GitHub Release `.deb` files can be installed directly with `apt install ./file.deb`.
+For `apt install locallycloud` and updates from a configured source, use
+[the signed repository builder](apt/README.md). It validates the two release
+packages and creates a `beta` suite for amd64 and arm64, with signed metadata and
+a public keyring. Publication still needs an HTTPS host and a maintainer-owned
+signing key. Preparing the files does not register the package with Debian or
+Ubuntu's official repositories.
 
 References: [SemVer](https://semver.org/), [Debian](https://www.debian.org/doc/debian-policy/ch-controlfields.html#version), [Arch](https://man.archlinux.org/man/PKGBUILD.5.en).
 
@@ -70,6 +99,24 @@ git push origin v0.1.0-beta.1
 Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, and `SHA256SUMS`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
 
 No personal token or additional secrets are required: the workflow uses `GITHUB_TOKEN`, with write access only in the publishing job. Actions must be enabled in the repository. The workflow does not publish an APT repository or submit the recipe to AUR; those channels need their own configuration.
+
+### Repair the first beta checksum manifest
+
+The initial `v0.1.0-beta.1` release uploaded `.deb` assets whose names GitHub
+normalized, while `SHA256SUMS` retained the original `~` filenames. Package bytes
+and internal versions are correct. The permanent release fix calculates hashes
+after renaming the files to their public names.
+
+To repair the existing release, merge `.github/workflows/release-checksums.yml`
+into the repository's default branch (`develop`), then run **Repair release
+checksums** in GitHub Actions with tag `v0.1.0-beta.1`. It downloads the published
+packages and manifest, verifies the original hashes using the public filenames,
+and replaces only `SHA256SUMS` using `GITHUB_TOKEN`. It preserves the tag and
+package assets. Do not rerun the package release job or move the published tag.
+
+The manual workflow must be present on the default branch to appear in the
+Actions UI. See [GitHub's manual workflow instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
+and [asset filename normalization](https://docs.github.com/en/rest/releases/assets#upload-a-release-asset).
 
 If a build fails, fix the issue before publishing a new tag; do not move tags that already have a release. Rerunning a workflow with an already published release will fail when attempting to create it, preventing silent replacement of its packages.
 

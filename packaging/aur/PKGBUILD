@@ -10,7 +10,7 @@ arch=('x86_64' 'aarch64')
 url='https://locallycloud.zentostudio.com'
 license=('Apache-2.0')
 depends=('glibc' 'libgcc' 'sqlite>=3.53.4' 'hicolor-icon-theme')
-makedepends=('cargo' 'cargo-about' 'clang' 'cmake')
+makedepends=('cargo' 'cargo-about' 'clang' 'cmake' 'git')
 optdepends=('crun: daemonless compute runtime for Lambda, ECS and EC2'
             'dbus: user D-Bus session required by rootless OCI execution'
             'postgresql: local RDS runtime'
@@ -18,7 +18,7 @@ optdepends=('crun: daemonless compute runtime for Lambda, ECS and EC2'
 # GCC LTO objects from aws-lc-sys do not link with Rust's lld invocation.
 options=('!lto' '!debug')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/alfredcodelabs/LocallyCloud/archive/refs/tags/$_tag.tar.gz")
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums=('e32625853f73ad1855cfa8ddca3ec17b5c4bda05b8c7a9490348cbaaba7cd909')
 
 _srcdir() {
   printf '%s/LocallyCloud-%s' "$srcdir" "${_tag#v}"
@@ -28,13 +28,29 @@ prepare() {
   cd "$(_srcdir)"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+  # The first beta archive predates the bundled Zstandard notice correction.
+  # Remove this patch when the next release archive includes the clarification.
+  cat >> packaging/licenses/about.toml <<'EOF'
+# Preserve both the Rust bindings and the bundled Zstandard C library notices.
+[zstd-sys.clarify]
+license = "BSD-3-Clause"
+
+[[zstd-sys.clarify.files]]
+path = "LICENSE"
+checksum = "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60"
+
+[[zstd-sys.clarify.files]]
+path = "zstd/LICENSE"
+checksum = "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+EOF
+  bash scripts/third-party-licenses.sh target/THIRD_PARTY_LICENSES
+  grep -Fq 'Copyright (c) Meta Platforms, Inc. and affiliates.' target/THIRD_PARTY_LICENSES
 }
 
 build() {
   cd "$(_srcdir)"
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
   cargo build --frozen --release -p locallycloud
-  bash scripts/third-party-licenses.sh target/THIRD_PARTY_LICENSES
 }
 
 check() {

@@ -31,7 +31,7 @@ The executable is `target/release/locallycloud`. Continue with [Quick start](#qu
 The `.deb` supports Debian 13, Ubuntu 24.04 LTS and 26.04 LTS, distributions based on them (such as Linux Mint or Pop!_OS), and WSL 2 distributions based on them. Releases provide one package per architecture: `amd64` for Intel and AMD processors, and `arm64` for ARM processors. The package requires glibc 2.39 or later; older releases such as Ubuntu 22.04 are not supported, and `apt` refuses to install the package there. When a tagged release is available, download the `.deb` for your architecture (`dpkg --print-architecture` shows it). From the download directory:
 
 ```sh
-sudo apt install ./locallycloud_0.1.0~beta.1-1_amd64.deb
+sudo apt install ./locallycloud_0.1.0.beta.1-1_amd64.deb
 ```
 
 Use the filename for the version and architecture you downloaded. The package includes SQLite and installs its required system libraries through `apt`, plus the recommended `dbus-user-session`; Rust and a separate SQLite installation are not needed. The installed command is `locallycloud`.
@@ -46,7 +46,7 @@ sudo pacman -U ./locallycloud-0.1.0beta.1-1-x86_64.pkg.tar.zst
 
 Use the filename for the version you downloaded. The package requires SQLite 3.53.4 or later from the Arch repositories. The installed command is `locallycloud`. On Arch Linux ARM (`aarch64`), build the package from a source checkout with `makepkg` in `packaging/arch`; that platform is supported on a best-effort basis.
 
-GitHub Actions builds both package formats. AUR and an APT repository are planned; a portable package format has not been chosen yet. See the [packaging and release guide](packaging/VERSIONING.md).
+GitHub Actions builds both package formats. The [AUR recipe](packaging/aur/PKGBUILD) and [signed APT repository tooling](packaging/apt/README.md) are prepared, but those distribution channels are not yet published. Download packages from [GitHub Releases](https://github.com/alfredcodelabs/LocallyCloud/releases). See the [packaging and release guide](packaging/VERSIONING.md).
 
 ### User-only installation without sudo
 
@@ -62,7 +62,7 @@ Alternatively, on a supported Debian or Ubuntu host with the required system lib
 
 ```sh
 mkdir -p "$HOME/.local/opt/locallycloud" "$HOME/.local/bin"
-dpkg-deb --extract ./locallycloud_0.1.0~beta.1-1_amd64.deb "$HOME/.local/opt/locallycloud"
+dpkg-deb --extract ./locallycloud_0.1.0.beta.1-1_amd64.deb "$HOME/.local/opt/locallycloud"
 ln -s "$HOME/.local/opt/locallycloud/usr/bin/locallycloud" "$HOME/.local/bin/locallycloud"
 export PATH="$HOME/.local/bin:$PATH"
 ```

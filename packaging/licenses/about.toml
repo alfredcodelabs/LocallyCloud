@@ -20,3 +20,15 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 ignore-dev-dependencies = true
 ignore-build-dependencies = true
 workarounds = ["ring", "rustls"]
+
+# Preserve both the Rust bindings and the bundled Zstandard C library notices.
+[zstd-sys.clarify]
+license = "BSD-3-Clause"
+
+[[zstd-sys.clarify.files]]
+path = "LICENSE"
+checksum = "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60"
+
+[[zstd-sys.clarify.files]]
+path = "zstd/LICENSE"
+checksum = "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
