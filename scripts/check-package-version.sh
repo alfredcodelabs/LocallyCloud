@@ -14,6 +14,11 @@ expect tag v0.1.0-beta.1
 expect arch 0.1.0beta.1
 expect debian 0.1.0~beta.1-1
 expect debian 0.1.0~beta.1-2 2
+fixture 0.1.0-beta.2
+expect product 0.1.0-beta.2
+expect tag v0.1.0-beta.2
+expect arch 0.1.0beta.2
+expect debian 0.1.0~beta.2-1
 fixture 0.1.0
 expect tag v0.1.0
 expect arch 0.1.0
@@ -44,4 +49,26 @@ fi
 startdir="$ROOT/packaging/arch"
 source "$startdir/PKGBUILD"
 [[ "$pkgver" == "$(bash "$ROOT/scripts/package-version.sh" arch)" ]]
-echo 'Version formats, revisions, rejected inputs and Arch alignment: OK'
+# Exercise the AUR preparation without downloading crates or generating real notices.
+(
+  source "$ROOT/packaging/aur/PKGBUILD"
+  cargo() { :; }
+  srcdir="$CHECK_DIR/aur"
+  for _tag in v0.1.0-beta.1 v0.1.0-beta.2; do
+    archive="$(_srcdir)"
+    mkdir -p "$archive/packaging/licenses" "$archive/scripts"
+    if [[ "$_tag" == v0.1.0-beta.1 ]]; then
+      : > "$archive/packaging/licenses/about.toml"
+    else
+      cp "$ROOT/packaging/licenses/about.toml" "$archive/packaging/licenses/about.toml"
+    fi
+    cat > "$archive/scripts/third-party-licenses.sh" <<'EOF'
+mkdir -p "$(dirname "$1")"
+printf '%s\n' 'Copyright (c) Meta Platforms, Inc. and affiliates.' > "$1"
+EOF
+    prepare
+    [[ "$(grep -Fc '[zstd-sys.clarify]' "$archive/packaging/licenses/about.toml")" == 1 ]]
+    [[ "$(grep -Fc '[[zstd-sys.clarify.files]]' "$archive/packaging/licenses/about.toml")" == 2 ]]
+  done
+)
+echo 'Version formats, revisions, rejected inputs, Arch alignment and AUR licenses: OK'

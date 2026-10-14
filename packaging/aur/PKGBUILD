@@ -28,9 +28,9 @@ prepare() {
   cd "$(_srcdir)"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
-  # The first beta archive predates the bundled Zstandard notice correction.
-  # Remove this patch when the next release archive includes the clarification.
-  cat >> packaging/licenses/about.toml <<'EOF'
+  # Only the first beta archive lacks the bundled Zstandard notice correction.
+  if [[ "$_tag" == v0.1.0-beta.1 ]]; then
+    cat >> packaging/licenses/about.toml <<'EOF'
 # Preserve both the Rust bindings and the bundled Zstandard C library notices.
 [zstd-sys.clarify]
 license = "BSD-3-Clause"
@@ -43,6 +43,7 @@ checksum = "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60"
 path = "zstd/LICENSE"
 checksum = "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
 EOF
+  fi
   bash scripts/third-party-licenses.sh target/THIRD_PARTY_LICENSES
   grep -Fq 'Copyright (c) Meta Platforms, Inc. and affiliates.' target/THIRD_PARTY_LICENSES
 }

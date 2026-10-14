@@ -32,6 +32,20 @@ bash scripts/check-package-version.sh
 
 For a new version, edit Cargo.toml and update Cargo.lock with `cargo update --workspace --offline`. Run the checks before creating the tag. GitHub Actions requires the tag to match the output of `package-version.sh tag` and builds all artifacts from that commit. The local scripts do not publish releases or packages.
 
+## 0.1.0-beta.2 candidate
+
+The next prerelease is `v0.1.0-beta.2`, with packaging revision 1. Its main changes since beta.1 are:
+
+- Configurable Lambda concurrency quotas and capacity metrics; host memory exhaustion is reported separately from Lambda throttling.
+- Step Functions execution metrics, bounded EventBridge target retries, and adaptive SQS Lambda event-source polling.
+- CloudWatch `GetMetricData`, batched dashboard charts, and fixes to SQS metrics, EMF delivery, and Lambda metric sampling.
+- Dashboard IAM enforcement, protected profile reads, an optional UI toggle, and reusable styled selects.
+- Trace propagation and clearer Lambda runtime errors.
+- Preserved object-valued `Detail` in optimized Step Functions → EventBridge tasks, verified with a local osls application flow.
+- Package checksum filenames aligned with published assets and verified beta distribution tooling.
+
+Before tagging, commit the reviewed candidate, pass the repository checks, and validate Lambda/OCI on a supported Debian or Ubuntu VM or WSL installation as required by `AGENTS.md`. The packaging workflow then builds and installs both Debian architectures and the Arch package before publishing the prerelease. Updating AUR checksums requires the published beta.2 archive; its recipe remains pinned to beta.1 until that archive exists.
+
 ## Packaging revisions
 
 If you fix only the package for an already published version, increment its revision: `pkgrel` for Arch and `LOCALLYCLOUD_DEBIAN_REVISION` for Debian. These revisions can evolve independently. Reset both to 1 for each new product version.
@@ -50,7 +64,7 @@ There are two Arch recipes. `packaging/arch/PKGBUILD` builds the local checkout 
 After the release tag is published, on an Arch machine:
 
 ```sh
-bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0-beta.1
+bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0-beta.2
 cd packaging/aur && makepkg --cleanbuild && namcap PKGBUILD ./*.pkg.tar.zst
 ```
 
@@ -63,8 +77,8 @@ the AUR repository; build artifacts do not.
 
 The first-beta archive predates the Zstandard C-library notice correction. Its
 AUR `prepare()` applies the same verified two-file BSD clarification used in
-`packaging/licenses/about.toml`; remove that temporary patch when updating to a
-tag containing the correction. When updating `zstd-sys`, refresh both license
+`packaging/licenses/about.toml` only for `v0.1.0-beta.1`. Later tags already
+contain the correction. When updating `zstd-sys`, refresh both license
 hashes and check that generated notices retain the bindings and bundled-library
 copyrights. The license helper rejects missing bundled Zstandard notices.
 
@@ -92,8 +106,8 @@ After saving and pushing the version and Cargo.lock changes:
 
 ```sh
 bash scripts/check-package-version.sh
-git tag -a v0.1.0-beta.1 -m "LocallyCloud 0.1.0-beta.1"
-git push origin v0.1.0-beta.1
+git tag -a v0.1.0-beta.2 -m "LocallyCloud 0.1.0-beta.2"
+git push origin v0.1.0-beta.2
 ```
 
 Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, and `SHA256SUMS`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
