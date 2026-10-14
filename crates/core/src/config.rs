@@ -45,6 +45,9 @@ pub struct LocallyCloudConfig {
     pub default_region: String,
     /// Optional AWS control-plane TLS identity, separate from API Gateway custom domains.
     pub tls: Option<ControlPlaneTls>,
+    /// Serve the embedded dashboard and its `/_locallycloud/explore/*` read path.
+    /// `LOCALLYCLOUD_UI=off` removes every dashboard route. Default: on.
+    pub ui_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +223,11 @@ impl LocallyCloudConfig {
             }
         };
 
+        let ui_enabled = match resolve(get, &["LOCALLYCLOUD_UI"]) {
+            Some((v, src)) => parse_ui(&v, src)?,
+            None => true,
+        };
+
         Ok(LocallyCloudConfig {
             listen_addr,
             legacy_backend_url,
@@ -232,7 +240,19 @@ impl LocallyCloudConfig {
             account_id,
             default_region,
             tls,
+            ui_enabled,
         })
+    }
+}
+
+fn parse_ui(value: &str, src: &'static str) -> Result<bool, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(ConfigError::new(
+            src,
+            format!("expected one of on|off, got `{other}`"),
+        )),
     }
 }
 
@@ -457,6 +477,25 @@ mod tests {
             LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_UPSTREAM_TIMEOUT_SECS", "soon")]))
                 .unwrap_err();
         assert_eq!(err.setting, "LOCALLYCLOUD_UPSTREAM_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn dashboard_ui_toggle_defaults_on_and_rejects_unknown_values() {
+        assert!(LocallyCloudConfig::resolve(&env(&[])).unwrap().ui_enabled);
+        assert!(
+            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_UI", "ON")]))
+                .unwrap()
+                .ui_enabled
+        );
+        assert!(
+            !LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_UI", "off")]))
+                .unwrap()
+                .ui_enabled
+        );
+        let err =
+            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_UI", "disabled")])).unwrap_err();
+        assert_eq!(err.setting, "LOCALLYCLOUD_UI");
+        assert!(err.to_string().contains("on|off"));
     }
 
     #[test]

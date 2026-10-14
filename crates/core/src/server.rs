@@ -52,6 +52,7 @@ struct AppState {
     max_request_body_bytes: usize,
     dashboard: Arc<DashboardContext>,
     control_plane_tls_hostname: Option<String>,
+    ui_enabled: bool,
 }
 
 pub struct LocallyCloudServer {
@@ -129,38 +130,32 @@ impl LocallyCloudServer {
             meter,
             max_request_body_bytes: self.config.max_request_body_bytes,
             control_plane_tls_hostname: self.config.tls.as_ref().map(|tls| tls.hostname.clone()),
-            dashboard: Arc::new(
+            ui_enabled: self.config.ui_enabled,
+            dashboard: Arc::new(if self.config.ui_enabled {
                 DashboardContext::load(
                     addr,
                     self.config.account_id.clone(),
                     self.config.default_region.clone(),
                 )
-                .await,
-            ),
+                .await
+            } else {
+                DashboardContext::disabled(
+                    addr,
+                    self.config.account_id.clone(),
+                    self.config.default_region.clone(),
+                )
+            }),
         };
         let app = Router::new()
             .route("/_locallycloud/health", get(health_handler))
             .route("/_localstack/health", get(health_handler))
-            .route("/_locallycloud/status", get(status_handler))
-            .route("/_locallycloud/activity", post(activity_handler))
-            .route("/_locallycloud/context", get(context_handler))
-            .route(
-                "/_locallycloud/explore/regions",
-                post(explorer_regions_handler),
-            )
-            .route(
-                "/_locallycloud/explore/read",
-                axum::routing::post(explorer_read_handler),
-            )
-            .route("/_locallycloud/ui", get(ui_handler))
-            .route("/_locallycloud/ui/", get(ui_handler))
-            .route("/_locallycloud/ui/{*page}", get(ui_handler))
-            .route("/_locallycloud/explore/s3", get(s3_explorer_handler))
-            .route("/_locallycloud/dashboard.js", get(ui_script_handler))
-            .route("/_locallycloud/dashboard.css", get(ui_style_handler))
-            .route("/_locallycloud/brand/{asset}", get(ui_brand_handler))
-            .route("/_locallycloud/dashboard-i18n.js", get(ui_i18n_handler))
-            .route("/_locallycloud/icons.svg", get(ui_icons_handler))
+            .route("/_locallycloud/status", get(status_handler));
+        let app = if self.config.ui_enabled {
+            dashboard_routes(app)
+        } else {
+            disabled_dashboard_routes(app)
+        };
+        let app = app
             .fallback(any(dispatch_handler))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -201,6 +196,51 @@ impl LocallyCloudServer {
         tracing::info!("shutdown complete");
         Ok(())
     }
+}
+
+fn dashboard_routes(app: Router<AppState>) -> Router<AppState> {
+    app.route("/_locallycloud/activity", post(activity_handler))
+        .route("/_locallycloud/context", get(context_handler))
+        .route(
+            "/_locallycloud/explore/regions",
+            post(explorer_regions_handler),
+        )
+        .route(
+            "/_locallycloud/explore/read",
+            axum::routing::post(explorer_read_handler),
+        )
+        .route("/_locallycloud/ui", get(ui_handler))
+        .route("/_locallycloud/ui/", get(ui_handler))
+        .route("/_locallycloud/ui/{*page}", get(ui_handler))
+        .route("/_locallycloud/explore/s3", get(s3_explorer_handler))
+        .route("/_locallycloud/dashboard.js", get(ui_script_handler))
+        .route("/_locallycloud/dashboard.css", get(ui_style_handler))
+        .route("/_locallycloud/brand/{asset}", get(ui_brand_handler))
+        .route("/_locallycloud/dashboard-i18n.js", get(ui_i18n_handler))
+        .route("/_locallycloud/icons.svg", get(ui_icons_handler))
+}
+
+// With the UI off, every dashboard path is absent (404) rather than reaching the AWS
+// dispatcher, so no dashboard-only read or signing path exists.
+fn disabled_dashboard_routes(app: Router<AppState>) -> Router<AppState> {
+    [
+        "/_locallycloud/activity",
+        "/_locallycloud/context",
+        "/_locallycloud/explore",
+        "/_locallycloud/explore/{*rest}",
+        "/_locallycloud/ui",
+        "/_locallycloud/ui/",
+        "/_locallycloud/ui/{*page}",
+        "/_locallycloud/dashboard.js",
+        "/_locallycloud/dashboard.css",
+        "/_locallycloud/brand/{*asset}",
+        "/_locallycloud/dashboard-i18n.js",
+        "/_locallycloud/icons.svg",
+    ]
+    .into_iter()
+    .fold(app, |app, path| {
+        app.route(path, any(|| async { StatusCode::NOT_FOUND }))
+    })
 }
 
 async fn health_handler(State(state): State<AppState>) -> Response {
@@ -850,6 +890,9 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
         .get::<ConnectInfo<crate::tls::ConnectionInfo>>()
         .is_some_and(|info| info.0.server_name.is_some());
     if !tls && dashboard_ui_request(req.method(), req.uri(), req.headers()) {
+        if !state.ui_enabled {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         return ui_handler().await;
     }
     let (mut parts, body) = req.into_parts();

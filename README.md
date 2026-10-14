@@ -248,6 +248,7 @@ See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com
 | `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | Memory budget for Lambda environments | `1024` |
 | `LOCALLYCLOUD_PG_BIN_DIR` | PostgreSQL binaries for RDS | Found on `PATH`, then the newest under `/usr/lib/postgresql` |
 | `LOCALLYCLOUD_COGNITO_MAILBOX_DIR` | Directory that receives Cognito confirmation codes | Disabled |
+| `LOCALLYCLOUD_UI` | Dashboard: `on` or `off`. `off` returns 404 for the dashboard and its read endpoints, which sign reads with your local AWS profiles; health and status stay available | `on` |
 
 Requests reach one endpoint and are routed to the corresponding native service handler. Requests for services without a native handler may be forwarded to the configured external fallback backend. Check `/_locallycloud/status` to distinguish native services from proxied services.
 

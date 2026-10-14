@@ -22,6 +22,16 @@ pub(crate) struct DashboardContext {
 // Only static profiles explicitly targeting this local instance are eligible. Never
 // execute credential_process, resolve SSO, or load cloud profiles into this dashboard.
 impl DashboardContext {
+    /// Context for `LOCALLYCLOUD_UI=off`: no profile or credential file is ever read.
+    pub fn disabled(addr: SocketAddr, account_id: String, default_region: String) -> Self {
+        Self {
+            profiles: Vec::new(),
+            account_id,
+            default_region,
+            listen_addr: addr,
+        }
+    }
+
     pub async fn load(addr: SocketAddr, account_id: String, default_region: String) -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)

@@ -1,4 +1,4 @@
-//! Dashboard reads under strict IAM.
+//! Dashboard reads under strict IAM and the `LOCALLYCLOUD_UI` switch.
 //!
 //! These tests run the real Axum front door on an ephemeral loopback port. Strict IAM is
 //! modeled by an evaluator that requires SigV4 at ingress and verifies signatures with
@@ -394,4 +394,79 @@ async fn strict_iam_dashboard_reads_are_signed_audited_and_bounded() {
     // Only the two accepted reads reached the handler.
     assert_eq!(recorder.calls.lock().unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn ui_off_removes_every_dashboard_route_but_keeps_health_and_status() {
+    aws_home();
+    let port = free_port();
+    let base = start(
+        port,
+        &[("LOCALLYCLOUD_UI", "off")],
+        ServiceRegistry::with_known_services(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for (method, path) in [
+        (Method::GET, "/_locallycloud/ui"),
+        (Method::GET, "/_locallycloud/ui/"),
+        (Method::GET, "/_locallycloud/ui/svc/lambda"),
+        (Method::GET, "/_locallycloud/dashboard.js"),
+        (Method::GET, "/_locallycloud/dashboard.css"),
+        (Method::GET, "/_locallycloud/dashboard-i18n.js"),
+        (Method::GET, "/_locallycloud/icons.svg"),
+        (Method::GET, "/_locallycloud/brand/icon.svg"),
+        (Method::GET, "/_locallycloud/context"),
+        (Method::POST, "/_locallycloud/activity"),
+        (Method::POST, "/_locallycloud/explore/read"),
+        (Method::POST, "/_locallycloud/explore/regions"),
+        (Method::GET, "/_locallycloud/explore/s3"),
+        (Method::GET, "/_locallycloud/explore/anything"),
+    ] {
+        let response = client
+            .request(method.clone(), format!("{base}{path}"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{method} {path}");
+    }
+    // The regional HTML fallback is also gone.
+    for path in ["/us-east-1/dynamo/Orders", "/home"] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .header("accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+    }
+    for path in [
+        "/_locallycloud/health",
+        "/_localstack/health",
+        "/_locallycloud/status",
+    ] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn ui_on_by_default_serves_the_dashboard() {
+    aws_home();
+    let port = free_port();
+    let base = start(port, &[], ServiceRegistry::with_known_services()).await;
+    let client = reqwest::Client::new();
+    for path in ["/_locallycloud/ui", "/_locallycloud/dashboard.js"] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+    }
+    let response = client
+        .get(format!("{base}/home"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
 }
