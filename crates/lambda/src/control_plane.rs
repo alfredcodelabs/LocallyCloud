@@ -775,15 +775,31 @@ pub fn list_tags(store: &FunctionStore, region: &str, account: &str, arn: &str) 
 /// `PutFunctionConcurrency` — set the reserved concurrent executions (HTTP 200).
 pub fn put_function_concurrency(
     store: &FunctionStore,
+    concurrency: &crate::concurrency::ConcurrencyLimiter,
     region: &str,
     account: &str,
     name: &str,
     input: &Value,
 ) -> OpResult {
     let name = resolve_function_name(name, region)?;
-    let value = u32_field(input, "ReservedConcurrentExecutions").ok_or_else(|| {
-        LambdaError::InvalidParameterValue("ReservedConcurrentExecutions is required".into())
-    })?;
+    let value = input
+        .get("ReservedConcurrentExecutions")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= i32::MAX as u32)
+        .ok_or_else(|| {
+            LambdaError::InvalidParameterValue(
+                "ReservedConcurrentExecutions must be a nonnegative integer from 0 to 2147483647"
+                    .into(),
+            )
+        })?;
+    if store
+        .get_reserved_concurrency(account, region, &name)
+        .is_none()
+    {
+        return Err(not_found(&name));
+    }
+    concurrency.validate_reserved(&function_arn(region, account, &name), value)?;
     if store.set_reserved_concurrency(account, region, &name, value) {
         Ok((
             200,
@@ -1881,8 +1897,15 @@ mod tests {
         assert_eq!(body.unwrap(), serde_json::json!({}));
 
         let put = serde_json::json!({ "ReservedConcurrentExecutions": 5 });
-        let (status, body) =
-            put_function_concurrency(&store, "us-east-1", "000000000000", "fn", &put).unwrap();
+        let (status, body) = put_function_concurrency(
+            &store,
+            &crate::concurrency::ConcurrencyLimiter::new(1000),
+            "us-east-1",
+            "000000000000",
+            "fn",
+            &put,
+        )
+        .unwrap();
         assert_eq!(status, 200);
         assert_eq!(body.unwrap()["ReservedConcurrentExecutions"], 5);
 
@@ -1902,8 +1925,15 @@ mod tests {
     fn concurrency_missing_function_is_not_found() {
         let store = FunctionStore::new();
         let put = serde_json::json!({ "ReservedConcurrentExecutions": 1 });
-        let err = put_function_concurrency(&store, "us-east-1", "000000000000", "nope", &put)
-            .unwrap_err();
+        let err = put_function_concurrency(
+            &store,
+            &crate::concurrency::ConcurrencyLimiter::new(1000),
+            "us-east-1",
+            "000000000000",
+            "nope",
+            &put,
+        )
+        .unwrap_err();
         assert!(matches!(err, LambdaError::ResourceNotFound(_)));
         let err =
             get_function_concurrency(&store, "us-east-1", "000000000000", "nope").unwrap_err();

@@ -48,6 +48,66 @@ pub struct LocallyCloudConfig {
     /// Serve the embedded dashboard and its `/_locallycloud/explore/*` read path.
     /// `LOCALLYCLOUD_UI=off` removes every dashboard route. Default: on.
     pub ui_enabled: bool,
+    pub lambda_concurrency: LambdaConcurrencyConfig,
+}
+
+const LAMBDA_ACCOUNT_CONCURRENCY: &str = "LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY";
+
+const LAMBDA_MIN_UNRESERVED: &str = "LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY";
+
+/// Validated simulation limits. Every account/region receives its own independent pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LambdaConcurrencyConfig {
+    account_limit: u32,
+    min_unreserved: u32,
+}
+
+impl Default for LambdaConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            account_limit: 1000,
+            min_unreserved: 100,
+        }
+    }
+}
+
+impl LambdaConcurrencyConfig {
+    pub fn new(account_limit: u32, min_unreserved: u32) -> Result<Self, ConfigError> {
+        if account_limit == 0 || account_limit > i32::MAX as u32 {
+            return Err(ConfigError::new(
+                LAMBDA_ACCOUNT_CONCURRENCY,
+                "expected an integer from 1 to 2147483647",
+            ));
+        }
+        if min_unreserved > account_limit {
+            return Err(ConfigError::new(LAMBDA_MIN_UNRESERVED, "must be between 0 and LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY; set it explicitly when using a quota below 100"));
+        }
+        Ok(Self {
+            account_limit,
+            min_unreserved,
+        })
+    }
+
+    pub fn account_limit(self) -> u32 {
+        self.account_limit
+    }
+    pub fn min_unreserved(self) -> u32 {
+        self.min_unreserved
+    }
+
+    fn resolve(get: &dyn Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        let number = |setting, default| match get(setting) {
+            Some(value) => value
+                .parse::<u32>()
+                .map_err(|_| ConfigError::new(setting, "expected a nonnegative decimal integer")),
+            None => Ok(default),
+        };
+        Self::new(
+            number(LAMBDA_ACCOUNT_CONCURRENCY, defaults.account_limit)?,
+            number(LAMBDA_MIN_UNRESERVED, defaults.min_unreserved)?,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +150,17 @@ const DEFAULT_REGION: &str = "us-east-1";
 impl LocallyCloudConfig {
     /// Resolve configuration from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
+        for setting in [LAMBDA_ACCOUNT_CONCURRENCY, LAMBDA_MIN_UNRESERVED] {
+            if matches!(
+                std::env::var(setting),
+                Err(std::env::VarError::NotUnicode(_))
+            ) {
+                return Err(ConfigError::new(
+                    setting,
+                    "expected a UTF-8 decimal integer",
+                ));
+            }
+        }
         Self::resolve(&|name| std::env::var(name).ok())
     }
 
@@ -241,6 +312,7 @@ impl LocallyCloudConfig {
             default_region,
             tls,
             ui_enabled,
+            lambda_concurrency: LambdaConcurrencyConfig::resolve(get)?,
         })
     }
 }
@@ -326,6 +398,55 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn lambda_concurrency_defaults_and_scaled_limits_are_validated() {
+        assert_eq!(
+            LocallyCloudConfig::resolve(&env(&[]))
+                .unwrap()
+                .lambda_concurrency,
+            LambdaConcurrencyConfig::new(1000, 100).unwrap()
+        );
+        assert_eq!(
+            LocallyCloudConfig::resolve(&env(&[(LAMBDA_ACCOUNT_CONCURRENCY, "3000")]))
+                .unwrap()
+                .lambda_concurrency,
+            LambdaConcurrencyConfig::new(3000, 100).unwrap()
+        );
+        assert_eq!(
+            LocallyCloudConfig::resolve(&env(&[
+                (LAMBDA_ACCOUNT_CONCURRENCY, "10"),
+                (LAMBDA_MIN_UNRESERVED, "2")
+            ]))
+            .unwrap()
+            .lambda_concurrency,
+            LambdaConcurrencyConfig::new(10, 2).unwrap()
+        );
+        assert_eq!(
+            LocallyCloudConfig::resolve(&env(&[(LAMBDA_MIN_UNRESERVED, "0")]))
+                .unwrap()
+                .lambda_concurrency
+                .min_unreserved(),
+            0
+        );
+        for value in ["", "0", "-1", "1.5", "bogus", "2147483648", "4294967296"] {
+            let error = LocallyCloudConfig::resolve(&env(&[(LAMBDA_ACCOUNT_CONCURRENCY, value)]))
+                .unwrap_err();
+            assert_eq!(error.setting, LAMBDA_ACCOUNT_CONCURRENCY, "{value}");
+        }
+        for pairs in [
+            vec![(LAMBDA_ACCOUNT_CONCURRENCY, "10")],
+            vec![(LAMBDA_MIN_UNRESERVED, "1001")],
+            vec![(LAMBDA_MIN_UNRESERVED, "-1")],
+        ] {
+            assert_eq!(
+                LocallyCloudConfig::resolve(&env(&pairs))
+                    .unwrap_err()
+                    .setting,
+                LAMBDA_MIN_UNRESERVED
+            );
+        }
     }
 
     #[test]

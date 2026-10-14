@@ -39,12 +39,16 @@ pub(crate) const MAX_PENDING_BUCKETS: usize = 10_000;
 
 /// (account, region, function name, minute start in ms).
 type BucketKey = (String, String, String, i64);
+type GaugeKey = (String, String, String);
 
 #[derive(Default)]
 struct Counters {
     invocations: u64,
     errors: u64,
     throttles: u64,
+    host_capacity_exceeded: u64,
+    concurrent: Option<u32>,
+    unreserved_concurrent: Option<u32>,
     /// AWS reports `Errors` (Sum 0) for every minute with invocations, not only failed ones.
     report_errors: bool,
     durations: Vec<f64>,
@@ -66,6 +70,14 @@ impl Counters {
             }
             Part::Throttles(count) => self.throttles += count,
             Part::Duration(duration_ms) => self.push_duration(duration_ms),
+            Part::HostCapacityExceeded(count) => self.host_capacity_exceeded += count,
+            Part::Concurrent(count) => {
+                self.concurrent = Some(self.concurrent.unwrap_or(0).max(count));
+            }
+            Part::UnreservedConcurrent(count) => {
+                self.unreserved_concurrent =
+                    Some(self.unreserved_concurrent.unwrap_or(0).max(count));
+            }
         }
     }
 
@@ -77,6 +89,12 @@ impl Counters {
             .into_iter()
             .chain(errors)
             .chain(throttles)
+            .chain(
+                (self.host_capacity_exceeded > 0)
+                    .then_some(Part::HostCapacityExceeded(self.host_capacity_exceeded)),
+            )
+            .chain(self.concurrent.map(Part::Concurrent))
+            .chain(self.unreserved_concurrent.map(Part::UnreservedConcurrent))
             .chain(self.durations.into_iter().map(Part::Duration))
     }
 }
@@ -88,6 +106,9 @@ enum Part {
     Errors(u64),
     Throttles(u64),
     Duration(f64),
+    HostCapacityExceeded(u64),
+    Concurrent(u32),
+    UnreservedConcurrent(u32),
 }
 
 impl Part {
@@ -97,6 +118,17 @@ impl Part {
             Part::Errors(count) => ("Errors", count as f64, MetricUnit::Count),
             Part::Throttles(count) => ("Throttles", count as f64, MetricUnit::Count),
             Part::Duration(duration_ms) => ("Duration", duration_ms, MetricUnit::Milliseconds),
+            Part::HostCapacityExceeded(count) => {
+                ("HostCapacityExceeded", count as f64, MetricUnit::Count)
+            }
+            Part::Concurrent(count) => {
+                ("ConcurrentExecutions", f64::from(count), MetricUnit::Count)
+            }
+            Part::UnreservedConcurrent(count) => (
+                "UnreservedConcurrentExecutions",
+                f64::from(count),
+                MetricUnit::Count,
+            ),
         }
     }
 }
@@ -135,6 +167,7 @@ pub(crate) struct MetricsRecorder {
     registry: Weak<ServiceRegistry>,
     period: Duration,
     pending: Mutex<BTreeMap<BucketKey, Counters>>,
+    current: Mutex<BTreeMap<GaugeKey, (u32, Option<u32>)>>,
     sampler: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -164,6 +197,53 @@ impl MetricsRecorder {
     pub(crate) fn record_throttle(self: &Arc<Self>, account: &str, region: &str, function: &str) {
         self.record(account, region, function, |counters| {
             counters.throttles += 1
+        });
+    }
+
+    pub(crate) fn record_host_capacity(
+        self: &Arc<Self>,
+        account: &str,
+        region: &str,
+        function: &str,
+    ) {
+        self.record(account, region, function, |counters| {
+            counters.host_capacity_exceeded += 1
+        });
+    }
+
+    /// Record transitions, rather than polling: even a sub-second peak is retained.
+    pub(crate) fn record_concurrency(
+        self: &Arc<Self>,
+        account: &str,
+        region: &str,
+        function: &str,
+        current: u32,
+        total: u32,
+        unreserved: u32,
+    ) {
+        if resolve_sink(&self.registry).is_none() {
+            return;
+        }
+        // Retain only live gauges, so the existing flush task can also sample long invocations.
+        if let Ok(mut gauges) = self.current.lock() {
+            for (name, level, unreserved) in
+                [(function, current, None), ("", total, Some(unreserved))]
+            {
+                let key = (account.to_owned(), region.to_owned(), name.to_owned());
+                if level == 0 {
+                    gauges.remove(&key);
+                } else {
+                    gauges.insert(key, (level, unreserved));
+                }
+            }
+        }
+        self.record(account, region, function, |counters| {
+            counters.apply(Part::Concurrent(current))
+        });
+        // An empty function name is the account/region series, with no dimensions.
+        self.record(account, region, "", |counters| {
+            counters.apply(Part::Concurrent(total));
+            counters.apply(Part::UnreservedConcurrent(unreserved));
         });
     }
 
@@ -214,8 +294,28 @@ impl MetricsRecorder {
     /// Flush pending buckets once; returns the number of accepted observations. Batches the
     /// sink cannot take now are merged back for the next tick.
     pub(crate) fn tick(&self) -> usize {
+        let current = self
+            .current
+            .lock()
+            .map(|gauges| gauges.clone())
+            .unwrap_or_default();
         let drained = match self.pending.lock() {
-            Ok(mut pending) => std::mem::take(&mut *pending),
+            Ok(mut pending) => {
+                let minute = now_ms() / MINUTE_MS * MINUTE_MS;
+                for ((account, region, function), (level, unreserved)) in current {
+                    merge(
+                        &mut pending,
+                        (account, region, function, minute),
+                        |counters| {
+                            counters.apply(Part::Concurrent(level));
+                            if let Some(unreserved) = unreserved {
+                                counters.apply(Part::UnreservedConcurrent(unreserved));
+                            }
+                        },
+                    );
+                }
+                std::mem::take(&mut *pending)
+            }
             Err(_) => return 0,
         };
         if drained.is_empty() {
@@ -282,7 +382,12 @@ impl MetricsRecorder {
             .pending
             .lock()
             .map(|pending| pending.is_empty())
-            .unwrap_or(true);
+            .unwrap_or(true)
+            && self
+                .current
+                .lock()
+                .map(|gauges| gauges.is_empty())
+                .unwrap_or(true);
         if idle {
             *sampler = None;
         }
@@ -318,9 +423,17 @@ fn observation(key: &BucketKey, part: Part, correlation_id: &str) -> MetricObser
     MetricObservation {
         account_id: account.clone(),
         region: region.clone(),
-        namespace: NAMESPACE.to_owned(),
+        namespace: match part {
+            Part::HostCapacityExceeded(_) => "LocallyCloud/Lambda",
+            _ => NAMESPACE,
+        }
+        .to_owned(),
         metric_name: metric_name.to_owned(),
-        dimensions: BTreeMap::from([("FunctionName".to_owned(), function_name.clone())]),
+        dimensions: if function_name.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("FunctionName".to_owned(), function_name.clone())])
+        },
         timestamp_ms: *minute,
         value,
         unit: Some(unit),
@@ -361,6 +474,7 @@ impl LambdaMetrics {
                 registry,
                 period,
                 pending: Mutex::new(BTreeMap::new()),
+                current: Mutex::new(BTreeMap::new()),
                 sampler: Mutex::new(None),
             }),
         }
@@ -392,6 +506,54 @@ mod tests {
 
     use async_trait::async_trait;
     use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
+
+    #[tokio::test]
+    async fn concurrency_peaks_survive_release_and_saturated_delivery() {
+        let sink = TestSink::new(1, EmitOutcome::Full);
+        let registry = registry_with(sink.clone());
+        let metrics = LambdaMetrics::new(Arc::downgrade(&registry));
+        let limiter = crate::concurrency::ConcurrencyLimiter::with_metrics(
+            locallycloud_core::config::LambdaConcurrencyConfig::new(3, 0).unwrap(),
+            Some(metrics.recorder().clone()),
+        );
+        let reserved = "arn:aws:lambda:us-east-1:000000000000:function:reserved";
+        let shared = "arn:aws:lambda:us-east-1:000000000000:function:shared";
+        limiter.set_reserved(reserved, 2);
+        let a = limiter.acquire(&format!("{reserved}:1")).unwrap();
+        let b = limiter.acquire(reserved).unwrap();
+        let c = limiter.acquire(shared).unwrap();
+        assert!(limiter.acquire(reserved).is_none());
+        assert!(limiter.acquire(shared).is_none());
+        drop((a, b, c));
+        assert_eq!(metrics.recorder().tick(), 0);
+        assert!(metrics.recorder().tick() > 0);
+        let observations = sink.observations();
+        let gauge = |function: Option<&str>, name: &str| {
+            observations
+                .iter()
+                .filter(|point| {
+                    point.metric_name == name
+                        && point.dimensions.get("FunctionName").map(String::as_str) == function
+                })
+                .map(|point| point.value)
+                .fold(0.0, f64::max)
+        };
+        assert_eq!(gauge(Some("reserved"), "ConcurrentExecutions"), 2.0);
+        assert_eq!(gauge(Some("shared"), "ConcurrentExecutions"), 1.0);
+        assert_eq!(gauge(None, "ConcurrentExecutions"), 3.0);
+        assert_eq!(gauge(None, "UnreservedConcurrentExecutions"), 1.0);
+        assert!(observations
+            .iter()
+            .all(|point| point.timestamp_ms % MINUTE_MS == 0));
+        let active = limiter.acquire(reserved).unwrap();
+        assert!(metrics.recorder().tick() > 0);
+        assert!(!metrics.recorder().should_stop());
+        // A steady execution is still sampled after its transition bucket was flushed.
+        assert!(metrics.recorder().tick() > 0);
+        drop(active);
+        assert!(metrics.recorder().tick() > 0);
+        assert!(metrics.recorder().should_stop());
+    }
 
     struct StubHandler;
 

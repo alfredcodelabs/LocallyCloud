@@ -30,7 +30,7 @@ use locallycloud_core::integration::pattern::IntegrationPatternId;
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use locallycloud_ec2::Ec2Handler;
 
-use crate::concurrency::{ConcurrencyLimiter, DEFAULT_REGION_LIMIT};
+use crate::concurrency::ConcurrencyLimiter;
 use crate::control_plane::{
     add_permission, create_alias, create_function, create_function_url_config, delete_alias,
     delete_function, delete_function_concurrency, delete_function_event_invoke_config,
@@ -54,6 +54,7 @@ use crate::esm::{
 use crate::executor::{DestinationRouter, Executor};
 use crate::model::{function_arn, resolve_function_name, FunctionStore, LayerStore, VpcConfig};
 use crate::runtime_api::{FunctionErrorType, Outcome};
+use locallycloud_core::config::LambdaConcurrencyConfig;
 
 /// The natively-implemented Lambda service.
 pub struct LambdaHandler {
@@ -67,6 +68,7 @@ pub struct LambdaHandler {
     /// Present when the data plane is wired; absent handlers reject invoke with 501.
     executor: Option<Arc<Executor>>,
     concurrency: Arc<ConcurrencyLimiter>,
+    concurrency_config: LambdaConcurrencyConfig,
     esm_workers: Mutex<HashMap<String, EsmWorker>>,
     persistence: Mutex<Option<Arc<crate::persistence::LambdaPersistence>>>,
     metadata_gate: Arc<tokio::sync::Mutex<()>>,
@@ -89,6 +91,18 @@ impl LambdaHandler {
     }
 
     fn with_parts(registry: Weak<ServiceRegistry>, executor: Option<Arc<Executor>>) -> Self {
+        Self::with_config_parts(registry, executor, LambdaConcurrencyConfig::default())
+    }
+
+    pub fn with_concurrency_config(config: LambdaConcurrencyConfig) -> Self {
+        Self::with_config_parts(Weak::new(), None, config)
+    }
+
+    fn with_config_parts(
+        registry: Weak<ServiceRegistry>,
+        executor: Option<Arc<Executor>>,
+        config: LambdaConcurrencyConfig,
+    ) -> Self {
         let layers = executor
             .as_ref()
             .map(|executor| executor.layer_store())
@@ -97,6 +111,15 @@ impl LambdaHandler {
         if let Some(executor) = &executor {
             executor.attach_function_store(&store);
         }
+        let concurrency = ConcurrencyLimiter::with_metrics(
+            config,
+            executor
+                .as_ref()
+                .map(|executor| executor.metrics_recorder()),
+        );
+        if let Some(executor) = &executor {
+            executor.attach_concurrency(concurrency.clone());
+        }
         LambdaHandler {
             store,
             layers,
@@ -104,7 +127,8 @@ impl LambdaHandler {
             registry,
             ec2: Mutex::new(None),
             executor,
-            concurrency: ConcurrencyLimiter::new(DEFAULT_REGION_LIMIT),
+            concurrency,
+            concurrency_config: config,
             esm_workers: Mutex::new(HashMap::new()),
             persistence: Mutex::new(None),
             metadata_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -123,14 +147,12 @@ impl LambdaHandler {
     ) -> Result<(), LambdaError> {
         persistence.restore(&self.store, &self.layers)?;
         self.esm.attach_state(state)?;
-        for (account, region, name) in self.store.function_scopes() {
-            if let Some(Some(value)) = self
-                .store
-                .get_reserved_concurrency(&account, &region, &name)
-            {
-                self.concurrency
-                    .set_reserved(&function_arn(&region, &account, &name), value);
-            }
+        for (account, region, name, value) in self.store.reserved_concurrency_scopes() {
+            let arn = function_arn(&region, &account, &name);
+            self.concurrency.validate_reserved(&arn, value).map_err(|error| {
+                LambdaError::InvalidParameterValue(format!("Restored Lambda reservations for account {account} in {region} exceed the configured quota: {error} Increase LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY or reduce LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY before restarting; persisted resources are unchanged."))
+            })?;
+            self.concurrency.set_reserved(&arn, value);
         }
         *self.persistence.lock().unwrap() = Some(persistence);
         Ok(())
@@ -402,6 +424,19 @@ impl LambdaHandler {
         let (region, account) = (req.region.as_str(), req.account_id.as_str());
 
         match segments.as_slice() {
+            ["2016-08-19", "account-settings"] if req.method == Method::GET => {
+                let (count, code_size) = self.store.account_usage(account, region);
+                Ok((
+                    200,
+                    Some(json!({
+                        "AccountLimit": {
+                            "ConcurrentExecutions": self.concurrency_config.account_limit(),
+                            "UnreservedConcurrentExecutions": self.concurrency.unreserved_concurrency(account, region)?,
+                        },
+                        "AccountUsage": { "FunctionCount": count, "TotalCodeSize": code_size.saturating_add(self.layers.code_size(account, region)) },
+                    })),
+                ))
+            }
             ["2015-03-31", "functions"] => match req.method {
                 Method::POST => {
                     let input = parse_json(&req.body)?;
@@ -511,27 +546,16 @@ impl LambdaHandler {
             ["2017-10-31", "functions", name, "concurrency"] => match req.method {
                 Method::PUT => {
                     let input = parse_json(&req.body)?;
-                    let result =
-                        put_function_concurrency(&self.store, region, account, name, &input)?;
-                    if let (Ok(rn), Some(v)) = (
-                        resolve_function_name(name, region),
-                        input
-                            .get("ReservedConcurrentExecutions")
-                            .and_then(Value::as_u64),
-                    ) {
-                        self.concurrency
-                            .set_reserved(&function_arn(region, account, &rn), v as u32);
-                    }
-                    Ok(result)
+                    put_function_concurrency(
+                        &self.store,
+                        &self.concurrency,
+                        region,
+                        account,
+                        name,
+                        &input,
+                    )
                 }
-                Method::DELETE => {
-                    let result = delete_function_concurrency(&self.store, region, account, name)?;
-                    if let Ok(rn) = resolve_function_name(name, region) {
-                        self.concurrency
-                            .clear_reserved(&function_arn(region, account, &rn));
-                    }
-                    Ok(result)
-                }
+                Method::DELETE => delete_function_concurrency(&self.store, region, account, name),
                 _ => Err(unsupported()),
             },
             ["2021-10-31", "functions", name, "url"] => match req.method {
@@ -1231,17 +1255,6 @@ impl LambdaHandler {
                     )
                     .into_response(&req.request_id);
                 }
-                // Acquire a concurrency slot (released on drop after the invoke).
-                let _slot = match self.concurrency.acquire(&func.function_arn) {
-                    Some(guard) => guard,
-                    None => {
-                        executor.publish_throttle_metric(account, region, &func, &req.request_id);
-                        return LambdaError::TooManyRequests(
-                            "Rate Exceeded: concurrent execution limit reached".into(),
-                        )
-                        .into_response(&req.request_id);
-                    }
-                };
                 let payload = req.body.to_vec();
                 let trace = req
                     .headers
@@ -1379,15 +1392,6 @@ impl LambdaInternalApi for LambdaHandler {
         if function.state != "Active" {
             return Err(LambdaInternalError::InvalidState);
         }
-        let Some(_slot) = self.concurrency.acquire(&function.function_arn) else {
-            executor.publish_throttle_metric(
-                &call.account_id,
-                &call.region,
-                &function,
-                &call.request_id,
-            );
-            return Err(LambdaInternalError::Throttled);
-        };
         let executed_version = function.version.clone();
         let result = executor
             .invoke_sync_traced(
@@ -1443,6 +1447,7 @@ fn map_internal_lambda_error(error: LambdaError) -> LambdaInternalError {
         LambdaError::ResourceNotFound(_) => LambdaInternalError::NotFound,
         LambdaError::ResourceConflict(_) => LambdaInternalError::InvalidState,
         LambdaError::TooManyRequests(_) => LambdaInternalError::Throttled,
+        LambdaError::LocalCapacityExceeded(_) => LambdaInternalError::LocalCapacityExceeded,
         LambdaError::InvalidParameterValue(_)
         | LambdaError::InvalidRequestContent(_)
         | LambdaError::RequestTooLarge(_) => LambdaInternalError::InvalidRequest,
@@ -1638,7 +1643,18 @@ impl DestinationRouter for RegistryDestinationRouter {
 
 /// Register Lambda as a `Native` REST-JSON service in the Core registry.
 pub fn register(registry: &Arc<ServiceRegistry>) -> Arc<LambdaHandler> {
-    let handler = Arc::new(LambdaHandler::with_parts(Arc::downgrade(registry), None));
+    register_with_config(registry, LambdaConcurrencyConfig::default())
+}
+
+pub fn register_with_config(
+    registry: &Arc<ServiceRegistry>,
+    config: LambdaConcurrencyConfig,
+) -> Arc<LambdaHandler> {
+    let handler = Arc::new(LambdaHandler::with_config_parts(
+        Arc::downgrade(registry),
+        None,
+        config,
+    ));
     let native_handler: Arc<dyn NativeHandler> = handler.clone();
     let lambda_api: Arc<dyn LambdaInternalApi> = handler.clone();
     registry.register_native_with_lambda_api(
@@ -1658,6 +1674,19 @@ pub async fn register_with_execution(
     registry: &Arc<ServiceRegistry>,
     aws_endpoint_url: &str,
 ) -> Option<Arc<LambdaHandler>> {
+    register_with_execution_config(
+        registry,
+        aws_endpoint_url,
+        LambdaConcurrencyConfig::default(),
+    )
+    .await
+}
+
+pub async fn register_with_execution_config(
+    registry: &Arc<ServiceRegistry>,
+    aws_endpoint_url: &str,
+    config: LambdaConcurrencyConfig,
+) -> Option<Arc<LambdaHandler>> {
     use crate::code_store::CodeStore;
     use crate::executor::Executor;
     use crate::runtime_api::InvocationBroker;
@@ -1669,7 +1698,7 @@ pub async fn register_with_execution(
         Some(rt) => Arc::new(rt) as Arc<dyn ComputeRuntime>,
         None => {
             tracing::warn!("no daemonless OCI runtime (crun/youki) found; Lambda invoke disabled");
-            return Some(register(registry));
+            return Some(register_with_config(registry, config));
         }
     };
 
@@ -1682,7 +1711,7 @@ pub async fn register_with_execution(
         Ok(limit) => limit,
         Err(error) => {
             tracing::error!(%error, "invalid LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL; Lambda invoke disabled");
-            return Some(register(registry));
+            return Some(register_with_config(registry, config));
         }
     };
 
@@ -1695,7 +1724,7 @@ pub async fn register_with_execution(
         Ok(limit) => limit,
         Err(error) => {
             tracing::error!(%error, "invalid LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB; Lambda invoke disabled");
-            return Some(register(registry));
+            return Some(register_with_config(registry, config));
         }
     };
 
@@ -1709,7 +1738,7 @@ pub async fn register_with_execution(
                     Ok(current) => current.join(path),
                     Err(error) => {
                         tracing::error!(%error, "could not resolve LOCALLYCLOUD_WORK_DIR");
-                        return Some(register(registry));
+                        return Some(register_with_config(registry, config));
                     }
                 }
             }
@@ -1718,7 +1747,7 @@ pub async fn register_with_execution(
     };
     if let Err(error) = locallycloud_compute::private_dir::ensure(&work) {
         tracing::error!(%error, path = %work.display(), "Lambda work directory is unavailable or insecure");
-        return Some(register(registry));
+        return Some(register_with_config(registry, config));
     }
 
     let broker = Arc::new(InvocationBroker::new());
@@ -1729,7 +1758,7 @@ pub async fn register_with_execution(
         Ok(l) => l,
         Err(e) => {
             tracing::error!(error = %e, "could not bind the Lambda Runtime API; invoke disabled");
-            return Some(register(registry));
+            return Some(register_with_config(registry, config));
         }
     };
     let runtime_api_base = listener
@@ -1777,9 +1806,10 @@ pub async fn register_with_execution(
             executor.reap_expired_warm().await;
         }
     });
-    let handler = Arc::new(LambdaHandler::with_parts(
+    let handler = Arc::new(LambdaHandler::with_config_parts(
         Arc::downgrade(registry),
         Some(executor.clone()),
+        config,
     ));
     let native_handler: Arc<dyn NativeHandler> = handler.clone();
     let lambda_api: Arc<dyn LambdaInternalApi> = handler.clone();
@@ -2250,6 +2280,144 @@ mod tests {
             .handle(request(Method::POST, "/2015-03-31/functions", &create_body))
             .await;
         assert_eq!(resp.status(), 201);
+    }
+
+    #[tokio::test]
+    async fn account_settings_reservation_updates_and_competing_writes_share_one_quota() {
+        async fn call(h: &LambdaHandler, req: ServiceRequest) -> (u16, Value) {
+            let response = h.handle(req).await;
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+        let h = Arc::new(LambdaHandler::with_concurrency_config(
+            LambdaConcurrencyConfig::new(10, 2).unwrap(),
+        ));
+        for name in ["fn", "other", "third"] {
+            let input = create_body(name, json!({"ZipFile":zip_base64()}));
+            assert_eq!(
+                h.handle(request(Method::POST, "/2015-03-31/functions", &input))
+                    .await
+                    .status(),
+                201
+            );
+        }
+        let settings = "/2016-08-19/account-settings";
+        let body = call(&h, request(Method::GET, settings, "")).await.1;
+        assert_eq!(
+            body["AccountLimit"],
+            json!({"ConcurrentExecutions":10,"UnreservedConcurrentExecutions":10})
+        );
+        assert_eq!(body["AccountUsage"]["FunctionCount"], 3);
+        assert!(body["AccountUsage"]["TotalCodeSize"].as_u64().unwrap() > 0);
+        let path = "/2017-10-31/functions/fn/concurrency";
+        for _ in 0..2 {
+            assert_eq!(
+                call(
+                    &h,
+                    request(Method::PUT, path, r#"{"ReservedConcurrentExecutions":8}"#)
+                )
+                .await
+                .0,
+                200
+            );
+        }
+        let rejected = h
+            .handle(request(
+                Method::PUT,
+                "/2017-10-31/functions/other/concurrency",
+                r#"{"ReservedConcurrentExecutions":1}"#,
+            ))
+            .await;
+        assert_eq!(rejected.status(), 400);
+        assert_eq!(
+            rejected.headers()["x-amzn-errortype"],
+            "InvalidParameterValueException"
+        );
+        assert_eq!(
+            call(
+                &h,
+                request(Method::GET, "/2019-09-30/functions/other/concurrency", "")
+            )
+            .await
+            .1,
+            json!({})
+        );
+        assert_eq!(
+            call(&h, request(Method::GET, settings, "")).await.1["AccountLimit"]
+                ["UnreservedConcurrentExecutions"],
+            2
+        );
+        for (account, region) in [("111111111111", "us-east-1"), ("000000000000", "eu-west-1")] {
+            let mut req = request(Method::GET, settings, "");
+            req.account_id = account.into();
+            req.region = region.into();
+            let body = call(&h, req).await.1;
+            assert_eq!(body["AccountLimit"]["UnreservedConcurrentExecutions"], 10);
+            assert_eq!(body["AccountUsage"]["FunctionCount"], 0);
+        }
+        assert_eq!(
+            call(
+                &h,
+                request(Method::PUT, path, r#"{"ReservedConcurrentExecutions":6}"#)
+            )
+            .await
+            .0,
+            200
+        );
+        let mut writes = Vec::new();
+        for name in ["other", "third"] {
+            let h = h.clone();
+            writes.push(tokio::spawn(async move {
+                let path = format!("/2017-10-31/functions/{name}/concurrency");
+                (
+                    name,
+                    call(
+                        &h,
+                        request(Method::PUT, &path, r#"{"ReservedConcurrentExecutions":2}"#),
+                    )
+                    .await
+                    .0,
+                )
+            }));
+        }
+        let a = writes.remove(0).await.unwrap();
+        let b = writes.remove(0).await.unwrap();
+        assert!(
+            matches!((a.1, b.1), (200, 400) | (400, 200)),
+            "{a:?}, {b:?}"
+        );
+        let winner = if a.1 == 200 { a.0 } else { b.0 };
+        assert_eq!(
+            call(
+                &h,
+                request(
+                    Method::DELETE,
+                    &format!("/2015-03-31/functions/{winner}"),
+                    ""
+                )
+            )
+            .await
+            .0,
+            204
+        );
+        assert_eq!(
+            call(&h, request(Method::GET, settings, "")).await.1["AccountLimit"]
+                ["UnreservedConcurrentExecutions"],
+            4
+        );
+        assert_eq!(call(&h, request(Method::DELETE, path, "")).await.0, 204);
+        assert_eq!(
+            call(&h, request(Method::GET, settings, "")).await.1["AccountLimit"]
+                ["UnreservedConcurrentExecutions"],
+            10
+        );
+        for value in ["-1", "1.5", "4294967296"] {
+            let body = format!("{{\"ReservedConcurrentExecutions\":{value}}}");
+            assert_eq!(call(&h, request(Method::PUT, path, &body)).await.0, 400);
+        }
     }
 
     #[tokio::test]

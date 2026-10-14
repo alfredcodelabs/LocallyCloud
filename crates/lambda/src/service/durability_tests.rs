@@ -373,6 +373,73 @@ async fn reserved_concurrency_get_function_restart_failure_and_delete() {
     );
     drop(handler);
     let restored = restore_handler(db.clone(), 0x63).unwrap();
+    assert_eq!(
+        call(
+            &restored,
+            Method::GET,
+            "/2016-08-19/account-settings",
+            Value::Null
+        )
+        .await
+        .1["AccountLimit"]["UnreservedConcurrentExecutions"],
+        996
+    );
+    let smaller =
+        LambdaHandler::with_concurrency_config(LambdaConcurrencyConfig::new(5, 2).unwrap());
+    let persistence = Arc::new(
+        crate::persistence::LambdaPersistence::with_cipher(
+            db.clone(),
+            StateCipher::with_key(&[0x63; 32]),
+        )
+        .unwrap(),
+    );
+    let error = smaller
+        .initialize_state(db.clone(), persistence)
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY"));
+    let compatible =
+        LambdaHandler::with_concurrency_config(LambdaConcurrencyConfig::new(6, 2).unwrap());
+    let persistence = Arc::new(
+        crate::persistence::LambdaPersistence::with_cipher(
+            db.clone(),
+            StateCipher::with_key(&[0x63; 32]),
+        )
+        .unwrap(),
+    );
+    compatible
+        .initialize_state(db.clone(), persistence)
+        .unwrap();
+    assert_eq!(
+        call(
+            &compatible,
+            Method::GET,
+            "/2016-08-19/account-settings",
+            Value::Null
+        )
+        .await
+        .1["AccountLimit"]["UnreservedConcurrentExecutions"],
+        2
+    );
+    assert_eq!(
+        call(
+            &compatible,
+            Method::PUT,
+            "/2017-10-31/functions/reserved/concurrency",
+            json!({"ReservedConcurrentExecutions":5})
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        compatible
+            .store
+            .get_reserved_concurrency("000000000000", "us-east-1", "reserved"),
+        Some(Some(4))
+    );
+    drop((smaller, compatible));
     let (status, body) = call(
         &restored,
         Method::GET,
@@ -392,6 +459,17 @@ async fn reserved_concurrency_get_function_restart_failure_and_delete() {
         .await
         .1["ReservedConcurrentExecutions"],
         4
+    );
+    assert_eq!(
+        call(
+            &restored,
+            Method::GET,
+            "/2016-08-19/account-settings",
+            Value::Null
+        )
+        .await
+        .1["AccountLimit"]["UnreservedConcurrentExecutions"],
+        996
     );
     let arn = "arn:aws:lambda:us-east-1:000000000000:function:reserved";
     let slots = (0..4)

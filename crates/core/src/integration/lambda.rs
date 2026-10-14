@@ -98,6 +98,8 @@ pub enum LambdaInternalError {
     InvalidState,
     #[error("Lambda internal invocation was throttled")]
     Throttled,
+    #[error("Local Lambda compute capacity is exhausted")]
+    LocalCapacityExceeded,
     #[error("Lambda internal invocation failed")]
     Internal,
 }

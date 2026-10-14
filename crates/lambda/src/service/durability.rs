@@ -1,14 +1,18 @@
 use super::*;
 
 impl LambdaHandler {
+    fn sync_reserved(&self, account: &str, region: &str, name: &str) {
+        let arn = function_arn(region, account, name);
+        match self.store.get_reserved_concurrency(account, region, name) {
+            Some(Some(value)) => self.concurrency.set_reserved(&arn, value),
+            _ => self.concurrency.clear_reserved(&arn),
+        }
+    }
+
     pub(super) async fn route_durable(
         &self,
         req: &ServiceRequest,
     ) -> Result<(u16, Option<Value>), LambdaError> {
-        let persistence = self.persistence.lock().unwrap().clone();
-        let Some(persistence) = persistence else {
-            return self.route(req).await;
-        };
         let Some(target) = metadata_target(req)? else {
             return self.route(req).await;
         };
@@ -16,6 +20,14 @@ impl LambdaHandler {
         let guard = self.metadata_gate.clone().lock_owned().await;
         let (account, region) = (&req.account_id, &req.region);
         let name = target.name().to_string();
+        let persistence = self.persistence.lock().unwrap().clone();
+        let Some(persistence) = persistence else {
+            let response = self.route(req).await?;
+            if target.is_function() {
+                self.sync_reserved(account, region, &name);
+            }
+            return Ok(response);
+        };
         // Deletion commits under Executor's existing admission/cleanup guard.
         if target.is_function()
             && req.method == Method::DELETE
@@ -26,7 +38,10 @@ impl LambdaHandler {
                 .clear_reserved(&function_arn(region, account, &name));
             return Ok(response);
         }
-        let mut staged = LambdaHandler::with_parts(self.registry.clone(), None);
+        let mut staged =
+            LambdaHandler::with_config_parts(self.registry.clone(), None, self.concurrency_config);
+        // Admission reads the original scope; staged changes become visible only after commit.
+        staged.concurrency = self.concurrency.clone();
         staged.executor = self.executor.clone();
         *staged.ec2.lock().unwrap() = self.ec2.lock().unwrap().clone();
         if target.is_function() {

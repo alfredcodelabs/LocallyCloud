@@ -322,6 +322,22 @@ pub struct FunctionStore {
 }
 
 impl FunctionStore {
+    pub(crate) fn account_usage(&self, account: &str, region: &str) -> (u32, u64) {
+        self.records
+            .iter()
+            .filter(|entry| entry.key().account_id == account && entry.key().region == region)
+            .fold((0_u32, 0_u64), |(count, size), entry| {
+                let code = entry
+                    .value()
+                    .versions
+                    .values()
+                    .fold(entry.value().latest.code_size, |size, function| {
+                        size.saturating_add(function.code_size)
+                    });
+                (count.saturating_add(1), size.saturating_add(code))
+            })
+    }
+
     pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
         Ok(self
             .records
@@ -331,18 +347,21 @@ impl FunctionStore {
             .collect())
     }
 
-    pub(crate) fn function_scopes(&self) -> Vec<(String, String, String)> {
-        self.records
-            .iter()
-            .map(|entry| {
+    pub(crate) fn reserved_concurrency_scopes(
+        &self,
+    ) -> impl Iterator<Item = (String, String, String, u32)> + '_ {
+        self.records.iter().filter_map(|entry| {
+            entry.value().reserved_concurrent_executions.map(|value| {
                 (
                     entry.key().account_id.clone(),
                     entry.key().region.clone(),
                     entry.key().name.clone(),
+                    value,
                 )
             })
-            .collect()
+        })
     }
+
     pub(crate) fn restore_network_leases(&self, ec2: &locallycloud_ec2::Ec2Handler) {
         for mut entry in self.records.iter_mut() {
             let key = entry.key().clone();
@@ -951,6 +970,19 @@ pub struct LayerStore {
 }
 
 impl LayerStore {
+    pub(crate) fn code_size(&self, account: &str, region: &str) -> u64 {
+        self.records
+            .iter()
+            .filter(|entry| entry.key().account_id == account && entry.key().region == region)
+            .fold(0_u64, |total, entry| {
+                entry
+                    .value()
+                    .versions
+                    .values()
+                    .fold(total, |size, layer| size.saturating_add(layer.code_size))
+            })
+    }
+
     pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
         Ok(self
             .records

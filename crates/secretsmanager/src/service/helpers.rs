@@ -61,6 +61,7 @@ pub(super) fn map_lambda_error(error: LambdaInternalError) -> SecretsError {
         LambdaInternalError::NotFound => SecretsError::ResourceNotFound,
         LambdaInternalError::InvalidState => SecretsError::InvalidRequest,
         LambdaInternalError::Unavailable
+        | LambdaInternalError::LocalCapacityExceeded
         | LambdaInternalError::Throttled
         | LambdaInternalError::Internal => SecretsError::Internal,
     }

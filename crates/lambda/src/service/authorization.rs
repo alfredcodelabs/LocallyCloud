@@ -62,6 +62,7 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
     };
     let mut context = BTreeMap::new();
     let (action, resource): (&str, String) = match (segments.as_slice(), method) {
+        (["2016-08-19", "account-settings"], "GET") => ("GetAccountSettings", "*".into()),
         (["2015-03-31", "functions"], "POST") => {
             let body = parse_json(&req.body)?;
             let name = body

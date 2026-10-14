@@ -282,8 +282,12 @@ async fn main() {
         tracing::error!(%error, "failed to initialize durable IAM state");
         std::process::exit(2);
     }
-    let lambda_handler =
-        locallycloud_lambda::register_with_execution(&registry, endpoint.guest_endpoint()).await;
+    let lambda_handler = locallycloud_lambda::service::register_with_execution_config(
+        &registry,
+        endpoint.guest_endpoint(),
+        config.lambda_concurrency,
+    )
+    .await;
     if let Some(lambda) = &lambda_handler {
         if let Err(error) = lambda.attach_state(state.clone()) {
             tracing::error!(%error, "failed to load durable Lambda state");

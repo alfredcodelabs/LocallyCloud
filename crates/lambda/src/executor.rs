@@ -373,6 +373,7 @@ pub struct Executor {
     /// without delaying the HTTP response from the runtime.
     self_ref: OnceLock<Weak<Executor>>,
     function_store: Mutex<Weak<FunctionStore>>,
+    concurrency: Mutex<Option<Arc<crate::concurrency::ConcurrencyLimiter>>>,
     code_store: Arc<CodeStore>,
     layers: Arc<LayerStore>,
     rootfs_root: PathBuf,
@@ -507,6 +508,7 @@ impl Executor {
             broker,
             self_ref: OnceLock::new(),
             function_store: Mutex::new(Weak::new()),
+            concurrency: Mutex::new(None),
             code_store,
             layers: Arc::new(LayerStore::new()),
             rootfs_root: rootfs_root.into(),
@@ -544,6 +546,13 @@ impl Executor {
     /// Attach the EC2 control plane used for real VPC ENI and endpoint policy.
     pub fn attach_ec2(&self, ec2: Arc<Ec2Handler>) {
         *self.ec2.lock().unwrap() = Some(ec2);
+    }
+
+    pub(crate) fn attach_concurrency(
+        &self,
+        concurrency: Arc<crate::concurrency::ConcurrencyLimiter>,
+    ) {
+        *self.concurrency.lock().unwrap() = Some(concurrency);
     }
 
     pub(crate) fn attach_function_store(&self, store: &Arc<FunctionStore>) {
@@ -600,6 +609,10 @@ impl Executor {
         self
     }
 
+    pub(crate) fn metrics_recorder(&self) -> Arc<crate::metrics::MetricsRecorder> {
+        self.metrics.recorder().clone()
+    }
+
     /// Attach the shared service registry for lazy producer-log capability resolution.
     pub fn with_service_registry(mut self, registry: Weak<ServiceRegistry>) -> Self {
         self.metrics = LambdaMetrics::new(registry.clone());
@@ -652,6 +665,23 @@ impl Executor {
                 )));
             }
         }
+        let concurrency = self
+            .concurrency
+            .lock()
+            .map_err(|_| {
+                LambdaError::InternalError("Lambda concurrency wiring lock poisoned".into())
+            })?
+            .clone();
+        let _slot = concurrency
+            .map(|limiter| {
+                limiter.acquire(&func.function_arn).ok_or_else(|| {
+                    self.publish_throttle_metric(account, region, func, "");
+                    LambdaError::TooManyRequests(
+                        "Rate Exceeded: concurrent execution limit reached".into(),
+                    )
+                })
+            })
+            .transpose()?;
         if func.package_type != "Zip" {
             return Err(LambdaError::NotImplemented(
                 "image-package invocation is not yet supported".into(),
@@ -696,8 +726,13 @@ impl Executor {
             Some(key) => key,
             None => match self.cold_start(account, region, func, code).await {
                 Ok(key) => key,
-                Err(e @ LambdaError::TooManyRequests(_)) => {
-                    self.publish_throttle_metric(account, region, func, "");
+                Err(e @ LambdaError::LocalCapacityExceeded(_)) => {
+                    self.metrics.recorder().record_host_capacity(
+                        account,
+                        region,
+                        &func.function_name,
+                    );
+                    tracing::warn!(account, region, function = %func.function_name, "local Lambda compute memory capacity exhausted");
                     return Err(e);
                 }
                 Err(e) => {
@@ -1250,8 +1285,8 @@ impl Executor {
             };
             match idle {
                 Some(key) => self.stop_env(&key).await,
-                None => return Err(LambdaError::TooManyRequests(
-                    format!("Local compute memory budget exhausted ({required} MiB required, {} MiB budget)", self.memory_budget_mb)
+                None => return Err(LambdaError::LocalCapacityExceeded(
+                    format!("Local compute memory budget exhausted ({required} MiB required, {} MiB budget). Reduce simultaneous work or increase LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB within available host RAM.", self.memory_budget_mb)
                 )),
             }
         }
@@ -2509,7 +2544,7 @@ mod tests {
         assert!(matches!(
             exec.invoke_sync("000000000000", "us-east-1", &oversized, b"{}".to_vec())
                 .await,
-            Err(LambdaError::TooManyRequests(_))
+            Err(LambdaError::LocalCapacityExceeded(_))
         ));
         assert!(exec.memory_reservations.lock().unwrap().is_empty());
         let invalid = func("provided.al2023", 10, code);
@@ -3321,6 +3356,103 @@ mod tests {
             };
             assert_eq!(observation.unit, Some(expected_unit));
         }
+    }
+
+    #[tokio::test]
+    async fn sync_async_and_function_urls_share_execution_admission() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let exec = build_executor(
+            Arc::new(InvocationBroker::new()),
+            GuestBehavior::EchoUppercaseLen,
+        )
+        .await
+        .with_service_registry(Arc::downgrade(&registry));
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let limiter = crate::concurrency::ConcurrencyLimiter::with_config(
+            locallycloud_core::config::LambdaConcurrencyConfig::new(10, 2).unwrap(),
+        );
+        limiter.set_reserved(&f.function_arn, 0);
+        exec.attach_concurrency(limiter);
+        assert!(matches!(
+            exec.invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+                .await,
+            Err(LambdaError::TooManyRequests(_))
+        ));
+        let url = crate::function_url::UrlRequest {
+            method: "GET".into(),
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            headers: Default::default(),
+            body: Vec::new(),
+            region: "us-east-1".into(),
+            url_id: "url-quota".into(),
+            account: "000000000000".into(),
+            request_id: "url-quota".into(),
+        };
+        assert!(matches!(
+            exec.invoke_url("000000000000", "us-east-1", &f, url).await,
+            Err(LambdaError::TooManyRequests(_))
+        ));
+        exec.invoke_async(
+            "000000000000",
+            "us-east-1",
+            &f,
+            b"{}".to_vec(),
+            &AsyncConfig {
+                max_retry_attempts: 0,
+                on_success_arn: None,
+                on_failure_arn: None,
+            },
+            None,
+        )
+        .await;
+        flush_metrics(&exec);
+        let points = metrics.observations.lock().unwrap();
+        assert_eq!(
+            points
+                .iter()
+                .filter(|point| point.metric_name == "Throttles")
+                .map(|point| point.value)
+                .sum::<f64>(),
+            3.0
+        );
+        assert!(points
+            .iter()
+            .all(|point| point.metric_name != "Invocations"));
+        assert!(exec.owned_envs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_capacity_rejection_does_not_publish_aws_throttles() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
+            .await
+            .with_service_registry(Arc::downgrade(&registry))
+            .with_memory_budget(1);
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let error = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, LambdaError::LocalCapacityExceeded(message) if message.contains("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB"))
+        );
+        let response = error.into_response("capacity-test");
+        assert_eq!(response.status(), 503);
+        assert_eq!(
+            response.headers()["x-amzn-errortype"],
+            "LocalCapacityExceededException"
+        );
+        flush_metrics(&exec);
+        let observations = metrics.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].namespace, "LocallyCloud/Lambda");
+        assert_eq!(observations[0].metric_name, "HostCapacityExceeded");
+        assert_eq!(observations[0].value, 1.0);
+        assert!(exec.memory_reservations.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

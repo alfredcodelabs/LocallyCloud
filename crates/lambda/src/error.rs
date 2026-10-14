@@ -26,6 +26,8 @@ pub enum LambdaError {
     #[error("{0}")]
     InternalError(String),
     #[error("{0}")]
+    LocalCapacityExceeded(String),
+    #[error("{0}")]
     NotImplemented(String),
 }
 
@@ -41,6 +43,7 @@ impl LambdaError {
             LambdaError::RequestTooLarge(_) => "RequestTooLargeException",
             LambdaError::TooManyRequests(_) => "TooManyRequestsException",
             LambdaError::InternalError(_) => "InternalServerError",
+            LambdaError::LocalCapacityExceeded(_) => "LocalCapacityExceededException",
             LambdaError::NotImplemented(_) => "NotImplementedException",
         }
     }
@@ -56,6 +59,7 @@ impl LambdaError {
             LambdaError::RequestTooLarge(_) => 413,
             LambdaError::TooManyRequests(_) => 429,
             LambdaError::InternalError(_) => 500,
+            LambdaError::LocalCapacityExceeded(_) => 503,
             LambdaError::NotImplemented(_) => 501,
         }
     }
