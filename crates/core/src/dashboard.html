@@ -29,7 +29,7 @@
       <div class="right">
         <div class="header-controls">
           <label class="sr" for="region" data-i18n="region"></label>
-          <select id="region"></select>
+          <span class="select-control"><select id="region"></select></span>
           <div class="identity-menu" id="identity-menu">
             <button type="button" class="identity-trigger" id="identity-label" popovertarget="identity-panel" aria-live="polite"></button>
             <div class="identity-panel" id="identity-panel" popover="auto" aria-labelledby="identity-label">
@@ -41,15 +41,15 @@
               </dl>
               <p class="dim" id="identity-note"></p>
               <p class="notice" id="identity-error" role="alert" hidden></p>
-              <label class="context-control"><span data-i18n="connectionProfile"></span><select id="profile"></select></label>
+              <label class="context-control"><span data-i18n="connectionProfile"></span><span class="select-control"><select id="profile"></select></span></label>
             </div>
           </div>
           <label class="sr" for="lang" data-i18n="language"></label>
-          <select id="lang">
+          <span class="select-control"><select id="lang">
             <option value="en">English</option>
             <option value="es">Español</option>
             <option value="pt">Português</option>
-          </select>
+          </select></span>
         </div>
         <div class="header-health">
           <span id="status" class="status offline" role="status" aria-live="polite"></span>
@@ -73,10 +73,10 @@
       <input id="search" type="search" autocomplete="off" data-i18n-placeholder="search" />
       <label class="check"><input id="hideIdle" type="checkbox" /> <span data-i18n="hideIdle"></span></label>
       <label class="check" for="sort"><span data-i18n="sortBy"></span>
-        <select id="sort">
+        <span class="select-control"><select id="sort">
           <option value="requests" data-i18n="sortRequests"></option>
           <option value="name" data-i18n="sortName"></option>
-        </select>
+        </select></span>
       </label>
     </div>
 
