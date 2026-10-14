@@ -20,6 +20,28 @@ use super::pattern::IntegrationPatternId;
 use super::InternalDispatcher;
 use crate::registry::ServiceName;
 
+/// Retry timing supplied explicitly by the source service.
+#[derive(Clone, Copy)]
+pub struct RetryBackoff {
+    pub initial: Duration,
+    pub maximum: Duration,
+    pub jitter: bool,
+}
+
+impl RetryBackoff {
+    pub fn delay(self, attempt: u32) -> Duration {
+        let ceiling = self
+            .initial
+            .saturating_mul(1_u32 << attempt.saturating_sub(1).min(31))
+            .min(self.maximum);
+        if !self.jitter {
+            return ceiling;
+        }
+        let sample = (uuid::Uuid::new_v4().as_u128() as u64) as f64 / u64::MAX as f64;
+        ceiling.mul_f64(sample)
+    }
+}
+
 /// A call originating from one emulated service to another (or from a Guest SDK).
 pub struct CrossServiceCall {
     pub source_service: ServiceName,
@@ -121,6 +143,26 @@ impl DeliveryEngine {
         policy: &AsyncDeliveryPolicy,
         allowed: impl Fn() -> bool,
     ) -> Result<(), DeliveryError> {
+        self.deliver_async_checked_with_backoff(
+            call,
+            policy,
+            allowed,
+            RetryBackoff {
+                initial: Duration::from_millis(25),
+                maximum: Duration::from_millis(800),
+                jitter: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn deliver_async_checked_with_backoff(
+        &self,
+        call: CrossServiceCall,
+        policy: &AsyncDeliveryPolicy,
+        allowed: impl Fn() -> bool,
+        backoff: RetryBackoff,
+    ) -> Result<(), DeliveryError> {
         let attempts = policy.max_attempts.max(1);
         let mut last_status = 0u16;
         for attempt in 1..=attempts {
@@ -144,9 +186,7 @@ impl DeliveryEngine {
                 }
                 FailureClass::Retriable => {
                     if attempt < attempts {
-                        let shift = attempt.saturating_sub(1).min(5);
-                        let delay_ms = 25_u64.saturating_mul(1_u64 << shift);
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        tokio::time::sleep(backoff.delay(attempt)).await;
                     }
                 }
             }
@@ -313,6 +353,46 @@ mod tests {
         assert_eq!(DeliveryEngine::classify(503), FailureClass::Retriable);
         assert_eq!(DeliveryEngine::classify(400), FailureClass::Terminal);
         assert_eq!(DeliveryEngine::classify(404), FailureClass::Terminal);
+    }
+
+    #[tokio::test]
+    async fn source_backoff_caps_attempts_and_preserves_legacy_timing() {
+        let handler = Arc::new(FlakyHandler {
+            calls: AtomicU32::new(0),
+            fail_times: 200,
+            fail_status: 503,
+        });
+        let engine = engine_with(handler.clone());
+        let error = engine
+            .deliver_async_checked_with_backoff(
+                call(),
+                &policy(186),
+                || true,
+                RetryBackoff {
+                    initial: Duration::ZERO,
+                    maximum: Duration::ZERO,
+                    jitter: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.attempts, 186);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 186);
+        let classic = RetryBackoff {
+            initial: Duration::from_millis(1),
+            maximum: Duration::from_millis(16),
+            jitter: false,
+        };
+        assert_eq!(classic.delay(1), Duration::from_millis(1));
+        assert_eq!(classic.delay(3), Duration::from_millis(4));
+        assert_eq!(classic.delay(185), Duration::from_millis(16));
+        let jitter = RetryBackoff {
+            jitter: true,
+            ..classic
+        };
+        for _ in 0..20 {
+            assert!(jitter.delay(4) <= Duration::from_millis(8));
+        }
     }
 
     #[tokio::test]

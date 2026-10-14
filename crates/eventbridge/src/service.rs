@@ -476,6 +476,14 @@ pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
 ) -> Result<(), String> {
+    register_with_state_and_retry_timing(registry, state, Duration::from_secs(1))
+}
+
+pub fn register_with_state_and_retry_timing(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    retry_second: Duration,
+) -> Result<(), String> {
     if registry.internal_dispatcher().is_none() {
         let dispatcher = Arc::new(InternalDispatcher::new_shared(
             registry,
@@ -489,7 +497,9 @@ pub fn register_with_state(
         ));
         registry.set_internal_dispatcher(dispatcher);
     }
-    let store = Arc::new(EbStore::with_state(state)?);
+    let mut store = EbStore::with_state(state)?;
+    store.retry_second = Some(retry_second);
+    let store = Arc::new(store);
     let services = Arc::new(Services::with_store(
         Arc::downgrade(registry),
         Arc::new(SystemClock),
@@ -516,16 +526,14 @@ pub fn register_with_state(
         services.events.resume_replays().await;
         services.scheduler.resume_schedules().await;
         services.pipes.resume_workers().await;
-        let notify = services.events.store.pending_notify();
-        let mut delay = Duration::from_secs(1);
-        loop {
-            if services.events.resume_pending().await {
-                tokio::time::sleep(delay).await;
-                delay = delay.saturating_mul(2).min(Duration::from_secs(60));
-            } else {
-                delay = Duration::from_secs(1);
-                notify.notified().await;
-            }
+        if services
+            .events
+            .store
+            .pending_fanouts()
+            .await
+            .is_ok_and(|work| !work.is_empty())
+        {
+            services.events.ensure_pending_worker();
         }
     });
     Ok(())
@@ -692,7 +700,7 @@ mod tests {
             sqs.handle(json_request(
                 "AmazonSQS",
                 "ReceiveMessage",
-                json!({"QueueUrl":"https://sqs.us-east-1.amazonaws.com/000000000000/eventbridge-compat"}),
+                json!({"QueueUrl":"https://sqs.us-east-1.amazonaws.com/000000000000/eventbridge-compat","WaitTimeSeconds":1}),
             ))
             .await,
         )
@@ -794,6 +802,68 @@ mod tests {
         assert_eq!(envelope["detail-type"], "Object Created");
         assert_eq!(envelope["detail"]["bucket"]["name"], "bucket");
         assert_eq!(envelope["detail"]["object"]["key"], "key.txt");
+    }
+
+    #[tokio::test]
+    async fn transformed_events_retry_in_background_and_reach_dlq_when_age_expires() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        struct Unavailable(AtomicU32);
+        #[async_trait]
+        impl NativeHandler for Unavailable {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(503)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }
+        let registry = ServiceRegistry::with_known_services();
+        locallycloud_sqs::register(&registry);
+        register(&registry);
+        let unavailable = Arc::new(Unavailable(AtomicU32::new(0)));
+        registry.register_native(
+            ServiceName::new("states"),
+            ServiceMetadata::new(AwsProtocol::Json10, Some("AWSStepFunctions")),
+            unavailable.clone(),
+        );
+        let mut store = EbStore::new();
+        store.retry_second = Some(Duration::from_millis(2));
+        let services = Arc::new(Services::with_store(
+            Arc::downgrade(&registry),
+            Arc::new(SystemClock),
+            Arc::new(store),
+        ));
+        let eventbridge: Arc<dyn NativeHandler> = Arc::new(EventsHandler(services));
+        let sqs = registry.native_handler(&ServiceName::new("sqs")).unwrap();
+        assert_eq!(
+            sqs.handle(json_request(
+                "AmazonSQS",
+                "CreateQueue",
+                json!({"QueueName":"retry-dlq"})
+            ))
+            .await
+            .status(),
+            200
+        );
+        events(
+            &eventbridge,
+            "PutRule",
+            json!({"Name":"retry-rule","EventPattern":"{\"source\":[\"retry-test\"]}"}),
+        )
+        .await;
+        events(&eventbridge, "PutTargets", json!({"Rule":"retry-rule","Targets":[{"Id":"workflow","Arn":"arn:aws:states:us-east-1:000000000000:stateMachine:unavailable","RoleArn":"arn:aws:iam::000000000000:role/events","InputPath":"$.detail","RetryPolicy":{"MaximumEventAgeInSeconds":60},"DeadLetterConfig":{"Arn":"arn:aws:sqs:us-east-1:000000000000:retry-dlq"}}]})).await;
+        let accepted = tokio::time::timeout(Duration::from_millis(100), events(&eventbridge, "PutEvents", json!({"Entries":[{"Source":"retry-test","DetailType":"Burst","Detail":"{\"id\":42}"}]}))).await.expect("PutEvents waited for target retries");
+        assert_eq!(accepted["FailedEntryCount"], 0);
+        let (_, received) = body(sqs.handle(json_request("AmazonSQS", "ReceiveMessage", json!({"QueueUrl":"https://sqs.us-east-1.amazonaws.com/000000000000/retry-dlq","WaitTimeSeconds":2}))).await).await;
+        let messages = received["Messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(messages[0]["Body"].as_str().unwrap()).unwrap(),
+            json!({"id":42})
+        );
+        assert!(unavailable.0.load(Ordering::SeqCst) > 1);
+        assert!(unavailable.0.load(Ordering::SeqCst) <= 186);
     }
 
     #[tokio::test]

@@ -1090,6 +1090,7 @@ fn schedule_delivery(schedule: &Schedule, scheduled_due: OffsetDateTime) -> Deli
             .and_then(Value::as_str)
             .map(str::to_string),
         scheduled_at: Some(scheduled_due),
+        retry_second: None,
     }
 }
 

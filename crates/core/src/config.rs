@@ -49,10 +49,28 @@ pub struct LocallyCloudConfig {
     /// `LOCALLYCLOUD_UI=off` removes every dashboard route. Default: on.
     pub ui_enabled: bool,
     pub lambda_concurrency: LambdaConcurrencyConfig,
+    /// Duration of one simulated EventBridge retry second; defaults to real time.
+    pub events_retry_second: Duration,
 }
 
 const LAMBDA_ACCOUNT_CONCURRENCY: &str = "LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY";
 
+fn retry_second(get: &dyn Fn(&str) -> Option<String>) -> Result<Duration, ConfigError> {
+    let Some(value) = get("LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE") else {
+        return Ok(Duration::from_secs(1));
+    };
+    let scale = value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (0.000001..=1.0).contains(value))
+        .ok_or_else(|| {
+            ConfigError::new(
+                "LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE",
+                "expected a finite number from 0.000001 to 1",
+            )
+        })?;
+    Ok(Duration::from_secs_f64(scale))
+}
 const LAMBDA_MIN_UNRESERVED: &str = "LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY";
 
 /// Validated simulation limits. Every account/region receives its own independent pool.
@@ -150,7 +168,11 @@ const DEFAULT_REGION: &str = "us-east-1";
 impl LocallyCloudConfig {
     /// Resolve configuration from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
-        for setting in [LAMBDA_ACCOUNT_CONCURRENCY, LAMBDA_MIN_UNRESERVED] {
+        for setting in [
+            LAMBDA_ACCOUNT_CONCURRENCY,
+            LAMBDA_MIN_UNRESERVED,
+            "LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE",
+        ] {
             if matches!(
                 std::env::var(setting),
                 Err(std::env::VarError::NotUnicode(_))
@@ -313,6 +335,7 @@ impl LocallyCloudConfig {
             tls,
             ui_enabled,
             lambda_concurrency: LambdaConcurrencyConfig::resolve(get)?,
+            events_retry_second: retry_second(get)?,
         })
     }
 }

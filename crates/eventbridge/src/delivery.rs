@@ -4,7 +4,7 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
 use locallycloud_core::integration::correlation::CorrelationContext;
 use locallycloud_core::integration::delivery::{
-    AsyncDeliveryPolicy, CrossServiceCall, DeliveryEngine,
+    AsyncDeliveryPolicy, CrossServiceCall, DeliveryEngine, RetryBackoff,
 };
 use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::logs::{
@@ -34,6 +34,7 @@ pub struct DeliveryRequest {
     pub retry: RetryPolicy,
     pub dead_letter_arn: Option<String>,
     pub scheduled_at: Option<OffsetDateTime>,
+    pub retry_second: Option<std::time::Duration>,
 }
 
 impl From<(&Target, String)> for DeliveryRequest {
@@ -49,6 +50,7 @@ impl From<(&Target, String)> for DeliveryRequest {
             retry: target.retry.clone(),
             dead_letter_arn: target.dead_letter_arn.clone(),
             scheduled_at: None,
+            retry_second: Some(std::time::Duration::from_secs(1)),
         }
     }
 }
@@ -173,7 +175,11 @@ pub(crate) async fn deliver_logs(
     let mut delivered = false;
     if !event_expired(request, OffsetDateTime::now_utc()) {
         for attempt in 0..attempts {
-            let result = async {
+            let remaining = remaining_age(request).unwrap_or(std::time::Duration::from_secs(86400));
+            if remaining.is_zero() {
+                break;
+            }
+            let result = tokio::time::timeout(remaining, async {
                 if !authorize_target(registry, request, InvocationMode::AsyncTarget, account) {
                     return Err(SinkError::Rejected("execution role denied".into()));
                 }
@@ -215,16 +221,22 @@ pub(crate) async fn deliver_logs(
                     return Err(SinkError::Rejected("partial producer commit".into()));
                 }
                 Ok::<(), SinkError>(())
-            }
-            .await;
+            })
+            .await
+            .unwrap_or(Err(SinkError::Unavailable));
             match result {
                 Ok(()) => {
                     delivered = true;
                     break;
                 }
                 Err(error) if retriable_sink_error(&error) && attempt + 1 < attempts => {
-                    let delay = 25u64.saturating_mul(1u64 << attempt.min(5));
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    let delay = retry_backoff(request).delay(attempt + 1).min(
+                        remaining_age(request).unwrap_or(std::time::Duration::from_secs(86400)),
+                    );
+                    tokio::time::sleep(delay).await;
+                    if event_expired(request, OffsetDateTime::now_utc()) {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -248,6 +260,7 @@ pub(crate) async fn deliver_logs(
             },
             dead_letter_arn: None,
             scheduled_at: None,
+            retry_second: None,
         };
         let _ = deliver(registry, &dlq_request, region, account).await;
     }
@@ -288,17 +301,13 @@ pub async fn deliver(
         match target_call(request, region, account, InvocationMode::AsyncTarget) {
             Ok(call) => {
                 let policy = delivery_policy(request);
-                let delivery = engine.deliver_async_checked(call, &policy, || {
-                    authorize_target(registry, request, InvocationMode::AsyncTarget, account)
-                });
-                if let (Some(scheduled_at), Some(maximum_age)) =
-                    (request.scheduled_at, request.retry.maximum_age_seconds)
-                {
-                    let deadline = scheduled_at
-                        + time::Duration::seconds(maximum_age.min(i64::MAX as u64) as i64);
-                    let remaining = (deadline - OffsetDateTime::now_utc())
-                        .try_into()
-                        .unwrap_or(std::time::Duration::ZERO);
+                let delivery = engine.deliver_async_checked_with_backoff(
+                    call,
+                    &policy,
+                    || authorize_target(registry, request, InvocationMode::AsyncTarget, account),
+                    retry_backoff(request),
+                );
+                if let Some(remaining) = remaining_age(request) {
                     tokio::time::timeout(remaining, delivery)
                         .await
                         .map_err(|_| ())
@@ -330,6 +339,7 @@ pub async fn deliver(
             },
             dead_letter_arn: None,
             scheduled_at: None,
+            retry_second: None,
         };
         let call = target_call(&dlq_request, region, account, InvocationMode::AsyncTarget)
             .map_err(|_| DeliveryFailure)?;
@@ -356,6 +366,33 @@ fn delivery_policy(request: &DeliveryRequest) -> AsyncDeliveryPolicy {
         max_attempts: request.retry.maximum_attempts.saturating_add(1),
         on_failure: None,
     }
+}
+
+pub(crate) fn retry_backoff(request: &DeliveryRequest) -> RetryBackoff {
+    match request.retry_second {
+        Some(second) => RetryBackoff {
+            initial: second,
+            maximum: second.saturating_mul(3600),
+            jitter: true,
+        },
+        None => RetryBackoff {
+            initial: std::time::Duration::from_millis(25),
+            maximum: std::time::Duration::from_millis(800),
+            jitter: false,
+        },
+    }
+}
+
+pub(crate) fn remaining_age(request: &DeliveryRequest) -> Option<std::time::Duration> {
+    let accepted = request.scheduled_at?;
+    let age = request
+        .retry_second
+        .unwrap_or(std::time::Duration::from_secs(1))
+        .mul_f64(request.retry.maximum_age_seconds?.min(86400) as f64);
+    let elapsed = (OffsetDateTime::now_utc() - accepted)
+        .as_seconds_f64()
+        .max(0.0);
+    Some(age.saturating_sub(std::time::Duration::from_secs_f64(elapsed)))
 }
 
 pub async fn deliver_sync(
@@ -419,8 +456,11 @@ fn event_expired(request: &DeliveryRequest, now: OffsetDateTime) -> bool {
     let Some(timestamp) = timestamp else {
         return false;
     };
-    let maximum_age = maximum_age.min(i64::MAX as u64) as i64;
-    (now - timestamp).whole_seconds() > maximum_age
+    let age = request
+        .retry_second
+        .unwrap_or(std::time::Duration::from_secs(1))
+        .mul_f64(maximum_age.min(86400) as f64);
+    (now - timestamp).as_seconds_f64() >= age.as_secs_f64()
 }
 
 fn arn_service(arn: &str) -> Option<&str> {
@@ -716,6 +756,7 @@ mod tests {
             },
             dead_letter_arn: Some("arn:aws:sqs:us-east-1:000000000000:dlq".into()),
             scheduled_at: None,
+            retry_second: None,
         }
     }
 

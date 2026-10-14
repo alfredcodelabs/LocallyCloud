@@ -204,6 +204,7 @@ async fn acknowledged_rule_and_pending_fanout_survive_reopen() {
         .clone();
     store
         .enqueue_fanout(PendingFanout {
+            accepted_at: None,
             id: "pending".into(),
             account: ctx.account.into(),
             region: ctx.region.into(),
@@ -254,6 +255,7 @@ async fn archive_rows_and_replay_snapshot_survive_reopen_and_archive_deletion() 
     let first = json!({"id":"first","source":"test"});
     let second = json!({"id":"second","source":"test"});
     let accepted = PendingFanout {
+        accepted_at: None,
         id: "first".into(),
         account: account.into(),
         region: region.into(),
@@ -361,6 +363,7 @@ async fn invalid_archive_reference_rolls_back_event_outbox() {
     let db = Arc::new(StateDb::open(root.path().join("state.sqlite3")).unwrap());
     let store = EbStore::with_state(db.clone()).unwrap();
     let fanout = PendingFanout {
+        accepted_at: None,
         id: "x".into(),
         account: "a".into(),
         region: "r".into(),

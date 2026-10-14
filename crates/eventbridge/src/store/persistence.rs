@@ -737,6 +737,14 @@ impl EbStore {
 
     pub async fn enqueue_fanout(&self, fanout: PendingFanout) -> Result<(), String> {
         let Some(state) = &self.persistence else {
+            let mut pending = self
+                .memory_fanouts
+                .lock()
+                .map_err(|_| "EventBridge pending queue lock poisoned".to_string())?;
+            if pending.len() >= 1024 {
+                return Err("EventBridge in-memory pending queue is full".into());
+            }
+            pending.insert(fanout.id.clone(), fanout);
             return Ok(());
         };
         let state = state.clone();
@@ -759,6 +767,10 @@ impl EbStore {
 
     pub async fn complete_fanout(&self, id: &str) -> Result<(), String> {
         let Some(state) = &self.persistence else {
+            self.memory_fanouts
+                .lock()
+                .map_err(|_| "EventBridge pending queue lock poisoned".to_string())?
+                .remove(id);
             return Ok(());
         };
         let state = state.clone();
@@ -777,13 +789,20 @@ impl EbStore {
 
     pub async fn pending_fanouts(&self) -> Result<Vec<PendingFanout>, String> {
         let Some(state) = &self.persistence else {
-            return Ok(Vec::new());
+            return Ok(self
+                .memory_fanouts
+                .lock()
+                .map_err(|_| "EventBridge pending queue lock poisoned".to_string())?
+                .values()
+                .take(16)
+                .cloned()
+                .collect());
         };
         let state = state.clone();
         tokio::task::spawn_blocking(move || {
             let connection = state.connection().map_err(|error| error.to_string())?;
             let mut statement = connection
-                .prepare("SELECT payload FROM events_pending_fanout ORDER BY rowid")
+                .prepare("SELECT payload FROM events_pending_fanout ORDER BY rowid LIMIT 16")
                 .map_err(|error| error.to_string())?;
             let rows = statement
                 .query_map([], |row| row.get::<_, Vec<u8>>(0))

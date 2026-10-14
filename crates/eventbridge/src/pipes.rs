@@ -1240,6 +1240,7 @@ async fn process_record(
         },
         dead_letter_arn: None,
         scheduled_at: None,
+        retry_second: None,
     };
     if delivery::deliver(registry, &request, region, account)
         .await
@@ -1275,6 +1276,7 @@ async fn invoke_sync_enrichment(
         },
         dead_letter_arn: None,
         scheduled_at: None,
+        retry_second: None,
     };
     delivery::deliver_sync(registry, &request, region, account)
         .await
@@ -1308,6 +1310,7 @@ async fn handle_record_failure(
         },
         dead_letter_arn: None,
         scheduled_at: None,
+        retry_second: None,
     };
     delivery::deliver(registry, &dlq, region, account)
         .await

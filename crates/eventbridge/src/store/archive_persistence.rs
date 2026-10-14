@@ -89,7 +89,7 @@ impl EbStore {
         archived: Vec<(String, ArchivedEvent)>,
     ) -> Result<(), String> {
         let Some(db) = &self.persistence else {
-            return Ok(());
+            return self.enqueue_fanout(fanout).await;
         };
         let _gate = self.persist_lock.lock().await;
         let id = fanout.id.clone();

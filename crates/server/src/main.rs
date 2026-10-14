@@ -310,7 +310,11 @@ async fn main() {
         tracing::error!(%error, "failed to register SNS");
         std::process::exit(4);
     }
-    if let Err(error) = locallycloud_eventbridge::register_with_state(&registry, state.clone()) {
+    if let Err(error) = locallycloud_eventbridge::service::register_with_state_and_retry_timing(
+        &registry,
+        state.clone(),
+        config.events_retry_second,
+    ) {
         tracing::error!(%error, "failed to register EventBridge");
         std::process::exit(4);
     }

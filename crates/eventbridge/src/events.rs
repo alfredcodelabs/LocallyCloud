@@ -993,10 +993,39 @@ fn parse_target(value: &Value) -> Result<Target, EventsError> {
         )));
     }
     let retry_value = value.get("RetryPolicy").unwrap_or(&Value::Null);
+    if let Some(policy) = value.get("RetryPolicy") {
+        let object = policy
+            .as_object()
+            .ok_or_else(|| EventsError::Validation("RetryPolicy must be an object".into()))?;
+        for (field, minimum, maximum) in [
+            ("MaximumRetryAttempts", 0, 185),
+            ("MaximumEventAgeInSeconds", 60, 86400),
+        ] {
+            if object.get(field).is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|value| !(minimum..=maximum).contains(&value))
+            }) {
+                return Err(EventsError::Validation(format!(
+                    "{field} must be an integer from {minimum} to {maximum}"
+                )));
+            }
+        }
+        if object.keys().any(|field| {
+            !matches!(
+                field.as_str(),
+                "MaximumRetryAttempts" | "MaximumEventAgeInSeconds"
+            )
+        }) {
+            return Err(EventsError::Validation(
+                "unsupported RetryPolicy field".into(),
+            ));
+        }
+    }
     let maximum_attempts = retry_value
         .get("MaximumRetryAttempts")
         .and_then(Value::as_u64)
-        .unwrap_or(0)
+        .unwrap_or(185)
         .min(u64::from(u32::MAX)) as u32;
     Ok(Target {
         id,
@@ -1010,7 +1039,8 @@ fn parse_target(value: &Value) -> Result<Target, EventsError> {
             maximum_attempts,
             maximum_age_seconds: retry_value
                 .get("MaximumEventAgeInSeconds")
-                .and_then(Value::as_u64),
+                .and_then(Value::as_u64)
+                .or(Some(86400)),
         },
         dead_letter_arn: value
             .get("DeadLetterConfig")
@@ -1169,6 +1199,7 @@ impl EventsService {
         self.store
             .accept_event(
                 PendingFanout {
+                    accepted_at: Some(OffsetDateTime::now_utc()),
                     id: id.clone(),
                     account: ctx.account.to_string(),
                     region: ctx.region.to_string(),
@@ -1202,15 +1233,9 @@ impl EventsService {
                 Err(error) => tracing::warn!(%error, "EventBridge schema discovery task failed"),
             }
         }
-        if self.fanout(ctx, &rules, &event, None).await {
-            self.store
-                .complete_fanout(&id)
-                .await
-                .map_err(EventsError::Internal)?;
-        } else {
-            drop(active);
-            self.store.notify_pending();
-        }
+        drop(active);
+        self.ensure_pending_worker();
+        self.store.notify_pending();
         Ok(id)
     }
 
@@ -1243,7 +1268,10 @@ impl EventsService {
                 region: &work.region,
                 request_id: &work.id,
             };
-            if self.fanout(&ctx, &work.rules, &work.event, None).await {
+            if self
+                .fanout(&ctx, &work.rules, &work.event, None, work.accepted_at)
+                .await
+            {
                 if let Err(error) = self.store.complete_fanout(&work.id).await {
                     tracing::error!(%error, "failed to complete EventBridge fanout");
                     failed = true;
@@ -1253,6 +1281,60 @@ impl EventsService {
             }
         }
         failed
+    }
+
+    pub(crate) fn ensure_pending_worker(&self) {
+        let Ok(mut workers) = self.workers.lock() else {
+            return;
+        };
+        let key = "pending-event-delivery".to_string();
+        if workers
+            .get(&key)
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return;
+        }
+        let store = self.store.clone();
+        let registry = self.registry.clone();
+        let http = self.http.clone();
+        let active = self.active_fanouts.clone();
+        workers.insert(key, tokio::spawn(async move {
+            let notify = store.pending_notify();
+            loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let pending = match store.pending_fanouts().await {
+                    Ok(work) => work,
+                    Err(error) => { tracing::error!(%error, "EventBridge pending queue unavailable"); return; }
+                };
+                if pending.is_empty() { notified.await; continue; }
+                let mut deliveries = tokio::task::JoinSet::new();
+                for work in pending {
+                    let claimed = active.lock().map(|mut active| active.insert(work.id.clone())).unwrap_or(false);
+                    if !claimed { continue; }
+                    let guard = ActiveFanout { id: work.id.clone(), active: active.clone() };
+                    let store = store.clone(); let registry = registry.clone(); let http = http.clone();
+                    deliveries.spawn(async move {
+                        let _guard = guard;
+                        let Some(registry) = registry.upgrade() else { return };
+                        let complete = fanout_rules(FanoutContext {
+                            registry: &registry, store: &store, http: http.as_ref(),
+                            account: &work.account, region: &work.region,
+                            correlation: CorrelationContext::root(),
+                            accepted_at: work.accepted_at.unwrap_or_else(OffsetDateTime::now_utc),
+                        }, &work.rules, &work.event, None).await;
+                        if complete {
+                            if let Err(error) = store.complete_fanout(&work.id).await {
+                                tracing::error!(%error, "EventBridge completion could not be committed");
+                            }
+                        }
+                    });
+                }
+                while deliveries.join_next().await.is_some() {}
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }));
     }
 
     pub async fn resume_scheduled_rules(&self) {
@@ -1301,6 +1383,7 @@ impl EventsService {
         rules: &[Rule],
         event: &Value,
         selected_rule_arns: Option<&[String]>,
+        accepted_at: Option<OffsetDateTime>,
     ) -> bool {
         let Some(registry) = self.registry.upgrade() else {
             return false;
@@ -1312,6 +1395,7 @@ impl EventsService {
                 http: self.http.as_ref(),
                 region: ctx.region,
                 account: ctx.account,
+                accepted_at: accepted_at.unwrap_or_else(OffsetDateTime::now_utc),
                 correlation: CorrelationContext {
                     flow_id: ctx.request_id.to_string(),
                     span_id: Uuid::new_v4().to_string(),
@@ -1332,6 +1416,7 @@ struct FanoutContext<'a> {
     region: &'a str,
     account: &'a str,
     correlation: CorrelationContext,
+    accepted_at: OffsetDateTime,
 }
 
 async fn fanout_rules(
@@ -1376,6 +1461,7 @@ async fn fanout_rules(
                     http: context.http,
                     region: context.region,
                     account: context.account,
+                    accepted_at: context.accepted_at,
                     correlation: context.correlation.child(),
                 },
                 &effective_target,
@@ -1801,6 +1887,7 @@ impl EventsService {
                                     http: http.as_ref(),
                                     region: &region,
                                     account: &account,
+                                    accepted_at: OffsetDateTime::now_utc(),
                                     correlation: CorrelationContext::root(),
                                 },
                                 &rules,
@@ -2656,6 +2743,11 @@ async fn deliver_rule_targets(
                 http,
                 region,
                 account,
+                accepted_at: event
+                    .get("time")
+                    .and_then(Value::as_str)
+                    .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                    .unwrap_or_else(OffsetDateTime::now_utc),
                 correlation: correlation.child(),
             },
             &effective_target,
@@ -2682,13 +2774,21 @@ async fn deliver_event_target(
         region,
         account,
         correlation,
+        accepted_at,
     } = context;
+    let mut request = DeliveryRequest::from((target, payload.clone()));
+    request.source_arn = Some(rule_arn.into());
+    request.scheduled_at = Some(accepted_at);
+    request.retry_second = Some(
+        store
+            .retry_second
+            .unwrap_or(std::time::Duration::from_secs(1)),
+    );
     if target.arn.split(':').nth(2) == Some("logs") {
-        let mut request = DeliveryRequest::from((target, payload));
-        request.source_arn = Some(rule_arn.into());
         return delivery::deliver_logs(registry, &request, region, account, rule_name, correlation)
             .await
-            .is_ok();
+            .is_ok()
+            || target.dead_letter_arn.is_none();
     }
     if let Ok(EbArn::ApiDestination {
         name,
@@ -2723,15 +2823,29 @@ async fn deliver_event_target(
         let mut delivered = false;
         if let Some((destination, connection)) = configuration {
             for attempt in 0..=target.retry.maximum_attempts {
-                match invoke_api_destination(http, &destination, &connection, &payload).await {
+                let remaining = delivery::remaining_age(&request)
+                    .unwrap_or(std::time::Duration::from_secs(86400));
+                if remaining.is_zero() {
+                    break;
+                }
+                let outcome = tokio::time::timeout(
+                    remaining,
+                    invoke_api_destination(http, &destination, &connection, &payload),
+                )
+                .await
+                .unwrap_or(ApiDelivery::RetriableFailure);
+                match outcome {
                     ApiDelivery::Success(_) => {
                         delivered = true;
                         break;
                     }
                     ApiDelivery::TerminalFailure => break,
                     ApiDelivery::RetriableFailure if attempt < target.retry.maximum_attempts => {
-                        let delay_ms = 25_u64.saturating_mul(1_u64 << attempt.min(5));
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        let delay = delivery::retry_backoff(&request).delay(attempt + 1).min(
+                            delivery::remaining_age(&request)
+                                .unwrap_or(std::time::Duration::from_secs(86400)),
+                        );
+                        tokio::time::sleep(delay).await;
                     }
                     ApiDelivery::RetriableFailure => break,
                 }
@@ -2753,19 +2867,19 @@ async fn deliver_event_target(
                     },
                     dead_letter_arn: None,
                     scheduled_at: None,
+                    retry_second: None,
                 };
                 return delivery::deliver(registry, &request, region, account)
                     .await
                     .is_ok();
             }
         }
-        return delivered;
+        return delivered || target.dead_letter_arn.is_none();
     }
-    let mut request = DeliveryRequest::from((target, payload));
-    request.source_arn = Some(rule_arn.into());
     delivery::deliver(registry, &request, region, account)
         .await
         .is_ok()
+        || target.dead_letter_arn.is_none()
 }
 
 fn validate_connection_auth(auth_type: &str, parameters: &Value) -> Result<(), EventsError> {
@@ -3199,6 +3313,27 @@ mod tests {
             &json!({"Id":"x","Arn":"arn:aws:sqs:r:a:q","Input":"{}","InputPath":"$.detail"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn classic_retry_defaults_and_explicit_zero_are_validated() {
+        let mut input = json!({"Id":"retry","Arn":"arn:aws:sqs:us-east-1:000000000000:q"});
+        let target = parse_target(&input).unwrap();
+        assert_eq!(target.retry.maximum_attempts, 185);
+        assert_eq!(target.retry.maximum_age_seconds, Some(86400));
+        input["RetryPolicy"] = json!({"MaximumRetryAttempts":0});
+        assert_eq!(parse_target(&input).unwrap().retry.maximum_attempts, 0);
+        for invalid in [
+            json!({"MaximumRetryAttempts":186}),
+            json!({"MaximumRetryAttempts":-1}),
+            json!({"MaximumRetryAttempts":1.5}),
+            json!({"MaximumEventAgeInSeconds":59}),
+            json!({"MaximumEventAgeInSeconds":86401}),
+            json!(null),
+        ] {
+            input["RetryPolicy"] = invalid;
+            assert!(parse_target(&input).is_err());
+        }
     }
 
     #[test]

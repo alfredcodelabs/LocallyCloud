@@ -842,6 +842,7 @@ async fn invoke_batch(
         },
         dead_letter_arn: None,
         scheduled_at: None,
+        retry_second: None,
     };
     let synchronous = find_string(&pipe.target_parameters, "InvocationType")
         .unwrap_or("REQUEST_RESPONSE")

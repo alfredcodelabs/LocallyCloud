@@ -38,6 +38,8 @@ pub struct AccountState {
 
 #[derive(Default)]
 pub struct EbStore {
+    pub(crate) retry_second: Option<std::time::Duration>,
+    pub(crate) memory_fanouts: std::sync::Mutex<BTreeMap<String, PendingFanout>>,
     scopes: DashMap<ScopeKey, Arc<RwLock<AccountState>>>,
     persistence: Option<Arc<StateDb>>,
     connection_crypto: Option<ConnectionCrypto>,
@@ -168,6 +170,8 @@ impl EbStore {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PendingFanout {
+    #[serde(default)]
+    pub accepted_at: Option<time::OffsetDateTime>,
     pub id: String,
     pub account: String,
     pub region: String,
