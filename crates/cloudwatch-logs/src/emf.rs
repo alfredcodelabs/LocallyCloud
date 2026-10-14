@@ -1,19 +1,28 @@
 //! CloudWatch embedded metric format (EMF) extraction for ingested log events.
+//!
+//! Follows "Specification: Embedded metric format" (CloudWatch User Guide):
+//! `_aws.Timestamp`, `CloudWatchMetrics`, and each directive's `Namespace`, `Dimensions`
+//! (at least one DimensionSet, which may itself be empty) and `Metrics` are required.
+//! Invalid namespaces, DimensionSets and metric names only drop the metrics they govern;
+//! structural violations drop every metric of the event. The log event itself is always kept.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use locallycloud_core::integration::metrics::{MetricObservation, MetricOrigin, MetricUnit};
 use serde_json::{Map, Value};
 
 use crate::model::{GroupKey, StoredEvent};
 
-const MAX_METRICS_PER_DIRECTIVE: usize = 100;
+const MAX_METRIC_DEFINITIONS_PER_EVENT: usize = 100;
 const MAX_DIMENSIONS_PER_SET: usize = 30;
 const MAX_VALUES_PER_METRIC: usize = 100;
+/// Local safety bound: the specification does not cap the number of DimensionSets.
 const MAX_DATAPOINTS_PER_EVENT: usize = 10_000;
 const MAX_NAME_LEN: usize = 255;
 const MAX_DIMENSION_NAME_LEN: usize = 250;
 const MAX_DIMENSION_VALUE_LEN: usize = 1_024;
+/// 2^360, the largest magnitude a metric value may have.
+const MAX_ABS_METRIC_VALUE: f64 = f64::from_bits(1_383 << 52);
 const PAST_WINDOW_MS: i64 = 14 * 24 * 60 * 60 * 1_000;
 const FUTURE_WINDOW_MS: i64 = 2 * 60 * 60 * 1_000;
 
@@ -29,7 +38,7 @@ pub(crate) struct EmfMetric {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EmfDocument {
-    pub timestamp_ms: Option<i64>,
+    pub timestamp_ms: i64,
     pub metrics: Vec<EmfMetric>,
 }
 
@@ -59,7 +68,7 @@ fn observations_for_event(
     let Ok(document) = parse(&event.message) else {
         return Vec::new();
     };
-    let timestamp_ms = document.timestamp_ms.unwrap_or(event.timestamp_ms);
+    let timestamp_ms = document.timestamp_ms;
     if timestamp_ms < now_ms.saturating_sub(PAST_WINDOW_MS)
         || timestamp_ms > now_ms.saturating_add(FUTURE_WINDOW_MS)
     {
@@ -100,17 +109,15 @@ pub(crate) fn parse(message: &str) -> Result<EmfDocument, EmfError> {
         .ok_or(EmfError::Invalid("_aws must be an object"))?;
     let timestamp_ms = metadata
         .get("Timestamp")
-        .map(|timestamp| {
-            timestamp
-                .as_i64()
-                .ok_or(EmfError::Invalid("Timestamp must be an integer"))
-        })
-        .transpose()?;
+        .ok_or(EmfError::Invalid("Timestamp is required"))?
+        .as_i64()
+        .ok_or(EmfError::Invalid("Timestamp must be an integer"))?;
     let directives = metadata
         .get("CloudWatchMetrics")
         .and_then(Value::as_array)
         .ok_or(EmfError::Invalid("CloudWatchMetrics must be an array"))?;
     let mut metrics = Vec::new();
+    let mut definition_count = 0_usize;
     let mut datapoints = 0_usize;
     for directive in directives {
         let directive = directive
@@ -119,19 +126,30 @@ pub(crate) fn parse(message: &str) -> Result<EmfDocument, EmfError> {
         let namespace = directive
             .get("Namespace")
             .and_then(Value::as_str)
-            .filter(|namespace| valid_name(namespace, MAX_NAME_LEN))
-            .ok_or(EmfError::Invalid("Namespace is invalid"))?;
+            .filter(|namespace| valid_text(namespace, MAX_NAME_LEN))
+            // `AWS/` is reserved for vended metrics; Monitoring would refuse these anyway,
+            // so drop the directive here instead of queueing undeliverable effects.
+            .filter(|namespace| !namespace.starts_with("AWS/"));
         let dimension_sets = dimension_sets(directive.get("Dimensions"), &root)?;
         let definitions = directive
             .get("Metrics")
             .and_then(Value::as_array)
             .ok_or(EmfError::Invalid("Metrics must be an array"))?;
-        if definitions.len() > MAX_METRICS_PER_DIRECTIVE {
-            return Err(EmfError::Invalid("too many metrics in a directive"));
+        definition_count = definition_count.saturating_add(definitions.len());
+        if definition_count > MAX_METRIC_DEFINITIONS_PER_EVENT {
+            return Err(EmfError::Invalid(
+                "too many metric definitions in one event",
+            ));
         }
         for definition in definitions {
             let definition = MetricDefinition::parse(definition)?;
-            let values = metric_values(root.get(definition.name))?;
+            let Some(name) = definition.name else {
+                continue;
+            };
+            let values = metric_values(root.get(name))?;
+            let (Some(namespace), Some(values)) = (namespace, values) else {
+                continue;
+            };
             for dimensions in &dimension_sets {
                 datapoints = datapoints.saturating_add(values.len());
                 if datapoints > MAX_DATAPOINTS_PER_EVENT {
@@ -139,7 +157,7 @@ pub(crate) fn parse(message: &str) -> Result<EmfDocument, EmfError> {
                 }
                 metrics.push(EmfMetric {
                     namespace: namespace.to_owned(),
-                    name: definition.name.to_owned(),
+                    name: name.to_owned(),
                     dimensions: dimensions.clone(),
                     values: values.clone(),
                     unit: definition.unit,
@@ -155,7 +173,8 @@ pub(crate) fn parse(message: &str) -> Result<EmfDocument, EmfError> {
 }
 
 struct MetricDefinition<'a> {
-    name: &'a str,
+    /// `None` when the name is invalid: that metric is not published.
+    name: Option<&'a str>,
     unit: MetricUnit,
     storage_resolution: u16,
 }
@@ -165,11 +184,6 @@ impl<'a> MetricDefinition<'a> {
         let definition = definition
             .as_object()
             .ok_or(EmfError::Invalid("MetricDefinition must be an object"))?;
-        let name = definition
-            .get("Name")
-            .and_then(Value::as_str)
-            .filter(|name| valid_name(name, MAX_NAME_LEN))
-            .ok_or(EmfError::Invalid("metric Name is invalid"))?;
         let unit = match definition.get("Unit") {
             None => MetricUnit::None,
             Some(unit) => unit
@@ -185,6 +199,10 @@ impl<'a> MetricDefinition<'a> {
                 _ => return Err(EmfError::Invalid("StorageResolution must be 1 or 60")),
             },
         };
+        let name = definition
+            .get("Name")
+            .and_then(Value::as_str)
+            .filter(|name| valid_text(name, MAX_NAME_LEN));
         Ok(Self {
             name,
             unit,
@@ -193,66 +211,97 @@ impl<'a> MetricDefinition<'a> {
     }
 }
 
+/// Resolves the directive's DimensionSets, dropping the ones that do not meet the
+/// specification; a repeated key inside a DimensionSet invalidates the whole document.
 fn dimension_sets(
     dimensions: Option<&Value>,
     root: &Map<String, Value>,
 ) -> Result<Vec<BTreeMap<String, String>>, EmfError> {
-    let sets = match dimensions {
-        None => return Ok(vec![BTreeMap::new()]),
-        Some(sets) => sets
-            .as_array()
-            .ok_or(EmfError::Invalid("Dimensions must be an array"))?,
-    };
+    let sets = dimensions
+        .ok_or(EmfError::Invalid("Dimensions is required"))?
+        .as_array()
+        .ok_or(EmfError::Invalid("Dimensions must be an array"))?;
     if sets.is_empty() {
-        return Ok(vec![BTreeMap::new()]);
+        return Err(EmfError::Invalid(
+            "Dimensions must contain at least one DimensionSet",
+        ));
     }
-    sets.iter()
-        .map(|set| {
-            let keys = set
-                .as_array()
-                .ok_or(EmfError::Invalid("DimensionSet must be an array"))?;
-            if keys.len() > MAX_DIMENSIONS_PER_SET {
-                return Err(EmfError::Invalid("too many dimensions in a DimensionSet"));
-            }
-            keys.iter()
-                .map(|key| {
-                    let key = key
-                        .as_str()
-                        .filter(|key| valid_name(key, MAX_DIMENSION_NAME_LEN))
-                        .ok_or(EmfError::Invalid("dimension key is invalid"))?;
-                    let value = root
-                        .get(key)
-                        .and_then(Value::as_str)
-                        .filter(|value| valid_name(value, MAX_DIMENSION_VALUE_LEN))
-                        .ok_or(EmfError::Invalid("dimension value is missing or invalid"))?;
-                    Ok((key.to_owned(), value.to_owned()))
-                })
-                .collect()
+    let mut resolved = Vec::new();
+    for set in sets {
+        let Some(keys) = set.as_array() else {
+            continue;
+        };
+        if has_duplicate_keys(keys) {
+            return Err(EmfError::Invalid(
+                "DimensionSet contains a duplicate dimension key",
+            ));
+        }
+        if let Some(dimensions) = resolve_dimension_set(keys, root) {
+            resolved.push(dimensions);
+        }
+    }
+    Ok(resolved)
+}
+
+fn has_duplicate_keys(keys: &[Value]) -> bool {
+    let mut seen = BTreeSet::new();
+    keys.iter()
+        .filter_map(Value::as_str)
+        .any(|key| !seen.insert(key))
+}
+
+fn resolve_dimension_set(
+    keys: &[Value],
+    root: &Map<String, Value>,
+) -> Option<BTreeMap<String, String>> {
+    if keys.len() > MAX_DIMENSIONS_PER_SET {
+        return None;
+    }
+    keys.iter()
+        .map(|key| {
+            let key = key.as_str().filter(|key| valid_dimension_key(key))?;
+            let value = root
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| valid_text(value, MAX_DIMENSION_VALUE_LEN))?;
+            Some((key.to_owned(), value.to_owned()))
         })
         .collect()
 }
 
-fn metric_values(target: Option<&Value>) -> Result<Vec<f64>, EmfError> {
-    let finite = |value: &Value| value.as_f64().filter(|value| value.is_finite());
-    match target {
+/// Returns `None` when a value is outside ±2^360: that metric is not published.
+fn metric_values(target: Option<&Value>) -> Result<Option<Vec<f64>>, EmfError> {
+    let numeric = |value: &Value| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or(EmfError::Invalid("metric value is not numeric"))
+    };
+    let values = match target {
         Some(Value::Array(values)) => {
             if values.len() > MAX_VALUES_PER_METRIC {
                 return Err(EmfError::Invalid("too many values for a metric"));
             }
-            values
-                .iter()
-                .map(|value| finite(value).ok_or(EmfError::Invalid("metric value is not numeric")))
-                .collect()
+            values.iter().map(numeric).collect::<Result<Vec<_>, _>>()?
         }
-        Some(value) => finite(value)
-            .map(|value| vec![value])
-            .ok_or(EmfError::Invalid("metric value is not numeric")),
-        None => Err(EmfError::Invalid("metric value is missing")),
-    }
+        Some(value) => vec![numeric(value)?],
+        None => return Err(EmfError::Invalid("metric value is missing")),
+    };
+    Ok(values
+        .iter()
+        .all(|value| value.abs() <= MAX_ABS_METRIC_VALUE)
+        .then_some(values))
 }
 
-fn valid_name(value: &str, max_len: usize) -> bool {
-    (1..=max_len).contains(&value.len()) && !value.chars().any(char::is_control)
+/// 1 to `max_len` printable ASCII characters, not only whitespace.
+fn valid_text(value: &str, max_len: usize) -> bool {
+    (1..=max_len).contains(&value.len())
+        && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        && value.bytes().any(|byte| byte != b' ')
+}
+
+fn valid_dimension_key(key: &str) -> bool {
+    valid_text(key, MAX_DIMENSION_NAME_LEN) && !key.starts_with(':')
 }
 
 #[cfg(test)]
@@ -279,8 +328,23 @@ mod tests {
         .to_string()
     }
 
+    fn base() -> Value {
+        json!({
+            "_aws": { "Timestamp": NOW_MS, "CloudWatchMetrics": [{
+                "Namespace": "App", "Dimensions": [["service"]],
+                "Metrics": [{ "Name": "Hits", "Unit": "Count" }]
+            }]},
+            "service": "api",
+            "Hits": 1
+        })
+    }
+
     fn invalid(message: Value) -> EmfError {
         parse(&message.to_string()).unwrap_err()
+    }
+
+    fn metrics(message: &Value) -> Vec<EmfMetric> {
+        parse(&message.to_string()).unwrap().metrics
     }
 
     fn event(message: String, timestamp_ms: i64) -> StoredEvent {
@@ -305,7 +369,7 @@ mod tests {
     #[test]
     fn parses_powertools_document() {
         let document = parse(&powertools_line()).unwrap();
-        assert_eq!(document.timestamp_ms, Some(NOW_MS));
+        assert_eq!(document.timestamp_ms, NOW_MS);
         assert_eq!(
             document.metrics,
             vec![EmfMetric {
@@ -382,79 +446,247 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_absent_dimensions_publish_dimensionless_metrics() {
-        for dimensions in [json!([[]]), json!([]), Value::Null] {
-            let mut directive = json!({ "Namespace": "App", "Metrics": [{ "Name": "Hits" }] });
-            if !dimensions.is_null() {
-                directive["Dimensions"] = dimensions;
+    fn missing_timestamp_yields_no_metrics() {
+        let mut message: Value = serde_json::from_str(&powertools_line()).unwrap();
+        message["_aws"].as_object_mut().unwrap().remove("Timestamp");
+        assert_eq!(
+            invalid(message.clone()),
+            EmfError::Invalid("Timestamp is required")
+        );
+        assert!(observations_for_events(
+            &group_key(),
+            &[event(message.to_string(), NOW_MS)],
+            NOW_MS
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn timestamp_must_lie_within_14_days_past_and_2_hours_future() {
+        let mut message: Value = serde_json::from_str(&powertools_line()).unwrap();
+        let observe = |message: &Value| {
+            // The event time never substitutes for `_aws.Timestamp`.
+            observations_for_events(
+                &group_key(),
+                &[event(message.to_string(), NOW_MS - 5_000)],
+                NOW_MS,
+            )
+        };
+        for timestamp in [NOW_MS - PAST_WINDOW_MS, NOW_MS + FUTURE_WINDOW_MS] {
+            message["_aws"]["Timestamp"] = json!(timestamp);
+            let observations = observe(&message);
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].timestamp_ms, timestamp);
+            assert_eq!(observations[0].unit, Some(MetricUnit::Count));
+        }
+        for timestamp in [NOW_MS - PAST_WINDOW_MS - 1, NOW_MS + FUTURE_WINDOW_MS + 1] {
+            message["_aws"]["Timestamp"] = json!(timestamp);
+            assert!(observe(&message).is_empty());
+        }
+    }
+
+    #[test]
+    fn dimensions_member_is_required() {
+        let mut message = base();
+        message["_aws"]["CloudWatchMetrics"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("Dimensions");
+        assert_eq!(
+            invalid(message),
+            EmfError::Invalid("Dimensions is required")
+        );
+    }
+
+    #[test]
+    fn dimensions_must_contain_at_least_one_dimension_set() {
+        let mut message = base();
+        message["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([]);
+        assert_eq!(
+            invalid(message),
+            EmfError::Invalid("Dimensions must contain at least one DimensionSet")
+        );
+    }
+
+    #[test]
+    fn empty_dimension_set_publishes_a_dimensionless_metric() {
+        let mut message = base();
+        message["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([[]]);
+        let metrics = metrics(&message);
+        assert_eq!(metrics.len(), 1);
+        assert!(metrics[0].dimensions.is_empty());
+    }
+
+    #[test]
+    fn duplicate_keys_within_a_dimension_set_invalidate_the_document() {
+        for sets in [
+            json!([["service", "service"]]),
+            json!([["service"], ["region", "service", "region"]]),
+        ] {
+            let mut message = base();
+            message["region"] = json!("eu");
+            message["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = sets;
+            assert_eq!(
+                invalid(message),
+                EmfError::Invalid("DimensionSet contains a duplicate dimension key")
+            );
+        }
+        let mut message = base();
+        message["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([["service"], ["service"]]);
+        assert_eq!(metrics(&message).len(), 2);
+    }
+
+    #[test]
+    fn invalid_dimension_sets_are_skipped_without_affecting_the_others() {
+        let too_many: Vec<String> = (0..31).map(|index| format!("d{index}")).collect();
+        let cases: Vec<(Value, Value)> = vec![
+            (json!(too_many), json!(null)),
+            (json!("service"), json!(null)),
+            (json!([1]), json!(null)),
+            (json!([""]), json!(null)),
+            (json!(["   "]), json!(null)),
+            (json!([":colon"]), json!(null)),
+            (json!(["k".repeat(251)]), json!(null)),
+            (json!(["clé"]), json!(null)),
+            (json!(["missing"]), json!(null)),
+            (json!(["target"]), json!(5)),
+            (json!(["target"]), json!("")),
+            (json!(["target"]), json!("  ")),
+            (json!(["target"]), json!("v".repeat(1_025))),
+            (json!(["target"]), json!("tab\tvalue")),
+            (json!(["target"]), json!("ünïcode")),
+        ];
+        for (set, target) in cases {
+            let mut message = base();
+            for key in &too_many {
+                message[key] = json!("v");
             }
-            let message = json!({
-                "_aws": { "Timestamp": NOW_MS, "CloudWatchMetrics": [directive] },
-                "Hits": 1
-            });
-            let document = parse(&message.to_string()).unwrap();
-            assert_eq!(document.metrics.len(), 1);
-            assert!(document.metrics[0].dimensions.is_empty());
+            message["clé"] = json!("v");
+            message[":colon"] = json!("v");
+            message["target"] = target;
+            message["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([set, ["service"]]);
+            let metrics = metrics(&message);
+            assert_eq!(metrics.len(), 1, "{set}");
+            assert_eq!(
+                metrics[0].dimensions,
+                BTreeMap::from([("service".into(), "api".into())])
+            );
+        }
+
+        let mut message = base();
+        for key in &too_many[..30] {
+            message[key] = json!("v");
+        }
+        message["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([too_many[..30]]);
+        assert_eq!(metrics(&message)[0].dimensions.len(), 30);
+        message["k".repeat(250)] = json!("v".repeat(1_024));
+        message["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([["k".repeat(250)]]);
+        assert_eq!(metrics(&message).len(), 1);
+    }
+
+    #[test]
+    fn invalid_namespace_drops_only_its_directive() {
+        for namespace in [
+            json!(7),
+            json!(""),
+            json!("   "),
+            json!("n".repeat(256)),
+            json!("Spaß"),
+            json!(null),
+            json!("AWS/Lambda"),
+        ] {
+            let mut message = base();
+            let mut skipped = message["_aws"]["CloudWatchMetrics"][0].clone();
+            skipped["Namespace"] = namespace;
+            message["_aws"]["CloudWatchMetrics"]
+                .as_array_mut()
+                .unwrap()
+                .insert(0, skipped);
+            let metrics = metrics(&message);
+            assert_eq!(metrics.len(), 1);
+            assert_eq!(metrics[0].namespace, "App");
+        }
+        let mut message = base();
+        message["_aws"]["CloudWatchMetrics"][0]["Namespace"] = json!("n".repeat(255));
+        assert_eq!(metrics(&message).len(), 1);
+    }
+
+    #[test]
+    fn invalid_metric_name_drops_only_that_metric() {
+        for name in [
+            json!(null),
+            json!(3),
+            json!(""),
+            json!(" "),
+            json!("m".repeat(256)),
+        ] {
+            let mut message = base();
+            message["_aws"]["CloudWatchMetrics"][0]["Metrics"] =
+                json!([{ "Name": name }, { "Name": "Hits" }]);
+            let metrics = metrics(&message);
+            assert_eq!(metrics.len(), 1);
+            assert_eq!(metrics[0].name, "Hits");
         }
     }
 
     #[test]
-    fn missing_targets_invalidate_the_event() {
-        let missing_value = json!({
-            "_aws": { "Timestamp": NOW_MS, "CloudWatchMetrics": [{
-                "Namespace": "App", "Dimensions": [[]], "Metrics": [{ "Name": "Hits" }]
-            }]}
-        });
+    fn metric_values_beyond_two_to_the_360_drop_only_that_metric() {
+        let limit = 2_f64.powi(360);
+        assert_eq!(MAX_ABS_METRIC_VALUE, limit);
+        let mut message = base();
+        message["_aws"]["CloudWatchMetrics"][0]["Metrics"] =
+            json!([{ "Name": "Huge" }, { "Name": "Hits" }]);
+        for huge in [json!(limit * 2.0), json!([1, -limit * 2.0])] {
+            message["Huge"] = huge;
+            let metrics = metrics(&message);
+            assert_eq!(metrics.len(), 1);
+            assert_eq!(metrics[0].name, "Hits");
+        }
+        message["Huge"] = json!([limit, -limit]);
+        assert_eq!(metrics(&message).len(), 2);
+    }
+
+    #[test]
+    fn more_than_100_metric_definitions_per_event_drop_every_metric() {
+        let mut message = base();
+        let directive = message["_aws"]["CloudWatchMetrics"][0].clone();
+        let mut directives = vec![directive.clone(), directive];
+        directives[0]["Metrics"] = json!(vec![json!({ "Name": "Hits" }); 50]);
+        directives[1]["Metrics"] = json!(vec![json!({ "Name": "Hits" }); 50]);
+        message["_aws"]["CloudWatchMetrics"] = json!(directives);
+        assert_eq!(metrics(&message).len(), 100);
+        message["_aws"]["CloudWatchMetrics"][1]["Metrics"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "Name": "Hits" }));
         assert_eq!(
-            invalid(missing_value),
-            EmfError::Invalid("metric value is missing")
-        );
-        let missing_dimension = json!({
-            "_aws": { "Timestamp": NOW_MS, "CloudWatchMetrics": [{
-                "Namespace": "App", "Dimensions": [["service"]], "Metrics": [{ "Name": "Hits" }]
-            }]},
-            "Hits": 1
-        });
-        assert_eq!(
-            invalid(missing_dimension),
-            EmfError::Invalid("dimension value is missing or invalid")
+            invalid(message),
+            EmfError::Invalid("too many metric definitions in one event")
         );
     }
 
     #[test]
-    fn enforces_dimension_metric_and_value_limits() {
-        let mut root = json!({ "Hits": 1 });
-        let keys: Vec<String> = (0..31).map(|index| format!("d{index}")).collect();
-        for key in &keys {
-            root[key] = json!("v");
-        }
-        root["_aws"] = json!({ "Timestamp": NOW_MS, "CloudWatchMetrics": [{
-            "Namespace": "App", "Dimensions": [keys], "Metrics": [{ "Name": "Hits" }]
-        }]});
+    fn more_than_100_values_in_a_metric_array_drop_every_metric() {
+        let mut message = base();
+        message["Hits"] = json!(vec![1; 100]);
+        assert_eq!(metrics(&message)[0].values.len(), 100);
+        message["_aws"]["CloudWatchMetrics"][0]["Metrics"] =
+            json!([{ "Name": "Hits" }, { "Name": "Other" }]);
+        message["Other"] = json!(1);
+        message["Hits"] = json!(vec![1; 101]);
         assert_eq!(
-            invalid(root.clone()),
-            EmfError::Invalid("too many dimensions in a DimensionSet")
-        );
-        root["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([keys[..30]]);
-        assert_eq!(parse(&root.to_string()).unwrap().metrics.len(), 1);
-
-        let definitions: Vec<_> = (0..101).map(|_| json!({ "Name": "Hits" })).collect();
-        root["_aws"]["CloudWatchMetrics"][0]["Metrics"] = json!(definitions);
-        assert_eq!(
-            invalid(root.clone()),
-            EmfError::Invalid("too many metrics in a directive")
-        );
-
-        root["_aws"]["CloudWatchMetrics"][0]["Metrics"] = json!([{ "Name": "Hits" }]);
-        root["Hits"] = json!(vec![1; 101]);
-        assert_eq!(
-            invalid(root.clone()),
+            invalid(message),
             EmfError::Invalid("too many values for a metric")
         );
-        root["Hits"] = json!(vec![1; 100]);
+    }
+
+    #[test]
+    fn missing_metric_target_invalidates_the_event() {
+        let mut message = base();
+        message.as_object_mut().unwrap().remove("Hits");
         assert_eq!(
-            parse(&root.to_string()).unwrap().metrics[0].values.len(),
-            100
+            invalid(message),
+            EmfError::Invalid("metric value is missing")
         );
     }
 
@@ -474,16 +706,6 @@ mod tests {
 
     #[test]
     fn rejects_wrong_member_types() {
-        let base = || {
-            json!({
-                "_aws": { "Timestamp": NOW_MS, "CloudWatchMetrics": [{
-                    "Namespace": "App", "Dimensions": [["service"]],
-                    "Metrics": [{ "Name": "Hits", "Unit": "Count" }]
-                }]},
-                "service": "api",
-                "Hits": 1
-            })
-        };
         type Mutation = fn(&mut Value);
         let cases: Vec<(Mutation, &str)> = vec![
             (|doc| doc["_aws"] = json!("x"), "_aws must be an object"),
@@ -500,24 +722,20 @@ mod tests {
                 "CloudWatchMetrics must be an array",
             ),
             (
-                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Namespace"] = json!(7),
-                "Namespace is invalid",
+                |doc| doc["_aws"]["CloudWatchMetrics"][0] = json!([]),
+                "MetricDirective must be an object",
             ),
             (
-                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Namespace"] = json!(""),
-                "Namespace is invalid",
+                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!({}),
+                "Dimensions must be an array",
             ),
             (
-                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!(["service"]),
-                "DimensionSet must be an array",
+                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Metrics"] = json!({}),
+                "Metrics must be an array",
             ),
             (
-                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Dimensions"] = json!([[1]]),
-                "dimension key is invalid",
-            ),
-            (
-                |doc| doc["service"] = json!(5),
-                "dimension value is missing or invalid",
+                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Metrics"][0] = json!("Hits"),
+                "MetricDefinition must be an object",
             ),
             (
                 |doc| doc["_aws"]["CloudWatchMetrics"][0]["Metrics"][0]["Unit"] = json!("Widgets"),
@@ -529,10 +747,6 @@ mod tests {
                         json!(30)
                 },
                 "StorageResolution must be 1 or 60",
-            ),
-            (
-                |doc| doc["_aws"]["CloudWatchMetrics"][0]["Metrics"][0]["Name"] = json!(null),
-                "metric Name is invalid",
             ),
             (
                 |doc| doc["Hits"] = json!("1"),
@@ -553,30 +767,6 @@ mod tests {
             assert_eq!(invalid(document), EmfError::Invalid(reason));
         }
         assert!(parse(&base().to_string()).is_ok());
-    }
-
-    #[test]
-    fn timestamp_defaults_to_event_time_and_out_of_window_events_are_skipped() {
-        let mut message: Value = serde_json::from_str(&powertools_line()).unwrap();
-        message["_aws"].as_object_mut().unwrap().remove("Timestamp");
-        let observations = observations_for_events(
-            &group_key(),
-            &[event(message.to_string(), NOW_MS - 5_000)],
-            NOW_MS,
-        );
-        assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].timestamp_ms, NOW_MS - 5_000);
-        assert_eq!(observations[0].unit, Some(MetricUnit::Count));
-
-        for timestamp in [NOW_MS - PAST_WINDOW_MS - 1, NOW_MS + FUTURE_WINDOW_MS + 1] {
-            message["_aws"]["Timestamp"] = json!(timestamp);
-            assert!(observations_for_events(
-                &group_key(),
-                &[event(message.to_string(), NOW_MS)],
-                NOW_MS
-            )
-            .is_empty());
-        }
     }
 
     #[test]

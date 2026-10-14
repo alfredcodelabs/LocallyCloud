@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, Weak};
 
-use locallycloud_core::integration::metrics::EmitOutcome;
+use locallycloud_core::integration::metrics::{EmitOutcome, MetricObservation, MetricSink};
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -53,6 +53,31 @@ impl Drop for MetricDeliveryWorker {
     }
 }
 
+async fn emit(
+    sink: &dyn MetricSink,
+    observations: Vec<MetricObservation>,
+    durable: bool,
+) -> EmitOutcome {
+    if durable {
+        sink.emit_durable(observations).await
+    } else {
+        sink.try_emit(observations)
+    }
+}
+
+/// Settle effects in the store: delivered (or permanently refused) effects are removed, the
+/// rest are marked failed for retry. Returns false when the store could not be updated.
+async fn finish(store: &Arc<LogsStore>, ids: Vec<u64>, settled: bool) -> bool {
+    if ids.is_empty() {
+        return true;
+    }
+    let owned = store.clone();
+    matches!(
+        tokio::task::spawn_blocking(move || owned.finish_metric_effects(&ids, settled)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc<Notify>) {
     loop {
         tokio::select! { _=notify.notified()=>{}, _=tokio::time::sleep(std::time::Duration::from_secs(5))=>{} }
@@ -63,7 +88,7 @@ async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc
             };
             let ids: Vec<_> = effects.iter().map(|effect| effect.id).collect();
             let durable = store.persistence().is_some();
-            let observations = effects
+            let observations: Vec<MetricObservation> = effects
                 .into_iter()
                 .map(|effect| {
                     let mut observation = effect.observation;
@@ -76,17 +101,32 @@ async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc
             let sink = registry
                 .upgrade()
                 .and_then(|registry| registry.metric_sink(&ServiceName::new("monitoring")));
-            let outcome = match sink {
-                Some(sink) if durable => sink.emit_durable(observations).await,
-                Some(sink) => sink.try_emit(observations),
-                None => EmitOutcome::Unavailable,
+            let Some(sink) = sink else {
+                let _ = finish(&store, ids, false).await;
+                break;
             };
-            let delivered = outcome == EmitOutcome::Accepted;
-            let owned = store.clone();
-            let finished =
-                tokio::task::spawn_blocking(move || owned.finish_metric_effects(&ids, delivered))
-                    .await;
-            if !matches!(finished, Ok(Ok(()))) || !delivered {
+            let outcome = emit(sink.as_ref(), observations.clone(), durable).await;
+            let (settled, retry) = match outcome {
+                EmitOutcome::Accepted => (ids, Vec::new()),
+                // A permanently refused batch must not wedge the queue: deliver its effects
+                // one by one and discard only those Monitoring can never accept.
+                EmitOutcome::Dropped => {
+                    let mut settled = Vec::new();
+                    let mut retry = Vec::new();
+                    for (id, observation) in ids.into_iter().zip(observations) {
+                        match emit(sink.as_ref(), vec![observation], durable).await {
+                            EmitOutcome::Accepted | EmitOutcome::Dropped => settled.push(id),
+                            _ => retry.push(id),
+                        }
+                    }
+                    (settled, retry)
+                }
+                _ => (Vec::new(), ids),
+            };
+            let settled_ok = finish(&store, settled, true).await;
+            let retry_empty = retry.is_empty();
+            let retry_ok = finish(&store, retry, false).await;
+            if !settled_ok || !retry_ok || !retry_empty {
                 break;
             }
         }

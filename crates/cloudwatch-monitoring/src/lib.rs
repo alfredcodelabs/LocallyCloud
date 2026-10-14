@@ -157,12 +157,19 @@ impl MonitoringDomain {
 
 impl MonitoringDomain {
     /// Restore authenticated committed samples; ingress timestamp limits are not retention.
+    ///
+    /// Samples persisted before `AWS/` was reserved for `AwsService` (for example EMF or
+    /// metric-filter output) are skipped instead of failing startup. The crate has no logging
+    /// dependency, so the skip is silent; the rows stay in the database untouched.
     fn restore(
         observations: Vec<MetricObservation>,
         persistence: Arc<persistence::Persistence>,
     ) -> Result<Self, MonitoringError> {
         let mut series: BTreeMap<ScopeKey, BTreeMap<MetricKey, Vec<MetricPoint>>> = BTreeMap::new();
         for observation in observations {
+            if uses_reserved_namespace(&observation) {
+                continue;
+            }
             validate_observation_shape(&observation)?;
             let scope = ScopeKey {
                 account_id: observation.account_id,
@@ -218,6 +225,16 @@ impl MetricSink for MonitoringMetricSink {
     async fn emit_durable(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
         if self.domain.persistence.is_none() {
             return EmitOutcome::Unavailable;
+        }
+        // Invalid observations can never be committed: report them as permanently dropped so
+        // producers do not retry them as if Monitoring were temporarily unavailable.
+        if observations.is_empty()
+            || observations.len() > MAX_METRIC_DATA
+            || observations
+                .iter()
+                .any(|observation| validate_observation(observation).is_err())
+        {
+            return EmitOutcome::Dropped;
         }
         let domain = self.domain.clone();
         match tokio::task::spawn_blocking(move || domain.commit(observations)).await {
@@ -929,14 +946,17 @@ fn validate_observation_shape(observation: &MetricObservation) -> Result<(), Mon
             "metric dimensions are outside supported limits".into(),
         ));
     }
-    if observation.origin == MetricOrigin::PublicPutMetricData
-        && observation.namespace.starts_with("AWS/")
-    {
+    if uses_reserved_namespace(observation) {
         return Err(MonitoringError::InvalidParameter(
-            "public metrics cannot use a reserved AWS namespace".into(),
+            "only AWS services can publish metrics to a reserved AWS/ namespace".into(),
         ));
     }
     Ok(())
+}
+
+/// `AWS/` namespaces are reserved for vended metrics published by native services.
+fn uses_reserved_namespace(observation: &MetricObservation) -> bool {
+    observation.origin != MetricOrigin::AwsService && observation.namespace.starts_with("AWS/")
 }
 
 fn validate_observation(observation: &MetricObservation) -> Result<(), MonitoringError> {
@@ -1318,6 +1338,80 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(weak_domain.upgrade().is_none());
         assert!(weak_alarms.upgrade().is_none());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    fn reserved_observation(origin: MetricOrigin, correlation_id: &str) -> MetricObservation {
+        MetricObservation {
+            account_id: TEST_ACCOUNT.into(),
+            region: TEST_REGION.into(),
+            namespace: "AWS/Lambda".into(),
+            metric_name: "Invocations".into(),
+            dimensions: BTreeMap::new(),
+            timestamp_ms: now_ms(),
+            value: 1.0,
+            unit: Some(MetricUnit::Count),
+            storage_resolution: 60,
+            origin,
+            correlation_id: correlation_id.into(),
+        }
+    }
+
+    #[test]
+    fn reserved_aws_namespaces_accept_only_aws_service_origin() {
+        assert!(validate_observation(&reserved_observation(MetricOrigin::AwsService, "a")).is_ok());
+        for origin in [
+            MetricOrigin::CloudWatchLogs,
+            MetricOrigin::PublicPutMetricData,
+        ] {
+            let observation = reserved_observation(origin, "b");
+            assert!(matches!(
+                validate_observation_shape(&observation),
+                Err(MonitoringError::InvalidParameter(_))
+            ));
+            let domain = MonitoringDomain::default();
+            assert!(domain.commit(vec![observation.clone()]).is_err());
+            let mut custom = observation;
+            custom.namespace = "MyApp/AWS/Lambda".into();
+            assert!(validate_observation(&custom).is_ok());
+        }
+    }
+
+    #[test]
+    fn restore_skips_legacy_reserved_namespace_samples() {
+        let path = std::env::temp_dir().join(format!(
+            "locallycloud-monitoring-reserved-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Arc::new(locallycloud_state::StateDb::open(path.join("state.sqlite3")).unwrap());
+        let persistence = Arc::new(
+            persistence::Persistence::with_cipher(
+                db,
+                locallycloud_state::StateCipher::with_key(&[9; 32]),
+            )
+            .unwrap(),
+        );
+        persistence
+            .commit(&[
+                reserved_observation(MetricOrigin::AwsService, "vended"),
+                reserved_observation(MetricOrigin::CloudWatchLogs, "emf"),
+                reserved_observation(MetricOrigin::PublicPutMetricData, "public"),
+            ])
+            .unwrap();
+        let domain =
+            MonitoringDomain::restore(persistence.load().unwrap(), persistence.clone()).unwrap();
+        let series = domain.series.read().unwrap();
+        let points: Vec<_> = series
+            .values()
+            .flat_map(|metrics| metrics.values())
+            .flatten()
+            .collect();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]._origin, MetricOrigin::AwsService);
+        drop(series);
         std::fs::remove_dir_all(path).unwrap();
     }
 

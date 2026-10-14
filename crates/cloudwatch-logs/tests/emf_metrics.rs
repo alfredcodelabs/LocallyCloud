@@ -1,5 +1,6 @@
 //! PutLogEvents with embedded metric format lines delivers metrics to the Monitoring sink.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,41 @@ impl MetricSink for RecordingSink {
     fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
         self.observations.lock().unwrap().extend(observations);
         EmitOutcome::Accepted
+    }
+}
+
+/// Records observations only while open; refuses them as `Full` otherwise.
+#[derive(Default)]
+struct GatedSink {
+    open: AtomicBool,
+    inner: RecordingSink,
+}
+
+impl MetricSink for GatedSink {
+    fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
+        if !self.open.load(Ordering::SeqCst) {
+            return EmitOutcome::Full;
+        }
+        self.inner.try_emit(observations)
+    }
+}
+
+/// Refuses any batch carrying the `Refused` namespace as permanently `Dropped`, the way
+/// Monitoring refuses observations it can never accept.
+#[derive(Default)]
+struct ReservingSink {
+    inner: RecordingSink,
+}
+
+impl MetricSink for ReservingSink {
+    fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
+        if observations
+            .iter()
+            .any(|observation| observation.namespace == "Refused")
+        {
+            return EmitOutcome::Dropped;
+        }
+        self.inner.try_emit(observations)
     }
 }
 
@@ -220,4 +256,183 @@ async fn emf_ingest_retries_earlier_and_later_puts_once_when_monitoring_recovers
     assert_eq!(observations.len(), 4, "{observations:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(sink.observations.lock().unwrap().len(), 4);
+}
+
+async fn create_group_with_error_filter(registry: &ServiceRegistry, group: &str) {
+    let body = json!({ "logGroupName": group });
+    assert_eq!(call(registry, "CreateLogGroup", body).await.0, 200);
+    let body = json!({ "logGroupName": group, "logStreamName": "s" });
+    assert_eq!(call(registry, "CreateLogStream", body).await.0, 200);
+    let filter = json!({
+        "logGroupName": group,
+        "filterName": "errors",
+        "filterPattern": "ERROR",
+        "metricTransformations": [{
+            "metricName": "ErrorCount",
+            "metricNamespace": "App",
+            "metricValue": "1"
+        }]
+    });
+    let (status, body) = call(registry, "PutMetricFilter", filter).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+async fn put_messages(registry: &ServiceRegistry, group: &str, messages: &[String], now: i64) {
+    let events: Vec<_> = messages
+        .iter()
+        .map(|message| json!({ "timestamp": now, "message": message }))
+        .collect();
+    let (status, body) = call(
+        registry,
+        "PutLogEvents",
+        json!({ "logGroupName": group, "logStreamName": "s", "logEvents": events }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("rejectedLogEventsInfo").is_none(), "{body}");
+}
+
+fn metric_names(observations: &[MetricObservation]) -> Vec<&str> {
+    let mut names: Vec<_> = observations
+        .iter()
+        .map(|observation| observation.metric_name.as_str())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+#[tokio::test]
+async fn metric_filter_and_emf_in_one_put_are_each_delivered_once() {
+    let (registry, sink) = setup();
+    create_group_with_error_filter(&registry, "/app/mixed").await;
+    let now = now_ms();
+    let mut without_timestamp: Value = serde_json::from_str(&powertools_line(now)).unwrap();
+    without_timestamp["_aws"]
+        .as_object_mut()
+        .unwrap()
+        .remove("Timestamp");
+    let mut duplicate_dimensions: Value = serde_json::from_str(&powertools_line(now)).unwrap();
+    duplicate_dimensions["_aws"]["CloudWatchMetrics"][0]["Dimensions"] =
+        json!([["service", "service"]]);
+    let messages = [
+        "ERROR payment declined".to_owned(),
+        powertools_line(now),
+        without_timestamp.to_string(),
+        duplicate_dimensions.to_string(),
+    ];
+    put_messages(&registry, "/app/mixed", &messages, now).await;
+
+    let observations = wait_for(&sink, 3).await;
+    assert_eq!(
+        metric_names(&observations),
+        ["ErrorCount", "SuccessfulBooking", "SuccessfulBooking"],
+        "{observations:?}"
+    );
+    let error = observations
+        .iter()
+        .find(|observation| observation.metric_name == "ErrorCount")
+        .unwrap();
+    assert_eq!(error.namespace, "App");
+    assert_eq!(error.value, 1.0);
+    assert_eq!(error.timestamp_ms, now);
+
+    let (status, stored) = call(
+        &registry,
+        "GetLogEvents",
+        json!({ "logGroupName": "/app/mixed", "logStreamName": "s", "startFromHead": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "{stored}");
+    let stored: Vec<_> = stored["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(stored, messages);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(sink.observations.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn deleting_the_metric_filter_keeps_pending_emf_effects() {
+    let registry = ServiceRegistry::with_known_services();
+    let sink = Arc::new(GatedSink::default());
+    registry.register_native_with_metric_sink(
+        ServiceName::new("monitoring"),
+        ServiceMetadata::new(AwsProtocol::Query, None),
+        Arc::new(StubMonitoring),
+        sink.clone(),
+    );
+    locallycloud_cloudwatch_logs::register(&registry).unwrap();
+    create_group_with_error_filter(&registry, "/app/pending").await;
+    let now = now_ms();
+    put_messages(
+        &registry,
+        "/app/pending",
+        &["ERROR payment declined".to_owned(), powertools_line(now)],
+        now,
+    )
+    .await;
+    // Let the worker hit the closed receiver so both effects stay pending.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(sink.inner.observations.lock().unwrap().is_empty());
+
+    let delete = json!({ "logGroupName": "/app/pending", "filterName": "errors" });
+    let (status, body) = call(&registry, "DeleteMetricFilter", delete).await;
+    assert_eq!(status, 200, "{body}");
+    sink.open.store(true, Ordering::SeqCst);
+    // A put without metric effects wakes the delivery worker.
+    put_messages(&registry, "/app/pending", &["INFO done".to_owned()], now).await;
+
+    let observations = wait_for(&sink.inner, 2).await;
+    assert_eq!(
+        metric_names(&observations),
+        ["SuccessfulBooking", "SuccessfulBooking"],
+        "{observations:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(sink.inner.observations.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn permanently_refused_emf_metrics_do_not_block_later_deliveries() {
+    let registry = ServiceRegistry::with_known_services();
+    let sink = Arc::new(ReservingSink::default());
+    registry.register_native_with_metric_sink(
+        ServiceName::new("monitoring"),
+        ServiceMetadata::new(AwsProtocol::Query, None),
+        Arc::new(StubMonitoring),
+        sink.clone(),
+    );
+    locallycloud_cloudwatch_logs::register(&registry).unwrap();
+    let group = json!({ "logGroupName": "/app/reserved" });
+    assert_eq!(call(&registry, "CreateLogGroup", group).await.0, 200);
+    let stream = json!({ "logGroupName": "/app/reserved", "logStreamName": "s" });
+    assert_eq!(call(&registry, "CreateLogStream", stream).await.0, 200);
+    let now = now_ms();
+    let mut reserved: Value = serde_json::from_str(&powertools_line(now)).unwrap();
+    reserved["_aws"]["CloudWatchMetrics"][0]["Namespace"] = json!("Refused");
+    put_messages(
+        &registry,
+        "/app/reserved",
+        &[reserved.to_string(), powertools_line(now)],
+        now,
+    )
+    .await;
+    let observations = wait_for(&sink.inner, 2).await;
+    assert_eq!(
+        metric_names(&observations),
+        ["SuccessfulBooking", "SuccessfulBooking"],
+        "{observations:?}"
+    );
+    assert!(observations
+        .iter()
+        .all(|observation| observation.namespace == "ServerlessAirline"));
+
+    // The refused effects were discarded, so a later put is delivered without waiting.
+    put_messages(&registry, "/app/reserved", &[powertools_line(now)], now).await;
+    let observations = wait_for(&sink.inner, 4).await;
+    assert_eq!(observations.len(), 4, "{observations:?}");
 }
