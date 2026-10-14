@@ -2,8 +2,10 @@
 
 mod alarms;
 mod authorization;
+mod metric_data;
 mod persistence;
 mod rpc_cbor;
+mod statistics;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -19,6 +21,7 @@ use locallycloud_core::integration::metrics::{
 };
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use serde_json::{json, Value};
+use statistics::{bucket_values, period_millis, Statistic};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -133,12 +136,17 @@ impl MonitoringDomain {
             .series
             .read()
             .map_err(|_| MonitoringError::Internal("monitoring store lock poisoned".into()))?;
-        Ok(series
+        // Series are kept sorted by timestamp (see `commit`/`restore`), so the requested window
+        // is located by binary search instead of scanning and cloning the whole series.
+        let points = series
             .get(scope)
             .and_then(|metrics| metrics.get(key))
-            .into_iter()
-            .flatten()
-            .filter(|point| point.timestamp_ms >= start_ms && point.timestamp_ms < end_ms)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let first = points.partition_point(|point| point.timestamp_ms < start_ms);
+        let last = points.partition_point(|point| point.timestamp_ms < end_ms);
+        Ok(points[first..last.max(first)]
+            .iter()
             .filter(|point| {
                 unit.is_none_or(|unit| point.unit.map(MetricUnit::as_str).unwrap_or("None") == unit)
             })
@@ -324,6 +332,11 @@ impl MonitoringHandler {
                 self.authorize_metric(request, &action, None)?;
                 self.get_metric_statistics(&query, &scope)?
             }
+            "GetMetricData" => {
+                self.authorize_metric(request, &action, None)?;
+                let body = metric_data::query_body(&query)?;
+                self.get_metric_data(&body, &scope)?.to_xml()?
+            }
             _ if alarms::supported(&action) => {
                 let value = alarms::query_json(&query)?;
                 let response = self.alarms.process_authorized(
@@ -388,6 +401,11 @@ impl MonitoringHandler {
             "GetMetricStatistics" => {
                 self.authorize_metric(request, action, None)?;
                 self.get_metric_statistics_json(body, scope)
+            }
+            "GetMetricData" => {
+                self.authorize_metric(request, action, None)?;
+                self.get_metric_data(body, scope)
+                    .map(|output| output.to_json())
             }
             _ if alarms::supported(action) => {
                 self.alarms
@@ -519,23 +537,17 @@ impl MonitoringHandler {
             .and_then(Value::as_u64)
             .filter(|period| *period > 0)
             .ok_or_else(|| MonitoringError::InvalidParameter("Period must be positive".into()))?;
-        let statistics: Vec<String> = json_field(body, "Statistics")
+        let statistics = json_field(body, "Statistics")
             .and_then(Value::as_array)
             .ok_or_else(|| MonitoringError::InvalidParameter("Statistics is required".into()))?
             .iter()
             .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect();
-        let allowed = ["Sum", "SampleCount", "Minimum", "Maximum", "Average"];
-        if statistics.is_empty()
-            || statistics
-                .iter()
-                .any(|statistic| !allowed.contains(&statistic.as_str()))
-        {
-            return Err(MonitoringError::InvalidParameter(
-                "Statistics contains an unsupported value".into(),
-            ));
-        }
+            .map(|name| Statistic::parse_basic(name).map(|statistic| (name, statistic)))
+            .collect::<Option<Vec<_>>>()
+            .filter(|statistics| !statistics.is_empty())
+            .ok_or_else(|| {
+                MonitoringError::InvalidParameter("Statistics contains an unsupported value".into())
+            })?;
         let key = MetricKey {
             namespace,
             metric_name: metric_name.clone(),
@@ -548,44 +560,18 @@ impl MonitoringHandler {
             end_ms,
             json_field(body, "Unit").and_then(Value::as_str),
         )?;
-        let period_ms = i64::try_from(period)
-            .ok()
-            .and_then(|period| period.checked_mul(1_000))
-            .ok_or_else(|| MonitoringError::InvalidParameter("Period is too large".into()))?;
-        let mut buckets: BTreeMap<(i64, String), Vec<MetricPoint>> = BTreeMap::new();
-        for point in points {
-            let bucket = point.timestamp_ms.div_euclid(period_ms) * period_ms;
-            let unit = point
-                .unit
-                .map(MetricUnit::as_str)
-                .unwrap_or("None")
-                .to_owned();
-            buckets.entry((bucket, unit)).or_default().push(point);
-        }
+        let period_ms = period_millis(period)?;
         let mut datapoints = Vec::new();
-        for ((timestamp_ms, _), points) in buckets.into_iter().rev() {
-            let values: Vec<f64> = points.iter().map(|point| point.value).collect();
-            let sum: f64 = values.iter().sum();
-            let count = values.len() as f64;
-            let minimum = values.iter().copied().fold(f64::INFINITY, f64::min);
-            let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let unit = points
-                .first()
-                .and_then(|point| point.unit.map(MetricUnit::as_str))
-                .unwrap_or("None");
+        for ((timestamp_ms, unit), values) in
+            bucket_values(points, period_ms, true).into_iter().rev()
+        {
             let mut datum = serde_json::Map::new();
             datum.insert("Timestamp".into(), json!(timestamp_ms as f64 / 1_000.0));
-            datum.insert("Unit".into(), json!(unit));
-            for statistic in &statistics {
-                let value = match statistic.as_str() {
-                    "Sum" => sum,
-                    "SampleCount" => count,
-                    "Minimum" => minimum,
-                    "Maximum" => maximum,
-                    "Average" => sum / count,
-                    _ => unreachable!(),
-                };
-                datum.insert(statistic.clone(), json!(value));
+            datum.insert("Unit".into(), json!(unit.unwrap_or("None")));
+            for (name, statistic) in &statistics {
+                if let Some(value) = statistic.compute(&values) {
+                    datum.insert((*name).to_owned(), json!(value));
+                }
             }
             datapoints.push(Value::Object(datum));
         }
@@ -695,15 +681,11 @@ impl MonitoringHandler {
                 "Statistics must contain at least one member".into(),
             ));
         }
-        let allowed = ["Sum", "SampleCount", "Minimum", "Maximum", "Average"];
-        if statistics
+        let statistics = statistics
             .iter()
-            .any(|statistic| !allowed.contains(&statistic.as_str()))
-        {
-            return Err(MonitoringError::InvalidParameter(
-                "unsupported statistic".into(),
-            ));
-        }
+            .map(|name| Statistic::parse_basic(name).map(|statistic| (name, statistic)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| MonitoringError::InvalidParameter("unsupported statistic".into()))?;
         let key = MetricKey {
             namespace,
             metric_name: metric_name.clone(),
@@ -712,44 +694,18 @@ impl MonitoringHandler {
         let points = self
             .domain
             .points(scope, &key, start_ms, end_ms, query.get("Unit"))?;
-        let period_ms = i64::try_from(period)
-            .ok()
-            .and_then(|period| period.checked_mul(1_000))
-            .ok_or_else(|| MonitoringError::InvalidParameter("Period is too large".into()))?;
-        let mut buckets: BTreeMap<(i64, String), Vec<MetricPoint>> = BTreeMap::new();
-        for point in points {
-            let bucket = point.timestamp_ms.div_euclid(period_ms) * period_ms;
-            let unit = point
-                .unit
-                .map(MetricUnit::as_str)
-                .unwrap_or("None")
-                .to_owned();
-            buckets.entry((bucket, unit)).or_default().push(point);
-        }
+        let period_ms = period_millis(period)?;
         let mut datapoints = String::new();
-        for ((timestamp_ms, _), points) in buckets.into_iter().rev() {
-            let values: Vec<f64> = points.iter().map(|point| point.value).collect();
-            let sum: f64 = values.iter().sum();
-            let count = values.len() as f64;
-            let minimum = values.iter().copied().fold(f64::INFINITY, f64::min);
-            let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let unit = points
-                .first()
-                .and_then(|point| point.unit.map(MetricUnit::as_str))
-                .unwrap_or("None");
+        for ((timestamp_ms, unit), values) in
+            bucket_values(points, period_ms, true).into_iter().rev()
+        {
             let mut member = text_element("Timestamp", &format_timestamp(timestamp_ms)?);
-            for statistic in &statistics {
-                let value = match statistic.as_str() {
-                    "Sum" => sum,
-                    "SampleCount" => count,
-                    "Minimum" => minimum,
-                    "Maximum" => maximum,
-                    "Average" => sum / count,
-                    _ => unreachable!(),
-                };
-                member.push_str(&text_element(statistic, &number_text(value)));
+            for (name, statistic) in &statistics {
+                if let Some(value) = statistic.compute(&values) {
+                    member.push_str(&text_element(name, &number_text(value)));
+                }
             }
-            member.push_str(&text_element("Unit", unit));
+            member.push_str(&text_element("Unit", unit.unwrap_or("None")));
             datapoints.push_str(&format!("<member>{member}</member>"));
         }
         Ok(format!(
@@ -810,6 +766,7 @@ fn register_domain(
         "PutMetricData".into(),
         "ListMetrics".into(),
         "GetMetricStatistics".into(),
+        "GetMetricData".into(),
     ];
     metadata
         .known_actions
@@ -1149,6 +1106,16 @@ impl QueryRequest {
             .get(key)
             .map(String::as_str)
             .filter(|value| !value.is_empty())
+    }
+
+    fn has_prefix(&self, prefix: &str) -> bool {
+        self.params
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(key, _)| key.starts_with(prefix))
     }
 
     fn list(&self, prefix: &str) -> Vec<String> {

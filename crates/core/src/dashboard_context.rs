@@ -182,7 +182,9 @@ pub(crate) fn read_target(service: &str, operation: &str) -> Option<(&'static st
         ("logs", "DescribeLogGroups" | "DescribeLogStreams" | "FilterLogEvents") => {
             Some(("Logs_20140328", "1.1"))
         }
-        ("monitoring", "GetMetricStatistics") => Some(("GraniteServiceVersion20100801", "1.0")),
+        ("monitoring", "GetMetricStatistics" | "GetMetricData") => {
+            Some(("GraniteServiceVersion20100801", "1.0"))
+        }
         (
             "states",
             "ListStateMachines"
@@ -332,6 +334,11 @@ mod tests {
         assert!(read_target("secretsmanager", "GetSecretValue").is_none());
         assert!(read_target("events", "ListTargetsByRule").is_some());
         assert!(read_target("events", "PutTargets").is_none());
+        assert_eq!(
+            read_target("monitoring", "GetMetricData"),
+            Some(("GraniteServiceVersion20100801", "1.0"))
+        );
+        assert!(read_target("monitoring", "PutMetricData").is_none());
         assert!(query_read(
             "sns",
             "ListTopics",

@@ -1,6 +1,8 @@
 //! Stateless authenticated cursors, bound to scope, operation and filters.
 use super::*;
 
+const MAX_TOKEN_LEN: usize = 8192;
+
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct Cursor {
     pub(super) last_name: Option<String>,
@@ -22,6 +24,65 @@ impl Alarms {
                     .expect("in-memory cipher initialized")
             })
     }
+    /// Seal an opaque, authenticated pagination token bound to scope, action and request.
+    pub(crate) fn seal_token(
+        &self,
+        action: &str,
+        binding: &str,
+        scope: &ScopeKey,
+        plaintext: &[u8],
+    ) -> Result<String, MonitoringError> {
+        let bytes = self
+            .cipher()
+            .seal(
+                &[
+                    "monitoring-pagination",
+                    &scope.account_id,
+                    &scope.region,
+                    action,
+                    binding,
+                ],
+                plaintext,
+            )
+            .map_err(persistence::internal)?;
+        Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    }
+    /// Open a token produced by `seal_token`; `None` if it is malformed, forged or rebound.
+    pub(crate) fn open_token(
+        &self,
+        action: &str,
+        binding: &str,
+        scope: &ScopeKey,
+        token: &str,
+    ) -> Option<Vec<u8>> {
+        if token.len() > MAX_TOKEN_LEN || token.is_empty() || !token.len().is_multiple_of(2) {
+            return None;
+        }
+        let data: Vec<u8> = token
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                std::str::from_utf8(pair)
+                    .ok()
+                    .and_then(|s| u8::from_str_radix(s, 16).ok())
+            })
+            .collect::<Option<_>>()?;
+        self.cipher()
+            .open(
+                &[
+                    "monitoring-pagination",
+                    &scope.account_id,
+                    &scope.region,
+                    action,
+                    binding,
+                ],
+                &data,
+            )
+            .ok()
+            .map(|plaintext| plaintext.to_vec())
+    }
     pub(super) fn cursor(
         &self,
         action: &str,
@@ -35,35 +96,9 @@ impl Alarms {
             });
         };
         let token = token.as_str().ok_or_else(invalid_token)?;
-        if token.len() > 8192 || token.is_empty() || !token.len().is_multiple_of(2) {
-            return Err(invalid_token());
-        }
-        let data: Vec<u8> = token
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                std::str::from_utf8(pair)
-                    .ok()
-                    .and_then(|s| u8::from_str_radix(s, 16).ok())
-                    .ok_or_else(invalid_token)
-            })
-            .collect::<Result<_, _>>()?;
-        let query = binding(body);
         let plaintext = self
-            .cipher()
-            .open(
-                &[
-                    "monitoring-pagination",
-                    &scope.account_id,
-                    &scope.region,
-                    action,
-                    &query,
-                ],
-                &data,
-            )
-            .map_err(|_| invalid_token())?;
+            .open_token(action, &binding(body), scope, token)
+            .ok_or_else(invalid_token)?;
         let cursor: Cursor = serde_json::from_slice(&plaintext).map_err(|_| invalid_token())?;
         if cursor.expires <= now_ms() {
             return Err(invalid_token());
@@ -77,21 +112,12 @@ impl Alarms {
         scope: &ScopeKey,
         cursor: &Cursor,
     ) -> Result<String, MonitoringError> {
-        let query = binding(body);
-        let bytes = self
-            .cipher()
-            .seal(
-                &[
-                    "monitoring-pagination",
-                    &scope.account_id,
-                    &scope.region,
-                    action,
-                    &query,
-                ],
-                &serde_json::to_vec(cursor).map_err(persistence::internal)?,
-            )
-            .map_err(persistence::internal)?;
-        Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+        self.seal_token(
+            action,
+            &binding(body),
+            scope,
+            &serde_json::to_vec(cursor).map_err(persistence::internal)?,
+        )
     }
 }
 fn binding(body: &Value) -> String {

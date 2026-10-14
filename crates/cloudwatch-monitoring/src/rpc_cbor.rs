@@ -135,6 +135,7 @@ fn from_json(value: Value, key: &str) -> Cbor {
     if matches!(
         key,
         "Timestamp"
+            | "Timestamps"
             | "StateUpdatedTimestamp"
             | "StateTransitionedTimestamp"
             | "AlarmConfigurationUpdatedTimestamp"

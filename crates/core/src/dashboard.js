@@ -247,17 +247,48 @@
     const kv = (pairs) => h("dl", { cls: "kv" }, pairs.filter((p) => p[1] != null && p[1] !== "")
       .map(([k, v]) => h("div", null, h("dt", { text: t(k) }), h("dd", null, v))));
 
-    // ---- Charts: one GetMetricStatistics call per metric, last 60 min at 1 min ----
+    // ---- Charts: all charts of a page share one GetMetricData call, last 60 min at 1 min ----
     const charts = [];
+    async function loadCharts() {
+      const list = [...charts], controller = state.readController;
+      const end = Math.floor(Date.now() / 1000), start = end - 3600;
+      const series = {};
+      try {
+        // PartialData results continue on the next page; points are merged by query Id.
+        let token;
+        for (let page = 0; page < 50; page++) {
+          const r = await api("monitoring", "GetMetricData", {
+            MetricDataQueries: list.flatMap((c) => c.queries), StartTime: start, EndTime: end, ScanBy: "TimestampAscending", ...(token ? { NextToken: token } : {}),
+          });
+          for (const m of r.MetricDataResults || []) {
+            const s = (series[m.Id] ||= new Map());
+            (m.Timestamps || []).forEach((ts, i) => s.set(ts, m.Values[i]));
+          }
+          token = r.NextToken;
+          if (!token) break;
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) list.forEach((c) => c.fail(e));
+        return;
+      }
+      if (!controller.signal.aborted) list.forEach((c) => c.fill(series, start));
+    }
     function chart(title, ns, metric, dims, stats, fmt = fmtNum) {
       const fig = h("figure", { cls: "chart" });
-      const load = async () => {
-        const end = Math.floor(Date.now() / 1000), start = end - 3600;
-        const q = stats.includes("Average") ? [...stats, "SampleCount"] : stats;
-        const r = await api("monitoring", "GetMetricStatistics", {
-          Namespace: ns, MetricName: metric, Dimensions: dims, StartTime: start, EndTime: end, Period: 60, Statistics: q,
-        });
-        const pts = (r.Datapoints || []).toSorted((a, b) => a.Timestamp - b.Timestamp);
+      const q = stats.includes("Average") ? [...stats, "SampleCount"] : stats;
+      // Ids must match ^[a-z][a-zA-Z0-9_]*$, e.g. "c2_Average".
+      const ids = Object.fromEntries(q.map((s) => [s, "c" + charts.length + "_" + s]));
+      fig.queries = q.map((s) => ({ Id: ids[s], MetricStat: { Metric: { Namespace: ns, MetricName: metric, Dimensions: dims }, Period: 60, Stat: s } }));
+      fig.fail = (e) => fig.replaceChildren(h("figcaption", { text: title }), errBox(e));
+      fig.fill = (series, start) => {
+        const byTs = new Map();
+        for (const s of q) {
+          for (const [ts, v] of series[ids[s]] || []) {
+            if (!byTs.has(ts)) { byTs.set(ts, { Timestamp: ts }); }
+            byTs.get(ts)[s] = v;
+          }
+        }
+        const pts = [...byTs.values()].toSorted((a, b) => a.Timestamp - b.Timestamp);
         const W = 300, H = 56, x = (ts) => ((ts - start) / 3600) * W;
         const sum = (k) => pts.reduce((s, p) => s + (p[k] || 0), 0);
         const summary = stats.map((s) => {
@@ -296,8 +327,6 @@
         fig.replaceChildren(cap, h("b", { text: summary }), g,
           h("div", { cls: "axis", "aria-hidden": "true" }, h("span", { text: rtf.format(-60, "minute") }), h("span", { text: rtf.format(0, "second") })));
       };
-      fig.load = () => load().catch((e) => fig.replaceChildren(h("figcaption", { text: title }), errBox(e)));
-      fig.load();
       charts.push(fig);
       return fig;
     }
@@ -997,7 +1026,7 @@
       $("detail").replaceChildren(
         h("div", { cls: "phead" }, h("h2", { cls: "title", text: crumbs.at(-1)[0] }), h("button", { type: "button", cls: "link", text: t("refresh"), onclick: route })), h("p", { cls: "meta", id: "svcmeta" }),
         ...[page ? (id ? page[1](id) : page[0]()) : msg("noExplorer")].flat(), serviceDiagnostics());
-      if (charts.length) every(60000, () => !document.hidden && charts.forEach((c) => c.load()));
+      if (charts.length) { loadCharts(); every(60000, () => !document.hidden && loadCharts()); }
       renderSvcMeta(); renderActivity(); renderRows();
       window.scrollTo(0, 0);
     }
