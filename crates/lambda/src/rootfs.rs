@@ -166,7 +166,8 @@ class InvocationTee:
         # Read the global once: another thread may end the invocation concurrently.
         logs = invocation_logs
         if logs is not None:
-            remaining = LOG_LIMIT - log_bytes
+            # Concurrent writers can overshoot the limit; a negative slice would keep text.
+            remaining = max(0, LOG_LIMIT - log_bytes)
             # Bound the encoding allocation too, even for one very large write.
             retained = data[:remaining].encode("utf-8")[:remaining].decode("utf-8", errors="ignore") if len(logs) < 4096 else ""
             size = len(retained.encode("utf-8"))
@@ -1554,6 +1555,68 @@ exports.handler = async (event, context) => {
                 );
             }
             assert!(!logs.contains(&format!("print {}", n + 1)), "{logs:?}");
+        }
+        assert_handled_error(&run.error, "boom 3");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    const PYTHON_THREADED_HANDLER: &str = r#"import sys
+import threading
+import time
+
+errors = []
+stop = threading.Event()
+worker = None
+
+def chatter():
+    while not stop.is_set():
+        try:
+            print("background")
+            sys.stdout.write("background write\n")
+        except BaseException as error:
+            errors.append(repr(error))
+            return
+        time.sleep(0.001)
+
+def handler(event, context):
+    global worker
+    n = event["n"]
+    if worker is None:
+        worker = threading.Thread(target=chatter, daemon=True)
+        worker.start()
+    print("main {}".format(n))
+    # Keep writing from the background thread while this invocation ends.
+    time.sleep(0.05)
+    if n == 3:
+        stop.set()
+        worker.join(5)
+        raise ValueError("boom 3" if not errors else repr(errors))
+    return {"errors": list(errors)}
+"#;
+
+    #[tokio::test]
+    async fn python_ric_tolerates_background_thread_stdout() {
+        let Some(python) = find_host_executable("python3") else {
+            return;
+        };
+        let base = temp();
+        let task = base.join("task");
+        write_file(&task.join("app.py"), PYTHON_THREADED_HANDLER.as_bytes());
+        let script = base.join("bootstrap");
+        let ric = PYTHON_RIC.replacen("__PYTHON__", python.to_str().unwrap(), 1);
+        write_file(&script, ric.as_bytes());
+
+        let run = run_ric(&python, &script, "app.handler", &task).await;
+        for response in &run.responses {
+            assert_eq!(response["errors"], serde_json::json!([]));
+        }
+        for (index, logs) in run.logs.iter().enumerate() {
+            let line = format!("main {}\n", index + 1);
+            assert!(
+                logs.contains(&line),
+                "invocation {} missing {line:?}",
+                index + 1
+            );
         }
         assert_handled_error(&run.error, "boom 3");
         let _ = fs::remove_dir_all(&base);
