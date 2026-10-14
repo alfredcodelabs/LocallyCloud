@@ -307,11 +307,16 @@ struct BrowseContext {
     profile: Option<String>,
 }
 
-async fn context_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn context_handler(State(state): State<AppState>, incoming: http::HeaderMap) -> Response {
+    // Profile names and the account ID must not leak to DNS-rebinding pages.
+    if !local_dashboard_headers(&incoming) {
+        return dashboard_error("dashboard reads require the local origin", 403);
+    }
     let dashboard = state.dashboard.refreshed().await;
     Json(serde_json::json!({"accountId": state.dashboard.account_id,
         "defaultRegion": state.dashboard.default_region, "defaultProfile": "instance",
         "profiles": dashboard.profiles.iter().map(|p| serde_json::json!({"name": p.name, "region": p.region, "signed": p.credentials.is_some()})).collect::<Vec<_>>() }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -569,6 +574,33 @@ async fn dispatch_dashboard_profile(
         "x-locallycloud-dashboard",
         http::HeaderValue::from_static("1"),
     );
+    // Strict IAM never grants the dashboard an unsigned exception; explain how to sign
+    // instead of surfacing a generic signature mismatch.
+    let strict = state
+        .registry
+        .authorization_evaluator(&crate::registry::ServiceName::new("iam"))
+        .is_some_and(|evaluator| evaluator.strict_sigv4_required());
+    if strict && (profile.access_key.is_none() || profile.credentials.is_none()) {
+        // The S3 explorer parses XML; every other dashboard read expects REST-JSON errors.
+        let protocol = if service == "s3" {
+            AwsProtocol::RestXml
+        } else {
+            AwsProtocol::RestJson
+        };
+        return render(
+            AwsError::new(
+                "MissingAuthenticationToken",
+                format!(
+                    "IAM enforcement is strict and the dashboard profile '{}' has no credentials. \
+                     Select a local AWS profile whose endpoint_url targets this instance and \
+                     whose static credentials are in the shared credentials file.",
+                    profile.name
+                ),
+                403,
+            )
+            .render(protocol),
+        );
+    }
     if let (Some(access), Some(credentials)) = (&profile.access_key, &profile.credentials) {
         if crate::integration::sigv4::sign(
             method,
