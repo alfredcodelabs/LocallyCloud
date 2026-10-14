@@ -7,7 +7,7 @@
 //! bounded by the function timeout. The environment is ephemeral (stopped after the invoke);
 //! warm pooling and snapshot reuse layer on top later (task 12).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
@@ -32,9 +32,6 @@ use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::logs::{
     LogScope, ProducerContext, ProducerGroupSpec, ProducerLogEvent, ProducerStreamSpec,
 };
-use locallycloud_core::integration::metrics::{
-    EmitOutcome, MetricObservation, MetricOrigin, MetricUnit,
-};
 use locallycloud_core::proxy::{forward_to_legacy, ProxyConfig};
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use locallycloud_core::router::extract_service_from_credential_scope;
@@ -44,6 +41,7 @@ use uuid::Uuid;
 use crate::code_store::CodeStore;
 use crate::error::LambdaError;
 use crate::exec_env::{build_execution_env, ExecEnvInputs};
+use crate::metrics::LambdaMetrics;
 use crate::model::{FunctionStore, LambdaFunction, LayerStore};
 use crate::rootfs::build_rootfs;
 use crate::runtime_api::{FunctionErrorType, InvocationBroker, Outcome};
@@ -393,6 +391,8 @@ pub struct Executor {
     destination_router: Option<Arc<dyn DestinationRouter>>,
     /// Registry is resolved lazily so Logs may register after Lambda during startup.
     registry: Weak<ServiceRegistry>,
+    /// Aggregates vended `AWS/Lambda` metrics; flushed lazily to Monitoring.
+    metrics: LambdaMetrics,
     install_host_runtime: bool,
     /// Per-environment stream identity and cumulative-output cursor.
     log_state: DashMap<String, ExecutionLogState>,
@@ -521,6 +521,7 @@ impl Executor {
             secret_access_key: secret_access_key.into(),
             destination_router: None,
             registry: Weak::new(),
+            metrics: LambdaMetrics::new(Weak::new()),
             install_host_runtime: false,
             log_state: DashMap::new(),
             owned_envs: DashMap::new(),
@@ -601,6 +602,7 @@ impl Executor {
 
     /// Attach the shared service registry for lazy producer-log capability resolution.
     pub fn with_service_registry(mut self, registry: Weak<ServiceRegistry>) -> Self {
+        self.metrics = LambdaMetrics::new(registry.clone());
         self.registry = registry;
         self
     }
@@ -695,23 +697,11 @@ impl Executor {
             None => match self.cold_start(account, region, func, code).await {
                 Ok(key) => key,
                 Err(e @ LambdaError::TooManyRequests(_)) => {
-                    self.publish_throttle_metric(
-                        account,
-                        region,
-                        func,
-                        &Uuid::new_v4().to_string(),
-                    );
+                    self.publish_throttle_metric(account, region, func, "");
                     return Err(e);
                 }
                 Err(e) => {
-                    self.publish_invocation_metrics(
-                        account,
-                        region,
-                        func,
-                        &Uuid::new_v4().to_string(),
-                        true,
-                        None,
-                    );
+                    self.publish_invocation_metrics(account, region, func, true, None);
                     return Ok(InvokeResult {
                         outcome: Outcome::Error {
                             error_type: FunctionErrorType::Unhandled,
@@ -781,7 +771,6 @@ impl Executor {
             account,
             region,
             func,
-            &request_id,
             matches!(outcome, Outcome::Error { .. }),
             Some(invoke_elapsed.as_secs_f64() * 1000.0),
         );
@@ -981,84 +970,38 @@ impl Executor {
         Ok(())
     }
 
-    /// Publish the vended `AWS/Lambda` Invocations, Errors, and Duration metrics for one
-    /// invocation. Delivery is best effort and never affects the invocation result.
+    /// Record the vended `AWS/Lambda` Invocations, Errors, and Duration metrics for one
+    /// invocation into the per-minute buckets. Delivery is best effort and never affects the
+    /// invocation result.
     fn publish_invocation_metrics(
         &self,
         account: &str,
         region: &str,
         func: &LambdaFunction,
-        correlation_id: &str,
         errored: bool,
         duration_ms: Option<f64>,
     ) {
-        let mut metrics = vec![
-            ("Invocations", 1.0, MetricUnit::Count),
-            ("Errors", if errored { 1.0 } else { 0.0 }, MetricUnit::Count),
-        ];
-        if let Some(duration_ms) = duration_ms {
-            metrics.push(("Duration", duration_ms, MetricUnit::Milliseconds));
-        }
-        self.emit_lambda_metrics(account, region, func, correlation_id, &metrics);
+        self.metrics.recorder().record_invocation(
+            account,
+            region,
+            &func.function_name,
+            errored,
+            duration_ms,
+        );
     }
 
-    /// Publish the vended `AWS/Lambda` Throttles metric for a rejected invocation.
+    /// Record the vended `AWS/Lambda` Throttles metric for a rejected invocation. Aggregated
+    /// observations carry a per-batch correlation id, so the request id is not used.
     pub(crate) fn publish_throttle_metric(
         &self,
         account: &str,
         region: &str,
         func: &LambdaFunction,
-        correlation_id: &str,
+        _correlation_id: &str,
     ) {
-        self.emit_lambda_metrics(
-            account,
-            region,
-            func,
-            correlation_id,
-            &[("Throttles", 1.0, MetricUnit::Count)],
-        );
-    }
-
-    fn emit_lambda_metrics(
-        &self,
-        account: &str,
-        region: &str,
-        func: &LambdaFunction,
-        correlation_id: &str,
-        metrics: &[(&str, f64, MetricUnit)],
-    ) {
-        let Some(registry) = self.registry.upgrade() else {
-            return;
-        };
-        let Some(sink) = registry.metric_sink(&ServiceName::new("monitoring")) else {
-            tracing::debug!("CloudWatch Monitoring unavailable; Lambda metrics skipped");
-            return;
-        };
-        let timestamp_ms = now_ms();
-        let dimensions = BTreeMap::from([("FunctionName".to_string(), func.function_name.clone())]);
-        let observations = metrics
-            .iter()
-            .map(|(name, value, unit)| MetricObservation {
-                account_id: account.to_string(),
-                region: region.to_string(),
-                namespace: "AWS/Lambda".into(),
-                metric_name: (*name).to_string(),
-                dimensions: dimensions.clone(),
-                timestamp_ms,
-                value: *value,
-                unit: Some(*unit),
-                storage_resolution: 60,
-                origin: MetricOrigin::AwsService,
-                correlation_id: correlation_id.to_string(),
-            })
-            .collect();
-        let outcome = sink.try_emit(observations);
-        if outcome != EmitOutcome::Accepted {
-            tracing::debug!(
-                ?outcome,
-                "Lambda metrics not accepted by CloudWatch Monitoring"
-            );
-        }
+        self.metrics
+            .recorder()
+            .record_throttle(account, region, &func.function_name);
     }
 
     /// The global lock serializes registration with recovery across locallycloud processes.
@@ -1990,6 +1933,9 @@ impl Executor {
         for env_key in remaining {
             self.stop_env(&env_key).await;
         }
+        // Final best-effort flush; anything Monitoring cannot take now is retried by the
+        // flush task or on drop.
+        self.metrics.recorder().tick();
     }
 
     async fn cleanup_failed_start(&self, env_key: &str, lease: Option<TaskNetworkLease>) {
@@ -2324,7 +2270,10 @@ mod tests {
     use locallycloud_core::integration::logs::{
         AppendOutcome, GroupRef, InternalLogSink, SinkError, StreamRef,
     };
-    use locallycloud_core::integration::metrics::MetricSink;
+    use locallycloud_core::integration::metrics::{
+        EmitOutcome, MetricObservation, MetricOrigin, MetricSink, MetricUnit,
+    };
+    use std::collections::BTreeMap;
     use std::io::Write;
 
     /// A test `ComputeRuntime` that launches a real in-process guest: it reads the injected
@@ -3334,8 +3283,19 @@ mod tests {
             .collect()
     }
 
-    fn assert_lambda_metric_shape(observations: &[MetricObservation], request_id: &str) {
+    /// Flush the aggregated metric buckets as the periodic task would.
+    fn flush_metrics(exec: &Executor) {
+        exec.metrics.recorder().tick();
+    }
+
+    fn assert_lambda_metric_shape(observations: &[MetricObservation]) {
+        let correlation = observations
+            .first()
+            .map(|observation| observation.correlation_id.clone())
+            .unwrap_or_default();
+        assert!(correlation.starts_with("lambda-metrics:"));
         for observation in observations {
+            assert_eq!(observation.timestamp_ms % 60_000, 0);
             assert_eq!(observation.namespace, "AWS/Lambda");
             assert_eq!(observation.account_id, "000000000000");
             assert_eq!(observation.region, "us-east-1");
@@ -3343,7 +3303,7 @@ mod tests {
                 observation.dimensions,
                 BTreeMap::from([("FunctionName".to_string(), "fn".to_string())])
             );
-            assert_eq!(observation.correlation_id, request_id);
+            assert_eq!(observation.correlation_id, correlation);
             assert_eq!(observation.storage_resolution, 60);
             assert_ne!(observation.origin, MetricOrigin::PublicPutMetricData);
             let expected_unit = if observation.metric_name == "Duration" {
@@ -3369,6 +3329,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result.outcome, Outcome::Success(_)));
+        flush_metrics(&exec);
         let observations = metrics.observations.lock().unwrap().clone();
         let values = metric_values(&observations);
         assert_eq!(values[0], ("Invocations".to_string(), 1.0));
@@ -3376,7 +3337,7 @@ mod tests {
         assert_eq!(values[2].0, "Duration");
         assert!(values[2].1 >= 0.0);
         assert_eq!(values.len(), 3);
-        assert_lambda_metric_shape(&observations, result.request_id.as_deref().unwrap());
+        assert_lambda_metric_shape(&observations);
     }
 
     #[tokio::test]
@@ -3393,12 +3354,69 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result.outcome, Outcome::Error { .. }));
+        flush_metrics(&exec);
         let observations = metrics.observations.lock().unwrap().clone();
         let values = metric_values(&observations);
         assert_eq!(values[0], ("Invocations".to_string(), 1.0));
         assert_eq!(values[1], ("Errors".to_string(), 1.0));
         assert_eq!(values[2].0, "Duration");
-        assert_lambda_metric_shape(&observations, result.request_id.as_deref().unwrap());
+        assert_lambda_metric_shape(&observations);
+    }
+
+    #[tokio::test]
+    async fn timeout_emits_error_metric_and_timeout_duration() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::Hang)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        let f = func("nodejs22.x", 1, zip_with(&[("index.js", b"x")]));
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(result.outcome, Outcome::Error { .. }));
+        flush_metrics(&exec);
+        let observations = metrics.observations.lock().unwrap().clone();
+        let values = metric_values(&observations);
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0], ("Invocations".to_string(), 1.0));
+        assert_eq!(values[1], ("Errors".to_string(), 1.0));
+        assert_eq!(values[2].0, "Duration");
+        assert!(
+            (1000.0..1500.0).contains(&values[2].1),
+            "timeout Duration should match the 1s timeout, got {}",
+            values[2].1
+        );
+        assert_lambda_metric_shape(&observations);
+    }
+
+    #[tokio::test]
+    async fn failed_cold_start_emits_error_metric_without_duration() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        // A custom runtime without `bootstrap` fails before any guest starts.
+        let f = func("provided.al2", 10, zip_with(&[("index.js", b"x")]));
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(result.outcome, Outcome::Error { .. }));
+        flush_metrics(&exec);
+        let observations = metrics.observations.lock().unwrap().clone();
+        assert_eq!(
+            metric_values(&observations),
+            vec![
+                ("Invocations".to_string(), 1.0),
+                ("Errors".to_string(), 1.0)
+            ]
+        );
+        assert_lambda_metric_shape(&observations);
     }
 
     #[tokio::test]
@@ -3414,6 +3432,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.outcome, Outcome::Success(b"{\"len\":2}".to_vec()));
+        // A saturated sink keeps the bucket for the next flush instead of losing it.
+        assert_eq!(exec.metrics.recorder().tick(), 0);
+        assert_eq!(exec.metrics.recorder().pending_buckets(), 1);
     }
 
     #[tokio::test]
@@ -3428,7 +3449,8 @@ mod tests {
         let exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
             .await
             .with_service_registry(Arc::downgrade(&registry));
-        let handler = LambdaHandler::with_executor(Arc::new(exec));
+        let exec = Arc::new(exec);
+        let handler = LambdaHandler::with_executor(exec.clone());
         let request = |method: http::Method, path: &str, body: Vec<u8>| ServiceRequest {
             method,
             uri: path.parse().unwrap(),
@@ -3470,12 +3492,100 @@ mod tests {
             ))
             .await;
         assert_eq!(throttled.status(), 429);
+        flush_metrics(&exec);
         let observations = metrics.observations.lock().unwrap().clone();
         assert_eq!(
             metric_values(&observations),
             vec![("Throttles".to_string(), 1.0)]
         );
-        assert_lambda_metric_shape(&observations, "throttled-rid");
+        assert_lambda_metric_shape(&observations);
+    }
+
+    /// Refuses the first `full` batches as a saturated Monitoring channel would.
+    struct SaturatedMetrics {
+        full: Mutex<usize>,
+        observations: Mutex<Vec<MetricObservation>>,
+    }
+
+    impl MetricSink for SaturatedMetrics {
+        fn try_emit(&self, observations: Vec<MetricObservation>) -> EmitOutcome {
+            let mut full = self.full.lock().unwrap();
+            if *full > 0 {
+                *full -= 1;
+                return EmitOutcome::Full;
+            }
+            self.observations.lock().unwrap().extend(observations);
+            EmitOutcome::Accepted
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_invocations_sum_exactly_under_saturated_monitoring() {
+        const INVOCATIONS: usize = 200;
+        let metrics = Arc::new(SaturatedMetrics {
+            full: Mutex::new(3),
+            observations: Mutex::new(Vec::new()),
+        });
+        let registry = observability_registry(metrics.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let mut exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        // Room for every guest so no invocation is throttled by the host memory budget.
+        exec.memory_budget_mb = 160 * INVOCATIONS as u64;
+        let exec = Arc::new(exec);
+        exec.bind_arc();
+        let f = Arc::new(func("nodejs22.x", 30, zip_with(&[("index.js", b"x")])));
+        let ticker = {
+            let exec = exec.clone();
+            tokio::spawn(async move {
+                loop {
+                    flush_metrics(&exec);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+        };
+        let invocations: Vec<_> = (0..INVOCATIONS)
+            .map(|_| {
+                let exec = exec.clone();
+                let f = f.clone();
+                tokio::spawn(async move {
+                    exec.invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+                        .await
+                })
+            })
+            .collect();
+        for invocation in invocations {
+            let result = invocation.await.unwrap().unwrap();
+            assert_eq!(result.outcome, Outcome::Success(b"{\"len\":2}".to_vec()));
+        }
+        ticker.abort();
+        let _ = ticker.await;
+        for _ in 0..10 {
+            if exec.metrics.recorder().pending_buckets() == 0 {
+                break;
+            }
+            flush_metrics(&exec);
+        }
+        exec.shutdown().await;
+        let observations = metrics.observations.lock().unwrap().clone();
+        let sum = |name: &str| -> f64 {
+            observations
+                .iter()
+                .filter(|observation| observation.metric_name == name)
+                .map(|observation| observation.value)
+                .sum()
+        };
+        assert_eq!(*metrics.full.lock().unwrap(), 0);
+        assert_eq!(sum("Invocations"), INVOCATIONS as f64);
+        assert_eq!(sum("Errors"), 0.0);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.metric_name == "Duration")
+                .count(),
+            INVOCATIONS
+        );
     }
 
     #[tokio::test]

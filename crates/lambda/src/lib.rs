@@ -12,6 +12,7 @@ pub mod esm;
 pub mod exec_env;
 pub mod executor;
 pub mod function_url;
+mod metrics;
 pub mod model;
 mod persistence;
 pub mod rootfs;
