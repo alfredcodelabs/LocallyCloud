@@ -2370,7 +2370,17 @@ impl Interpreter {
                     .await
             }
             "events:putEvents" => {
-                self.dispatch_json("events", "AWSEvents.PutEvents", payload)
+                let mut request = payload.clone();
+                if let Some(entries) = request.get_mut("Entries").and_then(Value::as_array_mut) {
+                    for entry in entries {
+                        if let Some(detail) =
+                            entry.get_mut("Detail").filter(|detail| detail.is_object())
+                        {
+                            *detail = Value::String(detail.to_string());
+                        }
+                    }
+                }
+                self.dispatch_json("events", "AWSEvents.PutEvents", &request)
                     .await
             }
             "s3:putObject" => self.dispatch_s3("putObject", payload).await,

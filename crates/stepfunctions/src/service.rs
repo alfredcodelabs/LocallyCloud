@@ -1332,6 +1332,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optimized_eventbridge_preserves_object_and_string_details() {
+        struct EventsWire;
+        #[async_trait]
+        impl NativeHandler for EventsWire {
+            async fn handle(&self, request: ServiceRequest) -> Response {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let Some(detail) = body["Entries"][0]["Detail"].as_str() else {
+                    return http::Response::builder()
+                        .status(400)
+                        .body(Body::from(
+                            json!({"__type":"ValidationException","message":"Detail must be a string"}).to_string(),
+                        ))
+                        .unwrap();
+                };
+                json_response(json!({
+                    "FailedEntryCount": 0,
+                    "Entries": [{"EventId":"recorded"}],
+                    "ReceivedDetail": serde_json::from_str::<Value>(detail).unwrap(),
+                }))
+            }
+        }
+        let reg = registry();
+        reg.register_native(
+            ServiceName::new("events"),
+            ServiceMetadata::new(AwsProtocol::Json11, Some("AWSEvents")),
+            Arc::new(EventsWire),
+        );
+        let h = handler(&reg, "states");
+        let expected = json!({"payment_id":"payment-7","nested":{"tags":["á",7]}});
+        for (name, field, language, detail) in [
+            (
+                "object-jsonpath",
+                "Parameters",
+                "JSONPath",
+                expected.clone(),
+            ),
+            ("object-jsonata", "Arguments", "JSONata", expected.clone()),
+            (
+                "string-jsonata",
+                "Arguments",
+                "JSONata",
+                json!(expected.to_string()),
+            ),
+        ] {
+            let mut task = json!({
+                "Type":"Task", "Resource":"arn:aws:states:::events:putEvents", "End":true,
+            });
+            task[field] = json!({"Entries":[{
+                "Source":"payment-store", "DetailType":"payment.received", "Detail":detail,
+            }]});
+            let arn = create_sm(
+                &h,
+                name,
+                json!({
+                    "QueryLanguage":language, "StartAt":"Emit", "States":{"Emit":task},
+                }),
+            )
+            .await;
+            let started = sfn(&h, "StartExecution", json!({"stateMachineArn":arn})).await;
+            let completed = await_execution(&h, started["executionArn"].as_str().unwrap()).await;
+            assert_eq!(completed["status"], "SUCCEEDED", "{completed}");
+            let output: Value =
+                serde_json::from_str(completed["output"].as_str().unwrap()).unwrap();
+            assert_eq!(output["ReceivedDetail"], expected);
+        }
+    }
+
+    #[tokio::test]
     async fn inherited_jsonata_assign_and_choice_output() {
         let reg = registry();
         let h = handler(&reg, "states");
