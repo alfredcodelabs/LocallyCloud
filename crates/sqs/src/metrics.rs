@@ -3,11 +3,14 @@
 //! Operation counters are aggregated in memory into one-minute buckets per queue (the AWS
 //! one-minute granularity) so traffic never turns into one observation per API call;
 //! `SentMessageSize` keeps one sample per message, capped per bucket. A sampler task flushes
-//! the buckets and samples the queue-depth gauges every period. It starts lazily on first
-//! queue use and exits once there are no queues and nothing is pending, so an idle SQS service
-//! runs no background work. Delivery is best effort and never affects an SQS API result.
+//! the buckets and samples the queue-depth gauges every period. As in CloudWatch, gauges are
+//! only sampled for *active* queues: a queue stays active for six hours after any API action
+//! accesses it and while it contains messages. The sampler starts lazily on first queue use and
+//! exits once no queue is active and nothing is pending, so an idle SQS service runs no
+//! background work. Delivery is best effort and never affects an SQS API result.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,10 +21,12 @@ use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use tokio::task::JoinHandle;
 
 use crate::model::QueueArn;
-use crate::store::{QueueState, SqsStore};
+use crate::store::{GuardedQueue, QueueState, SqsStore};
 
 const NAMESPACE: &str = "AWS/SQS";
 const SAMPLE_PERIOD: Duration = Duration::from_secs(60);
+/// CloudWatch considers a queue active for up to six hours after messages or API access.
+const INACTIVITY_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 const MINUTE_MS: i64 = 60_000;
 /// Monitoring rejects batches above 1000 observations.
 const MAX_BATCH: usize = 1_000;
@@ -56,7 +61,7 @@ pub(crate) fn message_counts(state: &QueueState, now: Instant) -> (u64, u64, u64
     counts
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -68,6 +73,7 @@ pub struct MetricsRecorder {
     store: Arc<SqsStore>,
     registry: Weak<ServiceRegistry>,
     period: Duration,
+    inactivity_ms: i64,
     pending: Mutex<BTreeMap<BucketKey, Counters>>,
     sampler: Mutex<Option<JoinHandle<()>>>,
 }
@@ -97,6 +103,15 @@ impl MetricsRecorder {
         if count > 0 {
             self.record(arn, |counters| counters.deleted += count as u64);
         }
+    }
+
+    /// Record that an API action accessed the queue (successful or not, as in CloudWatch).
+    pub fn mark_active(&self, queue: &GuardedQueue) {
+        queue.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    fn is_active(&self, queue: &GuardedQueue, now: i64) -> bool {
+        now.saturating_sub(queue.last_activity_ms.load(Ordering::Relaxed)) <= self.inactivity_ms
     }
 
     /// Start the gauge sampler on queue use (no-op when already running).
@@ -161,7 +176,15 @@ impl MetricsRecorder {
         };
         while !observations.is_empty() {
             let rest = observations.split_off(observations.len().min(MAX_BATCH));
-            let outcome = sink.try_emit(std::mem::replace(&mut observations, rest));
+            let mut batch = std::mem::replace(&mut observations, rest);
+            // Monitoring persistence deduplicates by (correlation, ordinal in batch). A minute's
+            // counters can be flushed by two ticks, so each batch needs its own correlation id
+            // or the second flush would be silently ignored.
+            let correlation_id = format!("sqs-metrics:{}", uuid::Uuid::new_v4());
+            for observation in &mut batch {
+                observation.correlation_id.clone_from(&correlation_id);
+            }
+            let outcome = sink.try_emit(batch);
             if outcome != EmitOutcome::Accepted {
                 tracing::debug!(?outcome, "AWS/SQS metric batch not accepted");
             }
@@ -177,12 +200,19 @@ impl MetricsRecorder {
             .unwrap_or(false)
     }
 
-    /// Exit when no queue exists and nothing is pending; decided under the sampler lock.
-    fn should_stop(&self) -> bool {
+    /// Exit when no queue is active and nothing is pending; decided under the sampler lock so
+    /// activity marked before a concurrent `touch` is always observed. Queues holding messages
+    /// had their activity refreshed by the preceding gauge sample.
+    pub(crate) fn should_stop(&self) -> bool {
         let Ok(mut sampler) = self.sampler.lock() else {
             return true;
         };
-        let idle = self.store.is_empty()
+        let now = now_ms();
+        let idle = !self
+            .store
+            .all()
+            .iter()
+            .any(|queue| self.is_active(queue, now))
             && self
                 .pending
                 .lock()
@@ -241,6 +271,15 @@ impl MetricsRecorder {
                 let state = queue.state.lock().await;
                 let cutoff =
                     timestamp.saturating_sub(state.retention_period().saturating_mul(1_000));
+                if state
+                    .messages
+                    .iter()
+                    .any(|message| message.sent_timestamp_ms > cutoff)
+                {
+                    queue.last_activity_ms.store(timestamp, Ordering::Relaxed);
+                } else if !self.is_active(&queue, timestamp) {
+                    continue;
+                }
                 let (visible, not_visible, delayed) = message_counts(&state, Instant::now());
                 let oldest = state
                     .messages
@@ -255,9 +294,11 @@ impl MetricsRecorder {
                     .min();
                 (visible, not_visible, delayed, oldest)
             };
-            let age = oldest.map_or(0, |sent| timestamp.saturating_sub(sent).max(0) / 1_000);
+            // Reported only while the queue holds at least one eligible (unexpired,
+            // non-poison) message.
+            let age = oldest.map(|sent| timestamp.saturating_sub(sent).max(0) / 1_000);
             let arn = &queue.arn;
-            for (name, value, unit) in [
+            let gauges = [
                 (
                     "ApproximateNumberOfMessagesVisible",
                     visible as f64,
@@ -273,12 +314,15 @@ impl MetricsRecorder {
                     delayed as f64,
                     MetricUnit::Count,
                 ),
+            ];
+            let age = age.map(|age| {
                 (
                     "ApproximateAgeOfOldestMessage",
                     age as f64,
                     MetricUnit::Seconds,
-                ),
-            ] {
+                )
+            });
+            for (name, value, unit) in gauges.into_iter().chain(age) {
                 observations.push(observation(
                     &arn.account,
                     &arn.region,
@@ -322,7 +366,8 @@ fn observation(
         unit: Some(unit),
         storage_resolution: 60,
         origin: VENDED_ORIGIN,
-        correlation_id: format!("sqs:{metric_name}:{timestamp_ms}"),
+        // Replaced by a per-batch id in `tick`.
+        correlation_id: String::new(),
     }
 }
 
@@ -348,24 +393,36 @@ pub struct SqsMetrics {
 
 impl SqsMetrics {
     pub fn new(store: Arc<SqsStore>, registry: Weak<ServiceRegistry>) -> Self {
-        Self::build(store, registry, SAMPLE_PERIOD)
+        Self::build(store, registry, SAMPLE_PERIOD, INACTIVITY_WINDOW)
     }
 
     #[cfg(test)]
-    pub(crate) fn with_period(
+    pub(crate) fn with_timing(
         store: Arc<SqsStore>,
         registry: Weak<ServiceRegistry>,
         period: Duration,
+        inactivity: Option<Duration>,
     ) -> Self {
-        Self::build(store, registry, period)
+        Self::build(
+            store,
+            registry,
+            period,
+            inactivity.unwrap_or(INACTIVITY_WINDOW),
+        )
     }
 
-    fn build(store: Arc<SqsStore>, registry: Weak<ServiceRegistry>, period: Duration) -> Self {
+    fn build(
+        store: Arc<SqsStore>,
+        registry: Weak<ServiceRegistry>,
+        period: Duration,
+        inactivity: Duration,
+    ) -> Self {
         Self {
             recorder: Arc::new(MetricsRecorder {
                 store,
                 registry,
                 period,
+                inactivity_ms: i64::try_from(inactivity.as_millis()).unwrap_or(i64::MAX),
                 pending: Mutex::new(BTreeMap::new()),
                 sampler: Mutex::new(None),
             }),

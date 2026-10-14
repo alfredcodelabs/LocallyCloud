@@ -61,8 +61,18 @@ impl SqsHandler {
 
     #[cfg(test)]
     fn with_metrics_period(registry: &Arc<ServiceRegistry>, period: std::time::Duration) -> Self {
+        Self::with_metrics_timing(registry, period, None)
+    }
+
+    #[cfg(test)]
+    fn with_metrics_timing(
+        registry: &Arc<ServiceRegistry>,
+        period: std::time::Duration,
+        inactivity: Option<std::time::Duration>,
+    ) -> Self {
         let store = Arc::new(SqsStore::new());
-        let metrics = SqsMetrics::with_period(store.clone(), Arc::downgrade(registry), period);
+        let metrics =
+            SqsMetrics::with_timing(store.clone(), Arc::downgrade(registry), period, inactivity);
         Self {
             store,
             registry: Arc::downgrade(registry),
@@ -344,25 +354,45 @@ impl NativeHandler for SqsHandler {
                 .map(str::to_owned),
             metrics: self.metrics.recorder(),
         };
-        if let Err(error) = self
+        // CloudWatch counts any action on a queue as activity, even a rejected one.
+        let accessed_queue = op != "DeleteQueue" && self.mark_queue_activity(&op, &body, &request);
+        let result = match self
             .authorize_queue_operation(&op, &body, &request, ctx.dispatcher.as_ref())
             .await
         {
-            return error_response(error, &request, protocol);
+            Ok(()) => self.dispatch(&op, &ctx, &body).await,
+            Err(error) => Err(error),
+        };
+        let resumes_metrics = accessed_queue
+            || (result.is_ok() && !matches!(op.as_str(), "ListQueues" | "DeleteQueue"));
+        if resumes_metrics {
+            ctx.metrics.touch();
         }
-        match self.dispatch(&op, &ctx, &body).await {
-            Ok(value) => {
-                if !matches!(op.as_str(), "ListQueues" | "DeleteQueue") {
-                    ctx.metrics.touch();
-                }
-                success_response(&op, value, protocol, &request.request_id)
-            }
+        match result {
+            Ok(value) => success_response(&op, value, protocol, &request.request_id),
             Err(err) => error_response(err, &request, protocol),
         }
     }
 }
 
 impl SqsHandler {
+    /// Mark the existing queue targeted by the request as active; false when none is.
+    fn mark_queue_activity(&self, op: &str, body: &Value, request: &ServiceRequest) -> bool {
+        // Only the owning account's requests count: a foreign caller must not be able to keep
+        // another account's queue (and the sampler) active.
+        let queue = match self.queue_resource(op, body, request) {
+            Ok((_, Some(arn))) if arn.account == request.account_id => self.store.get(&arn),
+            _ => None,
+        };
+        match queue {
+            Some(queue) => {
+                self.metrics.recorder().mark_active(&queue);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn queue_resource(
         &self,
         op: &str,
@@ -1586,15 +1616,15 @@ mod tests {
                     assert_eq!(status, 200);
                     assert_eq!(received["Messages"].as_array().unwrap().len(), 1);
                 }
+                let before = points(&sink, source, "ApproximateAgeOfOldestMessage").len();
                 h.metrics.recorder().tick().await;
-                let age = points(&sink, source, "ApproximateAgeOfOldestMessage")
-                    .last()
-                    .unwrap()
-                    .value;
+                let ages = points(&sink, source, "ApproximateAgeOfOldestMessage");
                 if *fifo {
-                    assert!(age >= 180.0);
+                    assert_eq!(ages.len(), before + 1);
+                    assert!(ages[before].value >= 180.0);
                 } else {
-                    assert_eq!(age, 0.0);
+                    // Only poison-pill messages remain: no eligible message, no datapoint.
+                    assert_eq!(ages.len(), before);
                 }
                 // The configured threshold is still four, independently of age exclusion.
                 assert_eq!(
@@ -1865,10 +1895,129 @@ mod tests {
                 "ApproximateNumberOfMessagesVisible",
                 "ApproximateNumberOfMessagesNotVisible",
                 "ApproximateNumberOfMessagesDelayed",
-                "ApproximateAgeOfOldestMessage",
             ] {
                 assert_eq!(gauge("idle", name).value, 0.0);
             }
+            assert!(points(&sink, "idle", "ApproximateAgeOfOldestMessage").is_empty());
+        }
+
+        const WINDOW: Duration = Duration::from_secs(3600);
+
+        /// Pretend the queue was last accessed just beyond the inactivity window.
+        fn expire_activity(h: &SqsHandler, name: &str) {
+            let queue = h
+                .store
+                .get(&QueueArn::new("us-east-1", "000000000000", name))
+                .unwrap();
+            let stale = crate::metrics::now_ms() - WINDOW.as_millis() as i64 - 1_000;
+            queue
+                .last_activity_ms
+                .store(stale, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn gauge_count(sink: &RecordingSink, queue: &str) -> usize {
+            points(sink, queue, "ApproximateNumberOfMessagesVisible").len()
+        }
+
+        #[tokio::test]
+        async fn empty_queue_reports_no_age_datapoint() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h = SqsHandler::with_metrics_timing(&registry, Duration::from_secs(3600), None);
+            let url = create(&h, "empty-age").await;
+            h.metrics.recorder().tick().await;
+            assert_eq!(gauge_count(&sink, "empty-age"), 1);
+            assert!(points(&sink, "empty-age", "ApproximateAgeOfOldestMessage").is_empty());
+
+            call(
+                &h,
+                "SendMessage",
+                json!({ "QueueUrl": url, "MessageBody": "x" }),
+            )
+            .await;
+            h.metrics.recorder().tick().await;
+            assert_eq!(
+                points(&sink, "empty-age", "ApproximateAgeOfOldestMessage").len(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_queue_stops_emitting_and_activity_resumes() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h =
+                SqsHandler::with_metrics_timing(&registry, Duration::from_secs(3600), Some(WINDOW));
+            let url = create(&h, "dormant").await;
+            let busy = create(&h, "busy").await;
+            call(
+                &h,
+                "SendMessage",
+                json!({ "QueueUrl": busy, "MessageBody": "x" }),
+            )
+            .await;
+            expire_activity(&h, "dormant");
+            expire_activity(&h, "busy");
+            h.metrics.recorder().tick().await;
+            assert_eq!(gauge_count(&sink, "dormant"), 0, "inactive empty queue");
+            assert_eq!(
+                gauge_count(&sink, "busy"),
+                1,
+                "messages keep a queue active"
+            );
+
+            // A rejected call still counts as access, as in CloudWatch.
+            let (status, _) = call(
+                &h,
+                "ChangeMessageVisibility",
+                json!({ "QueueUrl": url, "ReceiptHandle": "bogus", "VisibilityTimeout": 1 }),
+            )
+            .await;
+            assert_eq!(status, 400);
+            h.metrics.recorder().tick().await;
+            assert_eq!(gauge_count(&sink, "dormant"), 1);
+
+            expire_activity(&h, "dormant");
+            h.metrics.recorder().tick().await;
+            assert_eq!(gauge_count(&sink, "dormant"), 1);
+            call(&h, "GetQueueAttributes", json!({ "QueueUrl": url })).await;
+            h.metrics.recorder().tick().await;
+            assert_eq!(gauge_count(&sink, "dormant"), 2);
+        }
+
+        #[tokio::test]
+        async fn sampler_stops_when_every_queue_is_inactive() {
+            let (registry, sink) = registry_with_sink(EmitOutcome::Accepted);
+            let h =
+                SqsHandler::with_metrics_timing(&registry, Duration::from_millis(20), Some(WINDOW));
+            let recorder = h.metrics.recorder();
+            let url = create(&h, "sleepy").await;
+            assert!(recorder.sampler_running());
+            expire_activity(&h, "sleepy");
+            let mut stopped = false;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if !recorder.sampler_running() {
+                    stopped = true;
+                    break;
+                }
+            }
+            assert!(stopped, "sampler must exit once every queue is inactive");
+            assert!(h
+                .store
+                .exists(&QueueArn::new("us-east-1", "000000000000", "sleepy")));
+            sink.observations.lock().unwrap().clear();
+
+            call(
+                &h,
+                "SendMessage",
+                json!({ "QueueUrl": url, "MessageBody": "wake" }),
+            )
+            .await;
+            assert!(recorder.sampler_running(), "activity restarts the sampler");
+            // A queue holding messages stays active regardless of API silence.
+            expire_activity(&h, "sleepy");
+            recorder.tick().await;
+            assert!(!recorder.should_stop());
+            assert!(gauge_count(&sink, "sleepy") >= 1);
         }
 
         #[tokio::test]

@@ -1,6 +1,7 @@
 //! Region/account-scoped SQS store with per-queue guarded state and long-poll wakeups.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -112,6 +113,9 @@ pub struct GuardedQueue {
     pub fifo: bool,
     pub state: Mutex<QueueState>,
     pub notify: Notify,
+    /// Wall-clock ms of the last API access or observed message presence; drives the
+    /// CloudWatch inactivity cutoff for vended gauges.
+    pub last_activity_ms: AtomicI64,
 }
 
 type Key = (String, String, String);
@@ -190,6 +194,7 @@ impl SqsStore {
             fifo,
             state: Mutex::new(QueueState::new(attributes, tags)),
             notify: Notify::new(),
+            last_activity_ms: AtomicI64::new(crate::metrics::now_ms()),
         });
         match self.queues.entry(key(&arn)) {
             Entry::Vacant(entry) => {
