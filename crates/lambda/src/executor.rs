@@ -2129,7 +2129,14 @@ impl Executor {
         let event = crate::function_url::build_v2_event(&request)
             .to_string()
             .into_bytes();
-        let result = self.invoke_sync(account, region, func, event).await?;
+        let trace = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-amzn-trace-id"))
+            .map(|(_, value)| value.as_str());
+        let result = self
+            .invoke_sync_traced(account, region, func, event, trace)
+            .await?;
         Ok(match result.outcome {
             Outcome::Success(payload) => crate::function_url::interpret_v2_response(&payload),
             Outcome::Error { .. } => crate::function_url::error_response(),
@@ -2146,6 +2153,7 @@ impl Executor {
         func: &LambdaFunction,
         payload: Vec<u8>,
         config: &AsyncConfig,
+        incoming_trace: Option<&str>,
     ) {
         let total = config.max_retry_attempts.saturating_add(1); // initial + retries
         let mut invoke_count = 0u32;
@@ -2153,7 +2161,7 @@ impl Executor {
         for attempt in 1..=total {
             invoke_count = attempt;
             match self
-                .invoke_sync(account, region, func, payload.clone())
+                .invoke_sync_traced(account, region, func, payload.clone(), incoming_trace)
                 .await
             {
                 Ok(result) => {
@@ -3588,8 +3596,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sync_invoke_continues_caller_trace_root() {
+    const CALLER_ROOT: &str = "Root=1-5759e988-bd862e3fe1be46a994272793";
+
+    async fn trace_executor(fail: bool) -> (Executor, Arc<Mutex<Vec<String>>>) {
         let broker = Arc::new(InvocationBroker::new());
         let base = serve_runtime_api(broker.clone()).await;
         let tmp = std::env::temp_dir().join(format!("lc-exec-{}", Uuid::new_v4()));
@@ -3600,14 +3609,85 @@ mod tests {
             tmp.join("rootfs"),
             Arc::new(TraceRecordingGuest {
                 traces: traces.clone(),
+                fail,
             }),
             base,
             "http://127.0.0.1:4566",
             "test",
             "test",
         );
+        (exec, traces)
+    }
+
+    fn assert_continues_caller_root(trace: &str) {
+        assert!(
+            trace.starts_with(&format!("{CALLER_ROOT};Parent=")),
+            "{trace}"
+        );
+        assert!(!trace.contains("Parent=53995c3f42cd8ad8"), "{trace}");
+        assert!(trace.ends_with(";Sampled=0"), "{trace}");
+    }
+
+    #[tokio::test]
+    async fn async_invoke_continues_caller_trace_root_on_every_attempt() {
+        let (exec, traces) = trace_executor(true).await;
         let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
-        let root = "Root=1-5759e988-bd862e3fe1be46a994272793";
+        let cfg = AsyncConfig {
+            max_retry_attempts: 2,
+            on_success_arn: None,
+            on_failure_arn: None,
+        };
+        let incoming = format!("{CALLER_ROOT};Parent=53995c3f42cd8ad8;Sampled=1");
+        exec.invoke_async(
+            "000000000000",
+            "us-east-1",
+            &f,
+            b"{}".to_vec(),
+            &cfg,
+            Some(&incoming),
+        )
+        .await;
+        let traces = traces.lock().unwrap().clone();
+        assert_eq!(traces.len(), 3);
+        for trace in &traces {
+            assert_continues_caller_root(trace);
+        }
+        exec.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn function_url_invoke_continues_caller_trace_root() {
+        use crate::function_url::UrlRequest;
+        let (exec, traces) = trace_executor(false).await;
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let request = UrlRequest {
+            method: "GET".into(),
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            headers: vec![(
+                "X-Amzn-Trace-Id".into(),
+                format!("{CALLER_ROOT};Parent=53995c3f42cd8ad8;Sampled=1"),
+            )],
+            body: Vec::new(),
+            url_id: "abc".into(),
+            region: "us-east-1".into(),
+            account: "000000000000".into(),
+            request_id: "rid".into(),
+        };
+        exec.invoke_url("000000000000", "us-east-1", &f, request)
+            .await
+            .unwrap();
+        let traces = traces.lock().unwrap().clone();
+        assert_eq!(traces.len(), 1);
+        assert_continues_caller_root(&traces[0]);
+        exec.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sync_invoke_continues_caller_trace_root() {
+        let (exec, traces) = trace_executor(false).await;
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let root = CALLER_ROOT;
         exec.invoke_sync_traced(
             "000000000000",
             "us-east-1",
@@ -3632,6 +3712,8 @@ mod tests {
     /// A guest that records each invocation's `Lambda-Runtime-Trace-Id` header.
     struct TraceRecordingGuest {
         traces: Arc<Mutex<Vec<String>>>,
+        /// Report a handled function error so asynchronous invocations retry.
+        fail: bool,
     }
 
     #[async_trait]
@@ -3639,6 +3721,7 @@ mod tests {
         async fn start_task(&self, id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
             let api = spec.env.get("AWS_LAMBDA_RUNTIME_API").cloned().unwrap();
             let traces = self.traces.clone();
+            let outcome = if self.fail { "error" } else { "response" };
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
                 loop {
@@ -3667,7 +3750,7 @@ mod tests {
                         .push(header("Lambda-Runtime-Trace-Id"));
                     let _ = client
                         .post(format!(
-                            "http://{api}/2018-06-01/runtime/invocation/{rid}/response"
+                            "http://{api}/2018-06-01/runtime/invocation/{rid}/{outcome}"
                         ))
                         .body("null")
                         .send()
@@ -3723,7 +3806,7 @@ mod tests {
             on_success_arn: Some("arn:aws:sqs:us-east-1:000000000000:ok".into()),
             on_failure_arn: Some("arn:aws:sqs:us-east-1:000000000000:dlq".into()),
         };
-        exec.invoke_async("000000000000", "us-east-1", &f, b"hi".to_vec(), &cfg)
+        exec.invoke_async("000000000000", "us-east-1", &f, b"hi".to_vec(), &cfg, None)
             .await;
         let recs = router.records.lock().unwrap();
         assert_eq!(recs.len(), 1);
@@ -3745,7 +3828,7 @@ mod tests {
             on_success_arn: None,
             on_failure_arn: Some("arn:aws:sqs:us-east-1:000000000000:dlq".into()),
         };
-        exec.invoke_async("000000000000", "us-east-1", &f, b"{}".to_vec(), &cfg)
+        exec.invoke_async("000000000000", "us-east-1", &f, b"{}".to_vec(), &cfg, None)
             .await;
         let recs = router.records.lock().unwrap();
         assert_eq!(recs.len(), 1);

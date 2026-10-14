@@ -24,7 +24,7 @@ use locallycloud_core::integration::delivery::{
 use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::lambda::{
     LambdaCallContext, LambdaFunctionError, LambdaInternalApi, LambdaInternalError,
-    LambdaInvokeOutput, LambdaInvokeRequest, SensitivePayload,
+    LambdaInvokeOutput, LambdaInvokeRequest, SensitivePayload, MAX_TRACE_HEADER_LEN,
 };
 use locallycloud_core::integration::pattern::IntegrationPatternId;
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
@@ -1005,6 +1005,7 @@ impl LambdaHandler {
                         let registry = registry.upgrade()?;
                         let lambda = registry.lambda_api(&ServiceName::new("lambda"))?;
                         let payload = serde_json::to_vec(&event).ok()?;
+                        let trace_header = esm_trace_header(&event);
                         let output = match lambda
                             .invoke(LambdaInvokeRequest {
                                 call: LambdaCallContext {
@@ -1017,6 +1018,7 @@ impl LambdaHandler {
                                 function_name,
                                 qualifier: None,
                                 payload: SensitivePayload::new(payload),
+                                trace_header,
                             })
                             .await
                         {
@@ -1209,10 +1211,15 @@ impl LambdaHandler {
                 if cfg.on_failure_arn.is_none() {
                     cfg.on_failure_arn = func.dead_letter_arn.clone();
                 }
+                let trace = req
+                    .headers
+                    .get("x-amzn-trace-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 let (acct, reg) = (account.to_string(), region.to_string());
                 tokio::spawn(async move {
                     executor
-                        .invoke_async(&acct, &reg, &func, payload, &cfg)
+                        .invoke_async(&acct, &reg, &func, payload, &cfg, trace.as_deref())
                         .await;
                 });
                 empty_status(202)
@@ -1348,7 +1355,9 @@ impl LambdaInternalApi for LambdaHandler {
             function_name,
             qualifier,
             payload,
+            trace_header,
         } = request;
+        let trace_header = trace_header.filter(|header| header.len() <= MAX_TRACE_HEADER_LEN);
         if call.source_service.is_empty()
             || call.account_id.is_empty()
             || call.region.is_empty()
@@ -1381,11 +1390,12 @@ impl LambdaInternalApi for LambdaHandler {
         };
         let executed_version = function.version.clone();
         let result = executor
-            .invoke_sync(
+            .invoke_sync_traced(
                 &call.account_id,
                 &call.region,
                 &function,
                 payload.into_vec(),
+                trace_header.as_deref(),
             )
             .await
             .map_err(map_internal_lambda_error)?;
@@ -1408,6 +1418,24 @@ impl LambdaInternalApi for LambdaHandler {
             executed_version,
         })
     }
+}
+
+/// The `AWSTraceHeader` system attribute of a batch's first SQS record, which Lambda continues
+/// as the invocation trace. Kinesis and DynamoDB stream records carry none.
+///
+/// AWS documents that Lambda consumers propagate SQS trace context automatically and that
+/// producer traces are *linked* to the consumer's trace (X-Ray "tracing event-driven
+/// applications"). Without trace links, continuing the first record's Root is the closest local
+/// approximation: logs from producer and consumer share a Root, but batches mixing several
+/// producers only keep the first one.
+fn esm_trace_header(event: &Value) -> Option<String> {
+    event
+        .get("Records")?
+        .get(0)?
+        .get("attributes")?
+        .get("AWSTraceHeader")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn map_internal_lambda_error(error: LambdaError) -> LambdaInternalError {
@@ -2740,6 +2768,161 @@ mod tests {
             ))
             .await;
         assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn esm_trace_header_reads_first_sqs_record_system_attribute() {
+        let trace = "Root=1-5759e988-bd862e3fe1be46a994272793;Sampled=1";
+        let sqs = serde_json::json!({"Records": [
+            {"attributes": {"AWSTraceHeader": trace}},
+            {"attributes": {"AWSTraceHeader": "Root=1-00000000-000000000000000000000000"}}
+        ]});
+        assert_eq!(esm_trace_header(&sqs).as_deref(), Some(trace));
+        let kinesis = serde_json::json!({"Records": [{"kinesis": {"data": ""}}]});
+        assert_eq!(esm_trace_header(&kinesis), None);
+        assert_eq!(esm_trace_header(&serde_json::json!({"Records": []})), None);
+    }
+
+    use locallycloud_compute::runtime::{
+        ComputeRuntime, RuntimeError, TaskHandle, TaskSpec, TaskState,
+    };
+
+    /// A guest that records each invocation's `Lambda-Runtime-Trace-Id` header.
+    struct TraceRecordingGuest(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl ComputeRuntime for TraceRecordingGuest {
+        async fn start_task(&self, id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
+            let api = spec.env.get("AWS_LAMBDA_RUNTIME_API").cloned().unwrap();
+            let traces = self.0.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                loop {
+                    let Ok(next) = client
+                        .get(format!("http://{api}/2018-06-01/runtime/invocation/next"))
+                        .send()
+                        .await
+                    else {
+                        break;
+                    };
+                    if next.status() == 204 {
+                        break;
+                    }
+                    let header = |name: &str| {
+                        next.headers()
+                            .get(name)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    };
+                    let rid = header("Lambda-Runtime-Aws-Request-Id");
+                    traces
+                        .lock()
+                        .unwrap()
+                        .push(header("Lambda-Runtime-Trace-Id"));
+                    let _ = client
+                        .post(format!(
+                            "http://{api}/2018-06-01/runtime/invocation/{rid}/response"
+                        ))
+                        .body("null")
+                        .send()
+                        .await;
+                }
+            });
+            Ok(TaskHandle {
+                task_id: id.to_string(),
+                state: TaskState::Running,
+            })
+        }
+        async fn stop_task(&self, id: &str) -> Result<TaskHandle, RuntimeError> {
+            Ok(TaskHandle {
+                task_id: id.to_string(),
+                state: TaskState::Stopped,
+            })
+        }
+        async fn release_task(&self, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        async fn get_output(&self, _: &str) -> Result<String, RuntimeError> {
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_invoke_continues_caller_trace_root() {
+        use crate::code_store::CodeStore;
+        use crate::runtime_api::InvocationBroker;
+        let broker = Arc::new(InvocationBroker::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = listener.local_addr().unwrap().to_string();
+        let server_broker = broker.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, crate::runtime_api_server::router(server_broker))
+                .await
+                .unwrap()
+        });
+        let tmp = std::env::temp_dir().join(format!("lc-internal-trace-{}", uuid::Uuid::new_v4()));
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let executor = Arc::new(Executor::new(
+            broker,
+            Arc::new(CodeStore::new(tmp.join("code"))),
+            tmp.join("rootfs"),
+            Arc::new(TraceRecordingGuest(traces.clone())),
+            base,
+            "http://127.0.0.1:4566",
+            "test",
+            "test",
+        ));
+        let handler = LambdaHandler::with_executor(executor);
+        let created = handler
+            .handle(request(
+                Method::POST,
+                "/2015-03-31/functions",
+                &create_body("fn", serde_json::json!({"ZipFile": zip_base64()})),
+            ))
+            .await;
+        assert_eq!(created.status(), 201);
+        let root = "Root=1-5759e988-bd862e3fe1be46a994272793";
+        let api: &dyn LambdaInternalApi = &handler;
+        for trace_header in [
+            Some(format!("{root};Parent=53995c3f42cd8ad8;Sampled=1")),
+            Some(format!("{root};{}", "x".repeat(MAX_TRACE_HEADER_LEN))),
+            None,
+        ] {
+            api.invoke(LambdaInvokeRequest {
+                call: LambdaCallContext {
+                    source_service: "test".into(),
+                    account_id: "000000000000".into(),
+                    region: "us-east-1".into(),
+                    request_id: "rid".into(),
+                    caller_arn: None,
+                },
+                function_name: "fn".into(),
+                qualifier: None,
+                payload: SensitivePayload::new(b"{}".to_vec()),
+                trace_header,
+            })
+            .await
+            .unwrap();
+        }
+        let traces = traces.lock().unwrap().clone();
+        assert_eq!(traces.len(), 3);
+        assert!(
+            traces[0].starts_with(&format!("{root};Parent=")),
+            "{}",
+            traces[0]
+        );
+        assert!(!traces[0].contains("Parent=53995c3f42cd8ad8"));
+        assert!(traces[0].ends_with(";Sampled=0"));
+        for trace in &traces[1..] {
+            assert!(
+                trace.starts_with("Root=1-") && !trace.starts_with(root),
+                "{trace}"
+            );
+        }
+        handler.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }
 

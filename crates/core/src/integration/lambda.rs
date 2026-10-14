@@ -53,7 +53,13 @@ pub struct LambdaInvokeRequest {
     pub function_name: String,
     pub qualifier: Option<String>,
     pub payload: SensitivePayload,
+    /// Caller's `X-Amzn-Trace-Id`; the function continues its `Root` when valid. Values longer
+    /// than [`MAX_TRACE_HEADER_LEN`] are ignored rather than rejected.
+    pub trace_header: Option<String>,
 }
+
+/// Upper bound on a propagated `X-Amzn-Trace-Id` value.
+pub const MAX_TRACE_HEADER_LEN: usize = 1024;
 
 impl fmt::Debug for LambdaInvokeRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -63,6 +69,7 @@ impl fmt::Debug for LambdaInvokeRequest {
             .field("function_name", &self.function_name)
             .field("qualifier", &self.qualifier)
             .field("payload", &self.payload)
+            .field("trace_header", &self.trace_header.is_some())
             .finish()
     }
 }

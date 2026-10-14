@@ -12,6 +12,7 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 use tokio::time::timeout;
 
+use locallycloud_core::integration::lambda::MAX_TRACE_HEADER_LEN;
 use locallycloud_core::registry::ServiceRegistry;
 use locallycloud_wafv2::{WafDecision, WafEvaluator, WafRequest};
 
@@ -36,6 +37,8 @@ pub struct ExecuteCtx<'a> {
     pub request_id: &'a str,
     pub waf: Option<std::sync::Arc<dyn WafEvaluator>>,
     pub trusted_peer_ip: Option<&'a str>,
+    /// Client `X-Amzn-Trace-Id`, forwarded to Lambda integrations so the trace continues.
+    pub trace_header: Option<&'a http::HeaderValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2448,6 +2451,12 @@ async fn invoke_lambda(
         .unwrap_or(ctx.region);
     let mut headers = HeaderMap::new();
     set_dispatch_authorization(&mut headers, region, "lambda")?;
+    if let Some(trace) = ctx
+        .trace_header
+        .filter(|trace| trace.len() <= MAX_TRACE_HEADER_LEN)
+    {
+        headers.insert("x-amzn-trace-id", trace.clone());
+    }
     let response = timeout(
         Duration::from_millis(timeout_millis),
         dispatcher.dispatch(&Method::POST, &uri, &headers, body, ctx.request_id),
@@ -2678,6 +2687,7 @@ mod tests {
             request_id: "rid",
             waf: None,
             trusted_peer_ip: None,
+            trace_header: None,
         };
         let method = Method::POST;
         let uri: Uri = "/source".parse().unwrap();
@@ -2775,6 +2785,7 @@ mod tests {
             request_id: "rid",
             waf: None,
             trusted_peer_ip: None,
+            trace_header: None,
         };
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", http::HeaderValue::from_static("secret"));

@@ -249,6 +249,7 @@ impl SecretsManagerHandler {
                 function_name: lambda_arn.to_owned(),
                 qualifier: None,
                 payload: SensitivePayload::new(payload),
+                trace_header: None,
             })
             .await
             .map_err(map_lambda_error)?;

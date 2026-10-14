@@ -772,6 +772,7 @@ impl NativeHandler for ApiGwHandler {
                 request_id: &request.request_id,
                 waf,
                 trusted_peer_ip: trusted_peer_ip.as_deref(),
+                trace_header: request.headers.get("x-amzn-trace-id"),
             };
             return execute::invoke(
                 &ctx,
@@ -3063,6 +3064,107 @@ mod aws_proxy_e2e {
         assert!(events[0]["multiValueHeaders"]
             .get("x-locallycloud-trusted-peer-ip")
             .is_none());
+    }
+
+    /// Records the `X-Amzn-Trace-Id` header of each Lambda invoke dispatch.
+    #[derive(Default)]
+    struct TraceLambda(std::sync::Mutex<Vec<Option<String>>>);
+
+    #[async_trait]
+    impl NativeHandler for TraceLambda {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            let trace = request
+                .headers
+                .get("x-amzn-trace-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            self.0.lock().unwrap().push(trace);
+            http::Response::builder()
+                .status(200)
+                .body(Body::from(r#"{"statusCode":200,"body":"ok"}"#))
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn aws_proxy_forwards_client_trace_header_to_lambda() {
+        let reg = ServiceRegistry::with_known_services();
+        let lambda = Arc::new(TraceLambda::default());
+        reg.register_native(
+            ServiceName::new("lambda"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            lambda.clone(),
+        );
+        reg.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &reg,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(true),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )));
+        crate::register(&reg);
+        let h = reg.native_handler(&ServiceName::new("apigateway")).unwrap();
+        let api = call(
+            &h,
+            Method::POST,
+            "/v2/apis",
+            json!({ "name": "traced", "protocolType": "HTTP" }),
+        )
+        .await;
+        let api_id = api["apiId"].as_str().unwrap().to_string();
+        let integ = call(
+            &h,
+            Method::POST,
+            &format!("/v2/apis/{api_id}/integrations"),
+            json!({ "integrationType": "AWS_PROXY", "integrationUri": "arn:aws:lambda:us-east-1:000000000000:function:f", "payloadFormatVersion": "2.0" }),
+        )
+        .await;
+        let integ_id = integ["integrationId"].as_str().unwrap().to_string();
+        call(
+            &h,
+            Method::POST,
+            &format!("/v2/apis/{api_id}/routes"),
+            json!({ "routeKey": "$default", "target": format!("integrations/{integ_id}") }),
+        )
+        .await;
+        call(
+            &h,
+            Method::POST,
+            &format!("/v2/apis/{api_id}/stages"),
+            json!({ "stageName": "prod" }),
+        )
+        .await;
+        let trace = "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
+        for client_trace in [Some(trace), None] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "host",
+                HeaderValue::from_str(&format!("{api_id}.execute-api.us-east-1.amazonaws.com"))
+                    .unwrap(),
+            );
+            if let Some(value) = client_trace {
+                headers.insert("x-amzn-trace-id", HeaderValue::from_static(value));
+            }
+            let resp = h
+                .handle(ServiceRequest {
+                    method: Method::GET,
+                    uri: "/prod/thing".parse().unwrap(),
+                    headers,
+                    body: Bytes::new(),
+                    region: "us-east-1".to_string(),
+                    account_id: "000000000000".to_string(),
+                    request_id: "rid".to_string(),
+                })
+                .await;
+            assert_eq!(resp.status(), 200);
+        }
+        assert_eq!(
+            *lambda.0.lock().unwrap(),
+            vec![Some(trace.to_string()), None]
+        );
     }
 
     #[tokio::test]
