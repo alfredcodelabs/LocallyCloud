@@ -47,7 +47,7 @@ use crate::control_plane::{
 };
 use crate::error::LambdaError;
 use crate::esm::{
-    create_mapping, parse_batching_window, parse_scaling_config, poll_once, run_workers,
+    create_mapping, parse_batching_window, parse_scaling_config, run_workers,
     update_response_types, validate_batch_configuration, validate_batch_size, BatchSource,
     EsmStore, KinesisBatchSource, SourceType, SqsBatchSource,
 };
@@ -69,6 +69,7 @@ pub struct LambdaHandler {
     executor: Option<Arc<Executor>>,
     concurrency: Arc<ConcurrencyLimiter>,
     concurrency_config: LambdaConcurrencyConfig,
+    sqs_esm_max_pollers: u32,
     esm_workers: Mutex<HashMap<String, EsmWorker>>,
     persistence: Mutex<Option<Arc<crate::persistence::LambdaPersistence>>>,
     metadata_gate: Arc<tokio::sync::Mutex<()>>,
@@ -129,6 +130,7 @@ impl LambdaHandler {
             executor,
             concurrency,
             concurrency_config: config,
+            sqs_esm_max_pollers: 10,
             esm_workers: Mutex::new(HashMap::new()),
             persistence: Mutex::new(None),
             metadata_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -986,11 +988,18 @@ impl LambdaHandler {
         let region = region.to_string();
         let functions = self.store.clone();
         let worker_count = match SourceType::from_arn(&mapping.event_source_arn) {
-            Some(SourceType::Sqs) => mapping.maximum_concurrency.unwrap_or(5),
+            Some(SourceType::Sqs) => mapping
+                .maximum_concurrency
+                .unwrap_or(self.sqs_esm_max_pollers)
+                .min(self.sqs_esm_max_pollers),
             _ => 1,
         };
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         let previous = workers.remove(&uuid);
+        let polling = (SourceType::from_arn(&mapping.event_source_arn) == Some(SourceType::Sqs))
+            .then(|| {
+                crate::esm::PollingControl::new(worker_count, mapping.maximum_concurrency.is_some())
+            });
         let worker = tokio::spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.handle.await;
@@ -1003,8 +1012,10 @@ impl LambdaHandler {
                 let region = region.clone();
                 let functions = functions.clone();
                 let source = source.clone();
+                let polling = polling.clone();
                 async move {
             while let Some(current) = store.get(&worker_uuid).filter(|item| item.enabled) {
+                let _permit = match &polling { Some(control) => Some(control.acquire().await), None => None };
                 let function_name = current
                     .function_arn
                     .split(":function:")
@@ -1020,15 +1031,15 @@ impl LambdaHandler {
                     });
                     break;
                 }
-                let result = poll_once(&current, &source, |event| {
+                let result = crate::esm::poll_once_typed(&current, &source, |event| {
                     let registry = registry.clone();
                     let account = account.clone();
                     let region = region.clone();
                     let function_name = current.function_arn.clone();
                     async move {
-                        let registry = registry.upgrade()?;
-                        let lambda = registry.lambda_api(&ServiceName::new("lambda"))?;
-                        let payload = serde_json::to_vec(&event).ok()?;
+                        let registry = registry.upgrade().ok_or(crate::esm::PollError::Invocation(LambdaInternalError::Unavailable))?;
+                        let lambda = registry.lambda_api(&ServiceName::new("lambda")).ok_or(crate::esm::PollError::Invocation(LambdaInternalError::Unavailable))?;
+                        let payload = serde_json::to_vec(&event).map_err(|error| crate::esm::PollError::InvalidResponse(error.to_string()))?;
                         let trace_header = esm_trace_header(&event);
                         let output = match lambda
                             .invoke(LambdaInvokeRequest {
@@ -1049,23 +1060,25 @@ impl LambdaHandler {
                             Ok(output) => output,
                             Err(error) => {
                                 tracing::warn!(error_kind = ?error, "Event source mapping Lambda invocation rejected");
-                                return None;
+                                return Err(crate::esm::PollError::Invocation(error));
                             }
                         };
                         if let Some(error) = output.function_error {
                             tracing::warn!(error_kind = ?error, "Event source mapping Lambda function failed");
-                            return None;
+                            return Err(crate::esm::PollError::FunctionFailed);
                         }
-                        Some(output.payload.into_vec())
+                        Ok(output.payload.into_vec())
                     }
                 })
                 .await;
                 let processing = match &result {
-                    Ok(true) => "OK".to_string(),
-                    Ok(false) => "No records processed".to_string(),
-                    Err(error) => error.clone(),
+                    Ok(crate::esm::PollOutcome::Processed) => "OK".to_string(),
+                    Ok(crate::esm::PollOutcome::PartialFailure) => "Partial batch failure".to_string(),
+                    Ok(crate::esm::PollOutcome::Empty) => "No records processed".to_string(),
+                    Err(error) => error.to_string(),
                 };
                 let _ = store.set_processing_result(&worker_uuid, processing);
+                if let Some(control) = &polling { control.report(&result, current.reports_batch_item_failures()); }
                 if let Err(error) = result {
                     tracing::warn!(uuid = %worker_uuid, %error, "Event source mapping cycle failed");
                 }
@@ -1678,6 +1691,7 @@ pub async fn register_with_execution(
         registry,
         aws_endpoint_url,
         LambdaConcurrencyConfig::default(),
+        10,
     )
     .await
 }
@@ -1686,6 +1700,7 @@ pub async fn register_with_execution_config(
     registry: &Arc<ServiceRegistry>,
     aws_endpoint_url: &str,
     config: LambdaConcurrencyConfig,
+    sqs_esm_max_pollers: u32,
 ) -> Option<Arc<LambdaHandler>> {
     use crate::code_store::CodeStore;
     use crate::executor::Executor;
@@ -1806,11 +1821,10 @@ pub async fn register_with_execution_config(
             executor.reap_expired_warm().await;
         }
     });
-    let handler = Arc::new(LambdaHandler::with_config_parts(
-        Arc::downgrade(registry),
-        Some(executor.clone()),
-        config,
-    ));
+    let mut handler =
+        LambdaHandler::with_config_parts(Arc::downgrade(registry), Some(executor.clone()), config);
+    handler.sqs_esm_max_pollers = sqs_esm_max_pollers.clamp(2, 1000);
+    let handler = Arc::new(handler);
     let native_handler: Arc<dyn NativeHandler> = handler.clone();
     let lambda_api: Arc<dyn LambdaInternalApi> = handler.clone();
     registry.register_native_with_lambda_api(

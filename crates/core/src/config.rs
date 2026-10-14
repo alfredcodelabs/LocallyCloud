@@ -51,6 +51,7 @@ pub struct LocallyCloudConfig {
     pub lambda_concurrency: LambdaConcurrencyConfig,
     /// Duration of one simulated EventBridge retry second; defaults to real time.
     pub events_retry_second: Duration,
+    pub sqs_esm_max_pollers: u32,
 }
 
 const LAMBDA_ACCOUNT_CONCURRENCY: &str = "LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY";
@@ -172,6 +173,7 @@ impl LocallyCloudConfig {
             LAMBDA_ACCOUNT_CONCURRENCY,
             LAMBDA_MIN_UNRESERVED,
             "LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE",
+            "LOCALLYCLOUD_SQS_ESM_MAX_POLLERS",
         ] {
             if matches!(
                 std::env::var(setting),
@@ -336,6 +338,19 @@ impl LocallyCloudConfig {
             ui_enabled,
             lambda_concurrency: LambdaConcurrencyConfig::resolve(get)?,
             events_retry_second: retry_second(get)?,
+            sqs_esm_max_pollers: match get("LOCALLYCLOUD_SQS_ESM_MAX_POLLERS") {
+                None => 10,
+                Some(value) => value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|value| (2..=1000).contains(value))
+                    .ok_or_else(|| {
+                        ConfigError::new(
+                            "LOCALLYCLOUD_SQS_ESM_MAX_POLLERS",
+                            "expected an integer from 2 to 1000",
+                        )
+                    })?,
+            },
         })
     }
 }
@@ -469,6 +484,34 @@ mod tests {
                     .setting,
                 LAMBDA_MIN_UNRESERVED
             );
+        }
+    }
+
+    #[test]
+    fn retry_time_scale_and_poller_ceiling_have_independent_validated_defaults() {
+        let config = LocallyCloudConfig::resolve(&env(&[])).unwrap();
+        assert_eq!(config.events_retry_second, Duration::from_secs(1));
+        assert_eq!(config.sqs_esm_max_pollers, 10);
+        let config = LocallyCloudConfig::resolve(&env(&[
+            ("LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE", "0.001"),
+            ("LOCALLYCLOUD_SQS_ESM_MAX_POLLERS", "20"),
+        ]))
+        .unwrap();
+        assert_eq!(config.events_retry_second, Duration::from_millis(1));
+        assert_eq!(config.sqs_esm_max_pollers, 20);
+        for value in ["0", "-1", "NaN", "inf", "1.1", "0.0000001", "bad"] {
+            assert!(LocallyCloudConfig::resolve(&env(&[(
+                "LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE",
+                value
+            )]))
+            .is_err());
+        }
+        for value in ["0", "1", "1001", "1.5", "-1", "bad"] {
+            assert!(LocallyCloudConfig::resolve(&env(&[(
+                "LOCALLYCLOUD_SQS_ESM_MAX_POLLERS",
+                value
+            )]))
+            .is_err());
         }
     }
 

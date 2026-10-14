@@ -5,7 +5,9 @@
 
 mod kinesis;
 mod persistence;
+mod scaling;
 pub use kinesis::KinesisBatchSource;
+pub(crate) use scaling::PollingControl;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -627,31 +629,69 @@ where
     F: FnOnce(Value) -> Fut,
     Fut: std::future::Future<Output = Option<Vec<u8>>>,
 {
+    poll_once_typed(mapping, source, |event| async {
+        run(event).await.ok_or(PollError::FunctionFailed)
+    })
+    .await
+    .map(|outcome| !matches!(outcome, PollOutcome::Empty))
+    .map_err(|error| match error {
+        PollError::FunctionFailed => "Lambda invocation failed".into(),
+        error => error.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PollOutcome {
+    Empty,
+    Processed,
+    PartialFailure,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PollError {
+    #[error("{0}")]
+    Source(String),
+    #[error("Lambda invocation rejected: {0:?}")]
+    Invocation(locallycloud_core::integration::lambda::LambdaInternalError),
+    #[error("Lambda function failed")]
+    FunctionFailed,
+    #[error("Invalid batch response: {0}")]
+    InvalidResponse(String),
+}
+
+pub(crate) async fn poll_once_typed<F, Fut>(
+    mapping: &EventSourceMapping,
+    source: &Arc<dyn BatchSource>,
+    run: F,
+) -> Result<PollOutcome, PollError>
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, PollError>>,
+{
     if !mapping.enabled {
-        return Ok(false);
+        return Ok(PollOutcome::Empty);
     }
     let source_type = SourceType::from_arn(&mapping.event_source_arn)
-        .ok_or_else(|| "unsupported event source".to_string())?;
+        .ok_or_else(|| PollError::Source("unsupported event source".to_string()))?;
     let records = source
         .poll(
             mapping.batch_size,
             Duration::from_secs(mapping.maximum_batching_window_in_seconds.into()),
         )
-        .await?;
+        .await
+        .map_err(PollError::Source)?;
     if records.is_empty() {
-        return Ok(false);
+        return Ok(PollOutcome::Empty);
     }
     let event = build_batch_event(source_type, &mapping.event_source_arn, &records);
-    let Some(response) = run(event).await else {
-        return Err("Lambda invocation failed".into());
-    };
+    let response = run(event).await?;
 
     let failed = if mapping.reports_batch_item_failures() {
         let known = records
             .iter()
             .map(|record| record.item_identifier.clone())
             .collect();
-        failed_item_ids(&response, &known)?
+        failed_item_ids(&response, &known).map_err(PollError::InvalidResponse)?
     } else {
         HashSet::new()
     };
@@ -670,9 +710,13 @@ where
         .map(|record| record.ack_token.clone())
         .collect();
     if !succeeded.is_empty() {
-        source.ack(&succeeded).await?;
+        source.ack(&succeeded).await.map_err(PollError::Source)?;
     }
-    Ok(true)
+    Ok(if failed.is_empty() {
+        PollOutcome::Processed
+    } else {
+        PollOutcome::PartialFailure
+    })
 }
 
 /// SQS adapter that talks through locallycloud's scoped in-process dispatcher.

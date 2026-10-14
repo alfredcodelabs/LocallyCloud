@@ -286,6 +286,7 @@ async fn main() {
         &registry,
         endpoint.guest_endpoint(),
         config.lambda_concurrency,
+        config.sqs_esm_max_pollers,
     )
     .await;
     if let Some(lambda) = &lambda_handler {
