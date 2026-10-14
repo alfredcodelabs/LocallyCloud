@@ -182,21 +182,31 @@ impl Interpreter {
     }
 
     pub async fn run(&self, exec: Arc<crate::store::ExecutionCell>) -> Result<(), SfnError> {
+        let metrics = crate::metrics::ExecutionMetrics::start(self);
         let input = exec.read().await.input.clone();
         if self.record_history {
             let mut execution = exec.write().await;
             if execution.status != crate::store::Status::Running {
+                metrics.finish(execution.status);
                 return Ok(());
             }
             execution.record("ExecutionStarted", json!({ "input": input }));
         }
         self.run_from(exec.clone(), None, input).await;
         if !self.store.healthy() {
+            metrics.finish(crate::store::Status::Failed);
             return Err(SfnError::Internal(
                 "Step Functions execution journal is unavailable".into(),
             ));
         }
-        logging::deliver_execution(&self.registry, &self.region, &self.account, &exec).await
+        let result =
+            logging::deliver_execution(&self.registry, &self.region, &self.account, &exec).await;
+        metrics.finish(if result.is_err() {
+            crate::store::Status::Failed
+        } else {
+            exec.read().await.status
+        });
+        result
     }
 
     /// Resume a redriven execution at the unsuccessful state without replaying completed states.
@@ -206,13 +216,22 @@ impl Interpreter {
         state: String,
         input: Value,
     ) -> Result<(), SfnError> {
+        let metrics = crate::metrics::ExecutionMetrics::start(self);
         self.run_from(exec.clone(), Some(state), input).await;
         if !self.store.healthy() {
+            metrics.finish(crate::store::Status::Failed);
             return Err(SfnError::Internal(
                 "Step Functions execution journal is unavailable".into(),
             ));
         }
-        logging::deliver_execution(&self.registry, &self.region, &self.account, &exec).await
+        let result =
+            logging::deliver_execution(&self.registry, &self.region, &self.account, &exec).await;
+        metrics.finish(if result.is_err() {
+            crate::store::Status::Failed
+        } else {
+            exec.read().await.status
+        });
+        result
     }
 
     /// Execute exactly one state for the TestState API without creating durable resources.

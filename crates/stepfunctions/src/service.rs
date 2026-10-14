@@ -620,6 +620,115 @@ mod tests {
         reg
     }
 
+    #[tokio::test]
+    async fn standard_and_express_emit_execution_results_without_counting_duplicates() {
+        use locallycloud_core::integration::metrics::{EmitOutcome, MetricObservation, MetricSink};
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<MetricObservation>>);
+        impl MetricSink for Sink {
+            fn try_emit(&self, samples: Vec<MetricObservation>) -> EmitOutcome {
+                self.0.lock().unwrap().extend(samples);
+                EmitOutcome::Accepted
+            }
+        }
+        let registry = registry();
+        let h = handler(&registry, "states");
+        let sink = Arc::new(Sink::default());
+        registry.register_native_with_metric_sink(
+            ServiceName::new("monitoring"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            h.clone(),
+            sink.clone(),
+        );
+        let success = create_sm(
+            &h,
+            "metric-success",
+            json!({"StartAt":"Done","States":{"Done":{"Type":"Succeed"}}}),
+        )
+        .await;
+        let first = sfn(
+            &h,
+            "StartExecution",
+            json!({"stateMachineArn":success,"name":"once"}),
+        )
+        .await;
+        await_execution(&h, first["executionArn"].as_str().unwrap()).await;
+        sfn(
+            &h,
+            "StartExecution",
+            json!({"stateMachineArn":success,"name":"once"}),
+        )
+        .await;
+        let abort = create_sm(
+            &h,
+            "metric-aborted",
+            json!({"StartAt":"Wait","States":{"Wait":{"Type":"Wait","Seconds":1,"End":true}}}),
+        )
+        .await;
+        let execution = sfn(&h, "StartExecution", json!({"stateMachineArn":abort})).await;
+        sfn(
+            &h,
+            "StopExecution",
+            json!({"executionArn":execution["executionArn"]}),
+        )
+        .await;
+        let asynchronous = sfn(&h, "CreateStateMachine", json!({"name":"metric-async-express","type":"EXPRESS","roleArn":"arn:aws:iam::000000000000:role/sfn","definition":json!({"StartAt":"Fail","States":{"Fail":{"Type":"Fail","Error":"AsyncBusinessError"}}}).to_string()})).await;
+        sfn(
+            &h,
+            "StartExecution",
+            json!({"stateMachineArn":asynchronous["stateMachineArn"]}),
+        )
+        .await;
+        for (name, definition, expected) in [
+            (
+                "metric-failed",
+                json!({"StartAt":"Fail","States":{"Fail":{"Type":"Fail","Error":"BusinessError"}}}),
+                "FAILED",
+            ),
+            (
+                "metric-timeout",
+                json!({"TimeoutSeconds":1,"StartAt":"Wait","States":{"Wait":{"Type":"Wait","Seconds":2,"End":true}}}),
+                "TIMED_OUT",
+            ),
+        ] {
+            let machine = sfn(&h, "CreateStateMachine", json!({"name":name,"type":"EXPRESS","roleArn":"arn:aws:iam::000000000000:role/sfn","definition":definition.to_string()})).await;
+            let arn = machine["stateMachineArn"].as_str().unwrap();
+            let result = sfn(&h, "StartSyncExecution", json!({"stateMachineArn":arn})).await;
+            assert_eq!(result["status"], expected);
+        }
+        let samples = sink.0.lock().unwrap();
+        let sum = |name: &str| {
+            samples
+                .iter()
+                .filter(|sample| sample.namespace == "AWS/States" && sample.metric_name == name)
+                .map(|sample| sample.value)
+                .sum::<f64>()
+        };
+        assert_eq!(sum("ExecutionsStarted"), 5.0);
+        assert_eq!(sum("ExecutionsSucceeded"), 1.0);
+        assert_eq!(sum("ExecutionsFailed"), 2.0);
+        assert_eq!(sum("ExecutionsAborted"), 1.0);
+        assert_eq!(sum("ExecutionsTimedOut"), 1.0);
+        assert_eq!(sum("ExecutionThrottled"), 0.0);
+        assert!(samples
+            .iter()
+            .all(|sample| sample.dimensions.contains_key("StateMachineArn")));
+        assert!(samples
+            .iter()
+            .any(|sample| sample.namespace == "LocallyCloud/States"
+                && sample.metric_name == "ActiveExecutions"
+                && sample.value == 1.0));
+        assert_eq!(
+            samples
+                .iter()
+                .rev()
+                .find(|sample| sample.metric_name == "ActiveExecutions")
+                .unwrap()
+                .value,
+            0.0
+        );
+    }
+
     fn handler(reg: &Arc<ServiceRegistry>, service: &str) -> Arc<dyn NativeHandler> {
         reg.native_handler(&ServiceName::new(service)).unwrap()
     }

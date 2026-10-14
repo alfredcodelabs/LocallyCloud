@@ -14,6 +14,7 @@ pub mod error;
 pub mod interpreter;
 pub mod jsonata;
 pub mod logging;
+mod metrics;
 pub mod ops;
 pub mod path;
 mod s3_integration;

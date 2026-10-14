@@ -289,6 +289,8 @@ pub enum InsertExecutionResult {
 
 #[derive(Clone, Default)]
 pub struct SfnStore {
+    pub(crate) active_metrics: Arc<std::sync::Mutex<BTreeMap<String, u32>>>,
+    pub(crate) metric_sampler: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     machines: Arc<DashMap<Key, Arc<RwLock<StateMachineRecord>>>>,
     executions: Arc<DashMap<String, Arc<ExecutionCell>>>,
     activities: Arc<DashMap<Key, Arc<ActivityRecord>>>,
