@@ -6,6 +6,9 @@ LocallyCloud runs as a Rust binary without a Docker daemon. **It is currently a 
 
 Need help? Read the [frequently asked questions](docs/FAQ.md) for profiles, compatibility, runtime requirements, and troubleshooting. [Supported platforms](docs/PLATFORMS.md) lists the Linux distributions, architectures, and WSL 2 support, and explains how to use LocallyCloud from macOS or Windows through a Linux virtual machine.
 
+For cross-service load tests, supported limits, metrics and remaining fidelity gaps, see the
+[throttling and backpressure guide](docs/THROTTLING.md).
+
 ## Installation
 
 System packages use the distribution's package manager. Installing or removing them requires administrator privileges because they place files under `/usr`. **Running LocallyCloud and using its API do not require `sudo`.** Run the emulator as your regular user.
@@ -246,11 +249,49 @@ See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com
 | `LOCALLYCLOUD_RUNTIME` | Compute runtime: `auto`, `firecracker`, or `youki` (OCI) | `auto` |
 | `LOCALLYCLOUD_WORK_DIR` | Lambda work files | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/lambda` |
 | `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | Memory budget for Lambda environments | `1024` |
+| `LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY` | Independent Lambda execution quota for each account/region; integer from 1 to 2147483647 | `1000` |
+| `LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE` | Classic EventBridge rules: multiply retry delays and maximum event age by this factor; finite number from 0.000001 to 1 | `1` (real time) |
+| `LOCALLYCLOUD_SQS_ESM_MAX_POLLERS` | Local ceiling for SQS event source mapping workers; integer from 2 to 1000, independent of Lambda reserved concurrency | `10` |
+| `LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate controlled table write limits; reads and hot partitions are not modeled | Disabled |
+| `LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate provisioned shard write limits | Disabled |
+| `LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY` | Minimum slots left unreserved when assigning function RC; integer from 0 to the account quota. Set explicitly for quotas below 100 | `100` |
 | `LOCALLYCLOUD_PG_BIN_DIR` | PostgreSQL binaries for RDS | Found on `PATH`, then the newest under `/usr/lib/postgresql` |
 | `LOCALLYCLOUD_COGNITO_MAILBOX_DIR` | Directory that receives Cognito confirmation codes | Disabled |
 | `LOCALLYCLOUD_UI` | Dashboard: `on` or `off`. `off` returns 404 for the dashboard and its read endpoints, which sign reads with your local AWS profiles; health and status stay available | `on` |
 
 Requests reach one endpoint and are routed to the corresponding native service handler. Requests for services without a native handler may be forwarded to the configured external fallback backend. Check `/_locallycloud/status` to distinguish native services from proxied services.
+
+To simulate a small Lambda pool on a workstation:
+
+```sh
+LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY=10 \
+LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY=2 \
+LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB=1024 \
+locallycloud
+
+aws --profile locallycloud lambda get-account-settings
+```
+
+In this example, functions can reserve at most 8 slots in each account/region. Replacing a
+reservation excludes its old value from the sum; removing a reservation or deleting its
+function releases the slots. CLI, SDK, CloudFormation and SAM use the same quota check.
+The configured minimum of 2 is an explicit local adaptation of AWS's default floor of 100.
+The two variables default independently: a quota below 100 requires setting the minimum
+explicitly. Zero is allowed for the minimum and for a function's RC; RC zero disables that
+function without allocating slots. Invalid configuration prevents startup.
+
+A larger quota such as 3000 keeps the default minimum of 100 unless overridden. A quota
+does not allocate RAM or raise the host compute memory budget. Existing reservations are
+restored and checked on startup; if they exceed the new quota minus its minimum, startup
+fails without changing the persisted resources. Restart with compatible settings, lower
+the reservations through the API, and then restart with the smaller quota. These settings
+do not simulate Lambda's separate scaling-rate or request-rate limits.
+The execution quota applies to synchronous calls, asynchronous attempts, function URLs
+and internal service calls. Asynchronous throttling retries do not yet reproduce AWS's
+full retry window; use SQS to compare buffered delivery with direct invocation.
+
+Service-specific retry behavior, metric semantics, reusable before/after experiments and
+remaining fidelity gaps are documented in the [throttling guide](docs/THROTTLING.md).
 
 ## Uninstallation
 
