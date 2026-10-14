@@ -552,12 +552,33 @@ pub(crate) fn install_managed_runtime_with_cache(
     }
 }
 
+fn missing_node_message() -> String {
+    "Node.js runtimes require the `node` executable on the host. Install it from your \
+     distribution: Arch Linux `sudo pacman -S nodejs`, Debian/Ubuntu `sudo apt install nodejs`."
+        .into()
+}
+
+/// The `python3.X` package is only in the apt archive of the release that ships it.
+fn missing_python_message(runtime: &str, executable: &str) -> String {
+    let apt_release = match executable {
+        "python3.12" => Some("Ubuntu 24.04"),
+        "python3.13" => Some("Debian 13"),
+        "python3.14" => Some("Ubuntu 26.04"),
+        _ => None,
+    };
+    let apt = apt_release
+        .map(|release| format!("; {release} `sudo apt install {executable}`"))
+        .unwrap_or_default();
+    format!(
+        "{runtime} requires the `{executable}` executable on the host. Install it from your \
+         distribution: Arch Linux `sudo pacman -S python` (Arch's current Python version \
+         only){apt}; otherwise install {executable} from your distribution."
+    )
+}
+
 fn install_node_runtime(dest: &Path) -> Result<(), LambdaError> {
-    let node = find_host_executable("node").ok_or_else(|| {
-        LambdaError::NotImplemented(
-            "Node.js runtime requires a `node` executable on the host".into(),
-        )
-    })?;
+    let node = find_host_executable("node")
+        .ok_or_else(|| LambdaError::NotImplemented(missing_node_message()))?;
     copy_host_file(&node, &dest.join("usr/bin/node"))?;
     copy_dynamic_dependencies(&node, dest, &mut Default::default())?;
 
@@ -589,9 +610,7 @@ fn install_python_runtime_inner(
         .expect("Python runtime prefix");
     let executable_name = format!("python{version}");
     let python = find_host_executable(&executable_name).ok_or_else(|| {
-        LambdaError::NotImplemented(format!(
-            "{runtime} requires a `{executable_name}` executable on the host"
-        ))
+        LambdaError::NotImplemented(missing_python_message(runtime, &executable_name))
     })?;
 
     let output = Command::new(&python)
@@ -1620,6 +1639,37 @@ def handler(event, context):
         }
         assert_handled_error(&run.error, "boom 3");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_interpreter_errors_name_executable_and_distribution_packages() {
+        let node = missing_node_message();
+        assert!(node.contains("`node`"));
+        assert!(node.contains("sudo pacman -S nodejs"));
+        assert!(node.contains("sudo apt install nodejs"));
+
+        for (version, release) in [
+            ("python3.12", "Ubuntu 24.04"),
+            ("python3.13", "Debian 13"),
+            ("python3.14", "Ubuntu 26.04"),
+        ] {
+            let message = missing_python_message(version, version);
+            assert!(message.contains(&format!("`{version}` executable")));
+            assert!(message.contains("sudo pacman -S python"));
+            assert!(message.contains(&format!("{release} `sudo apt install {version}`")));
+            assert!(message.contains(&format!("install {version} from your distribution")));
+            assert!(!message.contains('/'), "no paths: {message}");
+        }
+        let unpackaged = missing_python_message("python3.11", "python3.11");
+        assert!(!unpackaged.contains("apt install"));
+        assert!(unpackaged.contains("install python3.11 from your distribution"));
+
+        let error = install_managed_runtime(&temp(), Some("python3.99")).unwrap_err();
+        assert!(
+            matches!(&error, LambdaError::NotImplemented(message)
+                if message == &missing_python_message("python3.99", "python3.99")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
