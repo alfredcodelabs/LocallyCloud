@@ -672,7 +672,8 @@ fn strip_member(xml: &str) -> String {
 }
 
 /// Seed the read-only AWS-managed policy catalog under `arn:aws:iam::aws:policy` (account
-/// key `aws`), idempotently. Includes the common Lambda execution-role policies.
+/// key `aws`), idempotently. Includes the common Lambda execution-role policies and
+/// `AWSXrayWriteOnlyAccess` (attached by SAM to traced functions).
 pub fn seed_aws_managed_policies(store: &IamStore) {
     // A wildcard action here lets a basic Lambda role access unrelated services.
     const MANAGED: &[(&str, &str, &str)] = &[
@@ -683,8 +684,7 @@ pub fn seed_aws_managed_policies(store: &IamStore) {
         ("AWSLambdaKinesisExecutionRole", "v2", "kinesis:DescribeStream,kinesis:DescribeStreamSummary,kinesis:GetRecords,kinesis:GetShardIterator,kinesis:ListShards,kinesis:ListStreams,kinesis:SubscribeToShard,logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents"),
     ];
     let now = now_iso8601();
-    for (name, version, actions) in MANAGED {
-        let arn = format!("arn:aws:iam::aws:policy/service-role/{name}");
+    let service_role = MANAGED.iter().map(|(name, version, actions)| {
         let document = serde_json::json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -692,15 +692,39 @@ pub fn seed_aws_managed_policies(store: &IamStore) {
                 "Action": actions.split(',').collect::<Vec<_>>(),
                 "Resource": "*"
             }]
-        })
-        .to_string();
+        });
+        ("/service-role/", *name, *version, document)
+    });
+    // Document as published in the AWS managed policy reference (default version v2).
+    let xray_write_only = (
+        "/",
+        "AWSXrayWriteOnlyAccess",
+        "v2",
+        serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": [
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets",
+                    "xray:GetSamplingStatisticSummaries"
+                ],
+                "Resource": ["*"]
+            }]
+        }),
+    );
+    for (path, name, version, document) in service_role.chain(std::iter::once(xray_write_only)) {
+        let arn = format!("arn:aws:iam::aws:policy{path}{name}");
+        let document = document.to_string();
         store.seed_policy(
             "aws",
             IamPolicy {
                 policy_name: name.to_string(),
                 policy_id: ids::unique_id(ids::POLICY),
                 arn: arn.clone(),
-                path: "/service-role/".to_string(),
+                path: path.to_string(),
                 create_date: now.clone(),
                 default_version_id: version.to_string(),
                 versions: vec![PolicyVersion {
@@ -1387,6 +1411,79 @@ mod managed_policy_tests {
         assert_eq!(
             evaluate(&[document], None, None, &request("dynamodb:PutItem")),
             Decision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn xray_write_only_policy_is_readable_and_attachable() {
+        const ARN: &str = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess";
+        let account = "000000000000";
+        let store = IamStore::new();
+        seed_aws_managed_policies(&store);
+        let encoded_arn = crate::model::urlencode_doc(ARN);
+
+        let policy = get_policy(
+            &store,
+            account,
+            &QueryRequest::parse(format!("PolicyArn={encoded_arn}").as_bytes()),
+        )
+        .unwrap();
+        assert!(policy.contains("<PolicyName>AWSXrayWriteOnlyAccess</PolicyName>"));
+        assert!(policy.contains(&format!("<Arn>{ARN}</Arn>")));
+        assert!(policy.contains("<Path>/</Path>"));
+        assert!(policy.contains("<DefaultVersionId>v2</DefaultVersionId>"));
+
+        let version = get_policy_version(
+            &store,
+            account,
+            &QueryRequest::parse(format!("PolicyArn={encoded_arn}&VersionId=v2").as_bytes()),
+        )
+        .unwrap();
+        let stored = store.get_policy("aws", ARN).unwrap();
+        let document = &stored.default_version().unwrap().document;
+        assert!(version.contains(&crate::model::urlencode_doc(document)));
+        let parsed: serde_json::Value = serde_json::from_str(document).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": [
+                        "xray:PutTraceSegments",
+                        "xray:PutTelemetryRecords",
+                        "xray:GetSamplingRules",
+                        "xray:GetSamplingTargets",
+                        "xray:GetSamplingStatisticSummaries"
+                    ],
+                    "Resource": ["*"]
+                }]
+            })
+        );
+
+        let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Principal":{"Service":"lambda.amazonaws.com"}}]}"#;
+        create_role(
+            &store,
+            account,
+            &QueryRequest::parse(
+                format!(
+                    "RoleName=traced&AssumeRolePolicyDocument={}",
+                    crate::model::urlencode_doc(trust)
+                )
+                .as_bytes(),
+            ),
+        )
+        .unwrap();
+        attach_policy(
+            &store,
+            account,
+            Entity::Role,
+            &QueryRequest::parse(format!("RoleName=traced&PolicyArn={encoded_arn}").as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_role(account, "traced").unwrap().attached_policies,
+            vec![ARN.to_string()]
         );
     }
 }
