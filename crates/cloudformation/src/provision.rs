@@ -3597,6 +3597,7 @@ impl Provisioner {
         props: &Value,
     ) -> Result<ResolvedResource, CfnError> {
         let reserved = lambda_reserved_concurrency(logical_id, props)?;
+        let tracing = lambda_tracing_mode(logical_id, props)?;
         let name = props
             .get("FunctionName")
             .and_then(Value::as_str)
@@ -3632,6 +3633,9 @@ impl Provisioner {
         }
         if let Some(vpc) = props.get("VpcConfig") {
             obj.insert("VpcConfig".into(), vpc.clone());
+        }
+        if let Some(mode) = tracing {
+            obj.insert("TracingConfig".into(), json!({"Mode": mode}));
         }
 
         let (status, resp) = self
@@ -3688,6 +3692,11 @@ impl Provisioner {
         props: &Value,
     ) -> Result<(), CfnError> {
         let reserved = lambda_reserved_concurrency(logical_id, props)?;
+        let tracing = lambda_tracing_mode(logical_id, props)?;
+        // Stacks created before TracingConfig was forwarded may hold a value Lambda never saw.
+        let previous_tracing = lambda_tracing_mode(logical_id, previous_props)
+            .ok()
+            .flatten();
         let code = if previous_props.get("Code") != props.get("Code") {
             Some(self.resolve_code(props.get("Code")).await?)
         } else {
@@ -3720,7 +3729,7 @@ impl Provisioner {
                 .await?;
             }
 
-            let configuration = |properties: &Value| {
+            let configuration = |properties: &Value, tracing: Option<&str>| {
                 let mut configuration = mapped_properties(
                     properties,
                     &[
@@ -3738,10 +3747,12 @@ impl Provisioner {
                 if let Some(timeout) = properties.get("Timeout") {
                     configuration["Timeout"] = coerce_number(timeout);
                 }
+                // Removing TracingConfig resets the function to the Lambda default, as in AWS.
+                configuration["TracingConfig"] = json!({"Mode": tracing.unwrap_or("PassThrough")});
                 configuration
             };
-            let next = configuration(props);
-            if next != configuration(previous_props) {
+            let next = configuration(props, tracing);
+            if next != configuration(previous_props, previous_tracing) {
                 self.call_json(
                     "lambda",
                     Method::PUT,
@@ -7755,6 +7766,36 @@ fn ensure_delete_succeeded(
     )))
 }
 
+/// `TracingConfig.Mode` when declared; `Mode` is optional and AWS allows `Active|PassThrough`.
+fn lambda_tracing_mode<'a>(
+    logical_id: &str,
+    props: &'a Value,
+) -> Result<Option<&'a str>, CfnError> {
+    let Some(config) = props.get("TracingConfig") else {
+        return Ok(None);
+    };
+    if !config.is_object() {
+        return Err(CfnError::Validation(format!(
+            "{logical_id} TracingConfig must be an object"
+        )));
+    }
+    ensure_known_properties(
+        logical_id,
+        "AWS::Lambda::Function.TracingConfig",
+        config,
+        &["Mode"],
+    )?;
+    match config.get("Mode") {
+        None => Ok(None),
+        Some(Value::String(mode)) if mode == "Active" || mode == "PassThrough" => {
+            Ok(Some(mode.as_str()))
+        }
+        Some(mode) => Err(CfnError::Validation(format!(
+            "{logical_id} TracingConfig.Mode {mode} must be one of Active, PassThrough"
+        ))),
+    }
+}
+
 fn lambda_reserved_concurrency(logical_id: &str, props: &Value) -> Result<Option<u32>, CfnError> {
     props
         .get("ReservedConcurrentExecutions")
@@ -8140,6 +8181,94 @@ mod tests {
             .0,
             404
         );
+    }
+
+    #[tokio::test]
+    async fn lambda_tracing_config_reaches_native_lambda_on_create_update_and_removal() {
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_lambda::register(&registry);
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        let mut props = json!({"FunctionName":"traced-native","Runtime":"python3.12","Handler":"ledger.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},
+            "TracingConfig":{"Mode":"Active"}});
+        let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
+        let mode = || async {
+            p.call_json(
+                "lambda",
+                Method::GET,
+                "/2015-03-31/functions/traced-native/configuration",
+                json!({}),
+                "Worker",
+            )
+            .await
+            .unwrap()["TracingConfig"]["Mode"]
+                .clone()
+        };
+        assert_eq!(mode().await, "Active");
+
+        let previous = props.clone();
+        props["TracingConfig"] = json!({"Mode":"PassThrough"});
+        p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+            .await
+            .unwrap();
+        assert_eq!(mode().await, "PassThrough");
+
+        let previous = props.clone();
+        props["TracingConfig"] = json!({"Mode":"Active"});
+        p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+            .await
+            .unwrap();
+        assert_eq!(mode().await, "Active");
+
+        // Removing the property resets the function to Lambda's default mode.
+        let previous = props.clone();
+        props.as_object_mut().unwrap().remove("TracingConfig");
+        p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+            .await
+            .unwrap();
+        assert_eq!(mode().await, "PassThrough");
+
+        for invalid in [
+            json!({"Mode":"Disabled"}),
+            json!({"Mode":"active"}),
+            json!({"Mode":true}),
+            json!({"Mode":"Active","Sampling":1}),
+            json!("Active"),
+        ] {
+            let mut next = props.clone();
+            next["TracingConfig"] = invalid.clone();
+            assert!(
+                p.update_lambda_function("Worker", &resource.ref_value, &props, &next)
+                    .await
+                    .is_err(),
+                "accepted {invalid}"
+            );
+            let mut create = next.clone();
+            create["FunctionName"] = json!("invalid-tracing");
+            assert!(p
+                .lambda_function("Invalid", "stack", &create)
+                .await
+                .is_err());
+        }
+        assert_eq!(mode().await, "PassThrough");
+        assert_eq!(
+            p.call(
+                "lambda",
+                Method::GET,
+                "/2015-03-31/functions/invalid-tracing",
+                json_host(),
+                Bytes::new()
+            )
+            .await
+            .unwrap()
+            .0,
+            404
+        );
+        p.delete_function(&resource.ref_value).await.unwrap();
     }
 
     #[tokio::test]

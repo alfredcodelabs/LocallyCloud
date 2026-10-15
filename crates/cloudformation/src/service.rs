@@ -4054,6 +4054,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sam_tracing_removal_updates_generated_role_and_function_in_place() {
+        use base64::Engine;
+        const XRAY: &str = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess";
+        const BASIC: &str = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_s3::register(&registry);
+        locallycloud_iam_sts::register(&registry);
+        locallycloud_lambda::register(&registry);
+        let handler = CfnHandler::new(Arc::downgrade(&registry));
+        let (region, account) = ("us-east-1", "000000000000");
+        let provisioner = handler.provisioner(region, account);
+        let call = |service: &'static str, method: Method, path: String, body: Bytes| {
+            let provisioner = &provisioner;
+            async move {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("host", "localhost:4566".parse().unwrap());
+                headers.insert(
+                    "content-type",
+                    "application/x-www-form-urlencoded".parse().unwrap(),
+                );
+                let (status, body) = provisioner
+                    .call(service, method, &path, headers, body)
+                    .await
+                    .unwrap();
+                assert!((200..300).contains(&status), "{service} {path}: {status}");
+                String::from_utf8(body.to_vec()).unwrap()
+            }
+        };
+        let zip = base64::engine::general_purpose::STANDARD
+            .decode("UEsDBBQAAAAAAMeaQ100F2L+HQAAAB0AAAAIAAAAaW5kZXguanNleHBvcnRzLmhhbmRsZXI9YXN5bmMoKT0+KHt9KVBLAQIUAxQAAAAAAMeaQ100F2L+HQAAAB0AAAAIAAAAAAAAAAAAAACAAQAAAABpbmRleC5qc1BLBQYAAAAAAQABADYAAABDAAAAAAA=")
+            .unwrap();
+        call("s3", Method::PUT, "/sam-artifacts".into(), Bytes::new()).await;
+        call(
+            "s3",
+            Method::PUT,
+            "/sam-artifacts/worker.zip".into(),
+            Bytes::from(zip),
+        )
+        .await;
+
+        let mut template = serde_json::json!({
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {"Worker": {"Type": "AWS::Serverless::Function", "Properties": {
+                "CodeUri": "s3://sam-artifacts/worker.zip", "Handler": "index.handler",
+                "Runtime": "nodejs22.x", "Tracing": "Active"
+            }}}
+        });
+        let mut query = Query {
+            params: [
+                ("StackName".into(), "traced".into()),
+                ("TemplateBody".into(), template.to_string()),
+                ("Capabilities.member.1".into(), "CAPABILITY_IAM".into()),
+                (
+                    "Capabilities.member.2".into(),
+                    "CAPABILITY_AUTO_EXPAND".into(),
+                ),
+            ]
+            .into(),
+        };
+        handler
+            .dispatch("CreateStack", &query, region, account)
+            .await
+            .unwrap();
+        let stack = handler.store.get(account, region, "traced").unwrap();
+        assert_eq!(
+            stack.status,
+            StackStatus::CreateComplete,
+            "{:?}",
+            stack.events
+        );
+        let physical = |stack: &Stack, logical: &str| {
+            stack
+                .resources
+                .iter()
+                .find(|resource| resource.logical_id == logical)
+                .unwrap()
+                .physical_id
+                .clone()
+        };
+        let role = physical(&stack, "WorkerRole");
+        let function = physical(&stack, "Worker");
+        let attached = || {
+            call(
+                "iam",
+                Method::POST,
+                "/".into(),
+                Bytes::from(format!(
+                    "Action=ListAttachedRolePolicies&Version=2010-05-08&RoleName={role}"
+                )),
+            )
+        };
+        let mode = || async {
+            let configuration = call(
+                "lambda",
+                Method::GET,
+                format!("/2015-03-31/functions/{function}/configuration"),
+                Bytes::new(),
+            )
+            .await;
+            serde_json::from_str::<Value>(&configuration).unwrap()["TracingConfig"]["Mode"].clone()
+        };
+        assert!(attached().await.contains(XRAY));
+        assert_eq!(mode().await, "Active");
+
+        template["Resources"]["Worker"]["Properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("Tracing");
+        query
+            .params
+            .insert("TemplateBody".into(), template.to_string());
+        handler
+            .dispatch("UpdateStack", &query, region, account)
+            .await
+            .unwrap();
+        let stack = handler.store.get(account, region, "traced").unwrap();
+        assert_eq!(
+            stack.status,
+            StackStatus::UpdateComplete,
+            "{:?}",
+            stack.events
+        );
+        assert_eq!(physical(&stack, "WorkerRole"), role);
+        let attached = attached().await;
+        assert!(!attached.contains(XRAY), "{attached}");
+        assert!(attached.contains(BASIC), "{attached}");
+        assert_eq!(mode().await, "PassThrough");
+    }
+
+    #[tokio::test]
     async fn nat_replacement_defers_cleanup_and_rollback_preserves_original_target() {
         let registry = Arc::new(ServiceRegistry::new());
         let ec2 = locallycloud_ec2::register(&registry);

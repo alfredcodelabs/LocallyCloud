@@ -144,6 +144,32 @@ fn code_uri(value: &Value) -> Result<Value, CfnError> {
     Ok(json!({"S3Bucket": bucket, "S3Key": key}))
 }
 
+/// SAM `Tracing` as a `TracingConfig.Mode`; `Disabled` is the same as omitting it.
+fn tracing_mode(value: &Value) -> Result<Option<Value>, CfnError> {
+    if intrinsic(value) {
+        return Ok(Some(value.clone()));
+    }
+    match value.as_str() {
+        Some("Disabled") => Ok(None),
+        Some("Active" | "PassThrough") => Ok(Some(value.clone())),
+        _ => Err(unsupported(format!(
+            "Function Tracing {value} must be one of Active, PassThrough, Disabled"
+        ))),
+    }
+}
+
+/// Mirrors samtranslator `_construct_role`: a generated role gets the X-Ray write policy
+/// unless `Tracing`, after resolving a parameter `Ref` to its template `Default`, is
+/// `Disabled`. Other intrinsics stay unresolved and therefore add the policy.
+fn tracing_needs_xray_policy(tracing: &Value, parameters: Option<&Value>) -> bool {
+    let resolved = tracing
+        .get("Ref")
+        .and_then(Value::as_str)
+        .and_then(|name| parameters?.get(name)?.get("Default"))
+        .unwrap_or(tracing);
+    resolved != "Disabled"
+}
+
 fn add_generated(
     generated: &mut Map<String, Value>,
     id: String,
@@ -219,6 +245,7 @@ fn validate_function_globals(props: &Map<String, Value>) -> Result<(), CfnError>
             "Timeout",
             "MemorySize",
             "Description",
+            "Tracing",
         ],
         "Globals.Function",
     )?;
@@ -340,6 +367,7 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
         return Err(unsupported("only AWS::Serverless-2016-10-31 is supported"));
     }
     apply_globals(raw)?;
+    let parameters = raw.get("Parameters").cloned();
     let root = raw
         .as_object_mut()
         .ok_or_else(|| unsupported("template must be an object"))?;
@@ -435,6 +463,7 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
                         "Description",
                         "FunctionName",
                         "ReservedConcurrentExecutions",
+                        "Tracing",
                         "Events",
                     ],
                     id,
@@ -456,9 +485,21 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
                         function.insert(key.into(), value.clone());
                     }
                 }
+                if let Some(mode) = p.get("Tracing").map(tracing_mode).transpose()?.flatten() {
+                    function.insert("TracingConfig".into(), json!({"Mode": mode}));
+                }
                 if !function.contains_key("Role") {
                     let role_id = format!("{id}Role");
                     function.insert("Role".into(), json!({"Fn::GetAtt":[role_id,"Arn"]}));
+                    let mut managed_policies = vec![json!(
+                        "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                    )];
+                    if p.get("Tracing").is_some_and(|tracing| {
+                        tracing_needs_xray_policy(tracing, parameters.as_ref())
+                    }) {
+                        managed_policies
+                            .push(json!("arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"));
+                    }
                     add_generated(
                         &mut generated,
                         role_id,
@@ -466,7 +507,7 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
                             "AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[{
                                 "Effect":"Allow","Action":["sts:AssumeRole"],
                                 "Principal":{"Service":["lambda.amazonaws.com"]}}]},
-                            "ManagedPolicyArns":["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]}}),
+                            "ManagedPolicyArns":managed_policies}}),
                     )?;
                 }
                 let uri = p
@@ -671,6 +712,94 @@ mod tests {
     }
 
     #[test]
+    fn function_tracing_maps_to_tracing_config() {
+        let function = |tracing: Value| {
+            json!({"Transform":"AWS::Serverless-2016-10-31", "Resources":{
+            "Worker":{"Type":"AWS::Serverless::Function", "Properties":{
+                "CodeUri":"s3://artifacts/worker.zip", "Handler":"ledger.post",
+                "Runtime":"python3.12", "Tracing":tracing
+            }}}})
+        };
+        for (tracing, expected) in [
+            (json!("Active"), Some(json!({"Mode":"Active"}))),
+            (json!("PassThrough"), Some(json!({"Mode":"PassThrough"}))),
+            (
+                json!({"Ref":"TracingMode"}),
+                Some(json!({"Mode":{"Ref":"TracingMode"}})),
+            ),
+            (json!("Disabled"), None),
+        ] {
+            let mut template = function(tracing);
+            transform(&mut template).unwrap();
+            let props = &template["Resources"]["Worker"]["Properties"];
+            assert_eq!(props.get("TracingConfig"), expected.as_ref());
+            assert!(props.get("Tracing").is_none());
+        }
+        for invalid in [json!("Off"), json!("active"), json!(true), json!({})] {
+            let mut template = function(invalid.clone());
+            let before = template.clone();
+            assert!(transform(&mut template).is_err(), "accepted {invalid}");
+            assert_eq!(template, before);
+        }
+    }
+
+    #[test]
+    fn traced_function_generated_role_gets_xray_write_policy() {
+        const BASIC: &str = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
+        const XRAY: &str = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess";
+        let function = |tracing: Option<Value>, role: Option<Value>| {
+            let mut props = json!({"CodeUri":"s3://artifacts/worker.zip",
+                "Handler":"ledger.post", "Runtime":"python3.12"});
+            if let Some(tracing) = tracing {
+                props["Tracing"] = tracing;
+            }
+            if let Some(role) = role {
+                props["Role"] = role;
+            }
+            json!({"Transform":"AWS::Serverless-2016-10-31",
+                "Parameters":{
+                    "Unset":{"Type":"String"},
+                    "Off":{"Type":"String","Default":"Disabled"},
+                    "On":{"Type":"String","Default":"Active"}},
+                "Resources":{"Worker":{"Type":"AWS::Serverless::Function","Properties":props}}})
+        };
+        for (tracing, expected) in [
+            (Some(json!("Active")), json!([BASIC, XRAY])),
+            (Some(json!("PassThrough")), json!([BASIC, XRAY])),
+            (Some(json!("Disabled")), json!([BASIC])),
+            (None, json!([BASIC])),
+            // samtranslator resolves parameter Refs (defaults included) before comparing.
+            (Some(json!({"Ref":"On"})), json!([BASIC, XRAY])),
+            (Some(json!({"Ref":"Off"})), json!([BASIC])),
+            (Some(json!({"Ref":"Unset"})), json!([BASIC, XRAY])),
+            (
+                Some(json!({"Fn::If":["Traced","Active","Disabled"]})),
+                json!([BASIC, XRAY]),
+            ),
+        ] {
+            let mut template = function(tracing.clone(), None);
+            transform(&mut template).unwrap();
+            let resources = &template["Resources"];
+            assert_eq!(
+                resources["WorkerRole"]["Properties"]["ManagedPolicyArns"], expected,
+                "Tracing {tracing:?}"
+            );
+            assert_eq!(
+                resources["Worker"]["Properties"]["Role"],
+                json!({"Fn::GetAtt":["WorkerRole","Arn"]})
+            );
+        }
+
+        let role = json!("arn:aws:iam::000000000000:role/existing");
+        let mut template = function(Some(json!("Active")), Some(role.clone()));
+        transform(&mut template).unwrap();
+        let resources = template["Resources"].as_object().unwrap();
+        assert!(!resources.contains_key("WorkerRole"));
+        assert_eq!(resources["Worker"]["Properties"]["Role"], role);
+        assert!(!template.to_string().contains(XRAY));
+    }
+
+    #[test]
     fn explicit_api_after_function_keeps_generated_route() {
         let mut template = json!({
             "Transform":"AWS::Serverless-2016-10-31",
@@ -763,6 +892,41 @@ mod globals_tests {
             raw["Resources"]["Worker"]["Properties"]["Environment"]["Variables"]["VAR"],
             json!({"Fn::Sub":"${LocalValue}"})
         );
+    }
+
+    #[test]
+    fn globals_function_tracing_applies_and_local_value_overrides() {
+        let mut raw = template(
+            json!({"Function":{"Tracing":"Active"}}),
+            json!({"CodeUri":"s3://artifacts/worker.zip"}),
+        );
+        raw["Resources"]["Plain"] = json!({"Type":"AWS::Serverless::Function",
+            "Properties":{"CodeUri":"s3://artifacts/plain.zip", "Tracing":"Disabled"}});
+        raw["Resources"]["Relay"] = json!({"Type":"AWS::Serverless::Function",
+            "Properties":{"CodeUri":"s3://artifacts/relay.zip", "Tracing":"PassThrough"}});
+        transform(&mut raw).unwrap();
+        let resources = &raw["Resources"];
+        assert_eq!(
+            resources["Worker"]["Properties"]["TracingConfig"],
+            json!({"Mode":"Active"})
+        );
+        assert!(resources["Plain"]["Properties"]
+            .get("TracingConfig")
+            .is_none());
+        assert_eq!(
+            resources["Relay"]["Properties"]["TracingConfig"],
+            json!({"Mode":"PassThrough"})
+        );
+
+        for globals in [
+            json!({"Function":{"Tracing":"Off"}}),
+            json!({"Function":{"Tracing":true}}),
+        ] {
+            let mut raw = template(globals, json!({"CodeUri":"s3://artifacts/worker.zip"}));
+            let before = raw.clone();
+            assert!(transform(&mut raw).is_err());
+            assert_eq!(raw, before);
+        }
     }
 
     #[test]
