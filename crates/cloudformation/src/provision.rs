@@ -460,6 +460,16 @@ impl Provisioner {
                 )
                 .await
             }
+            "AWS::IAM::Role" => {
+                self.update_iam_role(
+                    logical_id,
+                    &current.ref_value,
+                    previous_properties,
+                    properties,
+                )
+                .await?;
+                Ok(current.clone())
+            }
             "AWS::Lambda::Function" => {
                 self.update_lambda_function(
                     logical_id,
@@ -3434,6 +3444,150 @@ impl Provisioner {
             ref_value: name,
             attributes: attrs,
         })
+    }
+
+    /// Diff the role's trust policy, inline policies, and managed policy attachments in place.
+    /// A failed step reverts the steps already applied, so the role keeps its previous state.
+    async fn update_iam_role(
+        &self,
+        logical_id: &str,
+        role: &str,
+        previous: &Value,
+        next: &Value,
+    ) -> Result<(), CfnError> {
+        ensure_only_supported_changes(
+            logical_id,
+            "AWS::IAM::Role",
+            previous,
+            next,
+            &[
+                "RoleName",
+                "Path",
+                "AssumeRolePolicyDocument",
+                "Policies",
+                "ManagedPolicyArns",
+            ],
+        )?;
+        let path = |props: &Value| effective_property(props, "Path", json!("/"));
+        if previous.get("RoleName") != next.get("RoleName") || path(previous) != path(next) {
+            return Err(CfnError::ResourceFailed(format!(
+                "AWS::IAM::Role RoleName and Path require replacement for {logical_id}"
+            )));
+        }
+
+        // Each step is paired with the call that reverts it.
+        let mut steps: Vec<(IamRoleCall, IamRoleCall)> = Vec::new();
+        let trust = |props: &Value| {
+            props
+                .get("AssumeRolePolicyDocument")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "{}".to_string())
+        };
+        let (old_trust, new_trust) = (trust(previous), trust(next));
+        if old_trust != new_trust {
+            steps.push((
+                (
+                    "UpdateAssumeRolePolicy",
+                    vec![("PolicyDocument", new_trust)],
+                ),
+                (
+                    "UpdateAssumeRolePolicy",
+                    vec![("PolicyDocument", old_trust)],
+                ),
+            ));
+        }
+
+        let old_inline = iam_inline_policies(previous);
+        let new_inline = iam_inline_policies(next);
+        for (name, document) in &new_inline {
+            let put = |document: &str| {
+                (
+                    "PutRolePolicy",
+                    vec![
+                        ("PolicyName", name.clone()),
+                        ("PolicyDocument", document.to_string()),
+                    ],
+                )
+            };
+            match old_inline.get(name) {
+                Some(old) if old == document => {}
+                Some(old) => steps.push((put(document), put(old))),
+                None => steps.push((
+                    put(document),
+                    ("DeleteRolePolicy", vec![("PolicyName", name.clone())]),
+                )),
+            }
+        }
+
+        let old_managed = iam_managed_policies(previous);
+        let new_managed = iam_managed_policies(next);
+        let attachment =
+            |action: &'static str, arn: &str| (action, vec![("PolicyArn", arn.into())]);
+        for arn in new_managed.iter().filter(|arn| !old_managed.contains(arn)) {
+            steps.push((
+                attachment("AttachRolePolicy", arn),
+                attachment("DetachRolePolicy", arn),
+            ));
+        }
+        for (name, document) in old_inline
+            .iter()
+            .filter(|(name, _)| !new_inline.contains_key(*name))
+        {
+            steps.push((
+                ("DeleteRolePolicy", vec![("PolicyName", name.clone())]),
+                (
+                    "PutRolePolicy",
+                    vec![
+                        ("PolicyName", name.clone()),
+                        ("PolicyDocument", document.clone()),
+                    ],
+                ),
+            ));
+        }
+        for arn in old_managed.iter().filter(|arn| !new_managed.contains(arn)) {
+            steps.push((
+                attachment("DetachRolePolicy", arn),
+                attachment("AttachRolePolicy", arn),
+            ));
+        }
+
+        let mut applied = Vec::new();
+        for (forward, revert) in steps {
+            if let Err(error) = self.iam_role_call(logical_id, role, &forward).await {
+                for revert in applied.iter().rev() {
+                    if let Err(rollback) = self.iam_role_call(logical_id, role, revert).await {
+                        return Err(CfnError::ResourceFailed(format!(
+                            "{error}; IAM role rollback failed: {rollback}"
+                        )));
+                    }
+                }
+                return Err(error);
+            }
+            applied.push(revert);
+        }
+        Ok(())
+    }
+
+    async fn iam_role_call(
+        &self,
+        logical_id: &str,
+        role: &str,
+        (action, params): &IamRoleCall,
+    ) -> Result<(), CfnError> {
+        let mut form = format!("Action={action}&Version=2010-05-08&RoleName={}", enc(role));
+        for (key, value) in params {
+            form.push_str(&format!("&{key}={}", enc(value)));
+        }
+        let (status, response) = self
+            .call("iam", Method::POST, "/", form_host(), Bytes::from(form))
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(CfnError::ResourceFailed(format!(
+                "IAM {action} for {logical_id} failed ({status}): {}",
+                String::from_utf8_lossy(&response)
+            )));
+        }
+        Ok(())
     }
 
     async fn lambda_function(
@@ -6512,6 +6666,42 @@ fn event_target_ids(props: &Value) -> Vec<String> {
         .collect()
 }
 
+/// An IAM role-scoped Query action and its parameters besides `RoleName`.
+type IamRoleCall = (&'static str, Vec<(&'static str, String)>);
+
+/// Inline role policies as `PolicyName` → serialized document, read like `iam_role` does.
+fn iam_inline_policies(props: &Value) -> std::collections::BTreeMap<String, String> {
+    props
+        .get("Policies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|policy| {
+            (
+                policy
+                    .get("PolicyName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("inline")
+                    .to_string(),
+                policy
+                    .get("PolicyDocument")
+                    .map(Value::to_string)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn iam_managed_policies(props: &Value) -> Vec<&str> {
+    props
+        .get("ManagedPolicyArns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
 fn ensure_only_supported_changes(
     logical_id: &str,
     resource_type: &str,
@@ -8385,6 +8575,153 @@ mod tests {
                 assert!(error.contains(&format!("policy {policy}")), "{error}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn iam_role_update_diffs_policies_in_native_iam_and_reverts_failed_steps() {
+        const BASIC: &str = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
+        const XRAY: &str = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess";
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_iam_sts::register(&registry);
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let trust = |service: &str| {
+            json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Principal":{"Service":[service]},"Action":["sts:AssumeRole"]}]})
+        };
+        let document = |action: &str| json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":action,"Resource":"*"}]});
+        let initial = json!({
+            "RoleName": "cfn-updated-role",
+            "AssumeRolePolicyDocument": trust("lambda.amazonaws.com"),
+            "ManagedPolicyArns": [BASIC, XRAY],
+            "Policies": [
+                {"PolicyName": "kept", "PolicyDocument": document("s3:GetObject")},
+                {"PolicyName": "changed", "PolicyDocument": document("sqs:SendMessage")},
+                {"PolicyName": "removed", "PolicyDocument": document("sns:Publish")}
+            ]
+        });
+        let role = p.iam_role("Role", "stack", &initial).await.unwrap();
+        let query = |action: &'static str, extra: &'static str| {
+            let p = &p;
+            async move {
+                let form =
+                    format!("Action={action}&Version=2010-05-08&RoleName=cfn-updated-role{extra}");
+                let (status, body) = p
+                    .call("iam", Method::POST, "/", form_host(), Bytes::from(form))
+                    .await
+                    .unwrap();
+                assert_eq!(status, 200, "{action}");
+                String::from_utf8(body.to_vec()).unwrap()
+            }
+        };
+
+        let next = json!({
+            "RoleName": "cfn-updated-role",
+            "AssumeRolePolicyDocument": trust("states.amazonaws.com"),
+            "ManagedPolicyArns": [BASIC],
+            "Policies": [
+                {"PolicyName": "kept", "PolicyDocument": document("s3:GetObject")},
+                {"PolicyName": "changed", "PolicyDocument": document("sqs:DeleteMessage")},
+                {"PolicyName": "added", "PolicyDocument": document("logs:PutLogEvents")}
+            ]
+        });
+        let updated = p
+            .update(
+                "Role",
+                "AWS::IAM::Role",
+                &role,
+                &initial,
+                &next,
+                Replacement::Update(ResourcePolicy::Delete),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.ref_value, role.ref_value);
+        assert_eq!(updated.attributes, role.attributes);
+        let attached = query("ListAttachedRolePolicies", "").await;
+        assert!(attached.contains(BASIC), "{attached}");
+        assert!(!attached.contains(XRAY), "{attached}");
+        let inline = query("ListRolePolicies", "").await;
+        for (name, present) in [
+            ("kept", true),
+            ("changed", true),
+            ("added", true),
+            ("removed", false),
+        ] {
+            assert_eq!(
+                inline.contains(&format!("<member>{name}</member>")),
+                present,
+                "{name}: {inline}"
+            );
+        }
+        let changed = query("GetRolePolicy", "&PolicyName=changed").await;
+        assert!(changed.contains("DeleteMessage"), "{changed}");
+        assert!(query("GetRole", "").await.contains("states.amazonaws.com"));
+
+        // A failed attachment reverts the trust policy and inline policy already applied.
+        let mut failing = next.clone();
+        failing["AssumeRolePolicyDocument"] = trust("events.amazonaws.com");
+        failing["Policies"][1]["PolicyDocument"] = document("sqs:PurgeQueue");
+        failing["ManagedPolicyArns"] = json!([BASIC, "arn:aws:iam::000000000000:policy/missing"]);
+        let error = p
+            .update(
+                "Role",
+                "AWS::IAM::Role",
+                &role,
+                &next,
+                &failing,
+                Replacement::Update(ResourcePolicy::Delete),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("AttachRolePolicy"), "{error}");
+        assert!(query("GetRole", "").await.contains("states.amazonaws.com"));
+        assert!(query("GetRolePolicy", "&PolicyName=changed")
+            .await
+            .contains("DeleteMessage"));
+
+        // Identity and unsupported property changes are rejected before any IAM call.
+        for (key, value) in [
+            ("RoleName", json!("renamed-role")),
+            ("Path", json!("/service/")),
+            ("MaxSessionDuration", json!(7200)),
+        ] {
+            let mut changed = next.clone();
+            changed[key] = value;
+            let error = p
+                .update(
+                    "Role",
+                    "AWS::IAM::Role",
+                    &role,
+                    &next,
+                    &changed,
+                    Replacement::Update(ResourcePolicy::Delete),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Role"), "{key}: {error}");
+        }
+        let mut explicit_default_path = next.clone();
+        explicit_default_path["Path"] = json!("/");
+        p.update(
+            "Role",
+            "AWS::IAM::Role",
+            &role,
+            &next,
+            &explicit_default_path,
+            Replacement::Update(ResourcePolicy::Delete),
+        )
+        .await
+        .unwrap();
+
+        p.deprovision("AWS::IAM::Role", &role.ref_value, &next)
+            .await
+            .unwrap();
     }
 
     #[test]
