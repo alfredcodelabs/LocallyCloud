@@ -765,7 +765,7 @@ pub async fn create_deployment(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out
                 }
                 None => json!({}),
             };
-            let stage = stage_value(stage_name, &id, &stage_description);
+            let stage = stage_value(stage_name, &id, &stage_description)?;
             let logging = rest_stage_logging(&stage, ctx.account, ctx.region, api_id, stage_name)?;
             preflight(
                 ctx.registry,
@@ -812,7 +812,16 @@ pub async fn get_deployments(ctx: &Ctx<'_>, api_id: &str) -> Out {
     Ok((200, json!({ "item": items })))
 }
 
-fn stage_value(name: &str, deployment_id: &str, body: &Value) -> Value {
+fn stage_value(name: &str, deployment_id: &str, body: &Value) -> Result<Value, ApiGwError> {
+    let tracing_enabled = match body.get("tracingEnabled") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => {
+            return Err(ApiGwError::BadRequest(
+                "tracingEnabled must be a boolean".into(),
+            ))
+        }
+    };
     let mut stage = json!({
         "stageName": name,
         "deploymentId": deployment_id,
@@ -820,9 +829,18 @@ fn stage_value(name: &str, deployment_id: &str, body: &Value) -> Value {
         "createdDate": now_epoch(),
         "variables": body.get("variables").cloned().unwrap_or(json!({})),
         "methodSettings": body.get("methodSettings").cloned().unwrap_or(json!({})),
+        "tracingEnabled": tracing_enabled,
     });
     if let Some(settings) = body.get("accessLogSettings") {
         stage["accessLogSettings"] = settings.clone();
+    }
+    Ok(stage)
+}
+
+/// Stages stored before `tracingEnabled` was recorded have it off.
+fn with_stage_defaults(mut stage: Value) -> Value {
+    if let Some(fields) = stage.as_object_mut() {
+        fields.entry("tracingEnabled").or_insert(Value::Bool(false));
     }
     stage
 }
@@ -830,7 +848,7 @@ fn stage_value(name: &str, deployment_id: &str, body: &Value) -> Value {
 pub async fn create_stage(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
     let stage_name = req_str(body, "stageName")?;
     let deployment_id = req_str(body, "deploymentId")?;
-    let stage = stage_value(stage_name, deployment_id, body);
+    let stage = stage_value(stage_name, deployment_id, body)?;
     let logging = rest_stage_logging(&stage, ctx.account, ctx.region, api_id, stage_name)?;
     let r = rest(ctx, api_id).await?;
     {
@@ -876,7 +894,7 @@ pub async fn get_stage(ctx: &Ctx<'_>, api_id: &str, stage_name: &str) -> Out {
         .stages
         .get(stage_name)
         .cloned()
-        .map(|v| (200, v))
+        .map(|v| (200, with_stage_defaults(v)))
         .ok_or_else(|| {
             ApiGwError::NotFound(format!("Invalid stage identifier specified: {stage_name}"))
         })
@@ -1188,7 +1206,14 @@ pub async fn delete_deployment(ctx: &Ctx<'_>, api_id: &str, deployment_id: &str)
 
 pub async fn get_stages(ctx: &Ctx<'_>, api_id: &str) -> Out {
     let r = rest(ctx, api_id).await?;
-    let item = r.read().await.stages.values().cloned().collect::<Vec<_>>();
+    let item = r
+        .read()
+        .await
+        .stages
+        .values()
+        .cloned()
+        .map(with_stage_defaults)
+        .collect::<Vec<_>>();
     Ok((200, json!({ "item": item })))
 }
 
@@ -1253,9 +1278,14 @@ pub async fn update_stage(ctx: &Ctx<'_>, api_id: &str, stage_name: &str, body: &
     let r = rest(ctx, api_id).await?;
     let mut updated = {
         let guard = r.read().await;
-        guard.stages.get(stage_name).cloned().ok_or_else(|| {
-            ApiGwError::NotFound(format!("Invalid stage identifier specified: {stage_name}"))
-        })?
+        guard
+            .stages
+            .get(stage_name)
+            .cloned()
+            .map(with_stage_defaults)
+            .ok_or_else(|| {
+                ApiGwError::NotFound(format!("Invalid stage identifier specified: {stage_name}"))
+            })?
     };
     let body = normalized_stage_patch(&mut updated, body)?;
     apply_patch_operations(&mut updated, &body, |path| {

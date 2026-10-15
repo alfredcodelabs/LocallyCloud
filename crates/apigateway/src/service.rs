@@ -35,6 +35,7 @@ pub(crate) struct ApiGwHandler {
     domains: DomainBindings,
     persistence: Option<crate::store::Persistence>,
     configuration_gate: tokio::sync::RwLock<()>,
+    trace_sampler: crate::xray::Sampler,
 }
 
 #[derive(Clone)]
@@ -102,6 +103,7 @@ impl ApiGwHandler {
             domains: DomainBindings::default(),
             persistence: None,
             configuration_gate: tokio::sync::RwLock::new(()),
+            trace_sampler: crate::xray::Sampler::default(),
         }
     }
 
@@ -773,6 +775,8 @@ impl NativeHandler for ApiGwHandler {
                 waf,
                 trusted_peer_ip: trusted_peer_ip.as_deref(),
                 trace_header: request.headers.get("x-amzn-trace-id"),
+                trace_sampler: &self.trace_sampler,
+                stage_trace: None,
             };
             return execute::invoke(
                 &ctx,
@@ -3165,6 +3169,256 @@ mod aws_proxy_e2e {
             *lambda.0.lock().unwrap(),
             vec![Some(trace.to_string()), None]
         );
+    }
+
+    /// Records the scope and documents of each X-Ray `PutTraceSegments` call.
+    #[derive(Default)]
+    struct RecordingXray(std::sync::Mutex<Vec<(String, String, Vec<Value>)>>);
+
+    #[async_trait]
+    impl NativeHandler for RecordingXray {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            assert_eq!(request.uri.path(), "/TraceSegments");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let documents = body["TraceSegmentDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|document| serde_json::from_str(document.as_str().unwrap()).unwrap())
+                .collect();
+            self.0
+                .lock()
+                .unwrap()
+                .push((request.account_id, request.region, documents));
+            http::Response::builder()
+                .status(200)
+                .body(Body::from(r#"{"UnprocessedTraceSegments":[]}"#))
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn traced_rest_stage_emits_stage_segment_and_parents_lambda_on_its_subsegment() {
+        let reg = ServiceRegistry::with_known_services();
+        let lambda = Arc::new(TraceLambda::default());
+        let xray = Arc::new(RecordingXray::default());
+        reg.register_native(
+            ServiceName::new("lambda"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            lambda.clone(),
+        );
+        reg.register_native(
+            ServiceName::new("xray"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            xray.clone(),
+        );
+        reg.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &reg,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(true),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )));
+        crate::register(&reg);
+        let h = reg.native_handler(&ServiceName::new("apigateway")).unwrap();
+        let send = |method: Method, path: String, body: Value| {
+            let h = h.clone();
+            async move {
+                let response = h
+                    .handle(ServiceRequest {
+                        method,
+                        uri: path.parse().unwrap(),
+                        headers: HeaderMap::new(),
+                        body: Bytes::from(body.to_string()),
+                        region: "us-east-1".into(),
+                        account_id: "000000000000".into(),
+                        request_id: "rid".into(),
+                    })
+                    .await;
+                let status = response.status().as_u16();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        };
+        let api = call(&h, Method::POST, "/restapis", json!({"name":"orders"})).await;
+        let api_id = api["id"].as_str().unwrap().to_string();
+        let root_id = api["rootResourceId"].as_str().unwrap();
+        call(
+            &h,
+            Method::PUT,
+            &format!("/restapis/{api_id}/resources/{root_id}/methods/GET"),
+            json!({"authorizationType":"NONE"}),
+        )
+        .await;
+        call(&h, Method::PUT, &format!("/restapis/{api_id}/resources/{root_id}/methods/GET/integration"),
+            json!({"type":"AWS_PROXY","integrationHttpMethod":"POST","uri":"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:f/invocations"})).await;
+        let deployment = call(
+            &h,
+            Method::POST,
+            &format!("/restapis/{api_id}/deployments"),
+            json!({"stageName":"prod"}),
+        )
+        .await;
+        let deployment_id = deployment["id"].as_str().unwrap();
+
+        // Control plane: off by default, CreateStage and UpdateStage set it, Get(s) show it.
+        let stage_path = format!("/restapis/{api_id}/stages/prod");
+        let (_, stage) = send(Method::GET, stage_path.clone(), json!({})).await;
+        assert_eq!(stage["tracingEnabled"], false);
+        let (status, _) = send(
+            Method::POST,
+            format!("/restapis/{api_id}/stages"),
+            json!({"stageName":"beta","deploymentId":deployment_id,"tracingEnabled":"yes"}),
+        )
+        .await;
+        assert_eq!(status, 400);
+        let (status, beta) = send(
+            Method::POST,
+            format!("/restapis/{api_id}/stages"),
+            json!({"stageName":"beta","deploymentId":deployment_id,"tracingEnabled":true}),
+        )
+        .await;
+        assert_eq!((status, &beta["tracingEnabled"]), (201, &json!(true)));
+        let patch = |value: &str| json!({"patchOperations":[{"op":"replace","path":"/tracingEnabled","value":value}]});
+        let (status, _) = send(Method::PATCH, stage_path.clone(), patch("yes")).await;
+        assert_eq!(status, 400);
+        let (status, stage) = send(Method::PATCH, stage_path.clone(), patch("true")).await;
+        assert_eq!((status, &stage["tracingEnabled"]), (200, &json!(true)));
+        let (_, stages) = send(Method::GET, format!("/restapis/{api_id}/stages"), json!({})).await;
+        assert!(stages["item"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stage| stage["tracingEnabled"] == true));
+
+        let invoke = |client_trace: Option<&'static str>| {
+            let h = h.clone();
+            let api_id = api_id.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some(value) = client_trace {
+                    headers.insert("x-amzn-trace-id", HeaderValue::from_static(value));
+                }
+                h.handle(ServiceRequest {
+                    method: Method::GET,
+                    uri: format!("/restapis/{api_id}/prod/_user_request_/?q=1")
+                        .parse()
+                        .unwrap(),
+                    headers,
+                    body: Bytes::new(),
+                    region: "us-east-1".into(),
+                    account_id: "000000000000".into(),
+                    request_id: "rid".into(),
+                })
+                .await
+                .status()
+            }
+        };
+        let documents = |count: usize| {
+            let xray = xray.clone();
+            async move {
+                for _ in 0..250 {
+                    if xray.0.lock().unwrap().len() >= count {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let calls = xray.0.lock().unwrap();
+                calls
+                    .iter()
+                    .map(|(account, region, documents)| {
+                        assert_eq!(
+                            (account.as_str(), region.as_str()),
+                            ("000000000000", "us-east-1")
+                        );
+                        assert_eq!(documents.len(), 1);
+                        documents[0].clone()
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let last_lambda_trace = || lambda.0.lock().unwrap().last().cloned().flatten().unwrap();
+        let field = |trace: &str, name: &str| {
+            trace
+                .split(';')
+                .find_map(|part| part.strip_prefix(name)?.strip_prefix('='))
+                .map(str::to_owned)
+        };
+
+        // A caller-sampled request: the stage segment continues the caller's trace and Lambda
+        // is parented on the segment's `Lambda` subsegment.
+        const ROOT: &str = "1-5759e988-bd862e3fe1be46a994272793";
+        const CALLER: &str =
+            "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
+        assert_eq!(invoke(Some(CALLER)).await, 200);
+        let forwarded = last_lambda_trace();
+        assert_eq!(field(&forwarded, "Root").as_deref(), Some(ROOT));
+        assert_eq!(field(&forwarded, "Sampled").as_deref(), Some("1"));
+        let parent = field(&forwarded, "Parent").unwrap();
+        assert_ne!(parent, "53995c3f42cd8ad8");
+        let found = documents(1).await;
+        assert_eq!(found.len(), 1);
+        let segment = &found[0];
+        assert_eq!(segment["name"], "orders/prod");
+        assert_eq!(segment["origin"], "AWS::ApiGateway::Stage");
+        assert_eq!(segment["trace_id"], ROOT);
+        assert_eq!(segment["parent_id"], "53995c3f42cd8ad8");
+        assert_eq!(
+            segment["resource_arn"],
+            format!("arn:aws:apigateway:us-east-1::/restapis/{api_id}/stages/prod")
+        );
+        assert_eq!(segment["http"]["request"]["method"], "GET");
+        assert!(segment["http"]["request"]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/prod/_user_request_/?q=1"));
+        assert_eq!(segment["http"]["response"]["status"], 200);
+        assert!(segment.get("fault").is_none() && segment.get("error").is_none());
+        let subsegment = &segment["subsegments"][0];
+        assert_eq!(subsegment["id"], parent.as_str());
+        assert_eq!(subsegment["name"], "Lambda");
+        assert_eq!(subsegment["aws"]["function_name"], "f");
+        assert_ne!(segment["id"], parent.as_str());
+
+        // A caller's `Sampled=0` is honored: Lambda gets the decision, no segment is stored.
+        assert_eq!(
+            invoke(Some("Root=1-5759e988-bd862e3fe1be46a994272793;Sampled=0")).await,
+            200
+        );
+        assert_eq!(last_lambda_trace(), format!("Root={ROOT};Sampled=0"));
+        // Without a header the stage's rule samples (the reservoir slot of this second) and
+        // starts a new trace with the segment as its root.
+        assert_eq!(invoke(None).await, 200);
+        let forwarded = last_lambda_trace();
+        let root = field(&forwarded, "Root").unwrap();
+        assert_ne!(root, ROOT);
+        let found = documents(2).await;
+        assert_eq!(found.len(), 2);
+        let segment = &found[1];
+        assert_eq!(segment["trace_id"], root.as_str());
+        assert!(segment.get("parent_id").is_none());
+        assert_eq!(segment["aws"]["xray"]["sampling_rule_name"], "Default");
+        assert_eq!(
+            segment["subsegments"][0]["id"].as_str(),
+            field(&forwarded, "Parent").as_deref()
+        );
+
+        // Tracing off again: the client's header passes through unchanged and nothing is sent.
+        let (status, _) = send(Method::PATCH, stage_path, patch("false")).await;
+        assert_eq!(status, 200);
+        assert_eq!(invoke(Some(CALLER)).await, 200);
+        assert_eq!(last_lambda_trace(), CALLER);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(documents(0).await.len(), 2);
     }
 
     #[tokio::test]

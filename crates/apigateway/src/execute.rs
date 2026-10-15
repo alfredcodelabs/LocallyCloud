@@ -26,6 +26,7 @@ use crate::proxy_event::{
 };
 use crate::store::ApiGwStore;
 use crate::vtl::{ContextBinding, InputBinding, UtilBinding, VtlContext, VtlEngine};
+use crate::xray::{CallOutcome, Sampler, StageTrace, TracedStage};
 
 pub struct ExecuteCtx<'a> {
     pub store: &'a ApiGwStore,
@@ -39,6 +40,11 @@ pub struct ExecuteCtx<'a> {
     pub trusted_peer_ip: Option<&'a str>,
     /// Client `X-Amzn-Trace-Id`, forwarded to Lambda integrations so the trace continues.
     pub trace_header: Option<&'a http::HeaderValue>,
+    /// X-Ray's default sampling rule for REST stages with `tracingEnabled`.
+    pub(crate) trace_sampler: &'a Sampler,
+    /// The trace of the current request when its REST stage has `tracingEnabled`; replaces
+    /// `trace_header` for Lambda calls.
+    pub(crate) stage_trace: Option<&'a StageTrace>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,11 +547,63 @@ async fn invoke_rest(
             return plain(500, "Internal Server Error");
         }
     };
-    let response = invoke_rest_inner(ctx, target, record, incoming, custom_domain).await;
-    match logging {
-        Some(logging) => finish_logging(ctx, response, logging).await,
+    let traced_stage = {
+        let guard = record.read().await;
+        split_stage(target, &guard.stages)
+            .filter(|(_, _, stage)| {
+                stage.get("tracingEnabled").and_then(Value::as_bool) == Some(true)
+            })
+            .map(|(stage, _, _)| TracedStage {
+                api_id: target.api_id.to_string(),
+                api_name: guard
+                    .api
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                stage,
+            })
+    };
+    let Some(traced_stage) = traced_stage else {
+        let response = invoke_rest_inner(ctx, target, record, incoming, custom_domain).await;
+        return match logging {
+            Some(logging) => finish_logging(ctx, response, logging).await,
+            None => response,
+        };
+    };
+    let trace = StageTrace::begin(
+        ctx.trace_header,
+        ctx.trace_sampler,
+        &format!("{}/{}", ctx.account, ctx.region),
+    );
+    let traced = ExecuteCtx {
+        waf: ctx.waf.clone(),
+        stage_trace: Some(&trace),
+        ..*ctx
+    };
+    let method = incoming.method.clone();
+    let url = format!("http://{}{}", incoming.host, incoming.uri);
+    let response = invoke_rest_inner(&traced, target, record, incoming, custom_domain).await;
+    let response = match logging {
+        Some(logging) => finish_logging(&traced, response, logging).await,
         None => response,
+    };
+    if let Some(segment) = trace.segment(
+        &traced_stage,
+        ctx.account,
+        ctx.region,
+        ctx.request_id,
+        (&method, &url),
+        response.status().as_u16(),
+    ) {
+        crate::xray::put_trace_segments(
+            ctx.registry,
+            ctx.account,
+            ctx.region,
+            vec![segment.to_string()],
+        );
     }
+    response
 }
 
 async fn invoke_rest_inner(
@@ -2451,7 +2509,13 @@ async fn invoke_lambda(
         .unwrap_or(ctx.region);
     let mut headers = HeaderMap::new();
     set_dispatch_authorization(&mut headers, region, "lambda")?;
-    if let Some(trace) = ctx
+    // A traced stage hands Lambda its own context; otherwise the client's header passes.
+    let mut subsegment = None;
+    if let Some(trace) = ctx.stage_trace {
+        let (header, id) = trace.downstream();
+        headers.insert("x-amzn-trace-id", header);
+        subsegment = id.map(|id| (trace, id, SystemTime::now()));
+    } else if let Some(trace) = ctx
         .trace_header
         .filter(|trace| trace.len() <= MAX_TRACE_HEADER_LEN)
     {
@@ -2461,8 +2525,15 @@ async fn invoke_lambda(
         Duration::from_millis(timeout_millis),
         dispatcher.dispatch(&Method::POST, &uri, &headers, body, ctx.request_id),
     )
-    .await
-    .map_err(|_| InvokeFailure::Timeout)?;
+    .await;
+    if let Some((trace, id, start)) = subsegment {
+        let outcome = match &response {
+            Ok(response) => CallOutcome::Status(response.status().as_u16()),
+            Err(_) => CallOutcome::TimedOut,
+        };
+        trace.record_lambda(id, start, function, region, outcome);
+    }
+    let response = response.map_err(|_| InvokeFailure::Timeout)?;
     if !response.status().is_success() {
         return Err(InvokeFailure::Dispatch);
     }
@@ -2688,6 +2759,8 @@ mod tests {
             waf: None,
             trusted_peer_ip: None,
             trace_header: None,
+            trace_sampler: &Sampler::default(),
+            stage_trace: None,
         };
         let method = Method::POST;
         let uri: Uri = "/source".parse().unwrap();
@@ -2786,6 +2859,8 @@ mod tests {
             waf: None,
             trusted_peer_ip: None,
             trace_header: None,
+            trace_sampler: &Sampler::default(),
+            stage_trace: None,
         };
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", http::HeaderValue::from_static("secret"));

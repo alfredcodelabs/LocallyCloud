@@ -16,6 +16,7 @@ pub mod v1;
 pub mod v2;
 pub mod vtl;
 pub mod websocket;
+mod xray;
 
 #[cfg(test)]
 mod property_tests;
