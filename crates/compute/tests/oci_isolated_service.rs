@@ -405,3 +405,83 @@ async fn isolated_guest_public_tcp_keeps_original_destination() {
         .expect("release isolated guest");
     std::fs::remove_dir_all(rootfs).unwrap();
 }
+
+#[tokio::test]
+async fn isolated_guest_sends_udp_to_a_link_local_endpoint_bound_in_its_netns() {
+    let Some(runtime) = YoukiRuntime::discover() else {
+        return;
+    };
+    if !Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return;
+    }
+    let rootfs = unique_dir();
+    std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/isolated_udp_client.c");
+    assert!(Command::new("cc")
+        .args(["-static", "-O2"])
+        .arg(source)
+        .arg("-o")
+        .arg(rootfs.join("bin/udp-client"))
+        .status()
+        .unwrap()
+        .success());
+    let task_id = format!("isolated-udp-{}", std::process::id());
+    let address = std::net::Ipv4Addr::new(169, 254, 169, 253);
+    let spec = TaskSpec {
+        name: task_id.clone(),
+        image: rootfs.display().to_string(),
+        command: vec!["/bin/udp-client".into(), address.to_string(), "2000".into()],
+        env: HashMap::new(),
+        memory_mb: 128,
+        vcpu_count: 1,
+    };
+    // Lambda VPC guests always start with their Runtime API loopback listener.
+    let loopback_port = 58000 + (std::process::id() % 5000) as u16;
+    let (_, _loopback) = runtime
+        .start_task_isolated_with_loopback(&task_id, &spec, &[loopback_port])
+        .await
+        .expect("start isolated guest");
+    for invalid in [(std::net::Ipv4Addr::LOCALHOST, 2000), (address, 0)] {
+        assert!(runtime
+            .bind_isolated_udp(&task_id, invalid.0, invalid.1)
+            .await
+            .is_err());
+    }
+    let socket = runtime
+        .bind_isolated_udp(&task_id, address, 2000)
+        .await
+        .expect("bind UDP endpoint inside guest network namespace");
+    let mut datagram = [0; 16];
+    let (received, peer) =
+        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut datagram))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(&datagram[..received], b"ping");
+    socket.send_to(b"pong", peer).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = runtime.task_state(&task_id).await.unwrap();
+        if state != TaskState::Running {
+            assert_eq!(state, TaskState::Completed);
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "guest did not exit");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(runtime
+        .get_output(&task_id)
+        .await
+        .unwrap()
+        .contains("isolated-udp-ok"));
+    runtime
+        .release_task(&task_id)
+        .await
+        .expect("release isolated guest");
+    std::fs::remove_dir_all(rootfs).unwrap();
+}

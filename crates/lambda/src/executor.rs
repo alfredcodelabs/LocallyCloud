@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use http::{StatusCode, Uri};
-use locallycloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec};
+use locallycloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec, TaskState};
 use locallycloud_core::integration::correlation::CorrelationContext;
 use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::logs::{
@@ -42,9 +42,9 @@ use crate::code_store::CodeStore;
 use crate::error::LambdaError;
 use crate::exec_env::{build_execution_env, ExecEnvInputs};
 use crate::metrics::LambdaMetrics;
-use crate::model::{FunctionStore, LambdaFunction, LayerStore};
+use crate::model::{FunctionStore, LambdaFunction, LayerStore, TracingMode};
 use crate::rootfs::build_rootfs;
-use crate::runtime_api::{FunctionErrorType, InvocationBroker, Outcome};
+use crate::runtime_api::{FunctionErrorType, InitError, InvocationBroker, Outcome};
 
 #[derive(Clone)]
 struct VpcProxyPolicy {
@@ -417,7 +417,26 @@ pub struct Executor {
     max_warm_per_key: usize,
     /// Maximum idle environments retained across all functions and versions.
     max_warm_total: usize,
+    /// The on-demand Init limit ([`INIT_TIMEOUT`]; shortened by tests).
+    init_timeout: Duration,
+    /// Lambda's sampling rule for `Active` invocations without a caller decision.
+    sampler: crate::trace_header::Sampler,
+    /// Per-environment X-Ray daemon endpoints (address as seen by the guest, receiver task,
+    /// sampled roots the receiver accepts). Created at cold start, closed when the environment
+    /// stops.
+    xray_daemons: DashMap<
+        String,
+        (
+            SocketAddr,
+            tokio::task::JoinHandle<()>,
+            Arc<crate::xray_daemon::TraceRoots>,
+        ),
+    >,
 }
+
+/// The X-Ray daemon endpoint inside a VPC guest's network namespace: the guest-loopback
+/// address that already serves AmazonProvidedDNS, on the daemon's default port.
+const VPC_XRAY_DAEMON: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(169, 254, 169, 253), 2000);
 
 /// The result of a synchronous invocation: the outcome plus captured guest logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,8 +448,155 @@ pub struct InvokeResult {
     pub request_id: Option<String>,
     /// Stable stream associated with this execution environment.
     pub log_stream_name: Option<String>,
-    /// Billed duration in milliseconds (invoke phase only; no accrual while frozen).
+    /// Invoke-phase duration in microseconds; it never includes Init.
+    pub duration_us: u64,
+    /// Billed milliseconds: the invoke phase plus, on a cold start, the Init phase, rounded
+    /// up (no accrual while frozen).
     pub billed_duration_ms: u64,
+    /// The Init phase of the environment, on the invocation that cold-started it.
+    pub init: Option<InitReport>,
+    /// Output a managed runtime produced during Init, emitted before `START`.
+    pub init_logs: String,
+}
+
+/// `X-Amz-Log-Result` carries at most the last 4 KB of the invocation's log.
+const LOG_TAIL_BYTES: usize = 4096;
+
+impl InvokeResult {
+    /// The CloudWatch Logs lines of this invocation, in order: Init output, `INIT_REPORT`
+    /// (failed or timed-out Init), `START`, invocation output, `END`, `REPORT`.
+    pub fn log_lines(&self, version: &str, memory_size: u32) -> Vec<String> {
+        let Some(request_id) = self.request_id.as_deref() else {
+            return self.logs.lines().map(str::to_owned).collect();
+        };
+        let mut lines =
+            Vec::with_capacity(self.init_logs.lines().count() + self.logs.lines().count() + 4);
+        lines.extend(self.init_logs.lines().map(str::to_owned));
+        let init_status = self.init.as_ref().and_then(|init| match &init.status {
+            InitStatus::Success => None,
+            InitStatus::Timeout => Some("Status: timeout".to_string()),
+            InitStatus::Error(error_type) => {
+                Some(format!("Status: error\tError Type: {error_type}"))
+            }
+        });
+        if let (Some(init), Some(status)) = (&self.init, &init_status) {
+            lines.push(format!(
+                "INIT_REPORT Init Duration: {} ms\tPhase: init\t{status}",
+                format_ms(init.duration_us)
+            ));
+        }
+        lines.push(format!("START RequestId: {request_id} Version: {version}"));
+        lines.extend(self.logs.lines().map(str::to_owned));
+        lines.push(format!("END RequestId: {request_id}"));
+        let mut report = format!(
+            "REPORT RequestId: {request_id}\tDuration: {} ms\tBilled Duration: {} ms\tMemory Size: {memory_size} MB",
+            format_ms(self.duration_us),
+            self.billed_duration_ms,
+        );
+        match self
+            .init
+            .as_ref()
+            .map(|init| (&init.status, init.duration_us))
+        {
+            Some((InitStatus::Success, duration_us)) => {
+                report.push_str(&format!("\tInit Duration: {} ms", format_ms(duration_us)));
+            }
+            Some((InitStatus::Error(error_type), _)) => {
+                report.push_str(&format!("\tStatus: error\tError Type: {error_type}"));
+            }
+            Some((InitStatus::Timeout, _)) | None => {}
+        }
+        lines.push(report);
+        lines
+    }
+
+    /// The `--log-type Tail` bytes: the last 4 KB of [`log_lines`](Self::log_lines).
+    pub fn log_tail(&self, version: &str, memory_size: u32) -> Vec<u8> {
+        let mut text = self.log_lines(version, memory_size).join("\n");
+        text.push('\n');
+        let bytes = text.into_bytes();
+        bytes[bytes.len().saturating_sub(LOG_TAIL_BYTES)..].to_vec()
+    }
+}
+
+/// Init-phase facts reported on the platform log lines of a cold start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitReport {
+    pub duration_us: u64,
+    pub status: InitStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitStatus {
+    /// The runtime and extensions reached `Next`; `REPORT` carries `Init Duration`.
+    Success,
+    /// Init exceeded its 10 s limit and continued within the invocation.
+    Timeout,
+    /// Init failed with this error type; the invocation never reached the runtime.
+    Error(String),
+}
+
+/// AWS limits the on-demand Init phase to 10 seconds.
+const INIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often Init checks whether the guest task has already exited.
+const GUEST_EXIT_POLL: Duration = Duration::from_millis(75);
+
+#[derive(Debug)]
+struct ColdStart {
+    env_key: String,
+    init: InitReport,
+}
+
+/// An environment whose Init failed after its guest launched.
+#[derive(Debug)]
+struct InitFailure {
+    report: InitReport,
+    /// Invoke response payload (`errorType`, `errorMessage`, ...).
+    payload: Vec<u8>,
+    logs: String,
+    log_stream_name: String,
+}
+
+#[derive(Debug)]
+enum ColdStartError {
+    /// No runtime was launched (capacity, code, rootfs, network, or guest start).
+    Failed(LambdaError),
+    Init(InitFailure),
+}
+
+/// How long a failed Init with extensions waits for the supervisor's exit report.
+const SUPERVISOR_REPORT_GRACE: Duration = Duration::from_secs(2);
+
+/// The invoke response payload for a reported Init failure: the runtime's `ErrorRequest`
+/// when it is a JSON object, otherwise a generated one.
+fn init_failure_payload(reported: &InitError) -> Vec<u8> {
+    let valid = serde_json::from_slice::<serde_json::Value>(&reported.payload)
+        .is_ok_and(|value| value.is_object());
+    if valid {
+        reported.payload.clone()
+    } else {
+        init_error_payload(&reported.error_type, "Runtime failed to initialize")
+    }
+}
+
+fn init_error_payload(error_type: &str, message: &str) -> Vec<u8> {
+    serde_json::json!({"errorType": error_type, "errorMessage": message})
+        .to_string()
+        .into_bytes()
+}
+
+fn new_log_stream_name(version: &str) -> String {
+    format!("{}/[{}]{}", today(), version, Uuid::new_v4().simple())
+}
+
+fn billed_ms(duration_us: u64, init: Option<&InitReport>) -> u64 {
+    (duration_us + init.map_or(0, |init| init.duration_us)).div_ceil(1000)
+}
+
+/// Milliseconds with two decimals, as on Lambda platform log lines.
+fn format_ms(us: u64) -> String {
+    format!("{}.{:02}", us / 1000, us % 1000 / 10)
 }
 
 struct ExecutionLogState {
@@ -540,6 +706,9 @@ impl Executor {
             idle_timeout: Duration::from_secs(300),
             max_warm_per_key: 10,
             max_warm_total: 16,
+            init_timeout: INIT_TIMEOUT,
+            sampler: crate::trace_header::Sampler::default(),
+            xray_daemons: DashMap::new(),
         }
     }
 
@@ -629,7 +798,8 @@ impl Executor {
 
     /// Run one synchronous invocation of `func` with `payload`, returning its outcome, logs,
     /// and billed duration. Reuses a warm (frozen) environment when available, otherwise
-    /// cold-starts one; a healthy environment is frozen for reuse, a failed one is discarded.
+    /// cold-starts one. After a success or a handler error the environment is frozen for
+    /// reuse; after a timeout, crash, or runtime fault it is discarded.
     pub async fn invoke_sync(
         &self,
         account: &str,
@@ -652,6 +822,8 @@ impl Executor {
         incoming_trace: Option<&str>,
     ) -> Result<InvokeResult, LambdaError> {
         let _admitted = self.invocations.read().await;
+        // The `AWS::Lambda` service segment covers routing, queuing and environment setup.
+        let admitted_at = std::time::SystemTime::now();
         if self.closed.load(Ordering::Acquire) {
             return Err(LambdaError::InternalError(
                 "Lambda executor is shutting down".into(),
@@ -722,11 +894,11 @@ impl Executor {
         } else {
             None
         };
-        let env_key = match warm_env {
-            Some(key) => key,
+        let (env_key, init) = match warm_env {
+            Some(key) => (key, None),
             None => match self.cold_start(account, region, func, code).await {
-                Ok(key) => key,
-                Err(e @ LambdaError::LocalCapacityExceeded(_)) => {
+                Ok(cold) => (cold.env_key, Some(cold.init)),
+                Err(ColdStartError::Failed(e @ LambdaError::LocalCapacityExceeded(_))) => {
                     self.metrics.recorder().record_host_capacity(
                         account,
                         region,
@@ -735,33 +907,86 @@ impl Executor {
                     tracing::warn!(account, region, function = %func.function_name, "local Lambda compute memory capacity exhausted");
                     return Err(e);
                 }
-                Err(e) => {
+                Err(ColdStartError::Failed(e)) => {
                     self.publish_invocation_metrics(account, region, func, true, None);
-                    return Ok(InvokeResult {
+                    let request_id = Uuid::new_v4().to_string();
+                    let result = InvokeResult {
                         outcome: Outcome::Error {
                             error_type: FunctionErrorType::Unhandled,
                             payload: serde_json::json!({"errorMessage": e.to_string()})
                                 .to_string()
                                 .into_bytes(),
                         },
-                        logs: String::new(),
-                        request_id: None,
-                        log_stream_name: None,
+                        logs: format!("RequestId: {request_id} Error: {e}\n"),
+                        request_id: Some(request_id),
+                        log_stream_name: Some(new_log_stream_name(&func.version)),
+                        duration_us: 0,
                         billed_duration_ms: 0,
-                    });
+                        init: None,
+                        init_logs: String::new(),
+                    };
+                    self.publish_invocation_logs(account, region, func, &result)
+                        .await?;
+                    return Ok(result);
+                }
+                Err(ColdStartError::Init(failure)) => {
+                    // Errors=1 and no Duration: the invocation never reached the handler.
+                    self.publish_invocation_metrics(account, region, func, true, None);
+                    let result = InvokeResult {
+                        outcome: Outcome::Error {
+                            error_type: FunctionErrorType::Unhandled,
+                            payload: failure.payload,
+                        },
+                        logs: String::new(),
+                        request_id: Some(Uuid::new_v4().to_string()),
+                        log_stream_name: Some(failure.log_stream_name),
+                        duration_us: 0,
+                        billed_duration_ms: billed_ms(0, Some(&failure.report)),
+                        init: Some(failure.report),
+                        init_logs: failure.logs,
+                    };
+                    self.publish_invocation_logs(account, region, func, &result)
+                        .await?;
+                    return Ok(result);
                 }
             },
         };
 
+        // Guest output already carries Init output for custom runtimes and extensions.
+        let init_logs = self
+            .broker
+            .take_init_logs(&env_key)
+            .filter(|_| {
+                !self.broker.has_extensions(&env_key)
+                    && !crate::rootfs::is_custom(func.runtime.as_deref())
+            })
+            .map(|chunks| chunks.concat())
+            .unwrap_or_default();
         let mut environment_lease = self.environment_lease(&env_key);
         let timeout_ms = (func.timeout as i64) * 1000;
+        let trace = crate::trace_header::invocation_trace(
+            incoming_trace,
+            func.tracing_mode,
+            &self.sampler,
+            &crate::model::function_arn(region, account, &func.function_name),
+        );
+        // The environment's daemon endpoint only forwards documents of roots it was handed;
+        // admit this one before the runtime can see it. The guard finishes the root even if
+        // this future is dropped (a disconnected caller).
+        let admitted_root = self
+            .xray_daemons
+            .get(&env_key)
+            .map(|daemon| daemon.value().2.clone())
+            .filter(|_| trace.sampled)
+            .map(|roots| crate::xray_daemon::AdmittedRoot::new(roots, &trace.root));
+        let segment_start = std::time::SystemTime::now();
         let started = Instant::now();
         let (request_id, rx) = self.broker.submit_traced(
             &env_key,
             payload,
             &func.function_arn,
             timeout_ms,
-            crate::trace_header::invocation_trace_header(incoming_trace),
+            trace.header(),
         );
 
         let mut timed_out = false;
@@ -799,9 +1024,33 @@ impl Executor {
                     }
                 }
             };
-        // Billed duration covers the invoke phase only (no accrual while frozen).
+        // Init that exceeded its limit continued inside this invocation: surface a late
+        // `/init/error` (which stopped the environment) and the Init output posted late.
+        let init_timed_out = init
+            .as_ref()
+            .is_some_and(|init| init.status == InitStatus::Timeout);
+        let late_init_error = init_timed_out
+            .then(|| self.broker.take_init_error(&env_key))
+            .flatten();
+        let late_init_logs = init_timed_out
+            .then(|| self.broker.take_init_logs(&env_key))
+            .flatten()
+            .filter(|_| !crate::rootfs::is_custom(func.runtime.as_deref()));
+        let outcome = match &late_init_error {
+            Some(reported) => Outcome::Error {
+                error_type: FunctionErrorType::Unhandled,
+                payload: init_failure_payload(reported),
+            },
+            _ => outcome,
+        };
+        let init_logs = match &late_init_logs {
+            Some(chunks) => init_logs + &chunks.concat(),
+            None => init_logs,
+        };
+        // Duration covers the invoke phase only; Init ended before submission.
         let invoke_elapsed = timeout_elapsed.unwrap_or_else(|| started.elapsed());
-        let billed_duration_ms = invoke_elapsed.as_millis() as u64;
+        drop(admitted_root);
+        let duration_us = invoke_elapsed.as_micros() as u64;
         self.publish_invocation_metrics(
             account,
             region,
@@ -828,6 +1077,9 @@ impl Executor {
             };
         let logs = if has_extensions || crate::rootfs::is_custom(func.runtime.as_deref()) {
             fallback_logs
+        } else if late_init_error.is_some() && late_init_logs.is_some() && broker_logs.is_none() {
+            // The guest output repeats the Init output already taken from the runtime.
+            String::new()
         } else {
             broker_logs
                 .map(|chunks| chunks.concat())
@@ -838,15 +1090,40 @@ impl Executor {
             logs,
             request_id: Some(request_id.clone()),
             log_stream_name,
-            billed_duration_ms,
+            duration_us,
+            billed_duration_ms: billed_ms(duration_us, init.as_ref()),
+            init,
+            init_logs,
         };
+        if func.tracing_mode == TracingMode::Active && trace.sampled {
+            self.emit_lambda_segments(
+                account,
+                region,
+                func,
+                &trace,
+                admitted_at,
+                (segment_start, invoke_elapsed),
+                &result,
+            );
+        }
 
-        if !matches!(result.outcome, Outcome::Success(_)) || !has_extensions {
+        // A handler error reported through `/invocation/{id}/error` leaves the runtime
+        // running, so the environment is kept exactly as after a success; crashes, timeouts,
+        // runtime faults and stops reset it.
+        let reusable = matches!(
+            result.outcome,
+            Outcome::Success(_)
+                | Outcome::Error {
+                    error_type: FunctionErrorType::Reported,
+                    ..
+                }
+        );
+        if !reusable || !has_extensions {
             self.publish_invocation_logs(account, region, func, &result)
                 .await?;
         }
 
-        if matches!(result.outcome, Outcome::Success(_)) && has_extensions {
+        if reusable && has_extensions {
             let deadline = tokio::time::Instant::from_std(
                 started + Duration::from_millis(timeout_ms.max(0) as u64),
             );
@@ -863,7 +1140,9 @@ impl Executor {
                     let mut complete = background_result;
                     let (tail, _) = executor.read_environment_logs(&env_key).await;
                     complete.logs.push_str(&tail);
-                    complete.billed_duration_ms = started.elapsed().as_millis() as u64;
+                    complete.duration_us = started.elapsed().as_micros() as u64;
+                    complete.billed_duration_ms =
+                        billed_ms(complete.duration_us, complete.init.as_ref());
                     if let Err(error) = executor
                         .publish_invocation_logs(&account, &region, &function, &complete)
                         .await
@@ -898,7 +1177,7 @@ impl Executor {
             } else {
                 self.stop_env_reason(&env_key, "TIMEOUT").await;
             }
-        } else if matches!(result.outcome, Outcome::Success(_)) {
+        } else if reusable {
             self.return_warm(&pool_key, &env_key, generation).await;
         } else {
             let reason = if timed_out { "TIMEOUT" } else { "FAILURE" };
@@ -917,6 +1196,84 @@ impl Executor {
         }
         environment_lease.armed = false;
         Ok(result)
+    }
+
+    /// Send the two segments Lambda records for a sampled `Active` invocation, in one call:
+    /// - `AWS::Lambda` (the service): id `trace.service`, `parent_id` = the caller's `Parent`,
+    ///   from request admission (`admitted_at`) until now, when the response is ready.
+    /// - `AWS::Lambda::Function`: id = the `Parent` handed to the runtime, so SDK subsegments
+    ///   (whose facade segment carries that id) attach to it; `parent_id` = the service
+    ///   segment; it spans the invoke phase (`(start, elapsed)`, the same elapsed time
+    ///   reported as `Duration`) and carries `fault` when the function failed.
+    ///
+    /// Delivery runs in the background and never delays the response.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_lambda_segments(
+        &self,
+        account: &str,
+        region: &str,
+        func: &LambdaFunction,
+        trace: &crate::trace_header::InvocationTrace,
+        admitted_at: std::time::SystemTime,
+        (start, elapsed): (std::time::SystemTime, Duration),
+        result: &InvokeResult,
+    ) {
+        let epoch_seconds = |at: std::time::SystemTime| {
+            at.duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs_f64())
+                .unwrap_or_default()
+        };
+        let start_time = epoch_seconds(start);
+        let end_time = start_time + elapsed.as_secs_f64();
+        let mut service = serde_json::json!({
+            "name": func.function_name,
+            "id": trace.service,
+            "trace_id": trace.root,
+            "start_time": epoch_seconds(admitted_at),
+            // The clocks differ (wall vs monotonic); never end before the function segment.
+            "end_time": epoch_seconds(std::time::SystemTime::now()).max(end_time),
+            "origin": "AWS::Lambda",
+            "resource_arn": func.function_arn,
+        });
+        if let Some(request_id) = &result.request_id {
+            service["aws"] = serde_json::json!({ "request_id": request_id });
+        }
+        if let Some(parent) = &trace.caller_parent {
+            service["parent_id"] = serde_json::json!(parent);
+        }
+        let mut function = serde_json::json!({
+            "name": func.function_name,
+            "id": trace.parent,
+            "parent_id": trace.service,
+            "trace_id": trace.root,
+            "start_time": start_time,
+            "end_time": end_time,
+            "origin": "AWS::Lambda::Function",
+            "resource_arn": func.function_arn,
+        });
+        if matches!(result.outcome, Outcome::Error { .. }) {
+            function["fault"] = serde_json::json!(true);
+        }
+        let registry = self.registry.clone();
+        let account = account.to_owned();
+        let region = region.to_owned();
+        tokio::spawn(async move {
+            crate::xray_daemon::put_trace_segments(
+                &registry,
+                &account,
+                &region,
+                vec![service.to_string(), function.to_string()],
+            )
+            .await;
+        });
+    }
+
+    /// Close the X-Ray daemon endpoint of an environment, waiting until its socket is dropped.
+    async fn stop_xray_daemon(&self, env_key: &str) {
+        if let Some((_, (_, receiver, _))) = self.xray_daemons.remove(env_key) {
+            receiver.abort();
+            let _ = receiver.await;
+        }
     }
 
     async fn publish_invocation_logs(
@@ -977,26 +1334,14 @@ impl Executor {
                 LambdaError::InternalError("CloudWatch Logs stream publication failed".into())
             })?;
         let timestamp_ms = now_ms();
-        let mut events = Vec::with_capacity(result.logs.lines().count() + 3);
-        events.push(ProducerLogEvent {
-            timestamp_ms,
-            message: format!("START RequestId: {request_id} Version: {}", func.version),
-        });
-        events.extend(result.logs.lines().map(|line| ProducerLogEvent {
-            timestamp_ms,
-            message: line.to_string(),
-        }));
-        events.push(ProducerLogEvent {
-            timestamp_ms,
-            message: format!("END RequestId: {request_id}"),
-        });
-        events.push(ProducerLogEvent {
-            timestamp_ms,
-            message: format!(
-                "REPORT RequestId: {request_id}\tDuration: {}.00 ms\tBilled Duration: {} ms\tMemory Size: {} MB",
-                result.billed_duration_ms, result.billed_duration_ms, func.memory_size
-            ),
-        });
+        let events = result
+            .log_lines(&func.version, func.memory_size)
+            .into_iter()
+            .map(|message| ProducerLogEvent {
+                timestamp_ms,
+                message,
+            })
+            .collect();
         sink.append(scope, target, events, context)
             .await
             .map_err(|_| {
@@ -1416,18 +1761,29 @@ impl Executor {
         region: &str,
         func: &LambdaFunction,
         code: &[u8],
-    ) -> Result<String, LambdaError> {
+    ) -> Result<ColdStart, ColdStartError> {
         let env_key = format!("{}-{}", sanitize(&func.function_arn), Uuid::new_v4());
         self.reserve_memory(&env_key, u64::from(func.memory_size))
-            .await?;
+            .await
+            .map_err(ColdStartError::Failed)?;
         self.environment_functions.insert(
             env_key.clone(),
             crate::model::function_arn(region, account, &func.function_name),
         );
         let mut lease = self.environment_lease(&env_key);
-        let result = self
+        let result = match self
             .cold_start_inner(account, region, func, code, env_key.clone())
-            .await;
+            .await
+        {
+            Ok(launched) => self
+                .complete_init(func, &env_key, launched)
+                .await
+                .map(|init| ColdStart {
+                    env_key: env_key.clone(),
+                    init,
+                }),
+            Err(error) => Err(ColdStartError::Failed(LambdaError::InternalError(error))),
+        };
         if result.is_ok() {
             lease.armed = false;
         }
@@ -1435,7 +1791,7 @@ impl Executor {
             self.environment_functions.remove(&env_key);
             self.memory_reservations.lock().unwrap().remove(&env_key);
         }
-        result.map_err(LambdaError::InternalError)
+        result
     }
 
     async fn cold_start_inner(
@@ -1445,7 +1801,7 @@ impl Executor {
         func: &LambdaFunction,
         code: &[u8],
         env_key: String,
-    ) -> Result<String, String> {
+    ) -> Result<Instant, String> {
         let stored = self
             .code_store
             .store_zip(account, region, &func.function_name, code)
@@ -1513,7 +1869,9 @@ impl Executor {
                 &rootfs.path,
                 func.runtime.as_deref(),
                 &cache_root,
-            ) {
+            )
+            .await
+            {
                 self.cleanup_owned_rootfs(&env_key);
                 return Err(error.to_string());
             }
@@ -1598,7 +1956,7 @@ impl Executor {
         }
 
         let runtime_api = format!("{}/e/{}", self.runtime_api_base, env_key);
-        let log_stream = format!("{}/[{}]{}", today(), func.version, Uuid::new_v4().simple());
+        let log_stream = new_log_stream_name(&func.version);
         let role_credentials = self
             .registry
             .upgrade()
@@ -1639,6 +1997,33 @@ impl Executor {
                 .map(|credentials| credentials.session_token.as_str()),
             user_env: &func.environment,
         });
+        // Every environment gets its own daemon endpoint (Lambda runs the daemon in both
+        // tracing modes, and a caller-sampled `PassThrough` invocation still sends SDK
+        // documents), bound before the guest starts: an ephemeral loopback port for guests in
+        // the host netns, a fixed address inside the isolated netns of VPC guests (bound once
+        // that netns exists).
+        let mut xray_socket = None;
+        let xray_endpoint = if vpc_launch.is_some() {
+            SocketAddr::V4(VPC_XRAY_DAEMON)
+        } else {
+            let socket = match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    self.cleanup_owned_rootfs(&env_key);
+                    return Err(format!("X-Ray daemon endpoint unavailable: {error}"));
+                }
+            };
+            let address = match socket.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    self.cleanup_owned_rootfs(&env_key);
+                    return Err(format!("X-Ray daemon endpoint unavailable: {error}"));
+                }
+            };
+            xray_socket = Some(socket);
+            address
+        };
+        crate::exec_env::insert_xray_daemon_env(&mut env_map, xray_endpoint);
         let mut command = rootfs.entrypoint.clone();
         if let Some((_, _, runtime_port, aws_port, _)) = &vpc_launch {
             env_map.insert(
@@ -1728,6 +2113,17 @@ impl Executor {
                     return Err(format!("VPC DNS setup failed: {error}"));
                 }
             };
+            match self
+                .runtime
+                .bind_isolated_udp(&env_key, *VPC_XRAY_DAEMON.ip(), VPC_XRAY_DAEMON.port())
+                .await
+            {
+                Ok(socket) => xray_socket = Some(socket),
+                Err(error) => {
+                    self.cleanup_failed_start(&env_key, Some(lease)).await;
+                    return Err(format!("VPC X-Ray daemon endpoint failed: {error}"));
+                }
+            }
             let public_egress_enabled = public_tcp.is_some();
             let mut proxies = private_listeners
                 .into_iter()
@@ -1800,6 +2196,21 @@ impl Executor {
             self.cleanup_failed_start(&env_key, None).await;
             return Err(format!("guest start failed: {error}"));
         }
+        if let Some(socket) = xray_socket {
+            let roots = Arc::new(crate::xray_daemon::TraceRoots::default());
+            let receiver = crate::xray_daemon::serve(
+                socket,
+                roots.clone(),
+                self.registry.clone(),
+                account.to_owned(),
+                region.to_owned(),
+            );
+            self.xray_daemons
+                .insert(env_key.clone(), (xray_endpoint, receiver, roots));
+        }
+        // Init (and its 10 s limit) starts once the guest runs and, for VPC, its network
+        // proxies are ready; emulator setup is not part of the Init phase.
+        let launched = Instant::now();
         if let Err(error) = self.mark_rootfs_running(&env_key) {
             self.cleanup_failed_start(&env_key, None).await;
             return Err(format!("rootfs ownership transition failed: {error}"));
@@ -1815,14 +2226,110 @@ impl Executor {
                 role: func.role.clone(),
             },
         );
-        if self.broker.has_extensions(&env_key) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            if let Err(error) = self.broker.wait_init_ready(&env_key, deadline).await {
-                self.stop_env_reason(&env_key, "FAILURE").await;
-                return Err(format!("extension initialization failed: {error}"));
+        Ok(launched)
+    }
+
+    /// Wait for the Init phase of a launched environment: it ends when the runtime (and every
+    /// extension) first calls `Next`. Init is limited to 10 s; past that, a runtime without
+    /// extensions keeps initializing within the invocation, as Lambda retries Init with the
+    /// function timeout.
+    async fn complete_init(
+        &self,
+        func: &LambdaFunction,
+        env_key: &str,
+        launched: Instant,
+    ) -> Result<InitReport, ColdStartError> {
+        let has_extensions = self.broker.has_extensions(env_key);
+        let deadline = tokio::time::Instant::from_std(launched + self.init_timeout);
+        // A runtime that dies without reporting `/init/error` must fail Init at once.
+        let waited = tokio::select! {
+            biased;
+            waited = self.broker.wait_init_ready(env_key, deadline) => Some(waited),
+            () = self.wait_guest_exit(env_key) => None,
+        };
+        let duration_us = launched.elapsed().as_micros() as u64;
+        let exited = waited.is_none();
+        if let Some(Ok(())) = waited {
+            return Ok(InitReport {
+                duration_us,
+                status: InitStatus::Success,
+            });
+        }
+        // Any failure report stops the environment, so a live one past the deadline timed out.
+        let timed_out =
+            !exited && tokio::time::Instant::now() >= deadline && !self.broker.init_failed(env_key);
+        if timed_out && !has_extensions {
+            return Ok(InitReport {
+                duration_us,
+                status: InitStatus::Timeout,
+            });
+        }
+        if has_extensions && !exited && !timed_out {
+            // The supervisor reports an exit only after the process exited, so the process's
+            // own error (runtime `/init/error`, extension error) is recorded before it.
+            self.broker
+                .wait_supervisor_exit(
+                    env_key,
+                    tokio::time::Instant::now() + SUPERVISOR_REPORT_GRACE,
+                )
+                .await;
+        }
+        let (status, payload) = match self.broker.take_init_error(env_key) {
+            Some(reported) => {
+                let payload = init_failure_payload(&reported);
+                (InitStatus::Error(reported.error_type), payload)
+            }
+            None if timed_out => (
+                InitStatus::Timeout,
+                init_error_payload(
+                    "Sandbox.Timedout",
+                    "Init did not complete within the Init limit",
+                ),
+            ),
+            None if has_extensions && !exited => (
+                InitStatus::Error("Extension.Crash".to_owned()),
+                init_error_payload("Extension.Crash", "extension initialization failed"),
+            ),
+            None => (
+                InitStatus::Error("Runtime.ExitError".to_owned()),
+                init_error_payload("Runtime.ExitError", "Runtime exited during Init"),
+            ),
+        };
+        let init_logs = self.broker.take_init_logs(env_key);
+        let log_stream_name = self
+            .log_state
+            .get(env_key)
+            .map(|state| state.stream_name.clone());
+        let reason = if timed_out { "TIMEOUT" } else { "FAILURE" };
+        let captured = self.stop_env_reason_inner(env_key, reason, true).await;
+        let managed = !has_extensions && !crate::rootfs::is_custom(func.runtime.as_deref());
+        // A managed runtime that did not post its Init output keeps what the guest wrote.
+        let logs = match init_logs {
+            Some(chunks) if managed => chunks.concat(),
+            _ => captured.map(|(logs, _)| logs).unwrap_or_default(),
+        };
+        Err(ColdStartError::Init(InitFailure {
+            report: InitReport {
+                duration_us,
+                status,
+            },
+            payload,
+            logs,
+            log_stream_name: log_stream_name.unwrap_or_else(|| new_log_stream_name(&func.version)),
+        }))
+    }
+
+    /// Resolve once the guest task is no longer running. Never resolves on backends that
+    /// cannot report task state, which keeps the plain Init wait.
+    async fn wait_guest_exit(&self, env_key: &str) {
+        loop {
+            tokio::time::sleep(GUEST_EXIT_POLL).await;
+            match self.runtime.task_state(env_key).await {
+                Ok(TaskState::Running) => {}
+                Ok(_) | Err(RuntimeError::TaskNotFound { .. }) => return,
+                Err(_) => std::future::pending().await,
             }
         }
-        Ok(env_key.clone())
     }
 
     /// Take a non-expired warm environment and its generation for `pool_key`.
@@ -2009,6 +2516,7 @@ impl Executor {
         let gate = self.stopping.entry(env_key.to_owned()).or_default().clone();
         let mut finalized = gate.lock().await;
         if !self.owned_envs.contains_key(env_key) {
+            self.stop_xray_daemon(env_key).await;
             self.broker.release(env_key);
             self.log_state.remove(env_key);
             self.environment_functions.remove(env_key);
@@ -2074,6 +2582,7 @@ impl Executor {
             self.broker.release(env_key);
             self.log_state.remove(env_key);
             self.release_vpc_runtime(env_key);
+            self.stop_xray_daemon(env_key).await;
             if let Some((_, marker)) = self.owned_envs.remove(env_key) {
                 self.cleanup_rootfs_with_marker(env_key, marker);
             }
@@ -2334,7 +2843,24 @@ mod tests {
         ReportError,
         Hang,
         ReturnV2,
+        /// Spend 300 ms in Init (like a slow import), then echo.
+        SlowInit,
+        /// Report `/init/error` with captured Init output and exit.
+        InitError,
+        /// Crash during Init: write to the console and exit without any Runtime API call.
+        ExitDuringInit,
+        /// Finish Init after 300 ms (past a shortened Init limit), then echo.
+        LateInit,
+        /// Report `/init/error` after 300 ms (past a shortened Init limit).
+        LateInitError,
+        /// Act as the extension supervisor reporting this process class exited during Init.
+        SupervisorExit(&'static str),
+        /// Report `call <n>` through `/invocation/{id}/error`, `n` counting the calls this
+        /// runtime process served (module state); hang on the event `"hang"`. Also runs the
+        /// `ext` extension when the rootfs has one.
+        CountingError,
     }
+    const GUEST_INIT_ERROR: &str = r#"{"errorType":"Runtime.ImportModuleError","errorMessage":"Error: Cannot find module 'index'","stackTrace":[]}"#;
 
     #[async_trait]
     impl ComputeRuntime for InProcessGuest {
@@ -2349,8 +2875,72 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let api = spec.env.get("AWS_LAMBDA_RUNTIME_API").cloned().unwrap();
             let behavior = self.behavior;
+            let has_extension = std::path::Path::new(&spec.image)
+                .join("opt/extensions/ext")
+                .exists();
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
+                match behavior {
+                    GuestBehavior::SlowInit => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let _ = client
+                            .post(format!("http://{api}/2018-06-01/runtime/init/logs"))
+                            .body(r#"["init output\n"]"#)
+                            .send()
+                            .await;
+                    }
+                    GuestBehavior::InitError => {
+                        let _ = client
+                            .post(format!("http://{api}/2018-06-01/runtime/init/logs"))
+                            .body(r#"["init output\n","undefined\tERROR\tUncaught Exception\n"]"#)
+                            .send()
+                            .await;
+                        let _ = client
+                            .post(format!("http://{api}/2018-06-01/runtime/init/error"))
+                            .header(
+                                "Lambda-Runtime-Function-Error-Type",
+                                "Runtime.ImportModuleError",
+                            )
+                            .body(GUEST_INIT_ERROR)
+                            .send()
+                            .await;
+                        return;
+                    }
+                    GuestBehavior::ExitDuringInit => return,
+                    GuestBehavior::LateInit | GuestBehavior::LateInitError => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let _ = client
+                            .post(format!("http://{api}/2018-06-01/runtime/init/logs"))
+                            .body(r#"["late init output\n"]"#)
+                            .send()
+                            .await;
+                        if matches!(behavior, GuestBehavior::LateInitError) {
+                            let _ = client
+                                .post(format!("http://{api}/2018-06-01/runtime/init/error"))
+                                .header(
+                                    "Lambda-Runtime-Function-Error-Type",
+                                    "Runtime.ImportModuleError",
+                                )
+                                .body(GUEST_INIT_ERROR)
+                                .send()
+                                .await;
+                            return;
+                        }
+                    }
+                    GuestBehavior::SupervisorExit(exited) => {
+                        let _ = client
+                            .post(format!("http://{api}/locallycloud/supervisor/exit"))
+                            .header("Locallycloud-Exited", exited)
+                            .send()
+                            .await;
+                        return;
+                    }
+                    GuestBehavior::CountingError if has_extension => {
+                        tokio::spawn(run_test_extension(client.clone(), api.clone()));
+                    }
+                    _ => {}
+                }
+                let mut calls = 0u32;
                 // The runtime interface client loops until the environment is stopped (204).
                 loop {
                     let next = match client
@@ -2373,7 +2963,13 @@ mod tests {
                         .to_string();
                     let event = next.text().await.unwrap();
                     match behavior {
-                        GuestBehavior::EchoUppercaseLen => {
+                        GuestBehavior::EchoUppercaseLen
+                        | GuestBehavior::SlowInit
+                        | GuestBehavior::InitError
+                        | GuestBehavior::ExitDuringInit
+                        | GuestBehavior::LateInit
+                        | GuestBehavior::LateInitError
+                        | GuestBehavior::SupervisorExit(_) => {
                             let body = format!("{{\"len\":{}}}", event.len());
                             let _ = client
                                 .post(format!(
@@ -2383,13 +2979,29 @@ mod tests {
                                 .send()
                                 .await;
                         }
+                        // Like the AWS clients, no `Lambda-Runtime-Function-Error-Type`.
                         GuestBehavior::ReportError => {
                             let _ = client
                                 .post(format!(
                                     "http://{api}/2018-06-01/runtime/invocation/{rid}/error"
                                 ))
-                                .header("Lambda-Runtime-Function-Error-Type", "Handled")
                                 .body(r#"{"errorMessage":"boom"}"#)
+                                .send()
+                                .await;
+                        }
+                        GuestBehavior::CountingError => {
+                            calls += 1;
+                            if event == "\"hang\"" {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                continue;
+                            }
+                            let _ = client
+                                .post(format!(
+                                    "http://{api}/2018-06-01/runtime/invocation/{rid}/error"
+                                ))
+                                .body(format!(
+                                    r#"{{"errorType":"Error","errorMessage":"call {calls}"}}"#
+                                ))
                                 .send()
                                 .await;
                         }
@@ -2427,7 +3039,54 @@ mod tests {
         }
 
         async fn get_output(&self, _id: &str) -> Result<String, RuntimeError> {
-            Ok(String::new())
+            match self.behavior {
+                GuestBehavior::ExitDuringInit => Ok("Segmentation fault\n".into()),
+                _ => Ok(String::new()),
+            }
+        }
+
+        async fn task_state(&self, _id: &str) -> Result<TaskState, RuntimeError> {
+            match self.behavior {
+                GuestBehavior::ExitDuringInit => Ok(TaskState::Failed),
+                _ => Ok(TaskState::Running),
+            }
+        }
+    }
+
+    /// The `ext` external extension: register, then poll `event/next` until `SHUTDOWN`.
+    async fn run_test_extension(client: reqwest::Client, api: String) {
+        let Ok(registered) = client
+            .post(format!("http://{api}/2020-01-01/extension/register"))
+            .header("Lambda-Extension-Name", "ext")
+            .body(r#"{"events":["INVOKE","SHUTDOWN"]}"#)
+            .send()
+            .await
+        else {
+            return;
+        };
+        let Some(id) = registered
+            .headers()
+            .get("Lambda-Extension-Identifier")
+            .cloned()
+        else {
+            return;
+        };
+        loop {
+            let Ok(next) = client
+                .get(format!("http://{api}/2020-01-01/extension/event/next"))
+                .header("Lambda-Extension-Identifier", id.clone())
+                .send()
+                .await
+            else {
+                return;
+            };
+            if next.status() != 200 {
+                return;
+            }
+            let event: serde_json::Value = next.json().await.unwrap_or_default();
+            if event["eventType"] == "SHUTDOWN" {
+                return;
+            }
         }
     }
 
@@ -2476,6 +3135,7 @@ mod tests {
             code_zip: Some(code.into()),
             dead_letter_arn: None,
             vpc_config: None,
+            tracing_mode: crate::model::TracingMode::PassThrough,
         }
     }
 
@@ -2947,7 +3607,8 @@ mod tests {
             let env = exec
                 .cold_start("000000000000", "us-east-1", &f, &code)
                 .await
-                .unwrap();
+                .unwrap()
+                .env_key;
             let key = format!("{}:{}", f.function_arn, f.version);
             exec.return_warm(&key, &env, 0).await;
         }
@@ -3048,6 +3709,9 @@ mod tests {
             )
             .await
             .unwrap_err();
+        let ColdStartError::Failed(error) = error else {
+            panic!("expected a failed start, got {error:?}");
+        };
         assert!(error.to_string().contains("bootstrap"));
         assert_eq!(std::fs::read_dir(&exec.rootfs_root).unwrap().count(), 0);
     }
@@ -3116,7 +3780,8 @@ mod tests {
                 error_type,
                 payload,
             } => {
-                assert_eq!(error_type, FunctionErrorType::Handled);
+                assert_eq!(error_type, FunctionErrorType::Reported);
+                assert_eq!(error_type.as_str(), "Unhandled");
                 assert_eq!(payload, br#"{"errorMessage":"boom"}"#);
             }
             other => panic!("expected function error, got {other:?}"),
@@ -3143,6 +3808,105 @@ mod tests {
             }
             other => panic!("expected timeout error, got {other:?}"),
         }
+    }
+
+    fn reported_call(result: &InvokeResult) -> String {
+        let Outcome::Error {
+            error_type: FunctionErrorType::Reported,
+            payload,
+        } = &result.outcome
+        else {
+            panic!(
+                "expected a reported function error, got {:?}",
+                result.outcome
+            );
+        };
+        let payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        payload["errorMessage"].as_str().unwrap().to_owned()
+    }
+
+    /// A handler error reported through `/invocation/{id}/error` keeps the environment: the
+    /// runtime's state survives, Init runs once, and only the first `REPORT` has
+    /// `Init Duration`. With an extension the environment is reused after the rearm wait.
+    #[tokio::test]
+    async fn reported_function_error_keeps_environment_warm() {
+        let mut cases = vec![false];
+        if crate::rootfs::find_host_executable("bash").is_some() {
+            cases.push(true);
+        }
+        for with_extension in cases {
+            let logs = Arc::new(RecordingLogs::default());
+            let registry = observability_registry_with_logs(
+                Arc::new(RecordingMetrics::default()),
+                logs.clone(),
+            );
+            let broker = Arc::new(InvocationBroker::new());
+            let (exec, starts) =
+                build_executor_tracked(broker.clone(), GuestBehavior::CountingError).await;
+            let mut f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+            let exec = if with_extension {
+                with_extension_layer(exec, &mut f)
+            } else {
+                exec
+            }
+            .with_service_registry(Arc::downgrade(&registry));
+            let mut results = Vec::new();
+            for _ in 0..3 {
+                results.push(
+                    exec.invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+                        .await
+                        .unwrap(),
+                );
+            }
+            let calls: Vec<String> = results.iter().map(reported_call).collect();
+            assert_eq!(calls, ["call 1", "call 2", "call 3"], "{with_extension}");
+            assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(results[0].init.is_some());
+            assert!(results[1..].iter().all(|result| result.init.is_none()));
+            let stream = results[0].log_stream_name.clone().unwrap();
+            assert!(results
+                .iter()
+                .all(|result| result.log_stream_name.as_deref() == Some(stream.as_str())));
+            let messages = stream_messages(&logs, &stream);
+            for (index, result) in results.iter().enumerate() {
+                let id = result.request_id.clone().unwrap();
+                let report = messages
+                    .iter()
+                    .find(|message| message.starts_with(&format!("REPORT RequestId: {id}\t")))
+                    .unwrap_or_else(|| panic!("no REPORT for {id}: {messages:?}"));
+                assert_eq!(report.contains("\tInit Duration: "), index == 0, "{report}");
+                assert!(!report.contains("Status:"), "{report}");
+            }
+            assert_eq!(exec.owned_envs.len(), 1);
+            let env_key = exec.owned_envs.iter().next().unwrap().key().clone();
+            assert_eq!(broker.has_extensions(&env_key), with_extension);
+        }
+    }
+
+    /// A timeout still resets the environment: the next invocation runs Init again in a new
+    /// runtime process.
+    #[tokio::test]
+    async fn timeout_after_reported_error_resets_environment() {
+        let broker = Arc::new(InvocationBroker::new());
+        let (exec, starts) = build_executor_tracked(broker, GuestBehavior::CountingError).await;
+        let f = func("nodejs22.x", 1, zip_with(&[("index.js", b"x")]));
+        let invoke = |payload: &'static [u8]| {
+            exec.invoke_sync("000000000000", "us-east-1", &f, payload.to_vec())
+        };
+        assert_eq!(reported_call(&invoke(b"{}").await.unwrap()), "call 1");
+        assert_eq!(reported_call(&invoke(b"{}").await.unwrap()), "call 2");
+        let timed_out = invoke(b"\"hang\"").await.unwrap();
+        assert!(matches!(
+            timed_out.outcome,
+            Outcome::Error {
+                error_type: FunctionErrorType::Unhandled,
+                ..
+            }
+        ));
+        let after = invoke(b"{}").await.unwrap();
+        assert_eq!(reported_call(&after), "call 1");
+        assert!(after.init.is_some());
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     struct TimeoutFenceGuest {
@@ -3301,14 +4065,75 @@ mod tests {
         }
     }
 
+    /// Records every appended event as `(group, stream, message)`.
+    #[derive(Default)]
+    struct RecordingLogs {
+        events: Mutex<Vec<(String, String, String)>>,
+    }
+    #[async_trait]
+    impl InternalLogSink for RecordingLogs {
+        async fn resolve_group(
+            &self,
+            scope: LogScope,
+            spec: ProducerGroupSpec,
+            context: ProducerContext,
+        ) -> Result<GroupRef, SinkError> {
+            AcceptingLogs.resolve_group(scope, spec, context).await
+        }
+        async fn ensure_group(
+            &self,
+            scope: LogScope,
+            spec: ProducerGroupSpec,
+            context: ProducerContext,
+        ) -> Result<GroupRef, SinkError> {
+            AcceptingLogs.ensure_group(scope, spec, context).await
+        }
+        async fn ensure_stream(
+            &self,
+            scope: LogScope,
+            group: GroupRef,
+            spec: ProducerStreamSpec,
+            context: ProducerContext,
+        ) -> Result<StreamRef, SinkError> {
+            AcceptingLogs
+                .ensure_stream(scope, group, spec, context)
+                .await
+        }
+        async fn append(
+            &self,
+            _scope: LogScope,
+            target: StreamRef,
+            events: Vec<ProducerLogEvent>,
+            _context: ProducerContext,
+        ) -> Result<AppendOutcome, SinkError> {
+            let stored_events = events.len();
+            self.events
+                .lock()
+                .unwrap()
+                .extend(events.into_iter().map(|event| {
+                    (
+                        target.group_name.clone(),
+                        target.stream_name.clone(),
+                        event.message,
+                    )
+                }));
+            Ok(AppendOutcome { stored_events })
+        }
+    }
     fn observability_registry(metrics: Arc<dyn MetricSink>) -> Arc<ServiceRegistry> {
+        observability_registry_with_logs(metrics, Arc::new(AcceptingLogs))
+    }
+    fn observability_registry_with_logs(
+        metrics: Arc<dyn MetricSink>,
+        logs: Arc<dyn InternalLogSink>,
+    ) -> Arc<ServiceRegistry> {
         use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
         let registry = ServiceRegistry::with_known_services();
         registry.register_native_with_log_sink(
             ServiceName::new("logs"),
             ServiceMetadata::new(AwsProtocol::Json11, None),
             Arc::new(StubHandler),
-            Arc::new(AcceptingLogs),
+            logs,
         );
         registry.register_native_with_metric_sink(
             ServiceName::new("monitoring"),
@@ -3559,6 +4384,421 @@ mod tests {
         assert_lambda_metric_shape(&observations);
     }
 
+    fn stream_messages(logs: &RecordingLogs, stream: &str) -> Vec<String> {
+        logs.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(group, name, _)| group == "/aws/lambda/fn" && name == stream)
+            .map(|(_, _, message)| message.clone())
+            .collect()
+    }
+
+    /// Init (a 300 ms import) is measured once, reported only on the cold-start `REPORT`,
+    /// billed, and kept out of Duration and the `AWS/Lambda` Duration metric.
+    #[tokio::test]
+    async fn slow_init_is_reported_once_and_excluded_from_duration() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let logs = Arc::new(RecordingLogs::default());
+        let registry = observability_registry_with_logs(metrics.clone(), logs.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::SlowInit)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let cold = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        let warm = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(cold.outcome, Outcome::Success(_)));
+        assert!(matches!(warm.outcome, Outcome::Success(_)));
+        let init = cold.init.clone().unwrap();
+        assert_eq!(init.status, InitStatus::Success);
+        assert!(init.duration_us >= 300_000, "{init:?}");
+        assert!(cold.duration_us < 300_000, "{}", cold.duration_us);
+        assert_eq!(
+            cold.billed_duration_ms,
+            (cold.duration_us + init.duration_us).div_ceil(1000)
+        );
+        assert!(warm.init.is_none());
+        assert_eq!(warm.billed_duration_ms, warm.duration_us.div_ceil(1000));
+        assert_eq!(cold.log_stream_name, warm.log_stream_name);
+
+        let messages = stream_messages(&logs, cold.log_stream_name.as_deref().unwrap());
+        let cold_id = cold.request_id.clone().unwrap();
+        let warm_id = warm.request_id.clone().unwrap();
+        assert_eq!(messages[0], "init output");
+        assert_eq!(
+            messages[1],
+            format!("START RequestId: {cold_id} Version: $LATEST")
+        );
+        let report = |id: &str| {
+            messages
+                .iter()
+                .find(|message| message.starts_with(&format!("REPORT RequestId: {id}\t")))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            report(&cold_id),
+            format!(
+                "REPORT RequestId: {cold_id}\tDuration: {} ms\tBilled Duration: {} ms\tMemory Size: 128 MB\tInit Duration: {} ms",
+                format_ms(cold.duration_us),
+                cold.billed_duration_ms,
+                format_ms(init.duration_us)
+            )
+        );
+        assert!(!report(&warm_id).contains("Init Duration"));
+        assert_eq!(messages.iter().filter(|m| *m == "init output").count(), 1);
+        // `--log-type Tail` shows the import-time output and platform lines of the cold start.
+        let tail = String::from_utf8(cold.log_tail("$LATEST", 128)).unwrap();
+        assert!(
+            tail.starts_with("init output\nSTART RequestId: "),
+            "{tail:?}"
+        );
+        assert!(
+            tail.ends_with(&format!("{}\n", report(&cold_id))),
+            "{tail:?}"
+        );
+        assert!(!String::from_utf8(warm.log_tail("$LATEST", 128))
+            .unwrap()
+            .contains("init output"));
+
+        flush_metrics(&exec);
+        let observations = metrics.observations.lock().unwrap().clone();
+        let durations: Vec<f64> = observations
+            .iter()
+            .filter(|observation| observation.metric_name == "Duration")
+            .map(|observation| observation.value)
+            .collect();
+        assert!(!durations.is_empty());
+        assert!(
+            durations.iter().all(|value| *value < 300.0),
+            "{durations:?}"
+        );
+    }
+
+    /// An Init failure returns the runtime's error as an `Unhandled` function error and
+    /// writes the Init output, `INIT_REPORT`, and the invocation lines to a log stream.
+    #[tokio::test]
+    async fn init_error_is_returned_and_logged() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let logs = Arc::new(RecordingLogs::default());
+        let registry = observability_registry_with_logs(metrics.clone(), logs.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let (exec, starts) = build_executor_tracked(broker.clone(), GuestBehavior::InitError).await;
+        let exec = exec.with_service_registry(Arc::downgrade(&registry));
+        let mut f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        f.environment
+            .insert("SECRET_SETTING".into(), "do-not-log".into());
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            Outcome::Error {
+                error_type: FunctionErrorType::Unhandled,
+                payload: GUEST_INIT_ERROR.as_bytes().to_vec(),
+            }
+        );
+        let request_id = result.request_id.clone().unwrap();
+        let stream = result.log_stream_name.clone().unwrap();
+        let messages = stream_messages(&logs, &stream);
+        let init = result.init.clone().unwrap();
+        assert_eq!(
+            init.status,
+            InitStatus::Error("Runtime.ImportModuleError".into())
+        );
+        assert_eq!(
+            messages,
+            vec![
+                "init output".to_string(),
+                "undefined\tERROR\tUncaught Exception".to_string(),
+                format!(
+                    "INIT_REPORT Init Duration: {} ms\tPhase: init\tStatus: error\tError Type: Runtime.ImportModuleError",
+                    format_ms(init.duration_us)
+                ),
+                format!("START RequestId: {request_id} Version: $LATEST"),
+                format!("END RequestId: {request_id}"),
+                format!(
+                    "REPORT RequestId: {request_id}\tDuration: 0.00 ms\tBilled Duration: {} ms\tMemory Size: 128 MB\tStatus: error\tError Type: Runtime.ImportModuleError",
+                    result.billed_duration_ms
+                ),
+            ]
+        );
+        // `--log-type Tail` carries the same lines, including the Init error.
+        assert_eq!(
+            String::from_utf8(result.log_tail("$LATEST", 128)).unwrap(),
+            format!("{}\n", messages.join("\n"))
+        );
+        assert!(logs
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, _, message)| !message.contains("do-not-log")));
+        // The failed environment is discarded; the next invocation starts a new one.
+        assert!(exec.owned_envs.is_empty());
+        assert_eq!(broker.inflight_count(), 0);
+        let again = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(again.outcome, Outcome::Error { .. }));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+
+        flush_metrics(&exec);
+        let observations = metrics.observations.lock().unwrap().clone();
+        assert_eq!(
+            metric_values(&observations),
+            vec![
+                ("Invocations".to_string(), 2.0),
+                ("Errors".to_string(), 2.0)
+            ]
+        );
+    }
+
+    /// A runtime that dies during Init without `/init/error` fails at once as
+    /// `Runtime.ExitError`, not after the Init limit plus the function timeout.
+    #[tokio::test]
+    async fn runtime_exit_during_init_fails_promptly() {
+        let logs = Arc::new(RecordingLogs::default());
+        let registry =
+            observability_registry_with_logs(Arc::new(RecordingMetrics::default()), logs.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker.clone(), GuestBehavior::ExitDuringInit)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        let f = func("nodejs22.x", 30, zip_with(&[("index.js", b"x")]));
+        let started = Instant::now();
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let Outcome::Error {
+            error_type: FunctionErrorType::Unhandled,
+            payload,
+        } = &result.outcome
+        else {
+            panic!("unexpected outcome {:?}", result.outcome);
+        };
+        let payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(payload["errorType"], "Runtime.ExitError");
+        let init = result.init.clone().unwrap();
+        assert_eq!(init.status, InitStatus::Error("Runtime.ExitError".into()));
+        let request_id = result.request_id.clone().unwrap();
+        let messages = stream_messages(&logs, &result.log_stream_name.clone().unwrap());
+        assert_eq!(
+            messages,
+            vec![
+                "Segmentation fault".to_string(),
+                format!(
+                    "INIT_REPORT Init Duration: {} ms\tPhase: init\tStatus: error\tError Type: Runtime.ExitError",
+                    format_ms(init.duration_us)
+                ),
+                format!("START RequestId: {request_id} Version: $LATEST"),
+                format!("END RequestId: {request_id}"),
+                format!(
+                    "REPORT RequestId: {request_id}\tDuration: 0.00 ms\tBilled Duration: {} ms\tMemory Size: 128 MB\tStatus: error\tError Type: Runtime.ExitError",
+                    result.billed_duration_ms
+                ),
+            ]
+        );
+        assert!(exec.owned_envs.is_empty());
+        assert_eq!(broker.inflight_count(), 0);
+    }
+
+    /// Past the Init limit, Init continues inside the invocation: Init output posted late is
+    /// still emitted, and a late `/init/error` returns the runtime's own payload.
+    #[tokio::test]
+    async fn late_init_after_timeout_keeps_output_and_error() {
+        for behavior in [GuestBehavior::LateInit, GuestBehavior::LateInitError] {
+            let logs = Arc::new(RecordingLogs::default());
+            let registry = observability_registry_with_logs(
+                Arc::new(RecordingMetrics::default()),
+                logs.clone(),
+            );
+            let broker = Arc::new(InvocationBroker::new());
+            let mut exec = build_executor(broker.clone(), behavior)
+                .await
+                .with_service_registry(Arc::downgrade(&registry));
+            exec.init_timeout = Duration::from_millis(100);
+            let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+            let result = exec
+                .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+                .await
+                .unwrap();
+            let init = result.init.clone().unwrap();
+            assert_eq!(init.status, InitStatus::Timeout);
+            if matches!(behavior, GuestBehavior::LateInitError) {
+                assert_eq!(
+                    result.outcome,
+                    Outcome::Error {
+                        error_type: FunctionErrorType::Unhandled,
+                        payload: GUEST_INIT_ERROR.as_bytes().to_vec(),
+                    }
+                );
+            } else {
+                assert!(matches!(result.outcome, Outcome::Success(_)));
+            }
+            let messages = stream_messages(&logs, &result.log_stream_name.clone().unwrap());
+            assert_eq!(messages[0], "late init output", "{messages:?}");
+            assert_eq!(
+                messages[1],
+                format!(
+                    "INIT_REPORT Init Duration: {} ms\tPhase: init\tStatus: timeout",
+                    format_ms(init.duration_us)
+                )
+            );
+            assert_eq!(
+                messages.iter().filter(|m| *m == "late init output").count(),
+                1
+            );
+            assert_eq!(broker.inflight_count(), 0);
+            exec.shutdown().await;
+            assert!(exec.owned_envs.is_empty());
+        }
+    }
+
+    /// Attach a layer holding one executable external extension to `f`.
+    fn with_extension_layer(exec: Executor, f: &mut LambdaFunction) -> Executor {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+            zw.start_file("extensions/ext", opts).unwrap();
+            zw.write_all(b"#!/bin/sh\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let layers = Arc::new(LayerStore::new());
+        let published = layers.publish(
+            "000000000000",
+            "us-east-1",
+            "ext",
+            crate::model::LayerVersion {
+                version: 0,
+                description: String::new(),
+                created_date: "now".into(),
+                code_sha256: "x".into(),
+                code_size: buf.len() as u64,
+                code_zip: buf,
+                compatible_runtimes: Vec::new(),
+                compatible_architectures: Vec::new(),
+            },
+        );
+        f.layers = vec![format!(
+            "arn:aws:lambda:us-east-1:000000000000:layer:ext:{}",
+            published.version
+        )];
+        exec.with_layer_store(layers)
+    }
+
+    /// With extensions, Init fails with the supervisor's classification of the process that
+    /// exited, and an Init timeout logs `Status: timeout`.
+    #[tokio::test]
+    async fn extension_init_failures_are_classified() {
+        if crate::rootfs::find_host_executable("bash").is_none() {
+            return;
+        }
+        for (behavior, status, payload_type) in [
+            (
+                GuestBehavior::SupervisorExit("extension"),
+                InitStatus::Error("Extension.Crash".into()),
+                "Extension.Crash",
+            ),
+            (
+                GuestBehavior::SupervisorExit("runtime"),
+                InitStatus::Error("Runtime.ExitError".into()),
+                "Runtime.ExitError",
+            ),
+            // The runtime is ready but the extension never registers.
+            (
+                GuestBehavior::EchoUppercaseLen,
+                InitStatus::Timeout,
+                "Sandbox.Timedout",
+            ),
+        ] {
+            let logs = Arc::new(RecordingLogs::default());
+            let registry = observability_registry_with_logs(
+                Arc::new(RecordingMetrics::default()),
+                logs.clone(),
+            );
+            let broker = Arc::new(InvocationBroker::new());
+            let mut f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+            let mut exec =
+                with_extension_layer(build_executor(broker.clone(), behavior).await, &mut f)
+                    .with_service_registry(Arc::downgrade(&registry));
+            exec.init_timeout = Duration::from_millis(200);
+            let result = exec
+                .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+                .await
+                .unwrap();
+            let Outcome::Error {
+                error_type: FunctionErrorType::Unhandled,
+                payload,
+            } = &result.outcome
+            else {
+                panic!("unexpected outcome {:?}", result.outcome);
+            };
+            let payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+            assert_eq!(payload["errorType"], payload_type);
+            let init = result.init.clone().unwrap();
+            assert_eq!(init.status, status);
+            let expected = match &status {
+                InitStatus::Timeout => "Status: timeout".to_string(),
+                InitStatus::Error(error_type) => format!("Status: error\tError Type: {error_type}"),
+                InitStatus::Success => unreachable!(),
+            };
+            let messages = stream_messages(&logs, &result.log_stream_name.clone().unwrap());
+            assert!(
+                messages.contains(&format!(
+                    "INIT_REPORT Init Duration: {} ms\tPhase: init\t{expected}",
+                    format_ms(init.duration_us)
+                )),
+                "{messages:?}"
+            );
+            assert!(exec.owned_envs.is_empty());
+            assert_eq!(broker.inflight_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_start_writes_error_to_a_log_stream() {
+        let logs = Arc::new(RecordingLogs::default());
+        let registry =
+            observability_registry_with_logs(Arc::new(RecordingMetrics::default()), logs.clone());
+        let broker = Arc::new(InvocationBroker::new());
+        let exec = build_executor(broker, GuestBehavior::EchoUppercaseLen)
+            .await
+            .with_service_registry(Arc::downgrade(&registry));
+        // A custom runtime without `bootstrap` fails before any guest starts.
+        let f = func("provided.al2", 10, zip_with(&[("index.js", b"x")]));
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &f, b"{}".to_vec())
+            .await
+            .unwrap();
+        let request_id = result.request_id.clone().unwrap();
+        let messages = stream_messages(&logs, result.log_stream_name.as_deref().unwrap());
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert_eq!(
+            messages[0],
+            format!("START RequestId: {request_id} Version: $LATEST")
+        );
+        assert!(
+            messages[1].starts_with(&format!("RequestId: {request_id} Error: ")),
+            "{messages:?}"
+        );
+        assert!(messages[1].contains("bootstrap"), "{messages:?}");
+        assert_eq!(messages[2], format!("END RequestId: {request_id}"));
+        assert!(messages[3].starts_with(&format!("REPORT RequestId: {request_id}\t")));
+    }
+
     #[tokio::test]
     async fn rejected_metrics_do_not_fail_the_invocation() {
         let registry = observability_registry(Arc::new(RejectingMetrics));
@@ -3757,7 +4997,8 @@ mod tests {
             "{trace}"
         );
         assert!(!trace.contains("Parent=53995c3f42cd8ad8"), "{trace}");
-        assert!(trace.ends_with(";Sampled=0"), "{trace}");
+        // PassThrough keeps the caller's sampling decision.
+        assert!(trace.ends_with(";Sampled=1"), "{trace}");
     }
 
     #[tokio::test]
@@ -3835,16 +5076,424 @@ mod tests {
         let traces = traces.lock().unwrap().clone();
         assert_eq!(traces.len(), 2);
         assert!(traces[0].starts_with(&format!("{root};Parent=")));
-        assert!(traces[0].ends_with(";Sampled=0"));
+        assert!(traces[0].ends_with(";Sampled=1"));
         assert!(!traces[1].starts_with(root));
         assert!(traces[1].starts_with("Root=1-"));
+        assert!(traces[1].ends_with(";Sampled=0"));
         exec.shutdown().await;
+    }
+
+    /// Records what the fake X-Ray service receives through internal dispatch.
+    #[derive(Default)]
+    struct RecordingXray {
+        calls: Mutex<Vec<(String, String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl locallycloud_core::handler::NativeHandler for RecordingXray {
+        async fn handle(
+            &self,
+            request: locallycloud_core::handler::ServiceRequest,
+        ) -> axum::response::Response {
+            assert_eq!(request.uri.path(), "/TraceSegments");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let documents = body["TraceSegmentDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|document| document.as_str().unwrap().to_owned())
+                .collect();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request.account_id, request.region, documents));
+            axum::response::IntoResponse::into_response(axum::Json(
+                serde_json::json!({"UnprocessedTraceSegments": []}),
+            ))
+        }
+    }
+
+    /// A guest that behaves like an X-Ray SDK in Lambda: each invocation sends one
+    /// subsegment datagram, parented on the header's `Parent`, to `AWS_XRAY_DAEMON_ADDRESS`.
+    struct XrayGuest {
+        envs: Arc<Mutex<Vec<HashMap<String, String>>>>,
+        traces: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ComputeRuntime for XrayGuest {
+        async fn start_task(&self, id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
+            self.envs.lock().unwrap().push(spec.env.clone());
+            let api = spec.env.get("AWS_LAMBDA_RUNTIME_API").cloned().unwrap();
+            let daemon = spec.env.get("AWS_XRAY_DAEMON_ADDRESS").cloned();
+            let traces = self.traces.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                loop {
+                    let Ok(next) = client
+                        .get(format!("http://{api}/2018-06-01/runtime/invocation/next"))
+                        .send()
+                        .await
+                    else {
+                        break;
+                    };
+                    if next.status() == 204 {
+                        break;
+                    }
+                    let header = |name: &str| next.headers()[name].to_str().unwrap().to_string();
+                    let rid = header("Lambda-Runtime-Aws-Request-Id");
+                    let trace = header("Lambda-Runtime-Trace-Id");
+                    traces.lock().unwrap().push(trace.clone());
+                    // `"hang"` never answers (the invocation times out), `"fail"` reports
+                    // a function error.
+                    let event = next.text().await.unwrap_or_default();
+                    if event == "\"hang\"" {
+                        break;
+                    }
+                    let field = |name: &str| {
+                        trace
+                            .split(';')
+                            .find_map(|part| part.strip_prefix(name))
+                            .unwrap()
+                            .to_string()
+                    };
+                    if let (Some(daemon), "1") = (&daemon, field("Sampled=").as_str()) {
+                        let subsegment = serde_json::json!({
+                            "name": "## handler", "id": "00000000000000aa",
+                            "trace_id": field("Root="), "parent_id": field("Parent="),
+                            "type": "subsegment", "start_time": 1.0, "end_time": 2.0,
+                        });
+                        let mut foreign = subsegment.clone();
+                        foreign["trace_id"] = "1-5759e988-000000000000000000000000".into();
+                        for document in [foreign, subsegment] {
+                            let datagram =
+                                format!("{{\"format\": \"json\", \"version\": 1}}\n{document}");
+                            udp.send_to(datagram.as_bytes(), daemon).await.unwrap();
+                        }
+                        // Invalid datagrams are dropped without affecting the endpoint.
+                        udp.send_to(b"garbage", daemon).await.unwrap();
+                    }
+                    let (outcome, body) = if event == "\"fail\"" {
+                        ("error", r#"{"errorMessage":"boom","errorType":"Error"}"#)
+                    } else {
+                        ("response", "null")
+                    };
+                    let _ = client
+                        .post(format!(
+                            "http://{api}/2018-06-01/runtime/invocation/{rid}/{outcome}"
+                        ))
+                        .body(body)
+                        .send()
+                        .await;
+                }
+            });
+            Ok(TaskHandle {
+                task_id: id.to_string(),
+                state: TaskState::Running,
+            })
+        }
+        async fn stop_task(&self, id: &str) -> Result<TaskHandle, RuntimeError> {
+            Ok(TaskHandle {
+                task_id: id.to_string(),
+                state: TaskState::Stopped,
+            })
+        }
+        async fn release_task(&self, _: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        async fn get_output(&self, _id: &str) -> Result<String, RuntimeError> {
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_environment_owns_a_daemon_endpoint_and_active_emits_lambda_segments() {
+        use locallycloud_core::integration::InternalDispatcher;
+        use locallycloud_core::proxy::LegacyHealth;
+        use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
+
+        let registry = observability_registry(Arc::new(RecordingMetrics::default()));
+        let xray = Arc::new(RecordingXray::default());
+        registry.register_native(
+            ServiceName::new("xray"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            xray.clone(),
+        );
+        registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )));
+        let broker = Arc::new(InvocationBroker::new());
+        let base = serve_runtime_api(broker.clone()).await;
+        let tmp = std::env::temp_dir().join(format!("lc-exec-{}", Uuid::new_v4()));
+        let envs = Arc::new(Mutex::new(Vec::new()));
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let exec = Executor::new(
+            broker,
+            Arc::new(CodeStore::new(tmp.join("code"))),
+            tmp.join("rootfs"),
+            Arc::new(XrayGuest {
+                envs: envs.clone(),
+                traces: traces.clone(),
+            }),
+            base,
+            "http://127.0.0.1:4566",
+            "test",
+            "test",
+        )
+        .with_service_registry(Arc::downgrade(&registry));
+        let (account, region) = ("123456789012", "eu-west-1");
+
+        // Every document the fake X-Ray received, in scope.
+        let documents = || -> Vec<serde_json::Value> {
+            xray.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .inspect(|(call_account, call_region, _)| {
+                    assert_eq!(
+                        (call_account.as_str(), call_region.as_str()),
+                        (account, region)
+                    );
+                })
+                .flat_map(|(_, _, documents)| documents.iter())
+                .map(|document| serde_json::from_str(document).unwrap())
+                .collect()
+        };
+        let wait_for = |count: usize| {
+            let documents = &documents;
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let found = documents();
+                    if found.len() >= count || Instant::now() > deadline {
+                        // Let anything sent after the expected documents arrive too.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        return documents();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let field = |trace: &str, name: &str| {
+            trace
+                .split(';')
+                .find_map(|part| part.strip_prefix(name))
+                .unwrap()
+                .to_string()
+        };
+        let last_trace = || traces.lock().unwrap().last().unwrap().clone();
+        let daemon_addresses = || -> Vec<SocketAddr> {
+            exec.xray_daemons
+                .iter()
+                .map(|entry| entry.value().0)
+                .collect()
+        };
+
+        // PassThrough also gets an endpoint and the daemon variables, but no Lambda segment.
+        let plain = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        exec.invoke_sync(account, region, &plain, b"{}".to_vec())
+            .await
+            .unwrap();
+        let [plain_daemon] = daemon_addresses()[..] else {
+            panic!("one endpoint per environment");
+        };
+        assert!(plain_daemon.ip().is_loopback() && plain_daemon.port() != 0);
+        let env = envs.lock().unwrap()[0].clone();
+        assert_eq!(env["AWS_XRAY_DAEMON_ADDRESS"], plain_daemon.to_string());
+        assert_eq!(
+            env["_AWS_XRAY_DAEMON_PORT"],
+            plain_daemon.port().to_string()
+        );
+        assert!(last_trace().ends_with(";Sampled=0"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(documents().is_empty());
+        // A caller-sampled PassThrough invocation: the SDK subsegment is stored, the
+        // foreign-trace datagram the guest also sent is not, and Lambda adds no segment.
+        exec.invoke_sync_traced(
+            account,
+            region,
+            &plain,
+            b"{}".to_vec(),
+            Some(&format!("{CALLER_ROOT};Parent=53995c3f42cd8ad8;Sampled=1")),
+        )
+        .await
+        .unwrap();
+        let found = wait_for(1).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0]["type"], "subsegment");
+        assert_eq!(
+            found[0]["trace_id"],
+            CALLER_ROOT.strip_prefix("Root=").unwrap()
+        );
+        // A local process that does not know a live root cannot add segments either.
+        let outsider = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forged = serde_json::json!({"name": "forged", "id": "00000000000000bb",
+            "trace_id": "1-5759e988-111111111111111111111111", "start_time": 1.0, "end_time": 2.0});
+        outsider
+            .send_to(
+                format!("{{\"format\": \"json\", \"version\": 1}}\n{forged}").as_bytes(),
+                plain_daemon,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(documents().len(), 1);
+
+        // Active: the cold start binds another endpoint and hands its address to the guest.
+        let mut traced = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        traced.function_name = "traced".into();
+        traced.function_arn = crate::model::function_arn(region, account, "traced");
+        traced.tracing_mode = TracingMode::Active;
+        let result = exec
+            .invoke_sync(account, region, &traced, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(exec.xray_daemons.len(), 2);
+        let daemon = daemon_addresses()
+            .into_iter()
+            .find(|address| *address != plain_daemon)
+            .unwrap();
+        let env = envs.lock().unwrap()[1].clone();
+        assert_eq!(env["AWS_XRAY_DAEMON_ADDRESS"], daemon.to_string());
+        assert_eq!(env["_AWS_XRAY_DAEMON_ADDRESS"], "127.0.0.1");
+        assert_eq!(env["_AWS_XRAY_DAEMON_PORT"], daemon.port().to_string());
+        assert_eq!(env["AWS_XRAY_CONTEXT_MISSING"], "LOG_ERROR");
+        // The first Active request of the second falls in the reservoir.
+        let trace = last_trace();
+        assert!(trace.ends_with(";Sampled=1"), "{trace}");
+        let parent = field(&trace, "Parent=");
+        let root = field(&trace, "Root=");
+
+        // The SDK subsegment (via UDP), the service segment and the function segment arrive
+        // in scope; the guest's foreign-trace datagram is dropped.
+        let found = wait_for(4).await;
+        assert_eq!(found.len(), 4, "{found:?}");
+        let service = found
+            .iter()
+            .find(|document| document["origin"] == "AWS::Lambda")
+            .unwrap();
+        let function = found
+            .iter()
+            .find(|document| document["origin"] == "AWS::Lambda::Function")
+            .unwrap();
+        // Without a caller the service segment is the trace's root.
+        assert_eq!(service["name"], "traced");
+        assert_eq!(service["trace_id"], root.as_str());
+        assert_eq!(service["resource_arn"], traced.function_arn.as_str());
+        assert_eq!(
+            service["aws"]["request_id"],
+            result.request_id.as_deref().unwrap()
+        );
+        assert!(service.get("parent_id").is_none());
+        assert!(service.get("fault").is_none());
+        assert_ne!(service["id"], parent.as_str());
+        assert_eq!(function["id"], parent.as_str());
+        assert_eq!(function["trace_id"], root.as_str());
+        assert_eq!(function["name"], "traced");
+        assert_eq!(function["parent_id"], service["id"]);
+        assert!(function.get("fault").is_none());
+        // The service segment covers the function segment.
+        assert!(service["start_time"].as_f64() <= function["start_time"].as_f64());
+        assert!(service["end_time"].as_f64() >= function["end_time"].as_f64());
+        // The segment spans the invoke phase reported as Duration.
+        let span =
+            function["end_time"].as_f64().unwrap() - function["start_time"].as_f64().unwrap();
+        assert!(
+            (span - result.duration_us as f64 / 1e6).abs() < 1e-3,
+            "{span} vs {}",
+            result.duration_us
+        );
+        let subsegment = found
+            .iter()
+            .find(|document| {
+                document["type"] == "subsegment" && document["trace_id"] == root.as_str()
+            })
+            .unwrap();
+        assert_eq!(subsegment["parent_id"], parent.as_str());
+
+        // A caller's `Sampled=0` wins over Active: no segment for that invocation.
+        let calls_before = xray.calls.lock().unwrap().len();
+        exec.invoke_sync_traced(
+            account,
+            region,
+            &traced,
+            b"{}".to_vec(),
+            Some(&format!("{CALLER_ROOT};Parent=53995c3f42cd8ad8;Sampled=0")),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(xray.calls.lock().unwrap().len(), calls_before);
+
+        // A failed invocation with a caller parent: caller → service → function, and only
+        // the function segment carries `fault` (the Lambda service did not fail).
+        exec.invoke_sync_traced(
+            account,
+            region,
+            &traced,
+            b"\"fail\"".to_vec(),
+            Some(&format!("{CALLER_ROOT};Parent=53995c3f42cd8ad8;Sampled=1")),
+        )
+        .await
+        .unwrap();
+        let failed_parent = field(&last_trace(), "Parent=");
+        let found = wait_for(7).await;
+        assert_eq!(found.len(), 7, "{found:?}");
+        let function = found
+            .iter()
+            .find(|document| document["id"] == failed_parent.as_str())
+            .unwrap();
+        assert_eq!(function["origin"], "AWS::Lambda::Function");
+        assert_eq!(function["fault"], true);
+        let service = found
+            .iter()
+            .find(|document| document["id"] == function["parent_id"])
+            .unwrap();
+        assert_eq!(service["origin"], "AWS::Lambda");
+        assert_eq!(service["parent_id"], "53995c3f42cd8ad8");
+        assert_eq!(
+            service["trace_id"],
+            CALLER_ROOT.strip_prefix("Root=").unwrap()
+        );
+        assert!(service.get("fault").is_none());
+
+        // Invalidation (code or configuration update) closes the environment's endpoint.
+        exec.invalidate_warm(&format!("{}:$LATEST", traced.function_arn))
+            .await;
+        assert_eq!(daemon_addresses(), vec![plain_daemon]);
+        tokio::net::UdpSocket::bind(daemon).await.unwrap();
+
+        // A timeout stops the environment and closes its endpoint.
+        let mut slow = traced.clone();
+        slow.timeout = 1;
+        exec.invoke_sync(account, region, &slow, b"\"hang\"".to_vec())
+            .await
+            .unwrap();
+        let timed_out: SocketAddr = envs.lock().unwrap().last().unwrap()["AWS_XRAY_DAEMON_ADDRESS"]
+            .parse()
+            .unwrap();
+        assert_ne!(timed_out, plain_daemon);
+        assert_eq!(daemon_addresses(), vec![plain_daemon]);
+        tokio::net::UdpSocket::bind(timed_out).await.unwrap();
+
+        // Stopping the environments closes the remaining socket.
+        exec.shutdown().await;
+        assert!(exec.xray_daemons.is_empty());
+        tokio::net::UdpSocket::bind(plain_daemon).await.unwrap();
     }
 
     /// A guest that records each invocation's `Lambda-Runtime-Trace-Id` header.
     struct TraceRecordingGuest {
         traces: Arc<Mutex<Vec<String>>>,
-        /// Report a handled function error so asynchronous invocations retry.
+        /// Report a function error so asynchronous invocations retry.
         fail: bool,
     }
 
@@ -3951,9 +5600,8 @@ mod tests {
     async fn async_invoke_retries_then_routes_failure() {
         let broker = Arc::new(InvocationBroker::new());
         let router = Arc::new(RecordingRouter::default());
-        let exec = build_executor(broker, GuestBehavior::ReportError)
-            .await
-            .with_destination_router(router.clone());
+        let (exec, starts) = build_executor_tracked(broker, GuestBehavior::ReportError).await;
+        let exec = exec.with_destination_router(router.clone());
         let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
         let cfg = AsyncConfig {
             max_retry_attempts: 2,
@@ -3968,7 +5616,9 @@ mod tests {
         assert_eq!(recs[0].1["requestContext"]["condition"], "RetriesExhausted");
         // initial + 2 retries = 3 attempts.
         assert_eq!(recs[0].1["requestContext"]["approximateInvokeCount"], 3);
-        assert_eq!(recs[0].1["responseContext"]["functionError"], "Handled");
+        assert_eq!(recs[0].1["responseContext"]["functionError"], "Unhandled");
+        // The retries reuse the environment the handler error left running.
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

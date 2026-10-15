@@ -53,7 +53,7 @@ use crate::esm::{
 };
 use crate::executor::{DestinationRouter, Executor};
 use crate::model::{function_arn, resolve_function_name, FunctionStore, LayerStore, VpcConfig};
-use crate::runtime_api::{FunctionErrorType, Outcome};
+use crate::runtime_api::Outcome;
 use locallycloud_core::config::LambdaConcurrencyConfig;
 
 /// The natively-implemented Lambda service.
@@ -1187,6 +1187,15 @@ fn is_invoke_path(req: &ServiceRequest) -> bool {
     )
 }
 
+/// Lambda delivers `{}` to the handler when `Invoke` carries no payload.
+fn invoke_payload(body: &[u8]) -> Vec<u8> {
+    if body.is_empty() {
+        b"{}".to_vec()
+    } else {
+        body.to_vec()
+    }
+}
+
 impl LambdaHandler {
     /// Handle `POST /2015-03-31/functions/{name}/invocations`.
     async fn invoke(&self, req: &ServiceRequest) -> Response {
@@ -1242,7 +1251,7 @@ impl LambdaHandler {
                     )
                     .into_response(&req.request_id);
                 }
-                let payload = req.body.to_vec();
+                let payload = invoke_payload(&req.body);
                 let mut cfg = self.async_config(account, region, &name);
                 // The DeadLetterConfig ARN is the OnFailure fallback when no destination is set.
                 if cfg.on_failure_arn.is_none() {
@@ -1268,7 +1277,7 @@ impl LambdaHandler {
                     )
                     .into_response(&req.request_id);
                 }
-                let payload = req.body.to_vec();
+                let payload = invoke_payload(&req.body);
                 let trace = req
                     .headers
                     .get("x-amzn-trace-id")
@@ -1277,9 +1286,7 @@ impl LambdaHandler {
                     .invoke_sync_traced(account, region, &func, payload, trace)
                     .await
                 {
-                    Ok(result) => {
-                        invoke_response(&func.version, &req.request_id, result, tail_logs)
-                    }
+                    Ok(result) => invoke_response(&func, &req.request_id, result, tail_logs),
                     Err(e) => e.into_response(&req.request_id),
                 }
             }
@@ -1418,16 +1425,8 @@ impl LambdaInternalApi for LambdaHandler {
             .map_err(map_internal_lambda_error)?;
         let (payload, function_error) = match result.outcome {
             Outcome::Success(payload) => (payload, None),
-            Outcome::Error {
-                error_type,
-                payload,
-            } => {
-                let function_error = match error_type {
-                    FunctionErrorType::Handled => LambdaFunctionError::Handled,
-                    FunctionErrorType::Unhandled => LambdaFunctionError::Unhandled,
-                };
-                (payload, Some(function_error))
-            }
+            // Lambda reports every function error as `Unhandled`.
+            Outcome::Error { payload, .. } => (payload, Some(LambdaFunctionError::Unhandled)),
         };
         Ok(LambdaInvokeOutput {
             payload: SensitivePayload::new(payload),
@@ -1536,7 +1535,7 @@ fn hex(byte: u8) -> Option<u8> {
 /// Build the synchronous-invoke HTTP response (HTTP 200 with payload; `X-Amz-Function-Error`
 /// header on a function error; `X-Amz-Log-Result` tail when requested).
 fn invoke_response(
-    executed_version: &str,
+    func: &crate::model::LambdaFunction,
     request_id: &str,
     result: crate::executor::InvokeResult,
     tail_logs: bool,
@@ -1544,12 +1543,11 @@ fn invoke_response(
     let mut builder = http::Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .header("x-amz-executed-version", executed_version)
+        .header("x-amz-executed-version", &func.version)
         .header("x-amzn-requestid", request_id);
     if tail_logs {
-        // The last 4 KB of logs, base64-encoded.
-        let bytes = result.logs.as_bytes();
-        let tail = &bytes[bytes.len().saturating_sub(4096)..];
+        // The last 4 KB of the log as written to CloudWatch, base64-encoded.
+        let tail = result.log_tail(&func.version, func.memory_size);
         let encoded = base64::engine::general_purpose::STANDARD.encode(tail);
         if let Ok(value) = http::HeaderValue::from_str(&encoded) {
             builder = builder.header("x-amz-log-result", value);
@@ -1561,11 +1559,7 @@ fn invoke_response(
             error_type,
             payload,
         } => {
-            let label = match error_type {
-                FunctionErrorType::Handled => "Handled",
-                FunctionErrorType::Unhandled => "Unhandled",
-            };
-            builder = builder.header("x-amz-function-error", label);
+            builder = builder.header("x-amz-function-error", error_type.as_str());
             payload
         }
     };
@@ -1912,6 +1906,12 @@ fn json_response(status: u16, body: Option<Value>) -> Response {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn empty_invoke_payload_is_delivered_as_empty_object() {
+        assert_eq!(invoke_payload(b""), b"{}");
+        assert_eq!(invoke_payload(b"\"x\""), b"\"x\"");
+    }
     use std::io::{Cursor, Write};
 
     #[test]
@@ -3096,7 +3096,8 @@ mod tests {
             traces[0]
         );
         assert!(!traces[0].contains("Parent=53995c3f42cd8ad8"));
-        assert!(traces[0].ends_with(";Sampled=0"));
+        // PassThrough keeps the caller's sampling decision.
+        assert!(traces[0].ends_with(";Sampled=1"));
         for trace in &traces[1..] {
             assert!(
                 trace.starts_with("Root=1-") && !trace.starts_with(root),

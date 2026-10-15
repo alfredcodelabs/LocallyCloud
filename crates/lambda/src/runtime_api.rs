@@ -18,21 +18,23 @@ use tokio::sync::{oneshot, Notify};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-/// Classification of a function error reported by the guest.
+/// How a function error ended the invocation, which decides whether the execution
+/// environment survives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionErrorType {
-    /// The handler caught and reported the error (`/invocation/{id}/error`).
-    Handled,
-    /// The runtime crashed, timed out, or failed to initialize (`/init/error`, stop).
+    /// The runtime reported the error through `/invocation/{id}/error` and keeps polling
+    /// `next`, so the environment is reused (an error raised by the handler).
+    Reported,
+    /// The runtime crashed, timed out, failed to initialize, or the environment was stopped;
+    /// the environment is reset.
     Unhandled,
 }
 
 impl FunctionErrorType {
+    /// The `X-Amz-Function-Error` value: Lambda reports every function error, including one
+    /// raised by a managed-runtime handler, as `Unhandled`.
     pub fn as_str(self) -> &'static str {
-        match self {
-            FunctionErrorType::Handled => "Handled",
-            FunctionErrorType::Unhandled => "Unhandled",
-        }
+        "Unhandled"
     }
 }
 
@@ -46,6 +48,46 @@ pub enum Outcome {
         error_type: FunctionErrorType,
         payload: Vec<u8>,
     },
+}
+
+/// An Init failure reported by a runtime through `POST /runtime/init/error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitError {
+    /// Normalized `Lambda-Runtime-Function-Error-Type` (`Runtime.*` or `Function.*`).
+    pub error_type: String,
+    /// The bounded `ErrorRequest` body, empty when the runtime sent none or it was too large.
+    pub payload: Vec<u8>,
+}
+
+/// The guest process the extension supervisor saw exit before the environment shut down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisedExit {
+    Runtime,
+    Extension,
+}
+
+impl SupervisedExit {
+    /// Parse the supervisor's private classification header value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "runtime" => Some(SupervisedExit::Runtime),
+            "extension" => Some(SupervisedExit::Extension),
+            _ => None,
+        }
+    }
+
+    fn init_error(self) -> InitError {
+        let (error_type, message) = match self {
+            SupervisedExit::Runtime => ("Runtime.ExitError", "Runtime exited during Init"),
+            SupervisedExit::Extension => ("Extension.Crash", "Extension exited during Init"),
+        };
+        InitError {
+            error_type: error_type.to_owned(),
+            payload: serde_json::json!({"errorType": error_type, "errorMessage": message})
+                .to_string()
+                .into_bytes(),
+        }
+    }
 }
 
 /// A pending invocation delivered to a guest by `next`.
@@ -95,7 +137,37 @@ pub struct InvocationBroker {
     inflight: DashMap<String, oneshot::Sender<Outcome>>,
     inflight_keys: DashMap<String, String>,
     logs: DashMap<String, Vec<String>>,
+    /// Output captured by a managed runtime during Init, keyed by environment.
+    init_logs: DashMap<String, Vec<String>>,
+    /// The first Init failure reported by each environment's runtime.
+    init_errors: DashMap<String, InitError>,
     extensions: DashMap<String, Arc<ExtensionEnvironment>>,
+}
+
+/// Bound captured runtime output to 1 MiB, noting how many bytes were dropped.
+fn bound_logs(logs: Vec<String>) -> Vec<String> {
+    const LIMIT: usize = 1024 * 1024;
+    let mut retained = Vec::new();
+    let mut remaining = LIMIT;
+    let mut dropped = 0;
+    for mut chunk in logs {
+        let mut end = chunk.len().min(remaining);
+        while !chunk.is_char_boundary(end) {
+            end -= 1;
+        }
+        dropped += chunk.len() - end;
+        chunk.truncate(end);
+        remaining -= end;
+        if !chunk.is_empty() {
+            retained.push(chunk);
+        }
+    }
+    if dropped > 0 {
+        retained.push(format!(
+            "\n[locallycloud: {dropped} log bytes dropped because the capture limit was exceeded]\n"
+        ));
+    }
+    retained
 }
 
 impl InvocationBroker {
@@ -240,27 +312,98 @@ impl InvocationBroker {
         if sender.is_closed() {
             return false;
         }
-        const LIMIT: usize = 1024 * 1024;
-        let mut retained = Vec::new();
-        let mut remaining = LIMIT;
-        let mut dropped = 0;
-        for mut chunk in logs {
-            let mut end = chunk.len().min(remaining);
-            while !chunk.is_char_boundary(end) {
-                end -= 1;
-            }
-            dropped += chunk.len() - end;
-            chunk.truncate(end);
-            remaining -= end;
-            if !chunk.is_empty() {
-                retained.push(chunk);
-            }
-        }
-        if dropped > 0 {
-            retained.push(format!("\n[locallycloud: {dropped} log bytes dropped because the capture limit was exceeded]\n"));
-        }
-        self.logs.insert(request_id.to_string(), retained);
+        self.logs.insert(request_id.to_string(), bound_logs(logs));
         true
+    }
+
+    /// Record the output a managed runtime produced during Init. Only environments the
+    /// executor registered are accepted, so arbitrary keys cannot accumulate state.
+    pub fn record_init_logs(&self, key: &str, logs: Vec<String>) -> bool {
+        if !self.extensions.contains_key(key) {
+            return false;
+        }
+        self.init_logs.insert(key.to_owned(), bound_logs(logs));
+        true
+    }
+
+    /// Take the Init output recorded for an environment.
+    pub fn take_init_logs(&self, key: &str) -> Option<Vec<String>> {
+        self.init_logs.remove(key).map(|(_, logs)| logs)
+    }
+
+    /// Record a runtime's `/init/error` and stop the environment. The first report wins.
+    /// Unregistered keys are ignored so they cannot create broker state.
+    pub fn record_init_error(&self, key: &str, error: InitError) {
+        if !self.extensions.contains_key(key) {
+            return;
+        }
+        self.init_errors.entry(key.to_owned()).or_insert(error);
+        self.stop(key);
+    }
+
+    /// Take the Init failure of an environment. A runtime `/init/error` wins over an
+    /// extension-reported error, which wins over the supervisor's exit classification.
+    pub fn take_init_error(&self, key: &str) -> Option<InitError> {
+        let runtime = self.init_errors.remove(key).map(|(_, error)| error);
+        let Some(env) = self.extensions.get(key).map(|env| env.clone()) else {
+            return runtime;
+        };
+        let mut phase = env.phase.lock().unwrap();
+        let extension = phase.extension_error.take();
+        let supervised = phase.supervisor_exit.take().map(SupervisedExit::init_error);
+        runtime.or(extension).or(supervised)
+    }
+
+    /// Record which guest process the extension supervisor saw exit, then stop the
+    /// environment. Returns `false` for unregistered environments.
+    pub fn record_supervisor_exit(&self, key: &str, exit: SupervisedExit) -> bool {
+        let Some(env) = self.extensions.get(key).map(|env| env.clone()) else {
+            return false;
+        };
+        {
+            let mut phase = env.phase.lock().unwrap();
+            phase.supervisor_exit.get_or_insert(exit);
+            env.changed();
+        }
+        self.stop(key);
+        true
+    }
+
+    /// Wait until the supervisor has reported a process exit, or `deadline`. The exiting
+    /// process's own report (`/init/error`, `/extension/init/error`) precedes it.
+    pub async fn wait_supervisor_exit(&self, key: &str, deadline: Instant) -> bool {
+        let Some(env) = self.extensions.get(key).map(|env| env.clone()) else {
+            return false;
+        };
+        loop {
+            let notified = env.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if env.phase.lock().unwrap().supervisor_exit.is_some() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_queue(&self, key: &str) -> bool {
+        self.queues.contains_key(key)
+    }
+
+    /// Whether the environment failed or was stopped before reporting readiness.
+    pub fn init_failed(&self, key: &str) -> bool {
+        let stopped = self
+            .queues
+            .get(key)
+            .is_some_and(|queue| !queue.open.load(Ordering::SeqCst));
+        stopped
+            || self
+                .extensions
+                .get(key)
+                .is_some_and(|env| env.phase.lock().unwrap().failed)
     }
 
     /// Take the output recorded for one completed invocation.
@@ -327,6 +470,8 @@ impl InvocationBroker {
     pub fn release(&self, key: &str) {
         self.stop(key);
         self.cleanup_extensions(key);
+        self.init_logs.remove(key);
+        self.init_errors.remove(key);
         self.queues.remove(key);
     }
 
@@ -379,7 +524,7 @@ mod tests {
         broker.complete(
             &rid,
             Outcome::Error {
-                error_type: FunctionErrorType::Handled,
+                error_type: FunctionErrorType::Reported,
                 payload: b"{\"errorMessage\":\"boom\"}".to_vec(),
             },
         );
@@ -388,7 +533,7 @@ mod tests {
                 error_type,
                 payload,
             } => {
-                assert_eq!(error_type, FunctionErrorType::Handled);
+                assert_eq!(error_type, FunctionErrorType::Reported);
                 assert_eq!(payload, b"{\"errorMessage\":\"boom\"}");
             }
             other => panic!("expected error, got {other:?}"),
@@ -527,6 +672,10 @@ struct ExtensionPhase {
     runtime_poll_tokens: HashSet<Uuid>,
     failed: bool,
     shutdown: bool,
+    /// The first error reported through `/extension/init/error` or `/extension/exit/error`.
+    extension_error: Option<InitError>,
+    /// The first unexpected process exit reported by the extension supervisor.
+    supervisor_exit: Option<SupervisedExit>,
 }
 
 struct ExtensionEnvironment {
@@ -569,6 +718,8 @@ impl InvocationBroker {
                 runtime_poll_tokens: HashSet::new(),
                 failed: false,
                 shutdown: false,
+                extension_error: None,
+                supervisor_exit: None,
             }),
             notify: Notify::new(),
         });
@@ -694,7 +845,14 @@ impl InvocationBroker {
         }
     }
 
-    pub fn report_extension_error(&self, key: &str, id: &str) -> Result<(), ExtensionError> {
+    /// Record an extension's `/extension/init/error` or `/extension/exit/error`; the first
+    /// error of the environment is kept for the Init result.
+    pub fn report_extension_error(
+        &self,
+        key: &str,
+        id: &str,
+        error: InitError,
+    ) -> Result<(), ExtensionError> {
         let env = self.extensions.get(key).ok_or(ExtensionError::Forbidden)?;
         let mut phase = env.phase.lock().unwrap();
         let registration = phase
@@ -708,6 +866,7 @@ impl InvocationBroker {
         if phase.failed {
             return Err(ExtensionError::Failed);
         }
+        phase.extension_error.get_or_insert(error);
         phase.failed = true;
         env.changed();
         Ok(())

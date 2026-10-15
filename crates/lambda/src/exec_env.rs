@@ -130,9 +130,35 @@ pub fn build_execution_env(input: &ExecEnvInputs) -> BTreeMap<String, String> {
     env
 }
 
+/// Point the X-Ray SDKs at the environment's daemon endpoint, as Lambda does for every
+/// environment. `AWS_XRAY_DAEMON_ADDRESS` and `AWS_XRAY_CONTEXT_MISSING` are unreserved, so a
+/// user value wins; the underscore-prefixed variables are always set.
+pub fn insert_xray_daemon_env(env: &mut BTreeMap<String, String>, daemon: std::net::SocketAddr) {
+    env.entry("AWS_XRAY_DAEMON_ADDRESS".into())
+        .or_insert_with(|| daemon.to_string());
+    env.entry("AWS_XRAY_CONTEXT_MISSING".into())
+        .or_insert_with(|| "LOG_ERROR".into());
+    env.insert("_AWS_XRAY_DAEMON_ADDRESS".into(), daemon.ip().to_string());
+    env.insert("_AWS_XRAY_DAEMON_PORT".into(), daemon.port().to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xray_daemon_variables_respect_unreserved_user_values() {
+        let daemon: std::net::SocketAddr = "127.0.0.1:41234".parse().unwrap();
+        let mut env = BTreeMap::new();
+        insert_xray_daemon_env(&mut env, daemon);
+        assert_eq!(env["AWS_XRAY_DAEMON_ADDRESS"], "127.0.0.1:41234");
+        assert_eq!(env["AWS_XRAY_CONTEXT_MISSING"], "LOG_ERROR");
+        assert_eq!(env["_AWS_XRAY_DAEMON_ADDRESS"], "127.0.0.1");
+        assert_eq!(env["_AWS_XRAY_DAEMON_PORT"], "41234");
+        let mut env = user(&[("AWS_XRAY_CONTEXT_MISSING", "IGNORE_ERROR")]);
+        insert_xray_daemon_env(&mut env, daemon);
+        assert_eq!(env["AWS_XRAY_CONTEXT_MISSING"], "IGNORE_ERROR");
+    }
 
     fn user(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

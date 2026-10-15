@@ -11,9 +11,9 @@ use crate::error::LambdaError;
 use crate::model::{
     compute_zip_code, function_arn, function_url_id, is_supported_runtime, layer_arn,
     resolve_function_name, Alias, EventInvokeConfig, FunctionStore, FunctionUrlConfig,
-    LambdaFunction, LayerStore, LayerVersion, VpcConfig, DEFAULT_EPHEMERAL_MB, DEFAULT_MEMORY_MB,
-    DEFAULT_TIMEOUT_SECS, MAX_EPHEMERAL_MB, MAX_MEMORY_MB, MAX_TIMEOUT_SECS, MIN_EPHEMERAL_MB,
-    MIN_MEMORY_MB, MIN_TIMEOUT_SECS,
+    LambdaFunction, LayerStore, LayerVersion, TracingMode, VpcConfig, DEFAULT_EPHEMERAL_MB,
+    DEFAULT_MEMORY_MB, DEFAULT_TIMEOUT_SECS, MAX_EPHEMERAL_MB, MAX_MEMORY_MB, MAX_TIMEOUT_SECS,
+    MIN_EPHEMERAL_MB, MIN_MEMORY_MB, MIN_TIMEOUT_SECS,
 };
 
 type OpResult = Result<(u16, Option<Value>), LambdaError>;
@@ -49,6 +49,7 @@ pub fn create_function(
     };
     validate_env(input)?;
     let environment = environment_variables(input);
+    let tracing_mode = tracing_mode(input)?.unwrap_or_default();
 
     // Image requests are shape-validated and rejected before any state is created. Zip carries
     // the only executable package supported by this module.
@@ -151,9 +152,31 @@ pub fn create_function(
         code_zip,
         dead_letter_arn,
         vpc_config: vpc_config.flatten(),
+        tracing_mode,
     };
     store.create(account, region, func.clone())?;
     Ok((201, Some(func.to_configuration_json())))
+}
+
+/// `TracingConfig.Mode` when supplied; `Mode` is optional within `TracingConfig`.
+fn tracing_mode(input: &Value) -> Result<Option<TracingMode>, LambdaError> {
+    let Some(config) = input.get("TracingConfig") else {
+        return Ok(None);
+    };
+    let config = config.as_object().ok_or_else(|| {
+        LambdaError::InvalidParameterValue("TracingConfig must be an object".into())
+    })?;
+    match config.get("Mode") {
+        None => Ok(None),
+        Some(Value::String(mode)) => TracingMode::parse(mode).map(Some).ok_or_else(|| {
+            LambdaError::InvalidParameterValue(format!(
+                "Value {mode} at 'tracingConfig.mode' failed to satisfy constraint: Member must satisfy enum value set: [Active, PassThrough]"
+            ))
+        }),
+        Some(_) => Err(LambdaError::InvalidParameterValue(
+            "TracingConfig.Mode must be a string".into(),
+        )),
+    }
 }
 
 /// Reject a user `Environment` that sets a reserved variable (Requirement 21.7).
@@ -432,6 +455,7 @@ pub fn update_function_configuration(
     }
     let name = resolve_function_name(name, region)?;
     validate_env(input)?;
+    let tracing_mode = tracing_mode(input)?;
 
     // Validate supplied fields before mutating anything.
     if let Some(runtime) = input.get("Runtime").and_then(Value::as_str) {
@@ -510,6 +534,9 @@ pub fn update_function_configuration(
             }
             if let Some(v) = vpc_config {
                 f.vpc_config = v;
+            }
+            if let Some(v) = tracing_mode {
+                f.tracing_mode = v;
             }
             f.last_modified = now_iso8601();
             f.revision_id = Uuid::new_v4().to_string();

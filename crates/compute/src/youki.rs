@@ -528,6 +528,29 @@ impl YoukiRuntime {
         ))
     }
 
+    /// Bind a UDP socket on a link-local guest-loopback address of the isolated netns.
+    pub async fn bind_isolated_udp(
+        &self,
+        task_id: &str,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Result<tokio::net::UdpSocket, RuntimeError> {
+        if port == 0 || !address.is_link_local() {
+            return Err(exec_failed(
+                "isolated UDP endpoint needs a link-local IPv4 address and port",
+            ));
+        }
+        let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
+        let socket = tokio::task::spawn_blocking(move || {
+            crate::netns_socket::bind_udp(user_ns, net_ns, address, port)
+        })
+        .await
+        .map_err(|e| exec_failed(format!("OCI UDP worker failed: {e}")))?
+        .map_err(|e| exec_failed(format!("binding isolated OCI UDP endpoint: {e}")))?;
+        tokio::net::UdpSocket::from_std(socket)
+            .map_err(|e| exec_failed(format!("adopting isolated OCI UDP endpoint: {e}")))
+    }
+
     pub async fn bind_isolated_public_egress(
         &self,
         task_id: &str,
@@ -756,6 +779,15 @@ impl ComputeRuntime for YoukiRuntime {
         task_id: &str,
     ) -> Result<(tokio::net::UdpSocket, tokio::net::TcpListener), RuntimeError> {
         YoukiRuntime::bind_isolated_dns(self, task_id).await
+    }
+
+    async fn bind_isolated_udp(
+        &self,
+        task_id: &str,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Result<tokio::net::UdpSocket, RuntimeError> {
+        YoukiRuntime::bind_isolated_udp(self, task_id, address, port).await
     }
 
     async fn stop_task(&self, task_id: &str) -> Result<TaskHandle, RuntimeError> {

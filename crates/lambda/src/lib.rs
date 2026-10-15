@@ -21,5 +21,6 @@ pub mod runtime_api_server;
 pub mod service;
 pub mod trace_header;
 mod vpc_dns;
+mod xray_daemon;
 
 pub use service::{register, register_with_execution, LambdaHandler};

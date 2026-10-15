@@ -564,3 +564,139 @@ async fn reserved_concurrency_get_function_restart_failure_and_delete() {
     drop(db);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn tracing_config_is_validated_persisted_versioned_and_listed() {
+    let root = std::env::temp_dir().join(format!(
+        "locallycloud-lambda-tracing-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+    let handler = restore_handler(db.clone(), 0x71).unwrap();
+    let zip = package("exports.handler=async()=>1");
+
+    for config in [
+        json!({"Mode": "Disabled"}),
+        json!({"Mode": "active"}),
+        json!({"Mode": 1}),
+        json!("Active"),
+    ] {
+        let mut input = create("bad", &zip);
+        input["TracingConfig"] = config.clone();
+        let (status, body) = call(&handler, Method::POST, "/2015-03-31/functions", input).await;
+        assert_eq!(status, 400, "{config}: {body}");
+    }
+    let (status, _) = call(
+        &handler,
+        Method::GET,
+        "/2015-03-31/functions/bad",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404);
+
+    let (status, body) = call(
+        &handler,
+        Method::POST,
+        "/2015-03-31/functions",
+        create("plain", &zip),
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert_eq!(body["TracingConfig"], json!({"Mode": "PassThrough"}));
+    let mut input = create("traced", &zip);
+    input["TracingConfig"] = json!({"Mode": "Active"});
+    let (status, body) = call(&handler, Method::POST, "/2015-03-31/functions", input).await;
+    assert_eq!(status, 201);
+    assert_eq!(body["TracingConfig"], json!({"Mode": "Active"}));
+    let (status, _) = call(
+        &handler,
+        Method::POST,
+        "/2015-03-31/functions/traced/versions",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 201);
+
+    // An empty TracingConfig or one without Mode changes nothing; invalid modes change nothing.
+    for config in [json!({}), json!({"Mode": "Off"})] {
+        call(
+            &handler,
+            Method::PUT,
+            "/2015-03-31/functions/traced/configuration",
+            json!({"TracingConfig": config}),
+        )
+        .await;
+    }
+    let (status, body) = call(
+        &handler,
+        Method::PUT,
+        "/2015-03-31/functions/plain/configuration",
+        json!({"TracingConfig": {"Mode": "Active"}}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["TracingConfig"]["Mode"], "Active");
+    let (status, body) = call(
+        &handler,
+        Method::PUT,
+        "/2015-03-31/functions/plain/configuration",
+        json!({"TracingConfig": {"Mode": "Bogus"}}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    drop(handler);
+
+    let restored = restore_handler(db.clone(), 0x71).unwrap();
+    let (_, function) = call(
+        &restored,
+        Method::GET,
+        "/2015-03-31/functions/traced",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(function["Configuration"]["TracingConfig"]["Mode"], "Active");
+    let (_, configuration) = call(
+        &restored,
+        Method::GET,
+        "/2015-03-31/functions/plain/configuration",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(configuration["TracingConfig"]["Mode"], "Active");
+    let (_, versions) = call(
+        &restored,
+        Method::GET,
+        "/2015-03-31/functions/traced/versions",
+        Value::Null,
+    )
+    .await;
+    let versions = versions["Versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2);
+    assert!(versions
+        .iter()
+        .all(|version| version["TracingConfig"]["Mode"] == "Active"));
+    let (_, listed) = call(&restored, Method::GET, "/2015-03-31/functions", Value::Null).await;
+    let modes = listed["Functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["FunctionName"].clone(),
+                f["TracingConfig"]["Mode"].clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        modes.contains(&(json!("plain"), json!("Active"))),
+        "{modes:?}"
+    );
+    assert!(
+        modes.contains(&(json!("traced"), json!("Active"))),
+        "{modes:?}"
+    );
+    drop(restored);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}

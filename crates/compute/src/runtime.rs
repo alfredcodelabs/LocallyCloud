@@ -120,6 +120,19 @@ pub trait ComputeRuntime: Send + Sync {
         })
     }
 
+    /// Bind a UDP socket on a guest-loopback address of the isolated guest, serviced by host
+    /// code (for example the X-Ray daemon endpoint of a VPC Lambda environment).
+    async fn bind_isolated_udp(
+        &self,
+        _task_id: &str,
+        _address: std::net::Ipv4Addr,
+        _port: u16,
+    ) -> Result<tokio::net::UdpSocket, RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "isolated UDP endpoints are unavailable for this backend".into(),
+        })
+    }
+
     /// Stop a running task. Returns [`RuntimeError::TaskNotFound`] for an identifier that
     /// was never started and [`RuntimeError::TaskAlreadyCompleted`] for one that already
     /// finished naturally (Req 13.4, 13.5).

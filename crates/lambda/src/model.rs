@@ -59,6 +59,31 @@ impl VpcConfig {
     }
 }
 
+/// `TracingConfig.Mode`; AWS defaults to `PassThrough`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TracingMode {
+    Active,
+    #[default]
+    PassThrough,
+}
+
+impl TracingMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "Active" => Some(Self::Active),
+            "PassThrough" => Some(Self::PassThrough),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::PassThrough => "PassThrough",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LambdaFunction {
     pub function_name: String,
@@ -88,6 +113,9 @@ pub struct LambdaFunction {
     /// `DeadLetterConfig.TargetArn` for asynchronous invocation failures, if configured.
     pub dead_letter_arn: Option<String>,
     pub vpc_config: Option<VpcConfig>,
+    /// Records persisted before tracing support restore as `PassThrough`.
+    #[serde(default)]
+    pub tracing_mode: TracingMode,
 }
 
 impl LambdaFunction {
@@ -114,6 +142,7 @@ impl LambdaFunction {
             "State": self.state,
             // Creation and supported updates finish synchronously before returning.
             "LastUpdateStatus": "Successful",
+            "TracingConfig": { "Mode": self.tracing_mode.as_str() },
         });
         if !self.environment.is_empty() {
             json["Environment"] = serde_json::json!({ "Variables": self.environment });
@@ -1285,6 +1314,7 @@ mod tests {
             code_zip: None,
             dead_letter_arn: None,
             vpc_config: None,
+            tracing_mode: TracingMode::PassThrough,
         };
         let mut configured = f("a");
         assert!(configured

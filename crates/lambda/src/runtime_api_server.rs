@@ -15,7 +15,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use http::{HeaderMap, StatusCode};
 
-use crate::runtime_api::{ExtensionError, FunctionErrorType, InvocationBroker, Outcome};
+use crate::runtime_api::{
+    ExtensionError, FunctionErrorType, InitError, InvocationBroker, Outcome, SupervisedExit,
+};
 
 /// Build the Runtime API router bound to `broker`.
 pub fn router(broker: Arc<InvocationBroker>) -> Router {
@@ -34,6 +36,11 @@ pub fn router(broker: Arc<InvocationBroker>) -> Router {
             post(error),
         )
         .route("/e/{key}/2018-06-01/runtime/init/error", post(init_error))
+        .route("/e/{key}/2018-06-01/runtime/init/logs", post(init_logs))
+        .route(
+            "/e/{key}/locallycloud/supervisor/exit",
+            post(supervisor_exit),
+        )
         .route(
             "/e/{key}/2020-01-01/extension/register",
             post(extension_register),
@@ -92,22 +99,46 @@ async fn logs(
     Path((_key, rid)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    const MAX_LOG_BODY_BYTES: usize = 1_048_576;
-    const MAX_LOG_LINES: usize = 10_000;
-    if body.len() > MAX_LOG_BODY_BYTES {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
-    let Ok(lines) = serde_json::from_slice::<Vec<String>>(&body) else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let lines = match parse_log_lines(&body) {
+        Ok(lines) => lines,
+        Err(status) => return status.into_response(),
     };
-    if lines.len() > MAX_LOG_LINES || lines.iter().any(|line| line.len() > MAX_LOG_BODY_BYTES) {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
     if broker.record_logs(&rid, lines) {
         accepted()
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+/// `POST .../init/logs` — record managed-runtime output produced during Init (locallycloud
+/// extension of the Runtime API, like `.../logs`).
+async fn init_logs(
+    State(broker): State<Arc<InvocationBroker>>,
+    Path(key): Path<String>,
+    body: Bytes,
+) -> Response {
+    let lines = match parse_log_lines(&body) {
+        Ok(lines) => lines,
+        Err(status) => return status.into_response(),
+    };
+    if broker.record_init_logs(&key, lines) {
+        accepted()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+fn parse_log_lines(body: &[u8]) -> Result<Vec<String>, StatusCode> {
+    const MAX_LOG_BODY_BYTES: usize = 1_048_576;
+    const MAX_LOG_LINES: usize = 10_000;
+    if body.len() > MAX_LOG_BODY_BYTES {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let lines = serde_json::from_slice::<Vec<String>>(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if lines.len() > MAX_LOG_LINES || lines.iter().any(|line| line.len() > MAX_LOG_BODY_BYTES) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    Ok(lines)
 }
 
 /// `POST .../invocation/{rid}/error` — deliver a handler-reported function error.
@@ -117,7 +148,7 @@ async fn error(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let error_type = classify(headers.get("Lambda-Runtime-Function-Error-Type"));
+    let error_type = classify(&headers);
     broker.complete(
         &rid,
         Outcome::Error {
@@ -128,23 +159,89 @@ async fn error(
     accepted()
 }
 
-/// `POST .../init/error` — the runtime failed to initialize; tear the environment down so its
-/// pending invocation fails `Unhandled`.
+/// `POST .../init/error` — the runtime failed to initialize. The bounded error body and its
+/// normalized error type are kept for the invocation result and logs, then the environment
+/// is torn down so its pending invocation fails `Unhandled`.
 async fn init_error(
     State(broker): State<Arc<InvocationBroker>>,
     Path(key): Path<String>,
-    _body: Bytes,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    broker.stop(&key);
+    const MAX_INIT_ERROR_BYTES: usize = 256 * 1024;
+    let payload = if body.len() > MAX_INIT_ERROR_BYTES {
+        Vec::new()
+    } else {
+        body.to_vec()
+    };
+    broker.record_init_error(
+        &key,
+        InitError {
+            error_type: normalize_error_type(headers.get("Lambda-Runtime-Function-Error-Type")),
+            payload,
+        },
+    );
     accepted()
 }
 
-/// Classify the `Lambda-Runtime-Function-Error-Type` header. A reported handler error is
-/// `Handled` unless the runtime explicitly flags it `Unhandled`.
-fn classify(header: Option<&http::HeaderValue>) -> FunctionErrorType {
-    match header.and_then(|v| v.to_str().ok()) {
-        Some(v) if v.eq_ignore_ascii_case("Unhandled") => FunctionErrorType::Unhandled,
-        _ => FunctionErrorType::Handled,
+/// `POST /e/{key}/locallycloud/supervisor/exit` — private route of the guest extension
+/// supervisor: `Locallycloud-Exited` names the process class (`runtime` or `extension`) that
+/// exited unexpectedly. It only classifies the failure and stops the environment.
+async fn supervisor_exit(
+    State(broker): State<Arc<InvocationBroker>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(exit) = headers
+        .get("Locallycloud-Exited")
+        .and_then(|value| value.to_str().ok())
+        .and_then(SupervisedExit::parse)
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if broker.record_supervisor_exit(&key, exit) {
+        accepted()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// Lambda keeps `<Category.Reason>` values (Category `Runtime` or `Function`, Reason starting
+/// with an uppercase letter) and normalizes anything else to `Runtime.Unknown` or
+/// `Function.Unknown`.
+fn normalize_error_type(header: Option<&http::HeaderValue>) -> String {
+    let value = header.and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let well_formed = |category: &str| {
+        value
+            .strip_prefix(category)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|reason| {
+                reason.len() <= 128
+                    && reason.starts_with(|c: char| c.is_ascii_uppercase())
+                    && reason.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+    };
+    if well_formed("Runtime") || well_formed("Function") {
+        value.to_owned()
+    } else if value.starts_with("Function") {
+        "Function.Unknown".to_owned()
+    } else {
+        "Runtime.Unknown".to_owned()
+    }
+}
+
+/// Private header of the platform RICs: the runtime itself failed (its log delivery broke)
+/// and the environment must be reset rather than reused.
+const RUNTIME_FAULT_HEADER: &str = "Locallycloud-Runtime-Fault";
+
+/// A reported error leaves the runtime running, whatever `Lambda-Runtime-Function-Error-Type`
+/// says (the AWS clients send none; Lambda accepts any value), unless a platform RIC flags a
+/// runtime fault.
+fn classify(headers: &HeaderMap) -> FunctionErrorType {
+    if headers.contains_key(RUNTIME_FAULT_HEADER) {
+        FunctionErrorType::Unhandled
+    } else {
+        FunctionErrorType::Reported
     }
 }
 
@@ -250,31 +347,50 @@ mod tests {
     async fn guest_posts_error() {
         let broker = Arc::new(InvocationBroker::new());
         let base = serve(broker.clone()).await;
-        let (rid, rx) = broker.submit("envB", b"e".to_vec(), "arn", 5000);
         let client = reqwest::Client::new();
-        client
-            .get(format!("{base}/e/envB/2018-06-01/runtime/invocation/next"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .post(format!(
-                "{base}/e/envB/2018-06-01/runtime/invocation/{rid}/error"
-            ))
-            .header("Lambda-Runtime-Function-Error-Type", "Unhandled")
-            .body(r#"{"errorMessage":"boom"}"#)
-            .send()
-            .await
-            .unwrap();
-        match rx.await.unwrap() {
-            Outcome::Error {
-                error_type,
-                payload,
-            } => {
-                assert_eq!(error_type, FunctionErrorType::Unhandled);
-                assert_eq!(payload, br#"{"errorMessage":"boom"}"#);
+        // The public error-type header never decides the classification; only the
+        // platform RICs' private runtime-fault header resets the environment.
+        for (header, expected) in [
+            (None, FunctionErrorType::Reported),
+            (
+                Some(("Lambda-Runtime-Function-Error-Type", "Unhandled")),
+                FunctionErrorType::Reported,
+            ),
+            (
+                Some(("Lambda-Runtime-Function-Error-Type", "Handled")),
+                FunctionErrorType::Reported,
+            ),
+            (
+                Some((RUNTIME_FAULT_HEADER, "1")),
+                FunctionErrorType::Unhandled,
+            ),
+        ] {
+            let (rid, rx) = broker.submit("envB", b"e".to_vec(), "arn", 5000);
+            client
+                .get(format!("{base}/e/envB/2018-06-01/runtime/invocation/next"))
+                .send()
+                .await
+                .unwrap();
+            let mut request = client
+                .post(format!(
+                    "{base}/e/envB/2018-06-01/runtime/invocation/{rid}/error"
+                ))
+                .body(r#"{"errorMessage":"boom"}"#);
+            if let Some((name, value)) = header {
+                request = request.header(name, value);
             }
-            other => panic!("expected error, got {other:?}"),
+            request.send().await.unwrap();
+            match rx.await.unwrap() {
+                Outcome::Error {
+                    error_type,
+                    payload,
+                } => {
+                    assert_eq!(error_type, expected, "{header:?}");
+                    assert_eq!(error_type.as_str(), "Unhandled");
+                    assert_eq!(payload, br#"{"errorMessage":"boom"}"#);
+                }
+                other => panic!("expected error, got {other:?}"),
+            }
         }
     }
 
@@ -290,6 +406,197 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 204);
+    }
+
+    #[tokio::test]
+    async fn init_error_keeps_bounded_body_and_normalized_type() {
+        let broker = Arc::new(InvocationBroker::new());
+        broker
+            .discover_expected_extensions("envI", vec![], "fn", "$LATEST", "h")
+            .unwrap();
+        let base = serve(broker.clone()).await;
+        let client = reqwest::Client::new();
+        let logs = client
+            .post(format!("{base}/e/envI/2018-06-01/runtime/init/logs"))
+            .body(r#"["import output\n"]"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logs.status(), 202);
+        let body =
+            r#"{"errorType":"Runtime.ImportModuleError","errorMessage":"m","stackTrace":[]}"#;
+        for (header, body) in [("Runtime.ImportModuleError", body), ("Unhandled", "{}")] {
+            let posted = client
+                .post(format!("{base}/e/envI/2018-06-01/runtime/init/error"))
+                .header("Lambda-Runtime-Function-Error-Type", header)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(posted.status(), 202);
+        }
+        // The first report wins; a later supervisor report must not replace it.
+        let error = broker.take_init_error("envI").unwrap();
+        assert_eq!(error.error_type, "Runtime.ImportModuleError");
+        assert_eq!(error.payload, body.as_bytes());
+        assert_eq!(
+            broker.take_init_logs("envI").unwrap().concat(),
+            "import output\n"
+        );
+        assert!(broker.init_failed("envI"));
+        assert!(broker.next("envI").await.is_none());
+
+        // Unregistered environments cannot accumulate Init state.
+        let unknown = client
+            .post(format!("{base}/e/nope/2018-06-01/runtime/init/logs"))
+            .body(r#"["x"]"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), 404);
+        let oversized = client
+            .post(format!("{base}/e/nope/2018-06-01/runtime/init/error"))
+            .body(vec![b'x'; 300 * 1024])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), 202);
+        assert!(broker.take_init_error("nope").is_none());
+        let supervisor = client
+            .post(format!("{base}/e/nope/locallycloud/supervisor/exit"))
+            .header("Locallycloud-Exited", "runtime")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status(), 404);
+        assert!(!broker.has_queue("nope"));
+    }
+
+    /// A runtime `/init/error` wins over an extension error, which wins over the
+    /// supervisor's classification, regardless of arrival order.
+    #[tokio::test]
+    async fn init_error_precedence_runtime_then_extension_then_supervisor() {
+        let broker = Arc::new(InvocationBroker::new());
+        let base = serve(broker.clone()).await;
+        let client = reqwest::Client::new();
+        let supervisor = |key: &str, exited: &str| {
+            client
+                .post(format!("{base}/e/{key}/locallycloud/supervisor/exit"))
+                .header("Locallycloud-Exited", exited.to_owned())
+                .send()
+        };
+        let register = |key: &str| {
+            broker
+                .discover_expected_extensions(key, vec!["ext".into()], "fn", "$LATEST", "h")
+                .unwrap();
+            broker
+                .register_extension(key, "ext", vec!["INVOKE".into()])
+                .unwrap()
+                .0
+        };
+
+        // Supervisor only: the exited process class decides the type.
+        for (key, exited, expected) in [
+            ("sup-runtime", "runtime", "Runtime.ExitError"),
+            ("sup-extension", "extension", "Extension.Crash"),
+        ] {
+            register(key);
+            assert_eq!(supervisor(key, exited).await.unwrap().status(), 202);
+            assert!(broker.init_failed(key));
+            assert!(
+                broker
+                    .wait_supervisor_exit(key, tokio::time::Instant::now())
+                    .await
+            );
+            let error = broker.take_init_error(key).unwrap();
+            assert_eq!(error.error_type, expected);
+            let payload: serde_json::Value = serde_json::from_slice(&error.payload).unwrap();
+            assert_eq!(payload["errorType"], expected);
+        }
+        register("bad-class");
+        assert_eq!(
+            supervisor("bad-class", "other").await.unwrap().status(),
+            400
+        );
+        assert!(!broker.init_failed("bad-class"));
+
+        // The extension's typed error wins over the supervisor noticing it exit.
+        let id = register("ext-error");
+        let reported = client
+            .post(format!(
+                "{base}/e/ext-error/2020-01-01/extension/init/error"
+            ))
+            .header("Lambda-Extension-Identifier", &id)
+            .header(
+                "Lambda-Extension-Function-Error-Type",
+                "Extension.ConfigInvalid",
+            )
+            .json(&serde_json::json!({"errorMessage":"bad config"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reported.status(), 202);
+        assert_eq!(
+            supervisor("ext-error", "extension").await.unwrap().status(),
+            202
+        );
+        let error = broker.take_init_error("ext-error").unwrap();
+        assert_eq!(error.error_type, "Extension.ConfigInvalid");
+        let payload: serde_json::Value = serde_json::from_slice(&error.payload).unwrap();
+        assert_eq!(payload["errorMessage"], "bad config");
+
+        // A runtime `/init/error` wins over both, even when it arrives last.
+        let id = register("runtime-error");
+        broker
+            .report_extension_error(
+                "runtime-error",
+                &id,
+                InitError {
+                    error_type: "Extension.ConfigInvalid".into(),
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            supervisor("runtime-error", "runtime")
+                .await
+                .unwrap()
+                .status(),
+            202
+        );
+        let posted = client
+            .post(format!(
+                "{base}/e/runtime-error/2018-06-01/runtime/init/error"
+            ))
+            .header(
+                "Lambda-Runtime-Function-Error-Type",
+                "Runtime.ImportModuleError",
+            )
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(posted.status(), 202);
+        assert_eq!(
+            broker.take_init_error("runtime-error").unwrap().error_type,
+            "Runtime.ImportModuleError"
+        );
+        assert!(broker.take_init_error("runtime-error").is_none());
+    }
+
+    #[test]
+    fn init_error_type_is_normalized() {
+        let normalized =
+            |value: &str| normalize_error_type(Some(&http::HeaderValue::from_str(value).unwrap()));
+        assert_eq!(
+            normalized("Runtime.HandlerNotFound"),
+            "Runtime.HandlerNotFound"
+        );
+        assert_eq!(normalized("Function.Custom1"), "Function.Custom1");
+        assert_eq!(normalized("Function.bad"), "Function.Unknown");
+        assert_eq!(normalized("Runtime.Bad Type"), "Runtime.Unknown");
+        assert_eq!(normalized("TypeError"), "Runtime.Unknown");
+        assert_eq!(normalize_error_type(None), "Runtime.Unknown");
     }
 }
 
@@ -385,16 +692,41 @@ async fn extension_error(
     let Ok(id) = required_header(&headers, "Lambda-Extension-Identifier") else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if required_header(&headers, "Lambda-Extension-Function-Error-Type").is_err() {
+    let Ok(error_type) = required_header(&headers, "Lambda-Extension-Function-Error-Type") else {
         return StatusCode::BAD_REQUEST.into_response();
-    }
+    };
     if body.len() > 65536 {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    if !body.is_empty() && serde_json::from_slice::<serde_json::Value>(&body).is_err() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    match broker.report_extension_error(&key, id) {
+    let request = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    };
+    // Lambda accepts any string; keep it log-safe because it is written to `INIT_REPORT`.
+    let error_type = if !error_type.is_empty()
+        && error_type.len() <= 128
+        && error_type.bytes().all(|b| b.is_ascii_graphic())
+    {
+        error_type.to_owned()
+    } else {
+        "Extension.Unknown".to_owned()
+    };
+    let message = request["errorMessage"]
+        .as_str()
+        .unwrap_or("Extension failed")
+        .to_owned();
+    let payload = serde_json::json!({"errorType": error_type, "errorMessage": message})
+        .to_string()
+        .into_bytes();
+    let error = InitError {
+        error_type,
+        payload,
+    };
+    match broker.report_extension_error(&key, id, error) {
         Ok(()) => accepted(),
         Err(error) => extension_status(error),
     }

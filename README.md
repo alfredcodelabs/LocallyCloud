@@ -160,10 +160,11 @@ The server can start without a compute runtime. Install these dependencies only 
 | --- | --- |
 | Invoke Lambda, run ECS/Fargate tasks, or run EC2 instances | `crun` or `youki` available in `PATH`, a systemd user session with a user D-Bus (`dbus-user-session` on Debian and Ubuntu), and delegated cgroup v2 memory control on a compatible Linux host. Custom-runtime binaries (`provided.al2023`) must match the host architecture. |
 | Run ZIP-based Node.js or Python Lambda functions | An OCI runtime above and the matching language executable: `node` or, for example, `python3.13`. Debian 13's `nodejs` is Node 20; choose a version compatible with the declared function runtime. |
+| Use the runtime-included AWS SDK (`import boto3`) in Python functions without packaging it | The distribution's boto3 for that interpreter: `python3-boto3` (Debian and Ubuntu) or `python-boto3` (Arch). LocallyCloud copies boto3 and its pure-Python dependencies into the runtime; packaged copies in the function or its layers take precedence. Without it, functions must package boto3. Node.js runtimes do not include the AWS SDK for JavaScript v3 locally, so bundle `@aws-sdk/*` with the function. |
 | Run RDS PostgreSQL or Aurora PostgreSQL, including RDS Data API access | PostgreSQL 16 or later; use the newest version your distribution provides. `initdb`, `pg_ctl`, `postgres`, `psql`, and `pg_basebackup` must have matching versions. LocallyCloud starts its own databases. |
 | Open the dashboard from the applications menu | `xdg-utils`. Opening the URL directly in a browser does not require it. |
 
-On Debian and Ubuntu, install the components you need with `sudo apt install crun dbus-user-session`, `sudo apt install postgresql`, or `sudo apt install xdg-utils`; on Arch, use `sudo pacman -S crun postgresql xdg-utils`. RDS finds PostgreSQL on `PATH` (Arch) or the newest version under `/usr/lib/postgresql/<version>/bin` (Debian and Ubuntu). Set `LOCALLYCLOUD_PG_BIN_DIR` only to use a different installation.
+On Debian and Ubuntu, install the components you need with `sudo apt install crun dbus-user-session`, `sudo apt install postgresql`, `sudo apt install python3-boto3`, or `sudo apt install xdg-utils`; on Arch, use `sudo pacman -S crun postgresql python-boto3 xdg-utils`. RDS finds PostgreSQL on `PATH` (Arch) or the newest version under `/usr/lib/postgresql/<version>/bin` (Debian and Ubuntu). Set `LOCALLYCLOUD_PG_BIN_DIR` only to use a different installation.
 
 ### Debian OCI execution
 

@@ -39,6 +39,7 @@ Some features need host components:
 | Lambda, ECS/Fargate, EC2 (OCI) | `crun` or `youki`, a systemd user session with a user D-Bus, delegated cgroup v2 memory control | The `.deb` recommends `dbus-user-session`. On WSL 2, enable systemd (below). |
 | Lambda, ECS, EC2 (Firecracker) | Read and write access to `/dev/kvm` | Used automatically when available; otherwise OCI. Inside a VM, needs nested virtualization. |
 | ZIP Lambda functions | The matching interpreter on the host (`python3.x`, `node`) | Use what your distribution ships; for example Debian 13 has Python 3.13 and Node.js 20. |
+| Runtime-included boto3 in Python functions | Optional: `python3-boto3` (Debian, Ubuntu) or `python-boto3` (Arch) | Copied into the runtime when the host interpreter can import it; otherwise functions must package boto3. Node.js runtimes do not include the AWS SDK for JavaScript v3 locally; bundle it. |
 | Custom runtimes (`provided.al2023`) | A binary built for the host architecture | An x86_64 binary does not run on an arm64 host, and vice versa. |
 | RDS and RDS Data API | PostgreSQL 16 or later | Use the newest version your distribution provides. Found on `PATH` or under `/usr/lib/postgresql/<version>/bin`; `LOCALLYCLOUD_PG_BIN_DIR` overrides it. |
 | Dashboard from the applications menu | `xdg-utils` | The dashboard URL works in any browser without it. |
