@@ -16,4 +16,5 @@ pub mod proto;
 pub mod service;
 pub mod store;
 
-pub use service::{register, register_with_state};
+pub use model::QueueUrlStyle;
+pub use service::{register, register_with_state, register_with_state_and_queue_urls};

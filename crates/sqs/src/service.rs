@@ -22,7 +22,7 @@ use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, Ser
 
 use crate::error::SqsError;
 use crate::metrics::SqsMetrics;
-use crate::model::QueueArn;
+use crate::model::{QueueArn, QueueUrlStyle};
 use crate::ops::{self, Ctx};
 use crate::policy::{self, Decision};
 use crate::proto::{self, Protocol};
@@ -35,6 +35,7 @@ pub struct SqsHandler {
     store: Arc<SqsStore>,
     registry: Weak<ServiceRegistry>,
     metrics: SqsMetrics,
+    queue_urls: QueueUrlStyle,
 }
 
 impl Default for SqsHandler {
@@ -77,6 +78,7 @@ impl SqsHandler {
             store,
             registry: Arc::downgrade(registry),
             metrics,
+            queue_urls: QueueUrlStyle::Aws,
         }
     }
 
@@ -86,7 +88,15 @@ impl SqsHandler {
             store,
             registry,
             metrics,
+            queue_urls: QueueUrlStyle::Aws,
         }
+    }
+
+    /// Return queue URLs in `style`; handlers default to [`QueueUrlStyle::Aws`] and the
+    /// server wires the configured endpoint strategy.
+    pub fn with_queue_url_style(mut self, style: QueueUrlStyle) -> Self {
+        self.queue_urls = style;
+        self
     }
 
     async fn authorize_queue_operation(
@@ -323,7 +333,10 @@ impl NativeHandler for SqsHandler {
             .headers
             .get("x-amz-target")
             .and_then(|v| v.to_str().ok());
-        let (protocol, op, body) = proto::classify(target, &request.body);
+        let (protocol, op, mut body) = proto::classify(target, &request.body);
+        if protocol == Protocol::Query {
+            queue_url_from_path(&mut body, request.uri.path());
+        }
 
         let op = match op {
             Some(o) => o,
@@ -353,6 +366,8 @@ impl NativeHandler for SqsHandler {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned),
             metrics: self.metrics.recorder(),
+            queue_urls: &self.queue_urls,
+            trace_header: ops::request_trace_header(request.headers.get("x-amzn-trace-id")),
         };
         // CloudWatch counts any action on a queue as activity, even a rejected one.
         let accessed_queue = op != "DeleteQueue" && self.mark_queue_activity(&op, &body, &request);
@@ -446,7 +461,7 @@ impl SqsHandler {
                     .get("QueueUrl")
                     .and_then(Value::as_str)
                     .ok_or_else(|| SqsError::MissingParameter("QueueUrl is required".into()))?;
-                QueueArn::from_url(url)?
+                QueueArn::from_url(url, &request.region)?
             }
         };
         Ok((arn.to_arn(), Some(arn)))
@@ -520,6 +535,28 @@ fn error_response(err: SqsError, request: &ServiceRequest, protocol: Protocol) -
     response
 }
 
+/// The Query API also addresses a queue by the request path (`POST /<account>/<name>`
+/// with no `QueueUrl` parameter); an omitted `QueueUrl` falls back to that path.
+fn queue_url_from_path(body: &mut Value, path: &str) {
+    let Value::Object(fields) = body else {
+        return;
+    };
+    if fields
+        .get("QueueUrl")
+        .and_then(Value::as_str)
+        .is_some_and(|url| !url.is_empty())
+    {
+        return;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if let [account, name] = segments[..] {
+        fields.insert(
+            "QueueUrl".into(),
+            Value::String(format!("/{account}/{name}")),
+        );
+    }
+}
+
 /// Whether the client opted into `awsQueryCompatible` error mapping (`x-amzn-query-mode`).
 fn is_query_compat(req: &ServiceRequest) -> bool {
     req.headers
@@ -533,7 +570,17 @@ pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
 ) -> Result<(), SqsError> {
-    let handler: Arc<dyn NativeHandler> = Arc::new(SqsHandler::with_state(registry, state)?);
+    register_with_state_and_queue_urls(registry, state, QueueUrlStyle::Aws)
+}
+
+/// Register durable SQS returning queue URLs in `queue_urls`.
+pub fn register_with_state_and_queue_urls(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    queue_urls: QueueUrlStyle,
+) -> Result<(), SqsError> {
+    let handler: Arc<dyn NativeHandler> =
+        Arc::new(SqsHandler::with_state(registry, state)?.with_queue_url_style(queue_urls));
     registry.register_native(
         ServiceName::new("sqs"),
         ServiceMetadata::new(AwsProtocol::Json10, Some(TARGET_PREFIX)),
@@ -1117,6 +1164,139 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
+    }
+
+    const HTTP_TRACE: &str =
+        "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
+    const ATTRIBUTE_TRACE: &str = "Root=1-6759e988-bd862e3fe1be46a994272794;Sampled=1";
+
+    async fn send_traced(h: &SqsHandler, op: &str, body: Value, trace: &str) -> u16 {
+        let mut req = request(op, body);
+        req.headers
+            .insert("x-amzn-trace-id", HeaderValue::from_str(trace).unwrap());
+        h.handle(req).await.status().as_u16()
+    }
+
+    async fn received_traces(h: &SqsHandler, url: &str, names: Value) -> Vec<Value> {
+        let (status, v) = call(
+            h,
+            "ReceiveMessage",
+            json!({"QueueUrl": url, "MaxNumberOfMessages": 10, "MessageSystemAttributeNames": names}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let mut traces: Vec<Value> = v["Messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|m| m["Attributes"]["AWSTraceHeader"].clone())
+            .collect();
+        traces.sort_by_key(Value::to_string);
+        traces
+    }
+
+    #[tokio::test]
+    async fn send_message_inherits_http_trace_header() {
+        let h = SqsHandler::new();
+        for names in [json!(["AWSTraceHeader"]), json!(["All"])] {
+            let url = create(&h, &format!("trace-{}", names[0].as_str().unwrap())).await;
+            let body = json!({"QueueUrl": url, "MessageBody": "traced"});
+            assert_eq!(send_traced(&h, "SendMessage", body, HTTP_TRACE).await, 200);
+            assert_eq!(
+                received_traces(&h, &url, names).await,
+                vec![json!(HTTP_TRACE)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_trace_attribute_overrides_http_header() {
+        let h = SqsHandler::new();
+        let url = create(&h, "trace-explicit").await;
+        let body = json!({"QueueUrl": url, "MessageBody": "traced", "MessageSystemAttributes": {
+            "AWSTraceHeader": {"DataType": "String", "StringValue": ATTRIBUTE_TRACE}
+        }});
+        assert_eq!(send_traced(&h, "SendMessage", body, HTTP_TRACE).await, 200);
+        assert_eq!(
+            received_traces(&h, &url, json!(["AWSTraceHeader"])).await,
+            vec![json!(ATTRIBUTE_TRACE)]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_batch_applies_http_trace_header_to_every_entry() {
+        let h = SqsHandler::new();
+        let url = create(&h, "trace-batch").await;
+        let body = json!({"QueueUrl": url, "Entries": [
+            {"Id": "a", "MessageBody": "a"},
+            {"Id": "b", "MessageBody": "b"},
+            {"Id": "c", "MessageBody": "c", "MessageSystemAttributes": {
+                "AWSTraceHeader": {"DataType": "String", "StringValue": ATTRIBUTE_TRACE}
+            }}
+        ]});
+        assert_eq!(
+            send_traced(&h, "SendMessageBatch", body, HTTP_TRACE).await,
+            200
+        );
+        let mut expected = vec![json!(HTTP_TRACE), json!(HTTP_TRACE), json!(ATTRIBUTE_TRACE)];
+        expected.sort_by_key(Value::to_string);
+        assert_eq!(received_traces(&h, &url, json!(["All"])).await, expected);
+    }
+
+    #[tokio::test]
+    async fn send_without_trace_header_stores_none() {
+        let h = SqsHandler::new();
+        let url = create(&h, "trace-none").await;
+        let (status, _) = call(
+            &h,
+            "SendMessage",
+            json!({"QueueUrl": url, "MessageBody": "plain"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let oversized = format!(
+            "Root=1-5759e988-bd862e3fe1be46a994272793;{}",
+            "x".repeat(1024)
+        );
+        let body = json!({"QueueUrl": url, "MessageBody": "oversized"});
+        assert_eq!(send_traced(&h, "SendMessage", body, &oversized).await, 200);
+        assert_eq!(
+            received_traces(&h, &url, json!(["All"])).await,
+            vec![Value::Null, Value::Null]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_send_message_inherits_http_trace_header() {
+        let h = SqsHandler::new();
+        let url = create(&h, "trace-query").await;
+        let form = format!(
+            "Action=SendMessage&Version=2012-11-05&QueueUrl={}&MessageBody=query",
+            url.replace(':', "%3A").replace('/', "%2F")
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        headers.insert("x-amzn-trace-id", HeaderValue::from_static(HTTP_TRACE));
+        let req = ServiceRequest {
+            method: Method::POST,
+            uri: "/".parse().unwrap(),
+            headers,
+            body: Bytes::from(form),
+            region: "us-east-1".to_string(),
+            account_id: "000000000000".to_string(),
+            request_id: "rid".to_string(),
+        };
+        assert_eq!(h.handle(req).await.status().as_u16(), 200);
+        // Same attribute shape the Lambda SQS event source mapping copies into
+        // `Records[].attributes` (it receives with `MessageSystemAttributeNames: ["All"]`).
+        assert_eq!(
+            received_traces(&h, &url, json!(["All"])).await,
+            vec![json!(HTTP_TRACE)]
+        );
     }
 
     #[tokio::test]

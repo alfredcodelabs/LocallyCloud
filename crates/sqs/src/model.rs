@@ -26,6 +26,7 @@ impl QueueArn {
         format!("arn:aws:sqs:{}:{}:{}", self.region, self.account, self.name)
     }
 
+    /// The AWS-shaped URL `https://sqs.<region>.amazonaws.com/<account>/<name>`.
     pub fn to_url(&self) -> String {
         format!(
             "https://sqs.{}.amazonaws.com/{}/{}",
@@ -33,9 +34,11 @@ impl QueueArn {
         )
     }
 
-    /// Parse a queue URL of the form `https://sqs.<region>.amazonaws.com/<account>/<name>`
-    /// or a path-style `.../<account>/<name>`; the last two path segments are account/name.
-    pub fn from_url(url: &str) -> Result<QueueArn, SqsError> {
+    /// Parse a queue URL; the last two path segments are account/name. The region comes
+    /// from an `sqs.<region>.…` or legacy `<region>.queue.…` host, otherwise (path-style
+    /// `http://127.0.0.1:4566/<account>/<name>` or a bare path) from `default_region`,
+    /// which callers set to the request's signing region.
+    pub fn from_url(url: &str, default_region: &str) -> Result<QueueArn, SqsError> {
         let without_scheme = url.split("://").last().unwrap_or(url);
         let (host, path) = without_scheme.split_once('/').ok_or_else(|| {
             SqsError::InvalidParameterValue(format!("malformed queue URL: {url}"))
@@ -48,17 +51,50 @@ impl QueueArn {
         }
         let name = segments[segments.len() - 1].to_string();
         let account = segments[segments.len() - 2].to_string();
-        // Region from `sqs.<region>.amazonaws.com` when present, else a placeholder.
-        let region = host
-            .strip_prefix("sqs.")
-            .and_then(|h| h.split('.').next())
-            .unwrap_or("us-east-1")
-            .to_string();
         Ok(QueueArn {
-            region,
+            region: host_region(host).unwrap_or(default_region).to_string(),
             account,
             name,
         })
+    }
+}
+
+/// The region named by a queue URL host: `sqs.<region>.<domain>` (AWS and LocalStack
+/// domain style) or the legacy `<region>.queue.amazonaws.com`.
+fn host_region(host: &str) -> Option<&str> {
+    let hostname = host.split(':').next().unwrap_or(host);
+    let mut labels = hostname.split('.');
+    match (labels.next(), labels.next(), labels.next()) {
+        (Some(first), Some(region), Some(_)) if first.eq_ignore_ascii_case("sqs") => Some(region),
+        (Some(region), Some(second), Some(_)) if second.eq_ignore_ascii_case("queue") => {
+            Some(region)
+        }
+        _ => None,
+    }
+}
+
+/// How the queue URLs returned by CreateQueue, GetQueueUrl, ListQueues and
+/// ListDeadLetterSourceQueues are shaped. Every shape is accepted as input regardless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueUrlStyle {
+    /// `<endpoint>/<account>/<name>` on the locallycloud endpoint, so SDKs that use the
+    /// queue URL as their endpoint keep calling this instance.
+    Endpoint(String),
+    /// `https://sqs.<region>.amazonaws.com/<account>/<name>`.
+    Aws,
+}
+
+impl QueueUrlStyle {
+    pub fn url(&self, arn: &QueueArn) -> String {
+        match self {
+            QueueUrlStyle::Endpoint(base) => format!(
+                "{}/{}/{}",
+                base.trim_end_matches('/'),
+                arn.account,
+                arn.name
+            ),
+            QueueUrlStyle::Aws => arn.to_url(),
+        }
     }
 }
 
@@ -155,12 +191,52 @@ mod tests {
             "https://sqs.us-east-1.amazonaws.com/000000000000/my-queue"
         );
         assert_eq!(arn.to_arn(), "arn:aws:sqs:us-east-1:000000000000:my-queue");
-        let parsed = QueueArn::from_url(&arn.to_url()).unwrap();
+        let parsed = QueueArn::from_url(&arn.to_url(), "eu-west-1").unwrap();
         assert_eq!(parsed, arn);
     }
 
     #[test]
     fn from_url_rejects_malformed() {
-        assert!(QueueArn::from_url("https://sqs.us-east-1.amazonaws.com/").is_err());
+        assert!(QueueArn::from_url("https://sqs.us-east-1.amazonaws.com/", "us-east-1").is_err());
+    }
+
+    #[test]
+    fn endpoint_style_url_round_trips_with_request_region() {
+        let arn = QueueArn::new("eu-west-1", "000000000000", "orders.fifo");
+        let style = QueueUrlStyle::Endpoint("http://127.0.0.1:4566/".into());
+        let url = style.url(&arn);
+        assert_eq!(url, "http://127.0.0.1:4566/000000000000/orders.fifo");
+        assert_eq!(QueueArn::from_url(&url, "eu-west-1").unwrap(), arn);
+        assert_eq!(QueueUrlStyle::Aws.url(&arn), arn.to_url());
+    }
+
+    #[test]
+    fn from_url_accepts_every_queue_url_form() {
+        let expected = |region: &str| QueueArn::new(region, "000000000000", "q");
+        for (url, region) in [
+            (
+                "https://sqs.eu-west-1.amazonaws.com/000000000000/q",
+                "eu-west-1",
+            ),
+            (
+                "https://eu-west-1.queue.amazonaws.com/000000000000/q",
+                "eu-west-1",
+            ),
+            (
+                "http://sqs.eu-west-1.localhost.localstack.cloud:4566/000000000000/q",
+                "eu-west-1",
+            ),
+            ("https://queue.amazonaws.com/000000000000/q", "ap-south-1"),
+            ("http://127.0.0.1:4566/000000000000/q", "ap-south-1"),
+            ("http://localhost:4566/000000000000/q", "ap-south-1"),
+            ("http://sqs.localhost:4566/000000000000/q", "ap-south-1"),
+            ("/000000000000/q", "ap-south-1"),
+        ] {
+            assert_eq!(
+                QueueArn::from_url(url, "ap-south-1").unwrap(),
+                expected(region),
+                "{url}"
+            );
+        }
     }
 }

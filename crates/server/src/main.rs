@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 
 use locallycloud_compute::selector::{RuntimeKind, RuntimeSelector, SelectionError};
-use locallycloud_core::config::{LocallyCloudConfig, RuntimeChoice};
+use locallycloud_core::config::{LocallyCloudConfig, RuntimeChoice, SqsEndpointStrategy};
 use locallycloud_core::endpoint::EndpointResolver;
 use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::authorization::{
@@ -303,7 +303,17 @@ async fn main() {
         tracing::error!(%error, "failed to register S3");
         std::process::exit(4);
     }
-    if let Err(error) = locallycloud_sqs::register_with_state(&registry, state.clone()) {
+    // Queue URLs use the same base injected into guests as AWS_ENDPOINT_URL, because SDKs
+    // send queue operations to the QueueUrl host.
+    let queue_urls = match config.sqs_endpoint_strategy {
+        SqsEndpointStrategy::Path => {
+            locallycloud_sqs::QueueUrlStyle::Endpoint(endpoint.guest_endpoint().to_string())
+        }
+        SqsEndpointStrategy::Aws => locallycloud_sqs::QueueUrlStyle::Aws,
+    };
+    if let Err(error) =
+        locallycloud_sqs::register_with_state_and_queue_urls(&registry, state.clone(), queue_urls)
+    {
         tracing::error!(%error, "failed to register SQS");
         std::process::exit(4);
     }

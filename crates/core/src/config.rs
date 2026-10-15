@@ -15,6 +15,16 @@ pub enum RuntimeChoice {
     Youki,
 }
 
+/// Shape of the SQS queue URLs returned to clients (`LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqsEndpointStrategy {
+    /// `<guest endpoint>/<account>/<queue>`: SDKs that use the queue URL as their endpoint
+    /// keep calling this instance.
+    Path,
+    /// `https://sqs.<region>.amazonaws.com/<account>/<queue>`.
+    Aws,
+}
+
 /// All resolved configuration values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocallyCloudConfig {
@@ -52,6 +62,8 @@ pub struct LocallyCloudConfig {
     /// Duration of one simulated EventBridge retry second; defaults to real time.
     pub events_retry_second: Duration,
     pub sqs_esm_max_pollers: u32,
+    /// Default: [`SqsEndpointStrategy::Path`].
+    pub sqs_endpoint_strategy: SqsEndpointStrategy,
 }
 
 const LAMBDA_ACCOUNT_CONCURRENCY: &str = "LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY";
@@ -351,7 +363,25 @@ impl LocallyCloudConfig {
                         )
                     })?,
             },
+            sqs_endpoint_strategy: match resolve(get, &["LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY"]) {
+                Some((v, src)) => parse_sqs_endpoint_strategy(&v, src)?,
+                None => SqsEndpointStrategy::Path,
+            },
         })
+    }
+}
+
+fn parse_sqs_endpoint_strategy(
+    value: &str,
+    src: &'static str,
+) -> Result<SqsEndpointStrategy, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "path" => Ok(SqsEndpointStrategy::Path),
+        "aws" => Ok(SqsEndpointStrategy::Aws),
+        other => Err(ConfigError::new(
+            src,
+            format!("expected one of path|aws, got `{other}`"),
+        )),
     }
 }
 
@@ -683,6 +713,30 @@ mod tests {
             LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_UI", "disabled")])).unwrap_err();
         assert_eq!(err.setting, "LOCALLYCLOUD_UI");
         assert!(err.to_string().contains("on|off"));
+    }
+
+    #[test]
+    fn sqs_endpoint_strategy_defaults_to_path_and_rejects_unknown_values() {
+        let strategy = |value: &str| {
+            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY", value)]))
+        };
+        assert_eq!(
+            LocallyCloudConfig::resolve(&env(&[]))
+                .unwrap()
+                .sqs_endpoint_strategy,
+            SqsEndpointStrategy::Path
+        );
+        assert_eq!(
+            strategy("AWS").unwrap().sqs_endpoint_strategy,
+            SqsEndpointStrategy::Aws
+        );
+        assert_eq!(
+            strategy("path").unwrap().sqs_endpoint_strategy,
+            SqsEndpointStrategy::Path
+        );
+        let err = strategy("domain").unwrap_err();
+        assert_eq!(err.setting, "LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY");
+        assert!(err.to_string().contains("path|aws"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_sqs::error::SqsError;
 use locallycloud_sqs::md5::body_md5;
-use locallycloud_sqs::model::QueueArn;
+use locallycloud_sqs::model::{QueueArn, QueueUrlStyle};
 use locallycloud_sqs::service::SqsHandler;
 
 fn rt() -> tokio::runtime::Runtime {
@@ -92,8 +92,10 @@ proptest! {
     #[test]
     fn url_arn_round_trip(region in ident(), account in "[0-9]{12}", name in ident()) {
         let arn = QueueArn::new(&region, &account, &name);
-        let parsed = QueueArn::from_url(&arn.to_url()).unwrap();
-        prop_assert_eq!(parsed, arn);
+        let parsed = QueueArn::from_url(&arn.to_url(), "us-east-1").unwrap();
+        prop_assert_eq!(&parsed, &arn);
+        let local = QueueUrlStyle::Endpoint("http://127.0.0.1:4566".into()).url(&arn);
+        prop_assert_eq!(QueueArn::from_url(&local, &region).unwrap(), arn);
     }
 
     /// Property 5: `MD5OfMessageBody` is deterministic, 32 lowercase-hex chars.

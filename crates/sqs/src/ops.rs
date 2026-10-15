@@ -13,6 +13,7 @@ use locallycloud_core::integration::kms::{
     KmsCallContext, KmsDecryptRequest, KmsGenerateDataKeyRequest, KmsInternalError,
     KmsValidateKeyRequest, SensitiveBytes,
 };
+use locallycloud_core::integration::lambda::MAX_TRACE_HEADER_LEN;
 use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
@@ -20,7 +21,9 @@ use uuid::Uuid;
 use crate::error::SqsError;
 use crate::md5::{attributes_md5, body_md5};
 use crate::metrics::{message_counts, MetricsRecorder};
-use crate::model::{AttributeValue, EncryptedBody, Message, MessageAttribute, QueueArn};
+use crate::model::{
+    AttributeValue, EncryptedBody, Message, MessageAttribute, QueueArn, QueueUrlStyle,
+};
 use crate::store::{
     GuardedQueue, InsertResult, QueueState, ReceiveAttempt, SqsStore, DEFAULT_DELAY_SECONDS,
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_RETENTION_PERIOD, DEFAULT_VISIBILITY_TIMEOUT,
@@ -43,6 +46,32 @@ pub struct Ctx<'a> {
     pub dispatcher: Option<Arc<InternalDispatcher>>,
     pub authorization: Option<String>,
     pub metrics: Arc<MetricsRecorder>,
+    /// Shape of the queue URLs this instance returns.
+    pub queue_urls: &'a QueueUrlStyle,
+    /// The request's `X-Amzn-Trace-Id`, inherited as `AWSTraceHeader` by every message of a
+    /// send that does not set that system attribute explicitly.
+    pub trace_header: Option<String>,
+}
+
+/// Accept an `X-Amzn-Trace-Id` HTTP header value for propagation. The explicit
+/// `AWSTraceHeader` attribute only requires a string; the header must additionally be a
+/// valid visible-ASCII header value that is non-empty and bounded, otherwise it is ignored.
+pub fn request_trace_header(value: Option<&http::HeaderValue>) -> Option<String> {
+    value
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_TRACE_HEADER_LEN)
+        .map(str::to_owned)
+}
+
+/// The message system attribute overrides the HTTP trace header when both are set.
+fn inherit_trace_header(input: &mut SendInput, trace_header: Option<&str>) {
+    if let Some(trace) = trace_header {
+        input
+            .system_attributes
+            .entry("AWSTraceHeader".into())
+            .or_insert_with(|| trace.to_owned());
+    }
 }
 
 // ============================ request helpers ==================================
@@ -96,7 +125,7 @@ fn b64() -> base64::engine::GeneralPurpose {
 /// Resolve the queue named by the request's `QueueUrl`; `QueueDoesNotExist` when absent.
 fn resolve_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Arc<GuardedQueue>, SqsError> {
     let url = req_str(v, "QueueUrl")?;
-    let arn = QueueArn::from_url(url)?;
+    let arn = QueueArn::from_url(url, ctx.region)?;
     ctx.store.get(&arn).ok_or(SqsError::QueueDoesNotExist)
 }
 
@@ -628,12 +657,12 @@ pub async fn create_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
                     return Err(error);
                 }
             }
-            Ok(json!({ "QueueUrl": arn.to_url() }))
+            Ok(json!({ "QueueUrl": ctx.queue_urls.url(&arn) }))
         }
         InsertResult::Existing(existing) => {
             let state = existing.state.lock().await;
             if state.attributes == stored {
-                Ok(json!({ "QueueUrl": arn.to_url() }))
+                Ok(json!({ "QueueUrl": ctx.queue_urls.url(&arn) }))
             } else {
                 Err(SqsError::QueueNameExists)
             }
@@ -725,7 +754,11 @@ pub async fn list_queues(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     if !page.is_empty() {
         response.insert(
             "QueueUrls".into(),
-            Value::Array(page.iter().map(|queue| json!(queue.arn.to_url())).collect()),
+            Value::Array(
+                page.iter()
+                    .map(|queue| json!(ctx.queue_urls.url(&queue.arn)))
+                    .collect(),
+            ),
         );
     }
     if queues.len() > page.len() {
@@ -749,7 +782,7 @@ pub async fn get_queue_url(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> 
     if !ctx.store.exists(&arn) {
         return Err(SqsError::QueueDoesNotExist);
     }
-    Ok(json!({ "QueueUrl": arn.to_url() }))
+    Ok(json!({ "QueueUrl": ctx.queue_urls.url(&arn) }))
 }
 
 fn expire_messages(
@@ -1374,7 +1407,8 @@ async fn messages_json(
 
 pub async fn send_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
-    let input = parse_send_input(v)?;
+    let mut input = parse_send_input(v)?;
+    inherit_trace_header(&mut input, ctx.trace_header.as_deref());
     let key_id = {
         q.state
             .lock()
@@ -1458,7 +1492,8 @@ pub async fn send_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsEr
     for entry in entries {
         let input = parse_send_input(entry);
         let item = match input {
-            Ok(input) => {
+            Ok(mut input) => {
+                inherit_trace_header(&mut input, ctx.trace_header.as_deref());
                 let encrypted = match key_id.as_deref() {
                     Some(key) => Some(encrypt_body(ctx, &q.arn.to_arn(), key, &input.body).await?),
                     None => None,
@@ -2413,7 +2448,11 @@ pub async fn list_dead_letter_source_queues(ctx: &Ctx<'_>, v: &Value) -> Result<
     let mut response = Map::new();
     response.insert(
         "queueUrls".into(),
-        Value::Array(page.iter().map(|queue| json!(queue.arn.to_url())).collect()),
+        Value::Array(
+            page.iter()
+                .map(|queue| json!(ctx.queue_urls.url(&queue.arn)))
+                .collect(),
+        ),
     );
     if sources.len() > page.len() {
         response.insert(
@@ -2658,6 +2697,7 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
     let dispatcher = ctx.dispatcher.clone();
     let authorization = ctx.authorization.clone();
     let metrics = ctx.metrics.clone();
+    let queue_urls = ctx.queue_urls.clone();
     tokio::spawn(async move {
         let _lifecycle = lifecycle;
         let worker_ctx = Ctx {
@@ -2668,6 +2708,8 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
             dispatcher,
             authorization,
             metrics,
+            queue_urls: &queue_urls,
+            trace_header: None,
         };
         let interval = Duration::from_secs_f64(1.0 / rate as f64);
         let mut retry_delay = Duration::from_millis(100);
