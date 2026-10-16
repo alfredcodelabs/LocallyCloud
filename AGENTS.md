@@ -313,8 +313,16 @@ routing name never implies runtime support.
 
 ## Agent skills
 
+For architecture, cross-service flows or prior decisions, start with
+`scripts/agent-context status` and use the project `graphify` skill when available.
+Query the local index to locate relevant sources, then verify them before editing.
+Refresh stale semantic documents; do not treat unindexed documents as covered.
+If the optional tool is unavailable, continue with targeted source reads.
+See `docs/AGENT_CONTEXT.md` for setup and the extraction workflow.
+
 Project skills live in `.agents/skills/`:
 
+- `graphify` — navigate persistent code/document context and refresh relevant decisions.
 - `conditional-dispatch` — when writing or reviewing dispatch, mappings, validations, state
   transitions, or growing `if`/`else` chains.
 - `whitebox-review` — for code reviews, security audits, and before closing relevant changes

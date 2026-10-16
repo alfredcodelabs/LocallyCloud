@@ -379,6 +379,9 @@ Do not delete `~/.aws`, your PostgreSQL installation, or shared runtime director
 
 ## Development and releases
 
+Agents can use the optional [persistent project context](docs/AGENT_CONTEXT.md) to
+navigate code, AWS references and decisions between sessions.
+
 From the repository root:
 
 ```sh

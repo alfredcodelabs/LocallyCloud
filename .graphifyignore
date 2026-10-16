@@ -1,0 +1,29 @@
+# Index maintained project sources and decisions, including Git-ignored specs.
+*
+!AGENTS.md
+!README.md
+!Cargo.toml
+!crates/
+!crates/**
+!docs/
+!docs/**
+!.kiro/
+!.kiro/specs/
+!.kiro/specs/**
+!scripts/
+!scripts/**
+
+# Exclusions remain authoritative inside the included trees.
+**/target/
+**/node_modules/
+**/__pycache__/
+**/.git/
+**/.aws/
+**/.codex/
+**/.env*
+**/*.pem
+**/*.key
+**/*.sqlite*
+**/*.db
+**/*.log
+scripts/aws-smithy-diff.py

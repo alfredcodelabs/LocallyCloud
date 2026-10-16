@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Project-local Graphify entrypoint. No model calls or hooks are installed here."""
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+VERSION = "0.9.90"
+ROOT = Path(__file__).resolve().parent.parent
+WORK = ROOT / "target/agent-context"
+VENV = WORK / "venv"
+OUT = WORK / "graphify-out"
+GRAPH = OUT / "graph.json"
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read(path, default=None):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def write(path, value):
+    staged = path.with_suffix(path.suffix + ".tmp")
+    staged.write_text(json.dumps(value, indent=2) + "\n")
+    staged.replace(path)
+
+
+def native(*args):
+    subprocess.run([str(VENV / "bin/graphify"), *map(str, args)], check=True, cwd=ROOT,
+                   stdout=sys.stderr if args[0] == "update" else None)
+
+
+def config_hash():
+    return digest(ROOT / ".graphifyignore")
+
+
+def scan():
+    from graphify.detect import detect_incremental
+
+    return detect_incremental(ROOT, manifest_path=str(OUT / "manifest.json"), kind="ast")
+
+
+def status():
+    detected = scan()
+    graph = read(GRAPH, {"nodes": []})
+    documents = set(detected["files"].get("document", []))
+    indexed = set()
+    for node in graph["nodes"]:
+        if node.get("_origin") == "semantic" and node.get("source_file"):
+            indexed.add(str((ROOT / node["source_file"]).resolve()))
+    # A cached fragment can exist for a previous branch while the graph still holds
+    # another revision. Freshness describes what was actually published in this graph.
+    revisions = read(OUT / "semantic-revisions.json", {})
+    prompt = digest(SPEC)
+    stale = sorted(p for p in indexed & documents
+                   if revisions.get(p) != {"source": digest(p), "prompt": prompt})
+    pending = sorted(documents - indexed)
+    result = {
+        "graph_exists": GRAPH.exists(),
+        "structural_update_needed": (
+            not GRAPH.exists()
+            or bool(detected["new_total"] or detected.get("deleted_files")
+                    or detected.get("excluded_files") or indexed - documents)
+            or read(OUT / "build.json", {}).get("config_hash") != config_hash()
+        ),
+        "stale_semantic_documents": stale,
+        "excluded_semantic_documents": sorted(indexed - documents),
+        "unindexed_semantic_documents": len(pending),
+        "skipped_sensitive": detected.get("skipped_sensitive", []),
+        "pending_list": str(OUT / "pending-documents.json"),
+        "graph": str(GRAPH),
+    }
+    write(OUT / "pending-documents.json", {"stale": stale, "unindexed": pending})
+    return result
+
+
+def update():
+    if status()["structural_update_needed"]:
+        native("update", ROOT, "--no-cluster")
+        # Native updates preserve semantic documents outside their structural scan.
+        # This integration restricts them to the explicitly included corpus.
+        excluded = status()["excluded_semantic_documents"]
+        if excluded:
+            from graphify.build import build_merge
+            from graphify.export import to_json
+
+            graph = build_merge([], graph_path=GRAPH, prune_sources=excluded, root=ROOT,
+                                directed=True, dedup=False)
+            if not to_json(graph, {}, str(GRAPH), force=True):
+                raise ValueError("Could not prune excluded semantic documents")
+        write(OUT / "build.json", {"config_hash": config_hash(), "version": VERSION})
+    return status()
+
+
+def prepare(paths):
+    update()
+    documents = set(scan()["files"].get("document", []))
+    sources = {}
+    for name in paths:
+        path = (ROOT / name).resolve()
+        if str(path) not in documents:
+            raise ValueError(f"Not an included document: {name}")
+        sources[str(path)] = digest(path)
+    # Keep semantic work scoped to a task; the agent can prepare another batch.
+    if not 1 <= len(sources) <= 25:
+        raise ValueError("Prepare between 1 and 25 documents per batch")
+    request = {"root": str(ROOT), "prompt_sha256": digest(SPEC), "sources": sources}
+    request_path = OUT / ("request-" + os.urandom(8).hex() + ".json")
+    write(request_path, request)
+    print(json.dumps({"request": str(request_path), "extraction_spec": str(SPEC),
+                      "sources": list(sources)}, indent=2))
+
+
+def import_semantics(request_path, fragment_path):
+    from graphify.build import build_merge
+    from graphify.cache import save_semantic_cache
+    from graphify.detect import save_manifest
+    from graphify.export import to_json
+
+    request = read(Path(request_path))
+    fragment = read(Path(fragment_path))
+    if request["root"] != str(ROOT) or request["prompt_sha256"] != digest(SPEC):
+        raise ValueError("Extraction request belongs to a different root or prompt")
+    included = set(scan()["files"].get("document", []))
+    sources = request["sources"]
+    if not sources or any(p not in included or digest(p) != h for p, h in sources.items()):
+        raise ValueError("A source changed or was excluded; prepare and extract again")
+    existing = read(GRAPH, {"nodes": []})
+    owners = {n["id"]: str((ROOT / n.get("source_file", "")).resolve())
+              for n in existing["nodes"]}
+    nodes, edges = fragment["nodes"], fragment["edges"]
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        raise ValueError("Fragment must contain node and edge lists")
+    ids = [n["id"] for n in nodes]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate node IDs in semantic fragment")
+    if {n.get("source_file") for n in nodes} != set(sources):
+        raise ValueError("Every prepared source must produce nodes, with absolute source_file")
+    types = {"code", "document", "paper", "image", "rationale", "concept"}
+    for item in nodes + edges:
+        if item.get("source_file") not in sources or not item.get("source_location"):
+            raise ValueError("Every item needs a prepared source and a source_location")
+        item["_origin"] = "semantic"
+    for node in nodes:
+        if node.get("file_type") not in types:
+            raise ValueError("Invalid semantic node file_type")
+        if node["id"] in owners and owners[node["id"]] not in sources:
+            raise ValueError("Semantic node ID belongs to another source")
+    allowed = set(owners) | set(ids)
+    for edge in edges:
+        if edge.get("source") not in allowed or edge.get("target") not in allowed:
+            raise ValueError("Semantic edge has an unknown endpoint")
+        if (edge.get("confidence") not in {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
+                or type(edge.get("confidence_score")) not in (float, int)
+                or not 0 <= edge["confidence_score"] <= 1):
+            raise ValueError("Semantic edges require confidence and a score from 0 to 1")
+        if edge["confidence"] == "EXTRACTED" and edge["confidence_score"] != 1:
+            raise ValueError("EXTRACTED edges require confidence_score 1.0")
+    # Hyperedges are optional; keep this importer limited to validated pairwise edges.
+    if fragment.get("hyperedges"):
+        raise ValueError("Use pairwise edges for this project integration")
+    graph = build_merge([fragment], graph_path=GRAPH, root=ROOT, directed=True, dedup=False)
+    if any(digest(p) != h for p, h in sources.items()):
+        raise ValueError("A source changed during merge; prepare and extract again")
+    # A validated replacement can legitimately have fewer nodes than its predecessor.
+    if not to_json(graph, {}, str(GRAPH), force=True):
+        raise ValueError("Graph export failed")
+    save_semantic_cache(nodes, edges, root=ROOT, allowed_source_files=sources, prompt_file=SPEC)
+    save_manifest({"document": list(sources)}, manifest_path=str(OUT / "manifest.json"),
+                  root=ROOT, kind="semantic")
+    revisions = read(OUT / "semantic-revisions.json", {})
+    revisions.update({p: {"source": h, "prompt": request["prompt_sha256"]}
+                      for p, h in sources.items()})
+    write(OUT / "semantic-revisions.json", revisions)
+    print(f"Imported {len(sources)} documents; model token usage is not measured here.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["setup", "status", "update", "query", "explain",
+                                            "path", "prepare", "import", "guide"])
+    args, rest = parser.parse_known_args()
+    if args.command == "setup":
+        if not (VENV / "bin/python").exists():
+            subprocess.run(["uv", "venv", str(VENV)], check=True)
+        subprocess.run(["uv", "pip", "install", "--python", str(VENV / "bin/python"),
+                        f"graphifyy[terraform]=={VERSION}"], check=True)
+        return
+    if not (VENV / "bin/python").exists():
+        raise ValueError("Run scripts/agent-context setup first (requires uv and network)")
+    if Path(sys.prefix).resolve() != VENV.resolve():
+        os.execv(str(VENV / "bin/python"), [str(VENV / "bin/python"), str(Path(__file__).resolve()),
+                                           *sys.argv[1:]])
+    if importlib.metadata.version("graphifyy") != VERSION:
+        raise ValueError("Graphify version mismatch; run scripts/agent-context setup")
+    global SPEC
+    import graphify
+    SPEC = Path(graphify.__file__).parent / "skills/codex/references/extraction-spec.md"
+    if args.command == "guide":
+        print(SPEC)
+        return
+    import fcntl
+    OUT.mkdir(parents=True, exist_ok=True)
+    with (OUT / ".agent.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.command == "status":
+            print(json.dumps(status(), indent=2))
+        elif args.command == "update":
+            print(json.dumps(update(), indent=2))
+        elif args.command == "prepare":
+            prepare(rest)
+        elif args.command == "import":
+            if len(rest) != 2:
+                raise ValueError("Usage: scripts/agent-context import REQUEST.json FRAGMENT.json")
+            import_semantics(*rest)
+        else:
+            current = update()
+            if current["stale_semantic_documents"]:
+                raise ValueError("Stale semantic documents; prepare/extract/import them first: "
+                                 + ", ".join(current["stale_semantic_documents"]))
+            print(f"Semantic coverage: {current['unindexed_semantic_documents']} documents not "
+                  "yet extracted; see pending-documents.json. Verify sources.", file=sys.stderr)
+            native(args.command, *rest, "--graph", GRAPH)
+
+
+if __name__ == "__main__":
+    os.environ.update(GRAPHIFY_OUT=str(OUT), GRAPHIFY_MAX_WORKERS="1",
+                      OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", UV_CACHE_DIR=str(WORK / "uv-cache"))
+    try:
+        main()
+    except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError,
+            importlib.metadata.PackageNotFoundError) as error:
+        print(f"agent-context: {error}", file=sys.stderr)
+        sys.exit(1)

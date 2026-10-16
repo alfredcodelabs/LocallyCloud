@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Exercise the actual Graphify wrapper in disposable, disk-backed repositories."""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+class AgentContextTest(unittest.TestCase):
+    def setUp(self):
+        parent = ROOT / "target/agent-context-tests"
+        parent.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="workspace $ literal ", dir=parent)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "scripts").mkdir()
+        self.command = self.root / "scripts/agent-context"
+        shutil.copyfile(ROOT / "scripts/agent-context", self.command)
+        self.command.chmod(0o755)
+        shutil.copyfile(ROOT / ".graphifyignore", self.root / ".graphifyignore")
+        work = self.root / "target/agent-context"
+        work.mkdir(parents=True)
+        (work / "venv").symlink_to(ROOT / "target/agent-context/venv", target_is_directory=True)
+        self.document = self.root / "docs/decision.md"
+        self.document.parent.mkdir()
+        self.document.write_text("# Budget\n\nLocal default: 1024 MiB.\n")
+        self.code = self.root / "crates/demo/src/lib.rs"
+        self.code.parent.mkdir(parents=True)
+        self.code.write_text("pub fn base() -> usize { 1 }\n")
+
+    def run_tool(self, *args, ok=True):
+        env = dict(os.environ)
+        # Fixture commands do not need provider credentials or any external connection.
+        for key in list(env):
+            if key.endswith("API_KEY") or key.startswith("AWS_"):
+                del env[key]
+        result = subprocess.run([str(self.command), *map(str, args)], env=env,
+                                capture_output=True, text=True, timeout=60)
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0)
+        return result
+
+    def graph(self):
+        return json.loads((self.root / "target/agent-context/graphify-out/graph.json").read_text())
+
+    def request(self):
+        return json.loads(self.run_tool("prepare", "docs/decision.md").stdout)["request"]
+
+    def fragment(self, value):
+        path = self.root / "target/fragment.json"
+        path.write_text(json.dumps({"nodes": [{
+            "id": "docs_decision_budget", "label": "Local budget decision",
+            "file_type": "rationale", "source_file": str(self.document),
+            "source_location": f"line 3: Local default: {value} MiB.",
+            "rationale": f"Test decision allocates {value} MiB.",
+        }], "edges": []}))
+        return path
+
+    def test_includes_specs_and_excludes_secrets_and_build_outputs(self):
+        spec = self.root / ".kiro/specs/demo/design.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("# Design\nA maintained decision.\n")
+        for name in [".aws/credentials", "docs/secret.pem", "crates/demo/.env",
+                     "crates/demo/target/generated.rs"]:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("pub fn excluded_fixture() {}\n")
+        status = json.loads(self.run_tool("update").stdout)
+        self.assertFalse(status["structural_update_needed"])
+        pending = json.loads(Path(status["pending_list"]).read_text())
+        self.assertIn(str(spec), pending["unindexed"])
+        self.assertNotIn("excluded_fixture", json.dumps(self.graph()))
+
+    def test_semantic_refresh_blocks_stale_queries_and_replaces_rationale(self):
+        request = self.request()
+        self.run_tool("import", request, self.fragment(1024))
+        self.assertIn("1024", self.run_tool("query", "budget", "--budget", "500").stdout)
+        self.document.write_text("# Budget\n\nLocal default: 2048 MiB.\n")
+        blocked = self.run_tool("query", "budget", ok=False)
+        self.assertIn("Stale semantic documents", blocked.stderr)
+        self.run_tool("import", self.request(), self.fragment(2048))
+        node = next(n for n in self.graph()["nodes"] if n["id"] == "docs_decision_budget")
+        self.assertIn("2048", node["rationale"])
+        self.assertNotIn("1024", json.dumps(node))
+        # Another process reuses persisted context without a semantic pass.
+        self.assertEqual(json.loads(self.run_tool("status").stdout)["stale_semantic_documents"], [])
+        # An old cached fragment does not make the currently published graph fresh.
+        self.document.write_text("# Budget\n\nLocal default: 1024 MiB.\n")
+        self.assertIn("Stale semantic documents", self.run_tool("query", "budget", ok=False).stderr)
+        self.run_tool("import", self.request(), self.fragment(1024))
+        self.assertIn("1024", self.run_tool("query", "budget", "--budget", "500").stdout)
+        rules = self.root / ".graphifyignore"
+        original_rules = rules.read_text()
+        rules.write_text(original_rules + "\ndocs/decision.md\n")
+        self.run_tool("update")
+        self.assertFalse(any(n["id"] == "docs_decision_budget" for n in self.graph()["nodes"]))
+        rules.write_text(original_rules)
+        self.run_tool("import", self.request(), self.fragment(1024))
+        self.document.unlink()
+        self.run_tool("update")
+        self.assertFalse(any(n["id"] == "docs_decision_budget" for n in self.graph()["nodes"]))
+
+    def test_source_race_and_invalid_edges_do_not_overwrite_graph(self):
+        request = self.request()
+        fragment = self.fragment(1024)
+        before = self.graph()
+        self.document.write_text("# Changed after preparation\n")
+        self.assertIn("source changed", self.run_tool("import", request, fragment, ok=False).stderr)
+        self.assertEqual(self.graph(), before)
+        request = self.request()
+        invalid = json.loads(fragment.read_text())
+        invalid["edges"] = [{"source": "docs_decision_budget", "target": "invented",
+                             "source_file": str(self.document), "source_location": "line 1",
+                             "confidence": "INFERRED", "confidence_score": 0.75}]
+        fragment.write_text(json.dumps(invalid))
+        before = self.graph()
+        self.assertIn("unknown endpoint", self.run_tool("import", request, fragment, ok=False).stderr)
+        self.assertEqual(self.graph(), before)
+
+    def test_real_branch_checkout_removes_stale_code_symbols(self):
+        def git(*args):
+            subprocess.run(["git", "-C", str(self.root), "-c", "core.hooksPath=/dev/null",
+                            "-c", "commit.gpgsign=false", "-c", "user.name=Context Test",
+                            "-c", "user.email=context@localhost", *args],
+                           check=True, capture_output=True)
+
+        git("init", "-q", "-b", "baseline")
+        git("add", "crates", "docs", ".graphifyignore")
+        git("commit", "-qm", "baseline")
+        self.run_tool("update")
+        git("switch", "-qc", "feature")
+        self.code.write_text(self.code.read_text() + "pub fn branch_probe() {}\n")
+        git("add", "crates")
+        git("commit", "-qm", "feature")
+        self.run_tool("query", "branch_probe")
+        self.assertIn("branch_probe", json.dumps(self.graph()))
+        git("switch", "-q", "baseline")
+        self.run_tool("update")
+        self.assertNotIn("branch_probe", json.dumps(self.graph()))
+
+
+if __name__ == "__main__":
+    unittest.main()
