@@ -29,6 +29,9 @@ use crate::TARGET_PREFIX;
 
 mod persistence;
 
+#[cfg(test)]
+mod recovery_tests;
+
 const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
 const MAX_BATCH_REQUEST_BODY: usize = 6 * 1024 * 1024;

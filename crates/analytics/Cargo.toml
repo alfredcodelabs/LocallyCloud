@@ -9,6 +9,8 @@ description = "Native AWS analytics services"
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
 async-trait.workspace = true
 apache-avro = { version = "=0.21.0", default-features = false }
 axum.workspace = true

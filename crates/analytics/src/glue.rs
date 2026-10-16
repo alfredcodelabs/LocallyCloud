@@ -24,6 +24,11 @@ use crate::state::{
 pub(crate) const TARGET_PREFIX: &str = "AWSGlue";
 const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 
+#[cfg(test)]
+#[path = "glue/durability_tests.rs"]
+mod durability_tests;
+
+#[derive(Clone)]
 pub(crate) struct GlueHandler {
     state: Arc<AnalyticsState>,
     registry: Weak<ServiceRegistry>,
@@ -155,15 +160,18 @@ impl GlueHandler {
             return Err(AnalyticsError::AlreadyExists);
         }
         let now = now_epoch()?;
-        catalog.databases.insert(
-            input.database_input.name.clone(),
-            DatabaseRecord {
-                input: input.database_input,
-                create_time: now,
-                update_time: now,
-                tables: BTreeMap::new(),
-            },
-        );
+        let record = DatabaseRecord {
+            input: input.database_input,
+            create_time: now,
+            update_time: now,
+            tables: BTreeMap::new(),
+        };
+        if let Some(persistence) = &self.state.persistence {
+            persistence
+                .save_database(&scope, &record)
+                .map_err(|_| AnalyticsError::Internal)?;
+        }
+        catalog.databases.insert(record.input.name.clone(), record);
         Ok(json!({}))
     }
 
@@ -251,8 +259,19 @@ impl GlueHandler {
             .databases
             .get_mut(&input.name)
             .ok_or(AnalyticsError::EntityNotFound)?;
-        database.input = input.database_input;
-        database.update_time = now_epoch()?;
+        let candidate = DatabaseRecord {
+            input: input.database_input,
+            create_time: database.create_time,
+            update_time: now_epoch()?,
+            tables: BTreeMap::new(),
+        };
+        if let Some(persistence) = &self.state.persistence {
+            persistence
+                .save_database(&scope, &candidate)
+                .map_err(|_| AnalyticsError::Internal)?;
+        }
+        database.input = candidate.input;
+        database.update_time = candidate.update_time;
         Ok(json!({}))
     }
 
@@ -273,6 +292,11 @@ impl GlueHandler {
             .ok_or(AnalyticsError::EntityNotFound)?;
         if !database.tables.is_empty() {
             return Err(AnalyticsError::InvalidInput);
+        }
+        if let Some(persistence) = &self.state.persistence {
+            persistence
+                .delete_database(&scope, &input.name)
+                .map_err(|_| AnalyticsError::Internal)?;
         }
         catalog.databases.remove(&input.name);
         Ok(json!({}))
@@ -309,16 +333,19 @@ impl GlueHandler {
             return Err(AnalyticsError::AlreadyExists);
         }
         let now = now_epoch()?;
-        database.tables.insert(
-            input.table_input.name.clone(),
-            TableRecord {
-                input: input.table_input,
-                create_time: now,
-                update_time: now,
-                version_id: 1,
-                partitions: Vec::new(),
-            },
-        );
+        let record = TableRecord {
+            input: input.table_input,
+            create_time: now,
+            update_time: now,
+            version_id: 1,
+            partitions: Vec::new(),
+        };
+        if let Some(persistence) = &self.state.persistence {
+            persistence
+                .save_table(&scope, &input.database_name, &record)
+                .map_err(|_| AnalyticsError::Internal)?;
+        }
+        database.tables.insert(record.input.name.clone(), record);
         Ok(json!({}))
     }
 
@@ -460,9 +487,19 @@ impl GlueHandler {
             .checked_add(1)
             .ok_or(AnalyticsError::Internal)?;
         let now = now_epoch()?;
-        table.input = input.table_input;
-        table.update_time = now;
-        table.version_id = next_version;
+        let candidate = TableRecord {
+            input: input.table_input,
+            create_time: table.create_time,
+            update_time: now,
+            version_id: next_version,
+            partitions: table.partitions.clone(),
+        };
+        if let Some(persistence) = &self.state.persistence {
+            persistence
+                .save_table(&scope, &input.database_name, &candidate)
+                .map_err(|_| AnalyticsError::Internal)?;
+        }
+        *table = candidate;
         Ok(json!({}))
     }
 
@@ -487,10 +524,15 @@ impl GlueHandler {
             .databases
             .get_mut(&input.database_name)
             .ok_or(AnalyticsError::EntityNotFound)?;
-        database
-            .tables
-            .remove(&input.name)
-            .ok_or(AnalyticsError::EntityNotFound)?;
+        if !database.tables.contains_key(&input.name) {
+            return Err(AnalyticsError::EntityNotFound);
+        }
+        if let Some(persistence) = &self.state.persistence {
+            persistence
+                .delete_table(&scope, &input.database_name, &input.name)
+                .map_err(|_| AnalyticsError::Internal)?;
+        }
+        database.tables.remove(&input.name);
         Ok(json!({}))
     }
 
@@ -537,19 +579,28 @@ impl GlueHandler {
 #[async_trait]
 impl NativeHandler for GlueHandler {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
-        self.state.resource_regions(account)
+        let state = self.state.clone();
+        let account = account.to_owned();
+        tokio::task::spawn_blocking(move || state.resource_regions(&account))
+            .await
+            .map_err(|_| "Glue inventory unavailable")?
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        match self.process(&request) {
+        let request_id = request.request_id.clone();
+        let handler = self.clone();
+        let result = tokio::task::spawn_blocking(move || handler.process(&request))
+            .await
+            .unwrap_or(Err(AnalyticsError::Internal));
+        match result {
             Ok(value) => Response::builder()
                 .status(200)
                 .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
-                .header("x-amzn-RequestId", &request.request_id)
+                .header("x-amzn-RequestId", &request_id)
                 .body(Body::from(value.to_string()))
                 .expect("Glue JSON response is valid"),
             Err(error) => AwsError::from(error)
-                .with_request_id(request.request_id)
+                .with_request_id(request_id)
                 .render(AwsProtocol::Json11)
                 .into_response(),
         }

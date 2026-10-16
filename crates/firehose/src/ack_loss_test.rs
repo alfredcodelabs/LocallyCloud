@@ -45,7 +45,7 @@ impl NativeHandler for LoseFirstUpdateAck {
     }
 }
 
-async fn call(
+pub(super) async fn call(
     dispatcher: &InternalDispatcher,
     method: Method,
     path: &str,
@@ -56,6 +56,9 @@ async fn call(
     headers.insert(
         http::header::AUTHORIZATION,
         HeaderValue::from_static(match target {
+            Some(target) if target.starts_with("Firehose_20150804.") => {
+                "AWS4-HMAC-SHA256 Credential=test/19700101/us-east-1/firehose/aws4_request"
+            }
             Some(target) if target.starts_with("AmazonAthena.") => {
                 "AWS4-HMAC-SHA256 Credential=test/19700101/us-east-1/athena/aws4_request"
             }
@@ -89,7 +92,11 @@ async fn call(
     (status, body)
 }
 
-async fn json_call(dispatcher: &InternalDispatcher, operation: &str, body: Value) -> Value {
+pub(super) async fn json_call(
+    dispatcher: &InternalDispatcher,
+    operation: &str,
+    body: Value,
+) -> Value {
     let (status, body) = call(
         dispatcher,
         Method::POST,
@@ -123,7 +130,7 @@ async fn athena_call(dispatcher: &InternalDispatcher, operation: &str, body: Val
     serde_json::from_slice(&body).unwrap()
 }
 
-async fn query_results(dispatcher: &InternalDispatcher, sql: &str) -> Value {
+pub(super) async fn query_results(dispatcher: &InternalDispatcher, sql: &str) -> Value {
     let id = athena_call(dispatcher, "StartQueryExecution", json!({"QueryString":sql,"QueryExecutionContext":{"Database":"lake"},"ResultConfiguration":{"OutputLocation":format!("s3://{BUCKET}/query/")}})).await["QueryExecutionId"].as_str().unwrap().to_owned();
     for _ in 0..100 {
         let execution = athena_call(

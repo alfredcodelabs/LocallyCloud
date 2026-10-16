@@ -44,16 +44,23 @@ pub(crate) struct TableInput {
     pub(crate) fields: BTreeMap<String, Value>,
 }
 
+#[derive(Deserialize, Serialize)]
 pub(crate) struct DatabaseRecord {
     pub(crate) input: DatabaseInput,
+    #[serde(with = "timestamp_bits")]
     pub(crate) create_time: f64,
+    #[serde(with = "timestamp_bits")]
     pub(crate) update_time: f64,
+    #[serde(skip)]
     pub(crate) tables: BTreeMap<String, TableRecord>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct TableRecord {
     pub(crate) input: TableInput,
+    #[serde(with = "timestamp_bits")]
     pub(crate) create_time: f64,
+    #[serde(with = "timestamp_bits")]
     pub(crate) update_time: f64,
     pub(crate) version_id: u64,
     pub(crate) partitions: Vec<Value>,
@@ -64,8 +71,22 @@ pub(crate) struct Catalog {
     pub(crate) databases: BTreeMap<String, DatabaseRecord>,
 }
 
+// Preserve the exact wire timestamp across JSON persistence without decimal rounding.
+mod timestamp_bits {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(value.to_bits())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        Ok(f64::from_bits(u64::deserialize(deserializer)?))
+    }
+}
+
 pub(crate) struct AnalyticsState {
     catalogs: DashMap<Scope, Arc<Mutex<Catalog>>>,
+    pub(crate) persistence: Option<crate::persistence::Persistence>,
 }
 
 impl AnalyticsState {
@@ -92,7 +113,23 @@ impl AnalyticsState {
     pub(crate) fn new() -> Self {
         Self {
             catalogs: DashMap::new(),
+            persistence: None,
         }
+    }
+
+    pub(crate) fn with_state(
+        database: Arc<locallycloud_state::StateDb>,
+        cipher: locallycloud_state::StateCipher,
+    ) -> Result<Self, crate::persistence::PersistError> {
+        let persistence = crate::persistence::Persistence::new(database, cipher)?;
+        let state = Self {
+            persistence: Some(persistence),
+            ..Self::new()
+        };
+        if let Some(persistence) = &state.persistence {
+            persistence.restore(&state)?;
+        }
+        Ok(state)
     }
 
     pub(crate) fn catalog(&self, scope: &Scope) -> Arc<Mutex<Catalog>> {

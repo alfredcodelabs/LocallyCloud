@@ -387,7 +387,11 @@ async fn main() {
         tracing::error!(%error, "failed to register Secrets Manager");
         std::process::exit(4);
     }
-    locallycloud_analytics::register(&registry);
+    if let Err(error) = locallycloud_analytics::register_with_state(&registry, state.clone()).await
+    {
+        tracing::error!(%error, "failed to restore Glue catalog; check LOCALLYCLOUD_KMS_MASTER_KEY and state database compatibility");
+        std::process::exit(4);
+    }
     if let Err(error) = locallycloud_kinesis::register_with_state(&registry, state.clone()) {
         tracing::error!(%error, "failed to register Kinesis");
         std::process::exit(4);
