@@ -9,6 +9,7 @@ use http::{HeaderMap, HeaderValue};
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::identity::trusted_role;
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::AwsProtocol;
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
@@ -66,28 +67,29 @@ impl GlueHandler {
         if !evaluator.strict_sigv4_required() {
             return Ok(());
         }
-        // Core alone sets these markers after verifying external SigV4 or a scoped
-        // in-process dispatch. The source service owns internal role checks.
-        if request
-            .headers
-            .get("x-locallycloud-verified-internal-scope")
-            == Some(&HeaderValue::from_static("1"))
-        {
-            return Ok(());
-        }
-        if request
-            .headers
-            .get("x-locallycloud-verified-external-sigv4")
-            != Some(&HeaderValue::from_static("1"))
-        {
+        // Only Core can attest an external signature or a scoped internal caller.
+        let attested = [
+            "x-locallycloud-verified-internal-scope",
+            "x-locallycloud-verified-external-sigv4",
+        ]
+        .iter()
+        .any(|header| request.headers.get(*header) == Some(&HeaderValue::from_static("1")));
+        if !attested {
             return Err(AnalyticsError::AccessDenied);
         }
-        let key = request
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(RequestIdentity::access_key_from_authorization)
-            .ok_or(AnalyticsError::AccessDenied)?;
+        let delegated_identity = trusted_role(request);
+        let access_key_id = if delegated_identity.is_some() {
+            None
+        } else {
+            Some(
+                request
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(RequestIdentity::access_key_from_authorization)
+                    .ok_or(AnalyticsError::AccessDenied)?,
+            )
+        };
         let root = format!("arn:aws:glue:{}:{}:", request.region, request.account_id);
         let mut resources = vec![format!("{root}catalog")];
         if let Some(database) = database {
@@ -101,10 +103,10 @@ impl GlueHandler {
                 .authorize(AuthorizationRequest {
                     request_identity: RequestIdentity {
                         account_id: request.account_id.clone(),
-                        access_key_id: Some(key.clone()),
+                        access_key_id: access_key_id.clone(),
                         arn: None,
                     },
-                    delegated_identity: None,
+                    delegated_identity: delegated_identity.clone(),
                     source_service: "glue".into(),
                     action: format!("glue:{operation}"),
                     resource,
@@ -972,6 +974,155 @@ mod tests {
                 "{operation}"
             );
         }
+    }
+
+    #[test]
+    fn strict_glue_checks_internal_identity_and_ancestors_before_mutation() {
+        use locallycloud_core::integration::authorization::{
+            AuthorizationError, AuthorizationEvaluator,
+        };
+        use locallycloud_core::integration::identity::{
+            CallerIdentity, IdentityPropagator, PRINCIPAL_HEADER,
+        };
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Policy {
+            denied: Mutex<Option<String>>,
+            calls: Mutex<Vec<AuthorizationRequest>>,
+        }
+        impl AuthorizationEvaluator for Policy {
+            fn strict_sigv4_required(&self) -> bool {
+                true
+            }
+            fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError> {
+                let permitted = match &request.delegated_identity {
+                    Some(CallerIdentity::AssumedRole { role_arn, .. }) => {
+                        role_arn == "arn:aws:iam::000000000000:role/path/reader"
+                            && request.request_identity.access_key_id.is_none()
+                    }
+                    None => request.request_identity.access_key_id.as_deref() == Some("AKIAREADER"),
+                    _ => false,
+                };
+                let denied = self.denied.lock().unwrap().as_ref() == Some(&request.resource);
+                self.calls.lock().unwrap().push(request);
+                if permitted && !denied {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::Denied)
+                }
+            }
+        }
+        let state = Arc::new(AnalyticsState::new());
+        let admin = GlueHandler::new(state.clone());
+        admin
+            .process(&request(
+                "CreateDatabase",
+                json!({"DatabaseInput":{"Name":"db"}}),
+            ))
+            .unwrap();
+        admin.process(&request("CreateTable", json!({"DatabaseName":"db","TableInput":{"Name":"tab","Parameters":{"metadata_location":"s3://lake/old.json"}}}))).unwrap();
+        let get = || request("GetTable", json!({"DatabaseName":"db","Name":"tab"}));
+        let original = admin.process(&get()).unwrap();
+        let registry = ServiceRegistry::with_known_services();
+        let policy = Arc::new(Policy::default());
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            locallycloud_core::registry::ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(GlueHandler::new(state.clone())),
+            policy.clone(),
+        );
+        let handler = GlueHandler::with_registry(state, Arc::downgrade(&registry));
+        let internal = |mut req: ServiceRequest| {
+            req.headers.insert(
+                "x-locallycloud-verified-internal-scope",
+                HeaderValue::from_static("1"),
+            );
+            req.headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(
+                    "AWS4-HMAC-SHA256 Credential=local/19700101/us-east-1/glue/aws4_request",
+                ),
+            );
+            IdentityPropagator::attach(
+                &mut req.headers,
+                &CallerIdentity::AssumedRole {
+                    role_arn: "arn:aws:iam::000000000000:role/path/reader".into(),
+                    session_name: "test".into(),
+                },
+            );
+            req
+        };
+        assert_eq!(handler.process(&internal(get())).unwrap(), original);
+        let resources = ["catalog", "database/db", "table/db/tab"]
+            .map(|suffix| format!("arn:aws:glue:us-east-1:000000000000:{suffix}"));
+        assert_eq!(
+            policy
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.resource.clone())
+                .collect::<Vec<_>>(),
+            resources
+        );
+        let update = || {
+            internal(request(
+                "UpdateTable",
+                json!({"DatabaseName":"db","TableInput":{"Name":"tab","Parameters":{"metadata_location":"s3://lake/new.json"}}}),
+            ))
+        };
+        for (index, resource) in resources.iter().enumerate() {
+            *policy.denied.lock().unwrap() = Some(resource.clone());
+            policy.calls.lock().unwrap().clear();
+            assert!(matches!(
+                handler.process(&update()),
+                Err(AnalyticsError::AccessDenied)
+            ));
+            assert_eq!(admin.process(&get()).unwrap(), original);
+            let calls = policy.calls.lock().unwrap();
+            assert_eq!(calls.len(), index + 1);
+            assert!(calls
+                .iter()
+                .all(|r| r.action == "glue:UpdateTable" && r.source_service == "glue"));
+        }
+        *policy.denied.lock().unwrap() = None;
+        handler.process(&update()).unwrap();
+        assert_eq!(admin.process(&get()).unwrap()["Table"]["VersionId"], "2");
+        let mut user = internal(get());
+        user.headers.remove(PRINCIPAL_HEADER);
+        user.headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=AKIAREADER/19700101/us-east-1/glue/aws4_request",
+            ),
+        );
+        assert!(handler.process(&user).is_ok());
+        let mut anonymous = internal(get());
+        anonymous.headers.remove(PRINCIPAL_HEADER);
+        assert!(matches!(
+            handler.process(&anonymous),
+            Err(AnalyticsError::AccessDenied)
+        ));
+        let mut forged = internal(get());
+        forged
+            .headers
+            .remove("x-locallycloud-verified-internal-scope");
+        assert!(matches!(
+            handler.process(&forged),
+            Err(AnalyticsError::AccessDenied)
+        ));
+        let mut foreign = internal(get());
+        IdentityPropagator::attach(
+            &mut foreign.headers,
+            &CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::999999999999:role/path/reader".into(),
+                session_name: "test".into(),
+            },
+        );
+        assert!(matches!(
+            handler.process(&foreign),
+            Err(AnalyticsError::AccessDenied)
+        ));
     }
 
     #[test]

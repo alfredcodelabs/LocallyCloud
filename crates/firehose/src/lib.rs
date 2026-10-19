@@ -40,3 +40,9 @@ fn register_handler(registry: &Arc<ServiceRegistry>, handler: FirehoseHandler) {
 
 #[cfg(test)]
 mod ack_loss_test;
+
+#[cfg(test)]
+mod commit_test;
+
+#[cfg(test)]
+mod public_commit_test;

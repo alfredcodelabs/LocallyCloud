@@ -246,6 +246,7 @@ async fn committed_glue_update_with_lost_ack_retries_once_without_duplicate_rows
         account: ACCOUNT,
         region: REGION,
         bucket: BUCKET,
+        role_arn: "arn:aws:iam::000000000000:role/firehose",
     };
     assert!(matches!(
         iceberg::append(context(), &target, token, &records).await,

@@ -47,6 +47,15 @@ async fn firehose(dispatcher: &InternalDispatcher, operation: &str, body: Value)
 
 #[tokio::test]
 async fn worker_restart_replays_committed_batch_without_duplicate_snapshot_or_rows() {
+    worker_restart_case(false).await;
+}
+
+#[tokio::test]
+async fn worker_restart_replays_receipt_after_another_writer_expires_its_snapshot() {
+    worker_restart_case(true).await;
+}
+
+async fn worker_restart_case(expire: bool) {
     // S3/Glue stay live here to isolate Firehose journal recovery; the public CLI
     // gate separately restarts the complete server and restores the Glue catalog.
     let registry = ServiceRegistry::with_known_services();
@@ -86,7 +95,7 @@ async fn worker_restart_replays_committed_batch_without_duplicate_snapshot_or_ro
     )
     .await;
     assert!(status.is_success());
-    let metadata = json!({
+    let mut metadata = json!({
         "format-version":2,"table-uuid":Uuid::new_v4().to_string(),"location":"s3://ack-loss-lake/events",
         "last-sequence-number":0,"last-updated-ms":1,"last-column-id":2,"current-schema-id":0,
         "schemas":[{"type":"struct","schema-id":0,"fields":[
@@ -96,6 +105,9 @@ async fn worker_restart_replays_committed_batch_without_duplicate_snapshot_or_ro
         "default-sort-order-id":0,"sort-orders":[{"order-id":0,"fields":[]}],
         "properties":{},"snapshots":[],"snapshot-log":[],"metadata-log":[],"refs":{}
     });
+    if expire {
+        metadata["properties"] = json!({"locallycloud.firehose.snapshot-retention-enabled":"true", "history.expire.max-snapshot-age-ms":"1", "history.expire.min-snapshots-to-keep":"2"});
+    }
     let (status, _) = call(
         &dispatcher,
         Method::PUT,
@@ -117,6 +129,7 @@ async fn worker_restart_replays_committed_batch_without_duplicate_snapshot_or_ro
     }})).await;
     let role = "arn:aws:iam::000000000000:role/firehose";
     firehose(&dispatcher, "CreateDeliveryStream", json!({"DeliveryStreamName":"journal-stream","IcebergDestinationConfiguration":{
+        "BufferingHints":{"SizeInMBs":1,"IntervalInSeconds":0},
         "CatalogConfiguration":{"CatalogARN":"arn:aws:glue:us-east-1:000000000000:catalog"},
         "RoleARN":role,"S3Configuration":{"BucketARN":"arn:aws:s3:::ack-loss-lake","RoleARN":role},
         "AppendOnly":true,"DestinationTableConfigurationList":[{"DestinationDatabaseName":"lake","DestinationTableName":"events"}]
@@ -151,6 +164,38 @@ async fn worker_restart_replays_committed_batch_without_duplicate_snapshot_or_ro
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
     drop(handle);
+    let committed = if expire {
+        for id in 100..400 {
+            crate::iceberg::append(
+                crate::iceberg::Context {
+                    dispatcher: &dispatcher,
+                    account: "000000000000",
+                    region: "us-east-1",
+                    bucket: "ack-loss-lake",
+                    role_arn: role,
+                },
+                &crate::iceberg::Target {
+                    database: "lake".into(),
+                    table: "events".into(),
+                    bucket: "ack-loss-lake".into(),
+                },
+                Uuid::new_v4(),
+                &[json!({"id":id,"payload":format!("row-{id}")})
+                    .to_string()
+                    .into_bytes()],
+            )
+            .await
+            .unwrap();
+        }
+        json_call(
+            &dispatcher,
+            "GetTable",
+            json!({"DatabaseName":"lake","Name":"events"}),
+        )
+        .await
+    } else {
+        committed
+    };
     let (handler, resumed) =
         FirehoseHandler::with_state(Arc::downgrade(&registry), state.clone()).unwrap();
     crate::register_handler(&registry, handler);
@@ -198,16 +243,77 @@ async fn worker_restart_replays_committed_batch_without_duplicate_snapshot_or_ro
     let (status, body) = call(&dispatcher, Method::GET, path, None, Bytes::new()).await;
     assert!(status.is_success());
     let metadata: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(metadata["snapshots"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        metadata["snapshots"][0]["summary"]["locallycloud.batch-token"],
-        token
-    );
+    if expire {
+        assert_eq!(metadata["last-sequence-number"], 301);
+        assert!(metadata["snapshots"].as_array().unwrap().len() <= 3);
+        assert!(!metadata["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|snapshot| snapshot["summary"]["locallycloud.batch-token"] == token));
+        let index: Value = serde_json::from_str(
+            metadata["properties"]["locallycloud.firehose.replay-index"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let range = index["ranges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|range| {
+                range["lower"].as_str().unwrap() <= token.as_str()
+                    && range["upper"].as_str().unwrap() >= token.as_str()
+            })
+            .unwrap();
+        let (_, bytes) = call(
+            &dispatcher,
+            Method::GET,
+            range["location"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("s3:/")
+                .unwrap(),
+            None,
+            Bytes::new(),
+        )
+        .await;
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(page["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == &token));
+    } else {
+        assert_eq!(metadata["snapshots"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            metadata["snapshots"][0]["summary"]["locallycloud.batch-token"],
+            token
+        );
+    }
     let result = query_results(&dispatcher, "SELECT id, payload FROM lake.events").await;
-    let rows = result["ResultSet"]["Rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1]["Data"][0]["VarCharValue"], "7");
-    assert_eq!(rows[1]["Data"][1]["VarCharValue"], "once");
+    let mut rows = result["ResultSet"]["Rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|row| {
+            (
+                row["Data"][0]["VarCharValue"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap(),
+                row["Data"][1]["VarCharValue"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    let mut expected = vec![(7, "once".to_owned())];
+    if expire {
+        expected.extend((100..400).map(|id| (id, format!("row-{id}"))));
+    }
+    assert_eq!(rows, expected);
     resumed.shutdown().await;
     std::fs::remove_dir_all(root).unwrap();
 }

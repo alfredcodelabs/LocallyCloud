@@ -95,12 +95,12 @@ struct AthenaCaller {
 }
 
 impl AthenaCaller {
-    fn attach(&self, headers: &mut HeaderMap) {
+    fn attach(&self, headers: &mut HeaderMap, service: &str) {
         if let Some(identity) = &self.delegated_identity {
             IdentityPropagator::attach(headers, identity);
         } else if let Some(access_key_id) = &self.request_identity.access_key_id {
             if let Ok(value) = HeaderValue::from_str(&format!(
-                "AWS4-HMAC-SHA256 Credential={access_key_id}/19700101/us-east-1/s3/aws4_request"
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/19700101/us-east-1/{service}/aws4_request"
             )) {
                 headers.insert(http::header::AUTHORIZATION, value);
             }
@@ -2270,8 +2270,8 @@ async fn glue_json_request<T: DeserializeOwned>(
             "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/us-east-1/glue/aws4_request",
         ),
     );
-    if let Some(identity) = caller.and_then(|caller| caller.delegated_identity.as_ref()) {
-        IdentityPropagator::attach(&mut headers, identity);
+    if let Some(caller) = caller {
+        caller.attach(&mut headers, "glue");
     }
     let request_body = serde_json::to_vec(&body)
         .map(Bytes::from)
@@ -2330,7 +2330,7 @@ async fn s3_request(
         ),
     );
     if let Some(caller) = caller {
-        caller.attach(&mut headers);
+        caller.attach(&mut headers, "s3");
     }
     let request_id = Uuid::new_v4().to_string();
     Ok(dispatcher
@@ -2659,7 +2659,7 @@ mod tests {
             .iter()
             .all(|call| call.delegated_identity == caller.delegated_identity));
         let mut headers = HeaderMap::new();
-        caller.attach(&mut headers);
+        caller.attach(&mut headers, "s3");
         assert_eq!(
             headers[locallycloud_core::integration::identity::PRINCIPAL_HEADER],
             "arn:aws:iam::000000000000:role/reader/sfn"
@@ -2698,23 +2698,18 @@ mod tests {
         );
         assert_eq!(caller.delegated_identity, None);
         assert_eq!(evaluator.calls.lock().unwrap()[0].delegated_identity, None);
-        let mut headers = HeaderMap::new();
-        caller.attach(&mut headers);
-        assert_eq!(
-            headers.get(locallycloud_core::integration::identity::PRINCIPAL_HEADER),
-            None
-        );
-        assert_eq!(
-            headers[http::header::AUTHORIZATION]
-                .to_str()
-                .unwrap()
-                .split("Credential=")
-                .nth(1)
-                .unwrap()
-                .split('/')
-                .next(),
-            Some("AKIAREADER")
-        );
+        for service in ["s3", "glue"] {
+            let mut headers = HeaderMap::new();
+            caller.attach(&mut headers, service);
+            assert_eq!(
+                headers.get(locallycloud_core::integration::identity::PRINCIPAL_HEADER),
+                None
+            );
+            assert_eq!(
+                headers[http::header::AUTHORIZATION],
+                format!("AWS4-HMAC-SHA256 Credential=AKIAREADER/19700101/us-east-1/{service}/aws4_request")
+            );
+        }
     }
 
     #[tokio::test]

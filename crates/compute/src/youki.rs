@@ -815,10 +815,25 @@ impl ComputeRuntime for YoukiRuntime {
             .oci_command(&["kill", "--all", task_id, "KILL"])
             .await?;
         if !killed.status.success() {
-            return Err(exec_failed(format!(
-                "stopping OCI task: {}",
-                String::from_utf8_lossy(&killed.stderr).trim()
-            )));
+            let stderr = String::from_utf8_lossy(&killed.stderr);
+            let error = exec_failed(format!("stopping OCI task: {}", stderr.trim()));
+            if !oci_state_missing(&stderr, task_id) {
+                return Err(error);
+            }
+            // `run` can exit and remove OCI state after the initial Running snapshot.
+            // Only the owned monitor and drained readers establish the terminal outcome.
+            wait_finished(&slot).await?;
+            let state = slot.lock().await.state;
+            return match state {
+                TaskState::Completed => Err(RuntimeError::TaskAlreadyCompleted {
+                    task_id: task_id.into(),
+                }),
+                TaskState::Stopped | TaskState::Failed => Ok(TaskHandle {
+                    task_id: task_id.into(),
+                    state,
+                }),
+                TaskState::Running => Err(error),
+            };
         }
         let mut record = slot.lock().await;
         if record.state == TaskState::Running {
@@ -986,7 +1001,19 @@ async fn stream_output(mut pipe: impl AsyncRead + Unpin, slot: Slot) {
 }
 
 fn oci_state_missing(stderr: &str, task_id: &str) -> bool {
-    if stderr.contains("does not exist") || stderr.contains("not found") {
+    let message = stderr.trim();
+    if [
+        format!("container {task_id} does not exist"),
+        format!("container `{task_id}` does not exist"),
+        format!("container {task_id} not found"),
+        format!("container `{task_id}` not found"),
+    ]
+    .iter()
+    .any(|prefix| {
+        message
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(':'))
+    }) {
         return true;
     }
     // crun reports an absent container as ENOENT for its own status file.
@@ -1101,7 +1128,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("compute-release-{}", std::process::id()));
         crate::private_dir::ensure(&root).unwrap();
         let binary = root.join("runtime");
-        std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in state) echo 'does not exist' >&2; exit 1;; list) exit 0;; esac\n").unwrap();
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in state) echo \"container $2 does not exist\" >&2; exit 1;; list) exit 0;; esac\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let rt = YoukiRuntime::new(binary);
         for n in 0..32 {
@@ -1192,6 +1219,10 @@ esac
             "owned"
         ));
         for error in [
+            "OCI configuration not found",
+            "container another does not exist",
+            "container owned-copy not found",
+            "container owned does not existx",
             "No such file or directory",
             "error opening file `/usr/bin/crun': No such file or directory",
             "error opening file `/run/user/1000/crun/another/status': No such file or directory",
@@ -1260,6 +1291,119 @@ esac
                 .unwrap());
             assert_eq!(tokio::fs::try_exists(&bundle).await.unwrap(), !released);
             assert_eq!(runtime.tasks.contains_key("owned"), !released);
+        }
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_reconciles_disappearing_container_with_owned_completion() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/compute-stop-tests")
+            .join(format!(
+                "stop-race-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let missing = "container `owned` does not exist: open `/run/user/1000/crun/owned/status`: No such file or directory";
+        for (index, error, state, finished) in [
+            (0, missing, TaskState::Completed, true),
+            (1, missing, TaskState::Failed, true),
+            (2, missing, TaskState::Stopped, true),
+            (3, "permission denied", TaskState::Completed, true),
+            (4, missing, TaskState::Running, false),
+            (5, missing, TaskState::Completed, false),
+            (
+                6,
+                "error opening file `/usr/bin/crun': No such file or directory",
+                TaskState::Completed,
+                true,
+            ),
+            (7, "OCI configuration not found", TaskState::Completed, true),
+        ] {
+            let binary = root.join(format!("runtime-{index}"));
+            let bundle = root.join(format!("bundle-{index}"));
+            tokio::fs::create_dir(&bundle).await.unwrap();
+            tokio::fs::write(binary.with_extension("stderr"), error)
+                .await
+                .unwrap();
+            tokio::fs::write(
+                &binary,
+                r#"#!/bin/sh
+[ "$1" = kill ] || exit 99
+: > "$0.entered"
+while [ ! -f "$0.release" ]; do sleep 0.01; done
+cat "$0.stderr" >&2
+exit 1
+"#,
+            )
+            .await
+            .unwrap();
+            tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let runtime = Arc::new(YoukiRuntime::new(&binary));
+            let slot = slot_with(TaskState::Running);
+            slot.lock().await.bundle = bundle.clone();
+            runtime.tasks.insert("owned".into(), slot.clone());
+            let runner = runtime.clone();
+            let stop = tokio::spawn(async move { runner.stop_task("owned").await });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !tokio::fs::try_exists(binary.with_extension("entered"))
+                    .await
+                    .unwrap()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // The kill command is in flight: the original Running observation is stale.
+            {
+                let mut record = slot.lock().await;
+                record.state = state;
+                record.finished = finished;
+            }
+            tokio::fs::write(binary.with_extension("release"), [])
+                .await
+                .unwrap();
+            if index == 5 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(
+                    !stop.is_finished(),
+                    "completion must wait for owned output readers"
+                );
+                slot.lock().await.finished = true;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(7), stop)
+                .await
+                .unwrap()
+                .unwrap();
+            match index {
+                0 | 5 => assert!(matches!(
+                    result,
+                    Err(RuntimeError::TaskAlreadyCompleted { .. })
+                )),
+                1 | 2 => assert_eq!(result.unwrap().state, state),
+                3 | 6 | 7 => assert!(
+                    matches!(result, Err(RuntimeError::ExecutionFailed { reason }) if reason.contains(error))
+                ),
+                4 => assert!(
+                    matches!(result, Err(RuntimeError::ExecutionFailed { reason }) if reason.contains("output drain timed out"))
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(slot.lock().await.state, state);
+            assert_eq!(runtime.get_output("owned").await.unwrap(), "out");
+            assert!(runtime.tasks.contains_key("owned"));
+            assert!(tokio::fs::try_exists(bundle).await.unwrap());
         }
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

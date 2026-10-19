@@ -84,6 +84,22 @@ impl LocallyCloudServer {
 
     /// Resume restored producers after the internal dispatcher is available.
     pub async fn run_with_startup(self, startup: impl FnOnce() + Send) -> Result<(), ServerError> {
+        let addr = self.config.listen_addr;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|source| ServerError::Bind { addr, source })?;
+        self.run_on_listener(listener, shutdown_signal(), startup)
+            .await
+    }
+
+    /// Serve the normal front door on an owned listener with an explicit shutdown.
+    /// The caller controls binding; port-zero fixtures can retain socket ownership.
+    pub async fn run_on_listener(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+        startup: impl FnOnce() + Send,
+    ) -> Result<(), ServerError> {
         let tls_resolver: Option<Arc<dyn crate::tls::TlsIdentityResolver>> = match &self.config.tls
         {
             Some(config) => Some(Arc::new(
@@ -93,10 +109,10 @@ impl LocallyCloudServer {
             )),
             None => self.tls_resolver,
         };
-        let addr = self.config.listen_addr;
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|source| ServerError::Bind { addr, source })?;
+        let addr = listener.local_addr().map_err(|source| ServerError::Bind {
+            addr: self.config.listen_addr,
+            source,
+        })?;
 
         // Registry is initialized by construction; report readiness (Req 2.7).
         self.readiness.mark_ready();
@@ -171,7 +187,7 @@ impl LocallyCloudServer {
             app.into_make_service_with_connect_info::<crate::tls::ConnectionInfo>(),
         )
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            shutdown.await;
             let _ = signal_tx.send(());
         });
         let serve_task = tokio::spawn(async move { serve.await });

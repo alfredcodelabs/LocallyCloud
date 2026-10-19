@@ -12,7 +12,7 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::{
-    AuthorizationRequest, ServiceRoleAuthorizationRequest,
+    AuthorizationError, AuthorizationRequest, ServiceRoleAuthorizationRequest,
 };
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{AwsProtocol, ServiceName, ServiceRegistry};
@@ -27,7 +27,13 @@ use uuid::Uuid;
 use crate::iceberg;
 use crate::TARGET_PREFIX;
 
+mod failure;
 mod persistence;
+mod timing;
+
+use failure::{DeliveryPhase, ErrorBackup, FailureCode, LoggingOptions};
+
+use timing::{IcebergDeliveryPolicy, StartedAt};
 
 #[cfg(test)]
 mod recovery_tests;
@@ -93,6 +99,12 @@ struct DestinationConfig {
     bucket: String,
     prefix: String,
     iceberg: Option<iceberg::Target>,
+    #[serde(default)]
+    iceberg_delivery: Option<IcebergDeliveryPolicy>,
+    #[serde(default)]
+    error_backup: Option<ErrorBackup>,
+    #[serde(default)]
+    logging: Option<LoggingOptions>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -129,7 +141,13 @@ struct DeliveryStream {
     in_flight: Option<InFlight>,
     delivery_attempts: u8,
     retry_at: Option<Instant>,
+    pending_since: Option<StartedAt>,
+    retry_started: Option<StartedAt>,
     terminal_failure: bool,
+    phase: DeliveryPhase,
+    backup_attempts: u8,
+    backed_up_records: u64,
+    primary_failure: FailureCode,
 }
 
 #[derive(Clone)]
@@ -140,6 +158,8 @@ struct InFlight {
 }
 
 struct Batch {
+    phase: DeliveryPhase,
+    primary_failure: FailureCode,
     key: StreamKey,
     generation: Uuid,
     token: Uuid,
@@ -414,14 +434,20 @@ impl FirehoseHandler {
                     account: &scope.account_id,
                     region: &scope.region,
                     bucket: &target.bucket,
+                    role_arn: &destination.role_arn,
                 },
                 target,
             )
             .await
             .map_err(|error| match error {
-                iceberg::Error::Unsupported => FirehoseError::InvalidArgument(
-                    "Iceberg table metadata is unsupported or unavailable".into(),
-                ),
+                iceberg::Error::Unsupported | iceberg::Error::NoSuchTable => {
+                    FirehoseError::InvalidArgument(
+                        "Iceberg table metadata is unsupported or unavailable".into(),
+                    )
+                }
+                iceberg::Error::GlueAccessDenied | iceberg::Error::S3AccessDenied => {
+                    FirehoseError::AccessDenied
+                }
                 iceberg::Error::Transient => FirehoseError::ServiceUnavailable(
                     "Iceberg table metadata could not be read".into(),
                 ),
@@ -447,7 +473,13 @@ impl FirehoseHandler {
             in_flight: None,
             delivery_attempts: 0,
             retry_at: None,
+            pending_since: None,
+            retry_started: None,
             terminal_failure: false,
+            phase: DeliveryPhase::Primary,
+            backup_attempts: 0,
+            backed_up_records: 0,
+            primary_failure: FailureCode::InternalError,
         };
         self.inner.persist_create(&key, &stream)?;
         streams.insert(key, stream);
@@ -559,7 +591,8 @@ impl FirehoseHandler {
             access_key_id: Some(access_key_id),
             arn: None,
         };
-        authorize_roles(&registry, scope, &caller, source, destination, true)?;
+        authorize_roles(&registry, scope, &caller, source, destination, true)
+            .map_err(|_| FirehoseError::AccessDenied)?;
         Ok(Some(caller))
     }
 
@@ -603,6 +636,8 @@ impl FirehoseHandler {
                 "IcebergDestinationDescription": {
                     "CatalogConfiguration": {"CatalogARN": format!("arn:aws:glue:{}:{}:catalog", scope.region, scope.account_id)},
                     "RoleARN": stream.destination.role_arn,
+                    "BufferingHints": {"SizeInMBs": stream.iceberg_policy().unwrap_or_default().size_mib, "IntervalInSeconds": stream.iceberg_policy().unwrap_or_default().interval_seconds},
+                    "RetryOptions": {"DurationInSeconds": stream.iceberg_policy().unwrap_or_default().retry_seconds},
                     "S3DestinationDescription": {
                         "RoleARN": stream.destination.s3_role_arn,
                         "BucketARN": stream.destination.bucket_arn,
@@ -613,6 +648,30 @@ impl FirehoseHandler {
                         "DestinationTableName": target.table,
                     }],
                 },
+            });
+        }
+        if stream.destination.iceberg.is_some() {
+            let destination = &mut description["DeliveryStreamDescription"]["Destinations"][0]
+                ["IcebergDestinationDescription"];
+            if let Some(backup) = &stream.destination.error_backup {
+                destination["S3BackupMode"] = json!("FailedDataOnly");
+                if let Some(prefix) = &backup.table_prefix {
+                    destination["DestinationTableConfigurationList"][0]["S3ErrorOutputPrefix"] =
+                        json!(prefix);
+                }
+                if let Some(prefix) = &backup.global_prefix {
+                    destination["S3DestinationDescription"]["ErrorOutputPrefix"] = json!(prefix);
+                }
+                if let Some(options) = &backup.logging {
+                    destination["S3DestinationDescription"]["CloudWatchLoggingOptions"] =
+                        json!(options);
+                }
+            }
+            if let Some(options) = &stream.destination.logging {
+                destination["CloudWatchLoggingOptions"] = json!(options);
+            }
+            description["DeliveryStreamDescription"]["LocallyCloudBackup"] = json!({
+                "Phase": stream.phase, "Attempts": stream.backup_attempts, "BackedUpRecordCount": stream.backed_up_records
             });
         }
         if let Some(source) = &stream.source {
@@ -690,9 +749,7 @@ impl FirehoseHandler {
             ));
         }
         self.inner.ensure_worker()?;
-        self.inner
-            .persist_append(&key, stream, std::slice::from_ref(&data))?;
-        stream.pending.push_back(data);
+        self.inner.append_pending(&key, stream, vec![data])?;
         drop(streams);
         self.inner.notify.notify_one();
         Ok(Success::Json(json!({
@@ -779,8 +836,7 @@ impl FirehoseHandler {
             accepted_data.push(data);
             accepted = true;
         }
-        self.inner.persist_append(&key, stream, &accepted_data)?;
-        stream.pending.extend(accepted_data);
+        self.inner.append_pending(&key, stream, accepted_data)?;
         drop(streams);
         if accepted {
             self.inner.notify.notify_one();
@@ -849,6 +905,8 @@ impl FirehoseHandler {
         let mut updated = stream.clone();
         updated.terminal_failure = false;
         updated.delivery_attempts = 0;
+        updated.backup_attempts = 0;
+        updated.retry_started = None;
         updated.retry_at = None;
         // Keep retry_token and retained bytes: Iceberg checks the same token after a lost ACK.
         self.inner.persist_create(&key, &updated)?;
@@ -866,11 +924,11 @@ fn authorize_roles(
     source: Option<&KinesisSource>,
     destination: &DestinationConfig,
     assignment: bool,
-) -> Result<(), FirehoseError> {
+) -> Result<(), FailureCode> {
     let evaluator = registry
         .authorization_evaluator(&ServiceName::new("iam"))
-        .ok_or(FirehoseError::AccessDenied)?;
-    let authorize = |role_arn: &str, action: &str, resource: &str| {
+        .ok_or(FailureCode::InternalError)?;
+    let authorize = |role_arn: &str, action: &str, resource: &str, denied: FailureCode| {
         let request = ServiceRoleAuthorizationRequest {
             source_arn: None,
             caller: caller.clone(),
@@ -884,7 +942,7 @@ fn authorize_roles(
         } else {
             evaluator.authorize_service_role_execution(request)
         }
-        .map_err(|_| FirehoseError::AccessDenied)
+        .map_err(|error| failure::role_failure(error, denied))
     };
     if let Some(source) = source {
         for action in [
@@ -893,20 +951,48 @@ fn authorize_roles(
             "kinesis:GetShardIterator",
             "kinesis:GetRecords",
         ] {
-            authorize(&source.role_arn, action, &source.arn)?;
+            authorize(
+                &source.role_arn,
+                action,
+                &source.arn,
+                FailureCode::InternalError,
+            )?;
         }
     }
     let objects = format!("{}/*", destination.bucket_arn);
-    authorize(&destination.s3_role_arn, "s3:PutObject", &objects)?;
+    if assignment && destination.error_backup.is_some() {
+        authorize(
+            &destination.s3_role_arn,
+            "s3:PutObject",
+            &objects,
+            FailureCode::S3AccessDenied,
+        )?;
+    }
+    authorize(
+        &destination.role_arn,
+        "s3:PutObject",
+        &objects,
+        FailureCode::S3AccessDenied,
+    )?;
     if let Some(target) = &destination.iceberg {
         let table = format!(
             "arn:aws:glue:{}:{}:table/{}/{}",
             scope.region, scope.account_id, target.database, target.table
         );
         for action in ["glue:GetTable", "glue:UpdateTable"] {
-            authorize(&destination.role_arn, action, &table)?;
+            authorize(
+                &destination.role_arn,
+                action,
+                &table,
+                FailureCode::GlueAccessDenied,
+            )?;
         }
-        authorize(&destination.s3_role_arn, "s3:GetObject", &objects)?;
+        authorize(
+            &destination.role_arn,
+            "s3:GetObject",
+            &objects,
+            FailureCode::S3AccessDenied,
+        )?;
     }
     Ok(())
 }
@@ -1010,90 +1096,107 @@ impl Inner {
                 return;
             }
             self.poll_sources().await;
-            self.coalesce().await;
             loop {
                 if self.shutting_down.load(Ordering::Acquire) {
                     return;
                 }
-                let batches = self.take_batches();
+                let inner = self.clone();
+                let Ok(batches) = tokio::task::spawn_blocking(move || inner.take_batches()).await
+                else {
+                    tracing::error!("Firehose queue claim task failed");
+                    return;
+                };
                 if batches.is_empty() {
                     break;
                 }
                 for batch in batches {
-                    if let Some(caller) = &batch.role_caller {
-                        let authorized = self.registry.upgrade().is_some_and(|registry| {
-                            authorize_roles(
-                                &registry,
-                                &batch.key.scope,
-                                caller,
-                                None,
-                                &batch.destination,
-                                false,
-                            )
-                            .is_ok()
-                        });
-                        if !authorized {
-                            self.defer_unauthorized_batch(batch);
-                            continue;
+                    let authorization = match &batch.role_caller {
+                        None => Ok(()),
+                        Some(caller) if batch.phase == DeliveryPhase::Backup => {
+                            self.authorize_backup(&batch, caller)
                         }
+                        Some(caller) => self
+                            .registry
+                            .upgrade()
+                            .ok_or(FailureCode::InternalError)
+                            .and_then(|registry| {
+                                authorize_roles(
+                                    &registry,
+                                    &batch.key.scope,
+                                    caller,
+                                    None,
+                                    &batch.destination,
+                                    false,
+                                )
+                            }),
+                    };
+                    if authorization.is_err() && batch.destination.iceberg.is_none() {
+                        self.defer_unauthorized_batch(batch);
+                        continue;
                     }
-                    let delivered = self.deliver_batch(&batch).await;
-                    self.complete_batch(batch, delivered);
+                    let outcome = match authorization {
+                        Err(failure) => Err(failure),
+                        Ok(()) => match batch.phase {
+                            DeliveryPhase::Primary => self.deliver_batch(&batch).await,
+                            DeliveryPhase::Backup => self.deliver_error_backup(&batch).await,
+                        },
+                    };
+                    let observed_at = Instant::now();
+                    if let Err(failure) = outcome {
+                        self.log_delivery_error(&batch, failure).await;
+                    }
+                    let inner = self.clone();
+                    if tokio::task::spawn_blocking(move || {
+                        inner.complete_delivery_at(batch, outcome, observed_at)
+                    })
+                    .await
+                    .is_err()
+                    {
+                        tracing::error!(
+                            "Firehose completion task failed; journal retains ownership"
+                        );
+                        return;
+                    }
                 }
             }
         }
-    }
-
-    async fn coalesce(&self) {
-        let deadline = Instant::now() + LOCAL_COALESCE_DELAY;
-        while !self.shutting_down.load(Ordering::Acquire) && !self.batch_ready() {
-            tokio::select! {
-                _ = self.notify.notified() => {},
-                _ = tokio::time::sleep_until(deadline.into()) => break,
-            }
-        }
-    }
-
-    fn batch_ready(&self) -> bool {
-        self.streams.lock().is_ok_and(|streams| {
-            streams.values().any(|stream| {
-                if stream.terminal_failure || stream.in_flight.is_some() {
-                    return false;
-                }
-                if !stream.retained.is_empty() {
-                    return stream.retry_at.is_none_or(|due| due <= Instant::now());
-                }
-                !stream.pending.is_empty()
-                    && (stream.source.is_some()
-                        || stream.pending.len() >= MAX_BUFFERED_RECORDS
-                        || stream.pending.iter().map(Vec::len).sum::<usize>()
-                            >= COALESCE_SIZE_BYTES)
-            })
-        })
     }
 
     fn next_retry_delay(&self) -> Option<Duration> {
         let streams = self.streams.lock().ok()?;
-        let retry = streams
+        let now = Instant::now();
+        let due = streams
             .values()
-            .filter(|stream| {
-                !stream.terminal_failure
-                    && (!stream.retained.is_empty() || !stream.pending.is_empty())
-            })
-            .filter_map(|stream| stream.retry_at)
-            .map(|due| due.saturating_duration_since(Instant::now()))
+            .filter_map(|stream| stream.delivery_delay(now))
             .min();
         if streams.values().any(|stream| {
             stream.source.as_ref().is_some_and(|source| !source.stopped) && !stream.terminal_failure
         }) {
             Some(
-                retry
-                    .unwrap_or(SOURCE_POLL_INTERVAL)
+                due.unwrap_or(SOURCE_POLL_INTERVAL)
                     .min(SOURCE_POLL_INTERVAL),
             )
         } else {
-            retry
+            due
         }
+    }
+
+    fn append_pending(
+        &self,
+        key: &StreamKey,
+        stream: &mut DeliveryStream,
+        records: Vec<Vec<u8>>,
+    ) -> Result<(), FirehoseError> {
+        let previous = stream.pending_since;
+        if stream.pending.is_empty() && !records.is_empty() {
+            stream.pending_since = Some(StartedAt::now()?);
+        }
+        if let Err(error) = self.persist_append(key, stream, &records) {
+            stream.pending_since = previous;
+            return Err(error);
+        }
+        stream.pending.extend(records);
+        Ok(())
     }
 
     async fn poll_sources(&self) {
@@ -1229,12 +1332,11 @@ impl Inner {
                 .into_iter()
                 .map(|(_, _, data)| data)
                 .collect::<Vec<_>>();
-            if let Err(error) = self.persist_append(&key, stream, &data) {
+            if let Err(error) = self.append_pending(&key, stream, data) {
                 *stream = previous;
                 tracing::error!(stream = %key.name, ?error, "Firehose source records could not be committed");
                 continue;
             }
-            stream.pending.extend(data);
         }
     }
 
@@ -1370,6 +1472,10 @@ impl Inner {
     }
 
     fn take_batches(&self) -> Vec<Batch> {
+        self.take_batches_at(Instant::now())
+    }
+
+    fn take_batches_at(&self, now: Instant) -> Vec<Batch> {
         let Ok(mut streams) = self.streams.lock() else {
             tracing::error!("Firehose stream store lock is poisoned");
             return Vec::new();
@@ -1377,13 +1483,20 @@ impl Inner {
         streams
             .iter_mut()
             .filter_map(|(key, stream)| {
-                if stream.in_flight.is_some() || stream.terminal_failure
-                    || stream.retry_at.is_some_and(|due| due > Instant::now())
-                {
+                if stream.delivery_delay(now).is_none_or(|delay| !delay.is_zero()) {
+                    return None;
+                }
+                if stream.phase == DeliveryPhase::Primary && !stream.retained.is_empty() && stream.retry_expired(now) {
+                    let mut updated = stream.clone();
+                    updated.exhaust_primary();
+                    match self.persist_create(key, &updated) {
+                        Ok(()) => *stream = updated,
+                        Err(_) => stream.retry_at = Some(now + SOURCE_POLL_INTERVAL),
+                    }
                     return None;
                 }
                 let queue = if !stream.retained.is_empty() {
-                    if stream.retry_at.is_some_and(|due| due > Instant::now()) {
+                    if stream.retry_at.is_some_and(|due| due > now) {
                         return None;
                     }
                     "retained"
@@ -1394,7 +1507,12 @@ impl Inner {
                 };
                 let count = if queue == "retained" { stream.retained.len() } else { stream.pending.len() };
                 let token = stream.retry_token.unwrap_or_else(Uuid::new_v4);
-                if let Err(error) = self.persist_take(key, queue, count, token) {
+                let previous_pending = stream.pending_since;
+                if queue == "pending" {
+                    stream.pending_since = None;
+                }
+                if let Err(error) = self.persist_take(key, queue, count, token, stream) {
+                    stream.pending_since = previous_pending;
                     stream.retry_at = Some(Instant::now() + SOURCE_POLL_INTERVAL);
                     tracing::error!(stream = %key.name, ?error, "Firehose batch could not be journaled");
                     return None;
@@ -1412,6 +1530,8 @@ impl Inner {
                     bytes: records.iter().map(Vec::len).sum(),
                 });
                 Some(Batch {
+                    phase: stream.phase,
+                    primary_failure: stream.primary_failure,
                     key: key.clone(),
                     generation: stream.generation,
                     token,
@@ -1459,14 +1579,14 @@ impl Inner {
         tracing::warn!(stream = %batch.key.name, "Firehose delivery role authorization denied; batch retained");
     }
 
-    async fn deliver_batch(&self, batch: &Batch) -> bool {
+    async fn deliver_batch(&self, batch: &Batch) -> Result<(), FailureCode> {
         let Some(registry) = self.registry.upgrade() else {
             tracing::warn!(stream = %batch.key.name, "Firehose registry is unavailable");
-            return false;
+            return Err(FailureCode::InternalError);
         };
         let Some(dispatcher) = registry.internal_dispatcher() else {
             tracing::warn!(stream = %batch.key.name, "Firehose internal dispatcher is unavailable");
-            return false;
+            return Err(FailureCode::InternalError);
         };
         if let Some(target) = &batch.destination.iceberg {
             return iceberg::append(
@@ -1475,26 +1595,38 @@ impl Inner {
                     account: &batch.key.scope.account_id,
                     region: &batch.key.scope.region,
                     bucket: &target.bucket,
+                    role_arn: &batch.destination.role_arn,
                 },
                 target,
                 batch.token,
                 &batch.records,
             )
             .await
-            .is_ok();
+            .map_err(FailureCode::from);
         }
         let key = object_key(&batch.destination.prefix, &batch.key.name, batch.token);
+        let body = Bytes::from(batch.records.iter().flatten().copied().collect::<Vec<_>>());
+        self.put_s3(batch, &key, body).await
+    }
+
+    async fn put_s3(&self, batch: &Batch, key: &str, body: Bytes) -> Result<(), FailureCode> {
+        let Some(registry) = self.registry.upgrade() else {
+            return Err(FailureCode::InternalError);
+        };
+        let Some(dispatcher) = registry.internal_dispatcher() else {
+            return Err(FailureCode::InternalError);
+        };
         let uri: Uri = match format!(
             "/{}/{}",
             percent_encode(&batch.destination.bucket, false),
-            percent_encode(&key, true)
+            percent_encode(key, true)
         )
         .parse()
         {
             Ok(uri) => uri,
             Err(error) => {
                 tracing::warn!(stream = %batch.key.name, %error, "Firehose S3 URI is invalid");
-                return false;
+                return Err(FailureCode::InternalError);
             }
         };
         let mut headers = HeaderMap::new();
@@ -1502,18 +1634,20 @@ impl Inner {
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         );
-        headers.insert(
-            http::header::AUTHORIZATION,
-            HeaderValue::from_static(
-                "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/us-east-1/s3/aws4_request",
-            ),
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/{}/s3/aws4_request",
+            batch.key.scope.region
         );
-        let body = Bytes::from(
-            batch
-                .records
-                .iter()
-                .flat_map(|record| record.iter().copied())
-                .collect::<Vec<_>>(),
+        let Ok(authorization) = HeaderValue::from_str(&authorization) else {
+            return Err(FailureCode::InternalError);
+        };
+        headers.insert(http::header::AUTHORIZATION, authorization);
+        locallycloud_core::integration::identity::IdentityPropagator::attach(
+            &mut headers,
+            &locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                role_arn: batch.destination.s3_role_arn.clone(),
+                session_name: batch.token.to_string(),
+            },
         );
         let request_id = Uuid::new_v4().to_string();
         let response = tokio::time::timeout(
@@ -1531,13 +1665,28 @@ impl Inner {
         .await;
         let Ok(response) = response else {
             tracing::warn!(stream = %batch.key.name, "Firehose S3 PutObject timed out");
-            return false;
+            return Err(FailureCode::InternalError);
         };
         let has_etag = response
             .headers()
             .get("etag")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| !value.is_empty());
+        if response.status() == http::StatusCode::FORBIDDEN {
+            let status = response.status();
+            let body = tokio::time::timeout(
+                S3_DISPATCH_TIMEOUT,
+                axum::body::to_bytes(response.into_body(), iceberg::MAX_S3_ERROR_BODY),
+            )
+            .await
+            .map_err(|_| FailureCode::InternalError)?
+            .map_err(|_| FailureCode::InternalError)?;
+            return Err(if iceberg::s3_access_denied(status, &body) {
+                FailureCode::S3AccessDenied
+            } else {
+                FailureCode::InternalError
+            });
+        }
         if !response.status().is_success() || !has_etag {
             tracing::warn!(
                 stream = %batch.key.name,
@@ -1545,12 +1694,27 @@ impl Inner {
                 has_etag,
                 "Firehose S3 PutObject was not acknowledged"
             );
-            return false;
+            return Err(FailureCode::InternalError);
         }
-        true
+        Ok(())
     }
 
+    #[cfg(test)]
     fn complete_batch(&self, batch: Batch, delivered: bool) {
+        self.complete_batch_at(batch, delivered, Instant::now());
+    }
+
+    #[cfg(test)]
+    fn complete_batch_at(&self, batch: Batch, delivered: bool, now: Instant) {
+        self.complete_delivery_at(
+            batch,
+            delivered.then_some(()).ok_or(FailureCode::InternalError),
+            now,
+        );
+    }
+
+    fn complete_delivery_at(&self, batch: Batch, result: Result<(), FailureCode>, now: Instant) {
+        let delivered = result.is_ok();
         let Ok(mut streams) = self.streams.lock() else {
             tracing::error!("Firehose stream store lock is poisoned after delivery");
             return;
@@ -1566,7 +1730,11 @@ impl Inner {
         let mut updated = stream.clone();
         updated.in_flight = None;
         if delivered {
-            if let Some(source) = updated.source.as_mut() {
+            if let Some(source) = updated
+                .source
+                .as_mut()
+                .filter(|_| batch.phase == DeliveryPhase::Primary)
+            {
                 if let Some(sequence) = source.fetched.take() {
                     source
                         .checkpoints
@@ -1574,25 +1742,61 @@ impl Inner {
                 }
                 source.checkpoints.append(&mut source.fetched_shards);
             }
+            if batch.phase == DeliveryPhase::Backup {
+                updated.backed_up_records = updated
+                    .backed_up_records
+                    .saturating_add(batch.records.len() as u64);
+            }
+            updated.phase = DeliveryPhase::Primary;
+            updated.primary_failure = FailureCode::InternalError;
+            updated.backup_attempts = 0;
             updated.delivery_attempts = 0;
+            updated.retry_started = None;
             updated.retry_at = None;
         } else {
             updated.retry_token = Some(batch.token);
             updated.retained.extend(batch.records.iter().cloned());
-            updated.delivery_attempts = updated.delivery_attempts.saturating_add(1);
-            if updated.delivery_attempts >= MAX_DELIVERY_ATTEMPTS {
-                updated.terminal_failure = true;
-                updated.retry_at = None;
-                tracing::error!(
-                    stream = %batch.key.name,
-                    attempts = updated.delivery_attempts,
-                    retained_records = updated.retained.len(),
-                    "Firehose delivery exhausted; records retained in the local queue"
-                );
-            } else {
-                let seconds = 1_u64 << (updated.delivery_attempts - 1);
-                updated.retry_at =
-                    Some(Instant::now() + Duration::from_secs(seconds).min(MAX_RETRY_DELAY));
+            match batch.phase {
+                DeliveryPhase::Backup => {
+                    updated.backup_attempts = updated.backup_attempts.saturating_add(1);
+                    updated.terminal_failure = updated.backup_attempts >= MAX_DELIVERY_ATTEMPTS;
+                    updated.retry_at = if updated.terminal_failure {
+                        None
+                    } else {
+                        Some(now + failure::backoff(updated.backup_attempts))
+                    };
+                }
+                DeliveryPhase::Primary => {
+                    updated.primary_failure = result.err().unwrap_or_default();
+                    updated.delivery_attempts = updated.delivery_attempts.saturating_add(1);
+                    if updated.iceberg_policy().is_some() && updated.retry_started.is_none() {
+                        match StartedAt::at(now) {
+                            Ok(started) => updated.retry_started = Some(started),
+                            Err(_) => {
+                                updated.terminal_failure = true;
+                                tracing::error!(stream = %batch.key.name, "Firehose retry clock unavailable; records retained");
+                            }
+                        }
+                    }
+                    if updated.terminal_failure
+                        || updated.retry_expired(now)
+                        || (updated.iceberg_policy().is_none()
+                            && updated.delivery_attempts >= MAX_DELIVERY_ATTEMPTS)
+                    {
+                        updated.exhaust_primary();
+                        tracing::error!(
+                            stream = %batch.key.name,
+                            attempts = updated.delivery_attempts,
+                            retained_records = updated.retained.len(),
+                            "Firehose delivery exhausted; records retained in the local queue"
+                        );
+                    } else {
+                        let seconds = 1_u64 << updated.delivery_attempts.saturating_sub(1).min(5);
+                        let delay = Duration::from_secs(seconds).min(MAX_RETRY_DELAY);
+                        let remaining = updated.retry_remaining(now).unwrap_or(delay);
+                        updated.retry_at = Some(now + delay.min(remaining));
+                    }
+                }
             }
         }
         if let Err(error) = self.persist_complete(
@@ -1736,6 +1940,18 @@ struct IcebergDestinationConfiguration {
     destination_table_configuration_list: Vec<DestinationTableConfiguration>,
     #[serde(default)]
     buffering_hints: Option<BufferingHints>,
+    #[serde(default)]
+    retry_options: Option<RetryOptions>,
+    #[serde(default)]
+    s3_backup_mode: Option<String>,
+    #[serde(default)]
+    cloud_watch_logging_options: Option<LoggingOptions>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct RetryOptions {
+    duration_in_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1754,6 +1970,12 @@ struct IcebergS3Configuration {
     bucket_arn: String,
     #[serde(default)]
     prefix: String,
+    #[serde(default)]
+    error_output_prefix: Option<String>,
+    #[serde(default)]
+    cloud_watch_logging_options: Option<LoggingOptions>,
+    #[serde(default)]
+    compression_format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1866,6 +2088,9 @@ impl DestinationConfig {
             bucket,
             prefix,
             iceberg: None,
+            iceberg_delivery: None,
+            error_backup: None,
+            logging: None,
         })
     }
 }
@@ -1877,13 +2102,10 @@ fn validate_iceberg_configuration(
     if !config.append_only {
         return Err(unsupported("AppendOnly must be true for Iceberg delivery"));
     }
-    if let Some(hints) = &config.buffering_hints {
-        if hints.size_in_m_bs != Some(1) || hints.interval_in_seconds != Some(60) {
-            return Err(unsupported(
-                "Iceberg BufferingHints must be SizeInMBs=1 and IntervalInSeconds=60",
-            ));
-        }
-    }
+    let policy = IcebergDeliveryPolicy::parse(
+        config.buffering_hints.as_ref(),
+        config.retry_options.as_ref(),
+    )?;
     if config.destination_table_configuration_list.len() != 1 {
         return Err(unsupported(
             "Exactly one DestinationTableConfiguration is required",
@@ -1896,13 +2118,19 @@ fn validate_iceberg_configuration(
         .expect("single table validated");
     validate_iceberg_name(&table.destination_database_name, "DestinationDatabaseName")?;
     validate_iceberg_name(&table.destination_table_name, "DestinationTableName")?;
-    if !table.unique_keys.is_empty()
-        || table.s3_error_output_prefix.is_some()
-        || table.partition_spec.is_some()
-    {
+    if !table.unique_keys.is_empty() || table.partition_spec.is_some() {
         return Err(unsupported(
-            "Iceberg update keys, partition spec, and table error output are not supported",
+            "Iceberg update keys and partition spec are not supported",
         ));
+    }
+    let error_backup = failure::backup_configuration(
+        config.s3_backup_mode.as_deref(),
+        table.s3_error_output_prefix.as_deref(),
+        &config.s3_configuration,
+    )?;
+    let logging = config.cloud_watch_logging_options;
+    if let Some(options) = &logging {
+        options.validate()?;
     }
     let expected_catalog_arn =
         format!("arn:aws:glue:{}:{}:catalog", scope.region, scope.account_id);
@@ -1925,6 +2153,9 @@ fn validate_iceberg_configuration(
         bucket_arn: config.s3_configuration.bucket_arn,
         bucket: bucket.clone(),
         prefix: config.s3_configuration.prefix,
+        iceberg_delivery: Some(policy),
+        error_backup,
+        logging,
         iceberg: Some(iceberg::Target {
             database: table.destination_database_name,
             table: table.destination_table_name,
@@ -2160,6 +2391,9 @@ mod tests {
                 bucket: "output".into(),
                 prefix: "events/".into(),
                 iceberg: None,
+                iceberg_delivery: None,
+                error_backup: None,
+                logging: None,
             },
             role_caller: None,
             pending: VecDeque::new(),
@@ -2168,7 +2402,13 @@ mod tests {
             in_flight: None,
             delivery_attempts: 0,
             retry_at: None,
+            pending_since: None,
+            retry_started: None,
             terminal_failure: false,
+            phase: DeliveryPhase::Primary,
+            backup_attempts: 0,
+            backed_up_records: 0,
+            primary_failure: FailureCode::InternalError,
         };
         handler.inner.persist_create(&key, &stream).unwrap();
         handler
@@ -2313,6 +2553,9 @@ mod tests {
                     bucket: "events".into(),
                     prefix: String::new(),
                     iceberg: None,
+                    iceberg_delivery: None,
+                    error_backup: None,
+                    logging: None,
                 },
                 pending: VecDeque::from([b"first".to_vec()]),
                 retained: VecDeque::new(),
@@ -2320,7 +2563,13 @@ mod tests {
                 in_flight: None,
                 delivery_attempts: 0,
                 retry_at: None,
+                pending_since: None,
+                retry_started: None,
                 terminal_failure: false,
+                phase: DeliveryPhase::Primary,
+                backup_attempts: 0,
+                backed_up_records: 0,
+                primary_failure: FailureCode::InternalError,
             },
         );
         let first = handler.inner.take_batches().pop().unwrap();
@@ -2391,6 +2640,9 @@ mod tests {
                     bucket: "events".into(),
                     prefix: String::new(),
                     iceberg: None,
+                    iceberg_delivery: None,
+                    error_backup: None,
+                    logging: None,
                 },
                 pending: VecDeque::from([b"later".to_vec()]),
                 retained: VecDeque::from([b"failed".to_vec()]),
@@ -2398,7 +2650,13 @@ mod tests {
                 in_flight: None,
                 delivery_attempts: MAX_DELIVERY_ATTEMPTS,
                 retry_at: None,
+                pending_since: None,
+                retry_started: None,
                 terminal_failure: true,
+                phase: DeliveryPhase::Primary,
+                backup_attempts: 0,
+                backed_up_records: 0,
+                primary_failure: FailureCode::InternalError,
             },
         );
         assert!(matches!(
@@ -2445,6 +2703,9 @@ mod tests {
                     bucket: "events".into(),
                     prefix: String::new(),
                     iceberg: None,
+                    iceberg_delivery: None,
+                    error_backup: None,
+                    logging: None,
                 },
                 pending: VecDeque::from([b"first".to_vec()]),
                 retained: VecDeque::new(),
@@ -2452,7 +2713,13 @@ mod tests {
                 in_flight: None,
                 delivery_attempts: 0,
                 retry_at: None,
+                pending_since: None,
+                retry_started: None,
                 terminal_failure: false,
+                phase: DeliveryPhase::Primary,
+                backup_attempts: 0,
+                backed_up_records: 0,
+                primary_failure: FailureCode::InternalError,
             },
         );
         let first = handler.inner.take_batches().pop().unwrap();

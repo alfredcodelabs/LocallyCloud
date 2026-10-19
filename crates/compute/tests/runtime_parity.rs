@@ -116,7 +116,8 @@ async fn selected_runtime_hello_task_parity() {
                 memory_mb: 128,
                 vcpu_count: 1,
             };
-            let output = assert_lifecycle(&runtime, &spec, "parity-youki").await;
+            let task_id = format!("parity-youki-{}", std::process::id());
+            let output = assert_lifecycle(&runtime, &spec, &task_id).await;
             assert_eq!(
                 output.trim(),
                 "hello-locallycloud",
@@ -143,7 +144,8 @@ async fn selected_runtime_hello_task_parity() {
                 memory_mb: 128,
                 vcpu_count: 1,
             };
-            let output = assert_lifecycle(&runtime, &spec, "parity-fc").await;
+            let task_id = format!("parity-fc-{}", std::process::id());
+            let output = assert_lifecycle(&runtime, &spec, &task_id).await;
             assert!(
                 !output.trim().is_empty(),
                 "firecracker hello-task produced output"

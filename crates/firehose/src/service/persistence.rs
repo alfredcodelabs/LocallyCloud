@@ -22,11 +22,27 @@ struct SavedStream {
     retry_token: Option<String>,
     delivery_attempts: u8,
     terminal_failure: bool,
+    #[serde(default)]
+    pending_since_ms: Option<u64>,
+    #[serde(default)]
+    retry_started_ms: Option<u64>,
+    #[serde(default)]
+    retry_due_ms: Option<u64>,
+    #[serde(default)]
+    phase: DeliveryPhase,
+    #[serde(default)]
+    backup_attempts: u8,
+    #[serde(default)]
+    backed_up_records: u64,
+    #[serde(default)]
+    primary_failure: FailureCode,
 }
 
 impl SavedStream {
-    fn from_stream(stream: &DeliveryStream) -> Self {
-        Self {
+    fn from_stream(stream: &DeliveryStream) -> Result<Self, PersistError> {
+        let now =
+            StartedAt::now().map_err(|_| std::io::Error::other("Firehose clock unavailable"))?;
+        Ok(Self {
             source: stream.source.clone(),
             generation: stream.generation.to_string(),
             created_at: stream.created_at,
@@ -39,10 +55,33 @@ impl SavedStream {
             retry_token: stream.retry_token.map(|token| token.to_string()),
             delivery_attempts: stream.delivery_attempts,
             terminal_failure: stream.terminal_failure,
-        }
+            phase: stream.phase,
+            backup_attempts: stream.backup_attempts,
+            backed_up_records: stream.backed_up_records,
+            primary_failure: stream.primary_failure,
+            pending_since_ms: stream.pending_since.map(|start| start.unix_ms),
+            retry_started_ms: stream.retry_started.map(|start| start.unix_ms),
+            retry_due_ms: stream.retry_at.map(|due| {
+                now.unix_ms.saturating_add(
+                        due.saturating_duration_since(Instant::now()).as_millis() as u64,
+                    )
+            }),
+        })
     }
 
     fn into_stream(self) -> Result<DeliveryStream, PersistError> {
+        if self.phase == DeliveryPhase::Backup && self.destination.error_backup.is_none() {
+            return Err(
+                std::io::Error::other("Firehose backup phase has no backup destination").into(),
+            );
+        }
+        if self.destination.iceberg_delivery.is_some_and(|p| {
+            !(1..=128).contains(&p.size_mib) || p.interval_seconds > 900 || p.retry_seconds > 7200
+        }) {
+            return Err(
+                std::io::Error::other("unsupported persisted Firehose delivery policy").into(),
+            );
+        }
         Ok(DeliveryStream {
             source: self.source.map(|mut source| {
                 if let Some(sequence) = source.checkpoint.take() {
@@ -75,8 +114,14 @@ impl SavedStream {
                 .transpose()?,
             in_flight: None,
             delivery_attempts: self.delivery_attempts,
-            retry_at: None,
+            retry_at: self.retry_due_ms.map(StartedAt::restore_deadline),
             terminal_failure: self.terminal_failure,
+            phase: self.phase,
+            backup_attempts: self.backup_attempts,
+            backed_up_records: self.backed_up_records,
+            primary_failure: self.primary_failure,
+            pending_since: self.pending_since_ms.map(StartedAt::restore),
+            retry_started: self.retry_started_ms.map(StartedAt::restore),
         })
     }
 }
@@ -165,6 +210,31 @@ pub(super) fn load(state: &StateDb) -> Result<HashMap<StreamKey, DeliveryStream>
             }
         }
     }
+    for (key, stream) in &mut streams {
+        let mut migrated = false;
+        // Legacy state has no acceptance clock; start one conservative interval on restore.
+        if !stream.pending.is_empty() && stream.pending_since.is_none() {
+            migrated = true;
+            stream.pending_since = Some(
+                StartedAt::now()
+                    .map_err(|_| std::io::Error::other("Firehose clock unavailable"))?,
+            );
+        }
+        if !stream.retained.is_empty()
+            && stream.retry_started.is_none()
+            && stream.delivery_attempts > 0
+            && stream.iceberg_policy().is_some()
+        {
+            migrated = true;
+            stream.retry_started = Some(
+                StartedAt::now()
+                    .map_err(|_| std::io::Error::other("Firehose clock unavailable"))?,
+            );
+        }
+        if migrated {
+            save_config(&connection, key, stream)?;
+        }
+    }
     // A process may stop after claiming a batch and before observing its destination ACK.
     // Requeue those rows with their original token so the same object key is retried.
     connection.execute(
@@ -179,7 +249,7 @@ fn save_config(
     key: &StreamKey,
     stream: &DeliveryStream,
 ) -> Result<(), PersistError> {
-    let config = serde_json::to_string(&SavedStream::from_stream(stream))?;
+    let config = serde_json::to_string(&SavedStream::from_stream(stream)?)?;
     connection.execute(
         "INSERT INTO firehose_streams(account,region,name,config) VALUES(?1,?2,?3,?4)
          ON CONFLICT(account,region,name) DO UPDATE SET config=excluded.config",
@@ -243,6 +313,7 @@ impl Inner {
         queue: &str,
         count: usize,
         token: Uuid,
+        stream: &DeliveryStream,
     ) -> Result<(), FirehoseError> {
         let Some(state) = &self.state else {
             return Ok(());
@@ -266,6 +337,7 @@ impl Inner {
         if changed != count {
             return Err(FirehoseError::Internal);
         }
+        save_config(&tx, key, stream).map_err(|_| FirehoseError::Internal)?;
         tx.commit().map_err(|_| FirehoseError::Internal)
     }
 
