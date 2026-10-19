@@ -446,8 +446,20 @@ async fn interrupted_instance_restores_stopped_without_runtime_or_endpoint() {
     );
     let state = handler.scopes.lock().unwrap();
     let scope = &state[&("111".into(), "us-east-1".into())];
-    assert!(scope.network_interfaces.is_empty());
+    let eni_id = &scope.instances[&spec.instance_id].eni_id;
+    assert_eq!(scope.network_interfaces[eni_id].private_ip, spec.private_ip);
     assert!(scope.instances[&spec.instance_id].endpoint.is_none());
+    drop(state);
+    let task = handler
+        .reserve_task_network(
+            "111",
+            "us-east-1",
+            &spec.subnet_id,
+            &spec.security_group_ids,
+            "new-ecs-task",
+        )
+        .unwrap();
+    assert_ne!(task.private_ip, spec.private_ip);
 }
 
 #[tokio::test]
@@ -506,4 +518,440 @@ async fn logs_interface_endpoint_enforces_live_security_groups_after_restore() {
     assert!(!access(&handler));
     ok(&handler,&format!("Action=AuthorizeSecurityGroupEgress&GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=443&IpPermissions.1.ToPort=443&IpPermissions.1.Groups.1.GroupId={}",groups[0],groups[1])).await;
     assert!(access(&handler));
+}
+
+async fn stopped_fixture(runtime: Arc<dyn InstanceRuntime>) -> (TestDb, Ec2Handler, InstanceSpec) {
+    let db = TestDb::new();
+    let mut handler = db.handler(7).unwrap();
+    handler.runtime = Some(runtime.clone());
+    let (_, subnets, groups) = base(&handler).await;
+    let form=format!("Action=RunInstances&ImageId=ami-locallycloud-http&InstanceType=t3.micro&MinCount=1&MaxCount=1&SubnetId={}&SecurityGroupId.1={}",subnets[0],groups[1]);
+    let request = super::tests::request("111", "us-east-1", &form);
+    let spec = match handler
+        .prepare_instance(&request, &Input::parse(&request).unwrap())
+        .unwrap()
+    {
+        PreparedInstance::Launch(spec) => spec,
+        _ => panic!("new instance"),
+    };
+    drop(handler);
+    let mut handler = db.handler(7).unwrap();
+    handler.runtime = Some(runtime);
+    (db, handler, spec)
+}
+
+#[tokio::test]
+async fn start_instances_restores_same_identity_network_and_is_idempotent_and_scoped() {
+    use std::sync::atomic::Ordering;
+    let runtime = super::tests::mock_runtime(false).await;
+    let (_db, handler, spec) = stopped_fixture(runtime.clone()).await;
+    let key = ("111".into(), "us-east-1".into());
+    let eni_id = handler.scopes.lock().unwrap()[&key].instances[&spec.instance_id]
+        .eni_id
+        .clone();
+    let request = format!("Action=StartInstances&InstanceId.1={}", spec.instance_id);
+    for (account, region) in [("222", "us-east-1"), ("111", "us-west-2")] {
+        let (status, body) = call(&handler, account, region, &request).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("InvalidInstanceID.NotFound"));
+    }
+    let body = ok(&handler, &request).await;
+    assert!(body.contains("<previousState><code>80</code><name>stopped</name>"));
+    assert!(body.contains("<currentState><code>16</code><name>running</name>"));
+    assert!(ok(&handler, &request)
+        .await
+        .contains("<previousState><code>16</code><name>running</name>"));
+    assert_eq!(runtime.starts.load(Ordering::SeqCst), 1);
+    {
+        let states = handler.scopes.lock().unwrap();
+        let scope = &states[&key];
+        let current = &scope.instances[&spec.instance_id];
+        assert_eq!(current.eni_id, eni_id);
+        assert_eq!(current.spec.private_ip, spec.private_ip);
+        assert_eq!(current.spec.security_group_ids, spec.security_group_ids);
+        assert!(current.endpoint.is_some());
+    }
+    ok(
+        &handler,
+        &format!(
+            "Action=TerminateInstances&InstanceId.1={}",
+            spec.instance_id
+        ),
+    )
+    .await;
+    let (status, body) = call(&handler, "111", "us-east-1", &request).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("IncorrectInstanceState"));
+}
+
+#[tokio::test]
+async fn start_failures_retain_stopped_configuration_without_endpoint_and_allow_retry() {
+    use std::sync::atomic::Ordering;
+    let runtime = super::tests::mock_runtime(true).await;
+    let (db, handler, spec) = stopped_fixture(runtime.clone()).await;
+    let request = format!("Action=StartInstances&InstanceId.1={}", spec.instance_id);
+    assert_eq!(call(&handler, "111", "us-east-1", &request).await.0, 500);
+    assert!(ok(
+        &handler,
+        &format!("Action=DescribeInstances&InstanceId.1={}", spec.instance_id)
+    )
+    .await
+    .contains("<name>stopped</name>"));
+    assert!(handler
+        .resolve_target(
+            "111",
+            "us-east-1",
+            &spec.vpc_id,
+            spec.private_ip,
+            spec.guest_port
+        )
+        .is_none());
+    runtime.fail_start.store(false, Ordering::SeqCst);
+    db.sql("CREATE TRIGGER deny_start_intent BEFORE UPDATE ON ec2_records WHEN NEW.kind='instance' BEGIN SELECT RAISE(FAIL,'test intent failure'); END;");
+    assert_eq!(call(&handler, "111", "us-east-1", &request).await.0, 500);
+    assert_eq!(runtime.starts.load(Ordering::SeqCst), 1);
+    db.sql("DROP TRIGGER deny_start_intent;");
+    *runtime.persistence_failure.lock().unwrap() = Some(db.database.clone());
+    assert_eq!(call(&handler, "111", "us-east-1", &request).await.0, 500);
+    assert!(!runtime.running.load(Ordering::SeqCst));
+    {
+        let states = handler.scopes.lock().unwrap();
+        let current = &states[&("111".into(), "us-east-1".into())].instances[&spec.instance_id];
+        assert!(current.state == InstanceState::Stopped);
+        assert!(current.endpoint.is_none());
+    }
+    let restored = db.handler(7).unwrap();
+    assert!(ok(
+        &restored,
+        &format!("Action=DescribeInstances&InstanceId.1={}", spec.instance_id)
+    )
+    .await
+    .contains("<name>stopped</name>"));
+    db.sql("DROP TRIGGER reject_instance_commit;");
+    *runtime.persistence_failure.lock().unwrap() = None;
+    ok(&handler, &request).await;
+    ok(
+        &handler,
+        &format!(
+            "Action=TerminateInstances&InstanceId.1={}",
+            spec.instance_id
+        ),
+    )
+    .await;
+}
+
+struct BarrierRuntime {
+    inner: Arc<dyn InstanceRuntime>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+#[async_trait]
+impl InstanceRuntime for BarrierRuntime {
+    async fn start_instance(&self, spec: &InstanceSpec) -> Result<(), String> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.inner.start_instance(spec).await
+    }
+    async fn connect_instance(&self, id: &str, port: u16) -> Result<TcpStream, String> {
+        self.inner.connect_instance(id, port).await
+    }
+    async fn stop_instance(&self, id: &str) -> Result<(), String> {
+        self.inner.stop_instance(id).await
+    }
+    async fn instance_running(&self, id: &str) -> bool {
+        self.inner.instance_running(id).await
+    }
+}
+
+#[tokio::test]
+async fn cancelled_start_and_run_retain_operation_permit_until_lifecycle_finishes() {
+    for action in ["StartInstances", "RunInstances"] {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let runtime = Arc::new(BarrierRuntime {
+            inner: super::tests::mock_runtime(false).await,
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let (_db, handler, spec) = stopped_fixture(runtime).await;
+        let handler = Arc::new(handler);
+        let form = if action == "StartInstances" {
+            format!("Action=StartInstances&InstanceId.1={}", spec.instance_id)
+        } else {
+            format!("Action=RunInstances&ImageId=ami-locallycloud-http&InstanceType=t3.micro&MinCount=1&MaxCount=1&SubnetId={}&SecurityGroupId.1={}",spec.subnet_id,spec.security_group_ids[0])
+        };
+        let owner = handler.clone();
+        let client = tokio::spawn(async move { call(&owner, "111", "us-east-1", &form).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let id = handler.scopes.lock().unwrap()[&("111".into(), "us-east-1".into())]
+            .instances
+            .values()
+            .find(|instance| instance.state == InstanceState::Pending)
+            .unwrap()
+            .spec
+            .instance_id
+            .clone();
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+        let owner = handler.clone();
+        let mut terminate = tokio::spawn(async move {
+            call(
+                &owner,
+                "111",
+                "us-east-1",
+                &format!("Action=TerminateInstances&InstanceId.1={id}"),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut terminate)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(3), terminate)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("<previousState><code>16</code><name>running</name>"));
+    }
+}
+
+#[tokio::test]
+async fn start_rejects_missing_multiple_and_nonstartable_states_without_side_effects() {
+    let runtime = super::tests::mock_runtime(false).await;
+    let (_db, handler, spec) = stopped_fixture(runtime.clone()).await;
+    for (form, code) in [
+        ("Action=StartInstances".to_owned(), "MissingParameter"),
+        (
+            format!(
+                "Action=StartInstances&InstanceId.1={}&InstanceId.2={}",
+                spec.instance_id, spec.instance_id
+            ),
+            "InvalidParameterValue",
+        ),
+    ] {
+        let (status, body) = call(&handler, "111", "us-east-1", &form).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains(code));
+    }
+    for state in [
+        InstanceState::Pending,
+        InstanceState::ShuttingDown,
+        InstanceState::Terminated,
+    ] {
+        handler
+            .scopes
+            .lock()
+            .unwrap()
+            .get_mut(&("111".into(), "us-east-1".into()))
+            .unwrap()
+            .instances
+            .get_mut(&spec.instance_id)
+            .unwrap()
+            .state = state;
+        let (status, body) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            &format!("Action=StartInstances&InstanceId.1={}", spec.instance_id),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("IncorrectInstanceState"));
+    }
+    assert_eq!(runtime.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+async fn live_fixture(runtime: Arc<dyn InstanceRuntime>) -> (TestDb, Ec2Handler, InstanceSpec) {
+    let db = TestDb::new();
+    let mut handler = db.handler(7).unwrap();
+    handler.runtime = Some(runtime);
+    let (_, subnets, groups) = base(&handler).await;
+    let body=ok(&handler,&format!("Action=RunInstances&ImageId=ami-locallycloud-http&InstanceType=t3.micro&MinCount=1&MaxCount=1&SubnetId={}&SecurityGroupId.1={}",subnets[0],groups[1])).await;
+    let id = id(&body, "instanceId");
+    let spec = handler.scopes.lock().unwrap()[&("111".into(), "us-east-1".into())].instances[&id]
+        .spec
+        .clone();
+    (db, handler, spec)
+}
+
+#[tokio::test]
+async fn genuine_shutdown_restores_stopped_configuration_then_start_creates_fresh_runtime() {
+    use std::sync::atomic::Ordering;
+    let runtime = super::tests::mock_runtime(false).await;
+    let (db, handler, spec) = live_fixture(runtime.clone()).await;
+    handler.shutdown().await;
+    assert!(!runtime.running.load(Ordering::SeqCst));
+    {
+        let states = handler.scopes.lock().unwrap();
+        let scope = &states[&("111".into(), "us-east-1".into())];
+        let instance = &scope.instances[&spec.instance_id];
+        assert!(instance.state == InstanceState::Stopped);
+        assert!(instance.endpoint.is_none());
+        assert_eq!(
+            scope.network_interfaces[&instance.eni_id].private_ip,
+            spec.private_ip
+        );
+    }
+    drop(handler);
+    let fresh = super::tests::mock_runtime(false).await;
+    let mut restored = db.handler(7).unwrap();
+    restored.runtime = Some(fresh.clone());
+    let before = ok(
+        &restored,
+        &format!("Action=DescribeInstances&InstanceId.1={}", spec.instance_id),
+    )
+    .await;
+    assert!(before.contains("<name>stopped</name>"));
+    assert!(restored
+        .resolve_target(
+            "111",
+            "us-east-1",
+            &spec.vpc_id,
+            spec.private_ip,
+            spec.guest_port
+        )
+        .is_none());
+    ok(
+        &restored,
+        &format!("Action=StartInstances&InstanceId.1={}", spec.instance_id),
+    )
+    .await;
+    assert!(fresh.running.load(Ordering::SeqCst));
+    assert_eq!(fresh.starts.load(Ordering::SeqCst), 1);
+    let after = ok(
+        &restored,
+        &format!("Action=DescribeInstances&InstanceId.1={}", spec.instance_id),
+    )
+    .await;
+    assert!(after.contains(&format!(
+        "<privateIpAddress>{}</privateIpAddress>",
+        spec.private_ip
+    )));
+    assert!(after.contains("<name>running</name>"));
+    ok(
+        &restored,
+        &format!(
+            "Action=TerminateInstances&InstanceId.1={}",
+            spec.instance_id
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn shutdown_failures_keep_ownership_without_endpoint_and_never_revive_terminated_instances() {
+    use std::sync::atomic::Ordering;
+    let runtime = super::tests::mock_runtime(false).await;
+    let (db, handler, spec) = live_fixture(runtime.clone()).await;
+    runtime.fail_stop.store(true, Ordering::SeqCst);
+    handler.shutdown().await;
+    {
+        let states = handler.scopes.lock().unwrap();
+        let scope = &states[&("111".into(), "us-east-1".into())];
+        let instance = &scope.instances[&spec.instance_id];
+        assert!(instance.state == InstanceState::ShuttingDown);
+        assert!(instance.endpoint.is_none());
+        assert!(scope.network_interfaces.contains_key(&instance.eni_id));
+    }
+    assert!(runtime.running.load(Ordering::SeqCst));
+    assert!(handler
+        .resolve_target(
+            "111",
+            "us-east-1",
+            &spec.vpc_id,
+            spec.private_ip,
+            spec.guest_port
+        )
+        .is_none());
+    runtime.fail_stop.store(false, Ordering::SeqCst);
+    db.sql("CREATE TRIGGER deny_shutdown BEFORE UPDATE ON ec2_records WHEN NEW.kind='instance' BEGIN SELECT RAISE(FAIL,'test shutdown failure'); END;");
+    handler.shutdown().await;
+    assert!(!runtime.running.load(Ordering::SeqCst));
+    assert!(
+        handler.scopes.lock().unwrap()[&("111".into(), "us-east-1".into())].instances
+            [&spec.instance_id]
+            .endpoint
+            .is_none()
+    );
+    let restored = db.handler(7).unwrap();
+    assert!(
+        restored.scopes.lock().unwrap()[&("111".into(), "us-east-1".into())].instances
+            [&spec.instance_id]
+            .state
+            == InstanceState::Stopped
+    );
+    db.sql("DROP TRIGGER deny_shutdown;");
+    handler.shutdown().await;
+    ok(
+        &handler,
+        &format!(
+            "Action=TerminateInstances&InstanceId.1={}",
+            spec.instance_id
+        ),
+    )
+    .await;
+    handler.shutdown().await;
+    let restored = db.handler(7).unwrap();
+    let states = restored.scopes.lock().unwrap();
+    let scope = &states[&("111".into(), "us-east-1".into())];
+    let instance = &scope.instances[&spec.instance_id];
+    assert!(instance.state == InstanceState::Terminated);
+    assert!(!scope.network_interfaces.contains_key(&instance.eni_id));
+}
+
+#[tokio::test]
+async fn old_proxy_exit_callback_and_listener_cannot_claim_resumed_generation() {
+    let runtime = super::tests::mock_runtime(false).await;
+    let (_db, handler, spec) = live_fixture(runtime).await;
+    let key = ("111".into(), "us-east-1".into());
+    let old = handler.scopes.lock().unwrap()[&key].instances[&spec.instance_id]
+        .endpoint
+        .unwrap();
+    handler.shutdown().await;
+    ok(
+        &handler,
+        &format!("Action=StartInstances&InstanceId.1={}", spec.instance_id),
+    )
+    .await;
+    let fresh = handler.scopes.lock().unwrap()[&key].instances[&spec.instance_id]
+        .endpoint
+        .unwrap();
+    assert_ne!(fresh, old);
+    handler
+        .mark_terminated(&key, &spec.instance_id, Some(old))
+        .await
+        .unwrap();
+    assert!(
+        handler.scopes.lock().unwrap()[&key].instances[&spec.instance_id].state
+            == InstanceState::Running
+    );
+    if let Ok(mut socket) = TcpStream::connect(old).await {
+        let _ = socket
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let mut data = [0u8; 128];
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.read(&mut data)).await;
+        assert!(!matches!(result,Ok(Ok(size)) if size>0));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while TcpStream::connect(old).await.is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("old proxy listener must close instead of serving a fresh generation");
+    ok(
+        &handler,
+        &format!(
+            "Action=TerminateInstances&InstanceId.1={}",
+            spec.instance_id
+        ),
+    )
+    .await;
 }

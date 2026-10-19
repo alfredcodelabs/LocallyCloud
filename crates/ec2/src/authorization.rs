@@ -210,9 +210,19 @@ impl Ec2Handler {
                         resources.push(arn("vpc-endpoint", &id));
                     }
                 }
-                "TerminateInstances" => {
+                "TerminateInstances" | "StartInstances" => {
                     for id in input.indexed("InstanceId")? {
                         resources.push(arn("instance", &id));
+                        if action == "StartInstances" {
+                            if let Some(instance) = scope.and_then(|scope| scope.instances.get(&id))
+                            {
+                                vpc = Some(instance.spec.vpc_id.clone());
+                                context.insert(
+                                    "ec2:Subnet".into(),
+                                    vec![arn("subnet", &instance.spec.subnet_id)],
+                                );
+                            }
+                        }
                     }
                 }
                 "RunInstances" => {
@@ -482,5 +492,65 @@ mod tests {
             http::HeaderValue::from_static("arn:aws:iam::222:role/operator/session"),
         );
         assert_eq!(response(&handler, delegated).await.0, 403);
+    }
+    #[tokio::test]
+    async fn start_instances_requires_exact_instance_authority_before_runtime_launch() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let runtime = crate::tests::mock_runtime(false).await;
+        let handler = register_with_instance_runtime(&registry, runtime.clone());
+        let (vpc, subnet, group) = crate::tests::instance_network(&handler).await;
+        let form=format!("Action=RunInstances&ImageId=ami-locallycloud-http&InstanceType=t3.micro&MinCount=1&MaxCount=1&SubnetId={subnet}&SecurityGroupId.1={group}");
+        let req = crate::tests::request("111", "us-east-1", &form);
+        let spec = match handler
+            .prepare_instance(&req, &Input::parse(&req).unwrap())
+            .unwrap()
+        {
+            PreparedInstance::Launch(spec) => spec,
+            _ => panic!("new instance"),
+        };
+        handler
+            .scopes
+            .lock()
+            .unwrap()
+            .get_mut(&("111".into(), "us-east-1".into()))
+            .unwrap()
+            .instances
+            .get_mut(&spec.instance_id)
+            .unwrap()
+            .state = InstanceState::Stopped;
+        let policy = policy(&registry, handler.clone());
+        let start = format!("Action=StartInstances&InstanceId.1={}", spec.instance_id);
+        assert_eq!(response(&handler, request(&start)).await.0, 403);
+        assert_eq!(runtime.starts.load(Ordering::SeqCst), 0);
+        let resource = format!("arn:aws:ec2:us-east-1:111:instance/{}", spec.instance_id);
+        policy
+            .allowed
+            .lock()
+            .unwrap()
+            .push(("ec2:StartInstances".into(), resource.clone()));
+        assert_eq!(response(&handler, request(&start)).await.0, 200);
+        let call = policy.calls.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(call.resource, resource);
+        assert_eq!(
+            call.context["ec2:Vpc"],
+            vec![format!("arn:aws:ec2:us-east-1:111:vpc/{vpc}")]
+        );
+        policy
+            .allowed
+            .lock()
+            .unwrap()
+            .push(("ec2:TerminateInstances".into(), resource));
+        assert_eq!(
+            response(
+                &handler,
+                request(&format!(
+                    "Action=TerminateInstances&InstanceId.1={}",
+                    spec.instance_id
+                ))
+            )
+            .await
+            .0,
+            200
+        );
     }
 }

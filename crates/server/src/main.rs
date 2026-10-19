@@ -7,6 +7,7 @@ mod cli;
 mod domain_tls;
 mod ec2_runtime;
 mod ecs_guest;
+mod ecs_network;
 mod ecs_runtime;
 mod migration;
 
@@ -276,6 +277,9 @@ impl locallycloud_elbv2::AlbNetworkPreflight for Ec2AlbNetworkPreflight {
                     .connect_registered_task(&id, connection.target_ip, connection.target_port)
                     .await
             }
+            locallycloud_ec2::PrivateTargetOwner::HostSocket => {
+                tokio::net::TcpStream::connect(endpoint).await
+            }
             locallycloud_ec2::PrivateTargetOwner::Instance(id) => {
                 locallycloud_ec2::InstanceRuntime::connect_instance(
                     self.ec2_runtime.as_ref(),
@@ -506,6 +510,7 @@ async fn main() {
         Arc::downgrade(&registry),
         ecr,
         ec2.clone(),
+        ec2_runtime.clone(),
     ));
     let ecs_recovery = match locallycloud_ecs::register_with_state(
         &registry,

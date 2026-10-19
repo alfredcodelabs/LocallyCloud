@@ -38,6 +38,69 @@ struct TaskRecord {
 
 type Slot = Arc<Mutex<TaskRecord>>;
 
+/// Guest loopback port reserved for the host-owned transparent IPv4 TCP relay.
+pub const VPC_EGRESS_PORT: u16 = 49152;
+
+#[derive(Clone, Copy)]
+enum EgressCapture {
+    PublicOnly,
+    Vpc,
+}
+impl EgressCapture {
+    fn excluded_ranges(self, private_addresses: &[std::net::Ipv4Addr]) -> Vec<String> {
+        let mut excluded = private_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        excluded.extend(["127.0.0.0/8", "169.254.0.0/16"].map(str::to_owned));
+        if matches!(self, Self::PublicOnly) {
+            excluded.extend(
+                [
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "100.64.0.0/10",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        excluded
+    }
+}
+
+/// Read the kernel-attested original IPv4 TCP destination of a redirected socket.
+pub fn original_tcp_destination(
+    stream: &tokio::net::TcpStream,
+) -> std::io::Result<std::net::SocketAddrV4> {
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: address and size are valid writable getsockopt output buffers.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_IP,
+            80,
+            (&mut address as *mut libc::sockaddr_in).cast(),
+            &mut size,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if size as usize != std::mem::size_of::<libc::sockaddr_in>()
+        || address.sin_family != libc::AF_INET as u16
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "redirected TCP destination is not IPv4",
+        ));
+    }
+    Ok(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
+        u16::from_be(address.sin_port),
+    ))
+}
+
 #[derive(Clone)]
 pub struct YoukiRuntime {
     /// Path to the `youki` or `crun` binary.
@@ -698,7 +761,25 @@ impl YoukiRuntime {
         task_id: &str,
         private_addresses: &[std::net::Ipv4Addr],
     ) -> Result<tokio::net::TcpListener, RuntimeError> {
-        const EGRESS_PORT: u16 = 49152;
+        self.bind_isolated_egress(task_id, EgressCapture::PublicOnly, private_addresses)
+            .await
+    }
+
+    /// Capture all non-local IPv4 TCP; the host must authorize every original destination.
+    pub async fn bind_isolated_vpc_egress(
+        &self,
+        task_id: &str,
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        self.bind_isolated_egress(task_id, EgressCapture::Vpc, &[])
+            .await
+    }
+
+    async fn bind_isolated_egress(
+        &self,
+        task_id: &str,
+        mode: EgressCapture,
+        private_addresses: &[std::net::Ipv4Addr],
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
         let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
         let user_for_tcp = user_ns
             .try_clone()
@@ -709,7 +790,7 @@ impl YoukiRuntime {
                 user_for_tcp,
                 net_for_tcp,
                 std::net::Ipv4Addr::LOCALHOST,
-                EGRESS_PORT,
+                VPC_EGRESS_PORT,
             )
         })
         .await
@@ -717,16 +798,15 @@ impl YoukiRuntime {
         .map_err(|e| exec_failed(format!("binding public OCI listener: {e}")))?;
         let (user_ns, net_ns) = self.isolated_namespace_files(task_id, false).await?;
         let excluded = private_addresses.to_vec();
-        tokio::task::spawn_blocking(move || {
-            use std::os::unix::process::CommandExt;
-            fn run(
+        async move {
+            async fn run(
                 user_ns: &std::fs::File,
                 net_ns: &std::fs::File,
                 program: &str,
                 args: &[&str],
             ) -> std::io::Result<()> {
-                let mut command = std::process::Command::new(program);
-                command.args(args);
+                let mut command = Command::new(program);
+                command.args(args).kill_on_drop(true);
                 let user_fd = user_ns.as_raw_fd();
                 let net_fd = net_ns.as_raw_fd();
                 // SAFETY: pre_exec invokes only async-signal-safe setns calls.
@@ -740,7 +820,9 @@ impl YoukiRuntime {
                         Ok(())
                     });
                 }
-                let output = command.output()?;
+                let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+                    .await
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{program} guest-network setup timed out")))??;
                 if !output.status.success() {
                     return Err(std::io::Error::other(format!(
                         "{program}: {}",
@@ -754,7 +836,7 @@ impl YoukiRuntime {
                 &net_ns,
                 "nft",
                 &["add", "table", "ip", "locallycloud"],
-            )?;
+            ).await?;
             run(
                 &user_ns,
                 &net_ns,
@@ -767,21 +849,10 @@ impl YoukiRuntime {
                     "output",
                     "{ type nat hook output priority dstnat; policy accept; }",
                 ],
-            )?;
-            let mut excluded = excluded.iter().map(ToString::to_string).collect::<Vec<_>>();
-            excluded.extend(
-                [
-                    "127.0.0.0/8",
-                    "10.0.0.0/8",
-                    "172.16.0.0/12",
-                    "192.168.0.0/16",
-                    "169.254.0.0/16",
-                    "100.64.0.0/10",
-                ]
-                .map(str::to_owned),
-            );
+            ).await?;
+            let excluded = mode.excluded_ranges(&excluded);
             let rule = format!(
-                "ip daddr != {{ {} }} meta l4proto tcp redirect to :{EGRESS_PORT}",
+                "ip daddr != {{ {} }} meta l4proto tcp redirect to :{VPC_EGRESS_PORT}",
                 excluded.join(", ")
             );
             run(
@@ -789,7 +860,7 @@ impl YoukiRuntime {
                 &net_ns,
                 "nft",
                 &["add", "rule", "ip", "locallycloud", "output", &rule],
-            )?;
+            ).await?;
             run(
                 &user_ns,
                 &net_ns,
@@ -797,13 +868,12 @@ impl YoukiRuntime {
                 &[
                     "route", "add", "local", "default", "dev", "lo", "table", "local",
                 ],
-            )
-        })
+            ).await
+        }
         .await
-        .map_err(|e| exec_failed(format!("public egress setup worker failed: {e}")))?
         .map_err(|e| {
             exec_failed(format!(
-                "isolated public egress requires rootless ip/nft and kernel nft_redir support; if kernel modules no longer match the running kernel after an upgrade, reboot into the installed kernel: {e}"
+                "isolated IPv4 TCP egress requires rootless ip/nft and kernel nft_redir support; if kernel modules no longer match the running kernel after an upgrade, reboot into the installed kernel: {e}"
             ))
         })?;
         let tcp = tokio::net::TcpListener::from_std(tcp)
@@ -1286,6 +1356,25 @@ mod tests {
             bundle: PathBuf::new(),
             isolated_network: false,
         }))
+    }
+
+    #[test]
+    fn vpc_capture_includes_private_ranges_but_preserves_guest_metadata_and_loopback() {
+        let vpc = EgressCapture::Vpc.excluded_ranges(&[]);
+        assert_eq!(vpc, ["127.0.0.0/8", "169.254.0.0/16"]);
+        let private_ip = "10.0.1.2".parse().unwrap();
+        let public = EgressCapture::PublicOnly.excluded_ranges(&[private_ip]);
+        for range in [
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "100.64.0.0/10",
+            "10.0.1.2",
+        ] {
+            assert!(public.iter().any(|entry| entry == range), "{range}");
+        }
     }
 
     #[tokio::test]

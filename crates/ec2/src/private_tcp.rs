@@ -17,15 +17,15 @@ impl ScopeState {
             })
             .and_then(|instance| instance.endpoint)
             .or_else(|| {
-                let (task_id, endpoint) = self.task_endpoints.get(&(private_ip, port))?;
+                let endpoint = self.task_endpoints.get(&(private_ip, port))?;
                 self.network_interfaces
                     .values()
                     .any(|eni| {
                         eni.vpc_id == vpc_id
                             && eni.private_ip == private_ip
-                            && self.task_networks.get(&eni.id) == Some(task_id)
+                            && self.task_networks.get(&eni.id) == Some(&endpoint.task_id)
                     })
-                    .then_some(*endpoint)
+                    .then_some(endpoint.address)
             })
     }
 
@@ -252,9 +252,14 @@ mod tests {
         scope
             .task_networks
             .insert("eni-target".into(), "rds".into());
-        scope
-            .task_endpoints
-            .insert((target_ip, 5432), ("rds".into(), endpoint));
+        scope.task_endpoints.insert(
+            (target_ip, 5432),
+            PrivateEndpoint {
+                task_id: "rds".into(),
+                address: endpoint,
+                owner: PrivateTargetOwner::HostSocket,
+            },
+        );
         handler
             .scopes
             .lock()
@@ -426,6 +431,14 @@ mod tests {
 pub enum PrivateTargetOwner {
     Task(String),
     Instance(String),
+    HostSocket,
+}
+
+/// Current authorized endpoint and the transport that owns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateConnectionTarget {
+    pub endpoint: SocketAddr,
+    pub owner: PrivateTargetOwner,
 }
 
 impl Ec2Handler {
@@ -454,6 +467,47 @@ impl Ec2Handler {
         })
     }
 
+    /// Resolve policy and current transport ownership atomically for a retained source lease.
+    pub fn private_connection_target(
+        &self,
+        account: &str,
+        region: &str,
+        source: &TaskNetworkLease,
+        target_ip: Ipv4Addr,
+        port: u16,
+    ) -> Option<PrivateConnectionTarget> {
+        let key = (account.to_owned(), region.to_owned());
+        if source.key != key || !Arc::ptr_eq(&source.scopes, &self.scopes) {
+            return None;
+        }
+        let state = self.scopes.lock().ok()?;
+        let scope = state.get(&key)?;
+        if scope.task_networks.get(&source.eni_id) != Some(&source.task_id) {
+            return None;
+        }
+        let source_eni = scope.network_interfaces.get(&source.eni_id)?;
+        let endpoint = scope.private_tcp_access(&source.eni_id, target_ip, port)?;
+        let owner = scope
+            .instances
+            .values()
+            .find(|instance| {
+                instance.state == InstanceState::Running
+                    && instance.spec.vpc_id == source_eni.vpc_id
+                    && instance.spec.private_ip == target_ip
+                    && instance.spec.guest_port == port
+                    && instance.endpoint == Some(endpoint)
+            })
+            .map(|instance| PrivateTargetOwner::Instance(instance.spec.instance_id.clone()))
+            .or_else(|| {
+                scope
+                    .task_endpoints
+                    .get(&(target_ip, port))
+                    .filter(|entry| entry.address == endpoint)
+                    .map(|entry| entry.owner.clone())
+            })?;
+        Some(PrivateConnectionTarget { endpoint, owner })
+    }
+
     pub fn private_target_owner(
         &self,
         account: &str,
@@ -476,7 +530,6 @@ impl Ec2Handler {
                 instance.spec.instance_id.clone(),
             ));
         }
-        let (task_id, _) = scope.task_endpoints.get(&(target_ip, port))?;
-        Some(PrivateTargetOwner::Task(task_id.clone()))
+        Some(scope.task_endpoints.get(&(target_ip, port))?.owner.clone())
     }
 }

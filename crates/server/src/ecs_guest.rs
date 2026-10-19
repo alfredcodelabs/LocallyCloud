@@ -14,7 +14,7 @@ use axum::routing::any;
 use axum::Router;
 use http::{Method, StatusCode};
 use locallycloud_compute::runtime::{ComputeRuntime, TaskOutput};
-use locallycloud_compute::youki::YoukiRuntime;
+use locallycloud_compute::youki::{YoukiRuntime, VPC_EGRESS_PORT};
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::integration::authorization::ServiceRoleCredentials;
 use locallycloud_core::integration::correlation::CorrelationContext;
@@ -96,8 +96,8 @@ impl PreparedGuest {
         task: &TaskLaunch,
         network: &TaskNetworkLease,
     ) -> Result<Self, String> {
-        if [CREDENTIALS_PORT, AWS_GATEWAY_PORT].contains(&task.port) {
-            return Err("Application port conflicts with the task metadata bridge".into());
+        if [CREDENTIALS_PORT, AWS_GATEWAY_PORT, VPC_EGRESS_PORT].contains(&task.port) {
+            return Err("Application port conflicts with a reserved task networking port".into());
         }
         let state = Arc::new(GuestState {
             registry,

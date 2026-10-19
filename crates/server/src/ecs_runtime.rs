@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::ecs_guest::{GuestEndpoints, PreparedGuest};
+use crate::ecs_network::NetworkEndpoints;
 use locallycloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec, TaskState};
 use locallycloud_compute::youki::{IsolatedGuestSetup, YoukiRuntime};
 use locallycloud_core::registry::ServiceRegistry;
@@ -22,24 +23,80 @@ pub struct EcsOciRuntime {
     registry: Weak<ServiceRegistry>,
     ecr: Arc<locallycloud_ecr::EcrHandler>,
     ec2: Arc<locallycloud_ec2::Ec2Handler>,
+    instances: Arc<dyn locallycloud_ec2::InstanceRuntime>,
     runtime: Arc<Mutex<Option<Arc<YoukiRuntime>>>>,
     roots: Arc<Mutex<HashMap<String, TaskResources>>>,
 }
 
 struct TaskResources {
     root: PathBuf,
-    network: Option<locallycloud_ec2::TaskNetworkLease>,
+    network: Option<Arc<locallycloud_ec2::TaskNetworkLease>>,
     lifecycle: Arc<tokio::sync::Mutex<()>>,
     proxy: Option<JoinHandle<()>>,
     guest: Option<GuestEndpoints>,
+    egress: Option<NetworkEndpoints>,
+}
+
+#[derive(Clone)]
+pub(super) struct TaskConnector {
+    roots: Weak<Mutex<HashMap<String, TaskResources>>>,
+    runtime: Arc<YoukiRuntime>,
+}
+impl TaskConnector {
+    pub(super) async fn connect(
+        &self,
+        task_id: &str,
+        private_ip: std::net::Ipv4Addr,
+        port: u16,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        let roots = self
+            .roots
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("ECS owner unavailable"))?;
+        let owned = roots
+            .lock()
+            .map_err(|_| std::io::Error::other("ECS roots unavailable"))?
+            .get(task_id)
+            .is_some_and(|resources| {
+                resources
+                    .network
+                    .as_ref()
+                    .is_some_and(|lease| lease.private_ip == private_ip)
+            });
+        if !owned {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        self.runtime
+            .connect_isolated_tcp(task_id, port, Duration::from_secs(2))
+            .await
+            .map_err(std::io::Error::other)
+    }
 }
 struct GuestSetup {
     prepared: Mutex<Option<PreparedGuest>>,
     roots: Arc<Mutex<HashMap<String, TaskResources>>>,
+    ec2: Arc<locallycloud_ec2::Ec2Handler>,
+    network: Arc<locallycloud_ec2::TaskNetworkLease>,
+    instances: Arc<dyn locallycloud_ec2::InstanceRuntime>,
+    scope: (String, String),
 }
 #[async_trait::async_trait]
 impl IsolatedGuestSetup for GuestSetup {
     async fn prepare(&self, runtime: Arc<YoukiRuntime>, task_id: &str) -> Result<(), RuntimeError> {
+        let egress = NetworkEndpoints::start(
+            runtime.clone(),
+            task_id,
+            self.ec2.clone(),
+            self.network.clone(),
+            self.scope.clone(),
+            TaskConnector {
+                roots: Arc::downgrade(&self.roots),
+                runtime: runtime.clone(),
+            },
+            self.instances.clone(),
+        )
+        .await
+        .map_err(|reason| RuntimeError::ExecutionFailed { reason })?;
         let prepared = self
             .prepared
             .lock()
@@ -66,6 +123,7 @@ impl IsolatedGuestSetup for GuestSetup {
                 reason: "Task no longer owned".into(),
             })?;
         resources.guest = Some(guest);
+        resources.egress = Some(egress);
         Ok(())
     }
 }
@@ -140,6 +198,14 @@ async fn cleanup_task(
                 tracing::warn!(%task_id, dropped, "ECS task log bytes were dropped");
             }
         }
+        let egress = roots
+            .lock()
+            .map_err(|_| "Task ownership unavailable")?
+            .get_mut(task_id)
+            .and_then(|resources| resources.egress.take());
+        if let Some(mut egress) = egress {
+            egress.shutdown().await;
+        }
         runtime
             .release_task(task_id)
             .await
@@ -174,11 +240,13 @@ impl EcsOciRuntime {
         registry: Weak<ServiceRegistry>,
         ecr: Arc<locallycloud_ecr::EcrHandler>,
         ec2: Arc<locallycloud_ec2::Ec2Handler>,
+        instances: Arc<dyn locallycloud_ec2::InstanceRuntime>,
     ) -> Self {
         Self {
             registry,
             ecr,
             ec2,
+            instances,
             runtime: Arc::new(Mutex::new(None)),
             roots: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -200,25 +268,12 @@ impl EcsOciRuntime {
         private_ip: std::net::Ipv4Addr,
         port: u16,
     ) -> std::io::Result<tokio::net::TcpStream> {
-        let owned = self
-            .roots
-            .lock()
-            .map_err(|_| std::io::Error::other("ECS roots unavailable"))?
-            .get(task_id)
-            .is_some_and(|resources| {
-                resources
-                    .network
-                    .as_ref()
-                    .is_some_and(|lease| lease.private_ip == private_ip)
-            });
-        if !owned {
-            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        TaskConnector {
+            roots: Arc::downgrade(&self.roots),
+            runtime: self.runtime().map_err(std::io::Error::other)?,
         }
-        let runtime = self.runtime().map_err(std::io::Error::other)?;
-        runtime
-            .connect_isolated_tcp(task_id, port, Duration::from_secs(2))
-            .await
-            .map_err(std::io::Error::other)
+        .connect(task_id, private_ip, port)
+        .await
     }
 
     fn runtime(&self) -> Result<Arc<YoukiRuntime>, String> {
@@ -294,6 +349,7 @@ impl TaskRuntime for EcsOciRuntime {
                 lifecycle,
                 proxy: None,
                 guest: None,
+                egress: None,
             },
         );
         let mut startup = StartupCleanup {
@@ -335,7 +391,7 @@ impl TaskRuntime for EcsOciRuntime {
             &task.security_groups,
             &task_id,
         ) {
-            Some(network) => network,
+            Some(network) => Arc::new(network),
             None => {
                 return Err(startup
                     .fail("Unable to reserve task network interface".into())
@@ -353,7 +409,26 @@ impl TaskRuntime for EcsOciRuntime {
         let setup = Arc::new(GuestSetup {
             prepared: Mutex::new(Some(prepared)),
             roots: self.roots.clone(),
+            ec2: self.ec2.clone(),
+            network: network.clone(),
+            instances: self.instances.clone(),
+            scope: (task.account.clone(), task.region.clone()),
         });
+        let etc = root.join("etc");
+        if let Err(error) = async {
+            tokio::fs::create_dir_all(&etc).await?;
+            tokio::fs::write(
+                etc.join("resolv.conf"),
+                "nameserver 169.254.169.253\noptions timeout:2 attempts:1\n",
+            )
+            .await
+        }
+        .await
+        {
+            return Err(startup
+                .fail(format!("Task resolver configuration failed: {error}"))
+                .await);
+        }
         let spec = TaskSpec {
             name: task_id.clone(),
             image: root.display().to_string(),
@@ -413,7 +488,7 @@ impl TaskRuntime for EcsOciRuntime {
                 resources
                     .network
                     .as_ref()
-                    .is_some_and(|network| network.set_endpoint(task.port, endpoint))
+                    .is_some_and(|network| network.set_isolated_endpoint(task.port, endpoint))
             });
         if !published {
             return Err(startup.fail("Unable to publish task endpoint".into()).await);
@@ -758,6 +833,7 @@ mod cleanup_tests {
                 lifecycle,
                 proxy: None,
                 guest: None,
+                egress: None,
             },
         );
         let startup = StartupCleanup {
@@ -801,6 +877,7 @@ mod cleanup_tests {
                 lifecycle: Arc::new(tokio::sync::Mutex::new(())),
                 proxy: None,
                 guest: None,
+                egress: None,
             },
         );
         assert!(cleanup_task(&runtime, &roots, "retry").await.is_err());

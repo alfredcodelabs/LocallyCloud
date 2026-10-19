@@ -24,9 +24,11 @@ pub use persistence::{register_with_state_and_instance_runtime, Ec2StateError};
 use persistence::{Change, Persistence};
 mod authorization;
 mod endpoints;
+pub mod guest_dns;
 mod nat;
 mod private_tcp;
-pub use private_tcp::PrivateTargetOwner;
+mod start_instances;
+pub use private_tcp::{PrivateConnectionTarget, PrivateTargetOwner};
 mod security_group_egress;
 use endpoints::VpcEndpoint;
 use security_group_egress::{default_egress, permission_xml};
@@ -228,7 +230,7 @@ struct ScopeState {
     vpc_endpoint_tokens: BTreeMap<String, (BTreeMap<String, String>, String)>,
     task_networks: BTreeMap<String, String>,
     task_dns: BTreeMap<String, String>,
-    task_endpoints: BTreeMap<(Ipv4Addr, u16), (String, SocketAddr)>,
+    task_endpoints: BTreeMap<(Ipv4Addr, u16), PrivateEndpoint>,
 }
 
 /// An opaque dependency that prevents VPC deletion while a consumer retains it.
@@ -241,6 +243,12 @@ impl VpcLease {
     pub fn vpc_id(&self) -> &str {
         &self.vpc.id
     }
+}
+
+struct PrivateEndpoint {
+    task_id: String,
+    address: SocketAddr,
+    owner: PrivateTargetOwner,
 }
 
 /// Task-owned private ENI. Its address resolves to a local ingress proxy only
@@ -288,6 +296,19 @@ impl TaskNetworkLease {
     }
 
     pub fn set_endpoint(&self, port: u16, endpoint: SocketAddr) -> bool {
+        self.publish_endpoint(port, endpoint, PrivateTargetOwner::HostSocket)
+    }
+
+    /// Publish a task whose application lives inside its owned compute namespace.
+    pub fn set_isolated_endpoint(&self, port: u16, endpoint: SocketAddr) -> bool {
+        self.publish_endpoint(
+            port,
+            endpoint,
+            PrivateTargetOwner::Task(self.task_id.clone()),
+        )
+    }
+
+    fn publish_endpoint(&self, port: u16, endpoint: SocketAddr, owner: PrivateTargetOwner) -> bool {
         if endpoint.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return false;
         }
@@ -300,9 +321,14 @@ impl TaskNetworkLease {
         if scope.task_networks.get(&self.eni_id) != Some(&self.task_id) {
             return false;
         }
-        scope
-            .task_endpoints
-            .insert((self.private_ip, port), (self.task_id.clone(), endpoint));
+        scope.task_endpoints.insert(
+            (self.private_ip, port),
+            PrivateEndpoint {
+                task_id: self.task_id.clone(),
+                address: endpoint,
+                owner,
+            },
+        );
         true
     }
 }
@@ -317,7 +343,7 @@ impl Drop for TaskNetworkLease {
                     scope.network_interfaces.remove(&self.eni_id);
                     scope
                         .task_endpoints
-                        .retain(|_, (id, _)| id != &self.task_id);
+                        .retain(|_, endpoint| endpoint.task_id != self.task_id);
                 }
             }
         }
@@ -348,21 +374,31 @@ pub struct AlbNetworkLease {
     source_networks: Vec<Arc<TaskNetworkLease>>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Ec2Handler {
     scopes: Arc<Mutex<HashMap<(String, String), ScopeState>>>,
     runtime: Option<Arc<dyn InstanceRuntime>>,
     persistence: Option<Arc<Persistence>>,
     registry: Option<Weak<ServiceRegistry>>,
+    instance_operations: Arc<tokio::sync::Semaphore>,
+}
+impl Default for Ec2Handler {
+    fn default() -> Self {
+        Self {
+            scopes: Arc::default(),
+            runtime: None,
+            persistence: None,
+            registry: None,
+            instance_operations: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
 }
 
 impl Ec2Handler {
     pub fn with_instance_runtime(runtime: Arc<dyn InstanceRuntime>) -> Self {
         Self {
-            scopes: Arc::default(),
             runtime: Some(runtime),
-            persistence: None,
-            registry: None,
+            ..Self::default()
         }
     }
 
@@ -2270,6 +2306,29 @@ impl Ec2Handler {
 
     async fn run_instances(&self, req: &ServiceRequest, input: &Input) -> Result<String, Ec2Error> {
         let handler = self.clone();
+        let req = req.clone();
+        let input = input.clone();
+        tokio::spawn(async move {
+            let _permit = handler
+                .instance_operations
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    Ec2Error::new("InternalError", "EC2 instance operations unavailable")
+                })?;
+            handler.run_instances_owned(&req, &input).await
+        })
+        .await
+        .map_err(|_| Ec2Error::new("InternalError", "EC2 instance launch worker unavailable"))?
+    }
+
+    async fn run_instances_owned(
+        &self,
+        req: &ServiceRequest,
+        input: &Input,
+    ) -> Result<String, Ec2Error> {
+        let handler = self.clone();
         let operation_request = req.clone();
         let operation_input = input.clone();
         let prepared = tokio::task::spawn_blocking(move || {
@@ -2375,14 +2434,17 @@ impl Ec2Handler {
                             .instances
                             .values()
                             .filter(|i| i.state == InstanceState::Running)
-                            .map(|i| i.spec.instance_id.clone())
+                            .filter_map(|i| {
+                                i.endpoint
+                                    .map(|endpoint| (i.spec.instance_id.clone(), endpoint))
+                            })
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default()
             };
-            for id in running {
+            for (id, endpoint) in running {
                 if !runtime.instance_running(&id).await {
-                    self.mark_terminated(&key, &id).await?;
+                    self.mark_terminated(&key, &id, Some(endpoint)).await?;
                 }
             }
         }
@@ -2413,6 +2475,12 @@ impl Ec2Handler {
         req: &ServiceRequest,
         input: &Input,
     ) -> Result<String, Ec2Error> {
+        let _permit = self
+            .instance_operations
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Ec2Error::new("InternalError", "EC2 instance operations unavailable"))?;
         for key in input.fields.keys() {
             if ["Action", "Version", "DryRun"].contains(&key.as_str())
                 || indexed_key(key, "InstanceId").is_some()
@@ -2480,7 +2548,7 @@ impl Ec2Handler {
                 if runtime.stop_instance(id).await.is_err() {
                     return Err(Ec2Error::new("InternalError", "Could not stop instance"));
                 }
-                self.mark_terminated(&key, id).await?;
+                self.mark_terminated(&key, id, None).await?;
             }
             body.push_str(&format!("<item><instanceId>{}</instanceId><currentState><code>48</code><name>terminated</name></currentState><previousState><code>{}</code><name>{}</name></previousState></item>", escape(id), instance_state_code(old), instance_state(old)));
         }
@@ -2532,7 +2600,12 @@ impl Ec2Handler {
         }
     }
 
-    async fn mark_terminated(&self, key: &(String, String), id: &str) -> Result<(), Ec2Error> {
+    async fn mark_terminated(
+        &self,
+        key: &(String, String),
+        id: &str,
+        observed_endpoint: Option<SocketAddr>,
+    ) -> Result<(), Ec2Error> {
         let handler = self.clone();
         let key = key.clone();
         let id = id.to_owned();
@@ -2540,6 +2613,12 @@ impl Ec2Handler {
             let mut state = handler.scopes.lock().unwrap();
             if let Some(scope) = state.get_mut(&key) {
                 if let Some(instance) = scope.instances.get(&id) {
+                    if observed_endpoint.is_some_and(|endpoint| {
+                        instance.state != InstanceState::Running
+                            || instance.endpoint != Some(endpoint)
+                    }) {
+                        return Ok(());
+                    }
                     let mut instance = instance.clone();
                     instance.state = InstanceState::Terminated;
                     instance.endpoint = None;
@@ -2554,28 +2633,83 @@ impl Ec2Handler {
         .map_err(|_| Ec2Error::new("InternalError", "EC2 instance cleanup worker unavailable"))?
     }
 
+    async fn record_shutdown_state(
+        &self,
+        key: &(String, String),
+        id: &str,
+        target: InstanceState,
+    ) -> Result<(), Ec2Error> {
+        let handler = self.clone();
+        let key = key.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut states = handler
+                .scopes
+                .lock()
+                .map_err(|_| Ec2Error::new("InternalError", "EC2 shutdown state unavailable"))?;
+            let Some(scope) = states.get_mut(&key) else {
+                return Ok(());
+            };
+            let Some(instance) = scope.instances.get(&id) else {
+                return Ok(());
+            };
+            if instance.state == InstanceState::Terminated {
+                return Ok(());
+            }
+            let mut proposed = instance.clone();
+            proposed.state = target;
+            proposed.endpoint = None;
+            let persisted = handler.persist(&key, &[Change::put("instance", &id, &proposed)?]);
+            if persisted.is_err() {
+                proposed.state = InstanceState::ShuttingDown;
+            }
+            // Shutdown cannot keep advertising a healthy endpoint when either
+            // runtime cleanup or its durable state needs a retry.
+            scope.instances.insert(id, proposed);
+            persisted
+        })
+        .await
+        .map_err(|_| Ec2Error::new("InternalError", "EC2 shutdown worker unavailable"))?
+    }
+
     pub async fn shutdown(&self) {
+        let Ok(_permit) = self.instance_operations.clone().acquire_owned().await else {
+            return;
+        };
         let Some(runtime) = &self.runtime else {
             return;
         };
         let instances = {
-            let state = self.scopes.lock().unwrap();
-            state
+            let states = self.scopes.lock().unwrap();
+            states
                 .iter()
                 .flat_map(|(key, scope)| {
                     scope
                         .instances
                         .values()
-                        .filter(|i| i.state != InstanceState::Terminated)
-                        .map(move |i| (key.clone(), i.spec.instance_id.clone()))
+                        .filter(|instance| instance.state != InstanceState::Terminated)
+                        .map(move |instance| (key.clone(), instance.spec.instance_id.clone()))
                 })
                 .collect::<Vec<_>>()
         };
         for (key, id) in instances {
-            if runtime.stop_instance(&id).await.is_ok()
-                && self.mark_terminated(&key, &id).await.is_err()
+            if self
+                .record_shutdown_state(&key, &id, InstanceState::ShuttingDown)
+                .await
+                .is_err()
             {
-                tracing::warn!("EC2 instance termination persistence remains pending");
+                tracing::warn!("EC2 shutdown intent persistence remains pending");
+            }
+            if runtime.stop_instance(&id).await.is_err() {
+                tracing::warn!("EC2 runtime shutdown cleanup remains pending");
+                continue;
+            }
+            if self
+                .record_shutdown_state(&key, &id, InstanceState::Stopped)
+                .await
+                .is_err()
+            {
+                tracing::warn!("EC2 stopped-state persistence remains pending");
             }
         }
     }
@@ -2652,6 +2786,9 @@ async fn serve_instance_proxy(
     spec: InstanceSpec,
     runtime: Arc<dyn InstanceRuntime>,
 ) {
+    let Ok(proxy_endpoint) = listener.local_addr() else {
+        return;
+    };
     let scopes = handler.scopes.clone();
     loop {
         let accepted =
@@ -2661,14 +2798,16 @@ async fn serve_instance_proxy(
             state
                 .get(&key)
                 .and_then(|s| s.instances.get(&spec.instance_id))
-                .is_some_and(|i| i.state == InstanceState::Running)
+                .is_some_and(|i| {
+                    i.state == InstanceState::Running && i.endpoint == Some(proxy_endpoint)
+                })
         };
         if !active {
             break;
         }
         if !runtime.instance_running(&spec.instance_id).await {
             if handler
-                .mark_terminated(&key, &spec.instance_id)
+                .mark_terminated(&key, &spec.instance_id, Some(proxy_endpoint))
                 .await
                 .is_err()
             {
@@ -2683,9 +2822,17 @@ async fn serve_instance_proxy(
             std::net::IpAddr::V4(source) => {
                 let state = scopes.lock().unwrap();
                 state.get(&key).is_some_and(|scope| {
-                    spec.security_group_ids
-                        .iter()
-                        .all(|id| scope.security_groups.contains_key(id))
+                    scope
+                        .instances
+                        .get(&spec.instance_id)
+                        .is_some_and(|instance| {
+                            instance.state == InstanceState::Running
+                                && instance.endpoint == Some(proxy_endpoint)
+                        })
+                        && spec
+                            .security_group_ids
+                            .iter()
+                            .all(|id| scope.security_groups.contains_key(id))
                         && spec.security_group_ids.iter().any(|id| {
                             scope.security_groups.get(id).is_some_and(|group| {
                                 group.ingress.iter().any(|rule| {
@@ -2711,8 +2858,26 @@ async fn serve_instance_proxy(
         let runtime = runtime.clone();
         let id = spec.instance_id.clone();
         let port = spec.guest_port;
+        let connection_scopes = scopes.clone();
+        let connection_key = key.clone();
         tokio::spawn(async move {
             if let Ok(mut outbound) = runtime.connect_instance(&id, port).await {
+                let current = connection_scopes
+                    .lock()
+                    .ok()
+                    .and_then(|states| {
+                        states
+                            .get(&connection_key)
+                            .and_then(|scope| scope.instances.get(&id))
+                            .map(|instance| {
+                                instance.state == InstanceState::Running
+                                    && instance.endpoint == Some(proxy_endpoint)
+                            })
+                    })
+                    .unwrap_or(false);
+                if !current {
+                    return;
+                }
                 let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
             }
         });
@@ -2757,6 +2922,7 @@ impl NativeHandler for Ec2Handler {
         }
         let result = match action {
             "RunInstances" => self.run_instances(&request, &input).await,
+            "StartInstances" => self.start_instances(&request, &input).await,
             "DescribeInstances" => self.describe_instances(&request, &input).await,
             "TerminateInstances" => self.terminate_instances(&request, &input).await,
             _ => {
@@ -2811,6 +2977,7 @@ fn register_handler(registry: &ServiceRegistry, handler: Arc<Ec2Handler>) -> Arc
     let mut metadata = ServiceMetadata::new(AwsProtocol::Query, None);
     metadata.known_actions = [
         "RunInstances",
+        "StartInstances",
         "DescribeInstances",
         "TerminateInstances",
         "CreateVpc",
@@ -3882,7 +4049,7 @@ mod tests {
             .unwrap();
         assert_ne!(target.private_ip, lease.source_networks[0].private_ip);
         let endpoint = "127.0.0.1:12345".parse().unwrap();
-        assert!(target.set_endpoint(8080, endpoint));
+        assert!(target.set_isolated_endpoint(8080, endpoint));
         let access = || h.alb_target_access("111", "us-east-1", &lease, target.private_ip, 8080);
         assert_eq!(access(), None);
         let reference = format!("GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=8080&IpPermissions.1.ToPort=8080&IpPermissions.1.Groups.1.GroupId={}&IpPermissions.1.Groups.1.UserId=111", groups[1],groups[0]);
@@ -3900,6 +4067,52 @@ mod tests {
             assert_eq!(status, expected, "{body}");
         }
         assert_eq!(access(), Some(endpoint));
+        let source = lease.source_networks[0].as_ref();
+        let connection =
+            || h.private_connection_target("111", "us-east-1", source, target.private_ip, 8080);
+        assert_eq!(
+            connection(),
+            Some(PrivateConnectionTarget {
+                endpoint,
+                owner: PrivateTargetOwner::Task("ecs-task".into())
+            })
+        );
+        assert!(h
+            .private_connection_target("222", "us-east-1", source, target.private_ip, 8080)
+            .is_none());
+        assert!(h
+            .private_connection_target("111", "us-west-2", source, target.private_ip, 8080)
+            .is_none());
+        assert!(Ec2Handler::default()
+            .private_connection_target("111", "us-east-1", source, target.private_ip, 8080)
+            .is_none());
+        assert!(target.set_endpoint(8080, endpoint));
+        assert_eq!(
+            connection(),
+            Some(PrivateConnectionTarget {
+                endpoint,
+                owner: PrivateTargetOwner::HostSocket
+            })
+        );
+        assert!(target.set_isolated_endpoint(8080, endpoint));
+        let source_owner = h
+            .scopes
+            .lock()
+            .unwrap()
+            .get_mut(&("111".into(), "us-east-1".into()))
+            .unwrap()
+            .task_networks
+            .remove(&source.eni_id)
+            .unwrap();
+        assert_eq!(connection(), None);
+        h.scopes
+            .lock()
+            .unwrap()
+            .get_mut(&("111".into(), "us-east-1".into()))
+            .unwrap()
+            .task_networks
+            .insert(source.eni_id.clone(), source_owner);
+        assert!(connection().is_some());
         assert_eq!(
             h.private_target_owner("111", "us-east-1", &vpc, target.private_ip, 8080),
             Some(PrivateTargetOwner::Task("ecs-task".into()))
@@ -3944,6 +4157,7 @@ mod tests {
             200
         );
         assert_eq!(access(), None);
+        assert_eq!(connection(), None);
         let egress = format!("GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=8080&IpPermissions.1.ToPort=8080&IpPermissions.1.Groups.1.GroupId={}",groups[0],groups[1]);
         assert_eq!(
             call(
@@ -4702,17 +4916,26 @@ mod tests {
             _ => panic!("lease and subnet deletion must not both succeed or both fail"),
         }
     }
-    struct MockInstanceRuntime {
+    pub(super) struct MockInstanceRuntime {
         addr: SocketAddr,
-        running: std::sync::atomic::AtomicBool,
-        fail_start: bool,
+        pub(super) running: std::sync::atomic::AtomicBool,
+        pub(super) fail_start: std::sync::atomic::AtomicBool,
+        pub(super) starts: std::sync::atomic::AtomicUsize,
+        pub(super) fail_stop: std::sync::atomic::AtomicBool,
+        pub(super) persistence_failure: Mutex<Option<Arc<StateDb>>>,
     }
 
     #[async_trait]
     impl InstanceRuntime for MockInstanceRuntime {
         async fn start_instance(&self, _: &InstanceSpec) -> Result<(), String> {
-            if self.fail_start {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_start.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("failed".into());
+            }
+            let database = self.persistence_failure.lock().unwrap().clone();
+            if let Some(database) = database {
+                tokio::task::spawn_blocking(move || database.connection().unwrap().execute_batch("CREATE TRIGGER reject_instance_commit BEFORE UPDATE ON ec2_records WHEN NEW.kind='instance' BEGIN SELECT RAISE(FAIL,'test instance commit failure'); END;").unwrap()).await.unwrap();
             }
             self.running
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4724,6 +4947,9 @@ mod tests {
                 .map_err(|e| e.to_string())
         }
         async fn stop_instance(&self, _: &str) -> Result<(), String> {
+            if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("test stop failure".into());
+            }
             self.running
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -4733,7 +4959,7 @@ mod tests {
         }
     }
 
-    async fn mock_runtime(fail_start: bool) -> Arc<MockInstanceRuntime> {
+    pub(super) async fn mock_runtime(fail_start: bool) -> Arc<MockInstanceRuntime> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4752,11 +4978,14 @@ mod tests {
         Arc::new(MockInstanceRuntime {
             addr,
             running: std::sync::atomic::AtomicBool::new(false),
-            fail_start,
+            fail_start: std::sync::atomic::AtomicBool::new(fail_start),
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            fail_stop: std::sync::atomic::AtomicBool::new(false),
+            persistence_failure: Mutex::new(None),
         })
     }
 
-    async fn instance_network(h: &Ec2Handler) -> (String, String, String) {
+    pub(super) async fn instance_network(h: &Ec2Handler) -> (String, String, String) {
         let (_, body) = call(
             h,
             "111",

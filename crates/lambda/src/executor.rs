@@ -2099,7 +2099,11 @@ impl Executor {
             } else {
                 None
             };
-            let upstream = match crate::vpc_dns::system_resolver() {
+            let resolver = tokio::task::spawn_blocking(crate::vpc_dns::system_resolver)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let upstream = match resolver {
                 Ok(resolver) => resolver,
                 Err(error) => {
                     self.cleanup_failed_start(&env_key, Some(lease)).await;

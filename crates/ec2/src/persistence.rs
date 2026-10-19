@@ -165,7 +165,61 @@ impl Persistence {
                 _ => return Err(invalid()),
             }
         }
-        // No runtime ENI/socket/PID is restored. Dependencies come from current topology.
+        // Retain configured stopped-instance addresses before any producer can
+        // allocate a new lease. Runtime task/ALB ENIs, sockets and PIDs stay absent.
+        for ((account, _), scope) in state.iter_mut() {
+            for instance in scope
+                .instances
+                .values()
+                .filter(|instance| instance.state != InstanceState::Terminated)
+            {
+                let spec = &instance.spec;
+                let subnet = scope
+                    .subnets
+                    .get(&spec.subnet_id)
+                    .filter(|subnet| subnet.vpc_id == spec.vpc_id)
+                    .ok_or_else(invalid)?;
+                if !scope.vpcs.contains_key(&spec.vpc_id)
+                    || spec.security_group_ids.is_empty()
+                    || spec.security_group_ids.iter().any(|id| {
+                        !scope
+                            .security_groups
+                            .get(id)
+                            .is_some_and(|group| group.vpc_id == spec.vpc_id)
+                    })
+                    || !subnet.cidr.contains(&spec.private_ip)
+                    || scope.network_interfaces.values().any(|eni| {
+                        eni.id != instance.eni_id
+                            && eni.vpc_id == spec.vpc_id
+                            && eni.private_ip == spec.private_ip
+                    })
+                {
+                    return Err(invalid());
+                }
+                let eni = NetworkInterface {
+                    id: instance.eni_id.clone(),
+                    subnet_id: spec.subnet_id.clone(),
+                    vpc_id: spec.vpc_id.clone(),
+                    zone: subnet.zone.clone(),
+                    private_ip: spec.private_ip,
+                    description: format!("Primary network interface for {}", spec.instance_id),
+                    owner: account.clone(),
+                    group_ids: spec.security_group_ids.clone(),
+                };
+                if let Some(previous) = scope.network_interfaces.get(&instance.eni_id) {
+                    if previous.owner != eni.owner
+                        || previous.vpc_id != eni.vpc_id
+                        || previous.subnet_id != eni.subnet_id
+                        || previous.private_ip != eni.private_ip
+                        || previous.group_ids != eni.group_ids
+                    {
+                        return Err(invalid());
+                    }
+                } else {
+                    scope.network_interfaces.insert(eni.id.clone(), eni);
+                }
+            }
+        }
         for scope in state.values() {
             if scope.subnets.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))
                 || scope.security_groups.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))
