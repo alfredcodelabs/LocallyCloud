@@ -449,6 +449,21 @@ unsafe fn send_error(channel: i32, code: u8) {
     libc::send(channel, (&code as *const u8).cast(), 1, libc::MSG_NOSIGNAL);
 }
 
+pub(crate) fn send_descriptor(channel: i32, descriptor: i32) -> io::Result<()> {
+    // SAFETY: send_fd constructs a bounded ancillary message; descriptors are borrowed.
+    if unsafe { send_fd(channel, descriptor) } {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub(crate) fn receive_descriptor(channel: i32) -> io::Result<OwnedFd> {
+    let descriptor = receive_fd(channel)?;
+    // SAFETY: receive_fd returns a newly owned SCM_RIGHTS descriptor with CLOEXEC.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+}
+
 unsafe fn send_fd(channel: i32, socket: i32) -> bool {
     let byte = 0u8;
     let mut iov = libc::iovec {

@@ -25,6 +25,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::runtime::{ComputeRuntime, RuntimeError, TaskHandle, TaskOutput, TaskSpec, TaskState};
+pub use crate::youki_setup::{is_setup_address, run_oci_setup_hook, IsolatedGuestSetup};
+use crate::youki_setup::{NamespaceFiles, NamespaceLease, SetupGate, SETUP_TIMEOUT};
 
 struct TaskRecord {
     state: TaskState,
@@ -36,12 +38,14 @@ struct TaskRecord {
 
 type Slot = Arc<Mutex<TaskRecord>>;
 
+#[derive(Clone)]
 pub struct YoukiRuntime {
     /// Path to the `youki` or `crun` binary.
     runtime_binary: PathBuf,
     /// Base directory under which per-task OCI bundles are created.
     bundle_root: PathBuf,
     tasks: Arc<DashMap<String, Slot>>,
+    setup_namespaces: Arc<DashMap<String, Arc<NamespaceFiles>>>,
 }
 
 impl YoukiRuntime {
@@ -50,6 +54,7 @@ impl YoukiRuntime {
             runtime_binary: runtime_binary.into(),
             bundle_root: crate::private_dir::work_dir("oci"),
             tasks: Arc::new(DashMap::new()),
+            setup_namespaces: Arc::new(DashMap::new()),
         }
     }
 
@@ -92,6 +97,8 @@ impl YoukiRuntime {
         spec: &TaskSpec,
         rootfs: &Path,
         isolated_network: bool,
+        cpu_units: u32,
+        setup_gate: Option<&SetupGate>,
     ) -> Result<(), RuntimeError> {
         let gen = Command::new(&self.runtime_binary)
             .arg("spec")
@@ -133,6 +140,9 @@ impl YoukiRuntime {
         if spec.memory_mb == 0 {
             return Err(exec_failed("OCI memory_mb must be positive"));
         }
+        let quota = cpu_quota(cpu_units)?;
+        config["linux"]["resources"]["cpu"]["period"] = serde_json::json!(CPU_PERIOD_US);
+        config["linux"]["resources"]["cpu"]["quota"] = serde_json::json!(quota);
         let memory_bytes = u64::from(spec.memory_mb) * 1024 * 1024;
         config["linux"]["resources"]["memory"]["limit"] = serde_json::json!(memory_bytes);
         // OCI swap counts RAM+swap; equal values disable host swap for the guest.
@@ -173,6 +183,10 @@ impl YoukiRuntime {
             }
         }
 
+        if let Some(gate) = setup_gate {
+            config["hooks"]["createContainer"] = serde_json::json!([gate.hook()]);
+        }
+
         let serialized = serde_json::to_vec_pretty(&config)
             .map_err(|e| exec_failed(format!("serializing config.json: {e}")))?;
         tokio::fs::write(&config_path, serialized)
@@ -187,14 +201,38 @@ impl YoukiRuntime {
         spec: &TaskSpec,
         isolated_network: bool,
     ) -> Result<TaskHandle, RuntimeError> {
+        let cpu_units = spec
+            .vcpu_count
+            .checked_mul(1024)
+            .ok_or_else(|| exec_failed("OCI vcpu_count exceeds supported CPU units"))?;
+        self.start_task_with_network_and_cpu(task_id, spec, isolated_network, cpu_units, None)
+            .await
+    }
+
+    async fn start_task_with_network_and_cpu(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+        isolated_network: bool,
+        cpu_units: u32,
+        setup: Option<Arc<dyn IsolatedGuestSetup>>,
+    ) -> Result<TaskHandle, RuntimeError> {
+        let expected_cpu_quota = cpu_quota(cpu_units)?;
         self.ensure_runtime_available()?;
         let controllers = tokio::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
             .await
-            .map_err(|e| exec_failed(format!("OCI requires cgroup v2 memory delegation: {e}")))?;
-        if !controllers.split_whitespace().any(|c| c == "memory") {
-            return Err(exec_failed(
-                "OCI memory controller unavailable; enable rootless systemd cgroup v2 delegation",
-            ));
+            .map_err(|e| {
+                exec_failed(format!(
+                    "OCI requires cgroup v2 CPU and memory delegation: {e}"
+                ))
+            })?;
+        for controller in ["memory", "cpu"] {
+            if !controllers
+                .split_whitespace()
+                .any(|name| name == controller)
+            {
+                return Err(exec_failed(format!("OCI {controller} controller unavailable; enable rootless systemd cgroup v2 CPU and memory delegation")));
+            }
         }
         if task_id.is_empty()
             || !task_id
@@ -229,11 +267,23 @@ impl YoukiRuntime {
             .await
             .map_err(|error| exec_failed(format!("checking bundle directory: {error}")))?
             .map_err(|error| exec_failed(format!("checking bundle directory: {error}")))?;
+        let setup_gate = if setup.is_some() {
+            Some(SetupGate::new().await?)
+        } else {
+            None
+        };
         tokio::fs::create_dir(&bundle)
             .await
             .map_err(|error| exec_failed(format!("creating bundle dir: {error}")))?;
         if let Err(error) = self
-            .write_bundle_config(&bundle, spec, &rootfs, isolated_network)
+            .write_bundle_config(
+                &bundle,
+                spec,
+                &rootfs,
+                isolated_network,
+                cpu_units,
+                setup_gate.as_ref(),
+            )
             .await
         {
             let _ = tokio::fs::remove_dir_all(&bundle).await;
@@ -258,6 +308,10 @@ impl YoukiRuntime {
             }
         }
 
+        let runtime_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let published_pid = runtime_pid.clone();
+        let owned_bundle = bundle.clone();
+        let owned_slot = slot.clone();
         let runtime_binary = self.runtime_binary.clone();
         let id = task_id.to_string();
         tokio::spawn(async move {
@@ -274,6 +328,10 @@ impl YoukiRuntime {
                 .spawn();
             match child {
                 Ok(mut child) => {
+                    published_pid.store(
+                        child.id().unwrap_or(0),
+                        std::sync::atomic::Ordering::Release,
+                    );
                     let stdout = child
                         .stdout
                         .take()
@@ -321,6 +379,43 @@ impl YoukiRuntime {
             }
             slot.lock().await.finished = true;
         });
+        if let (Some(setup), Some(gate)) = (setup, setup_gate) {
+            let result = async {
+                let connection = gate.accept(task_id, &owned_bundle, &runtime_pid).await?;
+                if !effective_limits_match(connection.init_pid,u64::from(spec.memory_mb)*1024*1024,expected_cpu_quota).await {
+                    return Err(exec_failed("OCI pre-exec CPU/memory limits are not applied; enable systemd user CPU and memory delegation"));
+                }
+                let _namespace_lease = NamespaceLease::install(
+                    self.setup_namespaces.clone(),
+                    task_id,
+                    connection.namespaces.clone(),
+                );
+                tokio::time::timeout(
+                    SETUP_TIMEOUT,
+                    setup.prepare(Arc::new(self.clone()), task_id),
+                )
+                .await
+                .map_err(|_| exec_failed("OCI pre-exec guest setup timed out"))??;
+                let current = self.tasks.get(task_id).map(|entry| entry.clone());
+                if current
+                    .as_ref()
+                    .is_none_or(|slot| !Arc::ptr_eq(slot, &owned_slot))
+                    || owned_slot.lock().await.finished
+                {
+                    return Err(exec_failed(
+                        "OCI task ownership changed during pre-exec setup",
+                    ));
+                }
+                connection.acknowledge().await
+            }
+            .await;
+            if let Err(error) = result {
+                if let Err(cleanup) = self.release_task(task_id).await {
+                    return Err(exec_failed(format!("{error}; cleanup pending: {cleanup}")));
+                }
+                return Err(error);
+            }
+        }
         // Do not advertise Running until the native runtime has applied the kernel limit.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let expected = u64::from(spec.memory_mb) * 1024 * 1024;
@@ -346,33 +441,14 @@ impl YoukiRuntime {
             drop(record);
             if let Ok(pid) = tokio::fs::read_to_string(pid_path).await {
                 if let Ok(pid) = pid.trim().parse::<u32>() {
-                    if let Ok(groups) =
-                        tokio::fs::read_to_string(format!("/proc/{pid}/cgroup")).await
-                    {
-                        if let Some(group) =
-                            groups.lines().find_map(|line| line.strip_prefix("0::"))
-                        {
-                            let path = Path::new("/sys/fs/cgroup")
-                                .join(group.trim_start_matches('/'))
-                                .join("memory.max");
-                            if let Ok(limit) = tokio::fs::read_to_string(&path).await {
-                                let swap = tokio::fs::read_to_string(
-                                    path.with_file_name("memory.swap.max"),
-                                )
-                                .await;
-                                if limit.trim().parse::<u64>() == Ok(expected)
-                                    && swap.is_ok_and(|v| v.trim() == "0")
-                                {
-                                    break Ok(());
-                                }
-                            }
-                        }
+                    if effective_limits_match(pid, expected, expected_cpu_quota).await {
+                        break Ok(());
                     }
                 }
             }
             if tokio::time::Instant::now() >= deadline {
                 break Err(exec_failed(
-                    "OCI memory limit could not be verified; enable systemd user memory delegation",
+                    "OCI CPU/memory limits could not be verified; enable systemd user CPU and memory delegation",
                 ));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -399,10 +475,76 @@ impl YoukiRuntime {
         guest_port: u16,
         readiness_timeout: Duration,
     ) -> Result<TaskHandle, RuntimeError> {
+        let cpu_units = spec
+            .vcpu_count
+            .checked_mul(1024)
+            .ok_or_else(|| exec_failed("OCI vcpu_count exceeds supported CPU units"))?;
+        self.start_isolated_service_with_cpu_units(
+            task_id,
+            spec,
+            guest_port,
+            readiness_timeout,
+            cpu_units,
+        )
+        .await
+    }
+
+    /// Start a service with an exact ECS-style CPU allocation (1024 units per vCPU).
+    pub async fn start_isolated_service_with_cpu_units(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+        guest_port: u16,
+        readiness_timeout: Duration,
+        cpu_units: u32,
+    ) -> Result<TaskHandle, RuntimeError> {
+        self.start_service(
+            task_id,
+            spec,
+            guest_port,
+            readiness_timeout,
+            cpu_units,
+            None,
+        )
+        .await
+    }
+
+    /// Install owned guest endpoints before the image entrypoint is allowed to execute.
+    pub async fn start_isolated_service_with_setup(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+        guest_port: u16,
+        readiness_timeout: Duration,
+        cpu_units: u32,
+        setup: Arc<dyn IsolatedGuestSetup>,
+    ) -> Result<TaskHandle, RuntimeError> {
+        self.start_service(
+            task_id,
+            spec,
+            guest_port,
+            readiness_timeout,
+            cpu_units,
+            Some(setup),
+        )
+        .await
+    }
+
+    async fn start_service(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+        guest_port: u16,
+        readiness_timeout: Duration,
+        cpu_units: u32,
+        setup: Option<Arc<dyn IsolatedGuestSetup>>,
+    ) -> Result<TaskHandle, RuntimeError> {
         if guest_port == 0 {
             return Err(exec_failed("guest TCP port must be nonzero"));
         }
-        let handle = self.start_task_with_network(task_id, spec, true).await?;
+        let handle = self
+            .start_task_with_network_and_cpu(task_id, spec, true, cpu_units, setup)
+            .await?;
         let deadline = Instant::now() + readiness_timeout;
         loop {
             if self.task_state(task_id).await? != TaskState::Running {
@@ -685,6 +827,16 @@ impl YoukiRuntime {
         }
         let expected_bundle = record.bundle.clone();
         drop(record);
+        let setup_namespaces = self
+            .setup_namespaces
+            .get(task_id)
+            .map(|entry| entry.clone());
+        if let Some(files) = setup_namespaces {
+            if files.bundle != expected_bundle {
+                return Err(exec_failed("OCI setup namespace ownership mismatch"));
+            }
+            return files.duplicate();
+        }
         let state = self.oci_command(&["state", task_id]).await?;
         if !state.status.success() {
             return Err(exec_failed(format!(
@@ -705,11 +857,15 @@ impl YoukiRuntime {
             .as_u64()
             .filter(|pid| *pid > 0)
             .ok_or_else(|| exec_failed("OCI service state has no valid PID"))?;
-        let user_ns = std::fs::File::open(format!("/proc/{pid}/ns/user"))
-            .map_err(|e| exec_failed(format!("opening OCI user namespace: {e}")))?;
-        let net_ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
-            .map_err(|e| exec_failed(format!("opening OCI network namespace: {e}")))?;
-        Ok((user_ns, net_ns))
+        tokio::task::spawn_blocking(move || {
+            let user_ns = std::fs::File::open(format!("/proc/{pid}/ns/user"))
+                .map_err(|e| exec_failed(format!("opening OCI user namespace: {e}")))?;
+            let net_ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| exec_failed(format!("opening OCI network namespace: {e}")))?;
+            Ok((user_ns, net_ns))
+        })
+        .await
+        .map_err(|e| exec_failed(format!("opening OCI namespace worker failed: {e}")))?
     }
 }
 
@@ -1021,6 +1177,7 @@ fn oci_state_missing(stderr: &str, task_id: &str) -> bool {
     let Some(path) = stderr
         .trim()
         .strip_prefix("error opening file `")
+        .or_else(|| stderr.trim().strip_prefix("open `"))
         .and_then(|message| {
             [
                 "': No such file or directory",
@@ -1049,6 +1206,48 @@ fn exec_failed(reason: impl Into<String>) -> RuntimeError {
     RuntimeError::ExecutionFailed {
         reason: reason.into(),
     }
+}
+
+const CPU_PERIOD_US: u64 = 100_000;
+
+fn cpu_quota(cpu_units: u32) -> Result<u64, RuntimeError> {
+    let quota = u64::from(cpu_units)
+        .checked_mul(CPU_PERIOD_US)
+        .map(|value| value / 1024)
+        .ok_or_else(|| exec_failed("OCI CPU quota exceeds supported range"))?;
+    if quota < 1000 {
+        return Err(exec_failed("OCI CPU allocation must provide at least 1000 microseconds per 100000 microsecond period"));
+    }
+    Ok(quota)
+}
+
+async fn effective_limits_match(pid: u32, expected_memory: u64, expected_cpu_quota: u64) -> bool {
+    let Ok(groups) = tokio::fs::read_to_string(format!("/proc/{pid}/cgroup")).await else {
+        return false;
+    };
+    let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return false;
+    };
+    let path = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+    let Ok(memory) = tokio::fs::read_to_string(path.join("memory.max")).await else {
+        return false;
+    };
+    let Ok(swap) = tokio::fs::read_to_string(path.join("memory.swap.max")).await else {
+        return false;
+    };
+    let Ok(cpu) = tokio::fs::read_to_string(path.join("cpu.max")).await else {
+        return false;
+    };
+    memory.trim().parse::<u64>() == Ok(expected_memory)
+        && swap.trim() == "0"
+        && cpu_limit_matches(&cpu, expected_cpu_quota)
+}
+
+fn cpu_limit_matches(value: &str, expected_quota: u64) -> bool {
+    let mut fields = value.split_whitespace();
+    fields.next().and_then(|value| value.parse::<u64>().ok()) == Some(expected_quota)
+        && fields.next().and_then(|value| value.parse::<u64>().ok()) == Some(CPU_PERIOD_US)
+        && fields.next().is_none()
 }
 
 /// Resolve an executable name against `PATH`, returning the first match.
@@ -1101,7 +1300,7 @@ mod tests {
         let rt = YoukiRuntime::new(binary);
         let mut task = spec();
         task.memory_mb = 257;
-        rt.write_bundle_config(&root, &task, &root, false)
+        rt.write_bundle_config(&root, &task, &root, false, 1024, None)
             .await
             .unwrap();
         let value: serde_json::Value =
@@ -1114,12 +1313,71 @@ mod tests {
             value["linux"]["resources"]["memory"]["swap"],
             257_u64 * 1024 * 1024
         );
+        for (units, quota) in [
+            (256, 25_000),
+            (512, 50_000),
+            (1024, 100_000),
+            (2048, 200_000),
+        ] {
+            rt.write_bundle_config(&root, &task, &root, true, units, None)
+                .await
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+            assert_eq!(value["linux"]["resources"]["cpu"]["period"], 100_000);
+            assert_eq!(value["linux"]["resources"]["cpu"]["quota"], quota);
+            assert!(value["linux"]["namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value["type"] == "network"));
+        }
+        let gate = SetupGate::for_test();
+        rt.write_bundle_config(&root, &task, &root, true, 256, Some(&gate))
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            value["hooks"]["createContainer"][0]["args"][1],
+            "--internal-oci-setup-gate"
+        );
+        assert_eq!(
+            value["hooks"]["createContainer"][0]["args"][2],
+            gate.address
+        );
+        assert_eq!(value["hooks"]["createContainer"][0]["timeout"], 50);
+        assert_eq!(value["process"]["args"], serde_json::json!(["echo", "hi"]));
+        for units in [0, 1, 10] {
+            assert!(rt
+                .write_bundle_config(&root, &task, &root, false, units, None)
+                .await
+                .is_err());
+        }
         task.memory_mb = 0;
         assert!(rt
-            .write_bundle_config(&root, &task, &root, false)
+            .write_bundle_config(&root, &task, &root, false, 1024, None)
             .await
             .is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cpu_max_verification_rejects_unlimited_or_wrong_limits() {
+        assert_eq!(cpu_quota(256).unwrap(), 25_000);
+        assert_eq!(cpu_quota(u32::MAX).unwrap(), 419_430_399_902);
+        assert!(cpu_limit_matches("25000 100000\n", 25_000));
+        for value in [
+            "max 100000",
+            "50000 100000",
+            "25000 50000",
+            "25000",
+            "25000 100000 extra",
+            "",
+            "-1 100000",
+        ] {
+            assert!(!cpu_limit_matches(value, 25_000), "{value}");
+        }
     }
 
     #[tokio::test]
@@ -1218,7 +1476,13 @@ esac
             "error opening file `/run/user/1000/crun/owned/status`: No such file or directory\n",
             "owned"
         ));
+        assert!(oci_state_missing(
+            "open `/run/user/1000/crun/owned/status`: No such file or directory",
+            "owned"
+        ));
         for error in [
+            "open `/run/user/1000/crun/another/status`: No such file or directory",
+            "open `/run/user/1000/crun/owned/status`: Permission denied",
             "OCI configuration not found",
             "container another does not exist",
             "container owned-copy not found",

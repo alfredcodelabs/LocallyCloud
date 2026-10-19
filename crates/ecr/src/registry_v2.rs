@@ -2,8 +2,9 @@
 //!
 //! The control plane shares this repository state. Only EcrHandler may pass external
 //! requests here after validating a scoped, unexpired Basic token.
+use crate::persistence::{EcrStateError, Persistence};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -15,17 +16,17 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const MAX_BLOB: usize = 64 * 1024 * 1024;
-const MAX_MANIFEST: usize = 4 * 1024 * 1024;
+pub(super) const MAX_BLOB: usize = 64 * 1024 * 1024;
+pub(super) const MAX_MANIFEST: usize = 4 * 1024 * 1024;
 const MAX_UPLOADS: usize = 32;
-const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+pub(super) const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+pub(super) const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-struct RepoKey {
-    account: String,
-    region: String,
-    name: String,
+pub(super) struct RepoKey {
+    pub(super) account: String,
+    pub(super) region: String,
+    pub(super) name: String,
 }
 impl RepoKey {
     fn new(request: &ServiceRequest, name: &str) -> Self {
@@ -36,23 +37,138 @@ impl RepoKey {
         }
     }
 }
+#[derive(Clone)]
+pub(super) struct Blob {
+    size: usize,
+    resident: Option<Bytes>,
+}
+impl Blob {
+    pub(super) fn durable(size: usize) -> Self {
+        Self {
+            size,
+            resident: None,
+        }
+    }
+    fn len(&self) -> usize {
+        self.size
+    }
+    fn read(
+        &self,
+        persistence: Option<&Persistence>,
+        key: &RepoKey,
+        digest: &str,
+    ) -> Option<Bytes> {
+        match &self.resident {
+            Some(bytes) => Some(bytes.clone()),
+            None => persistence?.load_blob(key, digest, self.size).ok(),
+        }
+    }
+}
 #[derive(Default)]
 struct Repository {
-    blobs: BTreeMap<String, Bytes>,
+    blobs: BTreeMap<String, Blob>,
     manifests: BTreeMap<String, (Bytes, &'static str)>,
     tags: BTreeMap<String, String>,
     uploads: BTreeMap<String, Vec<u8>>,
     immutable_tags: bool,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RegistryV2Handler {
-    repos: Mutex<BTreeMap<RepoKey, Repository>>,
+    repos: Arc<Mutex<BTreeMap<RepoKey, Repository>>>,
+    persistence: Option<Arc<Persistence>>,
 }
 impl RegistryV2Handler {
     pub(crate) fn new() -> Self {
         Self::default()
     }
-    /// Provisioning hook for the ECR control plane. This is not public Registry API.
+    pub(super) fn with_persistence(persistence: Arc<Persistence>) -> Self {
+        Self {
+            persistence: Some(persistence),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn provision_restored_repository(
+        &self,
+        key: &RepoKey,
+        immutable_tags: bool,
+    ) -> bool {
+        let Ok(mut repos) = self.repos.lock() else {
+            return false;
+        };
+        if repos.contains_key(key) {
+            return false;
+        }
+        repos.insert(
+            key.clone(),
+            Repository {
+                immutable_tags,
+                ..Repository::default()
+            },
+        );
+        true
+    }
+
+    pub(super) fn restore_blob(
+        &self,
+        key: &RepoKey,
+        digest: String,
+        blob: Blob,
+    ) -> Result<(), EcrStateError> {
+        let mut repos = self
+            .repos
+            .lock()
+            .map_err(|_| std::io::Error::other("ECR registry lock unavailable"))?;
+        let repo = repos
+            .get_mut(key)
+            .ok_or_else(|| std::io::Error::other("ECR blob repository missing"))?;
+        repo.blobs.insert(digest, blob);
+        Ok(())
+    }
+
+    pub(super) fn restore_manifest(
+        &self,
+        key: &RepoKey,
+        digest: String,
+        body: Bytes,
+        media: &'static str,
+    ) -> Result<(), EcrStateError> {
+        let mut repos = self
+            .repos
+            .lock()
+            .map_err(|_| std::io::Error::other("ECR registry lock unavailable"))?;
+        let repo = repos
+            .get_mut(key)
+            .ok_or_else(|| std::io::Error::other("ECR manifest repository missing"))?;
+        let value: Value = serde_json::from_slice(&body)?;
+        if !valid_manifest(&value, media, &repo.blobs) {
+            return Err(std::io::Error::other("ECR manifest references invalid blob").into());
+        }
+        repo.manifests.insert(digest, (body, media));
+        Ok(())
+    }
+
+    pub(super) fn restore_tag(
+        &self,
+        key: &RepoKey,
+        tag: String,
+        digest: String,
+    ) -> Result<(), EcrStateError> {
+        let mut repos = self
+            .repos
+            .lock()
+            .map_err(|_| std::io::Error::other("ECR registry lock unavailable"))?;
+        let repo = repos
+            .get_mut(key)
+            .ok_or_else(|| std::io::Error::other("ECR tag repository missing"))?;
+        if !repo.manifests.contains_key(&digest) {
+            return Err(std::io::Error::other("ECR tag references missing manifest").into());
+        }
+        repo.tags.insert(tag, digest);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn provision_repository(
         &self,
         account: &str,
@@ -60,19 +176,38 @@ impl RegistryV2Handler {
         name: &str,
         immutable_tags: bool,
     ) -> bool {
+        self.provision_repository_with_metadata(account, region, name, immutable_tags, None)
+            .unwrap_or(false)
+    }
+    pub(crate) fn provision_repository_with_metadata(
+        &self,
+        account: &str,
+        region: &str,
+        name: &str,
+        immutable_tags: bool,
+        metadata: Option<&[u8]>,
+    ) -> Result<bool, EcrStateError> {
         if !valid_repo(name) {
-            return false;
+            return Ok(false);
         }
-        let Ok(mut repos) = self.repos.lock() else {
-            return false;
-        };
+        let mut repos = self
+            .repos
+            .lock()
+            .map_err(|_| std::io::Error::other("ECR registry lock unavailable"))?;
         let key = RepoKey {
             account: account.into(),
             region: region.into(),
             name: name.into(),
         };
         if repos.contains_key(&key) {
-            return false;
+            return Ok(false);
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.create_repository(
+                &key,
+                metadata
+                    .ok_or_else(|| std::io::Error::other("ECR repository metadata required"))?,
+            )?;
         }
         repos.insert(
             key,
@@ -81,7 +216,7 @@ impl RegistryV2Handler {
                 ..Repository::default()
             },
         );
-        true
+        Ok(true)
     }
     pub(crate) fn delete_repository(
         &self,
@@ -102,6 +237,11 @@ impl RegistryV2Handler {
         let repo = repos.get(&key).ok_or(DeleteRepositoryError::Missing)?;
         if !force && !repo.manifests.is_empty() {
             return Err(DeleteRepositoryError::NotEmpty);
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .delete_repository(&key)
+                .map_err(|_| DeleteRepositoryError::Unavailable)?;
         }
         repos.remove(&key);
         Ok(())
@@ -153,8 +293,15 @@ impl RegistryV2Handler {
         };
         let (manifest, _) = repo.manifests.get(digest)?;
         let value: Value = serde_json::from_slice(manifest).ok()?;
+        if !execution_blob_budget(&value) {
+            return None;
+        }
         let config_digest = value["config"]["digest"].as_str()?;
-        let config = repo.blobs.get(config_digest)?.clone();
+        let config = repo.blobs.get(config_digest)?.read(
+            self.persistence.as_deref(),
+            &key,
+            config_digest,
+        )?;
         if sha256(&config) != config_digest
             || config.len() as u64 != value["config"]["size"].as_u64()?
             || !matches!(
@@ -176,7 +323,10 @@ impl RegistryV2Handler {
                     _ => return None,
                 };
                 let digest = entry["digest"].as_str()?;
-                let blob = repo.blobs.get(digest)?.clone();
+                let blob =
+                    repo.blobs
+                        .get(digest)?
+                        .read(self.persistence.as_deref(), &key, digest)?;
                 if sha256(&blob) != digest || blob.len() as u64 != entry["size"].as_u64()? {
                     return None;
                 }
@@ -223,7 +373,8 @@ impl RegistryV2Handler {
                 "Registry state unavailable",
             );
         };
-        let Some(repo) = repos.get_mut(&RepoKey::new(request, name)) else {
+        let key = RepoKey::new(request, name);
+        let Some(repo) = repos.get_mut(&key) else {
             return error(
                 StatusCode::NOT_FOUND,
                 "NAME_UNKNOWN",
@@ -324,8 +475,23 @@ impl RegistryV2Handler {
                         "Blob digest mismatch",
                     );
                 }
+                let blob = if let Some(persistence) = &self.persistence {
+                    if persistence.save_blob(&key, digest, &content).is_err() {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "UNKNOWN",
+                            "Registry persistence unavailable",
+                        );
+                    }
+                    Blob::durable(content.len())
+                } else {
+                    Blob {
+                        size: content.len(),
+                        resident: Some(Bytes::from(content)),
+                    }
+                };
                 repo.uploads.remove(id);
-                repo.blobs.insert(digest.into(), Bytes::from(content));
+                repo.blobs.insert(digest.into(), blob);
                 let location = format!("/v2/{name}/blobs/{digest}");
                 response(
                     StatusCode::CREATED,
@@ -354,17 +520,19 @@ impl RegistryV2Handler {
                 let Some(body) = repo.blobs.get(digest) else {
                     return error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "Blob not found");
                 };
-                let mut result = response(
-                    StatusCode::OK,
-                    if request.method == Method::HEAD {
-                        Bytes::new()
-                    } else {
-                        body.clone()
-                    },
-                    Some(digest),
-                    None,
-                    None,
-                );
+                let bytes = if request.method == Method::HEAD {
+                    Bytes::new()
+                } else {
+                    let Some(bytes) = body.read(self.persistence.as_deref(), &key, digest) else {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "UNKNOWN",
+                            "Registry blob unavailable",
+                        );
+                    };
+                    bytes
+                };
+                let mut result = response(StatusCode::OK, bytes, Some(digest), None, None);
                 if request.method == Method::HEAD {
                     result.headers_mut().insert(
                         http::header::CONTENT_LENGTH,
@@ -438,6 +606,19 @@ impl RegistryV2Handler {
                         "TAG_INVALID",
                         "Repository tag is immutable",
                     );
+                }
+                if let Some(persistence) = &self.persistence {
+                    let tag = (!reference.starts_with("sha256:")).then_some(reference);
+                    if persistence
+                        .save_manifest(&key, &digest, &request.body, tag)
+                        .is_err()
+                    {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "UNKNOWN",
+                            "Registry persistence unavailable",
+                        );
+                    }
                 }
                 repo.manifests
                     .insert(digest.clone(), (request.body.clone(), media_type));
@@ -525,7 +706,7 @@ fn valid_repo(name: &str) -> bool {
                 })
         })
 }
-fn valid_digest(value: &str) -> bool {
+pub(super) fn valid_digest(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64
             && hex
@@ -533,7 +714,7 @@ fn valid_digest(value: &str) -> bool {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     })
 }
-fn valid_reference(value: &str) -> bool {
+pub(super) fn valid_reference(value: &str) -> bool {
     valid_digest(value)
         || (!value.is_empty()
             && value.len() <= 128
@@ -543,10 +724,26 @@ fn valid_reference(value: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
 }
-fn sha256(body: &[u8]) -> String {
+pub(super) fn sha256(body: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(body))
 }
-fn valid_manifest(value: &Value, media_type: &str, blobs: &BTreeMap<String, Bytes>) -> bool {
+// Execution admission is narrower than public Registry storage.
+fn execution_blob_budget(manifest: &Value) -> bool {
+    let Some(layers) = manifest["layers"]
+        .as_array()
+        .filter(|layers| layers.len() <= 32)
+    else {
+        return false;
+    };
+    std::iter::once(&manifest["config"])
+        .chain(layers.iter())
+        .try_fold(0u64, |total, entry| {
+            total.checked_add(entry["size"].as_u64()?)
+        })
+        .is_some_and(|total| total <= 256 * 1024 * 1024)
+}
+
+fn valid_manifest(value: &Value, media_type: &str, blobs: &BTreeMap<String, Blob>) -> bool {
     if value.get("schemaVersion").and_then(Value::as_u64) != Some(2)
         || value.get("mediaType").and_then(Value::as_str) != Some(media_type)
     {
@@ -605,7 +802,15 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 #[async_trait]
 impl NativeHandler for RegistryV2Handler {
     async fn handle(&self, request: ServiceRequest) -> Response {
-        self.process(&request)
+        let handler = self.clone();
+        match tokio::task::spawn_blocking(move || handler.process(&request)).await {
+            Ok(response) => response,
+            Err(_) => error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                "Registry state unavailable",
+            ),
+        }
     }
 }
 
@@ -672,6 +877,21 @@ mod tests {
         assert_eq!(finish.status(), StatusCode::CREATED);
         digest
     }
+    #[test]
+    fn execution_budget_rejects_layer_count_total_size_and_overflow_before_reads() {
+        let entry = serde_json::json!({"size":1});
+        let mut manifest = serde_json::json!({"config":{"size":1},"layers":vec![entry.clone();32]});
+        assert!(execution_blob_budget(&manifest));
+        manifest["layers"] = serde_json::json!(vec![entry; 33]);
+        assert!(!execution_blob_budget(&manifest));
+        manifest = serde_json::json!({"config":{"size":1},"layers":[{"size":256u64*1024*1024}]});
+        assert!(!execution_blob_budget(&manifest));
+        manifest["config"]["size"] = serde_json::json!(u64::MAX);
+        assert!(!execution_blob_budget(&manifest));
+        manifest["config"]["size"] = serde_json::Value::Null;
+        assert!(!execution_blob_budget(&manifest));
+    }
+
     #[tokio::test]
     async fn blob_digest_rejection_keeps_upload_and_scope() {
         let handler = RegistryV2Handler::new();

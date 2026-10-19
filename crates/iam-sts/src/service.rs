@@ -39,12 +39,16 @@ struct IamStsState {
 
 impl IamStsState {
     fn new(store: Arc<IamStore>, sessions: Arc<SessionStore>) -> Self {
+        Self::with_mode(store, sessions, EnforcementMode::from_env())
+    }
+
+    fn with_mode(store: Arc<IamStore>, sessions: Arc<SessionStore>, mode: EnforcementMode) -> Self {
         let enforcement = EnforcementFilter::new(store.clone(), sessions.clone());
         IamStsState {
             store,
             sessions,
             enforcement,
-            mode: EnforcementMode::from_env(),
+            mode,
         }
     }
 
@@ -399,6 +403,7 @@ impl AuthorizationEvaluator for IamStsState {
             access_key_id: creds.access_key_id,
             secret_access_key: creds.secret_access_key,
             session_token: creds.session_token,
+            expiration: creds.expiration,
         })
     }
 
@@ -1166,7 +1171,24 @@ fn register_inner(
 }
 
 fn publish_handlers(registry: &ServiceRegistry, store: Arc<IamStore>, sessions: Arc<SessionStore>) {
-    let state = Arc::new(IamStsState::new(store, sessions));
+    publish_state(registry, Arc::new(IamStsState::new(store, sessions)));
+}
+
+/// Publish explicitly provisioned IAM/STS stores with an injected enforcement mode.
+/// This performs no environment lookup or bootstrap provisioning.
+pub fn register_with_store_and_mode(
+    registry: &ServiceRegistry,
+    store: Arc<IamStore>,
+    sessions: Arc<SessionStore>,
+    mode: EnforcementMode,
+) {
+    publish_state(
+        registry,
+        Arc::new(IamStsState::with_mode(store, sessions, mode)),
+    );
+}
+
+fn publish_state(registry: &ServiceRegistry, state: Arc<IamStsState>) {
     let iam_handler: Arc<dyn NativeHandler> = Arc::new(IamHandler {
         state: state.clone(),
     });

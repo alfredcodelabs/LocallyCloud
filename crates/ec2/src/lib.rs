@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -16,39 +16,67 @@ use uuid::Uuid;
 
 const XMLNS: &str = "http://ec2.amazonaws.com/doc/2016-11-15/";
 
+#[cfg(test)]
+mod durability_tests;
+mod persistence;
+use locallycloud_state::{StateCipher, StateDb};
+pub use persistence::{register_with_state_and_instance_runtime, Ec2StateError};
+use persistence::{Change, Persistence};
+mod authorization;
 mod endpoints;
 mod nat;
 mod private_tcp;
+pub use private_tcp::PrivateTargetOwner;
 mod security_group_egress;
 use endpoints::VpcEndpoint;
-use security_group_egress::default_egress;
+use security_group_egress::{default_egress, permission_xml};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Vpc {
     id: String,
     cidr: Ipv4Net,
     owner: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Subnet {
     id: String,
     vpc_id: String,
     cidr: Ipv4Net,
     zone: String,
     owner: String,
+    #[serde(skip)]
     guard: Arc<()>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum RulePeer {
+    Cidr(Ipv4Net),
+    Group(String),
+}
+
+impl RulePeer {
+    fn contains(&self, ip: &Ipv4Addr) -> bool {
+        matches!(self, Self::Cidr(cidr) if cidr.contains(ip))
+    }
+
+    fn matches(&self, ip: Ipv4Addr, group_ids: &[String]) -> bool {
+        match self {
+            Self::Cidr(cidr) => cidr.contains(&ip),
+            Self::Group(id) => group_ids.contains(id),
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct IngressRule {
     protocol: String,
     from_port: Option<u16>,
     to_port: Option<u16>,
-    cidr: Ipv4Net,
+    peer: RulePeer,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SecurityGroup {
     id: String,
     vpc_id: String,
@@ -58,10 +86,11 @@ struct SecurityGroup {
     is_default: bool,
     ingress: Vec<IngressRule>,
     egress: Vec<IngressRule>,
+    #[serde(skip)]
     guard: Arc<()>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct NetworkInterface {
     id: String,
     subnet_id: String,
@@ -82,7 +111,7 @@ pub struct NetworkSelection {
     pub security_group_ids: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InstanceSpec {
     pub instance_id: String,
     pub image_id: String,
@@ -106,33 +135,37 @@ pub trait InstanceRuntime: Send + Sync {
     async fn instance_running(&self, instance_id: &str) -> bool;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum InstanceState {
     Pending,
     Running,
     ShuttingDown,
     Terminated,
+    Stopped,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Instance {
     spec: InstanceSpec,
     eni_id: String,
     state: InstanceState,
+    #[serde(skip)]
     endpoint: Option<SocketAddr>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct IdempotentInstance {
     params: BTreeMap<String, String>,
     instance_id: String,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct IdempotentEni {
     params: BTreeMap<String, String>,
     eni_id: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct RouteTable {
     id: String,
     vpc_id: String,
@@ -143,7 +176,7 @@ struct RouteTable {
     associations: BTreeMap<String, Option<String>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum RouteTarget {
     Local,
     NetworkInterface(String),
@@ -152,20 +185,20 @@ enum RouteTarget {
     BlackholeNatGateway(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct InternetGateway {
     id: String,
     vpc_id: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ElasticIp {
     allocation_id: String,
     public_ip: Ipv4Addr,
     nat_gateway_id: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct NatGateway {
     id: String,
     vpc_id: String,
@@ -312,12 +345,15 @@ pub struct AlbNetworkLease {
     _vpc: Arc<Vpc>,
     _subnet_guards: Vec<Arc<()>>,
     _group_guards: Vec<Arc<()>>,
+    source_networks: Vec<Arc<TaskNetworkLease>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Ec2Handler {
     scopes: Arc<Mutex<HashMap<(String, String), ScopeState>>>,
     runtime: Option<Arc<dyn InstanceRuntime>>,
+    persistence: Option<Arc<Persistence>>,
+    registry: Option<Weak<ServiceRegistry>>,
 }
 
 impl Ec2Handler {
@@ -325,6 +361,8 @@ impl Ec2Handler {
         Self {
             scopes: Arc::default(),
             runtime: Some(runtime),
+            persistence: None,
+            registry: None,
         }
     }
 
@@ -639,7 +677,7 @@ impl Ec2Handler {
         };
         groups.iter().any(|group| {
             group.ingress.iter().any(|rule| {
-                rule.cidr.contains(&source)
+                rule.peer.contains(&source)
                     && (rule.protocol == "-1"
                         || (rule.protocol == "tcp"
                             && rule.from_port.is_some_and(|from| from <= port)
@@ -660,8 +698,8 @@ impl Ec2Handler {
         if subnet_ids.len() < 2 || security_group_ids.is_empty() {
             return None;
         }
-        let state = self.scopes.lock().unwrap();
-        let scope = state.get(&(account.to_owned(), region.to_owned()))?;
+        let mut state = self.scopes.lock().ok()?;
+        let scope = state.get_mut(&(account.to_owned(), region.to_owned()))?;
         let mut vpc_id: Option<&str> = None;
         let mut zones = std::collections::HashSet::new();
         let mut subnets = Vec::with_capacity(subnet_ids.len());
@@ -690,10 +728,59 @@ impl Ec2Handler {
             }
             group_guards.push(group.guard.clone());
         }
+        let vpc_id = vpc_id.to_owned();
+        // Plan every address before mutation so a full subnet cannot leave partial ENIs.
+        let planned = subnet_ids
+            .iter()
+            .map(|id| {
+                let subnet = scope.subnets.get(id)?;
+                let base = u32::from(subnet.cidr.network());
+                let size = 1_u32 << (32 - subnet.cidr.prefix_len());
+                let ip = (4..size - 1)
+                    .map(|offset| Ipv4Addr::from(base + offset))
+                    .find(|ip| {
+                        !scope
+                            .network_interfaces
+                            .values()
+                            .any(|eni| eni.private_ip == *ip && eni.vpc_id == vpc_id)
+                    })?;
+                Some((subnet.clone(), ip))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut source_networks = Vec::with_capacity(planned.len());
+        for (subnet, private_ip) in planned {
+            let eni_id = resource_id("eni");
+            let task_id = format!("alb-network-{}", Uuid::new_v4());
+            scope.network_interfaces.insert(
+                eni_id.clone(),
+                NetworkInterface {
+                    id: eni_id.clone(),
+                    subnet_id: subnet.id.clone(),
+                    vpc_id: vpc_id.clone(),
+                    zone: subnet.zone,
+                    private_ip,
+                    description: "Managed ALB source network interface".into(),
+                    owner: account.into(),
+                    group_ids: security_group_ids.to_vec(),
+                },
+            );
+            scope.task_networks.insert(eni_id.clone(), task_id.clone());
+            source_networks.push(Arc::new(TaskNetworkLease {
+                eni_id,
+                vpc_id: vpc_id.clone(),
+                subnet_id: subnet.id,
+                private_ip,
+                security_group_ids: security_group_ids.to_vec(),
+                task_id,
+                key: (account.into(), region.into()),
+                scopes: self.scopes.clone(),
+            }));
+        }
         Some(AlbNetworkLease {
             vpc_id: vpc_id.to_owned(),
             subnets,
             security_group_ids: security_group_ids.to_vec(),
+            source_networks,
             _vpc: vpc,
             _subnet_guards: subnet_guards,
             _group_guards: group_guards,
@@ -741,16 +828,14 @@ impl Ec2Handler {
                     return Err(Ec2Error::unsupported("InstanceTenancy"));
                 }
                 let cidr = parse_cidr(input.required("CidrBlock")?, "CidrBlock")?;
-                let id = resource_id("vpc");
+                let id = input.resource_id("vpc");
                 let vpc = Vpc {
                     id: id.clone(),
                     cidr,
                     owner: req.account_id.clone(),
                 };
                 let mut state = self.scopes.lock().unwrap();
-                let scope = state.entry(key).or_default();
-                scope.vpcs.insert(id.clone(), Arc::new(vpc.clone()));
-                scope.vpc_dns.insert(id.clone(), (true, false));
+                let scope = state.entry(key.clone()).or_default();
                 let main_table = RouteTable {
                     id: resource_id("rtb"),
                     vpc_id: id.clone(),
@@ -760,22 +845,32 @@ impl Ec2Handler {
                     endpoint_routes: BTreeMap::new(),
                     associations: BTreeMap::from([(resource_id("rtbassoc"), None)]),
                 };
-                scope.route_tables.insert(main_table.id.clone(), main_table);
                 let default_id = resource_id("sg");
-                scope.security_groups.insert(
-                    default_id.clone(),
-                    SecurityGroup {
-                        id: default_id,
-                        vpc_id: id,
-                        name: "default".into(),
-                        description: "default VPC security group".into(),
-                        owner: req.account_id.clone(),
-                        is_default: true,
-                        ingress: Vec::new(),
-                        egress: default_egress(),
-                        guard: Arc::new(()),
-                    },
-                );
+                let default_group = SecurityGroup {
+                    id: default_id.clone(),
+                    vpc_id: id.clone(),
+                    name: "default".into(),
+                    description: "default VPC security group".into(),
+                    owner: req.account_id.clone(),
+                    is_default: true,
+                    ingress: Vec::new(),
+                    egress: default_egress(),
+                    guard: Arc::new(()),
+                };
+                self.persist(
+                    &key,
+                    &[
+                        Change::put("vpc", &id, &vpc)?,
+                        Change::put("dns", &id, &(true, false))?,
+                        Change::put("route-table", &main_table.id, &main_table)?,
+                        Change::put("sg", &default_id, &default_group)?,
+                    ],
+                )?;
+                scope.vpcs.insert(id.clone(), Arc::new(vpc.clone()));
+                scope.vpc_dns.insert(id.clone(), (true, false));
+                scope.route_tables.insert(main_table.id.clone(), main_table);
+                scope.security_groups.insert(default_id, default_group);
+
                 Ok(format!("<vpc>{}</vpc>", vpc_xml(&vpc)))
             }
             "ModifyVpcAttribute" => self.modify_vpc_attribute(key, input),
@@ -819,7 +914,7 @@ impl Ec2Handler {
                 input.dry_run()?;
                 let id = input.required("VpcId")?;
                 let mut state = self.scopes.lock().unwrap();
-                let scope = state.entry(key).or_default();
+                let scope = state.entry(key.clone()).or_default();
                 if !scope.vpcs.contains_key(id) {
                     return Err(Ec2Error::new(
                         "InvalidVpcID.NotFound",
@@ -861,6 +956,22 @@ impl Ec2Handler {
                         "The vpc has dependencies and cannot be deleted",
                     ));
                 }
+                let mut changes = vec![Change::delete("vpc", id), Change::delete("dns", id)];
+                changes.extend(
+                    scope
+                        .route_tables
+                        .values()
+                        .filter(|table| table.vpc_id == id)
+                        .map(|table| Change::delete("route-table", &table.id)),
+                );
+                changes.extend(
+                    scope
+                        .security_groups
+                        .values()
+                        .filter(|group| group.vpc_id == id)
+                        .map(|group| Change::delete("sg", &group.id)),
+                );
+                self.persist(&key, &changes)?;
                 scope.vpcs.remove(id);
                 scope.vpc_dns.remove(id);
                 scope.route_tables.retain(|_, table| table.vpc_id != id);
@@ -893,7 +1004,7 @@ impl Ec2Handler {
                     ));
                 }
                 let mut state = self.scopes.lock().unwrap();
-                let scope = state.entry(key).or_default();
+                let scope = state.entry(key.clone()).or_default();
                 let vpc = scope.vpcs.get(vpc_id).ok_or_else(|| {
                     Ec2Error::new(
                         "InvalidVpcID.NotFound",
@@ -916,7 +1027,7 @@ impl Ec2Handler {
                         "The CIDR conflicts with an existing subnet",
                     ));
                 }
-                let id = resource_id("subnet");
+                let id = input.resource_id("subnet");
                 let subnet = Subnet {
                     id: id.clone(),
                     vpc_id: vpc_id.to_owned(),
@@ -925,6 +1036,7 @@ impl Ec2Handler {
                     owner: req.account_id.clone(),
                     guard: Arc::new(()),
                 };
+                self.persist(&key, &[Change::put("subnet", &id, &subnet)?])?;
                 scope.subnets.insert(id, subnet.clone());
                 Ok(format!(
                     "<subnet>{}</subnet>",
@@ -985,7 +1097,7 @@ impl Ec2Handler {
                 input.dry_run()?;
                 let id = input.required("SubnetId")?;
                 let mut state = self.scopes.lock().unwrap();
-                let scope = state.entry(key).or_default();
+                let scope = state.entry(key.clone()).or_default();
                 if !scope.subnets.contains_key(id) {
                     return Err(Ec2Error::new(
                         "InvalidSubnetID.NotFound",
@@ -1020,6 +1132,7 @@ impl Ec2Handler {
                         "The subnet has dependencies and cannot be deleted",
                     ));
                 }
+                self.persist(&key, &[Change::delete("subnet", id)])?;
                 if scope.subnets.remove(id).is_none() {
                     return Err(Ec2Error::new(
                         "InvalidSubnetID.NotFound",
@@ -1107,7 +1220,7 @@ impl Ec2Handler {
             ));
         }
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         if !scope.vpcs.contains_key(vpc_id) {
             return Err(Ec2Error::new(
                 "InvalidVpcID.NotFound",
@@ -1124,21 +1237,21 @@ impl Ec2Handler {
                 "The security group already exists",
             ));
         }
-        let id = resource_id("sg");
-        scope.security_groups.insert(
-            id.clone(),
-            SecurityGroup {
-                id: id.clone(),
-                vpc_id: vpc_id.into(),
-                name: name.into(),
-                description: description.into(),
-                owner: account.into(),
-                is_default: false,
-                ingress: Vec::new(),
-                egress: default_egress(),
-                guard: Arc::new(()),
-            },
-        );
+        let id = input.resource_id("sg");
+        let group = SecurityGroup {
+            id: id.clone(),
+            vpc_id: vpc_id.into(),
+            name: name.into(),
+            description: description.into(),
+            owner: account.into(),
+            is_default: false,
+            ingress: Vec::new(),
+            egress: default_egress(),
+            guard: Arc::new(()),
+        };
+        self.persist(&key, &[Change::put("sg", &id, &group)?])?;
+        scope.security_groups.insert(id.clone(), group);
+
         Ok(format!("<return>true</return><groupId>{}</groupId><securityGroupArn>arn:aws:ec2:{}:{}:security-group/{}</securityGroupArn>", escape(&id), escape(region), escape(account), escape(&id)))
     }
 
@@ -1199,7 +1312,7 @@ impl Ec2Handler {
         input.dry_run()?;
         let id = input.required("GroupId")?;
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         let group = scope.security_groups.get(id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidGroup.NotFound",
@@ -1220,6 +1333,14 @@ impl Ec2Handler {
                 .vpc_endpoints
                 .values()
                 .any(|endpoint| endpoint.group_ids.iter().any(|group| group == id))
+            || scope.security_groups.values().any(|other| {
+                other.id != id
+                    && other
+                        .ingress
+                        .iter()
+                        .chain(&other.egress)
+                        .any(|rule| matches!(&rule.peer, RulePeer::Group(peer) if peer == id))
+            })
             || Arc::strong_count(&group.guard) > 1
         {
             return Err(Ec2Error::new(
@@ -1227,6 +1348,7 @@ impl Ec2Handler {
                 "The security group has dependencies and cannot be deleted",
             ));
         }
+        self.persist(&key, &[Change::delete("sg", id)])?;
         scope.security_groups.remove(id);
         Ok("<return>true</return>".into())
     }
@@ -1236,37 +1358,7 @@ impl Ec2Handler {
         key: (String, String),
         input: &Input,
     ) -> Result<String, Ec2Error> {
-        input.allow_ingress()?;
-        input.dry_run()?;
-        let id = input.required("GroupId")?;
-        let (protocol, from_port, to_port, cidr) = input.ingress_rule()?;
-        let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
-        let group = scope.security_groups.get_mut(id).ok_or_else(|| {
-            Ec2Error::new(
-                "InvalidGroup.NotFound",
-                format!("The security group '{id}' does not exist"),
-            )
-        })?;
-        if group.ingress.iter().any(|r| {
-            r.protocol == protocol
-                && r.from_port == from_port
-                && r.to_port == to_port
-                && r.cidr == cidr
-        }) {
-            return Err(Ec2Error::new(
-                "InvalidPermission.Duplicate",
-                "The specified rule already exists",
-            ));
-        }
-        let rule_id = resource_id("sgr");
-        group.ingress.push(IngressRule {
-            protocol: protocol.clone(),
-            from_port,
-            to_port,
-            cidr,
-        });
-        Ok(format!("<return>true</return><securityGroupRuleSet><item><groupId>{}</groupId><securityGroupRuleId>{}</securityGroupRuleId><isEgress>false</isEgress><ipProtocol>{}</ipProtocol>{}<cidrIpv4>{}</cidrIpv4></item></securityGroupRuleSet>", escape(id), escape(&rule_id), escape(&protocol), ports_xml(from_port, to_port), cidr))
+        self.change_security_rule(key, input, false, true)
     }
 
     fn revoke_security_group_ingress(
@@ -1274,32 +1366,7 @@ impl Ec2Handler {
         key: (String, String),
         input: &Input,
     ) -> Result<String, Ec2Error> {
-        input.allow_ingress()?;
-        input.dry_run()?;
-        let id = input.required("GroupId")?;
-        let (protocol, from_port, to_port, cidr) = input.ingress_rule()?;
-        let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
-        let group = scope.security_groups.get_mut(id).ok_or_else(|| {
-            Ec2Error::new(
-                "InvalidGroup.NotFound",
-                format!("The security group '{id}' does not exist"),
-            )
-        })?;
-        let before = group.ingress.len();
-        group.ingress.retain(|rule| {
-            !(rule.protocol == protocol
-                && rule.from_port == from_port
-                && rule.to_port == to_port
-                && rule.cidr == cidr)
-        });
-        if group.ingress.len() == before {
-            return Err(Ec2Error::new(
-                "InvalidPermission.NotFound",
-                "The specified rule does not exist",
-            ));
-        }
-        Ok("<return>true</return>".into())
+        self.change_security_rule(key, input, false, false)
     }
 
     fn create_network_interface(
@@ -1339,7 +1406,7 @@ impl Ec2Handler {
             ));
         }
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         if let Some(token) = token {
             if let Some(previous) = scope.eni_tokens.get(token) {
                 if previous.params != params {
@@ -1436,7 +1503,7 @@ impl Ec2Handler {
                     )
                 })?,
         };
-        let id = resource_id("eni");
+        let id = input.resource_id("eni");
         let eni = NetworkInterface {
             id: id.clone(),
             subnet_id: subnet_id.into(),
@@ -1447,6 +1514,18 @@ impl Ec2Handler {
             owner: account.into(),
             group_ids,
         };
+        let mut changes = vec![Change::put("eni", &id, &eni)?];
+        if let Some(token) = token {
+            changes.push(Change::put(
+                "eni-token",
+                token,
+                &IdempotentEni {
+                    params: params.clone(),
+                    eni_id: id.clone(),
+                },
+            )?);
+        }
+        self.persist(&key, &changes)?;
         scope.network_interfaces.insert(id.clone(), eni.clone());
         if let Some(token) = token {
             scope
@@ -1544,7 +1623,7 @@ impl Ec2Handler {
         input.dry_run()?;
         let id = input.required("NetworkInterfaceId")?;
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         if !scope.network_interfaces.contains_key(id) {
             return Err(Ec2Error::new(
                 "InvalidNetworkInterfaceID.NotFound",
@@ -1571,6 +1650,15 @@ impl Ec2Handler {
                 "The network interface is a route target",
             ));
         }
+        let mut changes = vec![Change::delete("eni", id)];
+        changes.extend(
+            scope
+                .eni_tokens
+                .iter()
+                .filter(|(_, record)| record.eni_id == id)
+                .map(|(token, _)| Change::delete("eni-token", token)),
+        );
+        self.persist(&key, &changes)?;
         scope.network_interfaces.remove(id);
         scope.eni_tokens.retain(|_, record| record.eni_id != id);
         Ok("<return>true</return>".into())
@@ -1595,7 +1683,7 @@ impl Ec2Handler {
             ));
         }
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         if let Some(token) = token {
             if let Some((previous_vpc, table_id)) = scope.route_table_tokens.get(token) {
                 if previous_vpc != vpc_id {
@@ -1620,7 +1708,7 @@ impl Ec2Handler {
             )
         })?;
         let table = RouteTable {
-            id: resource_id("rtb"),
+            id: input.resource_id("rtb"),
             vpc_id: vpc_id.into(),
             owner: account.into(),
             main: false,
@@ -1629,6 +1717,15 @@ impl Ec2Handler {
             associations: BTreeMap::new(),
         };
         let xml = route_table_xml(&table);
+        let mut changes = vec![Change::put("route-table", &table.id, &table)?];
+        if let Some(token) = token {
+            changes.push(Change::put(
+                "route-token",
+                token,
+                &(vpc_id.to_owned(), table.id.clone()),
+            )?);
+        }
+        self.persist(&key, &changes)?;
         if let Some(token) = token {
             scope
                 .route_table_tokens
@@ -1711,7 +1808,7 @@ impl Ec2Handler {
         input.dry_run()?;
         let id = input.required("RouteTableId")?;
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         let table = scope.route_tables.get(id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidRouteTableID.NotFound",
@@ -1724,6 +1821,15 @@ impl Ec2Handler {
                 "The route table has associations or is the main route table",
             ));
         }
+        let mut changes = vec![Change::delete("route-table", id)];
+        changes.extend(
+            scope
+                .route_table_tokens
+                .iter()
+                .filter(|(_, (_, table_id))| table_id == id)
+                .map(|(token, _)| Change::delete("route-token", token)),
+        );
+        self.persist(&key, &changes)?;
         scope.route_tables.remove(id);
         scope
             .route_table_tokens
@@ -1760,7 +1866,7 @@ impl Ec2Handler {
             ));
         }
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         let table = scope.route_tables.get(id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidRouteTableID.NotFound",
@@ -1811,7 +1917,7 @@ impl Ec2Handler {
             }
             RouteTarget::NatGateway(nat_id.into())
         };
-        let table = scope.route_tables.get_mut(id).unwrap();
+        let mut table = scope.route_tables.get(id).unwrap().clone();
         if table.routes.contains_key(&destination) {
             return Err(Ec2Error::new(
                 "RouteAlreadyExists",
@@ -1819,6 +1925,8 @@ impl Ec2Handler {
             ));
         }
         table.routes.insert(destination, target);
+        self.persist(&key, &[Change::put("route-table", id, &table)?])?;
+        scope.route_tables.insert(id.into(), table);
         Ok("<return>true</return>".into())
     }
 
@@ -1837,8 +1945,8 @@ impl Ec2Handler {
             "DestinationCidrBlock",
         )?;
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
-        let table = scope.route_tables.get_mut(id).ok_or_else(|| {
+        let scope = state.entry(key.clone()).or_default();
+        let mut table = scope.route_tables.get(id).cloned().ok_or_else(|| {
             Ec2Error::new(
                 "InvalidRouteTableID.NotFound",
                 format!("The route table ID '{id}' does not exist"),
@@ -1860,6 +1968,8 @@ impl Ec2Handler {
             Some(_) => {}
         }
         table.routes.remove(&destination);
+        self.persist(&key, &[Change::put("route-table", id, &table)?])?;
+        scope.route_tables.insert(id.into(), table);
         Ok("<return>true</return>".into())
     }
 
@@ -1873,7 +1983,7 @@ impl Ec2Handler {
         let id = input.required("RouteTableId")?;
         let subnet_id = input.required("SubnetId")?;
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         let subnet = scope.subnets.get(subnet_id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidSubnetID.NotFound",
@@ -1903,12 +2013,12 @@ impl Ec2Handler {
             ));
         }
         let association_id = resource_id("rtbassoc");
-        scope
-            .route_tables
-            .get_mut(id)
-            .unwrap()
+        let mut table = table.clone();
+        table
             .associations
             .insert(association_id.clone(), Some(subnet_id.into()));
+        self.persist(&key, &[Change::put("route-table", id, &table)?])?;
+        scope.route_tables.insert(id.into(), table);
         Ok(format!("<associationId>{association_id}</associationId><associationState><state>associated</state></associationState>"))
     }
 
@@ -1921,10 +2031,10 @@ impl Ec2Handler {
         input.dry_run()?;
         let id = input.required("AssociationId")?;
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         let table = scope
             .route_tables
-            .values_mut()
+            .values()
             .find(|table| table.associations.contains_key(id))
             .ok_or_else(|| {
                 Ec2Error::new(
@@ -1938,7 +2048,10 @@ impl Ec2Handler {
                 "The main route table association cannot be disassociated",
             ));
         }
+        let mut table = table.clone();
         table.associations.remove(id);
+        self.persist(&key, &[Change::put("route-table", &table.id, &table)?])?;
+        scope.route_tables.insert(table.id.clone(), table);
         Ok("<return>true</return>".into())
     }
 }
@@ -1964,8 +2077,16 @@ fn route_table_xml(table: &RouteTable) -> String {
     }).collect::<String>();
     format!("<routeTableId>{}</routeTableId><vpcId>{}</vpcId><ownerId>{}</ownerId><routeSet>{routes}{endpoint_routes}</routeSet><associationSet>{associations}</associationSet><propagatingVgwSet/><tagSet/>", escape(&table.id), escape(&table.vpc_id), escape(&table.owner))
 }
+enum PreparedInstance {
+    Replay(String),
+    Launch(InstanceSpec),
+}
 impl Ec2Handler {
-    async fn run_instances(&self, req: &ServiceRequest, input: &Input) -> Result<String, Ec2Error> {
+    fn prepare_instance(
+        &self,
+        req: &ServiceRequest,
+        input: &Input,
+    ) -> Result<PreparedInstance, Ec2Error> {
         for key in input.fields.keys() {
             if [
                 "Action",
@@ -2015,13 +2136,12 @@ impl Ec2Handler {
         }
         let params = input.eni_idempotency_params();
         let key = (req.account_id.clone(), req.region.clone());
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| {
-                Ec2Error::new("UnsupportedOperation", "Instance runtime is not configured")
-            })?
-            .clone();
+        if self.runtime.is_none() {
+            return Err(Ec2Error::new(
+                "UnsupportedOperation",
+                "Instance runtime is not configured",
+            ));
+        }
         let spec = {
             let mut state = self.scopes.lock().unwrap();
             let scope = state.entry(key.clone()).or_default();
@@ -2034,7 +2154,7 @@ impl Ec2Handler {
                         ));
                     }
                     if let Some(instance) = scope.instances.get(&previous.instance_id) {
-                        return Ok(format!("<reservationId>{}</reservationId><ownerId>{}</ownerId><groupSet/><instancesSet><item>{}</item></instancesSet>", escape(&format!("r-{}", &instance.spec.instance_id[2..])), escape(&req.account_id), instance_xml(instance, scope)));
+                        return Ok(PreparedInstance::Replay(format!("<reservationId>{}</reservationId><ownerId>{}</ownerId><groupSet/><instancesSet><item>{}</item></instancesSet>", escape(&format!("r-{}", &instance.spec.instance_id[2..])), escape(&req.account_id), instance_xml(instance, scope))));
                     }
                 }
             }
@@ -2094,7 +2214,7 @@ impl Ec2Handler {
                     )
                 })?;
             let spec = InstanceSpec {
-                instance_id: resource_id("i"),
+                instance_id: input.resource_id("i"),
                 image_id: image.into(),
                 instance_type: kind.into(),
                 vpc_id: subnet.vpc_id.clone(),
@@ -2104,7 +2224,7 @@ impl Ec2Handler {
                 guest_port: 8080,
             };
             let eni = NetworkInterface {
-                id: resource_id("eni"),
+                id: input.resource_id("eni"),
                 subnet_id: subnet.id.clone(),
                 vpc_id: subnet.vpc_id.clone(),
                 zone: subnet.zone.clone(),
@@ -2114,16 +2234,26 @@ impl Ec2Handler {
                 group_ids: ids,
             };
             let eni_id = eni.id.clone();
-            scope.network_interfaces.insert(eni_id.clone(), eni);
-            scope.instances.insert(
-                spec.instance_id.clone(),
-                Instance {
-                    spec: spec.clone(),
-                    eni_id,
-                    state: InstanceState::Pending,
-                    endpoint: None,
-                },
-            );
+            let instance = Instance {
+                spec: spec.clone(),
+                eni_id: eni_id.clone(),
+                state: InstanceState::Pending,
+                endpoint: None,
+            };
+            let mut changes = vec![Change::put("instance", &spec.instance_id, &instance)?];
+            if let Some(token) = token {
+                changes.push(Change::put(
+                    "instance-token",
+                    token,
+                    &IdempotentInstance {
+                        params: params.clone(),
+                        instance_id: spec.instance_id.clone(),
+                    },
+                )?);
+            }
+            self.persist(&key, &changes)?;
+            scope.network_interfaces.insert(eni_id, eni);
+            scope.instances.insert(spec.instance_id.clone(), instance);
             if let Some(token) = token {
                 scope.instance_tokens.insert(
                     token.into(),
@@ -2135,6 +2265,31 @@ impl Ec2Handler {
             }
             spec
         };
+        Ok(PreparedInstance::Launch(spec))
+    }
+
+    async fn run_instances(&self, req: &ServiceRequest, input: &Input) -> Result<String, Ec2Error> {
+        let handler = self.clone();
+        let operation_request = req.clone();
+        let operation_input = input.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            handler.prepare_instance(&operation_request, &operation_input)
+        })
+        .await
+        .map_err(|_| {
+            Ec2Error::new(
+                "InternalError",
+                "EC2 instance preparation worker unavailable",
+            )
+        })??;
+        let spec = match prepared {
+            PreparedInstance::Replay(xml) => return Ok(xml),
+            PreparedInstance::Launch(spec) => spec,
+        };
+        let runtime = self.runtime.clone().ok_or_else(|| {
+            Ec2Error::new("UnsupportedOperation", "Instance runtime is not configured")
+        })?;
+        let key = (req.account_id.clone(), req.region.clone());
         let started = runtime.start_instance(&spec).await;
         let healthy = if started.is_ok() {
             probe_instance(runtime.as_ref(), &spec).await
@@ -2184,9 +2339,9 @@ impl Ec2Handler {
                 "Instance was terminated during startup",
             ));
         };
-        let scopes = self.scopes.clone();
+        let handler = self.clone();
         tokio::spawn(async move {
-            serve_instance_proxy(listener, scopes, key, spec, runtime).await;
+            serve_instance_proxy(listener, handler, key, spec, runtime).await;
         });
         Ok(xml)
     }
@@ -2227,7 +2382,7 @@ impl Ec2Handler {
             };
             for id in running {
                 if !runtime.instance_running(&id).await {
-                    self.mark_terminated(&key, &id);
+                    self.mark_terminated(&key, &id).await?;
                 }
             }
         }
@@ -2275,8 +2430,13 @@ impl Ec2Handler {
         let runtime = self.runtime.as_ref().ok_or_else(|| {
             Ec2Error::new("UnsupportedOperation", "Instance runtime is not configured")
         })?;
-        let previous = {
-            let mut state = self.scopes.lock().unwrap();
+        let handler = self.clone();
+        let operation_key = key.clone();
+        let operation_ids = ids.clone();
+        let previous = tokio::task::spawn_blocking(move || {
+            let key = operation_key;
+            let ids = operation_ids;
+            let mut state = handler.scopes.lock().unwrap();
             let scope = state.entry(key.clone()).or_default();
             for id in &ids {
                 if !scope.instances.contains_key(id) {
@@ -2286,25 +2446,41 @@ impl Ec2Handler {
                     ));
                 }
             }
+            let mut proposed = Vec::new();
             let mut previous = Vec::new();
+            let mut changes = Vec::new();
             for id in &ids {
-                let instance = scope.instances.get_mut(id).expect("validated");
-                let old = instance.state;
-                if old == InstanceState::Running || old == InstanceState::Pending {
+                let mut instance = scope.instances.get(id).expect("validated").clone();
+                previous.push(instance.state);
+                if instance.state != InstanceState::Terminated {
                     instance.state = InstanceState::ShuttingDown;
                     instance.endpoint = None;
+                    changes.push(Change::put("instance", id, &instance)?);
+                    proposed.push(instance);
                 }
-                previous.push(old);
             }
-            previous
-        };
+            handler.persist(&key, &changes)?;
+            for instance in proposed {
+                scope
+                    .instances
+                    .insert(instance.spec.instance_id.clone(), instance);
+            }
+            Ok::<_, Ec2Error>(previous)
+        })
+        .await
+        .map_err(|_| {
+            Ec2Error::new(
+                "InternalError",
+                "EC2 instance termination worker unavailable",
+            )
+        })??;
         let mut body = String::new();
         for (id, old) in ids.iter().zip(previous) {
             if old != InstanceState::Terminated {
                 if runtime.stop_instance(id).await.is_err() {
                     return Err(Ec2Error::new("InternalError", "Could not stop instance"));
                 }
-                self.mark_terminated(&key, id);
+                self.mark_terminated(&key, id).await?;
             }
             body.push_str(&format!("<item><instanceId>{}</instanceId><currentState><code>48</code><name>terminated</name></currentState><previousState><code>{}</code><name>{}</name></previousState></item>", escape(id), instance_state_code(old), instance_state(old)));
         }
@@ -2318,32 +2494,64 @@ impl Ec2Handler {
         runtime: &dyn InstanceRuntime,
     ) {
         let stopped = runtime.stop_instance(id).await.is_ok();
-        let mut state = self.scopes.lock().unwrap();
-        if let Some(scope) = state.get_mut(key) {
-            if stopped {
-                if let Some(instance) = scope.instances.remove(id) {
-                    scope.network_interfaces.remove(&instance.eni_id);
+        let handler = self.clone();
+        let key = key.clone();
+        let id = id.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut state = handler.scopes.lock().unwrap();
+            if let Some(scope) = state.get_mut(&key) {
+                if stopped {
+                    let mut changes = vec![Change::delete("instance", &id)];
+                    changes.extend(
+                        scope
+                            .instance_tokens
+                            .iter()
+                            .filter(|(_, record)| record.instance_id == id)
+                            .map(|(token, _)| Change::delete("instance-token", token)),
+                    );
+                    handler.persist(&key, &changes)?;
+                    if let Some(instance) = scope.instances.remove(&id) {
+                        scope.network_interfaces.remove(&instance.eni_id);
+                    }
+                    scope
+                        .instance_tokens
+                        .retain(|_, record| record.instance_id != id);
+                } else if let Some(instance) = scope.instances.get(&id) {
+                    let mut instance = instance.clone();
+                    instance.state = InstanceState::ShuttingDown;
+                    instance.endpoint = None;
+                    handler.persist(&key, &[Change::put("instance", &id, &instance)?])?;
+                    scope.instances.insert(id, instance);
                 }
-                scope
-                    .instance_tokens
-                    .retain(|_, record| record.instance_id != id);
-            } else if let Some(instance) = scope.instances.get_mut(id) {
-                instance.state = InstanceState::ShuttingDown;
-                instance.endpoint = None;
             }
+            Ok::<_, Ec2Error>(())
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!("EC2 failed instance cleanup remains pending");
         }
     }
 
-    fn mark_terminated(&self, key: &(String, String), id: &str) {
-        let mut state = self.scopes.lock().unwrap();
-        if let Some(scope) = state.get_mut(key) {
-            if let Some(instance) = scope.instances.get_mut(id) {
-                instance.state = InstanceState::Terminated;
-                instance.endpoint = None;
-                let eni_id = instance.eni_id.clone();
-                scope.network_interfaces.remove(&eni_id);
+    async fn mark_terminated(&self, key: &(String, String), id: &str) -> Result<(), Ec2Error> {
+        let handler = self.clone();
+        let key = key.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut state = handler.scopes.lock().unwrap();
+            if let Some(scope) = state.get_mut(&key) {
+                if let Some(instance) = scope.instances.get(&id) {
+                    let mut instance = instance.clone();
+                    instance.state = InstanceState::Terminated;
+                    instance.endpoint = None;
+                    handler.persist(&key, &[Change::put("instance", &id, &instance)?])?;
+                    scope.network_interfaces.remove(&instance.eni_id);
+                    scope.instances.insert(id, instance);
+                }
             }
-        }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Ec2Error::new("InternalError", "EC2 instance cleanup worker unavailable"))?
     }
 
     pub async fn shutdown(&self) {
@@ -2364,8 +2572,10 @@ impl Ec2Handler {
                 .collect::<Vec<_>>()
         };
         for (key, id) in instances {
-            if runtime.stop_instance(&id).await.is_ok() {
-                self.mark_terminated(&key, &id);
+            if runtime.stop_instance(&id).await.is_ok()
+                && self.mark_terminated(&key, &id).await.is_err()
+            {
+                tracing::warn!("EC2 instance termination persistence remains pending");
             }
         }
     }
@@ -2377,6 +2587,7 @@ fn instance_state(state: InstanceState) -> &'static str {
         InstanceState::Running => "running",
         InstanceState::ShuttingDown => "shutting-down",
         InstanceState::Terminated => "terminated",
+        InstanceState::Stopped => "stopped",
     }
 }
 fn instance_state_code(state: InstanceState) -> u16 {
@@ -2385,6 +2596,7 @@ fn instance_state_code(state: InstanceState) -> u16 {
         InstanceState::Running => 16,
         InstanceState::ShuttingDown => 32,
         InstanceState::Terminated => 48,
+        InstanceState::Stopped => 80,
     }
 }
 fn instance_xml(instance: &Instance, scope: &ScopeState) -> String {
@@ -2435,11 +2647,12 @@ async fn probe_instance(runtime: &dyn InstanceRuntime, spec: &InstanceSpec) -> b
 
 async fn serve_instance_proxy(
     listener: TcpListener,
-    scopes: Arc<Mutex<HashMap<(String, String), ScopeState>>>,
+    handler: Ec2Handler,
     key: (String, String),
     spec: InstanceSpec,
     runtime: Arc<dyn InstanceRuntime>,
 ) {
+    let scopes = handler.scopes.clone();
     loop {
         let accepted =
             tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await;
@@ -2454,14 +2667,12 @@ async fn serve_instance_proxy(
             break;
         }
         if !runtime.instance_running(&spec.instance_id).await {
-            let mut state = scopes.lock().unwrap();
-            if let Some(scope) = state.get_mut(&key) {
-                if let Some(instance) = scope.instances.get_mut(&spec.instance_id) {
-                    instance.state = InstanceState::Terminated;
-                    instance.endpoint = None;
-                    let eni_id = instance.eni_id.clone();
-                    scope.network_interfaces.remove(&eni_id);
-                }
+            if handler
+                .mark_terminated(&key, &spec.instance_id)
+                .await
+                .is_err()
+            {
+                tracing::warn!("EC2 exited instance state persistence remains pending");
             }
             break;
         }
@@ -2478,7 +2689,7 @@ async fn serve_instance_proxy(
                         && spec.security_group_ids.iter().any(|id| {
                             scope.security_groups.get(id).is_some_and(|group| {
                                 group.ingress.iter().any(|rule| {
-                                    rule.cidr.contains(&source)
+                                    rule.peer.contains(&source)
                                         && (rule.protocol == "-1"
                                             || (rule.protocol == "tcp"
                                                 && rule
@@ -2530,10 +2741,13 @@ impl NativeHandler for Ec2Handler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        let input = match Input::parse(&request) {
+        let mut input = match Input::parse(&request) {
             Ok(input) => input,
             Err(error) => return error.into_response(&request.request_id),
         };
+        if let Err(error) = self.authorize_input(&request, &mut input) {
+            return error.into_response(&request.request_id);
+        }
         let action = input.one("Action").ok().flatten().unwrap_or("Unknown");
         if let Ok(Some(version)) = input.one("Version") {
             if version != "2016-11-15" {
@@ -2545,7 +2759,21 @@ impl NativeHandler for Ec2Handler {
             "RunInstances" => self.run_instances(&request, &input).await,
             "DescribeInstances" => self.describe_instances(&request, &input).await,
             "TerminateInstances" => self.terminate_instances(&request, &input).await,
-            _ => self.dispatch(&request, &input),
+            _ => {
+                let handler = self.clone();
+                let operation_request = request.clone();
+                let operation_input = input.clone();
+                tokio::task::spawn_blocking(move || {
+                    handler.dispatch(&operation_request, &operation_input)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Ec2Error::new(
+                        "InternalError",
+                        "EC2 topology worker unavailable",
+                    ))
+                })
+            }
         };
         match result {
             Ok(inner) => {
@@ -2562,18 +2790,21 @@ impl NativeHandler for Ec2Handler {
     }
 }
 
-pub fn register(registry: &ServiceRegistry) -> Arc<Ec2Handler> {
-    register_handler(registry, Arc::new(Ec2Handler::default()))
+pub fn register(registry: &Arc<ServiceRegistry>) -> Arc<Ec2Handler> {
+    let handler = Ec2Handler {
+        registry: Some(Arc::downgrade(registry)),
+        ..Ec2Handler::default()
+    };
+    register_handler(registry, Arc::new(handler))
 }
 
 pub fn register_with_instance_runtime(
-    registry: &ServiceRegistry,
+    registry: &Arc<ServiceRegistry>,
     runtime: Arc<dyn InstanceRuntime>,
 ) -> Arc<Ec2Handler> {
-    register_handler(
-        registry,
-        Arc::new(Ec2Handler::with_instance_runtime(runtime)),
-    )
+    let mut handler = Ec2Handler::with_instance_runtime(runtime);
+    handler.registry = Some(Arc::downgrade(registry));
+    register_handler(registry, Arc::new(handler))
 }
 
 fn register_handler(registry: &ServiceRegistry, handler: Arc<Ec2Handler>) -> Arc<Ec2Handler> {
@@ -2657,7 +2888,11 @@ impl Ec2Error {
             escape(request_id),
         );
         Response::builder()
-            .status(400)
+            .status(match self.code {
+                "InternalError" => 500,
+                "UnauthorizedOperation" => 403,
+                _ => 400,
+            })
             .header("content-type", "text/xml")
             .header("x-amzn-RequestId", request_id)
             .body(Body::from(body))
@@ -2665,11 +2900,20 @@ impl Ec2Error {
     }
 }
 
+#[derive(Clone)]
 struct Input {
+    planned_ids: BTreeMap<String, String>,
     fields: BTreeMap<String, Vec<String>>,
 }
 
 impl Input {
+    fn resource_id(&self, kind: &str) -> String {
+        self.planned_ids
+            .get(kind)
+            .cloned()
+            .unwrap_or_else(|| resource_id(kind))
+    }
+
     fn parse(req: &ServiceRequest) -> Result<Self, Ec2Error> {
         let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (name, value) in form_urlencoded::parse(req.uri.query().unwrap_or("").as_bytes())
@@ -2686,7 +2930,10 @@ impl Input {
                 "Duplicate query parameter",
             ));
         }
-        Ok(Self { fields })
+        Ok(Self {
+            fields,
+            planned_ids: BTreeMap::new(),
+        })
     }
     fn one(&self, name: &str) -> Result<Option<&str>, Ec2Error> {
         Ok(self
@@ -2817,6 +3064,8 @@ impl Input {
             "IpPermissions.1.FromPort",
             "IpPermissions.1.ToPort",
             "IpPermissions.1.IpRanges.1.CidrIp",
+            "IpPermissions.1.Groups.1.GroupId",
+            "IpPermissions.1.Groups.1.UserId",
         ];
         for key in self.fields.keys() {
             if !flat.contains(&key.as_str()) && !nested.contains(&key.as_str()) {
@@ -2826,7 +3075,7 @@ impl Input {
         Ok(())
     }
 
-    fn ingress_rule(&self) -> Result<(String, Option<u16>, Option<u16>, Ipv4Net), Ec2Error> {
+    fn ingress_rule(&self) -> Result<(String, Option<u16>, Option<u16>, RulePeer), Ec2Error> {
         let nested = self
             .fields
             .keys()
@@ -2881,8 +3130,28 @@ impl Input {
             }
             (Some(from), Some(to))
         };
-        let cidr = parse_any_ipv4_cidr(self.required(cidr_key)?, "CidrIp")?;
-        Ok((protocol.into(), from_port, to_port, cidr))
+        let peer = match (
+            self.one(cidr_key)?,
+            self.one("IpPermissions.1.Groups.1.GroupId")?,
+        ) {
+            (Some(cidr), None) => RulePeer::Cidr(parse_any_ipv4_cidr(cidr, "CidrIp")?),
+            (None, Some(id)) if !id.is_empty() => RulePeer::Group(id.into()),
+            _ => {
+                return Err(Ec2Error::new(
+                    "InvalidParameterValue",
+                    "Specify exactly one CIDR or security group peer",
+                ))
+            }
+        };
+        if self.one("IpPermissions.1.Groups.1.UserId")?.is_some()
+            && !matches!(peer, RulePeer::Group(_))
+        {
+            return Err(Ec2Error::new(
+                "InvalidParameterValue",
+                "UserId requires a security group peer",
+            ));
+        }
+        Ok((protocol.into(), from_port, to_port, peer))
     }
 
     fn eni_idempotency_params(&self) -> BTreeMap<String, String> {
@@ -2945,11 +3214,18 @@ fn group_xml(group: &SecurityGroup) -> String {
     } else {
         String::new()
     };
-    ingress.push_str(&group.ingress.iter().map(|rule| format!(
-        "<item><ipProtocol>{}</ipProtocol>{}<groups/><ipRanges><item><cidrIp>{}</cidrIp></item></ipRanges><ipv6Ranges/><prefixListIds/></item>",
-        escape(&rule.protocol), ports_xml(rule.from_port, rule.to_port), rule.cidr
-    )).collect::<String>());
-    let egress = group.egress.iter().map(|rule| format!("<item><ipProtocol>{}</ipProtocol>{}<groups/><ipRanges><item><cidrIp>{}</cidrIp></item></ipRanges><ipv6Ranges/><prefixListIds/></item>", escape(&rule.protocol), ports_xml(rule.from_port, rule.to_port), rule.cidr)).collect::<String>();
+    ingress.push_str(
+        &group
+            .ingress
+            .iter()
+            .map(|rule| permission_xml(rule, &group.owner))
+            .collect::<String>(),
+    );
+    let egress = group
+        .egress
+        .iter()
+        .map(|rule| permission_xml(rule, &group.owner))
+        .collect::<String>();
     format!("<ownerId>{}</ownerId><groupId>{}</groupId><groupName>{}</groupName><groupDescription>{}</groupDescription><vpcId>{}</vpcId><ipPermissions>{ingress}</ipPermissions><ipPermissionsEgress>{egress}</ipPermissionsEgress><tagSet/>",
         escape(&group.owner), escape(&group.id), escape(&group.name), escape(&group.description), escape(&group.vpc_id))
 }
@@ -3048,7 +3324,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
 
-    fn request(account: &str, region: &str, form: &str) -> ServiceRequest {
+    pub(super) fn request(account: &str, region: &str, form: &str) -> ServiceRequest {
         ServiceRequest {
             method: axum::http::Method::POST,
             uri: "/".parse().unwrap(),
@@ -3060,7 +3336,12 @@ mod tests {
         }
     }
 
-    async fn call(handler: &Ec2Handler, account: &str, region: &str, form: &str) -> (u16, String) {
+    pub(super) async fn call(
+        handler: &Ec2Handler,
+        account: &str,
+        region: &str,
+        form: &str,
+    ) -> (u16, String) {
         let response = handler.handle(request(account, region, form)).await;
         let status = response.status().as_u16();
         let body = String::from_utf8(
@@ -3073,7 +3354,7 @@ mod tests {
         (status, body)
     }
 
-    fn id(xml: &str, tag: &str) -> String {
+    pub(super) fn id(xml: &str, tag: &str) -> String {
         xml.split(&format!("<{tag}>"))
             .nth(1)
             .unwrap()
@@ -3571,6 +3852,225 @@ mod tests {
             200
         );
     }
+    #[tokio::test]
+    async fn alb_security_group_references_enforce_both_sides_and_owned_source() {
+        let h = Ec2Handler::default();
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.55.0.0%2F16",
+        )
+        .await;
+        let vpc = id(&body, "vpcId");
+        let mut subnets = Vec::new();
+        for (number, zone) in [(1, "a"), (2, "b")] {
+            let (status, body) = call(&h, "111", "us-east-1", &format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.55.{number}.0%2F24&AvailabilityZone=us-east-1{zone}")).await;
+            assert_eq!(status, 200, "{body}");
+            subnets.push(id(&body, "subnetId"));
+        }
+        let mut groups = Vec::new();
+        for name in ["alb", "app", "unused"] {
+            let (_, body) = call(&h, "111", "us-east-1", &format!("Action=CreateSecurityGroup&VpcId={vpc}&GroupName={name}&GroupDescription={name}")).await;
+            groups.push(id(&body, "groupId"));
+        }
+        let lease = h
+            .alb_network_lease("111", "us-east-1", &subnets, &groups[..1])
+            .unwrap();
+        let target = h
+            .reserve_task_network("111", "us-east-1", &subnets[0], &groups[1..2], "ecs-task")
+            .unwrap();
+        assert_ne!(target.private_ip, lease.source_networks[0].private_ip);
+        let endpoint = "127.0.0.1:12345".parse().unwrap();
+        assert!(target.set_endpoint(8080, endpoint));
+        let access = || h.alb_target_access("111", "us-east-1", &lease, target.private_ip, 8080);
+        assert_eq!(access(), None);
+        let reference = format!("GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=8080&IpPermissions.1.ToPort=8080&IpPermissions.1.Groups.1.GroupId={}&IpPermissions.1.Groups.1.UserId=111", groups[1],groups[0]);
+        for (action, expected) in [
+            ("AuthorizeSecurityGroupIngress", 200),
+            ("AuthorizeSecurityGroupIngress", 400),
+        ] {
+            let (status, body) = call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action={action}&{reference}"),
+            )
+            .await;
+            assert_eq!(status, expected, "{body}");
+        }
+        assert_eq!(access(), Some(endpoint));
+        assert_eq!(
+            h.private_target_owner("111", "us-east-1", &vpc, target.private_ip, 8080),
+            Some(PrivateTargetOwner::Task("ecs-task".into()))
+        );
+        assert_eq!(
+            h.alb_target_access("222", "us-east-1", &lease, target.private_ip, 8080),
+            None
+        );
+        assert_eq!(
+            h.alb_target_access("111", "us-west-2", &lease, target.private_ip, 8080),
+            None
+        );
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=DescribeSecurityGroups&GroupId.1={}", groups[1]),
+        )
+        .await;
+        assert!(body.contains(&format!(
+            "<groups><item><userId>111</userId><groupId>{}</groupId>",
+            groups[0]
+        )));
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=DeleteSecurityGroup&GroupId={}", groups[0]),
+        )
+        .await;
+        assert!(body.contains("DependencyViolation"));
+        let default_egress = format!("GroupId={}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0",groups[0]);
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=RevokeSecurityGroupEgress&{default_egress}")
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(access(), None);
+        let egress = format!("GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=8080&IpPermissions.1.ToPort=8080&IpPermissions.1.Groups.1.GroupId={}",groups[0],groups[1]);
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=AuthorizeSecurityGroupEgress&{egress}")
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(access(), Some(endpoint));
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=RevokeSecurityGroupIngress&{reference}")
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(access(), None);
+        let wrong_owner = reference.replace("UserId=111", "UserId=222");
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=AuthorizeSecurityGroupIngress&{wrong_owner}")
+            )
+            .await
+            .0,
+            400
+        );
+        // A second VPC's group cannot be referenced through same-account access.
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.56.0.0%2F16",
+        )
+        .await;
+        let other_vpc = id(&body, "vpcId");
+        let (_, body) = call(&h,"111","us-east-1",&format!("Action=CreateSecurityGroup&VpcId={other_vpc}&GroupName=other&GroupDescription=other")).await;
+        let foreign = reference.replace(&groups[0], &id(&body, "groupId"));
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=AuthorizeSecurityGroupIngress&{foreign}")
+            )
+            .await
+            .0,
+            400
+        );
+        // ALB ENIs live until the last lease clone is dropped.
+        let source_ids: Vec<_> = lease
+            .source_networks
+            .iter()
+            .map(|network| network.eni_id.clone())
+            .collect();
+        let clone = lease.clone();
+        drop(lease);
+        {
+            let state = h.scopes.lock().unwrap();
+            let scope = &state[&("111".into(), "us-east-1".into())];
+            assert!(source_ids
+                .iter()
+                .all(|id| scope.network_interfaces.contains_key(id)));
+        }
+        drop(clone);
+        {
+            let state = h.scopes.lock().unwrap();
+            let scope = &state[&("111".into(), "us-east-1".into())];
+            assert!(source_ids
+                .iter()
+                .all(|id| !scope.network_interfaces.contains_key(id)));
+        }
+        // Rule references alone protect a group even with no ENI/lease remaining.
+        let unused = reference.replace(&groups[1], &groups[2]);
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=AuthorizeSecurityGroupIngress&{unused}")
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, body) = call(
+            &h,
+            "111",
+            "us-east-1",
+            &format!("Action=DeleteSecurityGroup&GroupId={}", groups[0]),
+        )
+        .await;
+        assert!(body.contains("DependencyViolation"));
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=RevokeSecurityGroupIngress&{unused}")
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            call(
+                &h,
+                "111",
+                "us-east-1",
+                &format!("Action=DeleteSecurityGroup&GroupId={}", groups[0])
+            )
+            .await
+            .0,
+            200
+        );
+    }
+
     #[tokio::test]
     async fn alb_network_lease_validates_and_blocks_deletion() {
         let h = Ec2Handler::default();
@@ -4352,7 +4852,7 @@ mod tests {
         let h = Ec2Handler::with_instance_runtime(runtime);
         let (_, subnet, _) = instance_network(&h).await;
         let request = format!("Action=RunInstances&ImageId=ami-locallycloud-http&InstanceType=t3.micro&MinCount=1&MaxCount=1&SubnetId={subnet}&ClientToken=failed");
-        assert_eq!(call(&h, "111", "us-east-1", &request).await.0, 400);
+        assert_eq!(call(&h, "111", "us-east-1", &request).await.0, 500);
         let (_, body) = call(&h, "111", "us-east-1", "Action=DescribeNetworkInterfaces").await;
         assert!(body.contains("<networkInterfaceSet></networkInterfaceSet>"));
         assert_eq!(

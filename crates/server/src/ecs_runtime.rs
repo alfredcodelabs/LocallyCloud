@@ -5,11 +5,13 @@ use std::io::{Read, Write};
 
 use flate2::read::GzDecoder;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use crate::ecs_guest::{GuestEndpoints, PreparedGuest};
 use locallycloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec, TaskState};
-use locallycloud_compute::youki::YoukiRuntime;
+use locallycloud_compute::youki::{IsolatedGuestSetup, YoukiRuntime};
+use locallycloud_core::registry::ServiceRegistry;
 use locallycloud_ecs::{TaskLaunch, TaskNetworkInfo, TaskRuntime};
 use serde_json::Value;
 use tokio::io;
@@ -17,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub struct EcsOciRuntime {
+    registry: Weak<ServiceRegistry>,
     ecr: Arc<locallycloud_ecr::EcrHandler>,
     ec2: Arc<locallycloud_ec2::Ec2Handler>,
     runtime: Arc<Mutex<Option<Arc<YoukiRuntime>>>>,
@@ -28,6 +31,43 @@ struct TaskResources {
     network: Option<locallycloud_ec2::TaskNetworkLease>,
     lifecycle: Arc<tokio::sync::Mutex<()>>,
     proxy: Option<JoinHandle<()>>,
+    guest: Option<GuestEndpoints>,
+}
+struct GuestSetup {
+    prepared: Mutex<Option<PreparedGuest>>,
+    roots: Arc<Mutex<HashMap<String, TaskResources>>>,
+}
+#[async_trait::async_trait]
+impl IsolatedGuestSetup for GuestSetup {
+    async fn prepare(&self, runtime: Arc<YoukiRuntime>, task_id: &str) -> Result<(), RuntimeError> {
+        let prepared = self
+            .prepared
+            .lock()
+            .map_err(|_| RuntimeError::ExecutionFailed {
+                reason: "Guest setup unavailable".into(),
+            })?
+            .take()
+            .ok_or_else(|| RuntimeError::ExecutionFailed {
+                reason: "Guest setup already consumed".into(),
+            })?;
+        let guest = prepared
+            .start(runtime, task_id)
+            .await
+            .map_err(|reason| RuntimeError::ExecutionFailed { reason })?;
+        let mut roots = self
+            .roots
+            .lock()
+            .map_err(|_| RuntimeError::ExecutionFailed {
+                reason: "Task ownership unavailable".into(),
+            })?;
+        let resources = roots
+            .get_mut(task_id)
+            .ok_or_else(|| RuntimeError::ExecutionFailed {
+                reason: "Task no longer owned".into(),
+            })?;
+        resources.guest = Some(guest);
+        Ok(())
+    }
 }
 // Cancellation owns the same cleanup path as explicit StopTask. The worker holds the
 // lifecycle lock while materializing, so dropping the request cannot delete its live files.
@@ -88,6 +128,18 @@ async fn cleanup_task(
             | Err(RuntimeError::TaskNotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
+        let guest = roots
+            .lock()
+            .map_err(|_| "Task ownership unavailable")?
+            .get_mut(task_id)
+            .and_then(|resources| resources.guest.take());
+        if let Some(mut guest) = guest {
+            guest.shutdown().await;
+            let dropped = guest.dropped_log_bytes();
+            if dropped > 0 {
+                tracing::warn!(%task_id, dropped, "ECS task log bytes were dropped");
+            }
+        }
         runtime
             .release_task(task_id)
             .await
@@ -119,10 +171,12 @@ async fn cleanup_task(
 
 impl EcsOciRuntime {
     pub fn new(
+        registry: Weak<ServiceRegistry>,
         ecr: Arc<locallycloud_ecr::EcrHandler>,
         ec2: Arc<locallycloud_ec2::Ec2Handler>,
     ) -> Self {
         Self {
+            registry,
             ecr,
             ec2,
             runtime: Arc::new(Mutex::new(None)),
@@ -140,6 +194,33 @@ impl EcsOciRuntime {
             }
         }
     }
+    pub async fn connect_registered_task(
+        &self,
+        task_id: &str,
+        private_ip: std::net::Ipv4Addr,
+        port: u16,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        let owned = self
+            .roots
+            .lock()
+            .map_err(|_| std::io::Error::other("ECS roots unavailable"))?
+            .get(task_id)
+            .is_some_and(|resources| {
+                resources
+                    .network
+                    .as_ref()
+                    .is_some_and(|lease| lease.private_ip == private_ip)
+            });
+        if !owned {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        let runtime = self.runtime().map_err(std::io::Error::other)?;
+        runtime
+            .connect_isolated_tcp(task_id, port, Duration::from_secs(2))
+            .await
+            .map_err(std::io::Error::other)
+    }
+
     fn runtime(&self) -> Result<Arc<YoukiRuntime>, String> {
         let mut guard = self
             .runtime
@@ -156,6 +237,12 @@ impl EcsOciRuntime {
 
 #[async_trait::async_trait]
 impl TaskRuntime for EcsOciRuntime {
+    fn supports_execution_identity(&self) -> bool {
+        true
+    }
+    fn supports_awslogs(&self) -> bool {
+        true
+    }
     async fn preflight(
         &self,
         image: &str,
@@ -170,7 +257,8 @@ impl TaskRuntime for EcsOciRuntime {
             .ok_or("Subnet or security group is unavailable")?;
         let (repo, reference) = parse_ecr_image(image, account, region)?;
         self.ecr
-            .image_blobs(account, region, repo, reference)
+            .image_blobs_async(account, region, repo, reference)
+            .await?
             .ok_or("ECR image was not found or has unsupported layer media type")?;
         Ok(())
     }
@@ -186,7 +274,8 @@ impl TaskRuntime for EcsOciRuntime {
         let (repo, reference) = parse_ecr_image(&task.image, &task.account, &task.region)?;
         let (config, layers) = self
             .ecr
-            .image_blobs(&task.account, &task.region, repo, reference)
+            .image_blobs_async(&task.account, &task.region, repo, reference)
+            .await?
             .ok_or("ECR image was not found or has unsupported layer media type")?;
         let task_id = task.task_id.clone();
         let work = locallycloud_compute::private_dir::work_dir("ecs");
@@ -204,6 +293,7 @@ impl TaskRuntime for EcsOciRuntime {
                 network: None,
                 lifecycle,
                 proxy: None,
+                guest: None,
             },
         );
         let mut startup = StartupCleanup {
@@ -214,11 +304,6 @@ impl TaskRuntime for EcsOciRuntime {
             armed: true,
         };
         let root_for_build = root.clone();
-        let config = config.to_vec();
-        let layers = layers
-            .into_iter()
-            .map(|(blob, compressed)| (blob.to_vec(), compressed))
-            .collect::<Vec<_>>();
         let materialized = tokio::task::spawn_blocking(move || {
             let result = materialize(&root_for_build, &config, &layers);
             (result, start_lock)
@@ -257,6 +342,18 @@ impl TaskRuntime for EcsOciRuntime {
                     .await);
             }
         };
+        let prepared =
+            match PreparedGuest::prepare(self.registry.clone(), self.ec2.clone(), task, &network)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => return Err(startup.fail(error).await),
+            };
+        prepared.inject_env(&mut env);
+        let setup = Arc::new(GuestSetup {
+            prepared: Mutex::new(Some(prepared)),
+            roots: self.roots.clone(),
+        });
         let spec = TaskSpec {
             name: task_id.clone(),
             image: root.display().to_string(),
@@ -283,7 +380,14 @@ impl TaskRuntime for EcsOciRuntime {
             .expect("startup lifecycle owns tracked root")
             .network = Some(network);
         if let Err(error) = runtime
-            .start_isolated_service(&task_id, &spec, task.port, Duration::from_secs(5))
+            .start_isolated_service_with_setup(
+                &task_id,
+                &spec,
+                task.port,
+                Duration::from_secs(5),
+                task.cpu,
+                setup,
+            )
             .await
         {
             return Err(startup.fail(error.to_string()).await);
@@ -377,7 +481,7 @@ async fn serve_task_proxy(listener: TcpListener, context: TaskProxyContext) {
     let mut connections = tokio::task::JoinSet::new();
     loop {
         let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
+            accepted = listener.accept(), if connections.len() < 64 => accepted,
             _ = connections.join_next(), if !connections.is_empty() => continue,
         };
         let Ok((mut inbound, peer)) = accepted else {
@@ -396,7 +500,11 @@ async fn serve_task_proxy(listener: TcpListener, context: TaskProxyContext) {
                 .connect_isolated_tcp(&task_id, guest_port, Duration::from_secs(2))
                 .await
             {
-                let _ = io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    io::copy_bidirectional(&mut inbound, &mut outbound),
+                )
+                .await;
             }
         });
     }
@@ -421,10 +529,33 @@ fn parse_ecr_image<'a>(
 fn materialize(
     root: &Path,
     config: &[u8],
-    layers: &[(Vec<u8>, bool)],
+    layers: &[(impl AsRef<[u8]>, bool)],
 ) -> Result<(Vec<String>, HashMap<String, String>), String> {
     let image: Value = serde_json::from_slice(config).map_err(|_| "Invalid OCI image config")?;
+    let architecture = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        _ => return Err("Unsupported host architecture".into()),
+    };
+    if image["architecture"] != architecture || image["os"] != "linux" {
+        return Err("OCI image must be Linux and match the host architecture".into());
+    }
     let config = image.get("config").ok_or("OCI image config is missing")?;
+    if config
+        .get("User")
+        .is_some_and(|user| !matches!(user.as_str(), Some("" | "0" | "root" | "0:0" | "root:root")))
+    {
+        return Err(
+            "OCI image User is unsupported; only guest root mapped to the host user is admitted"
+                .into(),
+        );
+    }
+    if config
+        .get("WorkingDir")
+        .is_some_and(|directory| !matches!(directory.as_str(), Some("" | "/")))
+    {
+        return Err("OCI image WorkingDir is unsupported; use absolute application paths".into());
+    }
     let mut command = Vec::new();
     for key in ["Entrypoint", "Cmd"] {
         if let Some(items) = config.get(key).and_then(Value::as_array) {
@@ -450,8 +581,9 @@ fn materialize(
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let mut total_unpacked = 0usize;
     let result = layers.iter().try_for_each(|(layer, compressed)| {
+        let layer = layer.as_ref();
         if *compressed {
-            let mut decoder = GzDecoder::new(layer.as_slice());
+            let mut decoder = GzDecoder::new(layer);
             let mut unpacked = Vec::new();
             decoder
                 .by_ref()
@@ -574,6 +706,34 @@ fn extract_layer(root: &Path, layer: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    #[test]
+    fn unsupported_image_platform_user_and_workdir_fail_before_extraction() {
+        let root = std::env::temp_dir().join(format!("ecs-image-{}", uuid::Uuid::new_v4()));
+        let architecture = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            _ => "amd64",
+        };
+        let original = serde_json::json!({
+            "architecture": architecture, "os": "linux", "config": {"Cmd": ["/bin/app"]}
+        });
+        let layers: Vec<(Vec<u8>, bool)> = Vec::new();
+        for (field, value, message) in [
+            ("architecture", "foreign", "architecture"),
+            ("User", "10001", "User"),
+            ("WorkingDir", "/app", "WorkingDir"),
+        ] {
+            let mut image = original.clone();
+            if field == "architecture" {
+                image[field] = serde_json::json!(value);
+            } else {
+                image["config"][field] = serde_json::json!(value);
+            }
+            let error =
+                materialize(&root, &serde_json::to_vec(&image).unwrap(), &layers).unwrap_err();
+            assert!(error.contains(message), "{error}");
+            assert!(!root.exists());
+        }
+    }
     #[tokio::test]
     async fn cancelled_materialization_waits_for_worker_and_failed_cleanup_remains_retryable() {
         let base = std::env::temp_dir().join(format!(
@@ -597,6 +757,7 @@ mod cleanup_tests {
                 network: None,
                 lifecycle,
                 proxy: None,
+                guest: None,
             },
         );
         let startup = StartupCleanup {
@@ -639,6 +800,7 @@ mod cleanup_tests {
                 network: None,
                 lifecycle: Arc::new(tokio::sync::Mutex::new(())),
                 proxy: None,
+                guest: None,
             },
         );
         assert!(cleanup_task(&runtime, &roots, "retry").await.is_err());

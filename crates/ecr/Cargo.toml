@@ -9,6 +9,10 @@ description = "locallycloud AWS ECR service (JSON 1.1), registered Native; minim
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+tokio.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
@@ -23,4 +27,3 @@ uuid.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true

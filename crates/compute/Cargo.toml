@@ -11,6 +11,7 @@ description = "locallycloud compute: ComputeRuntime trait with Firecracker (prim
 
 [dependencies]
 tokio.workspace = true
+uuid.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
 thiserror.workspace = true

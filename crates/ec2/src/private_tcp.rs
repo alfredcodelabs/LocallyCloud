@@ -32,7 +32,7 @@ impl ScopeState {
     fn groups_allow_tcp(
         &self,
         group_ids: &[String],
-        peer: Ipv4Addr,
+        peer: &NetworkInterface,
         port: u16,
         egress: bool,
         vpc_id: &str,
@@ -50,13 +50,14 @@ impl ScopeState {
                 } else {
                     &group.ingress
                 };
-                rules.iter().any(|rule| {
-                    rule.cidr.contains(&peer)
-                        && (rule.protocol == "-1"
-                            || (rule.protocol == "tcp"
-                                && rule.from_port.is_some_and(|from| from <= port)
-                                && rule.to_port.is_some_and(|to| port <= to)))
-                })
+                (!egress && group.is_default && peer.group_ids.contains(id))
+                    || rules.iter().any(|rule| {
+                        rule.peer.matches(peer.private_ip, &peer.group_ids)
+                            && (rule.protocol == "-1"
+                                || (rule.protocol == "tcp"
+                                    && rule.from_port.is_some_and(|from| from <= port)
+                                    && rule.to_port.is_some_and(|to| port <= to)))
+                    })
             })
     }
 
@@ -101,20 +102,8 @@ impl ScopeState {
             .values()
             .find(|eni| eni.vpc_id == source.vpc_id && eni.private_ip == target_ip)?;
         if !self.direct_route(source, target)
-            || !self.groups_allow_tcp(
-                &source.group_ids,
-                target.private_ip,
-                port,
-                true,
-                &source.vpc_id,
-            )
-            || !self.groups_allow_tcp(
-                &target.group_ids,
-                source.private_ip,
-                port,
-                false,
-                &target.vpc_id,
-            )
+            || !self.groups_allow_tcp(&source.group_ids, target, port, true, &source.vpc_id)
+            || !self.groups_allow_tcp(&target.group_ids, source, port, false, &target.vpc_id)
         {
             return None;
         }
@@ -290,7 +279,7 @@ mod tests {
                     protocol: "tcp".into(),
                     from_port: Some(5432),
                     to_port: Some(5432),
-                    cidr: "10.7.1.0/24".parse().unwrap(),
+                    peer: RulePeer::Cidr("10.7.1.0/24".parse().unwrap()),
                 });
         }
         assert_eq!(access(), Some(endpoint));
@@ -329,7 +318,7 @@ mod tests {
                     protocol: "tcp".into(),
                     from_port: Some(5432),
                     to_port: Some(5432),
-                    cidr: all,
+                    peer: RulePeer::Cidr(all),
                 });
             scope
                 .route_tables
@@ -429,5 +418,65 @@ mod tests {
         assert!(handler
             .private_tcp_dns("111", "us-east-1", &source.eni_id)
             .is_empty());
+    }
+}
+
+/// Runtime identity of a currently registered private TCP listener.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrivateTargetOwner {
+    Task(String),
+    Instance(String),
+}
+
+impl Ec2Handler {
+    /// Authorize using an owned ALB ENI, never a client header or host loopback identity.
+    /// All lease clones must remain alive while the ALB accepts connections.
+    pub fn alb_target_access(
+        &self,
+        account: &str,
+        region: &str,
+        source: &AlbNetworkLease,
+        target_ip: Ipv4Addr,
+        port: u16,
+    ) -> Option<SocketAddr> {
+        let state = self.scopes.lock().ok()?;
+        let key = (account.to_owned(), region.to_owned());
+        let scope = state.get(&key)?;
+        source.source_networks.iter().find_map(|network| {
+            if network.key != key
+                || !Arc::ptr_eq(&network.scopes, &self.scopes)
+                || network.vpc_id != source.vpc_id
+                || scope.task_networks.get(&network.eni_id) != Some(&network.task_id)
+            {
+                return None;
+            }
+            scope.private_tcp_access(&network.eni_id, target_ip, port)
+        })
+    }
+
+    pub fn private_target_owner(
+        &self,
+        account: &str,
+        region: &str,
+        vpc_id: &str,
+        target_ip: Ipv4Addr,
+        port: u16,
+    ) -> Option<PrivateTargetOwner> {
+        let state = self.scopes.lock().ok()?;
+        let scope = state.get(&(account.to_owned(), region.to_owned()))?;
+        scope.resolve_target(vpc_id, target_ip, port)?;
+        if let Some(instance) = scope.instances.values().find(|instance| {
+            instance.state == InstanceState::Running
+                && instance.spec.vpc_id == vpc_id
+                && instance.spec.private_ip == target_ip
+                && instance.spec.guest_port == port
+                && instance.endpoint.is_some()
+        }) {
+            return Some(PrivateTargetOwner::Instance(
+                instance.spec.instance_id.clone(),
+            ));
+        }
+        let (task_id, _) = scope.task_endpoints.get(&(target_ip, port))?;
+        Some(PrivateTargetOwner::Task(task_id.clone()))
     }
 }

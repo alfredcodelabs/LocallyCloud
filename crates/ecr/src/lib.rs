@@ -2,9 +2,15 @@
 //!
 //! Core verifies SigV4 before marking GetAuthorizationToken as trusted. Issued tokens are
 //! account/region scoped and expire after 12 hours. Every Registry v2 request checks Basic
-//! authentication before reaching the shared in-memory repository store.
+//! authentication before reaching the shared repository store.
 
+#[cfg(test)]
+mod durability_tests;
+mod persistence;
 mod registry_v2;
+use locallycloud_state::{StateCipher, StateDb};
+pub use persistence::EcrStateError;
+use persistence::Persistence;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
@@ -25,12 +31,15 @@ use locallycloud_core::integration::authorization::AuthorizationRequest;
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 
+/// Config bytes followed by validated layers and their compression flags.
+pub type ImageBlobs = (bytes::Bytes, Vec<(bytes::Bytes, bool)>);
+
 const TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
 const DEFAULT_PAGE_SIZE: usize = 100;
 const TOKEN_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_ACTIVE_TOKENS: usize = 4096;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Repository {
     name: String,
     created_at: f64,
@@ -47,20 +56,21 @@ struct RegistryToken {
     expires_at: Instant,
 }
 
+#[derive(Clone)]
 pub struct EcrHandler {
     // key: "{account}:{region}:{name}"
-    repos: DashMap<String, Repository>,
+    repos: Arc<DashMap<String, Repository>>,
     registry_v2: Arc<registry_v2::RegistryV2Handler>,
-    tokens: DashMap<String, RegistryToken>,
+    tokens: Arc<DashMap<String, RegistryToken>>,
     registry: Option<Weak<ServiceRegistry>>,
 }
 
 impl EcrHandler {
     fn new() -> Self {
         Self {
-            repos: DashMap::new(),
+            repos: Arc::new(DashMap::new()),
             registry_v2: Arc::new(registry_v2::RegistryV2Handler::new()),
-            tokens: DashMap::new(),
+            tokens: Arc::new(DashMap::new()),
             registry: None,
         }
     }
@@ -69,6 +79,39 @@ impl EcrHandler {
         let mut handler = Self::new();
         handler.registry = Some(Arc::downgrade(registry));
         handler
+    }
+
+    fn process(&self, request: &ServiceRequest) -> Result<Value, AwsError> {
+        if request.method != http::Method::POST {
+            Err(unknown_operation(
+                "ECR JSON operations require POST".to_owned(),
+            ))
+        } else if request.uri.path() != "/" || request.uri.query().is_some() {
+            Err(invalid("ECR JSON operations require the exact path /"))
+        } else {
+            let operation = request
+                .headers
+                .get("x-amz-target")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|target| target.strip_prefix(&format!("{TARGET_PREFIX}.")))
+                .filter(|operation| !operation.is_empty() && !operation.contains('.'));
+            match operation {
+                None => Err(unknown_operation("x-amz-target is invalid".to_owned())),
+                Some(operation) => match serde_json::from_slice::<Value>(&request.body) {
+                    Err(error) => Err(AwsError::new(
+                        "SerializationException",
+                        format!("Could not deserialize request body: {error}"),
+                        400,
+                    )),
+                    Ok(Value::Object(body)) => self.dispatch(request, operation, &body),
+                    Ok(_) => Err(AwsError::new(
+                        "SerializationException",
+                        "Request body must be a JSON object".to_owned(),
+                        400,
+                    )),
+                },
+            }
+        }
     }
 
     fn authorize_get_authorization_token(&self, request: &ServiceRequest) -> Result<(), AwsError> {
@@ -115,9 +158,31 @@ impl EcrHandler {
         region: &str,
         name: &str,
         reference: &str,
-    ) -> Option<(bytes::Bytes, Vec<(bytes::Bytes, bool)>)> {
+    ) -> Option<ImageBlobs> {
         self.registry_v2
             .image_blobs(account, region, name, reference)
+    }
+
+    /// Read/decrypt only the requested image on a blocking worker.
+    pub async fn image_blobs_async(
+        self: &Arc<Self>,
+        account: &str,
+        region: &str,
+        name: &str,
+        reference: &str,
+    ) -> Result<Option<ImageBlobs>, String> {
+        let handler = self.clone();
+        let (account, region, name, reference) = (
+            account.to_owned(),
+            region.to_owned(),
+            name.to_owned(),
+            reference.to_owned(),
+        );
+        tokio::task::spawn_blocking(move || {
+            handler.image_blobs(&account, &region, &name, &reference)
+        })
+        .await
+        .map_err(|_| "ECR image read worker unavailable".to_owned())
     }
 
     fn issue_authorization_token(
@@ -314,7 +379,8 @@ impl EcrHandler {
                 400,
             )),
             Entry::Vacant(entry) => {
-                if !self.registry_v2.provision_repository(account, region, name, image_tag_mutability == "IMMUTABLE") {
+                let metadata = serde_json::to_vec(&repository).map_err(|_| AwsError::new("ServerException","ECR persistence unavailable",500))?;
+                if !self.registry_v2.provision_repository_with_metadata(account, region, name, image_tag_mutability == "IMMUTABLE",Some(&metadata)).map_err(|_| AwsError::new("ServerException","ECR persistence unavailable",500))? {
                     return Err(AwsError::new("ServerException", "ECR registry state is unavailable", 500));
                 }
                 entry.insert(repository.clone());
@@ -902,36 +968,17 @@ impl NativeHandler for EcrHandler {
         if request.uri.path() == "/v2" || request.uri.path().starts_with("/v2/") {
             return self.handle_registry(request).await;
         }
-        let result = if request.method != http::Method::POST {
-            Err(unknown_operation(
-                "ECR JSON operations require POST".to_owned(),
-            ))
-        } else if request.uri.path() != "/" || request.uri.query().is_some() {
-            Err(invalid("ECR JSON operations require the exact path /"))
-        } else {
-            let operation = request
-                .headers
-                .get("x-amz-target")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|target| target.strip_prefix(&format!("{TARGET_PREFIX}.")))
-                .filter(|operation| !operation.is_empty() && !operation.contains('.'));
-            match operation {
-                None => Err(unknown_operation("x-amz-target is invalid".to_owned())),
-                Some(operation) => match serde_json::from_slice::<Value>(&request.body) {
-                    Err(error) => Err(AwsError::new(
-                        "SerializationException",
-                        format!("Could not deserialize request body: {error}"),
-                        400,
-                    )),
-                    Ok(Value::Object(body)) => self.dispatch(&request, operation, &body),
-                    Ok(_) => Err(AwsError::new(
-                        "SerializationException",
-                        "Request body must be a JSON object".to_owned(),
-                        400,
-                    )),
-                },
-            }
-        };
+        let handler = self.clone();
+        let operation_request = request.clone();
+        let result = tokio::task::spawn_blocking(move || handler.process(&operation_request))
+            .await
+            .unwrap_or_else(|_| {
+                Err(AwsError::new(
+                    "ServerException",
+                    "ECR state unavailable",
+                    500,
+                ))
+            });
 
         match result {
             Ok(value) => Response::builder()
@@ -946,6 +993,35 @@ impl NativeHandler for EcrHandler {
                 .into_response(),
         }
     }
+}
+
+/// Restore durable repositories and committed images before registering ECR.
+pub async fn register_with_state(
+    registry: &Arc<ServiceRegistry>,
+    database: Arc<StateDb>,
+) -> Result<Arc<EcrHandler>, EcrStateError> {
+    let registry_for_restore = registry.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        let persistence = Arc::new(Persistence::new(database, StateCipher::from_env()?)?);
+        let mut handler = EcrHandler::with_registry(&registry_for_restore);
+        handler.registry_v2 = Arc::new(registry_v2::RegistryV2Handler::with_persistence(
+            persistence.clone(),
+        ));
+        persistence.restore(&handler)?;
+        Ok::<_, EcrStateError>(Arc::new(handler))
+    })
+    .await
+    .map_err(|error| -> EcrStateError { Box::new(error) })??;
+    register_handle(registry, handle.clone());
+    Ok(handle)
+}
+
+fn register_handle(registry: &Arc<ServiceRegistry>, handle: Arc<EcrHandler>) {
+    registry.register_native(
+        ServiceName::new("ecr"),
+        ServiceMetadata::new(AwsProtocol::Json11, Some(TARGET_PREFIX)),
+        handle,
+    );
 }
 
 /// Register ECR as a `Native` JSON-1.1 service.

@@ -6,11 +6,12 @@
 mod cli;
 mod domain_tls;
 mod ec2_runtime;
+mod ecs_guest;
 mod ecs_runtime;
 mod migration;
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use locallycloud_compute::selector::{RuntimeKind, RuntimeSelector, SelectionError};
 use locallycloud_core::config::{LocallyCloudConfig, RuntimeChoice, SqsEndpointStrategy};
@@ -130,8 +131,45 @@ impl locallycloud_elbv2::VpcPreflight for Ec2VpcPreflight {
     }
 }
 
-struct Ec2AlbNetworkPreflight(Arc<locallycloud_ec2::Ec2Handler>);
+struct OwnedAlbLease {
+    account: String,
+    region: String,
+    lease: Weak<locallycloud_ec2::AlbNetworkLease>,
+}
 
+struct Ec2AlbNetworkPreflight {
+    ec2: Arc<locallycloud_ec2::Ec2Handler>,
+    ecs_runtime: Arc<ecs_runtime::EcsOciRuntime>,
+    ec2_runtime: Arc<ec2_runtime::Ec2OciRuntime>,
+    leases: Mutex<std::collections::HashMap<String, OwnedAlbLease>>,
+}
+
+impl Ec2AlbNetworkPreflight {
+    fn owned_lease(
+        &self,
+        connection: &locallycloud_elbv2::AlbTargetConnection<'_>,
+    ) -> Option<Arc<locallycloud_ec2::AlbNetworkLease>> {
+        let leases = self.leases.lock().ok()?;
+        let owned = leases.get(connection.network_id)?;
+        if owned.account != connection.account || owned.region != connection.region {
+            return None;
+        }
+        let lease = owned.lease.upgrade()?;
+        if lease.vpc_id != connection.vpc_id
+            || lease.security_group_ids != connection.source_security_groups
+            || !lease
+                .subnets
+                .iter()
+                .map(|(id, _)| id)
+                .eq(connection.source_subnets.iter())
+        {
+            return None;
+        }
+        Some(lease)
+    }
+}
+
+#[async_trait::async_trait]
 impl locallycloud_elbv2::AlbNetworkPreflight for Ec2AlbNetworkPreflight {
     fn reserve(
         &self,
@@ -140,14 +178,27 @@ impl locallycloud_elbv2::AlbNetworkPreflight for Ec2AlbNetworkPreflight {
         subnet_ids: &[String],
         group_ids: &[String],
     ) -> Option<locallycloud_elbv2::AlbNetworkLease> {
-        let lease = self
-            .0
-            .alb_network_lease(account, region, subnet_ids, group_ids)?;
+        let lease = Arc::new(
+            self.ec2
+                .alb_network_lease(account, region, subnet_ids, group_ids)?,
+        );
+        let network_id = uuid::Uuid::new_v4().to_string();
+        let mut leases = self.leases.lock().ok()?;
+        leases.retain(|_, owned| owned.lease.strong_count() > 0);
+        leases.insert(
+            network_id.clone(),
+            OwnedAlbLease {
+                account: account.to_owned(),
+                region: region.to_owned(),
+                lease: Arc::downgrade(&lease),
+            },
+        );
         Some(locallycloud_elbv2::AlbNetworkLease {
+            network_id,
             vpc_id: lease.vpc_id.clone(),
             subnets: lease.subnets.clone(),
             security_groups: lease.security_group_ids.clone(),
-            guard: Arc::new(lease),
+            guard: lease,
         })
     }
 
@@ -155,12 +206,12 @@ impl locallycloud_elbv2::AlbNetworkPreflight for Ec2AlbNetworkPreflight {
         &self,
         account: &str,
         region: &str,
-        group_ids: &[String],
+        groups: &[String],
         source: Ipv4Addr,
         port: u16,
     ) -> bool {
-        self.0
-            .security_groups_allow_ingress(account, region, group_ids, source, port)
+        self.ec2
+            .security_groups_allow_ingress(account, region, groups, source, port)
     }
 
     fn allows_target_route(
@@ -168,11 +219,73 @@ impl locallycloud_elbv2::AlbNetworkPreflight for Ec2AlbNetworkPreflight {
         account: &str,
         region: &str,
         vpc_id: &str,
-        source_subnets: &[String],
-        target_ip: Ipv4Addr,
+        subnets: &[String],
+        ip: Ipv4Addr,
     ) -> bool {
-        self.0
-            .alb_can_reach_target(account, region, vpc_id, source_subnets, target_ip)
+        self.ec2
+            .alb_can_reach_target(account, region, vpc_id, subnets, ip)
+    }
+
+    fn allows_target_connection(
+        &self,
+        connection: &locallycloud_elbv2::AlbTargetConnection<'_>,
+    ) -> bool {
+        self.owned_lease(connection).is_some_and(|lease| {
+            self.ec2
+                .alb_target_access(
+                    connection.account,
+                    connection.region,
+                    &lease,
+                    connection.target_ip,
+                    connection.target_port,
+                )
+                .is_some()
+        })
+    }
+
+    async fn connect_target(
+        &self,
+        connection: &locallycloud_elbv2::AlbTargetConnection<'_>,
+        endpoint: SocketAddr,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let lease = self.owned_lease(connection).ok_or_else(denied)?;
+        if self.ec2.alb_target_access(
+            connection.account,
+            connection.region,
+            &lease,
+            connection.target_ip,
+            connection.target_port,
+        ) != Some(endpoint)
+        {
+            return Err(denied());
+        }
+        let owner = self
+            .ec2
+            .private_target_owner(
+                connection.account,
+                connection.region,
+                connection.vpc_id,
+                connection.target_ip,
+                connection.target_port,
+            )
+            .ok_or_else(denied)?;
+        match owner {
+            locallycloud_ec2::PrivateTargetOwner::Task(id) => {
+                self.ecs_runtime
+                    .connect_registered_task(&id, connection.target_ip, connection.target_port)
+                    .await
+            }
+            locallycloud_ec2::PrivateTargetOwner::Instance(id) => {
+                locallycloud_ec2::InstanceRuntime::connect_instance(
+                    self.ec2_runtime.as_ref(),
+                    &id,
+                    connection.target_port,
+                )
+                .await
+                .map_err(std::io::Error::other)
+            }
+        }
     }
 }
 
@@ -208,6 +321,13 @@ async fn main() {
         }
         cli::Command::Version => {
             println!("locallycloud {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        cli::Command::OciSetupGate(ref address) => {
+            if let Err(error) = locallycloud_compute::youki::run_oci_setup_hook(address).await {
+                eprintln!("OCI guest setup failed: {error}");
+                std::process::exit(6);
+            }
             return;
         }
         cli::Command::Serve | cli::Command::MigrateS3Encryption => {}
@@ -358,23 +478,66 @@ async fn main() {
         tracing::error!(%error, "failed to load durable CloudFormation state");
         std::process::exit(4);
     }
-    let ecr = locallycloud_ecr::register_with_handle(&registry);
-    let ec2 = locallycloud_ec2::register_with_instance_runtime(
+    let ecr = match locallycloud_ecr::register_with_state(&registry, state.clone()).await {
+        Ok(handler) => handler,
+        Err(error) => {
+            tracing::error!(%error, "failed to restore durable ECR state");
+            std::process::exit(4);
+        }
+    };
+    let ec2_runtime = Arc::new(ec2_runtime::Ec2OciRuntime::default());
+    let ec2 = match locallycloud_ec2::register_with_state_and_instance_runtime(
         &registry,
-        Arc::new(ec2_runtime::Ec2OciRuntime::default()),
-    );
+        state.clone(),
+        ec2_runtime.clone(),
+    )
+    .await
+    {
+        Ok(handler) => handler,
+        Err(error) => {
+            tracing::error!(%error, "failed to restore durable EC2 topology");
+            std::process::exit(4);
+        }
+    };
     if let Some(handler) = &lambda_handler {
         handler.attach_ec2(ec2.clone());
     }
-    let ecs_runtime = Arc::new(ecs_runtime::EcsOciRuntime::new(ecr, ec2.clone()));
-    locallycloud_ecs::register_with_runtime(&registry, Some(ecs_runtime.clone()));
-    locallycloud_elbv2::register_with_alb_integrations(
+    let ecs_runtime = Arc::new(ecs_runtime::EcsOciRuntime::new(
+        Arc::downgrade(&registry),
+        ecr,
+        ec2.clone(),
+    ));
+    let ecs_recovery = match locallycloud_ecs::register_with_state(
+        &registry,
+        Some(ecs_runtime.clone()),
+        state.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::error!(%error, "failed to restore durable ECS state");
+            std::process::exit(4);
+        }
+    };
+    if let Err(error) = locallycloud_elbv2::register_with_state_and_alb_integrations(
         &registry,
         Arc::new(Ec2VpcPreflight(ec2.clone())),
         Arc::new(Ec2TargetResolver(ec2.clone())),
-        Arc::new(Ec2AlbNetworkPreflight(ec2.clone())),
+        Arc::new(Ec2AlbNetworkPreflight {
+            ec2: ec2.clone(),
+            ecs_runtime: ecs_runtime.clone(),
+            ec2_runtime,
+            leases: Mutex::new(std::collections::HashMap::new()),
+        }),
         Arc::new(locallycloud_elbv2::LoopbackAlbEndpointAllocator::default()),
-    );
+        state.clone(),
+    )
+    .await
+    {
+        tracing::error!(%error, "failed to restore durable ALB state");
+        std::process::exit(4);
+    }
     if let Err(error) = locallycloud_kms::register_with_state(&registry, state.clone()) {
         tracing::error!(%error, "failed to register KMS");
         std::process::exit(4);
@@ -547,6 +710,10 @@ async fn main() {
     let restored_lambda = lambda_handler.clone();
     let server_result = server
         .run_with_startup(move || {
+            if let Err(error) = ecs_recovery.resume() {
+                tracing::error!(%error, "failed to resume durable ECS services");
+                std::process::exit(4);
+            }
             if let Some(handler) = restored_lambda {
                 handler.resume_event_sources();
             }

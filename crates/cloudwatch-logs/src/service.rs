@@ -1,9 +1,13 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::response::Response;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
+use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::identity::trusted_role;
+use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{AwsProtocol, ServiceName, ServiceRegistry};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -11,7 +15,7 @@ use serde_json::{json, Value};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{LogsError, RegistrationError};
 use crate::metric_delivery::MetricDeliveryWorker;
-use crate::model::ScopeKey;
+use crate::model::{GroupKey, ScopeKey};
 use crate::pagination::{DescribePaginator, EventPaginator, StreamDescribePaginator};
 use crate::query_worker::QueryWorker;
 use crate::retention::RetentionWorker;
@@ -138,7 +142,224 @@ impl LogsApi {
             ));
         }
         let scope = ScopeKey::new(&request.account_id, &request.region);
+        self.authorize(request, operation, &body, &scope)?;
         self.dispatch(operation, body, scope).await
+    }
+
+    fn authorize(
+        &self,
+        request: &ServiceRequest,
+        operation: &str,
+        body: &Value,
+        scope: &ScopeKey,
+    ) -> Result<(), LogsError> {
+        let Some(evaluator) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+        else {
+            return Ok(());
+        };
+        if !evaluator.strict_sigv4_required() {
+            return Ok(());
+        }
+        if ![
+            "x-locallycloud-verified-external-sigv4",
+            "x-locallycloud-verified-internal-scope",
+        ]
+        .iter()
+        .any(|header| request.headers.get(*header) == Some(&http::HeaderValue::from_static("1")))
+        {
+            return Err(LogsError::AccessDenied(
+                "Verified caller identity is required".into(),
+            ));
+        }
+        let resources = self.authorization_resources(operation, body, scope)?;
+        for resource in resources {
+            let mut context = BTreeMap::new();
+            let group_prefix = format!(
+                "arn:aws:logs:{}:{}:log-group:",
+                scope.region, scope.account_id
+            );
+            if let Some(group) = resource.strip_prefix(&group_prefix) {
+                let name = group.split(':').next().unwrap_or_default();
+                match self.store.list_tags(&GroupKey {
+                    scope: scope.clone(),
+                    name: name.into(),
+                }) {
+                    Ok(tags) => {
+                        for (key, value) in tags {
+                            context.insert(
+                                format!("aws:resourcetag/{}", key.to_ascii_lowercase()),
+                                vec![value],
+                            );
+                        }
+                    }
+                    Err(LogsError::ResourceNotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(tags) = body.get("tags").and_then(Value::as_object) {
+                context.insert("aws:tagkeys".into(), tags.keys().cloned().collect());
+                for (key, value) in tags {
+                    if let Some(value) = value.as_str() {
+                        context.insert(
+                            format!("aws:requesttag/{}", key.to_ascii_lowercase()),
+                            vec![value.into()],
+                        );
+                    }
+                }
+            }
+            if let Some(keys) = body.get("tagKeys").and_then(Value::as_array) {
+                context.insert(
+                    "aws:tagkeys".into(),
+                    keys.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
+            evaluator
+                .authorize(AuthorizationRequest {
+                    request_identity: RequestIdentity {
+                        account_id: request.account_id.clone(),
+                        access_key_id: request
+                            .headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(RequestIdentity::access_key_from_authorization),
+                        arn: None,
+                    },
+                    delegated_identity: trusted_role(request),
+                    source_service: "logs".into(),
+                    action: format!("logs:{operation}"),
+                    resource,
+                    context,
+                })
+                .map_err(|_| {
+                    LogsError::AccessDenied(
+                        "Not authorized for this CloudWatch Logs operation".into(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn authorization_resources(
+        &self,
+        operation: &str,
+        body: &Value,
+        scope: &ScopeKey,
+    ) -> Result<Vec<String>, LogsError> {
+        let required = |field: &str| {
+            body.get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| LogsError::InvalidParameter(format!("{field} is required")))
+        };
+        let prefix = format!("arn:aws:logs:{}:{}:", scope.region, scope.account_id);
+        let group_arn = |name: &str| {
+            groups::validate_group_name(name)?;
+            Ok::<_, LogsError>(format!("{prefix}log-group:{name}:*"))
+        };
+        let group_name = || {
+            streams::resolve_group_name(
+                body.get("logGroupName").and_then(Value::as_str),
+                body.get("logGroupIdentifier").and_then(Value::as_str),
+                scope,
+            )
+        };
+        let resource = match operation {
+            "CreateLogStream" | "DeleteLogStream" | "PutLogEvents" | "GetLogEvents" => {
+                let group = group_name()?;
+                let stream = required("logStreamName")?;
+                streams::validate_stream_name(stream)?;
+                format!("{prefix}log-group:{group}:log-stream:{stream}")
+            }
+            "CreateLogGroup"
+            | "DeleteLogGroup"
+            | "PutRetentionPolicy"
+            | "DeleteRetentionPolicy"
+            | "DescribeLogStreams"
+            | "FilterLogEvents"
+            | "PutMetricFilter"
+            | "DeleteMetricFilter"
+            | "PutSubscriptionFilter"
+            | "DescribeSubscriptionFilters"
+            | "DeleteSubscriptionFilter"
+            | "TagLogGroup"
+            | "UntagLogGroup"
+            | "ListTagsLogGroup" => group_arn(&group_name()?)?,
+            "DescribeMetricFilters" => match body.get("logGroupName").and_then(Value::as_str) {
+                Some(name) => group_arn(name)?,
+                None => "*".into(),
+            },
+            "PutDestination" | "PutDestinationPolicy" | "DeleteDestination" => {
+                format!("{prefix}destination:{}", required("destinationName")?)
+            }
+            "TagResource" | "UntagResource" | "ListTagsForResource" => {
+                required("resourceArn")?.into()
+            }
+            "GetQueryResults" => {
+                let query = self.store.get_query(scope, required("queryId")?)?;
+                return query
+                    .group_names
+                    .iter()
+                    .map(|name| group_arn(name))
+                    .collect();
+            }
+            "StartQuery" => {
+                let mut names = Vec::new();
+                if let Some(name) = body.get("logGroupName").and_then(Value::as_str) {
+                    names.push(name.to_owned());
+                }
+                for field in ["logGroupNames", "logGroupIdentifiers"] {
+                    if let Some(values) = body.get(field).and_then(Value::as_array) {
+                        if values.len() > 50 {
+                            return Err(LogsError::InvalidParameter(
+                                "At most 50 source groups are allowed".into(),
+                            ));
+                        }
+                        for value in values {
+                            let name = value.as_str().ok_or_else(|| {
+                                LogsError::InvalidParameter(
+                                    "Log group source must be a string".into(),
+                                )
+                            })?;
+                            let name = if field == "logGroupIdentifiers" && name.starts_with("arn:")
+                            {
+                                name.strip_prefix(&format!("{prefix}log-group:"))
+                                    .ok_or_else(|| {
+                                        LogsError::AccessDenied(
+                                            "Log group must belong to this account and region"
+                                                .into(),
+                                        )
+                                    })?
+                            } else {
+                                name
+                            };
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+                if names.is_empty() {
+                    return Err(LogsError::InvalidParameter(
+                        "A log group source is required".into(),
+                    ));
+                }
+                return names.iter().map(|name| group_arn(name)).collect();
+            }
+            "DescribeLogGroups"
+            | "DescribeDestinations"
+            | "DescribeQueries"
+            | "TestMetricFilter"
+            | "StopQuery" => "*".into(),
+            _ => {
+                return Err(LogsError::UnknownOperation(
+                    "Operation authorization is not implemented".into(),
+                ))
+            }
+        };
+        Ok(vec![resource])
     }
 
     async fn dispatch(

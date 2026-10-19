@@ -13,6 +13,8 @@ pub enum RegistrationError {
 #[derive(Debug, thiserror::Error)]
 pub enum LogsError {
     #[error("{0}")]
+    AccessDenied(String),
+    #[error("{0}")]
     InvalidParameter(String),
     #[error("{0}")]
     Serialization(String),
@@ -35,6 +37,9 @@ pub enum LogsError {
 impl From<LogsError> for AwsError {
     fn from(error: LogsError) -> Self {
         match error {
+            LogsError::AccessDenied(message) => {
+                AwsError::new("AccessDeniedException", message, 400)
+            }
             LogsError::InvalidParameter(message) => {
                 AwsError::new("InvalidParameterException", message, 400)
             }

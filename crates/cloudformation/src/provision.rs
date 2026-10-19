@@ -22,6 +22,9 @@ use crate::template::{ResolvedResource, ResourcePolicy};
 
 mod custom_domains;
 mod ec2;
+mod ecs_alb;
+mod ecs_sg;
+pub(crate) use ecs_alb::validate_ecs_alb_property_names;
 mod kinesis;
 mod monitoring;
 mod scheduler;
@@ -39,6 +42,14 @@ pub enum Replacement {
 
 /// Complete resource-type surface supported by this provisioner.
 pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
+    "AWS::EC2::SecurityGroupIngress",
+    "AWS::EC2::SecurityGroupEgress",
+    "AWS::ECS::Cluster",
+    "AWS::ECS::TaskDefinition",
+    "AWS::ECS::Service",
+    "AWS::ElasticLoadBalancingV2::LoadBalancer",
+    "AWS::ElasticLoadBalancingV2::TargetGroup",
+    "AWS::ElasticLoadBalancingV2::Listener",
     "AWS::Route53::HostedZone",
     "AWS::ApiGateway::DomainName",
     "AWS::ApiGateway::BasePathMapping",
@@ -129,6 +140,19 @@ impl Provisioner {
         properties: &Value,
     ) -> Result<ResolvedResource, CfnError> {
         match resource_type {
+            "AWS::EC2::SecurityGroupIngress" | "AWS::EC2::SecurityGroupEgress" => {
+                self.ecs_sg_rule(logical_id, resource_type, properties, false)
+                    .await
+            }
+            "AWS::ECS::Cluster"
+            | "AWS::ECS::TaskDefinition"
+            | "AWS::ECS::Service"
+            | "AWS::ElasticLoadBalancingV2::LoadBalancer"
+            | "AWS::ElasticLoadBalancingV2::TargetGroup"
+            | "AWS::ElasticLoadBalancingV2::Listener" => {
+                self.ecs_alb_resource(logical_id, stack_name, resource_type, properties)
+                    .await
+            }
             "AWS::Route53::HostedZone" => {
                 self.custom_domain_resource(logical_id, resource_type, properties)
                     .await
@@ -259,6 +283,26 @@ impl Provisioner {
             return Ok(current.clone());
         }
         match resource_type {
+            "AWS::EC2::SecurityGroupIngress" | "AWS::EC2::SecurityGroupEgress" => {
+                Err(CfnError::ResourceFailed(format!(
+                    "{resource_type} {logical_id} rule replacement is unsupported"
+                )))
+            }
+            "AWS::ECS::Cluster"
+            | "AWS::ECS::TaskDefinition"
+            | "AWS::ECS::Service"
+            | "AWS::ElasticLoadBalancingV2::LoadBalancer"
+            | "AWS::ElasticLoadBalancingV2::TargetGroup"
+            | "AWS::ElasticLoadBalancingV2::Listener" => {
+                self.update_ecs_alb(
+                    logical_id,
+                    resource_type,
+                    current,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
             "AWS::Route53::HostedZone" => {
                 self.update_custom_domain_resource(
                     logical_id,
@@ -693,6 +737,20 @@ impl Provisioner {
         properties: &Value,
     ) -> Result<(), CfnError> {
         match resource_type {
+            "AWS::EC2::SecurityGroupIngress" | "AWS::EC2::SecurityGroupEgress" => {
+                self.ecs_sg_rule(physical_id, resource_type, properties, true)
+                    .await?;
+                Ok(())
+            }
+            "AWS::ECS::Cluster"
+            | "AWS::ECS::TaskDefinition"
+            | "AWS::ECS::Service"
+            | "AWS::ElasticLoadBalancingV2::LoadBalancer"
+            | "AWS::ElasticLoadBalancingV2::TargetGroup"
+            | "AWS::ElasticLoadBalancingV2::Listener" => {
+                self.delete_ecs_alb(resource_type, physical_id, properties)
+                    .await
+            }
             "AWS::Route53::HostedZone" => {
                 self.delete_custom_domain_resource(resource_type, physical_id, properties)
                     .await

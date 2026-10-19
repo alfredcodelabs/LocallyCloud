@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct VpcEndpoint {
     pub(super) id: String,
     pub(super) vpc_id: String,
@@ -13,7 +13,7 @@ pub(super) struct VpcEndpoint {
     pub(super) private_dns: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum EndpointKind {
     Gateway,
     Interface,
@@ -56,7 +56,9 @@ impl Ec2Handler {
             })?;
         let kind = match input.one("VpcEndpointType")?.unwrap_or("Gateway") {
             "Gateway" if matches!(service, "s3" | "dynamodb") => EndpointKind::Gateway,
-            "Interface" if matches!(service, "ssm" | "secretsmanager") => EndpointKind::Interface,
+            "Interface" if matches!(service, "ssm" | "secretsmanager" | "logs") => {
+                EndpointKind::Interface
+            }
             _ => {
                 return Err(Ec2Error::new(
                     "InvalidParameterValue",
@@ -124,7 +126,7 @@ impl Ec2Handler {
             _ => {}
         }
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         if let Some(token) = token {
             if let Some((previous, id)) = scope.vpc_endpoint_tokens.get(token) {
                 if previous != &signature {
@@ -198,7 +200,7 @@ impl Ec2Handler {
                 "Endpoint security group is outside the VPC",
             ));
         }
-        let id = resource_id("vpce");
+        let id = input.resource_id("vpce");
         let endpoint = VpcEndpoint {
             id: id.clone(),
             vpc_id: vpc_id.into(),
@@ -210,13 +212,28 @@ impl Ec2Handler {
             group_ids,
             private_dns,
         };
+        let mut changes = vec![Change::put("endpoint", &id, &endpoint)?];
+        let mut tables = Vec::new();
         for table_id in &endpoint.route_table_ids {
-            scope
+            let mut table = scope
                 .route_tables
-                .get_mut(table_id)
+                .get(table_id)
                 .expect("validated route table")
-                .endpoint_routes
-                .insert(service.into(), id.clone());
+                .clone();
+            table.endpoint_routes.insert(service.into(), id.clone());
+            changes.push(Change::put("route-table", table_id, &table)?);
+            tables.push(table);
+        }
+        if let Some(token) = token {
+            changes.push(Change::put(
+                "endpoint-token",
+                token,
+                &(signature.clone(), id.clone()),
+            )?);
+        }
+        self.persist(&key, &changes)?;
+        for table in tables {
+            scope.route_tables.insert(table.id.clone(), table);
         }
         let xml = endpoint_xml(&endpoint);
         scope.vpc_endpoints.insert(id.clone(), endpoint);
@@ -304,23 +321,46 @@ impl Ec2Handler {
             ));
         }
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
+        let scope = state.entry(key.clone()).or_default();
         if ids.iter().any(|id| !scope.vpc_endpoints.contains_key(id)) {
             return Err(Ec2Error::new(
                 "InvalidVpcEndpointId.NotFound",
                 "The VPC endpoint does not exist",
             ));
         }
-        for id in ids {
-            let endpoint = scope.vpc_endpoints.remove(&id).expect("validated endpoint");
-            scope
-                .vpc_endpoint_tokens
-                .retain(|_, (_, endpoint_id)| endpoint_id != &id);
-            for table_id in endpoint.route_table_ids {
-                if let Some(table) = scope.route_tables.get_mut(&table_id) {
+        let mut changes = Vec::new();
+        let mut tables = BTreeMap::new();
+        for id in &ids {
+            let endpoint = scope.vpc_endpoints.get(id).expect("validated endpoint");
+            changes.push(Change::delete("endpoint", id));
+            changes.extend(
+                scope
+                    .vpc_endpoint_tokens
+                    .iter()
+                    .filter(|(_, (_, endpoint_id))| endpoint_id == id)
+                    .map(|(token, _)| Change::delete("endpoint-token", token)),
+            );
+            for table_id in &endpoint.route_table_ids {
+                if let Some(existing) = scope.route_tables.get(table_id) {
+                    let table = tables
+                        .entry(table_id.clone())
+                        .or_insert_with(|| existing.clone());
                     table.endpoint_routes.remove(&endpoint.service);
                 }
             }
+        }
+        for (id, table) in &tables {
+            changes.push(Change::put("route-table", id, table)?);
+        }
+        self.persist(&key, &changes)?;
+        for (id, table) in tables {
+            scope.route_tables.insert(id, table);
+        }
+        for id in ids {
+            scope.vpc_endpoints.remove(&id);
+            scope
+                .vpc_endpoint_tokens
+                .retain(|_, (_, endpoint_id)| endpoint_id != &id);
         }
         Ok("<unsuccessful/>".into())
     }
@@ -380,9 +420,12 @@ impl Ec2Handler {
                         || (rule.protocol == "tcp"
                             && rule.from_port.is_some_and(|from| from <= 443)
                             && rule.to_port.is_some_and(|to| to >= 443)))
-                        && destinations
-                            .iter()
-                            .any(|destination| contains_net(rule.cidr, *destination))
+                        && destinations.iter().any(|destination| match &rule.peer {
+                            RulePeer::Cidr(cidr) => contains_net(*cidr, *destination),
+                            RulePeer::Group(id) => {
+                                ep.kind == EndpointKind::Interface && ep.group_ids.contains(id)
+                            }
+                        })
                 })
             }) {
                 return false;
@@ -412,7 +455,7 @@ impl Ec2Handler {
                         && ep.group_ids.iter().any(|id| {
                             scope.security_groups.get(id).is_some_and(|group| {
                                 group.ingress.iter().any(|rule| {
-                                    rule.cidr.contains(&source_ip)
+                                    rule.peer.matches(source_ip, source_group_ids)
                                         && (rule.protocol == "-1"
                                             || (rule.protocol == "tcp"
                                                 && rule.from_port.is_some_and(|from| from <= 443)
@@ -542,10 +585,10 @@ impl Ec2Handler {
             }
         };
         let mut state = self.scopes.lock().unwrap();
-        let scope = state.entry(key).or_default();
-        let dns = scope
+        let scope = state.entry(key.clone()).or_default();
+        let mut dns = *scope
             .vpc_dns
-            .get_mut(vpc)
+            .get(vpc)
             .ok_or_else(|| Ec2Error::new("InvalidVpcID.NotFound", "The VPC does not exist"))?;
         if usage.is_some() {
             if value {
@@ -556,6 +599,8 @@ impl Ec2Handler {
         } else {
             dns.0 = value;
         }
+        self.persist(&key, &[Change::put("dns", vpc, &dns)?])?;
+        scope.vpc_dns.insert(vpc.into(), dns);
         Ok("<return>true</return>".into())
     }
 
@@ -631,6 +676,7 @@ mod tests {
         let disabled = call(&handler, &format!("Action=ModifyVpcAttribute&VpcId={vpc}&EnableNetworkAddressUsageMetrics.Value=false")).await;
         assert!(disabled.contains("<return>true</return>"));
         let unsupported = Input {
+            planned_ids: BTreeMap::new(),
             fields: BTreeMap::from([
                 ("VpcId".into(), vec![vpc.into()]),
                 (
@@ -679,6 +725,7 @@ mod tests {
         let replay = call(&handler, &gateway_request).await;
         assert_eq!(id(&replay, "vpcEndpointId"), gateway);
         let mismatch = Input {
+            planned_ids: BTreeMap::new(),
             fields: BTreeMap::from([
                 ("VpcId".into(), vec![vpc.into()]),
                 (
@@ -705,6 +752,7 @@ mod tests {
         assert!(!lists.contains("<prefixListId>pl-00000001</prefixListId>"));
         call(&handler, &format!("Action=RevokeSecurityGroupEgress&GroupId={lambda_sg}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.FromPort=0&IpPermissions.1.ToPort=0&IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0")).await;
         let ipv6 = Input {
+            planned_ids: BTreeMap::new(),
             fields: BTreeMap::from([
                 ("GroupId".into(), vec![lambda_sg.clone()]),
                 ("IpPermissions.1.IpProtocol".into(), vec!["-1".into()]),

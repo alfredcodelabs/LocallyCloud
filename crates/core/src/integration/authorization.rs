@@ -22,6 +22,8 @@ pub struct ServiceRoleCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: String,
+    /// RFC 3339 expiration issued by STS for these exact credentials.
+    pub expiration: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

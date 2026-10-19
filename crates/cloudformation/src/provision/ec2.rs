@@ -140,10 +140,38 @@ impl Provisioner {
                             logical_id,
                             &format!("AWS::EC2::{direction}"),
                             rule,
-                            &["IpProtocol", "FromPort", "ToPort", "CidrIp"],
+                            &[
+                                "IpProtocol",
+                                "FromPort",
+                                "ToPort",
+                                "CidrIp",
+                                if direction == "SecurityGroupIngress" {
+                                    "SourceSecurityGroupId"
+                                } else {
+                                    "DestinationSecurityGroupId"
+                                },
+                            ],
                         )?;
                         let protocol = required_property(rule, "IpProtocol", logical_id)?;
-                        let cidr = required_property(rule, "CidrIp", logical_id)?;
+                        let peer = if direction == "SecurityGroupIngress" {
+                            "SourceSecurityGroupId"
+                        } else {
+                            "DestinationSecurityGroupId"
+                        };
+                        let (peer_key, peer_value) = match (rule.get("CidrIp"), rule.get(peer)) {
+                            (Some(_), None) => {
+                                ("CidrIp", required_property(rule, "CidrIp", logical_id)?)
+                            }
+                            (None, Some(_)) => (
+                                "IpPermissions.1.Groups.1.GroupId",
+                                required_property(rule, peer, logical_id)?,
+                            ),
+                            _ => {
+                                return Err(CfnError::Validation(format!(
+                                    "{logical_id} requires exactly one CIDR or SG peer"
+                                )))
+                            }
+                        };
                         let port = |name: &str| {
                             if protocol == "-1" {
                                 return Ok("0".to_string());
@@ -160,7 +188,7 @@ impl Provisioner {
                         };
                         let from = port("FromPort")?;
                         let to = port("ToPort")?;
-                        Ok::<_, CfnError>((protocol, from, to, cidr))
+                        Ok::<_, CfnError>((protocol, from, to, peer_key, peer_value))
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => {
@@ -201,15 +229,37 @@ impl Provisioner {
                 ("AuthorizeSecurityGroupIngress", ingress),
                 ("AuthorizeSecurityGroupEgress", egress),
             ] {
-                for (protocol, from, to, cidr) in rules {
+                for (protocol, from, to, peer_key, peer_value) in rules {
+                    let nested = peer_key.starts_with("IpPermissions.");
                     self.call_ec2(
                         action,
                         &[
                             ("GroupId", &id),
-                            ("IpProtocol", &protocol),
-                            ("FromPort", &from),
-                            ("ToPort", &to),
-                            ("CidrIp", &cidr),
+                            (
+                                if nested {
+                                    "IpPermissions.1.IpProtocol"
+                                } else {
+                                    "IpProtocol"
+                                },
+                                &protocol,
+                            ),
+                            (
+                                if nested {
+                                    "IpPermissions.1.FromPort"
+                                } else {
+                                    "FromPort"
+                                },
+                                &from,
+                            ),
+                            (
+                                if nested {
+                                    "IpPermissions.1.ToPort"
+                                } else {
+                                    "ToPort"
+                                },
+                                &to,
+                            ),
+                            (peer_key, &peer_value),
                         ],
                         logical_id,
                     )
@@ -232,7 +282,7 @@ impl Provisioner {
         })
     }
 
-    async fn call_ec2(
+    pub(super) async fn call_ec2(
         &self,
         action: &str,
         fields: &[(&str, &str)],
@@ -273,6 +323,9 @@ impl Provisioner {
     }
 }
 
+pub(super) fn ec2_rule_id(xml: &str, id: &str) -> Result<String, CfnError> {
+    ec2_id(xml, "securityGroupRuleId", "sgr-", id)
+}
 fn ec2_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");

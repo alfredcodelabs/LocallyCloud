@@ -9,9 +9,14 @@ description = "LocallyCloud EC2 Query API: VPC and subnet control plane"
 
 [dependencies]
 locallycloud-core.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tracing.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 form_urlencoded = "=1.2.2"
-ipnet = "=2.12.0"
+ipnet = { version = "=2.12.0", features = ["serde"] }
 uuid.workspace = true
 tokio.workspace = true

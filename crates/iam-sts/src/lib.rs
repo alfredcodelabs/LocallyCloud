@@ -17,4 +17,4 @@ pub mod service;
 pub mod store;
 pub mod sts;
 
-pub use service::register;
+pub use service::{register, register_with_store_and_mode};

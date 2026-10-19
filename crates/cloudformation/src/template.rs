@@ -111,6 +111,11 @@ fn validate_resources(raw: &Value) -> Result<(), CfnError> {
             resource_type,
             declaration.get("Properties").unwrap_or(&Value::Null),
         )?;
+        crate::provision::validate_ecs_alb_property_names(
+            logical_id,
+            resource_type,
+            declaration.get("Properties").unwrap_or(&Value::Null),
+        )?;
         if let Some(depends_on) = declaration.get("DependsOn") {
             let valid = match depends_on {
                 Value::String(dependency) => !dependency.trim().is_empty(),

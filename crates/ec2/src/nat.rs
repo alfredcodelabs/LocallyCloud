@@ -81,17 +81,14 @@ impl Ec2Handler {
         input.allow(&["Action", "Version", "DryRun"])?;
         input.dry_run()?;
         let gateway = InternetGateway {
-            id: resource_id("igw"),
+            id: input.resource_id("igw"),
             vpc_id: None,
         };
         let xml = internet_gateway_xml(&gateway);
-        self.scopes
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .internet_gateways
-            .insert(gateway.id.clone(), gateway);
+        let mut states = self.scopes.lock().unwrap();
+        let scope = states.entry(key.clone()).or_default();
+        self.persist(&key, &[Change::put("igw", &gateway.id, &gateway)?])?;
+        scope.internet_gateways.insert(gateway.id.clone(), gateway);
         Ok(format!("<internetGateway>{xml}</internetGateway>"))
     }
 
@@ -151,7 +148,7 @@ impl Ec2Handler {
         let id = input.required("InternetGatewayId")?;
         let vpc_id = input.required("VpcId")?;
         let mut states = self.scopes.lock().unwrap();
-        let scope = states.entry(key).or_default();
+        let scope = states.entry(key.clone()).or_default();
         if !scope.vpcs.contains_key(vpc_id) {
             return Err(Ec2Error::new(
                 "InvalidVpcID.NotFound",
@@ -168,7 +165,7 @@ impl Ec2Handler {
                 "The VPC already has an internet gateway",
             ));
         }
-        let gateway = scope.internet_gateways.get_mut(id).ok_or_else(|| {
+        let mut gateway = scope.internet_gateways.get(id).cloned().ok_or_else(|| {
             Ec2Error::new(
                 "InvalidInternetGatewayID.NotFound",
                 format!("The internet gateway ID '{id}' does not exist"),
@@ -181,6 +178,8 @@ impl Ec2Handler {
             ));
         }
         gateway.vpc_id = Some(vpc_id.into());
+        self.persist(&key, &[Change::put("igw", id, &gateway)?])?;
+        scope.internet_gateways.insert(id.into(), gateway);
         Ok("<return>true</return>".into())
     }
 
@@ -194,7 +193,7 @@ impl Ec2Handler {
         let id = input.required("InternetGatewayId")?;
         let vpc_id = input.required("VpcId")?;
         let mut states = self.scopes.lock().unwrap();
-        let scope = states.entry(key).or_default();
+        let scope = states.entry(key.clone()).or_default();
         let gateway = scope.internet_gateways.get(id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidInternetGatewayID.NotFound",
@@ -218,7 +217,10 @@ impl Ec2Handler {
                 "A regional NAT gateway depends on the internet gateway",
             ));
         }
-        scope.internet_gateways.get_mut(id).unwrap().vpc_id = None;
+        let mut gateway = gateway.clone();
+        gateway.vpc_id = None;
+        self.persist(&key, &[Change::put("igw", id, &gateway)?])?;
+        scope.internet_gateways.insert(id.into(), gateway);
         Ok("<return>true</return>".into())
     }
 
@@ -231,7 +233,7 @@ impl Ec2Handler {
         input.dry_run()?;
         let id = input.required("InternetGatewayId")?;
         let mut states = self.scopes.lock().unwrap();
-        let scope = states.entry(key).or_default();
+        let scope = states.entry(key.clone()).or_default();
         let gateway = scope.internet_gateways.get(id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidInternetGatewayID.NotFound",
@@ -244,6 +246,7 @@ impl Ec2Handler {
                 "The internet gateway is attached to a VPC",
             ));
         }
+        self.persist(&key, &[Change::delete("igw", id)])?;
         scope.internet_gateways.remove(id);
         Ok("<return>true</return>".into())
     }
@@ -258,7 +261,7 @@ impl Ec2Handler {
         if input.one("Domain")?.is_some_and(|domain| domain != "vpc") {
             return Err(Ec2Error::unsupported("Domain"));
         }
-        let id = resource_id("eipalloc");
+        let id = input.resource_id("eipalloc");
         let mut scopes = self.scopes.lock().unwrap();
         let ip = (1..=254)
             .map(|last| Ipv4Addr::new(198, 51, 100, last))
@@ -276,14 +279,17 @@ impl Ec2Handler {
                     "The local public address pool is exhausted",
                 )
             })?;
-        scopes.entry(key).or_default().elastic_ips.insert(
-            id.clone(),
-            ElasticIp {
-                allocation_id: id.clone(),
-                public_ip: ip,
-                nat_gateway_id: None,
-            },
-        );
+        let address = ElasticIp {
+            allocation_id: id.clone(),
+            public_ip: ip,
+            nat_gateway_id: None,
+        };
+        self.persist(&key, &[Change::put("eip", &id, &address)?])?;
+        scopes
+            .entry(key)
+            .or_default()
+            .elastic_ips
+            .insert(id.clone(), address);
         Ok(format!(
             "<allocationId>{id}</allocationId><publicIp>{ip}</publicIp><domain>vpc</domain>"
         ))
@@ -419,7 +425,7 @@ impl Ec2Handler {
         input.dry_run()?;
         let id = input.required("AllocationId")?;
         let mut states = self.scopes.lock().unwrap();
-        let scope = states.entry(key).or_default();
+        let scope = states.entry(key.clone()).or_default();
         let eip = scope.elastic_ips.get(id).ok_or_else(|| {
             Ec2Error::new(
                 "InvalidAllocationID.NotFound",
@@ -432,6 +438,7 @@ impl Ec2Handler {
                 "The address is associated with a NAT gateway",
             ));
         }
+        self.persist(&key, &[Change::delete("eip", id)])?;
         scope.elastic_ips.remove(id);
         Ok("<return>true</return>".into())
     }
@@ -485,7 +492,7 @@ impl Ec2Handler {
             .map(|(name, value)| (name.clone(), value[0].clone()))
             .collect::<BTreeMap<_, _>>();
         let mut states = self.scopes.lock().unwrap();
-        let scope = states.entry(key).or_default();
+        let scope = states.entry(key.clone()).or_default();
         if let Some(token) = token {
             if let Some((previous, id)) = scope.nat_gateway_tokens.get(token) {
                 if previous != &params {
@@ -583,15 +590,37 @@ impl Ec2Handler {
             )
         };
         let gateway = NatGateway {
-            id: resource_id("nat"),
+            id: input.resource_id("nat"),
             vpc_id,
             subnet_id,
             allocation_id: allocation_id.clone(),
             private_ip,
             regional,
         };
-        if let Some(id) = allocation_id {
-            scope.elastic_ips.get_mut(&id).unwrap().nat_gateway_id = Some(gateway.id.clone());
+        let mut changes = vec![Change::put("nat", &gateway.id, &gateway)?];
+        let address = allocation_id
+            .as_ref()
+            .and_then(|id| scope.elastic_ips.get(id))
+            .map(|address| {
+                let mut address = address.clone();
+                address.nat_gateway_id = Some(gateway.id.clone());
+                address
+            });
+        if let Some(address) = &address {
+            changes.push(Change::put("eip", &address.allocation_id, address)?);
+        }
+        if let Some(token) = token {
+            changes.push(Change::put(
+                "nat-token",
+                token,
+                &(params.clone(), gateway.id.clone()),
+            )?);
+        }
+        self.persist(&key, &changes)?;
+        if let Some(address) = address {
+            scope
+                .elastic_ips
+                .insert(address.allocation_id.clone(), address);
         }
         let xml = nat_gateway_xml(&gateway, scope);
         if let Some(token) = token {
@@ -654,27 +683,63 @@ impl Ec2Handler {
         input.dry_run()?;
         let id = input.required("NatGatewayId")?;
         let mut states = self.scopes.lock().unwrap();
-        let scope = states.entry(key).or_default();
+        let scope = states.entry(key.clone()).or_default();
         if !scope.nat_gateways.contains_key(id) {
             return Err(Ec2Error::new(
                 "NatGatewayNotFound",
                 format!("The NAT gateway ID '{id}' does not exist"),
             ));
         }
-        for table in scope.route_tables.values_mut() {
+        let mut changes = vec![Change::delete("nat", id)];
+        let mut tables = Vec::new();
+        for table in scope.route_tables.values().filter(|table| {
+            table
+                .routes
+                .values()
+                .any(|target| matches!(target,RouteTarget::NatGateway(route_id) if route_id==id))
+        }) {
+            let mut table = table.clone();
             for target in table.routes.values_mut() {
-                if matches!(target, RouteTarget::NatGateway(route_id) if route_id == id) {
+                if matches!(target,RouteTarget::NatGateway(route_id) if route_id==id) {
                     *target = RouteTarget::BlackholeNatGateway(id.into());
                 }
             }
+            changes.push(Change::put("route-table", &table.id, &table)?);
+            tables.push(table);
         }
-        let gateway = scope.nat_gateways.remove(id).unwrap();
+        changes.extend(
+            scope
+                .nat_gateway_tokens
+                .iter()
+                .filter(|(_, (_, gateway_id))| gateway_id == id)
+                .map(|(token, _)| Change::delete("nat-token", token)),
+        );
+        let address = scope
+            .nat_gateways
+            .get(id)
+            .and_then(|gateway| gateway.allocation_id.as_ref())
+            .and_then(|id| scope.elastic_ips.get(id))
+            .map(|address| {
+                let mut address = address.clone();
+                address.nat_gateway_id = None;
+                address
+            });
+        if let Some(address) = &address {
+            changes.push(Change::put("eip", &address.allocation_id, address)?);
+        }
+        self.persist(&key, &changes)?;
+        for table in tables {
+            scope.route_tables.insert(table.id.clone(), table);
+        }
+        if let Some(address) = address {
+            scope
+                .elastic_ips
+                .insert(address.allocation_id.clone(), address);
+        }
+        scope.nat_gateways.remove(id);
         scope
             .nat_gateway_tokens
             .retain(|_, (_, gateway_id)| gateway_id != id);
-        if let Some(eip_id) = gateway.allocation_id {
-            scope.elastic_ips.get_mut(&eip_id).unwrap().nat_gateway_id = None;
-        }
         Ok(format!("<natGatewayId>{}</natGatewayId>", escape(id)))
     }
 
@@ -718,7 +783,7 @@ impl Ec2Handler {
             scope.security_groups.get(id).is_some_and(|group| {
                 group.vpc_id == eni.vpc_id
                     && group.egress.iter().any(|rule| {
-                        rule.cidr.contains(&destination)
+                        rule.peer.contains(&destination)
                             && (rule.protocol == "-1"
                                 || (rule.protocol == protocol
                                     && rule.from_port.is_some_and(|from| from <= port)
@@ -918,7 +983,7 @@ mod tests {
         let public_cidr = "10.1.2.0/24".parse().unwrap();
         let key = ("111".to_owned(), "us-east-1".to_owned());
         let mut states = h.scopes.lock().unwrap();
-        let scope = states.entry(key).or_default();
+        let scope = states.entry(key.clone()).or_default();
         for (id, cidr) in [
             ("subnet-private", private_cidr),
             ("subnet-public", public_cidr),

@@ -1880,6 +1880,9 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "itertools"
@@ -2175,7 +2178,10 @@ name = "locallycloud"
 version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
+ "axum",
  "flate2",
+ "hmac 0.12.1",
+ "http",
  "locallycloud-acm",
  "locallycloud-analytics",
  "locallycloud-apigateway",
@@ -2213,8 +2219,11 @@ dependencies = [
  "locallycloud-wafv2",
  "locallycloud-xray",
  "serde_json",
+ "sha2 0.10.9",
+ "time",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2316,6 +2325,8 @@ dependencies = [
  "locallycloud-apigateway",
  "locallycloud-core",
  "locallycloud-ec2",
+ "locallycloud-ecs",
+ "locallycloud-elbv2",
  "locallycloud-iam-sts",
  "locallycloud-kinesis",
  "locallycloud-lambda",
@@ -2431,6 +2442,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2495,7 +2507,12 @@ dependencies = [
  "form_urlencoded",
  "ipnet",
  "locallycloud-core",
+ "locallycloud-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2510,6 +2527,9 @@ dependencies = [
  "dashmap",
  "http",
  "locallycloud-core",
+ "locallycloud-state",
+ "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
@@ -2528,8 +2548,11 @@ dependencies = [
  "bytes",
  "http",
  "locallycloud-core",
+ "locallycloud-state",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -2542,6 +2565,11 @@ dependencies = [
  "axum",
  "http",
  "locallycloud-core",
+ "locallycloud-iam-sts",
+ "locallycloud-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

@@ -21,6 +21,7 @@ https://locallycloud.zentostudio.com";
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Serve,
+    OciSetupGate(String),
     MigrateS3Encryption,
     Help,
     Version,
@@ -35,6 +36,12 @@ pub fn parse(arguments: &[String]) -> Result<Command, String> {
             "migrate-s3-encryption" => Ok(Command::MigrateS3Encryption),
             other => Err(format!("unknown argument: {other}")),
         },
+        [flag, address]
+            if flag == "--internal-oci-setup-gate"
+                && locallycloud_compute::youki::is_setup_address(address) =>
+        {
+            Ok(Command::OciSetupGate(address.clone()))
+        }
         [first, ..] => Err(format!("unexpected arguments after {first}")),
     }
 }

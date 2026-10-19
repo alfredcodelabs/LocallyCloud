@@ -19,7 +19,7 @@ use locallycloud_core::integration::lambda::{
     LambdaCallContext, LambdaInternalError, LambdaInvokeRequest, SensitivePayload,
 };
 use locallycloud_core::integration::RequestIdentity;
-use locallycloud_core::registry::{AwsProtocol, ServiceRegistry};
+use locallycloud_core::registry::{AwsProtocol, ServiceName, ServiceRegistry};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -151,11 +151,25 @@ impl SecretsManagerHandler {
         operation: &str,
     ) -> Result<Arc<Mutex<Option<SecretRecord>>>, SecretsError> {
         let slot = self.store.resolve(scope, secret_id)?;
-        let arn = lock(&slot)?
+        let (arn, policy) = lock(&slot)?
             .as_ref()
-            .map(|record| record.arn.clone())
+            .map(|record| (record.arn.clone(), record.resource_policy.clone()))
             .ok_or(SecretsError::ResourceNotFound)?;
         self.authorize(request, operation, &arn)?;
+        if let Some(policy) = policy {
+            let evaluator = self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+                .ok_or(SecretsError::Internal)?;
+            evaluator
+                .authorize_resource_policy(
+                    Self::authorization_request(request, operation, &arn),
+                    Some(&policy),
+                    &scope.account_id,
+                )
+                .map_err(SecretsError::from_authorization)?;
+        }
         Ok(slot)
     }
 
@@ -165,7 +179,16 @@ impl SecretsManagerHandler {
         operation: &str,
         resource: &str,
     ) -> Result<(), SecretsError> {
-        let dispatcher = self.dispatcher()?;
+        self.dispatcher()?
+            .authorize(Self::authorization_request(request, operation, resource))
+            .map_err(SecretsError::from_authorization)
+    }
+
+    fn authorization_request(
+        request: &ServiceRequest,
+        operation: &str,
+        resource: &str,
+    ) -> AuthorizationRequest {
         let authorization = request
             .headers
             .get(http::header::AUTHORIZATION)
@@ -179,21 +202,19 @@ impl SecretsManagerHandler {
             "aws:ResourceAccount".to_owned(),
             vec![request.account_id.clone()],
         );
-        dispatcher
-            .authorize(AuthorizationRequest {
-                request_identity: RequestIdentity {
-                    account_id: request.account_id.clone(),
-                    access_key_id: authorization
-                        .and_then(RequestIdentity::access_key_from_authorization),
-                    arn: None,
-                },
-                delegated_identity: None,
-                source_service: "secretsmanager".to_owned(),
-                action: format!("secretsmanager:{operation}"),
-                resource: resource.to_owned(),
-                context,
-            })
-            .map_err(SecretsError::from_authorization)
+        AuthorizationRequest {
+            request_identity: RequestIdentity {
+                account_id: request.account_id.clone(),
+                access_key_id: authorization
+                    .and_then(RequestIdentity::access_key_from_authorization),
+                arn: None,
+            },
+            delegated_identity: None,
+            source_service: "secretsmanager".to_owned(),
+            action: format!("secretsmanager:{operation}"),
+            resource: resource.to_owned(),
+            context,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -413,6 +434,96 @@ mod kms_boundary_tests {
         fn authorize(&self, _: AuthorizationRequest) -> Result<(), AuthorizationError> {
             Ok(())
         }
+
+        fn authorize_resource_policy(
+            &self,
+            _: AuthorizationRequest,
+            _: Option<&str>,
+            _: &str,
+        ) -> Result<(), AuthorizationError> {
+            Ok(())
+        }
+    }
+
+    struct DenyStoredPolicy {
+        expected_arn: String,
+        expected_policy: String,
+        checked: AtomicBool,
+    }
+
+    impl AuthorizationEvaluator for DenyStoredPolicy {
+        fn strict_sigv4_required(&self) -> bool {
+            true
+        }
+
+        fn authorize(&self, _: AuthorizationRequest) -> Result<(), AuthorizationError> {
+            Ok(())
+        }
+
+        fn authorize_resource_policy(
+            &self,
+            request: AuthorizationRequest,
+            document: Option<&str>,
+            owner: &str,
+        ) -> Result<(), AuthorizationError> {
+            assert_eq!(request.resource, self.expected_arn);
+            assert_eq!(request.action, "secretsmanager:GetSecretValue");
+            assert_eq!(request.source_service, "secretsmanager");
+            assert_eq!(
+                request.request_identity.access_key_id.as_deref(),
+                Some("task-key")
+            );
+            assert_eq!(document, Some(self.expected_policy.as_str()));
+            assert_eq!(owner, "000000000000");
+            self.checked.store(true, Ordering::SeqCst);
+            Err(AuthorizationError::Denied)
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_resource_policy_deny_prevents_secret_decryption_after_identity_allow() {
+        let (handler, kms, registry) = setup();
+        let created = handler
+            .process(&request(
+                "CreateSecret",
+                json!({"Name":"policy-test","SecretString":"canary"}),
+            ))
+            .await
+            .unwrap();
+        let created: Value = serde_json::from_slice(&created).unwrap();
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"secretsmanager:GetSecretValue","Resource":"*"}]}"#;
+        handler
+            .process(&request(
+                "PutResourcePolicy",
+                json!({"SecretId":"policy-test","ResourcePolicy":policy}),
+            ))
+            .await
+            .unwrap();
+        let evaluator = Arc::new(DenyStoredPolicy {
+            expected_arn: created["ARN"].as_str().unwrap().to_owned(),
+            expected_policy: policy.to_owned(),
+            checked: AtomicBool::new(false),
+        });
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Json11, None),
+            Arc::new(EmptyHandler),
+            evaluator.clone(),
+        );
+        // Decryption would fail differently if authorization allowed it to execute.
+        kms.decrypt_mode.store(1, Ordering::SeqCst);
+        let mut read = request("GetSecretValue", json!({"SecretId":"policy-test"}));
+        read.headers.insert(
+            http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=task-key/20261019/us-east-1/secretsmanager/aws4_request, SignedHeaders=host, Signature=00"
+                .parse()
+                .unwrap(),
+        );
+        assert!(matches!(
+            handler.process(&read).await,
+            Err(SecretsError::AccessDenied)
+        ));
+        assert!(evaluator.checked.load(Ordering::SeqCst));
     }
 
     // 0 = healthy, 1 = unavailable, 2 = completes only after caller timeout.

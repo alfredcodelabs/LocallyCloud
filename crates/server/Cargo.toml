@@ -53,3 +53,11 @@ async-trait.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 flate2.workspace = true
+axum.workspace = true
+http.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+hmac.workspace = true
+sha2.workspace = true
