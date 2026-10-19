@@ -1,9 +1,13 @@
 # Agent context
 
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
+
 Graphify is an optional development tool for navigating code, specifications and
 decisions across sessions. It is independent of the emulator and runs locally.
 The repository pins Graphify 0.9.90; each checkout keeps its own environment,
 graph and caches under `target/agent-context/`. Nothing is shared through SQL.
+
+[⚙️ Setup](#setup-and-navigation) · [🧭 Decisions and AWS contracts](#decisions-and-aws-contracts)
 
 ## Setup and navigation
 
@@ -27,9 +31,10 @@ changing `.gitignore`. Do not put secrets in the included documents.
 
 ## Decisions and AWS contracts
 
-Structural extraction locates files and symbols. Semantic extraction preserves
-concepts, rationale, status and citations. It uses the coding agent's model and
-consumes model context; it is not automatic or free of model cost.
+> [!NOTE]
+> Structural extraction locates files and symbols. Semantic extraction preserves
+> concepts, rationale, status and citations using the coding agent's model and
+> context. Ordinary indexing and queries make no model calls.
 
 At task start, check status. Unindexed documents are listed in
 `target/agent-context/graphify-out/pending-documents.json`; select the documents

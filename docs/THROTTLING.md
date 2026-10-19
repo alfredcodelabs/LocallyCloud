@@ -1,7 +1,11 @@
 # Throttling
 
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Platforms](PLATFORMS.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
+
 Compare burst handling at workstation scale. Each service has independent limits;
 there is no shared throttle across Lambda, DynamoDB and Kinesis.
+
+[📊 Coverage](#coverage) · [🛠️ Configuration](#configuration) · [🔎 Diagnosis](#diagnosis) · [🧪 Before/after](#beforeafter-validation) · [📚 References](#aws-references)
 
 ## Coverage
 
@@ -35,11 +39,12 @@ are independent; quotas below 100 require an explicit smaller minimum. Incompati
 reservations prevent startup without mutation. Inspect limits with `lambda get-account-settings`.
 
 Time scale `0.01` makes one retry second last 10 ms and reduces event age proportionally.
-See the [README](../README.md#configuration) for accepted ranges.
+See the [configuration reference](SETUP.md#configuration) for accepted ranges.
 
-Use disposable state and disk-backed caches; `/tmp` may be tmpfs. Allow roughly
-simultaneous environments × (`MemorySize` + 32 MiB), plus retained warm environments and
-room for other applications. Increasing a quota allocates no RAM.
+> [!TIP]
+> Use disposable state and disk-backed caches; `/tmp` may be tmpfs. Budget roughly
+> simultaneous environments × (`MemorySize` + 32 MiB), plus warm environments and
+> room for other applications. Increasing a quota allocates no RAM.
 
 ## Diagnosis
 

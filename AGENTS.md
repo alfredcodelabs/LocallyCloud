@@ -182,8 +182,8 @@ default independently. Common values:
 - `LOCALLYCLOUD_WORK_DIR` for Lambda work files (relative paths resolve from the process
   working directory); default `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/lambda`.
 
-The README configuration table is the user-facing reference; keep it in sync when adding a
-variable. Choose a disk-backed work directory; an explicitly configured tmpfs still consumes RAM
+The configuration table in `docs/SETUP.md` is the user-facing reference; keep it in sync
+when adding a variable. The README links to it. Choose a disk-backed work directory; an explicitly configured tmpfs still consumes RAM
 (on desktops `/tmp` is often tmpfs). OCI execution requires a rootless systemd user session with
 a user D-Bus (`dbus-user-session` on Debian) and delegated cgroup v2 memory control; guest swap
 is disabled.

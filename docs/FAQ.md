@@ -1,12 +1,10 @@
 # Frequently asked questions
 
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [Agent context](AGENT_CONTEXT.md)
+
 Practical answers for using LocallyCloud during the beta. Start with the [installation and quick-start guide](../README.md#installation) if this is your first visit.
 
-- [Getting started](#getting-started)
-- [AWS profiles and connections](#aws-profiles-and-connections)
-- [Compatibility and services](#compatibility-and-services)
-- [Troubleshooting](#troubleshooting)
-- [Feedback and releases](#feedback-and-releases)
+[🚀 Getting started](#getting-started) · [🔌 Profiles](#aws-profiles-and-connections) · [📦 Compatibility](#compatibility-and-services) · [🔧 Troubleshooting](#troubleshooting) · [💬 Feedback](#feedback-and-releases)
 
 ## Getting started
 
@@ -20,7 +18,7 @@ LocallyCloud runs on Linux. It is developed on Arch Linux `x86_64` and packaged 
 
 ### Do I need Docker?
 
-No Docker daemon is required to run LocallyCloud. The server runs as a Rust binary. Workflows that execute isolated compute, such as Lambda invocations, require `crun` or `youki`; ordinary service requests do not require that runtime. See [Optional runtime dependencies](../README.md#optional-runtime-dependencies).
+No Docker daemon is required to run LocallyCloud. The server runs as a Rust binary. Workflows that execute isolated compute, such as Lambda invocations, require `crun` or `youki`; ordinary service requests do not require that runtime. See [Optional runtime dependencies](SETUP.md#optional-runtime-dependencies).
 
 ### Do I need Rust or SQLite when installing a package?
 
@@ -28,11 +26,11 @@ Rust is needed to build from source, not to run an installed package. The Debian
 
 ### Can an LLM agent use LocallyCloud without administrator privileges?
 
-Yes. Run the emulator as a regular user and use the `locallycloud` AWS profile from the agent's CLI or SDK client. Installing a system package with `apt` or `pacman` requires administrator privileges; [user-only installation](../README.md#user-only-installation-without-sudo) puts the executable in your home directory instead. Dependencies and optional host features must already be available or prepared separately.
+Yes. Run the emulator as a regular user and use the `locallycloud` AWS profile from the agent's CLI or SDK client. Installing a system package with `apt` or `pacman` requires administrator privileges; [user-only installation](SETUP.md#user-only-installation-without-sudo) puts the executable in your home directory instead. Dependencies and optional host features must already be available or prepared separately.
 
 ### How do I uninstall it, and are my resources deleted?
 
-Stop the emulator, then remove the system package with `sudo apt remove locallycloud` or `sudo pacman -R locallycloud`. For a user-only installation, remove its executable and any dedicated extraction directory. User state, the master key, and AWS profiles are preserved unless you delete them explicitly. The [uninstallation guide](../README.md#uninstallation) lists the exact default and custom data locations and optional cleanup steps.
+Stop the emulator, then remove the system package with `sudo apt remove locallycloud` or `sudo pacman -R locallycloud`. For a user-only installation, remove its executable and any dedicated extraction directory. User state, the master key, and AWS profiles are preserved unless you delete them explicitly. The [uninstallation guide](SETUP.md#uninstallation) lists the exact default and custom data locations and optional cleanup steps.
 
 ### Where is the dashboard?
 
@@ -81,7 +79,7 @@ aws --profile locallycloud sts get-caller-identity
 aws --profile locallycloud s3 ls
 ```
 
-The profile stores the endpoint, including its port, and the region. Keep your other profiles when adding these entries. See [Local AWS profile](../README.md#local-aws-profile) for setup commands and configuration precedence.
+The profile stores the endpoint, including its port, and the region. Keep your other profiles when adding these entries. See [Local AWS profile](SETUP.md#local-aws-profile) for setup commands and configuration precedence.
 
 ### Can I make LocallyCloud the default for my terminal?
 
@@ -96,7 +94,7 @@ With this profile selected, you do not need `--profile` or `--endpoint-url`. You
 
 ### Do I need real AWS credentials?
 
-The quick start uses local `test` credentials with the default permissive IAM mode. Real AWS credentials are not needed for that setup. Strict IAM testing uses locally configured bootstrap credentials and roles; see [Tool compatibility](../README.md#tool-compatibility).
+The quick start uses local `test` credentials with the default permissive IAM mode. Real AWS credentials are not needed for that setup. Strict IAM testing uses locally configured bootstrap credentials and roles; see [Tool compatibility](SERVICES.md#tool-compatibility).
 
 ### Why does a command ignore the profile endpoint?
 
@@ -112,11 +110,11 @@ AWS CLI and SDK clients can target the local endpoint for implemented AWS operat
 
 ### Can I use Terraform, Serverless Framework, or AWS SAM?
 
-Terraform with AWS provider 6.x has been tested with `apply`, a `plan` with no changes, a server restart, and `destroy` for common serverless resources (S3, SQS, SNS, DynamoDB, IAM roles, Lambda, KMS, SSM, Secrets Manager, CloudWatch Logs, EventBridge, HTTP APIs, Kinesis) and ECS clusters. Serverless Framework workflows with `serverless-localstack` have also been tested. SAM CLI 1.166.2 has been tested with `sam deploy` for HTTP API → Lambda ZIP → DynamoDB SimpleTable, including creation, updates, deployment without changes, and cleanup. This is workflow-level compatibility, not complete support for every feature. See the [compatibility table](../README.md#tool-compatibility).
+Terraform with AWS provider 6.x has been tested with `apply`, a `plan` with no changes, a server restart, and `destroy` for common serverless resources (S3, SQS, SNS, DynamoDB, IAM roles, Lambda, KMS, SSM, Secrets Manager, CloudWatch Logs, EventBridge, HTTP APIs, Kinesis) and ECS clusters. Serverless Framework workflows with `serverless-localstack` have also been tested. SAM CLI 1.166.2 has been tested with `sam deploy` for HTTP API → Lambda ZIP → DynamoDB SimpleTable, including creation, updates, deployment without changes, and cleanup. This is workflow-level compatibility, not complete support for every feature. See the [compatibility table](SERVICES.md#tool-compatibility).
 
 ### Are all AWS operations supported for listed services?
 
-No. Services implement subsets of AWS behavior. Review the [service overview](../README.md#available-services) and verify the operations your application needs. Inspect registered services with:
+No. Services implement subsets of AWS behavior. Review the [service overview](SERVICES.md) and verify the operations your application needs. Inspect registered services with:
 
 ```sh
 curl -fsS http://127.0.0.1:4566/_locallycloud/status
@@ -156,7 +154,7 @@ Encrypted state requires the same master key used to create it. An environment v
 
 ### The server runs, but Lambda, ECS, or EC2 execution fails. Why?
 
-The control plane can start without an isolated compute runtime. Check that `crun` or `youki` is available in `PATH` and supported by your Linux host. OCI execution also requires a systemd user session with a user D-Bus and delegated cgroup v2 memory control; it applies the configured guest memory limit without using host swap. ZIP-based Node.js or Python Lambda functions require the executable for the declared language runtime. See [Optional runtime dependencies](../README.md#optional-runtime-dependencies).
+The control plane can start without an isolated compute runtime. Check that `crun` or `youki` is available in `PATH` and supported by your Linux host. OCI execution also requires a systemd user session with a user D-Bus and delegated cgroup v2 memory control; it applies the configured guest memory limit without using host swap. ECS tasks additionally require delegated cgroup v2 CPU control, `ip` and `nft` in `PATH`, and kernel netfilter redirect support (`nft_redir`), even for private-only tasks. Missing prerequisites fail task execution rather than server startup. See [ECS networking requirements](SETUP.md#optional-runtime-dependencies). ZIP-based Node.js or Python Lambda functions require the executable for the declared language runtime. See [Optional runtime dependencies](SETUP.md#optional-runtime-dependencies).
 
 ### Why does Lambda report D-Bus errors and then TooManyRequestsException on Debian?
 
@@ -168,7 +166,7 @@ sudo apt install crun dbus-user-session
 
 Log out and log back in, or reboot, and verify the user session with `systemctl --user status dbus`. The host must also delegate cgroup v2 memory control to that session. Start LocallyCloud without `sudo`. The `.deb` recommends `dbus-user-session`, so `apt` installs it by default; it is missing if recommended packages were skipped or the system was installed from a minimal or cloud image. `crun` is never installed automatically. On WSL 2, systemd must also be enabled; see [Supported platforms](PLATFORMS.md#wsl-2).
 
-On Debian 13 with `crun` 1.21, a failed guest launch can retain its local memory reservation. Repeated attempts then report `TooManyRequestsException` with a memory-budget error even though no guest is running; with the default budget this starts after about six failures. This is a known beta issue, not proof that a running Lambda consumed all available RAM. After resolving the session requirements, restart LocallyCloud with the same state database and `LOCALLYCLOUD_KMS_MASTER_KEY`; do not delete the state or generate a replacement key. Raising the budget only postpones the failure. See [Debian OCI execution](../README.md#debian-oci-execution).
+On Debian 13 with `crun` 1.21, a failed guest launch can retain its local memory reservation. Repeated attempts then report `TooManyRequestsException` with a memory-budget error even though no guest is running; with the default budget this starts after about six failures. This is a known beta issue, not proof that a running Lambda consumed all available RAM. After resolving the session requirements, restart LocallyCloud with the same state database and `LOCALLYCLOUD_KMS_MASTER_KEY`; do not delete the state or generate a replacement key. Raising the budget only postpones the failure. See [runtime dependencies](SETUP.md#optional-runtime-dependencies).
 
 ### RDS cannot start a PostgreSQL database. What is missing?
 
@@ -190,8 +188,12 @@ These survive a restart with the same database and master key:
 - API Gateway configuration and custom domains, imported ACM certificates and keys.
 - CloudFormation stacks, change sets, and deleted-stack history.
 - RDS instances, clusters, and snapshots, stored with their PostgreSQL data directories.
+- Glue catalog databases and tables.
+- ECR repositories and stored images, EC2/VPC topology, ECS clusters/task definitions/services, and ALB configuration.
 
-Interrupted Step Functions executions become `ABORTED`; they are not automatically replayed. Cognito user pools, EC2/VPC, ECS, ECR, Elastic Load Balancing, Route 53, CloudFront, WAF v2, CloudTrail, X-Ray, Glue, Athena, ARC, and Region Switch resources are still process-local. Recreate or reconcile them after a restart before using resources that depend on them; for example, `terraform plan` proposes to recreate an ECS cluster after a restart.
+Interrupted Step Functions executions become `ABORTED`; they are not automatically replayed. ECS desired services reconcile with new processes and rebuilt network leases; interrupted standalone tasks are not replayed. EC2 instances that were not terminated restore as stopped, retaining their configured primary ENI and private IP. Use `StartInstances` with one instance ID per request to start them explicitly. ALB listeners and target health are rebuilt. See [recovery behavior and limits](SERVICES.md#persistence-and-beta-limits).
+
+Cognito user pools, Route 53, CloudFront, WAF v2, CloudTrail, X-Ray, Athena, ARC, and Region Switch resources are still process-local. Recreate or reconcile them after a restart before using resources that depend on them.
 
 S3 metadata from earlier versions is migrated automatically on startup. Earlier binaries cannot read the upgraded state. This metadata upgrade is separate from the explicit migration of legacy plaintext object bodies.
 
