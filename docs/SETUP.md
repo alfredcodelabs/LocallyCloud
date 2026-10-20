@@ -35,7 +35,7 @@ The `.deb` supports Debian 13, Ubuntu 24.04 LTS and 26.04 LTS, distributions bas
 sudo apt install ./locallycloud_0.1.0.beta.3-1_amd64.deb
 ```
 
-Use the filename for the version and architecture you downloaded. The package includes SQLite and installs its required system libraries through `apt`, plus the recommended `dbus-user-session`; Rust and a separate SQLite installation are not needed. The installed command is `locallycloud`.
+Use the filename for the version and architecture you downloaded. The package includes SQLite and installs its required system libraries through `apt`; Rust and a separate SQLite installation are not needed. It recommends `dbus-user-session`, but APT can leave recommendations uninstalled. Install it explicitly when using OCI compute. The installed command is `locallycloud`.
 
 ### Arch Linux package
 
@@ -74,7 +74,7 @@ An agent can then start `locallycloud`, set up the `locallycloud` AWS profile, a
 
 ## Optional runtime dependencies
 
-The server can start without a compute runtime. Install these dependencies only for the workflows that need them; Linux packages do not install them automatically, except that `apt` installs the `.deb`'s recommended `dbus-user-session`.
+The server can start without a compute runtime. Install these dependencies only for the workflows that need them. The `.deb` recommends `dbus-user-session`; check that it is installed before using OCI compute, since APT may skip recommendations.
 
 | Workflow | Requirement |
 | --- | --- |

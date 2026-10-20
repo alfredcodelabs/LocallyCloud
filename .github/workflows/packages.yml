@@ -126,7 +126,9 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y curl openssl ./dist/*.deb
+          # APT can skip Recommends that need upgrades to preinstalled base libraries.
+          apt-get install -y curl openssl dbus-user-session ./dist/*.deb
+          dpkg-query -W -f='${Recommends}\n' locallycloud | grep -qw dbus-user-session
           dpkg-query -W -f='${Status}\n' dbus-user-session | grep -q 'install ok installed'
           useradd --create-home tester
           # shellcheck disable=SC2016
