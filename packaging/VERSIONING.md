@@ -16,6 +16,7 @@ ordering. Local build outputs and APT repository pool files retain `~`.
 | First beta | `0.1.0-beta.1` | `v0.1.0-beta.1` | `0.1.0~beta.1-1` | `0.1.0beta.1-1` |
 | Second beta | `0.1.0-beta.2` | `v0.1.0-beta.2` | `0.1.0~beta.2-1` | `0.1.0beta.2-1` |
 | Third beta | `0.1.0-beta.3` | `v0.1.0-beta.3` | `0.1.0~beta.3-1` | `0.1.0beta.3-1` |
+| Fourth beta | `0.1.0-beta.4` | `v0.1.0-beta.4` | `0.1.0~beta.4-1` | `0.1.0beta.4-1` |
 | Release without a beta suffix | `0.1.0` | `v0.1.0` | `0.1.0-1` | `0.1.0-1` |
 | Subsequent patch | `0.1.1` | `v0.1.1` | `0.1.1-1` | `0.1.1-1` |
 
@@ -33,9 +34,16 @@ bash scripts/check-package-version.sh
 
 For a new version, edit Cargo.toml and update Cargo.lock with `cargo update --workspace --offline`. Run the checks before creating the tag. GitHub Actions requires the tag to match the output of `package-version.sh tag` and builds all artifacts from that commit. The local scripts do not publish releases or packages.
 
-## 0.1.0-beta.3 candidate
+## 0.1.0-beta.4 candidate
 
-The next prerelease is `v0.1.0-beta.3`, with packaging revision 1. Its main changes since beta.2 are:
+The next prerelease is `v0.1.0-beta.4`, with packaging revision 1. Changes since beta.3:
+
+- Package installation checks explicitly install `dbus-user-session` and independently verify the package's recommendation metadata. This handles Ubuntu 26.04 images where APT skips the recommendation.
+- Setup and troubleshooting clarify that recommended packages may need explicit installation for OCI compute.
+
+### Beta.3 feature baseline
+
+Beta.3 introduced these changes since beta.2:
 
 - Firehose/Iceberg delivery and maintenance, encrypted recovery checks, and persisted Glue catalog state.
 - Durable ECS services integrated with local ECR images, scoped runtime identity and internal HTTP ALB lifecycle.
@@ -45,7 +53,7 @@ The next prerelease is `v0.1.0-beta.3`, with packaging revision 1. Its main chan
 
 Before tagging, commit the reviewed candidate, pass the repository checks, and validate Lambda/OCI on a supported Debian or Ubuntu VM or WSL installation as required by `AGENTS.md`. Restore the missing external ECS/ALB/network fixtures before relying on their historical results as a current release gate. The packaging workflow builds and installs both Debian architectures and the Arch package before publishing the prerelease.
 
-Updating AUR checksums requires the published beta.3 archive; do not update its pinned source version or invent checksums before that archive exists.
+Updating AUR checksums requires the published beta.4 archive; do not update its pinned source version or invent checksums before that archive exists.
 
 ## Packaging revisions
 
@@ -65,7 +73,7 @@ There are two Arch recipes. `packaging/arch/PKGBUILD` builds the local checkout 
 After the release tag is published, on an Arch machine:
 
 ```sh
-bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0-beta.3
+bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0-beta.4
 cd packaging/aur && makepkg --cleanbuild && namcap PKGBUILD ./*.pkg.tar.zst
 ```
 
@@ -107,8 +115,8 @@ After saving and pushing the version and Cargo.lock changes:
 
 ```sh
 bash scripts/check-package-version.sh
-git tag -a v0.1.0-beta.3 -m "LocallyCloud 0.1.0-beta.3"
-git push origin v0.1.0-beta.3
+git tag -a v0.1.0-beta.4 -m "LocallyCloud 0.1.0-beta.4"
+git push origin v0.1.0-beta.4
 ```
 
 Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, and `SHA256SUMS`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.

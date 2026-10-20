@@ -32,7 +32,7 @@ The executable is `target/release/locallycloud`. Continue with [Quick start](../
 The `.deb` supports Debian 13, Ubuntu 24.04 LTS and 26.04 LTS, distributions based on them (such as Linux Mint or Pop!_OS), and WSL 2 distributions based on them. Releases provide one package per architecture: `amd64` for Intel and AMD processors, and `arm64` for ARM processors. The package requires glibc 2.39 or later; older releases such as Ubuntu 22.04 are not supported, and `apt` refuses to install the package there. When a tagged release is available, download the `.deb` for your architecture (`dpkg --print-architecture` shows it). From the download directory:
 
 ```sh
-sudo apt install ./locallycloud_0.1.0.beta.3-1_amd64.deb
+sudo apt install ./locallycloud_0.1.0.beta.4-1_amd64.deb
 ```
 
 Use the filename for the version and architecture you downloaded. The package includes SQLite and installs its required system libraries through `apt`; Rust and a separate SQLite installation are not needed. It recommends `dbus-user-session`, but APT can leave recommendations uninstalled. Install it explicitly when using OCI compute. The installed command is `locallycloud`.
@@ -42,7 +42,7 @@ Use the filename for the version and architecture you downloaded. The package in
 When a tagged release is available, download its `.pkg.tar.zst` for Arch Linux `x86_64`:
 
 ```sh
-sudo pacman -U ./locallycloud-0.1.0beta.3-1-x86_64.pkg.tar.zst
+sudo pacman -U ./locallycloud-0.1.0beta.4-1-x86_64.pkg.tar.zst
 ```
 
 Use the filename for the version you downloaded. The package requires SQLite 3.53.4 or later from the Arch repositories. The installed command is `locallycloud`. On Arch Linux ARM (`aarch64`), build the package from a source checkout with `makepkg` in `packaging/arch`; that platform is supported on a best-effort basis.
@@ -63,7 +63,7 @@ Alternatively, on a supported Debian or Ubuntu host with the required system lib
 
 ```sh
 mkdir -p "$HOME/.local/opt/locallycloud" "$HOME/.local/bin"
-dpkg-deb --extract ./locallycloud_0.1.0.beta.3-1_amd64.deb "$HOME/.local/opt/locallycloud"
+dpkg-deb --extract ./locallycloud_0.1.0.beta.4-1_amd64.deb "$HOME/.local/opt/locallycloud"
 ln -s "$HOME/.local/opt/locallycloud/usr/bin/locallycloud" "$HOME/.local/bin/locallycloud"
 export PATH="$HOME/.local/bin:$PATH"
 ```
