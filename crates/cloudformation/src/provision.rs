@@ -1,7 +1,7 @@
 //! Resource provisioning: translate a CloudFormation resource into real calls against the
 //! owning native service (S3, IAM, Lambda, …) dispatched through the Core registry.
 //!
-//! The explicit allowlist below is the complete supported resource surface. Every stack entry
+//! The explicit allowlist below plus Lambda-backed custom resources is the supported surface. Every stack entry
 //! is validated against it before lifecycle side effects; the provision fallback remains an
 //! error as a defensive backstop. `AWS::Logs::LogGroup` and `AWS::Logs::LogStream` are
 //! provisioned through the registered native CloudWatch Logs handler so stack status always
@@ -21,6 +21,8 @@ use crate::error::CfnError;
 use crate::template::{ResolvedResource, ResourcePolicy};
 
 mod custom_domains;
+mod custom_resources;
+pub(crate) use custom_resources::{is_custom_resource, validate_custom_resource};
 mod ec2;
 mod ecs_alb;
 mod ecs_sg;
@@ -40,7 +42,7 @@ pub enum Replacement {
     Rollback,
 }
 
-/// Complete resource-type surface supported by this provisioner.
+/// Built-in resource types supported by this provisioner; custom types are checked separately.
 pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::EC2::SecurityGroupIngress",
     "AWS::EC2::SecurityGroupEgress",
@@ -105,7 +107,7 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
 ];
 
 pub fn is_supported_resource_type(resource_type: &str) -> bool {
-    SUPPORTED_RESOURCE_TYPES.contains(&resource_type)
+    SUPPORTED_RESOURCE_TYPES.contains(&resource_type) || is_custom_resource(resource_type)
 }
 
 pub struct Provisioner {
@@ -113,6 +115,8 @@ pub struct Provisioner {
     region: String,
     account: String,
     caller_access_key: Option<String>,
+    stack_id: Option<String>,
+    response_endpoint: String,
 }
 
 impl Provisioner {
@@ -122,7 +126,15 @@ impl Provisioner {
             region,
             account,
             caller_access_key: None,
+            stack_id: None,
+            response_endpoint: "http://127.0.0.1:4566".into(),
         }
+    }
+
+    pub(crate) fn with_stack(mut self, stack_id: &str, endpoint: &str) -> Self {
+        self.stack_id = Some(stack_id.into());
+        self.response_endpoint = endpoint.into();
+        self
     }
 
     pub(crate) fn with_caller_access_key(mut self, caller_access_key: Option<String>) -> Self {
@@ -140,6 +152,10 @@ impl Provisioner {
         properties: &Value,
     ) -> Result<ResolvedResource, CfnError> {
         match resource_type {
+            kind if is_custom_resource(kind) => {
+                self.custom_resource(logical_id, kind, properties, None, None)
+                    .await
+            }
             "AWS::EC2::SecurityGroupIngress" | "AWS::EC2::SecurityGroupEgress" => {
                 self.ecs_sg_rule(logical_id, resource_type, properties, false)
                     .await
@@ -283,6 +299,16 @@ impl Provisioner {
             return Ok(current.clone());
         }
         match resource_type {
+            kind if is_custom_resource(kind) => {
+                self.custom_resource(
+                    logical_id,
+                    kind,
+                    properties,
+                    Some(current),
+                    Some(previous_properties),
+                )
+                .await
+            }
             "AWS::EC2::SecurityGroupIngress" | "AWS::EC2::SecurityGroupEgress" => {
                 Err(CfnError::ResourceFailed(format!(
                     "{resource_type} {logical_id} rule replacement is unsupported"

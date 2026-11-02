@@ -48,6 +48,74 @@ pub fn is_presigned_url(req: &ServiceRequest) -> bool {
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(b"X-Amz-Signature"))
 }
+
+/// Sign an object PUT using explicit credentials; no process environment is read.
+pub fn presign_put(
+    endpoint: &str,
+    path: &str,
+    region: &str,
+    access_key: &str,
+    secret: &str,
+    expires: u32,
+) -> Result<String, String> {
+    let uri: http::Uri = endpoint.parse().map_err(|_| "Invalid S3 endpoint")?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+        || !(1..=604_800).contains(&expires)
+    {
+        return Err("Invalid S3 endpoint or presign expiry".into());
+    }
+    let host = uri.authority().ok_or("S3 endpoint has no authority")?;
+    let format =
+        time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
+            .map_err(|_| "Invalid date format")?;
+    let date = OffsetDateTime::now_utc()
+        .format(&format)
+        .map_err(|_| "Invalid date")?;
+    let short_date = date.get(..8).ok_or("Invalid date")?;
+    let scope = format!("{short_date}/{region}/s3/aws4_request");
+    let credential = format!("{access_key}/{scope}");
+    let query = format!(
+        "X-Amz-Algorithm={ALGORITHM}&X-Amz-Credential={}&X-Amz-Date={date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host",
+        uri_encode(credential.as_bytes(), false)
+    );
+    let canonical = format!(
+        "PUT\n{}\n{}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",
+        canonical_uri(path),
+        canonical_query(&raw_query_pairs(&query))
+    );
+    let string_to_sign = format!(
+        "{ALGORITHM}\n{date}\n{scope}\n{}",
+        hex(&Sha256::digest(canonical.as_bytes()))
+    );
+    let signature = hex(&hmac_sha256(
+        &signing_key(secret, short_date, region, "s3"),
+        string_to_sign.as_bytes(),
+    ));
+    Ok(format!(
+        "{}{path}?{query}&X-Amz-Signature={signature}",
+        endpoint.trim_end_matches('/')
+    ))
+}
+
+/// Sign a local service callback with the same credentials accepted by S3.
+pub async fn presign_local_put(
+    endpoint: &str,
+    path: &str,
+    region: &str,
+    expires: u32,
+) -> Result<String, String> {
+    let (key, secret) = tokio::task::spawn_blocking(|| {
+        let key =
+            env::var("LOCALLYCLOUD_S3_ACCESS_KEY_ID").unwrap_or_else(|_| "locallycloud".into());
+        let secret = resolve_secret(&key).ok_or("S3 callback signing credentials unavailable")?;
+        Ok::<_, String>((key, secret))
+    })
+    .await
+    .map_err(|_| "S3 callback signing failed")??;
+    presign_put(endpoint, path, region, &key, &secret, expires)
+}
 pub fn validate_url(req: &ServiceRequest) -> Result<(), S3Error> {
     let pairs = raw_query_pairs(req.uri.query().unwrap_or_default());
     let required = |name: &str| -> Result<String, S3Error> {
@@ -743,6 +811,30 @@ mod tests {
         format!("{path}?{query}&X-Amz-Signature={signature}")
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn explicit_put_presign_round_trip_and_method_binding() {
+        let url = presign_put(
+            "http://localhost:4599",
+            "/responses/key",
+            "us-east-2",
+            "locallycloud",
+            "test",
+            60,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:4599"));
+        let mut put = request(
+            Method::PUT,
+            url.parse().unwrap(),
+            headers,
+            Bytes::from_static(b"response"),
+        );
+        assert!(validate_url(&put).is_ok());
+        put.method = Method::GET;
+        assert!(matches!(validate_url(&put), Err(S3Error::AccessDenied)));
     }
 
     #[test]

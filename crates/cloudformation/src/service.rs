@@ -28,6 +28,7 @@ pub struct CfnHandler {
     store: Arc<CfnStore>,
     registry: Weak<ServiceRegistry>,
     caller_access_key: Option<String>,
+    response_endpoint: String,
 }
 
 impl CfnHandler {
@@ -36,6 +37,7 @@ impl CfnHandler {
             store: CfnStore::new(),
             registry,
             caller_access_key: None,
+            response_endpoint: "http://127.0.0.1:4566".into(),
         }
     }
 
@@ -604,7 +606,9 @@ impl CfnHandler {
             .any(|resource| !resource.pending_cleanup.is_empty())
         {
             let failed = cleanup_network_replacements(
-                &self.provisioner(region, account),
+                &self
+                    .provisioner(region, account)
+                    .with_stack(&existing.stack_id, &self.response_endpoint),
                 &mut existing.resources,
                 &mut existing.events,
             )
@@ -687,7 +691,9 @@ impl CfnHandler {
             if stack.status == StackStatus::DeleteComplete {
                 return Ok(String::new());
             }
-            let provisioner = self.provisioner(region, account);
+            let provisioner = self
+                .provisioner(region, account)
+                .with_stack(&stack.stack_id, &self.response_endpoint);
             let template = Template::parse(&stack.template_body)?;
             let declarations: BTreeMap<_, _> = template
                 .resources()
@@ -768,6 +774,26 @@ impl CfnHandler {
                     resource.status.as_str(),
                     "DELETE_COMPLETE" | "DELETE_SKIPPED"
                 ) {
+                    continue;
+                }
+                // A failed custom-resource deletion must keep its provider and that
+                // provider's dependencies available for a subsequent DeleteStack retry.
+                let blocked = has_failed_dependent(&resource.logical_id, &remaining, &declarations);
+                if blocked {
+                    if let Some(candidate) = remaining
+                        .iter_mut()
+                        .find(|r| r.logical_id == resource.logical_id)
+                    {
+                        candidate.status = "DELETE_FAILED".into();
+                    }
+                    let reason = "Dependency retained because a dependent resource failed deletion";
+                    stack.events.push(event(
+                        &resource.logical_id,
+                        &resource.resource_type,
+                        "DELETE_FAILED",
+                        Some(reason.into()),
+                    ));
+                    failures.push(format!("{}: {reason}", resource.logical_id));
                     continue;
                 }
                 if !resource.pending_cleanup.is_empty() {
@@ -852,7 +878,8 @@ impl CfnHandler {
                 let deletion = match properties {
                     Ok(properties) => {
                         provisioner
-                            .deprovision(
+                            .deprovision_named(
+                                &resource.logical_id,
                                 &resource.resource_type,
                                 &resource.physical_id,
                                 &properties,
@@ -927,7 +954,7 @@ impl CfnHandler {
     async fn provision(
         &self,
         stack_name: &str,
-        _stack_id: &str,
+        stack_id: &str,
         _template: &Template,
         parameters: &BTreeMap<String, String>,
         region: &str,
@@ -960,7 +987,9 @@ impl CfnHandler {
             },
         }
 
-        let provisioner = self.provisioner(region, account);
+        let provisioner = self
+            .provisioner(region, account)
+            .with_stack(stack_id, &self.response_endpoint);
         let previous_resolved: BTreeMap<String, ResolvedResource> = existing
             .iter()
             .map(|resource| {
@@ -1057,7 +1086,12 @@ impl CfnHandler {
                 .cloned()
                 .unwrap_or(Value::Null);
             if let Err(error) = provisioner
-                .deprovision(&resource.resource_type, &resource.physical_id, &properties)
+                .deprovision_named(
+                    &resource.logical_id,
+                    &resource.resource_type,
+                    &resource.physical_id,
+                    &properties,
+                )
                 .await
             {
                 removal_failures.insert(resource.logical_id.clone(), error.to_string());
@@ -1201,12 +1235,14 @@ impl CfnHandler {
                             resource_type: decl.resource_type.clone(),
                             applied_properties: props.clone(),
                             previous_properties,
-                            deferred_previous: (matches!(
+                            deferred_previous: ((matches!(
                                 decl.resource_type.as_str(),
                                 "AWS::EC2::NatGateway"
                                     | "AWS::EC2::Route"
                                     | "AWS::EC2::VPCGatewayAttachment"
-                            ) && current.ref_value != updated.ref_value)
+                            ) || crate::provision::is_custom_resource(
+                                &decl.resource_type,
+                            )) && current.ref_value != updated.ref_value)
                                 .then_some(current),
                             replacement_policy: decl.update_replace_policy,
                         });
@@ -1322,9 +1358,31 @@ impl CfnHandler {
                         else {
                             continue;
                         };
+                        if has_failed_dependent(logical_id, &resources, &declarations) {
+                            if let Some(candidate) =
+                                resources.iter_mut().find(|r| r.logical_id == *logical_id)
+                            {
+                                candidate.status = "DELETE_FAILED".into();
+                            }
+                            let reason =
+                                "Dependency retained because a dependent resource failed deletion";
+                            events.push(event(
+                                logical_id,
+                                resource_type,
+                                "DELETE_FAILED",
+                                Some(reason.into()),
+                            ));
+                            cleanup_failures.push(format!("{logical_id}: {reason}"));
+                            continue;
+                        }
                         events.push(event(logical_id, resource_type, "DELETE_IN_PROGRESS", None));
                         match provisioner
-                            .deprovision(resource_type, &resource.physical_id, properties)
+                            .deprovision_named(
+                                logical_id,
+                                resource_type,
+                                &resource.physical_id,
+                                properties,
+                            )
                             .await
                         {
                             Ok(()) => {
@@ -1382,7 +1440,12 @@ impl CfnHandler {
                         };
                         let restore = if let Some(previous) = deferred_previous {
                             provisioner
-                                .deprovision(resource_type, &current.ref_value, applied_properties)
+                                .deprovision_named(
+                                    logical_id,
+                                    resource_type,
+                                    &current.ref_value,
+                                    applied_properties,
+                                )
                                 .await
                                 .map(|()| previous.clone())
                         } else {
@@ -1793,6 +1856,7 @@ impl NativeHandler for CfnHandler {
         let execution = Self {
             store: self.store.clone(),
             registry: self.registry.clone(),
+            response_endpoint: self.response_endpoint.clone(),
             caller_access_key: request
                 .headers
                 .get(http::header::AUTHORIZATION)
@@ -1843,6 +1907,15 @@ pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<locallycloud_state::StateDb>,
 ) -> Result<(), String> {
+    register_with_state_and_endpoint(registry, state, "http://127.0.0.1:4566")
+}
+
+/// Register with the same endpoint advertised to compute guests.
+pub fn register_with_state_and_endpoint(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    response_endpoint: &str,
+) -> Result<(), String> {
     let store = CfnStore::with_state(&state).map_err(|_| {
         "CloudFormation state could not be loaded; check the state database and master key"
             .to_owned()
@@ -1854,6 +1927,7 @@ pub fn register_with_state(
             store,
             registry: Arc::downgrade(registry),
             caller_access_key: None,
+            response_endpoint: response_endpoint.into(),
         }),
     );
     Ok(())
@@ -2349,6 +2423,22 @@ fn parse_s3_url(url: &str) -> Option<(String, String)> {
     Some((bucket.to_string(), key.to_string()))
 }
 
+fn has_failed_dependent(
+    logical_id: &str,
+    resources: &[StackResource],
+    declarations: &BTreeMap<String, crate::template::ResourceDecl>,
+) -> bool {
+    resources.iter().any(|dependent| {
+        dependent.status == "DELETE_FAILED"
+            && declarations.get(&dependent.logical_id).is_some_and(|decl| {
+                decl.depends_on.iter().any(|name| name == logical_id)
+                    || crate::template::referenced_ids(&decl.properties)
+                        .iter()
+                        .any(|name| name == logical_id)
+            })
+    })
+}
+
 /// Cleanup is deferred until new dependents have switched, and failed physical IDs remain
 /// attached to their stack resource for the next update/delete attempt.
 async fn cleanup_network_replacements(
@@ -2362,7 +2452,8 @@ async fn cleanup_network_replacements(
         let mut remaining = Vec::new();
         for retired in resource.pending_cleanup.drain(..).rev() {
             match provisioner
-                .deprovision(
+                .deprovision_named(
+                    &resource.logical_id,
                     &resource.resource_type,
                     &retired.physical_id,
                     &retired.properties,
@@ -2704,6 +2795,7 @@ mod tests {
                 store: CfnStore::with_cipher(&db, StateCipher::with_key(&[31; 32])).unwrap(),
                 registry: Arc::downgrade(&registry),
                 caller_access_key: None,
+                response_endpoint: "http://127.0.0.1:4566".into(),
             };
             (registry, handler)
         };
@@ -4388,3 +4480,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "custom_resource_tests.rs"]
+mod custom_resource_tests;

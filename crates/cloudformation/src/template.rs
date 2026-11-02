@@ -111,6 +111,11 @@ fn validate_resources(raw: &Value) -> Result<(), CfnError> {
             resource_type,
             declaration.get("Properties").unwrap_or(&Value::Null),
         )?;
+        crate::provision::validate_custom_resource(
+            logical_id,
+            resource_type,
+            declaration.get("Properties").unwrap_or(&Value::Null),
+        )?;
         crate::provision::validate_ecs_alb_property_names(
             logical_id,
             resource_type,

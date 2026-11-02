@@ -478,7 +478,11 @@ async fn main() {
                 std::process::exit(4);
             }
         };
-    if let Err(error) = locallycloud_cloudformation::register_with_state(&registry, state.clone()) {
+    if let Err(error) = locallycloud_cloudformation::register_with_state_and_endpoint(
+        &registry,
+        state.clone(),
+        endpoint.guest_endpoint(),
+    ) {
         tracing::error!(%error, "failed to load durable CloudFormation state");
         std::process::exit(4);
     }
