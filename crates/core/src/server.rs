@@ -8,14 +8,14 @@
 //! path shared with cross-service calls. See Requirements 2, 3 and 23.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::dashboard_context::{
     encode, query_read, read_target, rest_read, valid_region, DashboardContext,
 };
 use axum::body::Body;
 use axum::extract::{
-    connect_info::ConnectInfo, ws::WebSocketUpgrade, FromRequestParts, Path, Query, Request, State,
+    connect_info::ConnectInfo, ws::WebSocketUpgrade, FromRequestParts, Query, Request, State,
 };
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -53,6 +53,7 @@ struct AppState {
     dashboard: Arc<DashboardContext>,
     control_plane_tls_hostname: Option<String>,
     ui_enabled: bool,
+    architecture: Option<Arc<dyn crate::views::architecture::ArchitectureSource>>,
 }
 
 pub struct LocallyCloudServer {
@@ -60,6 +61,7 @@ pub struct LocallyCloudServer {
     registry: Arc<ServiceRegistry>,
     readiness: Readiness,
     tls_resolver: Option<Arc<dyn crate::tls::TlsIdentityResolver>>,
+    architecture: Option<Arc<dyn crate::views::architecture::ArchitectureSource>>,
 }
 
 impl LocallyCloudServer {
@@ -69,7 +71,18 @@ impl LocallyCloudServer {
             registry,
             readiness: Readiness::new(),
             tls_resolver: None,
+            architecture: None,
         }
+    }
+
+    /// Inject the topology builder behind the dashboard's architecture view. Without it the
+    /// view's data endpoint answers 404.
+    pub fn with_architecture_source(
+        mut self,
+        source: Arc<dyn crate::views::architecture::ArchitectureSource>,
+    ) -> Self {
+        self.architecture = Some(source);
+        self
     }
 
     pub fn with_tls_resolver(mut self, resolver: Arc<dyn crate::tls::TlsIdentityResolver>) -> Self {
@@ -156,6 +169,7 @@ impl LocallyCloudServer {
             max_request_body_bytes: self.config.max_request_body_bytes,
             control_plane_tls_hostname: self.config.tls.as_ref().map(|tls| tls.hostname.clone()),
             ui_enabled: self.config.ui_enabled,
+            architecture: self.architecture,
             dashboard: Arc::new(if self.config.ui_enabled {
                 DashboardContext::load(
                     addr,
@@ -224,47 +238,32 @@ impl LocallyCloudServer {
 }
 
 fn dashboard_routes(app: Router<AppState>) -> Router<AppState> {
-    app.route("/_locallycloud/activity", post(activity_handler))
-        .route("/_locallycloud/context", get(context_handler))
-        .route(
-            "/_locallycloud/explore/regions",
-            post(explorer_regions_handler),
-        )
-        .route(
-            "/_locallycloud/explore/read",
-            axum::routing::post(explorer_read_handler),
-        )
-        .route("/_locallycloud/ui", get(ui_handler))
-        .route("/_locallycloud/ui/", get(ui_handler))
-        .route("/_locallycloud/ui/{*page}", get(ui_handler))
-        .route("/_locallycloud/explore/s3", get(s3_explorer_handler))
-        .route("/_locallycloud/dashboard.js", get(ui_script_handler))
-        .route("/_locallycloud/dashboard.css", get(ui_style_handler))
-        .route("/_locallycloud/brand/{asset}", get(ui_brand_handler))
-        .route("/_locallycloud/dashboard-i18n.js", get(ui_i18n_handler))
-        .route("/_locallycloud/icons.svg", get(ui_icons_handler))
+    use crate::views::routes::Endpoint;
+    crate::views::routes::routes().fold(app, |app, route| {
+        let handler = match route.endpoint {
+            Endpoint::Page => get(|headers: http::HeaderMap| async move {
+                crate::views::assets::serve(&crate::views::assets::PAGE, &headers)
+            }),
+            Endpoint::Asset(asset) => get(move |headers: http::HeaderMap| async move {
+                crate::views::assets::serve(asset, &headers)
+            }),
+            Endpoint::Context => get(context_handler),
+            Endpoint::Activity => post(activity_handler),
+            Endpoint::ExploreRegions => post(explorer_regions_handler),
+            Endpoint::ExploreRead => post(explorer_read_handler),
+            Endpoint::ExploreS3 => get(s3_explorer_handler),
+            Endpoint::ArchitectureTopology => post(architecture_topology_handler),
+            Endpoint::Reserved => any(|| async { StatusCode::NOT_FOUND }),
+        };
+        app.route(route.path, handler)
+    })
 }
 
 // With the UI off, every dashboard path is absent (404) rather than reaching the AWS
 // dispatcher, so no dashboard-only read or signing path exists.
 fn disabled_dashboard_routes(app: Router<AppState>) -> Router<AppState> {
-    [
-        "/_locallycloud/activity",
-        "/_locallycloud/context",
-        "/_locallycloud/explore",
-        "/_locallycloud/explore/{*rest}",
-        "/_locallycloud/ui",
-        "/_locallycloud/ui/",
-        "/_locallycloud/ui/{*page}",
-        "/_locallycloud/dashboard.js",
-        "/_locallycloud/dashboard.css",
-        "/_locallycloud/brand/{*asset}",
-        "/_locallycloud/dashboard-i18n.js",
-        "/_locallycloud/icons.svg",
-    ]
-    .into_iter()
-    .fold(app, |app, path| {
-        app.route(path, any(|| async { StatusCode::NOT_FOUND }))
+    crate::views::routes::routes().fold(app, |app, route| {
+        app.route(route.path, any(|| async { StatusCode::NOT_FOUND }))
     })
 }
 
@@ -694,17 +693,101 @@ async fn dispatch_dashboard_profile(
         .await
 }
 
-fn dashboard_error(message: &str, status: u16) -> Response {
-    render(AwsError::new("InvalidRequest", message, status).render(AwsProtocol::RestJson))
+#[derive(serde::Deserialize)]
+struct TopologyQuery {
+    #[serde(flatten)]
+    context: BrowseContext,
+    stack: String,
 }
 
-async fn ui_handler() -> Response {
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/html; charset=utf-8")
-        .header("cache-control", "no-store")
-        .body(Body::from(crate::status::DASHBOARD_HTML))
-        .expect("dashboard html is always valid")
+/// Signs each architecture read as the verified dashboard profile; admits reads only.
+struct DashboardReader {
+    state: AppState,
+    dashboard: DashboardContext,
+    profile: String,
+    region: String,
+}
+
+#[async_trait::async_trait]
+impl crate::views::architecture::AwsReader for DashboardReader {
+    async fn read(
+        &self,
+        read: crate::views::architecture::AwsRead,
+    ) -> Result<crate::views::architecture::AwsReply, crate::views::architecture::ReadError> {
+        use crate::views::architecture::{is_read, AwsReply, ReadError};
+        const LIMIT: usize = 8 * 1024 * 1024;
+        let profile = self.dashboard.profile(&self.profile);
+        let Some(profile) = profile.filter(|_| is_read(&read)) else {
+            return Err(ReadError::NotRead);
+        };
+        let mut headers = read.headers;
+        headers.insert("host", http::HeaderValue::from_static("localhost"));
+        let response = dispatch_dashboard_profile(
+            &self.state,
+            profile,
+            &self.region,
+            &read.method,
+            &read.uri,
+            headers,
+            read.body,
+            read.service,
+        )
+        .await;
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), LIMIT)
+            .await
+            .map_err(|_| ReadError::TooLarge(LIMIT))?;
+        Ok(AwsReply { status, body })
+    }
+}
+
+async fn architecture_topology_handler(
+    State(state): State<AppState>,
+    incoming: http::HeaderMap,
+    Json(query): Json<TopologyQuery>,
+) -> Response {
+    use crate::views::architecture::{Scope, TopologyError};
+    if !local_dashboard_headers(&incoming) {
+        return dashboard_error("dashboard reads require the local origin", 403);
+    }
+    let Some(source) = state.architecture.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if query.stack.is_empty()
+        || query.stack.len() > 1024
+        || query.stack.chars().any(char::is_control)
+    {
+        return dashboard_error("invalid stack name", 400);
+    }
+    let verified = match dashboard_account(&state, &query.context).await {
+        Ok(verified) => verified,
+        Err(error) => return *error,
+    };
+    let reader = DashboardReader {
+        state: state.clone(),
+        dashboard: state.dashboard.refreshed().await,
+        profile: query
+            .context
+            .profile
+            .clone()
+            .unwrap_or_else(|| "instance".into()),
+        region: verified.region.clone(),
+    };
+    let scope = Scope {
+        account: verified.account,
+        region: verified.region,
+    };
+    let (code, status, message) = match source.topology(&reader, &scope, &query.stack).await {
+        Ok(model) => return Json(model).into_response(),
+        Err(TopologyError::NotFound(m)) => ("ResourceNotFoundException", 404, m),
+        Err(TopologyError::AccessDenied(m)) => ("AccessDeniedException", 403, m),
+        Err(TopologyError::Unprocessable(m)) => ("InvalidRequest", 422, m),
+    };
+    render(AwsError::new(code, message, status).render(AwsProtocol::RestJson))
+}
+
+fn dashboard_error(message: &str, status: u16) -> Response {
+    render(AwsError::new("InvalidRequest", message, status).render(AwsProtocol::RestJson))
 }
 
 async fn activity_handler(
@@ -756,83 +839,11 @@ async fn activity_handler(
     .into_response()
 }
 
-async fn ui_script_handler() -> Response {
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/javascript; charset=utf-8")
-        .header("cache-control", "no-store")
-        .body(Body::from(crate::status::DASHBOARD_JS))
-        .expect("dashboard script is always valid")
-}
-
-async fn ui_style_handler() -> Response {
-    Response::builder()
-        .header("content-type", "text/css; charset=utf-8")
-        .header("cache-control", "no-store")
-        .body(Body::from(crate::status::DASHBOARD_CSS))
-        .expect("embedded dashboard CSS response is always valid")
-}
-
-async fn ui_brand_handler(Path(asset): Path<String>) -> Response {
-    let svg = match asset.as_str() {
-        "icon.svg" => include_str!("../../../packaging/assets/locallycloud.svg"),
-        "wordmark.svg" => include_str!("../../../packaging/assets/locallycloud-wordmark.svg"),
-        "wordmark-light.svg" => {
-            include_str!("../../../packaging/assets/locallycloud-wordmark-light.svg")
-        }
-        _ => return Response::builder().status(404).body(Body::empty()).unwrap(),
-    };
-    Response::builder()
-        .header("content-type", "image/svg+xml")
-        .header("cache-control", "no-store")
-        .body(Body::from(svg))
-        .expect("embedded brand asset response is always valid")
-}
-
-async fn ui_i18n_handler() -> Response {
-    Response::builder()
-        .header("content-type", "text/javascript; charset=utf-8")
-        .header("cache-control", "no-store")
-        .body(Body::from(crate::status::DASHBOARD_I18N))
-        .expect("dashboard translations response is always valid")
-}
-
-async fn ui_icons_handler(headers: http::HeaderMap) -> Response {
-    use sha2::Digest;
-    static ETAG: OnceLock<String> = OnceLock::new();
-    let etag = ETAG.get_or_init(|| {
-        format!(
-            "\"{:x}\"",
-            sha2::Sha256::digest(crate::status::SERVICE_ICONS_SVG)
-        )
-    });
-    let unchanged = headers
-        .get(http::header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.split(',').any(|candidate| {
-                let candidate = candidate.trim();
-                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
-            })
-        });
-    Response::builder()
-        .status(if unchanged { 304 } else { 200 })
-        .header("content-type", "image/svg+xml")
-        .header("cache-control", "public, no-cache")
-        .header("etag", etag.as_str())
-        .body(if unchanged {
-            Body::empty()
-        } else {
-            Body::from(crate::status::SERVICE_ICONS_SVG)
-        })
-        .expect("embedded service sprite response is always valid")
-}
-
 fn dashboard_ui_request(method: &http::Method, uri: &http::Uri, headers: &http::HeaderMap) -> bool {
     let path = uri.path().trim_start_matches('/');
     let region = path.split('/').next().unwrap_or("");
     method == http::Method::GET
-        && (valid_region(region) || matches!(region, "home" | "dashboard"))
+        && (valid_region(region) || region == "dashboard")
         && headers
             .get("accept")
             .and_then(|h| h.to_str().ok())
@@ -924,7 +935,7 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
         if !state.ui_enabled {
             return StatusCode::NOT_FOUND.into_response();
         }
-        return ui_handler().await;
+        return crate::views::assets::serve(&crate::views::assets::PAGE, req.headers());
     }
     let (mut parts, body) = req.into_parts();
     let peer = ConnectInfo::<crate::tls::ConnectionInfo>::from_request_parts(&mut parts, &state)
@@ -1020,36 +1031,6 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod dashboard_tests {
 
-    #[tokio::test]
-    async fn service_sprite_is_cacheable_and_revalidates_by_content() {
-        let response = super::ui_icons_handler(http::HeaderMap::new()).await;
-        assert_eq!(response.status(), 200);
-        assert_eq!(response.headers()["content-type"], "image/svg+xml");
-        assert_eq!(response.headers()["cache-control"], "public, no-cache");
-        let etag = response.headers()["etag"].to_str().unwrap().to_owned();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(body.as_ref(), crate::status::SERVICE_ICONS_SVG.as_bytes());
-        for candidate in [
-            etag.clone(),
-            format!("W/{etag}"),
-            format!("\"old\", {etag}"),
-            "*".into(),
-        ] {
-            let mut headers = http::HeaderMap::new();
-            headers.insert("if-none-match", candidate.parse().unwrap());
-            let response = super::ui_icons_handler(headers).await;
-            assert_eq!(response.status(), 304);
-            assert!(axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .is_empty());
-        }
-        let mut headers = http::HeaderMap::new();
-        headers.insert("if-none-match", "\"old\"".parse().unwrap());
-        assert_eq!(super::ui_icons_handler(headers).await.status(), 200);
-    }
     use super::{BrowseContext, S3Browse};
 
     #[test]
@@ -1067,7 +1048,7 @@ mod dashboard_tests {
             &uri,
             &headers
         ));
-        for path in ["/home", "/home/key", "/dashboard/key"] {
+        for path in ["/dashboard", "/dashboard/key"] {
             let path = path.parse().unwrap();
             assert!(super::dashboard_ui_request(
                 &http::Method::GET,

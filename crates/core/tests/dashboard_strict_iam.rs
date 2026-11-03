@@ -433,7 +433,7 @@ async fn ui_off_removes_every_dashboard_route_but_keeps_health_and_status() {
         assert_eq!(response.status(), 404, "{method} {path}");
     }
     // The regional HTML fallback is also gone.
-    for path in ["/us-east-1/dynamo/Orders", "/home"] {
+    for path in ["/us-east-1/dynamo/Orders", "/dashboard/"] {
         let response = client
             .get(format!("{base}{path}"))
             .header("accept", "text/html")
@@ -462,8 +462,13 @@ async fn ui_on_by_default_serves_the_dashboard() {
         let response = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(response.status(), 200, "{path}");
     }
+    // The internal namespace is reserved: unknown and retired paths never reach AWS dispatch.
+    for path in ["/_locallycloud/ui/svc/lambda", "/_locallycloud/anything"] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+    }
     let response = client
-        .get(format!("{base}/home"))
+        .get(format!("{base}/dashboard/"))
         .header("accept", "text/html")
         .send()
         .await

@@ -43,6 +43,7 @@ members = [
     "crates/cognito",
     "crates/acm",
     "crates/cloudfront",
+    "crates/architecture",
 ]
 
 [workspace.package]
@@ -142,6 +143,7 @@ locallycloud-wafv2 = { path = "crates/wafv2" }
 locallycloud-cognito = { path = "crates/cognito" }
 locallycloud-acm = { path = "crates/acm" }
 locallycloud-cloudfront = { path = "crates/cloudfront" }
+locallycloud-architecture = { path = "crates/architecture" }
 
 [profile.dev.package.rsa]
 opt-level = 3

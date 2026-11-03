@@ -1,0 +1,23 @@
+[package]
+name = "locallycloud-architecture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Architecture-review topology for locallycloud: review model and the AWS anti-corruption layer"
+
+[dependencies]
+locallycloud-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures-util = "=0.3.34"
+http.workspace = true
+quick-xml = "=0.42.0"
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

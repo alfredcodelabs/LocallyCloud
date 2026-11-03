@@ -48,6 +48,7 @@ locallycloud-wafv2.workspace = true
 locallycloud-cognito.workspace = true
 locallycloud-acm.workspace = true
 locallycloud-cloudfront.workspace = true
+locallycloud-architecture.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
@@ -60,4 +61,5 @@ time.workspace = true
 
 [dev-dependencies]
 hmac.workspace = true
+reqwest.workspace = true
 sha2.workspace = true

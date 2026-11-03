@@ -2186,6 +2186,7 @@ dependencies = [
  "locallycloud-analytics",
  "locallycloud-apigateway",
  "locallycloud-arc",
+ "locallycloud-architecture",
  "locallycloud-cloudformation",
  "locallycloud-cloudfront",
  "locallycloud-cloudtrail",
@@ -2218,6 +2219,7 @@ dependencies = [
  "locallycloud-stepfunctions",
  "locallycloud-wafv2",
  "locallycloud-xray",
+ "reqwest",
  "serde_json",
  "sha2 0.10.9",
  "time",
@@ -2310,6 +2312,22 @@ dependencies = [
  "locallycloud-core",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "locallycloud-architecture"
+version = "0.1.0-beta.4"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "http",
+ "locallycloud-core",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
 ]
 
 [[package]]

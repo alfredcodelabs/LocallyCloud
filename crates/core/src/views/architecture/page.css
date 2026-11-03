@@ -1,0 +1,97 @@
+/* Architecture review page. Every rule is scoped to the `.ar` mount element and uses dashboard tokens. */
+.ar { --ar-tint: var(--bg); }
+.ar .ar-head { justify-content: space-between; align-items: flex-start; gap: 12px 20px; }
+.ar .ar-heading { min-width: 0; }
+.ar .ar-heading .meta { margin-bottom: 8px; }
+.ar .ar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ar button, .ar .ar-file, .ar input, .ar select, .ar textarea { font: inherit; font-size: 13px; color: inherit; }
+.ar button:not(.link), .ar .ar-file {
+  border: 1px solid var(--line); background: var(--surface); border-radius: 6px; padding: 6px 12px; cursor: pointer;
+}
+.ar button:not(.link):hover, .ar .ar-file:hover { border-color: var(--accent); }
+.ar button:disabled { opacity: .55; cursor: default; }
+.ar button.link { text-align: start; white-space: normal; }
+.ar .ar-file { position: relative; overflow: hidden; display: inline-flex; }
+.ar .ar-file input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
+.ar .ar-file:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ar input:not([type]), .ar input[type="search"], .ar select, .ar textarea {
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); min-width: 0; max-width: 100%;
+}
+.ar textarea { resize: vertical; }
+.ar input[type="checkbox"] { accent-color: var(--accent); }
+.ar .ar-field { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; min-width: 0; }
+.ar .ar-field > * { flex: none; }
+.ar .check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.ar .ar-notice { margin: 0 0 12px; padding: 8px 12px; border-inline-start: 3px solid var(--accent); background: var(--surface); font-size: 13px; overflow-wrap: anywhere; }
+.ar .ar-notice:empty { display: none; }
+.ar .ar-notice.ar-error { color: var(--bad); border-color: var(--bad); }
+.ar .ar-evidence { font-size: 12px; margin: 0 0 6px; }
+.ar p { margin: 4px 0; }
+.ar .ar-box { margin: 10px 0; }
+.ar .ar-box summary { font-weight: 500; color: var(--accent); margin-bottom: 8px; }
+.ar .ar-box ul { margin: 0; padding-inline-start: 20px; font-size: 12px; overflow-wrap: anywhere; }
+.ar .ar-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; margin: 12px 0 20px; }
+.ar .ar-workspace[hidden], .ar [hidden] { display: none; }
+.ar .ar-diagram, .ar .ar-inspector { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); min-width: 0; }
+.ar .ar-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 14px; padding: 12px; border-bottom: 1px solid var(--line); }
+.ar .ar-toolbar input[type="search"] { width: 180px; }
+.ar .ar-zoom { display: inline-flex; gap: 6px; }
+.ar .ar-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 12px; margin: 0; font-size: 11px; color: var(--muted); }
+.ar .ar-viewport {
+  overflow: auto; height: 540px; background-color: var(--ar-tint);
+  background-image: radial-gradient(var(--line) .8px, transparent .8px); background-size: 20px 20px;
+}
+.ar .ar-viewport svg { display: block; }
+.ar .ar-node { cursor: grab; touch-action: none; }
+.ar .ar-node:active { cursor: grabbing; }
+.ar .ar-node > rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+.ar .ar-node.selected > rect, .ar .ar-node:focus-visible > rect { stroke: var(--accent); stroke-width: 3; }
+.ar .ar-node:focus, .ar .ar-edge:focus { outline: none; }
+.ar .ar-node text, .ar .ar-edge text { fill: var(--text); font: 12px system-ui, sans-serif; pointer-events: none; }
+.ar .ar-node .type, .ar .ar-node .status { fill: var(--muted); font-size: 10px; }
+.ar .ar-node .mark { fill: var(--accent); font-size: 10px; font-weight: 700; }
+.ar .ar-node.dim { opacity: .2; }
+.ar .ar-edge path { fill: none; stroke: var(--accent); stroke-width: 2; }
+.ar .ar-edge.proposed path { stroke-dasharray: 7 5; }
+.ar .ar-edge.dependency path { stroke: var(--muted); stroke-dasharray: 2 6; }
+.ar .ar-edge.selected path:not(.hit), .ar .ar-edge:focus-visible path:not(.hit) { stroke-width: 4; }
+.ar .ar-edge .hit { stroke: transparent; stroke-width: 18; cursor: pointer; pointer-events: stroke; }
+.ar .ar-edge text { font-size: 10px; paint-order: stroke; stroke: var(--surface); stroke-width: 5; stroke-linejoin: round; fill: var(--muted); }
+.ar .ar-zone-box { fill: var(--ar-tint); fill-opacity: .65; stroke: var(--line); stroke-dasharray: 6 5; }
+.ar .ar-zone-label { font: 11px system-ui, sans-serif; fill: var(--muted); }
+.ar .ar-below { padding: 12px; border-top: 1px solid var(--line); font-size: 12px; }
+.ar .ar-form { display: grid; gap: 10px; }
+.ar .ar-inline { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); align-items: end; }
+.ar .ar-inspector { padding: 16px; max-height: 900px; overflow: auto; }
+.ar .ar-inspector h3 { font-size: 14px; margin: 18px 0 8px; }
+.ar .ar-guided { border-bottom: 1px solid var(--line); padding-bottom: 16px; margin-bottom: 16px; }
+.ar .ar-guided h3 { margin-top: 0; }
+.ar .ar-guided h4 { font-size: 14px; margin: 12px 0 4px; }
+.ar .ar-guided p, .ar .ar-guided .ar-actions { font-size: 12px; margin: 8px 0; }
+.ar .ar-steps { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 12px; }
+.ar .ar-steps button { font-size: 11px; padding: 4px 7px; }
+.ar .ar-steps button[aria-current="step"] { border-color: var(--accent); font-weight: 700; }
+.ar .ar-answer { margin: 12px 0; }
+.ar .ar-wrap { overflow-wrap: anywhere; }
+.ar .ar-pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.ar .ar-mono { font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ar .ar-card { padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; }
+.ar .ar-card p { font-size: 12px; color: var(--muted); }
+.ar .ar-card button { font-size: 12px; margin-top: 6px; padding: 4px 8px; }
+.ar .ar-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ar .ar-threat-form { margin-top: 16px; padding-top: 8px; border-top: 1px solid var(--line); }
+.ar .ar-register td, .ar .ar-register th { white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
+@media (max-width: 860px) {
+  .ar .ar-workspace { grid-template-columns: minmax(0, 1fr); }
+  .ar .ar-inspector { max-height: none; }
+  .ar .ar-viewport { height: 420px; }
+}
+@media (max-width: 560px) {
+  .ar .ar-toolbar input[type="search"] { width: 100%; }
+  .ar .ar-toolbar .ar-field { flex: 1 1 100%; }
+  .ar .ar-pair { grid-template-columns: minmax(0, 1fr); }
+}
+@media (forced-colors: active) {
+  .ar .ar-node > rect { stroke: CanvasText; }
+  .ar .ar-edge path:not(.hit) { stroke: CanvasText; }
+}

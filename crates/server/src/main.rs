@@ -729,7 +729,11 @@ async fn main() {
         gateway: gateway_waf,
         certificates: acm,
     };
-    let server = LocallyCloudServer::new(config, registry).with_tls_resolver(Arc::new(domain_tls));
+    let server = LocallyCloudServer::new(config, registry)
+        .with_tls_resolver(Arc::new(domain_tls))
+        .with_architecture_source(Arc::new(
+            locallycloud_architecture::CloudFormationTopology::default(),
+        ));
 
     let restored_lambda = lambda_handler.clone();
     let server_result = server

@@ -20,7 +20,7 @@
       lastOk: 0,
       health: "offline",
       error: "",
-      svc: "",
+      svc: "", page: "",
     };
     const rowsByName = new Map();
 
@@ -99,6 +99,7 @@
       document.querySelector(".brand a").href = contextual(homePath());
       $("nav-overview").href = contextual(homePath());
       $("nav-billing").href = contextual(homePath() + "billing/");
+      $("nav-architecture").href = contextual(homePath() + "architecture/");
     }
     function updateOptions(select, options) {
       if (select.options.length !== options.length || options.some((option, i) => {
@@ -214,7 +215,7 @@
       if (!res.ok) {
         const type = (res.headers.get("x-amzn-errortype") || body.__type || body.code || "").split(":")[0].split("#").pop();
         const err = new Error(body.message || body.Message || type || "HTTP " + res.status);
-        err.type = type;
+        err.type = type; err.status = res.status;
         err.auth = res.status === 403 || /AccessDenied|Unrecognized|InvalidClientToken|MissingAuth|Signature|NotAuthorized|ExpiredToken/.test(type);
         throw err;
       }
@@ -723,6 +724,7 @@
         (name) => [panel(t("config"), async () => {
           const stack = (await api("cloudformation", "DescribeStacks", { StackName: name })).Stacks?.[0];
           return [kv([["status", stack?.StackStatus], ["ARN", stack?.StackId], ["error", stack?.StackStatusReason]]),
+            h("p", null, link(contextual(homePath() + "architecture/" + enc(stack?.StackName || name)), t("architecture"))),
             table(["name", "value"], (stack?.Outputs || []).map((output) => [output.OutputKey, output.OutputValue]))];
         }),
         panel(t("resources"), async () => [h("p", { cls: "muted" }, t("stackCleanupNotice")),
@@ -945,14 +947,51 @@
       );
     }
 
-    // Dashboard paths are separate from AWS API routes; old hash bookmarks still work.
+    // The architecture review loads its module and stylesheet only when first opened.
+    const ARCHITECTURE_JS = "/_locallycloud/views/architecture/page.js";
+    const ARCHITECTURE_CSS = "/_locallycloud/views/architecture/page.css";
+    let architecture = null;
+    async function showArchitecture(stack) {
+      document.title = (stack ? stack + " · " : "") + t("architecture") + " · LocallyCloud";
+      if (!document.querySelector('link[data-view="architecture"]')) {
+        document.head.append(h("link", { rel: "stylesheet", href: ARCHITECTURE_CSS, "data-view": "architecture" }));
+      }
+      const root = $("architecture"), controller = state.readController;
+      root.replaceChildren(msg("loading"));
+      let view;
+      try { view = await import(ARCHITECTURE_JS); } catch (e) {
+        if (!controller.signal.aborted) root.replaceChildren(errBox(e));
+        return;
+      }
+      if (controller.signal.aborted) return;
+      root.replaceChildren();
+      architecture = { url: location.pathname + location.search, page: view.mount(root, {
+        t, lang: () => state.lang, call, api, profile: state.profile, region: state.region, stack, signal: controller.signal, contextual, homePath,
+      }) };
+    }
+    // Reserved pages are matched in order before service slugs: `/<region>/<name>/[<rest>]`.
+    const RESERVED_PAGES = [
+      { name: "billing", nav: "nav-billing", main: "billing", show: () => { document.title = t("billing") + " · LocallyCloud"; renderBilling(); } },
+      { name: "architecture", nav: "nav-architecture", main: "architecture", show: showArchitecture },
+    ];
+    // Unsaved review work is only discarded after the user confirms.
+    function leaveArchitecture() {
+      if (!architecture) return true;
+      if (!architecture.page.confirmLeave()) return false;
+      architecture.page.unmount(); architecture = null;
+      return true;
+    }
+    const decode = (part) => { try { return decodeURIComponent(part); } catch { return part; } };
+
+    // Dashboard paths are separate from AWS API routes.
     let timers = [];
     function every(ms, fn) { timers.push(setInterval(fn, ms)); }
     async function route() {
+      if (architecture?.url === location.pathname + location.search) { architecture.page.relocalize(); return; }
+      if (architecture && !leaveArchitecture()) { history.replaceState(null, "", architecture.url); return; }
       timers.forEach(clearInterval); timers = []; charts.length = 0;
-      const legacy = (location.hash === "#app" ? "" : location.hash.replace(/^#\/?/, ""));
       state.readController.abort(); state.readController = new AbortController();
-      let path = location.pathname.replace(/^\/(?:dashboard|home|_locallycloud\/ui)\/?/, "");
+      let path = location.pathname.replace(/^\/(?:dashboard|_locallycloud\/ui)\/?/, "");
       const regional = location.pathname.match(/^\/([a-z][a-z0-9-]*-\d+)\/(.*)$/);
       state.profile = new URLSearchParams(location.search).get("profile") || state.profile || state.context?.defaultProfile || "instance";
       state.region = regional?.[1] || state.region || state.context?.defaultRegion || "us-east-1";
@@ -961,7 +1000,8 @@
       state.activity = null; state.activityError = "";
       contextControls();
       $("detail").replaceChildren(msg("loading"));
-      $("ov").hidden = true; $("billing").hidden = true; $("detail").hidden = false;
+      $("ov").hidden = true; $("detail").hidden = false;
+      for (const page of RESERVED_PAGES) $(page.main).hidden = true;
       const controller = state.readController;
       try {
         const identity = await read({ service: "sts", operation: "GetCallerIdentity" });
@@ -976,10 +1016,10 @@
         renderIdentity(); $("detail").replaceChildren(errBox(e)); $("crumbs").hidden = true;
         return;
       }
-      const parts = (legacy || path).replace(/\/$/, "").split("/");
-      if (parts[0] === "svc") parts.shift();
-      const billing = parts[0] === "billing";
-      const selected = !billing && parts[0] ? decodeURIComponent(parts[0]) : "";
+      const parts = path.replace(/\/$/, "").split("/");
+      const reserved = RESERVED_PAGES.find((page) => page.name === parts[0]);
+      const rest = reserved && parts.length > 1 ? decode(parts.slice(1).join("/")) : "";
+      const selected = !reserved && parts[0] ? decodeURIComponent(parts[0]) : "";
       const svc = selected === "dynamo" ? "dynamodb" : selected;
       let id = svc && parts.length > 1 ? decodeURIComponent(parts.slice(1).join("/")) : "";
       if (svc === "states" && id && !id.startsWith("arn:")) {
@@ -992,24 +1032,25 @@
       }
       store.set("region", state.region); store.set("profile", state.profile);
       contextControls(); activityViewKey = "";
-      // Canonicalize old dashboard/hash bookmarks without losing full resource identifiers.
-      if (!regional || legacy) {
+      // Canonicalize non-regional entry paths without losing full resource identifiers.
+      if (!regional) {
         const routeId = svc === "states" && id ? R.sm(id) : contextual(servicePath(svc, id));
-        history.replaceState(null, "", billing ? contextual(homePath() + "billing/") : svc ? routeId : contextual(homePath()));
+        history.replaceState(null, "", reserved ? contextual(homePath() + reserved.name + "/" + (rest ? enc(rest) : "")) : svc ? routeId : contextual(homePath()));
       }
-      state.svc = svc;
-      $("ov").hidden = !!svc || billing;
-      $("billing").hidden = !billing;
+      state.svc = svc; state.page = reserved?.name || "";
+      $("ov").hidden = !!svc || !!reserved;
       $("detail").hidden = !svc;
       $("crumbs").hidden = !svc;
-      if (!svc && !billing) $("nav-overview").setAttribute("aria-current", "page");
+      if (!svc && !reserved) $("nav-overview").setAttribute("aria-current", "page");
       else $("nav-overview").removeAttribute("aria-current");
-      if (billing) $("nav-billing").setAttribute("aria-current", "page");
-      else $("nav-billing").removeAttribute("aria-current");
-      if (billing) {
+      for (const page of RESERVED_PAGES) {
+        $(page.main).hidden = page !== reserved;
+        if (page === reserved) $(page.nav).setAttribute("aria-current", "page");
+        else $(page.nav).removeAttribute("aria-current");
+      }
+      if (reserved) {
         $("detail").replaceChildren();
-        document.title = t("billing") + " · LocallyCloud";
-        renderBilling();
+        reserved.show(rest);
         return;
       }
       if (!svc) {
@@ -1187,15 +1228,15 @@
       e.preventDefault(); history.pushState(null, "", a.href); route();
     });
     window.addEventListener("popstate", route);
-    window.addEventListener("hashchange", () => { if (location.hash !== "#app") route(); });
     setInterval(renderAgo, 1000);
 
     function switchContext() {
       $("identity-panel").hidePopover();
+      if (!leaveArchitecture()) { contextControls(); return; }
       const profile = state.context.profiles.find((p) => p.name === $("profile").value);
       state.profile = profile.name;
       state.region = $("region").value || state.region;
-      history.pushState(null, "", contextual(state.svc ? servicePath(state.svc) : homePath()));
+      history.pushState(null, "", contextual(state.svc ? servicePath(state.svc) : homePath() + (state.page ? state.page + "/" : "")));
       route();
     }
     $("region").onchange = switchContext;

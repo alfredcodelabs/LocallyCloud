@@ -46,6 +46,28 @@ jobs:
           [[ "$rust" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
 
+  architecture-review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check dashboard view modules and review engine
+        run: |
+          for file in crates/core/src/views/architecture/*.js crates/core/src/views/architecture/tests/*.mjs tools/architecture-review-mcp/*.mjs; do
+            node --check "$file"
+          done
+          node --test crates/core/src/views/architecture/tests/*.test.mjs
+      - name: Check the optional MCP companion
+        run: |
+          npm ci --prefix tools/architecture-review-mcp --ignore-scripts
+          node tools/architecture-review-mcp/test.mjs
+
   debian:
     needs: version
     strategy:
@@ -169,7 +191,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [debian, debian-install, arch]
+    needs: [architecture-review, debian, debian-install, arch]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
