@@ -442,6 +442,7 @@ async fn producer_context(
         }
     }
     Ok(ProducerContext {
+        source_arn: None,
         source_service: "apigateway".into(),
         identity: role
             .map(|role_arn| CallerIdentity::AssumedRole {

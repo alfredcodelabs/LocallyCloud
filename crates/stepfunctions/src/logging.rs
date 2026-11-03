@@ -35,31 +35,45 @@ pub fn is_enabled(value: Option<&Value>, region: &str, account: &str) -> bool {
 
 pub async fn preflight_configuration(
     value: Option<&Value>,
-    registry: &Weak<ServiceRegistry>,
-    region: &str,
-    account: &str,
+    ctx: &crate::ops::Ctx<'_>,
+    role: &str,
+    source: &str,
+    configure: bool,
 ) -> Result<(), SfnError> {
+    let (region, account) = (ctx.region, ctx.account);
     let configuration = parse_configuration(value, region, account)?;
     let Some(group_name) = configuration.group_name else {
         return Ok(());
     };
-    let registry = registry
+    let registry = ctx
+        .registry
         .upgrade()
         .ok_or_else(|| invalid_configuration("CloudWatch Logs service registry is unavailable"))?;
     let sink = registry
         .log_sink(&ServiceName::new("logs"))
         .ok_or_else(|| invalid_configuration("CloudWatch Logs sink is unavailable"))?;
+    let strict =
+        crate::log_delivery::validate_role(&registry, region, account, role, source, configure)?;
     sink.resolve_group(
         LogScope::new(account, region),
-        ProducerGroupSpec { name: group_name },
-        producer_context(CallerIdentity::ServicePrincipal {
-            service: "states".into(),
+        ProducerGroupSpec {
+            name: group_name.clone(),
+        },
+        producer_context(CallerIdentity::AssumedRole {
+            role_arn: role.into(),
+            session_name: "states-log-delivery".into(),
         }),
     )
     .await
     .map_err(|error| {
         invalid_configuration(format!("CloudWatch Logs destination is invalid: {error}"))
     })?;
+    let native_delivery = registry.native_handler(&ServiceName::new("logs")).is_some()
+        && registry.internal_dispatcher().is_some();
+    if configure && (strict || native_delivery) {
+        crate::log_delivery::configure(&registry, region, account, role, source, &group_name)
+            .await?;
+    }
     Ok(())
 }
 
@@ -69,7 +83,7 @@ pub async fn deliver_execution(
     account: &str,
     execution: &Arc<crate::store::ExecutionCell>,
 ) -> Result<(), SfnError> {
-    let (configuration, group_name, stream_name, identity, events) = {
+    let (configuration, group_name, stream_name, identity, source, events) = {
         let execution = execution.read().await;
         let configuration =
             parse_configuration(execution.logging_configuration.as_ref(), region, account)?;
@@ -127,6 +141,7 @@ pub async fn deliver_execution(
                 role_arn: execution.role_arn.clone(),
                 session_name: execution.name.clone(),
             },
+            crate::log_delivery::source(&execution.state_machine_arn),
             events,
         )
     };
@@ -150,6 +165,16 @@ pub async fn deliver_execution(
         )
         .await
         .map_err(delivery_error)?;
+    let mut context = context;
+    if registry
+        .authorization_evaluator(&ServiceName::new("iam"))
+        .is_some_and(|e| e.strict_sigv4_required())
+    {
+        context.identity = CallerIdentity::ServicePrincipal {
+            service: "delivery.logs".into(),
+        };
+        context.source_arn = Some(source);
+    }
     let stream = sink
         .ensure_stream(
             scope.clone(),
@@ -386,6 +411,7 @@ fn redact_execution_data(value: &mut Value) {
 
 fn producer_context(identity: CallerIdentity) -> ProducerContext {
     ProducerContext {
+        source_arn: None,
         source_service: "states".into(),
         identity,
         correlation: CorrelationContext::root(),

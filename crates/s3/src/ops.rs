@@ -128,7 +128,7 @@ fn bucket_key_enabled(value: Option<&str>) -> Result<bool, S3Error> {
     }
 }
 
-fn kms_error(error: KmsInternalError) -> S3Error {
+pub(crate) fn kms_error(error: KmsInternalError) -> S3Error {
     match error {
         KmsInternalError::AccessDenied => S3Error::AccessDenied,
         KmsInternalError::Disabled => S3Error::KmsDisabled,
@@ -176,11 +176,6 @@ fn explicit_encryption(
             Ok(ServerSideEncryption::default())
         }
         SseAlgorithm::AwsKms => {
-            if bucket_key {
-                return Err(S3Error::NotImplemented(
-                    "S3 Bucket Keys are not implemented for object operations".into(),
-                ));
-            }
             let key_id = match kms_key_id {
                 Some("") => {
                     return Err(S3Error::InvalidArgument(
@@ -218,10 +213,22 @@ fn request_encryption(
     let kms_key_id = sse_header("x-amz-server-side-encryption-aws-kms-key-id")?;
     let bucket_key_header = sse_header("x-amz-server-side-encryption-bucket-key-enabled")?;
     if algorithm.is_none() {
-        if kms_key_id.is_some() || bucket_key_header.is_some() {
+        if kms_key_id.is_some() {
             return Err(S3Error::InvalidArgument(
                 "The server side encryption algorithm is required".into(),
             ));
+        }
+        let bucket_key = match bucket_key_header {
+            Some(value) => bucket_key_enabled(Some(value))?,
+            None => default.bucket_key_enabled,
+        };
+        if bucket_key_header.is_some() {
+            return explicit_encryption(
+                ctx,
+                default.algorithm,
+                default.kms_key_arn.as_deref(),
+                bucket_key,
+            );
         }
         return match default.algorithm {
             SseAlgorithm::AwsKms => explicit_encryption(
@@ -233,15 +240,15 @@ fn request_encryption(
             SseAlgorithm::Aes256 => Ok(default.clone()),
         };
     }
-    explicit_encryption(
-        ctx,
-        sse_algorithm(algorithm.expect("checked above"))?,
-        kms_key_id,
-        bucket_key_enabled(bucket_key_header)?,
-    )
+    let algorithm = sse_algorithm(algorithm.ok_or(S3Error::InternalError)?)?;
+    let bucket_key = match bucket_key_header {
+        Some(value) => bucket_key_enabled(Some(value))?,
+        None => algorithm == SseAlgorithm::AwsKms && default.bucket_key_enabled,
+    };
+    explicit_encryption(ctx, algorithm, kms_key_id, bucket_key)
 }
 
-fn kms_call(
+pub(crate) fn kms_call(
     ctx: &Ctx<'_>,
     action: &str,
     key: &str,
@@ -300,6 +307,19 @@ fn kms_call(
     })
 }
 
+fn encryption_context(
+    bucket: &str,
+    key: &str,
+    encryption: &ServerSideEncryption,
+) -> BTreeMap<String, String> {
+    let arn = if encryption.bucket_key_enabled {
+        format!("arn:aws:s3:::{bucket}")
+    } else {
+        format!("arn:aws:s3:::{bucket}/{key}")
+    };
+    BTreeMap::from([("aws:s3:arn".into(), arn)])
+}
+
 pub(crate) async fn encrypt_body(
     ctx: &Ctx<'_>,
     bucket: &str,
@@ -307,12 +327,7 @@ pub(crate) async fn encrypt_body(
     body: &StoredBody,
     encryption: &ServerSideEncryption,
 ) -> Result<StoredBody, S3Error> {
-    if encryption.bucket_key_enabled {
-        return Err(S3Error::NotImplemented(
-            "S3 Bucket Keys are not implemented".into(),
-        ));
-    }
-    let context = BTreeMap::from([("aws:s3:arn".into(), format!("arn:aws:s3:::{bucket}/{key}"))]);
+    let context = encryption_context(bucket, key, encryption);
     let (plain, wrapped, kms_key) = match encryption.algorithm {
         SseAlgorithm::Aes256 => {
             let (plain, wrapped) = ctx.store.storage_keys.generate(&context)?;
@@ -323,6 +338,24 @@ pub(crate) async fn encrypt_body(
                 .kms_key_arn
                 .as_deref()
                 .ok_or(S3Error::InternalError)?;
+            if encryption.bucket_key_enabled {
+                let bucket_key =
+                    crate::bucket_keys::for_write(ctx, bucket, key_id, &context).await?;
+                let (plain, wrapped) = crate::encryption::wrap_bucket_key(
+                    &bucket_key.plain,
+                    bucket_key.wrapped,
+                    bucket,
+                    key,
+                )?;
+                let source = body.clone();
+                let kms_key = bucket_key.key_arn;
+                let encrypted = tokio::task::spawn_blocking(move || {
+                    EncryptedBody::encrypt(&source, &plain, wrapped, Some(kms_key), context)
+                })
+                .await
+                .map_err(|_| S3Error::InternalError)??;
+                return Ok(StoredBody::Encrypted(Arc::new(encrypted)));
+            }
             let call = kms_call(ctx, "kms:GenerateDataKey", key_id, &context)?;
             let output = ctx
                 .dispatcher
@@ -376,9 +409,22 @@ pub(crate) async fn open_body(
         }
         return Ok(body.clone());
     };
-    let context = BTreeMap::from([("aws:s3:arn".into(), format!("arn:aws:s3:::{bucket}/{key}"))]);
+    let context = encryption_context(bucket, key, encryption);
     if encrypted.context != context {
         return Err(S3Error::InternalError);
+    }
+    if encryption.bucket_key_enabled {
+        let key_id = encrypted.kms_key.as_deref().ok_or(S3Error::InternalError)?;
+        if encrypted.wrapped_key.len() > 16384 {
+            return Err(S3Error::InternalError);
+        }
+        let envelope: crate::encryption::BucketEnvelope =
+            serde_json::from_slice(&encrypted.wrapped_key).map_err(|_| S3Error::InternalError)?;
+        let bucket_key =
+            crate::bucket_keys::for_read(ctx, bucket, key_id, &envelope.bucket_key, &context)
+                .await?;
+        let plain = crate::encryption::unwrap_bucket_key(&bucket_key, envelope, bucket, key)?;
+        return Ok(StoredBody::Opened(encrypted.clone(), Arc::new(plain)));
     }
     let plain = if let Some(key_id) = &encrypted.kms_key {
         let call = kms_call(ctx, "kms:Decrypt", key_id, &context)?;

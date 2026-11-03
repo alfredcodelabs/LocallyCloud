@@ -2024,6 +2024,23 @@ mod tests {
     }
 
     #[async_trait]
+    impl NativeHandler for GatedLogs {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            match request
+                .headers
+                .get("x-amz-target")
+                .and_then(|header| header.to_str().ok())
+            {
+                Some("Logs_20140328.DescribeResourcePolicies") => {
+                    json_response(json!({"resourcePolicies":[]}))
+                }
+                Some("Logs_20140328.PutResourcePolicy") => json_response(json!({})),
+                other => panic!("Unexpected operation in gated log delivery fixture: {other:?}"),
+            }
+        }
+    }
+
+    #[async_trait]
     impl InternalLogSink for GatedLogs {
         async fn resolve_group(
             &self,
@@ -2076,7 +2093,7 @@ mod tests {
         reg.register_native_with_log_sink(
             ServiceName::new("logs"),
             ServiceMetadata::new(AwsProtocol::Json11, Some("Logs_20140328")),
-            h.clone(),
+            sink.clone(),
             sink.clone(),
         );
         let created = sfn(&h, "CreateStateMachine", json!({

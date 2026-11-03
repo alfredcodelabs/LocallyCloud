@@ -166,6 +166,7 @@ pub(crate) async fn deliver_logs(
         },
     );
     let context = ProducerContext {
+        source_arn: None,
         source_service: request.source_service.into(),
         identity,
         correlation,

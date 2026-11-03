@@ -6,7 +6,7 @@ use super::correlation::CorrelationContext;
 use super::identity::CallerIdentity;
 
 /// Contract version understood by the registry and native producers.
-pub const INTERNAL_LOG_SINK_VERSION: u16 = 2;
+pub const INTERNAL_LOG_SINK_VERSION: u16 = 3;
 /// Maximum number of nested producer-to-Logs hops in one causal flow.
 pub const MAX_INTERNAL_LOG_DEPTH: u8 = 8;
 
@@ -54,6 +54,8 @@ pub struct ProducerLogEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerContext {
+    /// Origin resource for service-principal delivery. External ingress strips this provenance.
+    pub source_arn: Option<String>,
     pub source_service: String,
     pub identity: CallerIdentity,
     pub correlation: CorrelationContext,
@@ -66,6 +68,7 @@ impl ProducerContext {
             return Err(SinkError::LoopDetected);
         }
         Ok(Self {
+            source_arn: self.source_arn.clone(),
             source_service: self.source_service.clone(),
             identity: self.identity.clone(),
             correlation: self.correlation.child(),

@@ -494,6 +494,7 @@ impl StoredBucket {
 
 /// Globally named buckets with account-scoped access.
 pub struct AccountStore {
+    pub(crate) bucket_keys: crate::bucket_keys::BucketKeyCache,
     buckets: DashMap<String, (String, StoredBucket)>,
     account_public_access_blocks: DashMap<String, PublicAccessBlock>,
     next_id: AtomicU64,
@@ -504,6 +505,7 @@ impl Default for AccountStore {
     fn default() -> Self {
         Self {
             buckets: DashMap::new(),
+            bucket_keys: Default::default(),
             account_public_access_blocks: DashMap::new(),
             next_id: AtomicU64::new(1),
             storage_keys: Arc::new(StorageKeys::ephemeral().expect("S3 storage key generation")),

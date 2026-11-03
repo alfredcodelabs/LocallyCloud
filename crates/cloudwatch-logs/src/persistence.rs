@@ -192,6 +192,11 @@ impl Persistence {
                 name: group,
             };
             match kind.as_str() {
+                "resource-policy" => {
+                    state
+                        .resource_policies
+                        .insert((key.scope, key.name, id), decode(&plaintext)?);
+                }
                 "group" => {
                     let mut value: LogGroup = decode(&plaintext)?;
                     for filter in value.metric_filters.values_mut() {

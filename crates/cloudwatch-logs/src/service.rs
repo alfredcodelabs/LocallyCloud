@@ -219,28 +219,54 @@ impl LogsApi {
                         .collect(),
                 );
             }
-            evaluator
-                .authorize(AuthorizationRequest {
-                    request_identity: RequestIdentity {
-                        account_id: request.account_id.clone(),
-                        access_key_id: request
-                            .headers
-                            .get("authorization")
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(RequestIdentity::access_key_from_authorization),
-                        arn: None,
-                    },
-                    delegated_identity: trusted_role(request),
-                    source_service: "logs".into(),
-                    action: format!("logs:{operation}"),
-                    resource,
-                    context,
-                })
-                .map_err(|_| {
-                    LogsError::AccessDenied(
-                        "Not authorized for this CloudWatch Logs operation".into(),
-                    )
-                })?;
+            let mut delegated_identity = trusted_role(request);
+            if request
+                .headers
+                .get("x-locallycloud-verified-internal-scope")
+                == Some(&http::HeaderValue::from_static("1"))
+            {
+                if let Some(principal) = request
+                    .headers
+                    .get("x-locallycloud-caller-principal")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|p| p.ends_with(".amazonaws.com"))
+                {
+                    delegated_identity=Some(locallycloud_core::integration::identity::CallerIdentity::ServicePrincipal{service:principal.into()});
+                    for (header, key) in [
+                        ("x-locallycloud-source-arn", "aws:sourcearn"),
+                        ("x-locallycloud-source-account", "aws:sourceaccount"),
+                    ] {
+                        if let Some(value) =
+                            request.headers.get(header).and_then(|v| v.to_str().ok())
+                        {
+                            context.insert(key.into(), vec![value.into()]);
+                        }
+                    }
+                }
+            }
+            let authorization = AuthorizationRequest {
+                request_identity: RequestIdentity {
+                    account_id: request.account_id.clone(),
+                    access_key_id: request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(RequestIdentity::access_key_from_authorization),
+                    arn: None,
+                },
+                delegated_identity,
+                source_service: "logs".into(),
+                action: format!("logs:{operation}"),
+                resource: resource.clone(),
+                context,
+            };
+            let result=if matches!(operation,"CreateLogStream"|"PutLogEvents") && matches!(authorization.delegated_identity,Some(locallycloud_core::integration::identity::CallerIdentity::ServicePrincipal{..})) {
+                let document=self.store.delivery_policy(scope,&resource)?;
+                evaluator.authorize_resource_policy(authorization,document.as_deref(),&scope.account_id)
+            } else {evaluator.authorize(authorization)};
+            result.map_err(|_| {
+                LogsError::AccessDenied("Not authorized for this CloudWatch Logs operation".into())
+            })?;
         }
         Ok(())
     }
@@ -349,6 +375,9 @@ impl LogsApi {
                 return names.iter().map(|name| group_arn(name)).collect();
             }
             "DescribeLogGroups"
+            | "PutResourcePolicy"
+            | "DeleteResourcePolicy"
+            | "DescribeResourcePolicies"
             | "DescribeDestinations"
             | "DescribeQueries"
             | "TestMetricFilter"
@@ -369,6 +398,36 @@ impl LogsApi {
         scope: ScopeKey,
     ) -> Result<Value, LogsError> {
         match operation {
+            "PutResourcePolicy" => {
+                let input: crate::resource_policies::Put = decode(body)?;
+                if let Some(evaluator) = self
+                    .registry
+                    .upgrade()
+                    .and_then(|r| r.authorization_evaluator(&ServiceName::new("iam")))
+                {
+                    evaluator
+                        .validate_resource_policy(&input.policy_document)
+                        .map_err(|_| {
+                            LogsError::InvalidParameter(
+                                "Invalid or unsupported resource policy".into(),
+                            )
+                        })?;
+                }
+                let policy = self
+                    .store
+                    .put_resource_policy(scope, input, self.clock.now_ms())?;
+                Ok(json!({"revisionId":policy.revision_id,"resourcePolicy":policy}))
+            }
+            "DeleteResourcePolicy" => {
+                self.store.delete_resource_policy(scope, decode(body)?)?;
+                Ok(json!({}))
+            }
+            "DescribeResourcePolicies" => crate::resource_policies::describe(
+                &self.store,
+                scope,
+                decode(body)?,
+                self.clock.now_ms(),
+            ),
             "CreateLogGroup" => {
                 groups::create(&self.store, decode(body)?, scope, self.clock.now_ms())?;
                 Ok(json!({}))

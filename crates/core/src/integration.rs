@@ -281,6 +281,33 @@ impl InternalDispatcher {
         }
     }
 
+    pub async fn kms_authorize_cached_key_bounded(
+        &self,
+        request: kms::KmsAuthorizeCachedKeyRequest,
+        limit: Duration,
+    ) -> Result<(), kms::KmsInternalError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or(kms::KmsInternalError::Unavailable)?;
+        let api = registry
+            .kms_api(&ServiceName::new("kms"))
+            .ok_or(kms::KmsInternalError::Unavailable)?;
+        let permit = self
+            .kms_blocking_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| kms::KmsInternalError::Unavailable)?;
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            api.authorize_cached_key(request)
+        });
+        match tokio::time::timeout(limit, worker).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(kms::KmsInternalError::Internal),
+        }
+    }
+
     /// See [`Self::kms_encrypt_bounded`]; late plaintext is dropped by the detached worker.
     pub async fn kms_decrypt_bounded(
         &self,

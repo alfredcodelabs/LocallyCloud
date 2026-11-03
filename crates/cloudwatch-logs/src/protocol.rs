@@ -26,6 +26,9 @@ pub const RETENTION_DAYS: &[u16] = &[
 ];
 
 const OPERATIONS: &[&str] = &[
+    "PutResourcePolicy",
+    "DescribeResourcePolicies",
+    "DeleteResourcePolicy",
     "CreateLogGroup",
     "DescribeLogGroups",
     "DeleteLogGroup",

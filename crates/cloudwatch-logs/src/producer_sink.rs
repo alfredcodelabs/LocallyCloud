@@ -54,6 +54,16 @@ impl LogsProducerSink {
                 .map_err(|_| DispatchFailure::Internal)?,
         );
         IdentityPropagator::attach(&mut headers, &context.identity);
+        if let Some(source) = &context.source_arn {
+            headers.insert(
+                "x-locallycloud-source-arn",
+                HeaderValue::from_str(source).map_err(|_| DispatchFailure::Internal)?,
+            );
+            headers.insert(
+                "x-locallycloud-source-account",
+                HeaderValue::from_str(&scope.account_id).map_err(|_| DispatchFailure::Internal)?,
+            );
+        }
         context
             .correlation
             .log_hop(&context.source_service, "logs", "producer-log", "sync");
@@ -110,36 +120,6 @@ impl LogsProducerSink {
                 groups.iter().any(|group| {
                     group.get("logGroupName").and_then(Value::as_str) == Some(name)
                         && group.get("logGroupClass").and_then(Value::as_str) == Some("STANDARD")
-                })
-            }))
-    }
-
-    async fn stream_exists(
-        &self,
-        scope: &LogScope,
-        group_name: &str,
-        stream_name: &str,
-        context: &ProducerContext,
-    ) -> Result<bool, SinkError> {
-        let value = self
-            .call(
-                scope,
-                "DescribeLogStreams",
-                json!({
-                    "logGroupName": group_name,
-                    "logStreamNamePrefix": stream_name,
-                    "limit": 50
-                }),
-                context,
-            )
-            .await
-            .map_err(SinkError::from)?;
-        Ok(value
-            .get("logStreams")
-            .and_then(Value::as_array)
-            .is_some_and(|streams| {
-                streams.iter().any(|stream| {
-                    stream.get("logStreamName").and_then(Value::as_str) == Some(stream_name)
                 })
             }))
     }
@@ -230,17 +210,11 @@ impl InternalLogSink for LogsProducerSink {
             Err(DispatchFailure::Rejected { ref code, .. })
                 if code == "ResourceAlreadyExistsException" =>
             {
-                if self
-                    .stream_exists(&scope, &group.name, &spec.name, &context)
-                    .await?
-                {
-                    Ok(StreamRef {
-                        group_name: group.name,
-                        stream_name: spec.name,
-                    })
-                } else {
-                    Err(SinkError::Incompatible("log stream".into()))
-                }
+                // The authorized CreateLogStream response proves this exact stream exists.
+                Ok(StreamRef {
+                    group_name: group.name,
+                    stream_name: spec.name,
+                })
             }
             Err(error) => Err(error.into()),
         }

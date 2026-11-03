@@ -4,7 +4,31 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Contract version understood by the registry and internal callers.
-pub const KMS_INTERNAL_API_VERSION: u16 = 5;
+pub const KMS_INTERNAL_API_VERSION: u16 = 6;
+
+#[derive(Clone, Copy)]
+pub enum KmsDataKeyAction {
+    Generate,
+    Decrypt,
+}
+
+impl KmsDataKeyAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generate => "kms:GenerateDataKey",
+            Self::Decrypt => "kms:Decrypt",
+        }
+    }
+}
+
+/// Revalidate a cached service key without generating or decrypting key material again.
+pub struct KmsAuthorizeCachedKeyRequest {
+    pub call: KmsCallContext,
+    pub key_id: String,
+    pub ciphertext: SensitiveBytes,
+    pub encryption_context: BTreeMap<String, String>,
+    pub action: KmsDataKeyAction,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KmsCallContext {
@@ -168,6 +192,12 @@ pub enum KmsInternalError {
 }
 
 pub trait KmsInternalApi: Send + Sync {
+    fn authorize_cached_key(
+        &self,
+        _request: KmsAuthorizeCachedKeyRequest,
+    ) -> Result<(), KmsInternalError> {
+        Err(KmsInternalError::Unavailable)
+    }
     fn version(&self) -> u16 {
         KMS_INTERNAL_API_VERSION
     }

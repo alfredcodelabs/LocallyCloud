@@ -13,6 +13,7 @@ pub mod clock;
 pub mod error;
 pub mod interpreter;
 pub mod jsonata;
+mod log_delivery;
 pub mod logging;
 mod metrics;
 pub mod ops;

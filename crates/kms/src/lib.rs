@@ -185,6 +185,14 @@ impl InternalFault {
 }
 
 impl KmsInternalApi for KmsHandler {
+    fn authorize_cached_key(
+        &self,
+        request: locallycloud_core::integration::kms::KmsAuthorizeCachedKeyRequest,
+    ) -> Result<(), KmsInternalError> {
+        self.service
+            .authorize_cached_key_internal(request)
+            .map_err(map_internal_error)
+    }
     fn generate_data_key(
         &self,
         request: KmsGenerateDataKeyRequest,
@@ -521,6 +529,103 @@ mod tests {
             admin_call(&handler, "alias/example", "DisableKey").await,
             400
         );
+    }
+
+    #[test]
+    fn cached_key_authorization_rechecks_native_permissions_and_state_without_crypto() {
+        use locallycloud_core::integration::kms::{
+            KmsAuthorizeCachedKeyRequest, KmsCallContext, KmsDataKeyAction, SensitiveBytes,
+        };
+        let registry = ServiceRegistry::with_known_services();
+        let handler = KmsHandler::with_registry(&registry, test_db()).unwrap();
+        let account = "000000000000";
+        let region = "us-east-1";
+        let created = handler
+            .service
+            .dispatch("CreateKey", &serde_json::Map::new(), account, region)
+            .unwrap();
+        let key = created["KeyMetadata"]["Arn"].as_str().unwrap().to_owned();
+        let context =
+            std::collections::BTreeMap::from([("aws:s3:arn".into(), "arn:aws:s3:::bucket".into())]);
+        let call = KmsCallContext {
+            source_service: "s3".into(),
+            account_id: account.into(),
+            region: region.into(),
+            request_id: "fixture".into(),
+            caller_arn: Some(format!("arn:aws:iam::{account}:root")),
+            iam_policy_allowed: false,
+            iam_policy_denied: false,
+        };
+        let generated = handler
+            .generate_data_key(KmsGenerateDataKeyRequest {
+                call: call.clone(),
+                key_id: key.clone(),
+                number_of_bytes: 32,
+                encryption_context: context.clone(),
+            })
+            .unwrap();
+        assert_eq!(handler.internal_call_count.load(Ordering::Relaxed), 1);
+        let request = |call: KmsCallContext, action| KmsAuthorizeCachedKeyRequest {
+            call,
+            key_id: key.clone(),
+            ciphertext: SensitiveBytes::new(generated.ciphertext.as_slice().to_vec()),
+            encryption_context: context.clone(),
+            action,
+        };
+        handler
+            .authorize_cached_key(request(call.clone(), KmsDataKeyAction::Generate))
+            .unwrap();
+        handler
+            .authorize_cached_key(request(call.clone(), KmsDataKeyAction::Decrypt))
+            .unwrap();
+        assert_eq!(handler.internal_call_count.load(Ordering::Relaxed), 1);
+        let mut denied = call.clone();
+        denied.iam_policy_denied = true;
+        assert!(matches!(
+            handler.authorize_cached_key(request(denied, KmsDataKeyAction::Generate)),
+            Err(KmsInternalError::AccessDenied)
+        ));
+        handler
+            .service
+            .dispatch(
+                "DisableKey",
+                serde_json::json!({"KeyId":key}).as_object().unwrap(),
+                account,
+                region,
+            )
+            .unwrap();
+        assert!(matches!(
+            handler.authorize_cached_key(request(call.clone(), KmsDataKeyAction::Decrypt)),
+            Err(KmsInternalError::Disabled)
+        ));
+        handler
+            .service
+            .dispatch(
+                "EnableKey",
+                serde_json::json!({"KeyId":key}).as_object().unwrap(),
+                account,
+                region,
+            )
+            .unwrap();
+        let policy=serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":format!("arn:aws:iam::{account}:root")},"Action":"kms:*","Resource":"*"},{"Effect":"Deny","Principal":"*","Action":["kms:GenerateDataKey","kms:Decrypt"],"Resource":"*"}]}).to_string();
+        handler
+            .service
+            .dispatch(
+                "PutKeyPolicy",
+                serde_json::json!({"KeyId":key,"PolicyName":"default","Policy":policy})
+                    .as_object()
+                    .unwrap(),
+                account,
+                region,
+            )
+            .unwrap();
+        for action in [KmsDataKeyAction::Generate, KmsDataKeyAction::Decrypt] {
+            assert!(matches!(
+                handler.authorize_cached_key(request(call.clone(), action)),
+                Err(KmsInternalError::AccessDenied)
+            ));
+        }
+        assert_eq!(handler.internal_call_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

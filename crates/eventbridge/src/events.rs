@@ -774,6 +774,7 @@ impl EventsService {
                     },
                 );
                 let context = ProducerContext {
+                    source_arn: None,
                     source_service: "events".into(),
                     identity,
                     correlation: CorrelationContext {

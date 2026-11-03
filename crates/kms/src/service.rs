@@ -28,6 +28,43 @@ pub(crate) struct KmsService {
 }
 
 impl KmsService {
+    pub(crate) fn authorize_cached_key_internal(
+        &self,
+        request: locallycloud_core::integration::kms::KmsAuthorizeCachedKeyRequest,
+    ) -> Result<(), KmsError> {
+        validate_internal_call(&request.call)?;
+        validate_internal_context(&request.encryption_context)?;
+        let scope = Scope::new(&request.call.account_id, &request.call.region);
+        let key_id = self.resolve_key_id(&request.key_id, &scope)?;
+        let envelope = crypto::parse_envelope(request.ciphertext.as_slice())?;
+        if envelope.scope != scope || envelope.key_id != key_id {
+            return Err(KmsError::InvalidCiphertext);
+        }
+        self.store
+            .with_key(&scope, &key_id, |key| {
+                if !key.is_enabled() {
+                    return Err(inactive_key_error(key));
+                }
+                if key
+                    .owner_service
+                    .as_deref()
+                    .is_some_and(|owner| owner != request.call.source_service)
+                    || !internal_policy_allows(
+                        key,
+                        &request.call,
+                        request.action.as_str(),
+                        &request.encryption_context,
+                    )
+                {
+                    return Err(KmsError::AccessDenied);
+                }
+                if key.material_version != envelope.material_version {
+                    return Err(KmsError::InvalidCiphertext);
+                }
+                Ok(())
+            })
+            .ok_or(KmsError::NotFound)?
+    }
     pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
         self.store.resource_regions(account)
     }

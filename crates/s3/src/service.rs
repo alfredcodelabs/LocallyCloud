@@ -6506,8 +6506,7 @@ mod encryption_storage_tests {
     }
 
     #[tokio::test]
-    async fn bucket_keys_configuration_is_stored_but_object_operations_are_explicitly_unsupported()
-    {
+    async fn bucket_keys_configuration_does_not_fake_writes_without_kms() {
         let handler = S3Handler::new();
         handler
             .handle(request(Method::PUT, "/bucket-keys", Bytes::new()))
@@ -6527,7 +6526,7 @@ mod encryption_storage_tests {
         );
         assert_eq!(
             handler.handle(put).await.status(),
-            StatusCode::NOT_IMPLEMENTED
+            StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(
             handler

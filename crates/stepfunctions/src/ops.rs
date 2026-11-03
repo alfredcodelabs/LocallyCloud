@@ -212,9 +212,10 @@ pub async fn create_state_machine(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
     let encryption_configuration = v.get("encryptionConfiguration").cloned();
     crate::logging::preflight_configuration(
         logging_configuration.as_ref(),
-        &ctx.registry,
-        ctx.region,
-        ctx.account,
+        ctx,
+        &role_arn,
+        &arn,
+        true,
     )
     .await?;
     validate_tracing_configuration(tracing_configuration.as_ref())?;
@@ -400,11 +401,19 @@ pub async fn update_state_machine(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
     if let Some(role_arn) = str_field(v, "roleArn") {
         validate_role_arn(role_arn)?;
     }
+    let (stored_role, stored_logging) = {
+        let stored = handle.read().await;
+        (
+            stored.role_arn.clone(),
+            stored.logging_configuration.clone(),
+        )
+    };
     crate::logging::preflight_configuration(
-        v.get("loggingConfiguration"),
-        &ctx.registry,
-        ctx.region,
-        ctx.account,
+        v.get("loggingConfiguration").or(stored_logging.as_ref()),
+        ctx,
+        str_field(v, "roleArn").unwrap_or(&stored_role),
+        &sm_arn(ctx.region, ctx.account, &target.name),
+        true,
     )
     .await?;
     validate_tracing_configuration(v.get("tracingConfiguration"))?;
@@ -1305,9 +1314,10 @@ pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
     let target = resolve_execution_target(ctx, &state_machine_arn).await?;
     crate::logging::preflight_configuration(
         target.logging_configuration.as_ref(),
-        &ctx.registry,
-        ctx.region,
-        ctx.account,
+        ctx,
+        &target.role_arn,
+        &sm_arn(ctx.region, ctx.account, &target.name),
+        false,
     )
     .await?;
     let logging_enabled = crate::logging::is_enabled(
@@ -1461,9 +1471,10 @@ pub async fn start_sync_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
     }
     crate::logging::preflight_configuration(
         target.logging_configuration.as_ref(),
-        &ctx.registry,
-        ctx.region,
-        ctx.account,
+        ctx,
+        &target.role_arn,
+        &sm_arn(ctx.region, ctx.account, &target.name),
+        false,
     )
     .await?;
     let logging_enabled = crate::logging::is_enabled(

@@ -5,6 +5,7 @@
 //! query-string sub-resource markers — never an `X-Amz-Target` header.
 
 pub mod addr;
+mod bucket_keys;
 mod dirty;
 mod encryption;
 pub mod error;

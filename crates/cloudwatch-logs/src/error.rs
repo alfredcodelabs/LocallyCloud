@@ -32,11 +32,16 @@ pub enum LogsError {
     LimitExceeded(String),
     #[error("{0}")]
     ServiceUnavailable(String),
+    #[error("{0}")]
+    OperationAborted(String),
 }
 
 impl From<LogsError> for AwsError {
     fn from(error: LogsError) -> Self {
         match error {
+            LogsError::OperationAborted(message) => {
+                AwsError::new("OperationAbortedException", message, 400)
+            }
             LogsError::AccessDenied(message) => {
                 AwsError::new("AccessDeniedException", message, 400)
             }

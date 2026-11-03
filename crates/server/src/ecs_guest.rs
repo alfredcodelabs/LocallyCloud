@@ -154,6 +154,7 @@ impl PreparedGuest {
                     .ok_or("CloudWatch Logs is unavailable")?;
                 let scope = LogScope::new(&task.account, region);
                 let context = ProducerContext {
+                    source_arn: None,
                     source_service: "ecs".into(),
                     identity: CallerIdentity::AssumedRole {
                         role_arn: role.clone(),
@@ -1564,6 +1565,7 @@ mod tests {
                 name: "/ecs/native".into(),
             },
             ProducerContext {
+                source_arn: None,
                 source_service: "ecs".into(),
                 identity: CallerIdentity::AssumedRole {
                     role_arn: "arn:aws:iam::000000000000:role/execution".into(),

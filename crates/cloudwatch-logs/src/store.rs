@@ -67,6 +67,8 @@ pub(crate) struct NewQuery {
 
 #[derive(Default)]
 pub(crate) struct StoreState {
+    pub(crate) resource_policies:
+        BTreeMap<(ScopeKey, String, String), crate::resource_policies::ResourcePolicy>,
     pub(crate) revision: u64,
     pub(crate) next_put_ordinals: BTreeMap<ScopeKey, u64>,
     pub(crate) next_metric_effect_id: u64,
@@ -258,6 +260,9 @@ impl LogsStore {
         let revision = next_revision(state.revision)?;
         state.groups.remove(key);
         state
+            .resource_policies
+            .retain(|(scope, group, _), _| scope != &key.scope || group != &key.name);
+        state
             .metric_effects
             .retain(|_, effect| &effect.group_key != key);
         state
@@ -269,6 +274,156 @@ impl LogsStore {
         state.revision = revision;
         self.commit(&mut state, vec![remove(None, key, None, None)])?;
         Ok(())
+    }
+
+    pub(crate) fn resource_policies(
+        &self,
+        scope: &ScopeKey,
+        kind: &str,
+        arn: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<crate::resource_policies::ResourcePolicy>, LogsError> {
+        Ok(self
+            .read()?
+            .resource_policies
+            .iter()
+            .filter(|((s, _, _), _)| s == scope)
+            .filter(|(_, p)| {
+                p.policy_scope == kind
+                    && arn.is_none_or(|arn| p.resource_arn.as_deref() == Some(arn))
+            })
+            .skip(offset)
+            .take(limit)
+            .map(|(_, p)| p.clone())
+            .collect())
+    }
+
+    pub(crate) fn put_resource_policy(
+        &self,
+        scope: ScopeKey,
+        input: crate::resource_policies::Put,
+        now: i64,
+    ) -> Result<crate::resource_policies::ResourcePolicy, LogsError> {
+        use crate::resource_policies::{self, ResourcePolicy};
+        resource_policies::name(&input.policy_name)?;
+        resource_policies::validate(&input.policy_document, input.resource_arn.as_deref())?;
+        let group = resource_policies::group(&scope, input.resource_arn.as_deref())?;
+        let key = GroupKey {
+            scope: scope.clone(),
+            name: group.clone(),
+        };
+        let id = (scope.clone(), group.clone(), input.policy_name.clone());
+        let mut state = self.write()?;
+        if !group.is_empty() && !state.groups.contains_key(&key) {
+            return Err(LogsError::ResourceNotFound(
+                "log group does not exist".into(),
+            ));
+        }
+        let existing = state.resource_policies.get(&id);
+        if existing.map(|p| p.revision_id.as_str()) != input.expected_revision_id.as_deref()
+            && (input.resource_arn.is_some() || input.expected_revision_id.is_some())
+        {
+            return Err(LogsError::OperationAborted(
+                "Resource policy revision changed".into(),
+            ));
+        }
+        if existing.is_none() {
+            let count = state
+                .resource_policies
+                .keys()
+                .filter(|(s, g, _)| s == &scope && g == &group)
+                .count();
+            if count >= if group.is_empty() { 10 } else { 1 } {
+                return Err(LogsError::LimitExceeded(
+                    "Resource policy limit reached".into(),
+                ));
+            }
+        }
+        let policy = ResourcePolicy {
+            policy_name: input.policy_name,
+            policy_document: input.policy_document,
+            policy_scope: if group.is_empty() {
+                "ACCOUNT"
+            } else {
+                "RESOURCE"
+            }
+            .into(),
+            resource_arn: input.resource_arn,
+            revision_id: Uuid::new_v4().to_string(),
+            last_updated_time: now,
+        };
+        let change = row("resource-policy", &key, "", &policy.policy_name, 0, &policy)?;
+        state.resource_policies.insert(id, policy.clone());
+        self.commit(&mut state, vec![change])?;
+        Ok(policy)
+    }
+
+    pub(crate) fn delete_resource_policy(
+        &self,
+        scope: ScopeKey,
+        input: crate::resource_policies::Delete,
+    ) -> Result<(), LogsError> {
+        crate::resource_policies::name(&input.policy_name)?;
+        let group = crate::resource_policies::group(&scope, input.resource_arn.as_deref())?;
+        let key = GroupKey {
+            scope: scope.clone(),
+            name: group.clone(),
+        };
+        let id = (scope, group, input.policy_name.clone());
+        let mut state = self.write()?;
+        let old = state
+            .resource_policies
+            .get(&id)
+            .ok_or_else(|| LogsError::ResourceNotFound("Resource policy does not exist".into()))?;
+        if input.resource_arn.is_some()
+            && Some(old.revision_id.as_str()) != input.expected_revision_id.as_deref()
+        {
+            return Err(LogsError::OperationAborted(
+                "Resource policy revision changed".into(),
+            ));
+        }
+        state.resource_policies.remove(&id);
+        self.commit(
+            &mut state,
+            vec![remove(
+                Some("resource-policy"),
+                &key,
+                None,
+                Some(&input.policy_name),
+            )],
+        )
+    }
+
+    pub(crate) fn delivery_policy(
+        &self,
+        scope: &ScopeKey,
+        resource: &str,
+    ) -> Result<Option<String>, LogsError> {
+        let prefix = format!(
+            "arn:aws:logs:{}:{}:log-group:",
+            scope.region, scope.account_id
+        );
+        let group = resource
+            .strip_prefix(&prefix)
+            .and_then(|tail| tail.split(':').next());
+        let state = self.read()?;
+        let mut statements = Vec::new();
+        for ((s, g, _), policy) in &state.resource_policies {
+            if s != scope || (!g.is_empty() && Some(g.as_str()) != group) {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(&policy.policy_document).map_err(|_| unavailable())?;
+            match value.get("Statement") {
+                Some(serde_json::Value::Array(items)) => statements.extend(items.iter().cloned()),
+                Some(value) => statements.push(value.clone()),
+                None => return Err(unavailable()),
+            }
+        }
+        Ok((!statements.is_empty()).then(|| {
+            serde_json::json!({"Version":"2012-10-17","Statement":statements}).to_string()
+        }))
     }
 
     pub fn set_retention(

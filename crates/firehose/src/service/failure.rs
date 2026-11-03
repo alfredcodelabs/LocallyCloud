@@ -235,6 +235,7 @@ impl Inner {
         let message=json!({"deliveryStreamARN":batch.key.scope.stream_arn(&batch.key.name),
             "deliveryStreamVersionId":1,"destination":batch.destination.bucket_arn,"errorCode":failure.code(),"message":message}).to_string();
         let context = ProducerContext {
+            source_arn: None,
             source_service: "firehose".into(),
             identity: CallerIdentity::AssumedRole {
                 role_arn: batch.destination.role_arn.clone(),

@@ -15,6 +15,7 @@ mod persistence;
 mod producer_sink;
 mod protocol;
 mod query_worker;
+mod resource_policies;
 mod retention;
 mod service;
 mod store;

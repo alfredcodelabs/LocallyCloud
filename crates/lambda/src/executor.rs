@@ -1297,6 +1297,7 @@ impl Executor {
         };
         let scope = LogScope::new(account, region);
         let context = ProducerContext {
+            source_arn: None,
             source_service: "lambda".into(),
             identity: CallerIdentity::AssumedRole {
                 role_arn: func.role.clone(),
@@ -1698,6 +1699,7 @@ impl Executor {
         let scope = LogScope::new(&account, &region);
         let correlation = Uuid::new_v4().to_string();
         let context = ProducerContext {
+            source_arn: None,
             source_service: "lambda".into(),
             identity: CallerIdentity::AssumedRole {
                 role_arn: role,

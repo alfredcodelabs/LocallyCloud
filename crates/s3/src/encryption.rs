@@ -17,6 +17,47 @@ use crate::store::StoredBody;
 pub(crate) const CHUNK: usize = 64 * 1024;
 const OVERHEAD: usize = 12 + 16;
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BucketEnvelope {
+    pub bucket_key: Vec<u8>,
+    pub object_key: Vec<u8>,
+}
+
+pub(crate) fn wrap_bucket_key(
+    key: &SensitiveBytes,
+    wrapped: Vec<u8>,
+    bucket: &str,
+    object: &str,
+) -> Result<(SensitiveBytes, Vec<u8>), S3Error> {
+    let plain = SensitiveBytes::new(random::<32>()?.to_vec());
+    let aad = serde_json::to_vec(&("locallycloud-s3-bucket-key", bucket, object))
+        .map_err(|_| S3Error::InternalError)?;
+    let envelope = BucketEnvelope {
+        bucket_key: wrapped,
+        object_key: seal(key.as_slice(), &aad, plain.as_slice())?,
+    };
+    Ok((
+        plain,
+        serde_json::to_vec(&envelope).map_err(|_| S3Error::InternalError)?,
+    ))
+}
+
+pub(crate) fn unwrap_bucket_key(
+    key: &SensitiveBytes,
+    envelope: BucketEnvelope,
+    bucket: &str,
+    object: &str,
+) -> Result<SensitiveBytes, S3Error> {
+    let aad = serde_json::to_vec(&("locallycloud-s3-bucket-key", bucket, object))
+        .map_err(|_| S3Error::InternalError)?;
+    let opened = open(key.as_slice(), &aad, &envelope.object_key)?;
+    if opened.len() != 32 {
+        return Err(S3Error::InternalError);
+    }
+    Ok(SensitiveBytes::new(opened.to_vec()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedBody {
     pub version: u8,
