@@ -512,6 +512,7 @@ mod tests {
                     arn: "arn:aws:logs:us-east-1:000000000000:log-group:orders".into(),
                     creation_time_ms: 0,
                     retention_days: None,
+                    kms_key_id: None,
                     class: LogClass::Standard,
                     tags: BTreeMap::new(),
                     streams: BTreeMap::new(),

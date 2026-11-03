@@ -339,7 +339,7 @@ async fn main() {
 
     observability::init_tracing();
 
-    let config = match LocallyCloudConfig::from_env() {
+    let mut config = match LocallyCloudConfig::from_env() {
         Ok(config) => config,
         Err(err) => {
             tracing::error!(setting = err.setting, reason = %err.reason, "invalid configuration");
@@ -355,6 +355,21 @@ async fn main() {
         return;
     }
 
+    // Resolve port zero before advertising callback URLs to native services and guests.
+    let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(%error, addr = %config.listen_addr, "failed to bind front door");
+            std::process::exit(1);
+        }
+    };
+    config.listen_addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve front door address");
+            std::process::exit(1);
+        }
+    };
     let endpoint =
         EndpointResolver::resolve(config.external_endpoint.as_deref(), config.listen_addr);
     tracing::info!(
@@ -718,7 +733,7 @@ async fn main() {
 
     let restored_lambda = lambda_handler.clone();
     let server_result = server
-        .run_with_startup(move || {
+        .run_with_listener(listener, move || {
             if let Err(error) = ecs_recovery.resume() {
                 tracing::error!(%error, "failed to resume durable ECS services");
                 std::process::exit(4);

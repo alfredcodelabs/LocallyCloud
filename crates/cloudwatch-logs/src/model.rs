@@ -185,6 +185,8 @@ pub struct LogGroup {
     pub arn: String,
     pub creation_time_ms: i64,
     pub retention_days: Option<u16>,
+    #[serde(default)]
+    pub kms_key_id: Option<String>,
     pub class: LogClass,
     pub tags: BTreeMap<String, String>,
     #[serde(default)]
@@ -212,6 +214,7 @@ impl LogGroup {
             arn: self.arn.clone(),
             creation_time_ms: self.creation_time_ms,
             retention_days: self.retention_days,
+            kms_key_id: self.kms_key_id.clone(),
             class: self.class,
             tags: self.tags.clone(),
             streams: BTreeMap::new(),

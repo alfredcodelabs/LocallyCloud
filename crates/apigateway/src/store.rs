@@ -95,6 +95,8 @@ impl ApiV2Record {
 /// Resources shared by the v1 and v2 control planes in one account and region.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SharedRecord {
+    #[serde(default)]
+    pub account_settings: Option<Value>,
     pub api_keys: BTreeMap<String, Value>,
     pub usage_plans: BTreeMap<String, Value>,
     pub domains: BTreeMap<String, Value>,
@@ -189,6 +191,7 @@ impl ApiGwStore {
         for (region, scope) in scopes {
             let s = scope.read().await;
             if !s.api_keys.is_empty()
+                || s.account_settings.is_some()
                 || !s.usage_plans.is_empty()
                 || !s.domains.is_empty()
                 || !s.private_domains.is_empty()

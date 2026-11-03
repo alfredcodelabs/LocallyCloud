@@ -192,6 +192,52 @@ async fn rest(
 
 // ============================ REST APIs ========================================
 
+pub async fn get_account(ctx: &Ctx<'_>) -> Out {
+    let shared = ctx.store.shared(ctx.account, ctx.region);
+    let settings = shared
+        .read()
+        .await
+        .account_settings
+        .clone()
+        .unwrap_or_else(|| json!({}));
+    Ok((200, settings))
+}
+
+pub async fn update_account(ctx: &Ctx<'_>, body: &Value) -> Out {
+    let shared = ctx.store.shared(ctx.account, ctx.region);
+    let mut settings = shared
+        .read()
+        .await
+        .account_settings
+        .clone()
+        .unwrap_or_else(|| json!({"cloudwatchRoleArn":null}));
+    if settings.get("cloudwatchRoleArn").is_none() {
+        settings["cloudwatchRoleArn"] = Value::Null;
+    }
+    apply_patch_operations(&mut settings, body, |path| path == "/cloudwatchRoleArn")?;
+    if let Some(value) = settings
+        .get("cloudwatchRoleArn")
+        .filter(|value| !value.is_null())
+    {
+        let prefix = format!("arn:aws:iam::{}:role/", ctx.account);
+        if !value.as_str().is_some_and(|arn| {
+            arn.len() <= 2048
+                && arn.strip_prefix(&prefix).is_some_and(|name| {
+                    !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"+=,.@_/-".contains(&b))
+                })
+        }) {
+            return Err(ApiGwError::BadRequest(
+                "cloudwatchRoleArn must identify an IAM role in this account".into(),
+            ));
+        }
+    }
+    shared.write().await.account_settings = Some(settings.clone());
+    Ok((200, settings))
+}
+
 pub async fn create_rest_api(ctx: &Ctx<'_>, body: &Value) -> Out {
     let name = req_str(body, "name")?;
     let id = gen_id();
@@ -769,6 +815,7 @@ pub async fn create_deployment(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out
             let logging = rest_stage_logging(&stage, ctx.account, ctx.region, api_id, stage_name)?;
             preflight(
                 ctx.registry,
+                ctx.store,
                 ctx.account,
                 ctx.region,
                 ctx.request_id,
@@ -866,6 +913,7 @@ pub async fn create_stage(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
     }
     preflight(
         ctx.registry,
+        ctx.store,
         ctx.account,
         ctx.region,
         ctx.request_id,
@@ -1271,6 +1319,37 @@ fn normalized_stage_patch(stage: &mut Value, body: &Value) -> Result<Value, ApiG
             stage["methodSettings"]["*/*"] = json!({});
         }
     }
+    // UpdateStage's replace operation also initializes optional settings. JSON Patch
+    // replacement elsewhere remains strict (for example, model and API updates).
+    for operation in operations {
+        if operation.get("op").and_then(Value::as_str) != Some("replace") {
+            continue;
+        }
+        let path = operation.get("path").and_then(Value::as_str).unwrap_or("");
+        let default = match path {
+            "/accessLogSettings/destinationArn" | "/accessLogSettings/format" => json!(""),
+            "/methodSettings/*~1*/loggingLevel" => json!("OFF"),
+            "/methodSettings/*~1*/dataTraceEnabled"
+            | "/methodSettings/*~1*/metricsEnabled"
+            | "/methodSettings/*~1*/cachingEnabled"
+            | "/methodSettings/*~1*/cacheDataEncrypted"
+            | "/methodSettings/*~1*/requireAuthorizationForCacheControl" => json!(false),
+            "/methodSettings/*~1*/cacheTtlInSeconds" => json!(300),
+            "/methodSettings/*~1*/throttlingBurstLimit"
+            | "/methodSettings/*~1*/throttlingRateLimit" => json!(-1),
+            "/methodSettings/*~1*/unauthorizedCacheControlHeaderStrategy" => {
+                json!("SUCCEED_WITH_RESPONSE_HEADER")
+            }
+            _ => continue,
+        };
+        if stage.pointer(path).is_none() {
+            if let Some(raw) = operation.get("value") {
+                let value = coerced_patch_value(raw, Some(&default))?;
+                operation["value"] = value;
+            }
+            operation["op"] = json!("add");
+        }
+    }
     Ok(body)
 }
 
@@ -1316,6 +1395,7 @@ pub async fn update_stage(ctx: &Ctx<'_>, api_id: &str, stage_name: &str, body: &
     }
     preflight(
         ctx.registry,
+        ctx.store,
         ctx.account,
         ctx.region,
         ctx.request_id,
@@ -2380,6 +2460,28 @@ pub async fn delete_base_path_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_replace_initializes_optional_logging_fields() {
+        let mut stage = stage_value("stubs", "deployment", &json!({})).unwrap();
+        let body = normalized_stage_patch(&mut stage, &json!({"patchOperations": [
+            {"op":"replace","path":"/accessLogSettings/destinationArn","value":"arn:aws:logs:us-east-1:000000000000:log-group:access"},
+            {"op":"replace","path":"/accessLogSettings/format","value":"$context.requestId"},
+            {"op":"replace","path":"/*/*/logging/loglevel","value":"INFO"},
+            {"op":"replace","path":"/*/*/metrics/enabled","value":"false"}
+        ]})).unwrap();
+        apply_patch_operations(&mut stage, &body, |_| true).unwrap();
+        assert_eq!(stage["accessLogSettings"]["format"], "$context.requestId");
+        assert_eq!(stage["methodSettings"]["*/*"]["metricsEnabled"], false);
+        assert!(rest_stage_logging(&stage, "000000000000", "us-east-1", "api", "stubs").is_ok());
+        apply_patch_operations(
+            &mut stage,
+            &json!({"patchOperations":[{"op":"remove","path":"/accessLogSettings"}]}),
+            |_| true,
+        )
+        .unwrap();
+        assert!(stage.get("accessLogSettings").is_none());
+    }
 
     #[test]
     fn patch_supports_coercion_and_rejects_unknown_operations() {

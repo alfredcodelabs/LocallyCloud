@@ -848,6 +848,7 @@ pub async fn create_stage(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
     let logging = http_stage_logging(&stage, ctx.account, ctx.region, &protocol_type)?;
     preflight(
         ctx.registry,
+        ctx.store,
         ctx.account,
         ctx.region,
         ctx.request_id,
@@ -925,6 +926,7 @@ pub async fn update_stage(ctx: &Ctx<'_>, api_id: &str, stage_name: &str, body: &
     let logging = http_stage_logging(&updated, ctx.account, ctx.region, &protocol_type)?;
     preflight(
         ctx.registry,
+        ctx.store,
         ctx.account,
         ctx.region,
         ctx.request_id,

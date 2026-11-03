@@ -20,6 +20,12 @@ pub const DASHBOARD_CSS: &str = include_str!("dashboard.css");
 /// One embedded SVG sprite; related API namespaces share the same symbol.
 pub const SERVICE_ICONS_SVG: &str = include_str!("icons/sprite.svg");
 
+pub fn runtime_capabilities(registry: &ServiceRegistry) -> serde_json::Value {
+    let api = registry.lambda_api(&crate::registry::ServiceName::new("lambda"));
+    let reason = api.as_ref().and_then(|api| api.unavailable_reason());
+    json!({"lambdaInvoke": {"available": api.is_some() && reason.is_none(), "reason": reason}})
+}
+
 /// Return the sprite symbol ID for a registered service.
 pub fn service_icon(service: &str) -> Option<&'static str> {
     match service {
@@ -103,6 +109,7 @@ pub fn status_json(
         "product": "locallycloud",
         "version": version,
         "ready": ready,
+        "capabilities": runtime_capabilities(registry),
         "serviceCount": services.len(),
         "nativeCount": native,
         "totalRequests": metrics.iter().map(|m| m.requests).sum::<u64>(),

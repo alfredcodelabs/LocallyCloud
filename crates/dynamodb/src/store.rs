@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use locallycloud_state::StateDb;
+use locallycloud_state::{StateCipher, StateDb};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,6 +110,8 @@ pub struct StreamRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDefinition {
+    #[serde(default)]
+    pub sse_type: Option<String>,
     pub name: String,
     pub arn: String,
     pub key_schema: Vec<KeySchemaElement>,
@@ -435,7 +437,8 @@ pub struct TableStore {
     pub operation_gate: Mutex<()>,
     pub(crate) capacity: crate::capacity::CapacityModel,
     uncommitted: AtomicBool,
-    state: Option<Arc<StateDb>>,
+    pub(crate) state: Option<Arc<StateDb>>,
+    pub(crate) cipher: Option<Arc<StateCipher>>,
 }
 
 pub(crate) fn validate_table_name(name: &str) -> Result<(), DdbError> {
@@ -457,6 +460,18 @@ impl TableStore {
     }
 
     pub fn with_state(state: Arc<StateDb>) -> Result<Self, DdbError> {
+        let cipher = if std::env::var_os("LOCALLYCLOUD_KMS_MASTER_KEY").is_some() {
+            Some(Arc::new(StateCipher::from_env().map_err(persist_error)?))
+        } else {
+            None
+        };
+        Self::with_state_and_cipher(state, cipher)
+    }
+
+    pub(crate) fn with_state_and_cipher(
+        state: Arc<StateDb>,
+        cipher: Option<Arc<StateCipher>>,
+    ) -> Result<Self, DdbError> {
         let connection = state.connection().map_err(persist_error)?;
         connection
             .execute_batch(
@@ -495,8 +510,12 @@ impl TableStore {
         ",
             )
             .map_err(persist_error)?;
+        connection
+            .execute_batch(crate::recovery::SCHEMA)
+            .map_err(persist_error)?;
         let store = Self {
             state: Some(state),
+            cipher,
             ..Self::default()
         };
         {
@@ -515,6 +534,11 @@ impl TableStore {
                 .map_err(persist_error)?;
             for row in rows {
                 let (account, region, name, metadata) = row.map_err(persist_error)?;
+                let metadata = crate::recovery::decode(
+                    store.cipher.as_deref(),
+                    &["dynamodb-metadata", &account, &region, &name],
+                    &metadata,
+                )?;
                 let saved: PersistedTable =
                     serde_json::from_str(&metadata).map_err(persist_error)?;
                 store.tables.insert(
@@ -539,8 +563,13 @@ impl TableStore {
             .map_err(persist_error)?;
         for row in rows {
             let (account, region, name, key, item) = row.map_err(persist_error)?;
+            let item = crate::recovery::decode_item(
+                store.cipher.as_deref(),
+                &[&account, &region, &name],
+                &key,
+                &item,
+            )?;
             let key: StoredKey = serde_json::from_str(&key).map_err(persist_error)?;
-            let item: Item = serde_json::from_str(&item).map_err(persist_error)?;
             if let Some(table) = store.get(&account, &region, &name) {
                 table
                     .try_write()
@@ -550,7 +579,7 @@ impl TableStore {
             }
         }
         {
-            let mut query = connection.prepare("SELECT account,region,name,record FROM dynamodb_stream_records ORDER BY account,region,name,sequence")
+            let mut query = connection.prepare("SELECT account,region,name,record,sequence FROM dynamodb_stream_records ORDER BY account,region,name,sequence")
                 .map_err(persist_error)?;
             let rows = query
                 .query_map([], |row| {
@@ -559,11 +588,23 @@ impl TableStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 })
                 .map_err(persist_error)?;
             for row in rows {
-                let (account, region, name, record) = row.map_err(persist_error)?;
+                let (account, region, name, record, sequence) = row.map_err(persist_error)?;
+                let record = crate::recovery::decode(
+                    store.cipher.as_deref(),
+                    &[
+                        "dynamodb-stream",
+                        &account,
+                        &region,
+                        &name,
+                        &sequence.to_string(),
+                    ],
+                    &record,
+                )?;
                 let record = serde_json::from_str(&record).map_err(persist_error)?;
                 if let Some(table) = store.get(&account, &region, &name) {
                     let mut guard = table
@@ -689,6 +730,11 @@ impl TableStore {
                 .optional()
                 .map_err(persist_error)?;
             if let Some(old_metadata) = old_metadata {
+                let old_metadata = crate::recovery::decode(
+                    self.cipher.as_deref(),
+                    &["dynamodb-metadata", account, region, name],
+                    &old_metadata,
+                )?;
                 let old: PersistedTable =
                     serde_json::from_str(&old_metadata).map_err(persist_error)?;
                 if old.identity() != table.persist_id {
@@ -701,6 +747,12 @@ impl TableStore {
             }
             let metadata =
                 serde_json::to_string(&PersistedTable::from_data(table)).map_err(persist_error)?;
+            let metadata = crate::recovery::encode(
+                self.cipher.as_deref(),
+                table.def.sse_type.is_some(),
+                &["dynamodb-metadata", account, region, name],
+                &metadata,
+            )?;
             transaction
                 .execute(
                     "INSERT INTO dynamodb_tables(account,region,name,metadata) VALUES(?1,?2,?3,?4)
@@ -711,9 +763,22 @@ impl TableStore {
             for record in table.stream_records.iter().skip(table.stream_persisted) {
                 let sequence: i64 = record.sequence_number.parse().map_err(persist_error)?;
                 let encoded = serde_json::to_string(record).map_err(persist_error)?;
+                let encoded = crate::recovery::encode(
+                    self.cipher.as_deref(),
+                    table.def.sse_type.is_some(),
+                    &[
+                        "dynamodb-stream",
+                        account,
+                        region,
+                        name,
+                        &sequence.to_string(),
+                    ],
+                    &encoded,
+                )?;
                 transaction.execute("INSERT INTO dynamodb_stream_records(account,region,name,sequence,record) VALUES(?1,?2,?3,?4,?5)",
                     params![account,region,name,sequence,encoded]).map_err(persist_error)?;
             }
+            crate::recovery::record(&transaction, account, region, table, self.cipher.as_deref())?;
             for key in &table.dirty_keys {
                 let encoded_key = serde_json::to_string(key).map_err(persist_error)?;
                 if let Some(version) = table.replica_versions.get(key) {
@@ -723,7 +788,13 @@ impl TableStore {
                         params![account,region,name,encoded_key,encoded_version]).map_err(persist_error)?;
                 }
                 if let Some(item) = table.items.get(key) {
-                    let encoded_item = serde_json::to_string(item).map_err(persist_error)?;
+                    let encoded_item = crate::recovery::encode_item(
+                        self.cipher.as_deref(),
+                        table.def.sse_type.is_some(),
+                        &[account, region, name],
+                        &encoded_key,
+                        item,
+                    )?;
                     transaction.execute("INSERT INTO dynamodb_items(account,region,name,item_key,item) VALUES(?1,?2,?3,?4,?5)
                         ON CONFLICT(account,region,name,item_key) DO UPDATE SET item=excluded.item",
                         params![account, region, name, encoded_key, encoded_item]).map_err(persist_error)?;
@@ -778,6 +849,7 @@ impl TableStore {
                 params![entry.key().0,entry.key().1,entry.key().2,outcome.fingerprint,created_unix,encoded_result])
                 .map_err(persist_error)?;
         }
+        crate::recovery::prune(&transaction)?;
         transaction.commit().map_err(persist_error)?;
         self.clear_uncommitted();
         for (_, _, mut table) in locked {
@@ -886,6 +958,7 @@ mod tests {
 
     fn simple_def(name: &str) -> TableDefinition {
         TableDefinition {
+            sse_type: None,
             name: name.to_string(),
             arn: format!("arn:aws:dynamodb:us-east-1:0:table/{name}"),
             key_schema: vec![KeySchemaElement {

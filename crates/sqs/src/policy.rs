@@ -34,6 +34,7 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
 pub(crate) struct SourceContext<'a> {
     pub arn: Option<&'a str>,
     pub account: Option<&'a str>,
+    pub secure_transport: Option<bool>,
 }
 
 // ARN conditions are case sensitive and support IAM's '*' and '?' wildcards.
@@ -89,6 +90,20 @@ fn conditions_match(statement: &Value, source: SourceContext<'_>) -> Option<bool
             let (actual, wildcard) = match (operator.as_str(), key.to_ascii_lowercase().as_str()) {
                 ("ArnEquals" | "ArnLike", "aws:sourcearn") => (source.arn, true),
                 ("StringEquals", "aws:sourceaccount") => (source.account, false),
+                ("Bool", "aws:securetransport") => {
+                    if candidates
+                        .iter()
+                        .any(|value| !matches!(*value, "true" | "false"))
+                    {
+                        return None;
+                    }
+                    (
+                        source
+                            .secure_transport
+                            .map(|secure| if secure { "true" } else { "false" }),
+                        false,
+                    )
+                }
                 _ => return None,
             };
             matches &= actual.is_some_and(|actual| {
@@ -207,6 +222,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transport_deny_uses_attested_network_context_and_keeps_redacted_calls_distinct() {
+        let policy = r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"sqs:*","Resource":"*","Condition":{"Bool":{"aws:SecureTransport":"false"}}}}"#;
+        for (secure_transport, expected) in [
+            (Some(false), Decision::Deny),
+            (Some(true), Decision::Unmatched),
+            (None, Decision::Unmatched),
+        ] {
+            let result = evaluate(
+                policy,
+                "arn:aws:iam::000000000000:root",
+                "000000000000",
+                "sqs:SetQueueAttributes",
+                "arn:aws:sqs:us-east-1:000000000000:queue",
+                SourceContext {
+                    secure_transport,
+                    ..Default::default()
+                },
+            );
+            assert!(result == expected);
+        }
+    }
+
+    #[test]
     fn policy_requires_matching_principal_action_resource_and_deny_wins() {
         let raw = r#"{"Statement":[{"Effect":"Allow","Principal":{"Service":"s3.amazonaws.com"},"Action":"sqs:SendMessage","Resource":"arn:aws:sqs:us-east-1:000000000000:q"},{"Effect":"Deny","Principal":"*","Action":"sqs:DeleteMessage","Resource":"*"}]}"#;
         assert!(matches!(
@@ -257,6 +295,7 @@ mod tests {
         let source = SourceContext {
             arn: Some("arn:aws:sns:us-east-1:000000000000:orders-created"),
             account: Some("000000000000"),
+            secure_transport: None,
         };
         let evaluate_policy = |condition: Value, effect: &str, context| {
             let raw = serde_json::json!({"Statement":[
@@ -323,7 +362,7 @@ mod tests {
             ));
         }
         for condition in [
-            serde_json::json!({"Bool":{"aws:SecureTransport":"true"}}),
+            serde_json::json!({"Bool":{"aws:SecureTransport":"not-a-boolean"}}),
             serde_json::json!({"ArnLike":{"aws:SourceArn":42}}),
             serde_json::json!({}),
         ] {

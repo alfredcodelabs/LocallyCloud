@@ -92,6 +92,73 @@ impl StageResolver for ApiGatewayWafBinding {
 }
 
 impl ApiGwHandler {
+    fn authorize_account_role(
+        &self,
+        request: &ServiceRequest,
+        segments: &[&str],
+        body: &Value,
+    ) -> Result<(), ApiGwError> {
+        if segments != ["account"] || request.method != Method::PATCH {
+            return Ok(());
+        }
+        let Some(evaluator) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+        else {
+            return Ok(());
+        };
+        if !evaluator.strict_sigv4_required() {
+            return Ok(());
+        }
+        if ![
+            "x-locallycloud-verified-external-sigv4",
+            "x-locallycloud-verified-internal-scope",
+        ]
+        .iter()
+        .any(|header| {
+            request
+                .headers
+                .get(*header)
+                .is_some_and(|value| value == "1")
+        }) {
+            return Err(ApiGwError::Forbidden(
+                "A verified identity is required to assign the logging role".into(),
+            ));
+        }
+        let caller = locallycloud_core::integration::RequestIdentity {
+            account_id: request.account_id.clone(),
+            access_key_id: request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(
+                    locallycloud_core::integration::RequestIdentity::access_key_from_authorization,
+                ),
+            arn: None,
+        };
+        for patch in body
+            .get("patchOperations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if patch.get("path").and_then(Value::as_str) != Some("/cloudwatchRoleArn")
+                || patch.get("op").and_then(Value::as_str) == Some("remove")
+            {
+                continue;
+            }
+            let Some(role) = patch.get("value").and_then(Value::as_str) else {
+                continue;
+            };
+            evaluator.authorize_service_role_assignment(locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest {
+                caller: caller.clone(), role_arn: role.into(), service_principal: "apigateway.amazonaws.com".into(),
+                source_arn: None, action: "logs:PutLogEvents".into(), resource: "*".into(),
+            }).map_err(|_| ApiGwError::Forbidden("Not authorized to assign the API Gateway logging role".into()))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> Self {
         let http = reqwest::Client::new();
         ApiGwHandler {
@@ -123,6 +190,7 @@ impl ApiGwHandler {
         match segs.first().copied() {
             Some(
                 "restapis"
+                | "account"
                 | "apikeys"
                 | "usageplans"
                 | "domainnames"
@@ -142,6 +210,8 @@ async fn route_v1(
     body: &Value,
 ) -> Result<(u16, Value), ApiGwError> {
     match (method, segs) {
+        (&Method::GET, ["account"]) => v1::get_account(ctx).await,
+        (&Method::PATCH, ["account"]) => v1::update_account(ctx, body).await,
         (&Method::POST, ["restapis"]) => v1::create_rest_api(ctx, body).await,
         (&Method::GET, ["restapis"]) => v1::get_rest_apis(ctx).await,
         (&Method::GET, ["restapis", id]) => v1::get_rest_api(ctx, id).await,
@@ -803,6 +873,9 @@ impl NativeHandler for ApiGwHandler {
                 }
             }
         };
+        if let Err(error) = self.authorize_account_role(&request, &segs, &body) {
+            return error.into_response(&request.request_id);
+        }
         if request.method == Method::GET {
             let resource = format!(
                 "arn:aws:apigateway:{}::{}",

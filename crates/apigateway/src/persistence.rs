@@ -101,6 +101,7 @@ impl ApiGwStore {
         {
             let record = record.read().await;
             snapshot.shared = SharedRecord {
+                account_settings: record.account_settings.clone(),
                 api_keys: record.api_keys.clone(),
                 usage_plans: record.usage_plans.clone(),
                 domains: record.domains.clone(),

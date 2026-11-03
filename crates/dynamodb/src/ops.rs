@@ -338,7 +338,9 @@ pub async fn create_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
         .get("StreamSpecification")
         .map(parse_stream_spec)
         .transpose()?;
+    let sse_type = parse_sse(ctx, req.get("SSESpecification"))?;
     let def = TableDefinition {
+        sse_type,
         name: name.clone(),
         arn: format!(
             "arn:aws:dynamodb:{}:{}:table/{name}",
@@ -456,6 +458,38 @@ fn parse_tag_list(arr: &[Value]) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+fn parse_sse(ctx: &Ctx<'_>, specification: Option<&Value>) -> Result<Option<String>, DdbError> {
+    let Some(specification) = specification else {
+        return Ok(None);
+    };
+    let object = specification
+        .as_object()
+        .ok_or_else(|| DdbError::Validation("SSESpecification must be an object".into()))?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "Enabled" | "SSEType"))
+    {
+        return Err(DdbError::Validation(
+            "Customer-managed KMS keys and unknown SSE properties are not implemented".into(),
+        ));
+    }
+    let enabled = specification
+        .get("Enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| DdbError::Validation("SSESpecification.Enabled must be a boolean".into()))?;
+    let kind = match specification.get("SSEType") {
+        None => "KMS",
+        Some(Value::String(kind)) if matches!(kind.as_str(), "AES256" | "KMS") => kind,
+        _ => return Err(DdbError::Validation("SSEType must be AES256 or KMS".into())),
+    };
+    if enabled && (ctx.store.state.is_none() || ctx.store.cipher.is_none()) {
+        return Err(DdbError::Validation(
+            "DynamoDB SSE requires persistent state and LOCALLYCLOUD_KMS_MASTER_KEY".into(),
+        ));
+    }
+    Ok(enabled.then(|| kind.into()))
+}
+
 /// Build the table description JSON.
 fn describe(def: &TableDefinition, item_count: usize) -> Value {
     let key_schema: Vec<Value> = def
@@ -491,6 +525,9 @@ fn describe(def: &TableDefinition, item_count: usize) -> Value {
             "NumberOfDecreasesToday": 0
         }
     });
+    if let Some(kind) = &def.sse_type {
+        out["SSEDescription"] = json!({"Status":"ENABLED","SSEType":kind});
+    }
     if let Some(stream) = &def.stream_spec {
         if stream.enabled {
             let stream_arn = format!("{}/stream/{}", def.arn, def.creation_date);
@@ -627,40 +664,149 @@ pub async fn update_time_to_live(ctx: &Ctx<'_>, req: &Value) -> Result<Value, Dd
     }))
 }
 
-fn continuous_backups_json(pitr_enabled: bool) -> Value {
-    json!({
-        "ContinuousBackupsDescription": {
-            "ContinuousBackupsStatus": "DISABLED",
-            "PointInTimeRecoveryDescription": {
-                "PointInTimeRecoveryStatus": if pitr_enabled { "ENABLED" } else { "DISABLED" }
-            }
-        }
+async fn recovery_io<T: Send + 'static>(
+    ctx: &Ctx<'_>,
+    action: impl FnOnce(&mut rusqlite::Connection, &str, &str) -> Result<T, DdbError> + Send + 'static,
+) -> Result<T, DdbError> {
+    let state = ctx.store.state.clone().ok_or_else(|| {
+        DdbError::RecoveryUnavailable(
+            "Point-in-time recovery is unavailable without a persistent state database".into(),
+        )
+    })?;
+    let account = ctx.account.to_owned();
+    let region = ctx.region.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut db = state.connection().map_err(crate::recovery::error)?;
+        action(&mut db, &account, &region)
     })
+    .await
+    .map_err(crate::recovery::error)?
 }
 
 pub async fn describe_continuous_backups(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let name = req_str(req, "TableName")?;
-    let table = get_table(ctx, name).await?;
-    let guard = table.read().await;
-    Ok(continuous_backups_json(guard.pitr_enabled))
+    let name = req_str(req, "TableName")?.to_owned();
+    get_table(ctx, &name).await?;
+    if ctx.store.state.is_none() {
+        return Ok(
+            json!({"ContinuousBackupsDescription":{"ContinuousBackupsStatus":"DISABLED",
+            "PointInTimeRecoveryDescription":{"PointInTimeRecoveryStatus":"DISABLED"}}}),
+        );
+    }
+    recovery_io(ctx, move |db, account, region| {
+        crate::recovery::describe(db, account, region, &name)
+    })
+    .await
 }
 
 pub async fn update_continuous_backups(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let name = req_str(req, "TableName")?;
-    let enabled = req
+    let name = req_str(req, "TableName")?.to_owned();
+    let spec = req
         .get("PointInTimeRecoverySpecification")
-        .and_then(|s| s.get("PointInTimeRecoveryEnabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let table = get_table(ctx, name).await?;
-    if enabled {
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            DdbError::Validation("PointInTimeRecoverySpecification is required".into())
+        })?;
+    if spec.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "PointInTimeRecoveryEnabled" | "RecoveryPeriodInDays"
+        )
+    }) {
         return Err(DdbError::Validation(
-            "Point-in-time recovery is unavailable until backups can be restored".into(),
+            "Unsupported PointInTimeRecoverySpecification property".into(),
         ));
     }
-    let mut guard = table.write().await;
-    guard.pitr_enabled = false;
-    Ok(continuous_backups_json(false))
+    let enabled = spec
+        .get("PointInTimeRecoveryEnabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            DdbError::Validation("PointInTimeRecoveryEnabled must be a boolean".into())
+        })?;
+    let days = spec
+        .get("RecoveryPeriodInDays")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|days| (1..=35).contains(days))
+                .map(|days| days as u32)
+                .ok_or_else(|| {
+                    DdbError::Validation("RecoveryPeriodInDays must be between 1 and 35".into())
+                })
+        })
+        .transpose()?;
+    get_table(ctx, &name).await?;
+    if !enabled && ctx.store.state.is_none() {
+        return describe_continuous_backups(ctx, req).await;
+    }
+    recovery_io(ctx, move |db, account, region| {
+        crate::recovery::configure(db, account, region, &name, enabled, days)
+    })
+    .await
+}
+
+pub async fn restore_table_to_point_in_time(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
+    let object = req
+        .as_object()
+        .ok_or_else(|| DdbError::Validation("Expected an object".into()))?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "SourceTableName" | "TargetTableName" | "UseLatestRestorableTime" | "RestoreDateTime"
+        )
+    }) {
+        return Err(DdbError::Validation("Restore supports same-region SourceTableName, TargetTableName and a restore time; overrides and SourceTableArn are not implemented".into()));
+    }
+    let name = req_str(req, "SourceTableName")?.to_owned();
+    let target = req_str(req, "TargetTableName")?;
+    crate::store::validate_table_name(target)?;
+    let latest = req
+        .get("UseLatestRestorableTime")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                DdbError::Validation("UseLatestRestorableTime must be a boolean".into())
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let requested = req
+        .get("RestoreDateTime")
+        .map(|value| {
+            value.as_f64().ok_or_else(|| {
+                DdbError::Validation("RestoreDateTime must be an epoch timestamp".into())
+            })
+        })
+        .transpose()?;
+    if latest == requested.is_some() {
+        return Err(DdbError::Validation(
+            "Specify either UseLatestRestorableTime=true or RestoreDateTime".into(),
+        ));
+    }
+    let source = get_table(ctx, &name).await?;
+    let mut def = source.read().await.def.clone();
+    if ctx.store.get(ctx.account, ctx.region, target).is_some() {
+        return Err(DdbError::ResourceInUse(format!(
+            "Table already exists: {target}"
+        )));
+    }
+    let cipher = ctx.store.cipher.clone();
+    let items = recovery_io(ctx, move |db, account, region| {
+        crate::recovery::restore(db, account, region, &name, requested, cipher.as_deref())
+    })
+    .await?;
+    def.name = target.into();
+    def.arn = format!(
+        "arn:aws:dynamodb:{}:{}:table/{target}",
+        ctx.region, ctx.account
+    );
+    def.creation_date = now_epoch_secs().to_string();
+    def.replicas.clear();
+    def.stream_spec = None;
+    let result = describe(&def, items.len());
+    let mut restored = TableData::new(def, Default::default(), None, false);
+    restored.dirty_keys.extend(items.keys().cloned());
+    restored.items = items;
+    ctx.store.create(ctx.account, ctx.region, restored)?;
+    Ok(json!({"TableDescription":result}))
 }
 
 pub async fn list_tags_of_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
@@ -702,6 +848,13 @@ pub async fn untag_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbErro
 pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let name = req_str(req, "TableName")?;
     let table = get_table(ctx, name).await?;
+    if req.get("SSESpecification").is_some()
+        && parse_sse(ctx, req.get("SSESpecification"))? != table.read().await.def.sse_type
+    {
+        return Err(DdbError::Validation(
+            "Changing DynamoDB SSE requires data migration and is not implemented".into(),
+        ));
+    }
     if req.get("ReplicaUpdates").is_some() {
         return update_replicas(ctx, req, &table).await;
     }
@@ -904,16 +1057,18 @@ async fn update_replicas(
         let mut def = source.def.clone();
         def.arn = format!("arn:aws:dynamodb:{target}:{}:table/{name}", ctx.account);
         def.replicas = regions.clone();
-        def.stream_spec = Some(StreamSpecification {
-            enabled: true,
-            view_type: "NEW_AND_OLD_IMAGES".into(),
-        });
-        let mut replica = TableData::new(
-            def,
-            source.tags.clone(),
-            source.ttl_attribute.clone(),
-            source.pitr_enabled,
-        );
+        let stream_spec = source
+            .def
+            .stream_spec
+            .clone()
+            .filter(|spec| spec.enabled)
+            .unwrap_or(StreamSpecification {
+                enabled: true,
+                view_type: "NEW_AND_OLD_IMAGES".into(),
+            });
+        def.stream_spec = Some(stream_spec.clone());
+        let mut replica =
+            TableData::new(def, Default::default(), source.ttl_attribute.clone(), false);
         replica.items = source.items.clone();
         replica.dirty_keys.extend(replica.items.keys().cloned());
         replica.replica_versions = source.replica_versions.clone();
@@ -923,10 +1078,7 @@ async fn update_replicas(
         // Existing items precede all future writes. Tombstones are copied as well.
         ctx.store.create(ctx.account, target, replica)?;
         source.def.replicas = regions.clone();
-        source.def.stream_spec = Some(StreamSpecification {
-            enabled: true,
-            view_type: "NEW_AND_OLD_IMAGES".into(),
-        });
+        source.def.stream_spec = Some(stream_spec);
         for region in regions
             .iter()
             .filter(|region| region.as_str() != ctx.region && region.as_str() != target)
@@ -2578,6 +2730,41 @@ pub async fn list_exports(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
 #[cfg(test)]
 mod global_table_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replica_preserves_new_image_stream_and_queryable_indexes() {
+        let store = TableStore::new();
+        let east = Ctx {
+            store: &store,
+            account: "123456789012",
+            region: "us-east-1",
+        };
+        let west = Ctx {
+            region: "us-west-2",
+            ..east
+        };
+        create_table(&east, &json!({
+            "TableName":"indexed-replica", "BillingMode":"PAY_PER_REQUEST",
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"status","AttributeType":"S"}],
+            "GlobalSecondaryIndexes":[{"IndexName":"by-status","KeySchema":[{"AttributeName":"status","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}],
+            "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}
+        })).await.unwrap();
+        update_table(&east, &json!({"TableName":"indexed-replica","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]})).await.unwrap();
+        put_item(&east, &json!({"TableName":"indexed-replica","Item":{"pk":{"S":"one"},"status":{"S":"ready"}}})).await.unwrap();
+        replicate_pending(&store).await;
+        for ctx in [&east, &west] {
+            let description = describe_table(ctx, &json!({"TableName":"indexed-replica"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                description["Table"]["StreamSpecification"]["StreamViewType"],
+                "NEW_IMAGE"
+            );
+            let items = query(ctx, &json!({"TableName":"indexed-replica","IndexName":"by-status","KeyConditionExpression":"#s = :s","ExpressionAttributeNames":{"#s":"status"},"ExpressionAttributeValues":{":s":{"S":"ready"}}})).await.unwrap();
+            assert_eq!(items["Count"], 1);
+        }
+    }
 
     #[tokio::test]
     async fn deleting_replica_waits_for_its_local_writes() {

@@ -865,6 +865,30 @@ impl S3Handler {
         }
         let mut context =
             BTreeMap::from([("aws:requestedregion".into(), vec![req.region.clone()])]);
+        if action == "s3:PutObject" {
+            let query = QueryParams::parse(req.uri.query());
+            let creates_object = match req.method {
+                Method::PUT => !query.has("uploadId"),
+                Method::POST => !query.has("uploads"),
+                _ => false,
+            };
+            context.insert(
+                "s3:objectcreationoperation".into(),
+                vec![creates_object.to_string()],
+            );
+            for (header, key) in [
+                ("if-none-match", "s3:if-none-match"),
+                ("if-match", "s3:if-match"),
+            ] {
+                if let Some(value) = req
+                    .headers
+                    .get(header)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    context.insert(key.into(), vec![value.into()]);
+                }
+            }
+        }
         if req.method == Method::GET && matches!(action, "s3:ListBucket" | "s3:ListBucketVersions")
         {
             let query = QueryParams::parse(req.uri.query());
@@ -1302,7 +1326,9 @@ impl S3Handler {
             if !matches!(req.method, Method::GET | Method::PUT) {
                 return Err(S3Error::AccessDenied);
             }
-            presign::validate_url(req)?;
+            if !Self::strict_external(req) {
+                presign::validate_url(req)?;
+            }
         }
 
         let shape = resolve(host, req.uri.path());
@@ -3245,7 +3271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_encryption_persists_canonical_kms_and_rejects_without_mutation() {
+    async fn bucket_encryption_defers_key_resolution_until_object_write() {
         let (h, _registry, kms) = kms_handler();
         h.handle(req(Method::PUT, "/buck", "", &[])).await;
 
@@ -3279,21 +3305,14 @@ mod tests {
         .await
         .1;
         assert!(configured.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"));
-        assert!(configured.contains(
-            "<KMSMasterKeyID>arn:aws:kms:us-east-1:000000000000:key/key-123</KMSMasterKeyID>"
-        ));
+        assert!(configured.contains("<KMSMasterKeyID>alias/data</KMSMasterKeyID>"));
         assert!(configured.contains("<BucketKeyEnabled>false</BucketKeyEnabled>"));
-        {
-            let requests = kms.requests.lock().unwrap();
-            assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].key_id, "alias/data");
-            assert_eq!(requests[0].call.source_service, "s3");
-            assert_eq!(requests[0].call.account_id, "000000000000");
-        }
+        assert!(kms.requests.lock().unwrap().is_empty());
 
         for (invalid_key, expected_status) in [
             ("alias/missing", 400),
             ("missing-key", 400),
+            ("arn:aws:kms:us-east-1:111111111111:key/missing", 400),
             ("disabled", 400),
             ("denied", 403),
         ] {
@@ -3307,15 +3326,31 @@ mod tests {
                 ))
                 .await
                 .status(),
-                expected_status
+                200
             );
-            let unchanged = body_string(
+            let stored = body_string(
                 h.handle(req(Method::GET, "/buck?encryption", "", &[]))
                     .await,
             )
             .await
             .1;
-            assert_eq!(unchanged, configured);
+            assert!(stored.contains(invalid_key));
+            let failed_write = h
+                .handle(req(Method::PUT, "/buck/unavailable", "private", &[]))
+                .await;
+            assert_eq!(failed_write.status(), expected_status);
+            if invalid_key.contains("missing") {
+                assert!(body_string(failed_write)
+                    .await
+                    .1
+                    .contains("KMS.NotFoundException"));
+            }
+            assert_eq!(
+                h.handle(req(Method::GET, "/buck/unavailable", "", &[]))
+                    .await
+                    .status(),
+                404
+            );
         }
 
         assert_eq!(
@@ -6471,7 +6506,8 @@ mod encryption_storage_tests {
     }
 
     #[tokio::test]
-    async fn bucket_keys_reject_without_mutating_object_or_configuration() {
+    async fn bucket_keys_configuration_is_stored_but_object_operations_are_explicitly_unsupported()
+    {
         let handler = S3Handler::new();
         handler
             .handle(request(Method::PUT, "/bucket-keys", Bytes::new()))
@@ -6510,13 +6546,13 @@ mod encryption_storage_tests {
                 .handle(request(Method::PUT, "/bucket-keys?encryption", body))
                 .await
                 .status(),
-            StatusCode::NOT_IMPLEMENTED
+            StatusCode::OK
         );
         let bucket = handler.store.get("000000000000", "bucket-keys").unwrap();
-        assert_eq!(
-            bucket.read().await.encryption,
-            crate::store::ServerSideEncryption::default()
-        );
+        let encryption = bucket.read().await.encryption.clone();
+        assert_eq!(encryption.algorithm, crate::store::SseAlgorithm::AwsKms);
+        assert!(encryption.bucket_key_enabled);
+        assert_eq!(encryption.kms_key_arn, None);
     }
 }
 

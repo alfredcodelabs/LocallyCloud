@@ -15,6 +15,7 @@ use crate::error::LambdaError;
 /// AWS-supported runtime identifiers (see the Lambda spec resolution table). `go1.x` and
 /// other deprecated/unknown runtimes are intentionally absent.
 pub const SUPPORTED_RUNTIMES: &[&str] = &[
+    "nodejs24.x",
     "nodejs22.x",
     "nodejs20.x",
     "python3.14",
@@ -1168,6 +1169,7 @@ mod tests {
 
     #[test]
     fn supported_runtime_set_excludes_go1x() {
+        assert!(is_supported_runtime("nodejs24.x"));
         assert!(is_supported_runtime("nodejs22.x"));
         assert!(is_supported_runtime("python3.14"));
         assert!(is_supported_runtime("provided.al2023"));

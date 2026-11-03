@@ -30,6 +30,10 @@ const ACCESS_FIELDS: &[&str] = &[
     "$context.identity.userAgent",
     "$context.responseLength",
     "$context.integrationStatus",
+    "$context.identity.caller",
+    "$context.identity.user",
+    "$context.requestTime",
+    "$context.requestTimeEpoch",
 ];
 
 #[derive(Clone)]
@@ -56,6 +60,7 @@ pub struct StageLogging {
     access: Option<AccessLogSettings>,
     execution: ExecutionLevel,
     execution_group: Option<String>,
+    account_role: bool,
 }
 
 impl StageLogging {
@@ -64,6 +69,7 @@ impl StageLogging {
             access: None,
             execution: ExecutionLevel::Off,
             execution_group: None,
+            account_role: false,
         }
     }
 
@@ -73,6 +79,7 @@ impl StageLogging {
 }
 
 pub struct RequestLogValues<'a> {
+    pub request_time: OffsetDateTime,
     pub request_id: &'a str,
     pub status: u16,
     pub method: &'a str,
@@ -91,6 +98,20 @@ pub struct RequestLogValues<'a> {
 impl RequestLogValues<'_> {
     fn value(&self, field: &str) -> String {
         match field {
+            "$context.requestTime" => {
+                let format = time::format_description::parse_borrowed::<2>(
+                    "[day]/[month repr:short]/[year]:[hour]:[minute]:[second] +0000",
+                );
+                format
+                    .ok()
+                    .and_then(|format| self.request_time.format(&format).ok())
+                    .unwrap_or_else(|| "-".into())
+            }
+            "$context.requestTimeEpoch" => {
+                (self.request_time.unix_timestamp_nanos() / 1_000_000).to_string()
+            }
+            // These IAM identity fields are absent for NONE/TOKEN/REQUEST authorization.
+            "$context.identity.caller" | "$context.identity.user" => "-".into(),
             "$context.requestId" | "$context.extendedRequestId" => self.request_id.to_string(),
             "$context.status" => self.status.to_string(),
             "$context.httpMethod" => self.method.to_string(),
@@ -363,6 +384,7 @@ pub fn rest_stage_logging(
         execution,
         execution_group: (execution != ExecutionLevel::Off)
             .then(|| format!("API-Gateway-Execution-Logs_{api_id}/{stage_name}")),
+        account_role: true,
     })
 }
 
@@ -382,21 +404,59 @@ pub fn http_stage_logging(
         access,
         execution: ExecutionLevel::Off,
         execution_group: None,
+        account_role: false,
     })
 }
 
-fn producer_context(request_id: &str) -> ProducerContext {
-    ProducerContext {
+async fn producer_context(
+    registry: &Weak<ServiceRegistry>,
+    store: &crate::store::ApiGwStore,
+    account: &str,
+    region: &str,
+    request_id: &str,
+    account_role: bool,
+) -> Result<ProducerContext, SinkError> {
+    let role = if account_role {
+        store
+            .shared(account, region)
+            .read()
+            .await
+            .account_settings
+            .as_ref()
+            .and_then(|settings| settings.get("cloudwatchRoleArn"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        None
+    };
+    if let Some(role_arn) = &role {
+        if let Some(evaluator) = registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+        {
+            evaluator.authorize_service_role_trust(locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest {
+                caller: locallycloud_core::integration::RequestIdentity { account_id: account.into(), access_key_id: None, arn: None },
+                role_arn: role_arn.clone(), service_principal: "apigateway.amazonaws.com".into(),
+                source_arn: None, action: "logs:PutLogEvents".into(), resource: "*".into(),
+            }).map_err(|_| SinkError::Rejected("API Gateway logging role is missing or no longer trusts the service".into()))?;
+        }
+    }
+    Ok(ProducerContext {
         source_service: "apigateway".into(),
-        identity: CallerIdentity::ServicePrincipal {
-            service: "apigateway".into(),
-        },
+        identity: role
+            .map(|role_arn| CallerIdentity::AssumedRole {
+                role_arn,
+                session_name: "apigateway-logging".into(),
+            })
+            .unwrap_or_else(|| CallerIdentity::ServicePrincipal {
+                service: "apigateway".into(),
+            }),
         correlation: CorrelationContext {
             flow_id: request_id.to_string(),
             span_id: Uuid::new_v4().to_string(),
         },
         loop_depth: 0,
-    }
+    })
 }
 
 fn concrete_sink(registry: &Weak<ServiceRegistry>) -> Result<Arc<dyn InternalLogSink>, SinkError> {
@@ -408,6 +468,7 @@ fn concrete_sink(registry: &Weak<ServiceRegistry>) -> Result<Arc<dyn InternalLog
 
 pub async fn preflight(
     registry: &Weak<ServiceRegistry>,
+    store: &crate::store::ApiGwStore,
     account: &str,
     region: &str,
     request_id: &str,
@@ -420,21 +481,35 @@ pub async fn preflight(
         ApiGwError::BadRequest(format!("CloudWatch Logs preflight failed: {error}"))
     })?;
     let scope = LogScope::new(account, region);
+    let context = producer_context(
+        registry,
+        store,
+        account,
+        region,
+        request_id,
+        settings.account_role,
+    )
+    .await
+    .map_err(|error| {
+        ApiGwError::BadRequest(format!("CloudWatch Logs preflight failed: {error}"))
+    })?;
     for group_name in settings
         .access
         .iter()
         .map(|settings| settings.group_name.as_str())
         .chain(settings.execution_group.iter().map(String::as_str))
     {
-        sink.resolve_group(
-            scope.clone(),
-            ProducerGroupSpec {
-                name: group_name.to_string(),
-            },
-            producer_context(request_id),
-        )
-        .await
-        .map_err(|error| {
+        let group = ProducerGroupSpec {
+            name: group_name.to_string(),
+        };
+        let result = if settings.execution_group.as_deref() == Some(group_name) {
+            sink.ensure_group(scope.clone(), group, context.clone())
+                .await
+        } else {
+            sink.resolve_group(scope.clone(), group, context.clone())
+                .await
+        };
+        result.map_err(|error| {
             ApiGwError::BadRequest(format!("CloudWatch Logs preflight failed: {error}"))
         })?;
     }
@@ -484,7 +559,7 @@ async fn append_one(
     scope: &LogScope,
     group_name: &str,
     stream_name: &str,
-    request_id: &str,
+    context: &ProducerContext,
     message: String,
 ) -> Result<(), SinkError> {
     let group = sink
@@ -493,7 +568,7 @@ async fn append_one(
             ProducerGroupSpec {
                 name: group_name.to_string(),
             },
-            producer_context(request_id),
+            context.clone(),
         )
         .await?;
     let stream = sink
@@ -503,7 +578,7 @@ async fn append_one(
             ProducerStreamSpec {
                 name: stream_name.to_string(),
             },
-            producer_context(request_id),
+            context.clone(),
         )
         .await?;
     let timestamp_ms = SystemTime::now()
@@ -518,7 +593,7 @@ async fn append_one(
                 timestamp_ms,
                 message,
             }],
-            producer_context(request_id),
+            context.clone(),
         )
         .await?;
     if outcome.stored_events != 1 {
@@ -529,6 +604,7 @@ async fn append_one(
 
 pub async fn emit(
     registry: &Weak<ServiceRegistry>,
+    store: &crate::store::ApiGwStore,
     account: &str,
     region: &str,
     settings: &StageLogging,
@@ -539,6 +615,15 @@ pub async fn emit(
     }
     let sink = concrete_sink(registry)?;
     let scope = LogScope::new(account, region);
+    let context = producer_context(
+        registry,
+        store,
+        account,
+        region,
+        values.request_id,
+        settings.account_role,
+    )
+    .await?;
     let stream_name = format!("{}/{}", values.stage, OffsetDateTime::now_utc().date());
     if let Some(access) = &settings.access {
         append_one(
@@ -546,7 +631,7 @@ pub async fn emit(
             &scope,
             &access.group_name,
             &stream_name,
-            values.request_id,
+            &context,
             render_access(access, values),
         )
         .await?;
@@ -565,7 +650,7 @@ pub async fn emit(
                 .as_deref()
                 .ok_or_else(|| SinkError::InvalidRequest("execution log group".into()))?,
             &stream_name,
-            values.request_id,
+            &context,
             render_execution(values),
         )
         .await?;

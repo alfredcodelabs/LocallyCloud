@@ -1,8 +1,10 @@
-//! SigV4 header verification for ordinary AWS CLI/SDK requests.
+//! SigV4 verification for AWS CLI/SDK requests and host-signed S3 query URLs.
 //!
 //! This verifier intentionally accepts only ordinary, signed, single-request payloads. It
-//! rejects presigned requests, streaming payloads, and unsigned payloads. A future broader
-//! verifier can add those forms without weakening token issuance.
+//! Streaming requests remain unsupported. S3 query authentication is verified against
+//! the same active IAM/STS credentials, never an unsigned public-surface exception.
+mod presign;
+pub use presign::{presign_s3_put, query_access_key};
 
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, Method, Uri};
@@ -91,6 +93,9 @@ pub fn verify(
     expected_service: &str,
     credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
 ) -> bool {
+    if expected_service == "s3" && !headers.contains_key("authorization") {
+        return presign::verify(method, uri, headers, body, expected_region, credentials);
+    }
     verify_at(
         method,
         uri,

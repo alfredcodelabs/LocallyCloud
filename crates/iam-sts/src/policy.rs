@@ -113,6 +113,27 @@ pub fn service_trust_allows(
         Value::Object(_) => vec![statement],
         _ => return false,
     };
+    // Step Functions also uses its regional principal in generated execution-role trust.
+    // SourceArn is supplied by the service and validated before this trust check.
+    let regional_service = context
+        .get("aws:sourcearn")
+        .and_then(|values| values.first())
+        .filter(|_| service == "states.amazonaws.com")
+        .and_then(|source| {
+            let parts: Vec<_> = source.splitn(6, ':').collect();
+            match parts.as_slice() {
+                ["arn", "aws", "states", region, _, resource]
+                    if !region.is_empty()
+                        && region
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                        && resource.starts_with("stateMachine:") =>
+                {
+                    Some(format!("states.{region}.amazonaws.com"))
+                }
+                _ => None,
+            }
+        });
     let mut allowed = false;
     for statement in statements {
         if statement.get("NotPrincipal").is_some()
@@ -147,7 +168,12 @@ pub fn service_trust_allows(
             Some(Value::Object(map)) if map.len() == 1 => map
                 .get("Service")
                 .and_then(|value| parse_string_set("Service", Some(value)).ok())
-                .is_some_and(|services| any_glob(&services, service)),
+                .is_some_and(|services| {
+                    any_glob(&services, service)
+                        || regional_service
+                            .as_ref()
+                            .is_some_and(|regional| any_glob(&services, regional))
+                }),
             _ => false,
         };
         let request = EvalRequest {
@@ -537,6 +563,61 @@ fn has_matching(doc: &PolicyDocument, effect: Effect, req: &EvalRequest) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regional_states_trust_is_bound_to_source_region_and_preserves_explicit_deny() {
+        let role = "arn:aws:iam::000000000000:role/workflow";
+        let context = BTreeMap::from([(
+            "aws:sourcearn".into(),
+            vec!["arn:aws:states:us-east-2:000000000000:stateMachine:workflow".into()],
+        )]);
+        let policy = |principal: &str| {
+            format!(
+                r#"{{"Statement":{{"Effect":"Allow","Principal":{{"Service":"{principal}"}},"Action":"sts:AssumeRole"}}}}"#
+            )
+        };
+        assert!(service_trust_allows(
+            &policy("states.us-east-2.amazonaws.com"),
+            "states.amazonaws.com",
+            role,
+            &context
+        ));
+        assert!(service_trust_allows(
+            &policy("states.amazonaws.com"),
+            "states.amazonaws.com",
+            role,
+            &context
+        ));
+        assert!(!service_trust_allows(
+            &policy("states.us-east-1.amazonaws.com"),
+            "states.amazonaws.com",
+            role,
+            &context
+        ));
+        assert!(!service_trust_allows(
+            &policy("states.us-east-2.amazonaws.com"),
+            "states.amazonaws.com",
+            role,
+            &BTreeMap::new()
+        ));
+        assert!(!service_trust_allows(
+            &policy("states.us-east-2.amazonaws.com"),
+            "lambda.amazonaws.com",
+            role,
+            &context
+        ));
+        for denied in ["states.amazonaws.com", "states.us-east-2.amazonaws.com"] {
+            let document = format!(
+                r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"Service":"states.amazonaws.com"}},"Action":"sts:AssumeRole"}},{{"Effect":"Deny","Principal":{{"Service":"{denied}"}},"Action":"sts:AssumeRole"}}]}}"#
+            );
+            assert!(!service_trust_allows(
+                &document,
+                "states.amazonaws.com",
+                role,
+                &context
+            ));
+        }
+    }
 
     fn req(action: &str, resource: &str) -> EvalRequest {
         EvalRequest {

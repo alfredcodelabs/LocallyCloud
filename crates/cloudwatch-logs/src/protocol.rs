@@ -130,6 +130,8 @@ pub struct LogGroupDescription {
     pub creation_time: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention_in_days: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kms_key_id: Option<String>,
     pub metric_filter_count: u64,
     pub arn: String,
     pub stored_bytes: u64,

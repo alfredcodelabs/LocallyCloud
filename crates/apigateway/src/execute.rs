@@ -70,6 +70,7 @@ struct IncomingRequest<'a> {
 }
 
 struct InvocationLogContext {
+    request_time: time::OffsetDateTime,
     settings: StageLogging,
     stage: String,
     path: String,
@@ -454,6 +455,7 @@ async fn finish_logging(
         }
     };
     let values = RequestLogValues {
+        request_time: logging.request_time,
         request_id: ctx.request_id,
         status,
         method: &logging.method,
@@ -470,6 +472,7 @@ async fn finish_logging(
     };
     if let Err(error) = emit_logs(
         ctx.registry,
+        ctx.store,
         ctx.account,
         ctx.region,
         &logging.settings,
@@ -518,6 +521,7 @@ async fn invoke_rest(
                 .as_ref()
                 .and_then(|snapshot| rest_route(&snapshot.resources, incoming.method, &path));
             Ok::<_, crate::error::ApiGwError>(InvocationLogContext {
+                request_time: time::OffsetDateTime::now_utc(),
                 settings,
                 stage,
                 path,
@@ -1074,6 +1078,7 @@ async fn invoke_http(
                     .and_then(|snapshot| http_route(&snapshot.routes, incoming.method, &path))
             };
             Ok::<_, crate::error::ApiGwError>(InvocationLogContext {
+                request_time: time::OffsetDateTime::now_utc(),
                 settings,
                 stage,
                 path,

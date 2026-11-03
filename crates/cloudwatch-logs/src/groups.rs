@@ -25,10 +25,24 @@ pub fn create(
             "logGroupName must not start with aws/".into(),
         ));
     }
-    if request.kms_key_id.is_some() {
-        return Err(LogsError::InvalidParameter(
-            "kmsKeyId is not supported".into(),
-        ));
+    if let Some(arn) = &request.kms_key_id {
+        let fields = arn.splitn(6, ':').collect::<Vec<_>>();
+        if arn.len() > 2048
+            || fields.len() != 6
+            || fields[0] != "arn"
+            || !matches!(fields[1], "aws" | "aws-cn" | "aws-us-gov")
+            || fields[2] != "kms"
+            || fields[3].is_empty()
+            || fields[4].len() != 12
+            || !fields[4].bytes().all(|byte| byte.is_ascii_digit())
+            || !fields[5]
+                .strip_prefix("key/")
+                .is_some_and(|key| !key.is_empty())
+        {
+            return Err(LogsError::InvalidParameter(
+                "kmsKeyId must be a KMS key ARN".into(),
+            ));
+        }
     }
     if request.deletion_protection_enabled.is_some() {
         return Err(LogsError::InvalidParameter(
@@ -51,6 +65,7 @@ pub fn create(
         name: name.clone(),
         creation_time_ms: now_ms,
         retention_days: None,
+        kms_key_id: request.kms_key_id,
         class: LogClass::Standard,
         tags,
         streams: BTreeMap::new(),
@@ -267,6 +282,7 @@ fn group_description(group: LogGroup) -> LogGroupDescription {
         log_group_name: group.name,
         creation_time: group.creation_time_ms,
         retention_in_days: group.retention_days,
+        kms_key_id: group.kms_key_id,
         metric_filter_count: group.metric_filters.len() as u64,
         arn: legacy_arn,
         stored_bytes: group.streams.values().fold(0_u64, |total, stream| {

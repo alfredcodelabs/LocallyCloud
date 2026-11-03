@@ -2654,7 +2654,7 @@ def handler(event, context):
             b"exports.handler = async () => ({});\n",
         );
         let dest = base.join("rootfs");
-        let rootfs = build_rootfs(&dest, Some("nodejs22.x"), &code, &[]).unwrap();
+        let rootfs = build_rootfs(&dest, Some("nodejs24.x"), &code, &[]).unwrap();
         assert_eq!(
             rootfs.entrypoint,
             vec!["/var/runtime/bootstrap".to_string()]

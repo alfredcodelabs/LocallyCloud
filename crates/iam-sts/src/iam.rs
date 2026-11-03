@@ -677,6 +677,7 @@ fn strip_member(xml: &str) -> String {
 pub fn seed_aws_managed_policies(store: &IamStore) {
     // A wildcard action here lets a basic Lambda role access unrelated services.
     const MANAGED: &[(&str, &str, &str)] = &[
+        ("AmazonAPIGatewayPushToCloudWatchLogs", "v1", "logs:CreateLogGroup,logs:CreateLogStream,logs:DescribeLogGroups,logs:DescribeLogStreams,logs:PutLogEvents,logs:GetLogEvents,logs:FilterLogEvents"),
         ("AWSLambdaBasicExecutionRole", "v1", "logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents"),
         ("AWSLambdaVPCAccessExecutionRole", "v3", "logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents,ec2:CreateNetworkInterface,ec2:DescribeNetworkInterfaces,ec2:DescribeSubnets,ec2:DeleteNetworkInterface,ec2:AssignPrivateIpAddresses,ec2:UnassignPrivateIpAddresses"),
         ("AWSLambdaSQSQueueExecutionRole", "v1", "sqs:ReceiveMessage,sqs:DeleteMessage,sqs:GetQueueAttributes,logs:CreateLogGroup,logs:CreateLogStream,logs:PutLogEvents"),

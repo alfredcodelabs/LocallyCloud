@@ -99,6 +99,8 @@ pub enum S3Error {
     KmsDisabled,
     #[error("The state of the specified KMS key is not valid for this request")]
     KmsInvalidState,
+    #[error("The specified KMS key does not exist")]
+    KmsNotFound,
     #[error("{0}")]
     NotImplemented(String),
     #[error("We encountered an internal error. Please try again.")]
@@ -152,6 +154,7 @@ impl S3Error {
             S3Error::AccessDenied | S3Error::LegacyKmsMigrationRequired => "AccessDenied",
             S3Error::KmsDisabled => "KMS.DisabledException",
             S3Error::KmsInvalidState => "KMS.KMSInvalidStateException",
+            S3Error::KmsNotFound => "KMS.NotFoundException",
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::InternalError => "InternalError",
         }
@@ -193,7 +196,7 @@ impl S3Error {
             | S3Error::MalformedXML
             | S3Error::AuthorizationQueryParametersError
             | S3Error::InvalidTag => 400,
-            S3Error::KmsDisabled | S3Error::KmsInvalidState => 400,
+            S3Error::KmsDisabled | S3Error::KmsInvalidState | S3Error::KmsNotFound => 400,
             S3Error::PreconditionFailed => 412,
             S3Error::NotModified => 304,
             S3Error::InvalidRange => 416,

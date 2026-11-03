@@ -16,6 +16,16 @@ pub struct SigningCredentials {
     pub session_token: Option<String>,
 }
 
+/// Internal signing request. The signer returns a URL, never the underlying secret key.
+pub struct S3PutPresignRequest {
+    pub account: String,
+    pub access_key: String,
+    pub endpoint: String,
+    pub path: String,
+    pub region: String,
+    pub expires: u32,
+}
+
 /// Short-lived credentials issued to a service for an existing execution role.
 #[derive(Clone)]
 pub struct ServiceRoleCredentials {
@@ -70,6 +80,9 @@ pub enum ResourcePolicyError {
 }
 
 pub trait AuthorizationEvaluator: Send + Sync {
+    fn presign_s3_put(&self, _request: S3PutPresignRequest) -> Result<String, AuthorizationError> {
+        Err(AuthorizationError::Unavailable)
+    }
     fn version(&self) -> u16 {
         AUTHORIZATION_EVALUATOR_VERSION
     }

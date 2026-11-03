@@ -133,9 +133,8 @@ fn kms_error(error: KmsInternalError) -> S3Error {
         KmsInternalError::AccessDenied => S3Error::AccessDenied,
         KmsInternalError::Disabled => S3Error::KmsDisabled,
         KmsInternalError::InvalidState => S3Error::KmsInvalidState,
-        KmsInternalError::InvalidRequest
-        | KmsInternalError::NotFound
-        | KmsInternalError::InvalidCiphertext => {
+        KmsInternalError::NotFound => S3Error::KmsNotFound,
+        KmsInternalError::InvalidRequest | KmsInternalError::InvalidCiphertext => {
             S3Error::InvalidArgument("The KMS key is invalid or unavailable".into())
         }
         KmsInternalError::Unavailable | KmsInternalError::Internal => S3Error::InternalError,
@@ -179,7 +178,7 @@ fn explicit_encryption(
         SseAlgorithm::AwsKms => {
             if bucket_key {
                 return Err(S3Error::NotImplemented(
-                    "S3 Bucket Keys are not implemented".into(),
+                    "S3 Bucket Keys are not implemented for object operations".into(),
                 ));
             }
             let key_id = match kms_key_id {
@@ -224,7 +223,15 @@ fn request_encryption(
                 "The server side encryption algorithm is required".into(),
             ));
         }
-        return Ok(default.clone());
+        return match default.algorithm {
+            SseAlgorithm::AwsKms => explicit_encryption(
+                ctx,
+                default.algorithm,
+                default.kms_key_arn.as_deref(),
+                default.bucket_key_enabled,
+            ),
+            SseAlgorithm::Aes256 => Ok(default.clone()),
+        };
     }
     explicit_encryption(
         ctx,
@@ -1191,12 +1198,24 @@ fn parse_bucket_encryption(ctx: &Ctx<'_>, body: &[u8]) -> Result<ServerSideEncry
     }
     let algorithm = sse_algorithm(child_text(apply, "SSEAlgorithm").ok_or(S3Error::MalformedXML)?)?;
     let bucket_key = bucket_key_enabled(bucket_key_nodes.first().map(|node| node.text.as_str()))?;
-    explicit_encryption(
-        ctx,
-        algorithm,
-        child_text(apply, "KMSMasterKeyID"),
-        bucket_key,
-    )
+    let key = child_text(apply, "KMSMasterKeyID");
+    match algorithm {
+        SseAlgorithm::Aes256 => explicit_encryption(ctx, algorithm, key, bucket_key),
+        SseAlgorithm::AwsKms => {
+            if key.is_some_and(str::is_empty) {
+                return Err(S3Error::InvalidArgument(
+                    "KMS key ID must not be empty".into(),
+                ));
+            }
+            // General-purpose buckets store identifiers without consulting KMS. The
+            // first object write resolves the key and enforces its state and access.
+            Ok(ServerSideEncryption {
+                algorithm,
+                kms_key_arn: key.map(str::to_string),
+                bucket_key_enabled: bucket_key,
+            })
+        }
+    }
 }
 
 fn bucket_encryption_xml(encryption: &ServerSideEncryption) -> String {

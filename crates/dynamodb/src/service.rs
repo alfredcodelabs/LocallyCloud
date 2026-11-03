@@ -105,6 +105,7 @@ impl DynamoHandler {
             "UpdateTimeToLive" => ops::update_time_to_live(ctx, body).await,
             "DescribeContinuousBackups" => ops::describe_continuous_backups(ctx, body).await,
             "UpdateContinuousBackups" => ops::update_continuous_backups(ctx, body).await,
+            "RestoreTableToPointInTime" => ops::restore_table_to_point_in_time(ctx, body).await,
             "ListTagsOfResource" => ops::list_tags_of_resource(ctx, body).await,
             "TagResource" => ops::tag_resource(ctx, body).await,
             "UntagResource" => ops::untag_resource(ctx, body).await,
@@ -229,6 +230,15 @@ fn authorize(
 fn authorization_targets(op: &str, body: &Value) -> Result<Vec<(String, String)>, DdbError> {
     let mut targets = Vec::new();
     match op {
+        "RestoreTableToPointInTime" => {
+            for field in ["SourceTableName", "TargetTableName"] {
+                let table = body
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DdbError::Validation(format!("{field} is required")))?;
+                targets.push((op.into(), table.into()));
+            }
+        }
         "BatchGetItem" | "BatchWriteItem" => {
             let items = body
                 .get("RequestItems")
@@ -1002,6 +1012,177 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("ValidationException"));
+    }
+
+    #[tokio::test]
+    async fn sse_seals_items_streams_metadata_and_recovery_and_requires_original_key() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-ddb-sse-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let cipher = Arc::new(locallycloud_state::StateCipher::with_key(&[19; 32]));
+        let h = DynamoHandler::with_store(
+            Arc::new(
+                TableStore::with_state_and_cipher(state.clone(), Some(cipher.clone())).unwrap(),
+            ),
+            Weak::new(),
+        );
+        let (status,description)=call_json(&h,"CreateTable",r#"{"TableName":"tbl","BillingMode":"PAY_PER_REQUEST","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"SSESpecification":{"Enabled":true},"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#).await;
+        assert_eq!(status, 200, "{description}");
+        assert_eq!(
+            description["TableDescription"]["SSEDescription"]["Status"],
+            "ENABLED"
+        );
+        assert_eq!(call(&h,"PutItem",r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"payload":{"S":"sensitive-ledger-payload"}}}"#).await.status(),200);
+        assert_eq!(call(&h,"UpdateContinuousBackups",r#"{"TableName":"tbl","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#).await.status(),200);
+        let db = state.connection().unwrap();
+        for (table, column) in [
+            ("dynamodb_tables", "metadata"),
+            ("dynamodb_items", "item"),
+            ("dynamodb_stream_records", "record"),
+            ("dynamodb_recovery_items", "item"),
+        ] {
+            let stored: String = db
+                .query_row(
+                    &format!("SELECT {column} FROM {table} LIMIT 1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(stored.starts_with("dynamodb-sealed-v1:"), "{table}");
+            assert!(!stored.contains("sensitive-ledger-payload"));
+        }
+        drop(db);
+        drop(h);
+        let wrong = Arc::new(locallycloud_state::StateCipher::with_key(&[20; 32]));
+        assert!(TableStore::with_state_and_cipher(state.clone(), Some(wrong)).is_err());
+        assert!(TableStore::with_state_and_cipher(state.clone(), None).is_err());
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state_and_cipher(state.clone(), Some(cipher)).unwrap()),
+            Weak::new(),
+        );
+        let (_, item) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(item["Item"]["payload"]["S"], "sensitive-ledger-payload");
+        assert_eq!(call(&h,"RestoreTableToPointInTime",r#"{"SourceTableName":"tbl","TargetTableName":"restored","UseLatestRestorableTime":true}"#).await.status(),200);
+        let (_, item) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"restored","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(item["Item"]["payload"]["S"], "sensitive-ledger-payload");
+        drop(h);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_checkpoint_updates_and_deletes_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "locallycloud-ddb-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state.clone()).unwrap()),
+            Weak::new(),
+        );
+        create_provisioned(&h).await;
+        assert_eq!(
+            call(
+                &h,
+                "PutItem",
+                r#"{"TableName":"tbl","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#
+            )
+            .await
+            .status(),
+            200
+        );
+        let (status, description) = call_json(&h,"UpdateContinuousBackups",r#"{"TableName":"tbl","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true,"RecoveryPeriodInDays":1}}"#).await;
+        assert_eq!(status, 200, "{description}");
+        let before = description["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
+            ["LatestRestorableDateTime"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(call(&h,"TransactWriteItems",r#"{"TransactItems":[{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"},"n":{"N":"2"}}}},{"Put":{"TableName":"tbl","Item":{"id":{"S":"b"}}}}]}"#).await.status(),200);
+        let (_, description) =
+            call_json(&h, "DescribeContinuousBackups", r#"{"TableName":"tbl"}"#).await;
+        let middle = description["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
+            ["LatestRestorableDateTime"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(
+            call(
+                &h,
+                "DeleteItem",
+                r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#
+            )
+            .await
+            .status(),
+            200
+        );
+        drop(h);
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state.clone()).unwrap()),
+            Weak::new(),
+        );
+        for (target, timestamp, expected) in [("before", before, "1"), ("middle", middle, "2")] {
+            let request = serde_json::json!({"SourceTableName":"tbl","TargetTableName":target,"RestoreDateTime":timestamp}).to_string();
+            let (status, body) = call_json(&h, "RestoreTableToPointInTime", &request).await;
+            assert_eq!(status, 200, "{body}");
+            let (_, body) = call_json(
+                &h,
+                "GetItem",
+                &serde_json::json!({"TableName":target,"Key":{"id":{"S":"a"}}}).to_string(),
+            )
+            .await;
+            assert_eq!(body["Item"]["n"]["N"], expected);
+        }
+        assert_eq!(call(&h,"RestoreTableToPointInTime",r#"{"SourceTableName":"tbl","TargetTableName":"latest","UseLatestRestorableTime":true}"#).await.status(),200);
+        let (_, body) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"latest","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert!(body.get("Item").is_none());
+        let (_, body) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"latest","Key":{"id":{"S":"b"}}}"#,
+        )
+        .await;
+        assert_eq!(body["Item"]["id"]["S"], "b");
+        let (status, body) = call_json(
+            &h,
+            "RestoreTableToPointInTime",
+            r#"{"SourceTableName":"tbl","TargetTableName":"invalid","RestoreDateTime":0}"#,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(body["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("InvalidRestoreTimeException"));
+        assert_eq!(call(&h,"UpdateContinuousBackups",r#"{"TableName":"tbl","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true,"RecoveryPeriodInDays":36}}"#).await.status(),400);
+        assert_eq!(call(&h,"UpdateContinuousBackups",r#"{"TableName":"tbl","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":false}}"#).await.status(),200);
+        drop(h);
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state).unwrap()),
+            Weak::new(),
+        );
+        let (_, body) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"before","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert_eq!(body["Item"]["n"]["N"], "1");
+        drop(h);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

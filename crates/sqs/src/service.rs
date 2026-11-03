@@ -261,12 +261,28 @@ impl SqsHandler {
                         && !components[5].is_empty()
                 });
                 if valid {
-                    policy::SourceContext { arn, account }
+                    policy::SourceContext {
+                        arn,
+                        account,
+                        ..Default::default()
+                    }
                 } else {
                     policy::SourceContext::default()
                 }
             } else {
                 policy::SourceContext::default()
+            };
+            let source = policy::SourceContext {
+                secure_transport: request
+                    .headers
+                    .get("x-locallycloud-verified-secure-transport")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| match value {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    }),
+                ..source
             };
             match policy::evaluate(
                 &raw,

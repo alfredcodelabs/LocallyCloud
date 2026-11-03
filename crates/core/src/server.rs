@@ -88,6 +88,15 @@ impl LocallyCloudServer {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|source| ServerError::Bind { addr, source })?;
+        self.run_with_listener(listener, startup).await
+    }
+
+    /// Serve an already bound front door until an OS termination signal.
+    pub async fn run_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+        startup: impl FnOnce() + Send,
+    ) -> Result<(), ServerError> {
         self.run_on_listener(listener, shutdown_signal(), startup)
             .await
     }
@@ -260,7 +269,13 @@ fn disabled_dashboard_routes(app: Router<AppState>) -> Router<AppState> {
 }
 
 async fn health_handler(State(state): State<AppState>) -> Response {
-    let (status, body) = health_response(state.readiness.is_ready());
+    let ready = state.readiness.is_ready();
+    let (status, _) = health_response(ready);
+    let body = serde_json::json!({
+        "status": if ready { "running" } else { "starting" },
+        "capabilities": crate::status::runtime_capabilities(&state.registry),
+    })
+    .to_string();
     Response::builder()
         .status(status)
         .header("content-type", "application/json")

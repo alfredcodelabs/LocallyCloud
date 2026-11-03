@@ -31,6 +31,7 @@ use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, Ser
 use locallycloud_ec2::Ec2Handler;
 
 use crate::concurrency::ConcurrencyLimiter;
+const EXECUTION_UNAVAILABLE: &str = "Lambda invocation is disabled: no compute executor is available. Install crun or youki, ensure a rootless systemd user session and a writable Lambda work directory, and check startup diagnostics.";
 use crate::control_plane::{
     add_permission, create_alias, create_function, create_function_url_config, delete_alias,
     delete_function, delete_function_concurrency, delete_function_event_invoke_config,
@@ -359,35 +360,75 @@ impl LambdaHandler {
         let registry = self.registry.upgrade().ok_or_else(|| {
             LambdaError::InvalidParameterValue("local S3 service is unavailable".into())
         })?;
-        let handler = registry
-            .native_handler(&ServiceName::new("s3"))
-            .ok_or_else(|| {
-                LambdaError::InvalidParameterValue("local S3 service is unavailable".into())
-            })?;
+        if registry.native_handler(&ServiceName::new("s3")).is_none() {
+            return Err(LambdaError::InvalidParameterValue(
+                "local S3 service is unavailable".into(),
+            ));
+        }
+        let dispatcher = registry.internal_dispatcher().ok_or_else(|| {
+            LambdaError::InternalError("S3 deployment package dispatcher is unavailable".into())
+        })?;
         let mut path = format!("/{}/{}", encode_path(bucket, false), encode_path(key, true));
         if let Some(version) = version {
             path.push_str("?versionId=");
             path.push_str(&encode_path(version, false));
         }
         let mut headers = http::HeaderMap::new();
-        headers.insert("host", http::HeaderValue::from_static("localhost:4599"));
-        let response = handler
-            .handle(ServiceRequest {
-                method: Method::GET,
-                uri: path.parse().map_err(|_| {
-                    LambdaError::InvalidParameterValue("invalid S3 deployment package path".into())
-                })?,
-                headers,
-                body: bytes::Bytes::new(),
-                region: req.region.clone(),
-                account_id: req.account_id.clone(),
-                request_id: req.request_id.clone(),
-            })
+        headers.insert("host", http::HeaderValue::from_static("s3.localhost"));
+        let attested = [
+            "x-locallycloud-verified-internal-scope",
+            "x-locallycloud-verified-external-sigv4",
+        ]
+        .iter()
+        .any(|header| req.headers.get(*header).is_some_and(|value| value == "1"));
+        let access_key = if attested {
+            req.headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(
+                    locallycloud_core::integration::RequestIdentity::access_key_from_authorization,
+                )
+        } else {
+            None
+        };
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential={}/19700101/{}/s3/aws4_request",
+                access_key.as_deref().unwrap_or("locallycloud"),
+                req.region
+            ))
+            .map_err(|_| {
+                LambdaError::InvalidParameterValue("invalid deployment package identity".into())
+            })?,
+        );
+        if let Some(identity) = locallycloud_core::integration::identity::trusted_role(req) {
+            locallycloud_core::integration::identity::IdentityPropagator::attach(
+                &mut headers,
+                &identity,
+            );
+        }
+        let uri = path.parse().map_err(|_| {
+            LambdaError::InvalidParameterValue("invalid S3 deployment package path".into())
+        })?;
+        let response = dispatcher
+            .dispatch_scoped(
+                &Method::GET,
+                &uri,
+                &headers,
+                Bytes::new(),
+                &req.request_id,
+                &req.account_id,
+                &req.region,
+            )
             .await;
         let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .map_err(|_| LambdaError::InternalError("could not read S3 object response".into()))?;
+        let body = axum::body::to_bytes(
+            response.into_body(),
+            crate::code_store::MAX_UNZIPPED_SIZE as usize,
+        )
+        .await
+        .map_err(|_| LambdaError::InternalError("could not read S3 object response".into()))?;
         if !status.is_success() {
             return Err(LambdaError::InvalidParameterValue(format!(
                 "could not fetch s3://{bucket}/{key} ({status})"
@@ -1206,7 +1247,7 @@ impl LambdaHandler {
         let executor = match &self.executor {
             Some(e) => e.clone(),
             None => {
-                return LambdaError::NotImplemented("invocation is not enabled".into())
+                return LambdaError::NotImplemented(EXECUTION_UNAVAILABLE.into())
                     .into_response(&req.request_id)
             }
         };
@@ -1379,6 +1420,10 @@ impl LambdaHandler {
 
 #[async_trait]
 impl LambdaInternalApi for LambdaHandler {
+    fn unavailable_reason(&self) -> Option<&'static str> {
+        self.executor.is_none().then_some(EXECUTION_UNAVAILABLE)
+    }
+
     async fn invoke(
         &self,
         request: LambdaInvokeRequest,
@@ -2198,15 +2243,22 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_operation_returns_501() {
-        let handler = LambdaHandler::new();
-        let resp = handler
-            .handle(request(
-                Method::POST,
-                "/2015-03-31/functions/fn/invocations",
-                "",
-            ))
-            .await;
+        let registry = ServiceRegistry::with_known_services();
+        let handler = register(&registry);
+        let capabilities = locallycloud_core::status::runtime_capabilities(&registry);
+        assert_eq!(capabilities["lambdaInvoke"]["available"], false);
+        assert_eq!(
+            capabilities["lambdaInvoke"]["reason"],
+            EXECUTION_UNAVAILABLE
+        );
+        let mut req = request(Method::POST, "/2015-03-31/functions/fn/invocations", "");
+        req.headers
+            .insert("x-amz-invocation-type", HeaderValue::from_static("Event"));
+        let resp = handler.handle(req).await;
         assert_eq!(resp.status(), 501);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["Message"], EXECUTION_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -2245,6 +2297,18 @@ mod tests {
             ServiceMetadata::new(AwsProtocol::RestXml, None),
             Arc::new(ZipS3),
         );
+        registry.set_internal_dispatcher(Arc::new(
+            locallycloud_core::integration::InternalDispatcher::new_shared(
+                &registry,
+                locallycloud_core::proxy::ProxyConfig {
+                    backend_url: "http://127.0.0.1:1".into(),
+                    upstream_timeout: Duration::from_secs(1),
+                },
+                locallycloud_core::proxy::LegacyHealth::new(false),
+                "us-east-1".into(),
+                "000000000000".into(),
+            ),
+        ));
         let handler = LambdaHandler::with_parts(Arc::downgrade(&registry), None);
 
         let create = create_body(

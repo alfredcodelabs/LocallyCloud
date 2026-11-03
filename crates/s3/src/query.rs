@@ -38,11 +38,20 @@ impl QueryParams {
             .filter(|v| !v.is_empty())
     }
 
-    /// Operational query allowlist; SDK v3 x-id is advisory and never selects IAM permissions.
+    /// Operational allowlist; SigV4 fields are verified separately and do not select actions.
     pub fn only_keys(&self, allowed: &[&str]) -> bool {
-        self.pairs
-            .iter()
-            .all(|(key, _)| key == "x-id" || allowed.contains(&key.as_str()))
+        const AUTH: &[&str] = &[
+            "X-Amz-Algorithm",
+            "X-Amz-Credential",
+            "X-Amz-Date",
+            "X-Amz-Expires",
+            "X-Amz-SignedHeaders",
+            "X-Amz-Signature",
+            "X-Amz-Security-Token",
+        ];
+        self.pairs.iter().all(|(key, _)| {
+            key == "x-id" || AUTH.contains(&key.as_str()) || allowed.contains(&key.as_str())
+        })
     }
 
     /// Whether `key` is present (even with an empty value, e.g. `?acl`).
@@ -69,5 +78,14 @@ mod tests {
         let q = QueryParams::parse(Some("acl"));
         assert!(q.has("acl"));
         assert_eq!(q.get("acl"), None);
+    }
+
+    #[test]
+    fn authentication_fields_do_not_select_an_operational_subresource() {
+        let q = QueryParams::parse(Some("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=fixture&X-Amz-Signature=fixture&versionId=v1"));
+        assert!(q.only_keys(&["versionId"]));
+        assert!(!q.only_keys(&[]));
+        let unsupported = QueryParams::parse(Some("X-Amz-Signature=fixture&acl"));
+        assert!(!unsupported.only_keys(&[]));
     }
 }

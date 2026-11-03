@@ -37,6 +37,10 @@ pub enum DdbError {
     #[error("{0}")]
     UnknownOperation(String),
     #[error("{0}")]
+    RecoveryUnavailable(String),
+    #[error("{0}")]
+    InvalidRestoreTime(String),
+    #[error("{0}")]
     Internal(String),
 }
 
@@ -77,6 +81,8 @@ impl DdbError {
             DdbError::IdempotentParameterMismatch(_) => "IdempotentParameterMismatchException",
             DdbError::ExportNotFound(_) => "ExportNotFoundException",
             DdbError::UnknownOperation(_) => "UnknownOperationException",
+            DdbError::RecoveryUnavailable(_) => "PointInTimeRecoveryUnavailableException",
+            DdbError::InvalidRestoreTime(_) => "InvalidRestoreTimeException",
             DdbError::Internal(_) => "InternalServerError",
         }
     }
@@ -95,6 +101,7 @@ impl DdbError {
             | DdbError::IdempotentParameterMismatch(_)
             | DdbError::ExportNotFound(_)
             | DdbError::UnknownOperation(_) => 400,
+            DdbError::RecoveryUnavailable(_) | DdbError::InvalidRestoreTime(_) => 400,
             DdbError::Internal(_) => 500,
         }
     }

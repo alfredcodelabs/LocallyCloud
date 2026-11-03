@@ -674,7 +674,7 @@ impl InternalDispatcher {
             evaluator.as_deref().and_then(|evaluator| {
                 let candidate = match scope {
                     Some((account, _)) => account.to_owned(),
-                    None => credential_account(evaluator, headers)?,
+                    None => credential_account(evaluator, headers, uri)?,
                 };
                 evaluator
                     .verify_sigv4(
@@ -775,6 +775,18 @@ impl InternalDispatcher {
                                     "x-locallycloud-verified-external-sigv4",
                                     HeaderValue::from_static("1"),
                                 );
+                                if decision.service_name.as_str() == "s3"
+                                    && !native_headers.contains_key(http::header::AUTHORIZATION)
+                                {
+                                    if let Some(credential) = x_amz_credential.as_deref() {
+                                        if let Ok(value) = HeaderValue::from_str(&format!(
+                                            "AWS4-HMAC-SHA256 Credential={credential}"
+                                        )) {
+                                            native_headers
+                                                .insert(http::header::AUTHORIZATION, value);
+                                        }
+                                    }
+                                }
                             }
                             if ecr_token_request {
                                 native_headers.insert(
@@ -937,7 +949,7 @@ impl InternalDispatcher {
                         service => service,
                     };
                     let verified_account = evaluator.as_deref().and_then(|evaluator| {
-                        let candidate = credential_account(evaluator, headers)?;
+                        let candidate = credential_account(evaluator, headers, uri)?;
                         evaluator
                             .verify_sigv4(
                                 &candidate,
@@ -1011,12 +1023,13 @@ impl InternalDispatcher {
 fn credential_account(
     evaluator: &dyn authorization::AuthorizationEvaluator,
     headers: &HeaderMap,
+    uri: &Uri,
 ) -> Option<String> {
     let key = headers
-        .get(http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()
-        .and_then(RequestIdentity::access_key_from_authorization)?;
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(RequestIdentity::access_key_from_authorization)
+        .or_else(|| sigv4::query_access_key(uri))?;
     evaluator
         .credential_account(&key)
         .ok()
@@ -1046,8 +1059,7 @@ pub(crate) fn claims_sigv4_identity(
 }
 
 /// Public HTTP surfaces use their own authentication (or are explicitly anonymous).
-/// S3 presigned URLs and POST policies are excluded in strict mode until their signing
-/// credentials and revocation checks are backed by IAM.
+/// S3 query URLs require IAM-backed signature verification; POST policies remain excluded.
 fn unsigned_public_request(
     service: &str,
     method: &Method,

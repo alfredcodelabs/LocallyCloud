@@ -20,6 +20,7 @@ use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use crate::error::CfnError;
 use crate::template::{ResolvedResource, ResourcePolicy};
 
+mod authorizer;
 mod custom_domains;
 mod custom_resources;
 pub(crate) use custom_resources::{is_custom_resource, validate_custom_resource};
@@ -27,6 +28,7 @@ mod ec2;
 mod ecs_alb;
 mod ecs_sg;
 pub(crate) use ecs_alb::validate_ecs_alb_property_names;
+mod firehose;
 mod kinesis;
 mod monitoring;
 mod scheduler;
@@ -62,6 +64,7 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::S3::Bucket",
     "AWS::S3::BucketPolicy",
     "AWS::Kinesis::Stream",
+    "AWS::KinesisFirehose::DeliveryStream",
     "AWS::SQS::Queue",
     "AWS::SQS::QueuePolicy",
     "AWS::DynamoDB::Table",
@@ -97,6 +100,7 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::EC2::VPCGatewayAttachment",
     "AWS::EC2::Route",
     "AWS::ApiGateway::RestApi",
+    "AWS::ApiGateway::Authorizer",
     "AWS::ApiGateway::Resource",
     "AWS::ApiGateway::Method",
     "AWS::ApiGateway::Deployment",
@@ -110,6 +114,7 @@ pub fn is_supported_resource_type(resource_type: &str) -> bool {
     SUPPORTED_RESOURCE_TYPES.contains(&resource_type) || is_custom_resource(resource_type)
 }
 
+#[derive(Clone)]
 pub struct Provisioner {
     registry: Weak<ServiceRegistry>,
     region: String,
@@ -200,6 +205,10 @@ impl Provisioner {
                 self.kinesis_stream(logical_id, stack_name, properties)
                     .await
             }
+            "AWS::KinesisFirehose::DeliveryStream" => {
+                self.firehose_stream(logical_id, stack_name, properties)
+                    .await
+            }
             "AWS::SQS::Queue" => self.sqs_queue(logical_id, stack_name, properties).await,
             "AWS::SQS::QueuePolicy" => {
                 self.sqs_queue_policy(logical_id, stack_name, properties)
@@ -266,6 +275,9 @@ impl Provisioner {
             }
             "AWS::EC2::Route" => self.ec2_route(logical_id, properties).await,
             "AWS::ApiGateway::RestApi" => self.apigateway_rest_api(logical_id, properties).await,
+            "AWS::ApiGateway::Authorizer" => {
+                self.apigateway_authorizer(logical_id, properties).await
+            }
             "AWS::ApiGateway::Resource" => self.apigateway_resource(logical_id, properties).await,
             "AWS::ApiGateway::Method" => self.apigateway_method(logical_id, properties).await,
             "AWS::ApiGateway::Deployment" => {
@@ -429,6 +441,12 @@ impl Provisioner {
                 self.update_kinesis_stream(logical_id, current, previous_properties, properties)
                     .await
             }
+            "AWS::KinesisFirehose::DeliveryStream" => {
+                if previous_properties != properties {
+                    return Err(CfnError::ResourceFailed(format!("AWS::KinesisFirehose::DeliveryStream configuration updates are not implemented for {logical_id}")));
+                }
+                Ok(current.clone())
+            }
             "AWS::DynamoDB::Table" => {
                 self.update_dynamodb_table(logical_id, current, previous_properties, properties)
                     .await
@@ -573,6 +591,15 @@ impl Provisioner {
             }
             "AWS::Lambda::EventSourceMapping" => {
                 self.update_lambda_event_source_mapping(
+                    logical_id,
+                    current,
+                    previous_properties,
+                    properties,
+                )
+                .await
+            }
+            "AWS::ApiGateway::Authorizer" => {
+                self.update_apigateway_authorizer(
                     logical_id,
                     current,
                     previous_properties,
@@ -819,6 +846,9 @@ impl Provisioner {
             "AWS::S3::Bucket" => self.delete_bucket(physical_id).await,
             "AWS::S3::BucketPolicy" => self.delete_bucket_policy(physical_id).await,
             "AWS::Kinesis::Stream" => self.delete_kinesis_stream(physical_id).await,
+            "AWS::KinesisFirehose::DeliveryStream" => {
+                self.delete_firehose_stream(physical_id).await
+            }
             "AWS::SQS::Queue" => self.delete_sqs_queue(physical_id).await,
             "AWS::SQS::QueuePolicy" => self.delete_sqs_queue_policy(properties).await,
             "AWS::DynamoDB::Table" => self.delete_dynamodb_table(physical_id).await,
@@ -879,6 +909,10 @@ impl Provisioner {
                     .await
             }
             "AWS::ApiGateway::RestApi" => self.delete_apigateway_rest_api(physical_id).await,
+            "AWS::ApiGateway::Authorizer" => {
+                self.delete_apigateway_authorizer(physical_id, properties)
+                    .await
+            }
             "AWS::ApiGateway::Resource" => {
                 self.delete_apigateway_resource(physical_id, properties)
                     .await
@@ -1473,6 +1507,9 @@ impl Provisioner {
         if let Some(value) = props.get("StreamSpecification") {
             body["StreamSpecification"] = dynamodb_stream_specification(logical_id, value)?;
         }
+        if let Some(value) = props.get("SSESpecification") {
+            body["SSESpecification"] = dynamodb_sse_specification(logical_id, value)?;
+        }
 
         self.call_aws_json(
             "dynamodb",
@@ -1559,6 +1596,18 @@ impl Provisioner {
             }
             created.push((*region).clone());
         }
+        if let Err(primary) = self
+            .configure_global_table_replicas(logical_id, &resolved.ref_value, None, props)
+            .await
+        {
+            return match self
+                .delete_dynamodb_global_table(&resolved.ref_value, props)
+                .await
+            {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(with_cleanup_failure(primary, cleanup)),
+            };
+        }
         self.describe_dynamodb_table(&resolved.ref_value, logical_id)
             .await
     }
@@ -1592,6 +1641,8 @@ impl Provisioner {
             self.dynamodb_replica_update(logical_id, &current.ref_value, region, true)
                 .await?;
         }
+        self.configure_global_table_replicas(logical_id, &current.ref_value, Some(previous), props)
+            .await?;
         self.describe_dynamodb_table(&current.ref_value, logical_id)
             .await
     }
@@ -1607,6 +1658,85 @@ impl Provisioner {
                 .await?;
         }
         self.delete_dynamodb_table(table_name).await
+    }
+
+    async fn configure_global_table_replicas(
+        &self,
+        logical: &str,
+        name: &str,
+        previous: Option<&Value>,
+        props: &Value,
+    ) -> Result<(), CfnError> {
+        let Some(entries) = props.get("Replicas").and_then(Value::as_array) else {
+            return Err(CfnError::Internal);
+        };
+        for entry in entries {
+            let region = required_property(entry, "Region", logical)?;
+            let old = previous
+                .and_then(|props| props.get("Replicas"))
+                .and_then(Value::as_array)
+                .and_then(|entries| {
+                    entries.iter().find(|entry| {
+                        entry.get("Region").and_then(Value::as_str) == Some(region.as_str())
+                    })
+                });
+            let mut regional = self.clone();
+            regional.region = region.clone();
+            let empty = json!([]);
+            let new_tags = entry.get("Tags").unwrap_or(&empty);
+            let old_tags = old.and_then(|entry| entry.get("Tags")).unwrap_or(&empty);
+            let arn = format!("arn:aws:dynamodb:{region}:{}:table/{name}", self.account);
+            if old_tags != new_tags {
+                let removed: Vec<_> = old_tags
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tag| tag.get("Key").and_then(Value::as_str))
+                    .filter(|key| {
+                        !new_tags
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|tag| tag.get("Key").and_then(Value::as_str) == Some(*key))
+                    })
+                    .collect();
+                if !removed.is_empty() {
+                    regional
+                        .call_aws_json(
+                            "dynamodb",
+                            "DynamoDB_20120810.UntagResource",
+                            json!({"ResourceArn":arn,"TagKeys":removed}),
+                            logical,
+                        )
+                        .await?;
+                }
+                if new_tags.as_array().is_some_and(|tags| !tags.is_empty()) {
+                    regional
+                        .call_aws_json(
+                            "dynamodb",
+                            "DynamoDB_20120810.TagResource",
+                            json!({"ResourceArn":arn,"Tags":new_tags}),
+                            logical,
+                        )
+                        .await?;
+                }
+            }
+            let new_pitr = entry.get("PointInTimeRecoverySpecification");
+            if old.and_then(|entry| entry.get("PointInTimeRecoverySpecification")) != new_pitr {
+                let specification = new_pitr
+                    .cloned()
+                    .unwrap_or_else(|| json!({"PointInTimeRecoveryEnabled":false}));
+                regional
+                    .call_aws_json(
+                        "dynamodb",
+                        "DynamoDB_20120810.UpdateContinuousBackups",
+                        json!({"TableName":name,"PointInTimeRecoverySpecification":specification}),
+                        logical,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn dynamodb_replica_update(
@@ -1648,6 +1778,8 @@ impl Provisioner {
                 "Replicas",
                 "StreamSpecification",
                 "MultiRegionConsistency",
+                "GlobalSecondaryIndexes",
+                "SSESpecification",
             ],
         )?;
         if props.get("BillingMode").and_then(Value::as_str) != Some("PAY_PER_REQUEST") {
@@ -1664,14 +1796,8 @@ impl Provisioner {
             )));
         }
         let replicas = self.global_table_replicas(logical_id, props)?;
-        if replicas.len() > 1
-            && props
-                .get("StreamSpecification")
-                .and_then(|v| v.get("StreamViewType"))
-                .and_then(Value::as_str)
-                != Some("NEW_AND_OLD_IMAGES")
-        {
-            return Err(CfnError::Validation(format!("AWS::DynamoDB::GlobalTable {logical_id} requires NEW_AND_OLD_IMAGES StreamSpecification for multiple replicas")));
+        if replicas.len() > 1 && props.get("StreamSpecification").is_none() {
+            return Err(CfnError::Validation(format!("AWS::DynamoDB::GlobalTable {logical_id} requires StreamSpecification for multiple replicas")));
         }
         let mut table = props.clone();
         table
@@ -1706,17 +1832,17 @@ impl Provisioner {
             })?;
         let mut regions = std::collections::BTreeSet::new();
         for entry in entries {
-            let object = entry.as_object().ok_or_else(|| {
-                CfnError::Validation(format!(
-                    "AWS::DynamoDB::GlobalTable {logical_id} requires Replica objects"
-                ))
-            })?;
-            if object.len() != 1 {
-                return Err(CfnError::Validation(format!(
-                    "AWS::DynamoDB::GlobalTable {logical_id} supports only Replica.Region"
-                )));
+            dynamodb_known_object_fields(
+                logical_id,
+                "Replica",
+                entry,
+                &["Region", "Tags", "PointInTimeRecoverySpecification"],
+            )?;
+            dynamodb_tags(logical_id, entry)?;
+            if let Some(specification) = entry.get("PointInTimeRecoverySpecification") {
+                validate_dynamodb_recovery(logical_id, specification)?;
             }
-            let region = object
+            let region = entry
                 .get("Region")
                 .and_then(Value::as_str)
                 .filter(|v| !v.is_empty())
@@ -3202,7 +3328,13 @@ impl Provisioner {
             logical_id,
             "AWS::Logs::LogGroup",
             props,
-            &["LogGroupName", "RetentionInDays", "Tags", "LogGroupClass"],
+            &[
+                "LogGroupName",
+                "RetentionInDays",
+                "Tags",
+                "LogGroupClass",
+                "KmsKeyId",
+            ],
         )?;
         let name = props
             .get("LogGroupName")
@@ -3210,6 +3342,9 @@ impl Provisioner {
             .map(str::to_string)
             .unwrap_or_else(|| generate_name(stack_name, logical_id, 512));
         let mut create = json!({"logGroupName": name});
+        if let Some(key) = props.get("KmsKeyId") {
+            create["kmsKeyId"] = key.clone();
+        }
         let tags = cfn_tags_object(props);
         if !tags.is_empty() {
             create["tags"] = Value::Object(tags);
@@ -3252,7 +3387,13 @@ impl Provisioner {
             logical_id,
             "AWS::Logs::LogGroup",
             props,
-            &["LogGroupName", "RetentionInDays", "Tags", "LogGroupClass"],
+            &[
+                "LogGroupName",
+                "RetentionInDays",
+                "Tags",
+                "LogGroupClass",
+                "KmsKeyId",
+            ],
         )?;
         ensure_only_supported_changes(
             logical_id,
@@ -5986,6 +6127,7 @@ fn validate_dynamodb_table_properties(logical_id: &str, props: &Value) -> Result
             "Tags",
             "TimeToLiveSpecification",
             "PointInTimeRecoverySpecification",
+            "SSESpecification",
         ],
     )?;
 
@@ -6109,22 +6251,65 @@ fn validate_dynamodb_table_properties(logical_id: &str, props: &Value) -> Result
         }
     }
     if let Some(specification) = props.get("PointInTimeRecoverySpecification") {
-        dynamodb_known_object_fields(
-            logical_id,
-            "PointInTimeRecoverySpecification",
-            specification,
-            &["PointInTimeRecoveryEnabled"],
-        )?;
-        if !specification
-            .get("PointInTimeRecoveryEnabled")
-            .is_some_and(Value::is_boolean)
-        {
-            return Err(CfnError::Validation(format!(
-                "AWS::DynamoDB::Table resource {logical_id} requires boolean PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled"
-            )));
-        }
+        validate_dynamodb_recovery(logical_id, specification)?;
     }
     dynamodb_tags(logical_id, props)?;
+    if let Some(specification) = props.get("SSESpecification") {
+        dynamodb_sse_specification(logical_id, specification)?;
+    }
+    Ok(())
+}
+
+fn dynamodb_sse_specification(logical: &str, specification: &Value) -> Result<Value, CfnError> {
+    dynamodb_known_object_fields(
+        logical,
+        "SSESpecification",
+        specification,
+        &["SSEEnabled", "SSEType"],
+    )?;
+    let enabled = specification
+        .get("SSEEnabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            CfnError::Validation(format!(
+                "{logical} SSESpecification.SSEEnabled must be boolean"
+            ))
+        })?;
+    let mut body = json!({"Enabled":enabled});
+    if let Some(kind) = specification.get("SSEType") {
+        if !matches!(kind.as_str(), Some("AES256" | "KMS")) {
+            return Err(CfnError::Validation(format!(
+                "{logical} SSEType must be AES256 or KMS"
+            )));
+        }
+        body["SSEType"] = kind.clone();
+    }
+    Ok(body)
+}
+
+fn validate_dynamodb_recovery(logical_id: &str, specification: &Value) -> Result<(), CfnError> {
+    dynamodb_known_object_fields(
+        logical_id,
+        "PointInTimeRecoverySpecification",
+        specification,
+        &["PointInTimeRecoveryEnabled", "RecoveryPeriodInDays"],
+    )?;
+    if !specification
+        .get("PointInTimeRecoveryEnabled")
+        .is_some_and(Value::is_boolean)
+    {
+        return Err(CfnError::Validation(format!(
+                "AWS::DynamoDB::Table resource {logical_id} requires boolean PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled"
+            )));
+    }
+    if specification
+        .get("RecoveryPeriodInDays")
+        .is_some_and(|value| !value.as_u64().is_some_and(|days| (1..=35).contains(&days)))
+    {
+        return Err(CfnError::Validation(format!(
+            "{logical_id} RecoveryPeriodInDays must be between 1 and 35"
+        )));
+    }
     Ok(())
 }
 
@@ -8663,7 +8848,7 @@ mod tests {
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "BillingMode": "PAY_PER_REQUEST",
-            "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+            "StreamSpecification": {"StreamViewType": "NEW_IMAGE"},
             "Replicas": [{"Region": "us-east-1"}, {"Region": "us-west-2"}]
         });
         assert!(provisioner.global_table_properties("Orders", &base).is_ok());

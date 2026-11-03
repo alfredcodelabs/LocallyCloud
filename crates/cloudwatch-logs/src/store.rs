@@ -1750,6 +1750,7 @@ mod tests {
                     arn: "arn:aws:logs:region:account:log-group:group".into(),
                     creation_time_ms: 1,
                     retention_days: None,
+                    kms_key_id: None,
                     class: LogClass::Standard,
                     tags: BTreeMap::new(),
                     streams: BTreeMap::new(),

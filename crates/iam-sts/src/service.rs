@@ -11,7 +11,8 @@ use axum::response::Response;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::{
     AuthorizationError, AuthorizationEvaluator, AuthorizationRequest, ResourcePolicyError,
-    ServiceRoleAuthorizationRequest, ServiceRoleCredentials, SigningCredentials,
+    S3PutPresignRequest, ServiceRoleAuthorizationRequest, ServiceRoleCredentials,
+    SigningCredentials,
 };
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 
@@ -130,6 +131,7 @@ impl IamStsState {
         request: &ServiceRequest,
         service: &str,
         action: &str,
+        resource: &str,
     ) -> Result<(), IamStsError> {
         let access_key_id = request
             .headers
@@ -170,9 +172,12 @@ impl IamStsState {
                 )),
             };
         }
-        let result =
-            self.enforcement
-                .check(self.mode, &identity, &format!("{service}:{action}"), "*");
+        let result = self.enforcement.check(
+            self.mode,
+            &identity,
+            &format!("{service}:{action}"),
+            resource,
+        );
         if let Err(IamStsError::AccessDenied(_)) = &result {
             tracing::info!(
                 request_id = %request.request_id,
@@ -183,9 +188,96 @@ impl IamStsState {
         }
         result
     }
+
+    fn iam_resource(
+        &self,
+        account: &str,
+        action: &str,
+        query: &QueryRequest,
+    ) -> Result<String, IamStsError> {
+        match action {
+            "CreateRole" => Ok(build_iam_arn(
+                account,
+                "role",
+                query.get("Path").unwrap_or("/"),
+                query.require("RoleName")?,
+            )),
+            "GetRole"
+            | "UpdateRole"
+            | "UpdateAssumeRolePolicy"
+            | "TagRole"
+            | "UntagRole"
+            | "ListRoleTags"
+            | "DeleteRole"
+            | "AttachRolePolicy"
+            | "DetachRolePolicy"
+            | "ListAttachedRolePolicies"
+            | "PutRolePolicy"
+            | "GetRolePolicy"
+            | "ListRolePolicies"
+            | "DeleteRolePolicy"
+            | "PutRolePermissionsBoundary"
+            | "DeleteRolePermissionsBoundary"
+            | "ListInstanceProfilesForRole" => {
+                let name = query.require("RoleName")?;
+                Ok(self
+                    .store
+                    .get_role(account, name)
+                    .map(|role| role.arn)
+                    .unwrap_or_else(|| build_iam_arn(account, "role", "/", name)))
+            }
+            _ => Ok("*".into()),
+        }
+    }
+}
+
+impl IamStsState {
+    fn signing_credentials(&self, account: &str, access_key: &str) -> Option<SigningCredentials> {
+        if let Some(root) = self.store.root_for_key(account, access_key) {
+            return Some(SigningCredentials {
+                secret_access_key: root.secret_access_key,
+                session_token: None,
+            });
+        }
+
+        if let Some(session) = self.sessions.resolve(access_key) {
+            session.root_provenance(account, &self.store).ok()?;
+            return (session.account == account).then_some(SigningCredentials {
+                secret_access_key: session.secret_access_key,
+                session_token: Some(session.session_token),
+            });
+        }
+        self.store.list_users(account).into_iter().find_map(|user| {
+            user.access_keys.into_iter().find_map(|key| {
+                (key.access_key_id == access_key && key.status == "Active").then_some(
+                    SigningCredentials {
+                        secret_access_key: key.secret_access_key,
+                        session_token: None,
+                    },
+                )
+            })
+        })
+    }
 }
 
 impl AuthorizationEvaluator for IamStsState {
+    fn presign_s3_put(&self, request: S3PutPresignRequest) -> Result<String, AuthorizationError> {
+        if self.credential_account(&request.access_key)?.as_deref() != Some(&request.account) {
+            return Err(AuthorizationError::Denied);
+        }
+        let credentials = self
+            .signing_credentials(&request.account, &request.access_key)
+            .ok_or(AuthorizationError::Denied)?;
+        locallycloud_core::integration::sigv4::presign_s3_put(
+            &request.endpoint,
+            &request.path,
+            &request.region,
+            &request.access_key,
+            &credentials,
+            request.expires,
+        )
+        .ok_or(AuthorizationError::InvalidRequest)
+    }
     fn credential_account(
         &self,
         access_key_id: &str,
@@ -428,32 +520,7 @@ impl AuthorizationEvaluator for IamStsState {
             body,
             region,
             service,
-            |access_key| {
-                if let Some(root) = self.store.root_for_key(account, access_key) {
-                    return Some(SigningCredentials {
-                        secret_access_key: root.secret_access_key,
-                        session_token: None,
-                    });
-                }
-
-                if let Some(session) = self.sessions.resolve(access_key) {
-                    session.root_provenance(account, &self.store).ok()?;
-                    return (session.account == account).then_some(SigningCredentials {
-                        secret_access_key: session.secret_access_key,
-                        session_token: Some(session.session_token),
-                    });
-                }
-                self.store.list_users(account).into_iter().find_map(|user| {
-                    user.access_keys.into_iter().find_map(|key| {
-                        (key.access_key_id == access_key && key.status == "Active").then_some(
-                            SigningCredentials {
-                                secret_access_key: key.secret_access_key,
-                                session_token: None,
-                            },
-                        )
-                    })
-                })
-            },
+            |access_key| self.signing_credentials(account, access_key),
         )
     }
 
@@ -679,7 +746,11 @@ impl NativeHandler for IamHandler {
             }
         };
         tracing::info!(request_id = %request.request_id, service = "iam", %action, "iam request");
-        if let Err(e) = self.state.enforce(&request, "iam", &action) {
+        let resource = match self.state.iam_resource(&request.account_id, &action, &q) {
+            Ok(resource) => resource,
+            Err(error) => return error.into_response(&request.request_id, IAM_XMLNS),
+        };
+        if let Err(e) = self.state.enforce(&request, "iam", &action, &resource) {
             return e.into_response(&request.request_id, IAM_XMLNS);
         }
         let result = if action.starts_with("Get")
@@ -726,7 +797,7 @@ impl NativeHandler for StsHandler {
         };
         let caller_key = access_key_id_from_auth(&request);
         tracing::info!(request_id = %request.request_id, service = "sts", %action, "sts request");
-        if let Err(e) = self.state.enforce(&request, "sts", &action) {
+        if let Err(e) = self.state.enforce(&request, "sts", &action, "*") {
             return e.into_response(&request.request_id, STS_XMLNS);
         }
         let state = self.state.clone();
@@ -1225,6 +1296,95 @@ mod tests {
     use http::{HeaderMap, Method};
 
     #[test]
+    fn role_operations_enforce_the_real_target_arn_and_path() {
+        let state = IamStsState::with_mode(
+            Arc::new(IamStore::new()),
+            Arc::new(SessionStore::new()),
+            EnforcementMode::Strict,
+        );
+        let account = "000000000000";
+        let key = "AKIA1234567890123456";
+        seed_bootstrap_user(
+            &state.store,
+            account,
+            BootstrapCredentials {
+                access_key_id: key.into(),
+                secret_access_key: "a".repeat(40),
+            },
+        );
+        state.store.update_user(account, "locallycloud-bootstrap", |user| {
+            user.inline_policies.clear();
+            user.inline_policies.insert("scoped-roles".into(), r#"{"Statement":{"Effect":"Allow","Action":["iam:CreateRole","iam:ListAttachedRolePolicies","iam:AttachRolePolicy"],"Resource":"arn:aws:iam::000000000000:role/team/*"}}"#.into());
+        });
+        let role = QueryRequest::parse(br#"RoleName=worker&Path=%2Fteam%2F&AssumeRolePolicyDocument={"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#);
+        iam::create_role(&state.store, account, &role).unwrap();
+        let mut req = request("Action=ListAttachedRolePolicies&RoleName=worker");
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            format!("AWS4-HMAC-SHA256 Credential={key}/20260101/us-east-1/iam/aws4_request")
+                .parse()
+                .unwrap(),
+        );
+        for action in ["CreateRole", "ListAttachedRolePolicies", "AttachRolePolicy"] {
+            let query = if action == "CreateRole" {
+                role.clone()
+            } else {
+                QueryRequest::parse(b"RoleName=worker&Path=%2Fignored%2F")
+            };
+            let resource = state.iam_resource(account, action, &query).unwrap();
+            assert_eq!(resource, "arn:aws:iam::000000000000:role/team/worker");
+            assert!(state.enforce(&req, "iam", action, &resource).is_ok());
+            assert!(state.enforce(&req, "iam", action, "*").is_err());
+            assert!(state
+                .enforce(&req, "iam", action, "arn:aws:iam::000000000000:role/other")
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn role_scoped_deny_is_enforced_for_an_administrator() {
+        let state = IamStsState::with_mode(
+            Arc::new(IamStore::new()),
+            Arc::new(SessionStore::new()),
+            EnforcementMode::Strict,
+        );
+        let account = "000000000000";
+        let key = "AKIA1234567890123456";
+        seed_bootstrap_user(
+            &state.store,
+            account,
+            BootstrapCredentials {
+                access_key_id: key.into(),
+                secret_access_key: "a".repeat(40),
+            },
+        );
+        state.store.update_user(account, "locallycloud-bootstrap", |user| {
+            user.inline_policies.insert("protected-role".into(), r#"{"Statement":{"Effect":"Deny","Action":"iam:AttachRolePolicy","Resource":"arn:aws:iam::000000000000:role/protected"}}"#.into());
+        });
+        let mut req = request("Action=AttachRolePolicy&RoleName=protected");
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            format!("AWS4-HMAC-SHA256 Credential={key}/20260101/us-east-1/iam/aws4_request")
+                .parse()
+                .unwrap(),
+        );
+        let resource = state
+            .iam_resource(account, "AttachRolePolicy", &QueryRequest::parse(&req.body))
+            .unwrap();
+        assert!(state
+            .enforce(&req, "iam", "AttachRolePolicy", &resource)
+            .is_err());
+        assert!(state
+            .enforce(
+                &req,
+                "iam",
+                "AttachRolePolicy",
+                "arn:aws:iam::000000000000:role/other"
+            )
+            .is_ok());
+    }
+
+    #[test]
     fn registered_sts_actions_route_without_a_credential_scope() {
         let registry = ServiceRegistry::with_known_services();
         register(&registry);
@@ -1331,7 +1491,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        assert!(state.enforce(&req, "sts", "GetSessionToken").is_ok());
+        assert!(state.enforce(&req, "sts", "GetSessionToken", "*").is_ok());
         let result = dispatch_sts(
             &state,
             "000000000000",

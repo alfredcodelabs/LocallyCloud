@@ -1160,3 +1160,94 @@ async fn strict_unmodeled_acl_upload_is_explicit_and_leaves_no_object() {
         404
     );
 }
+
+#[tokio::test]
+async fn conditional_write_policy_enforces_headers_but_allows_multipart_setup() {
+    let fixture = Fixture::new().await;
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Sid":"DenyUnconditionalRawWrite","Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::policy-dest/raw/*","Condition":{"Null":{"s3:if-none-match":"true"},"Bool":{"s3:ObjectCreationOperation":"true"}}}]}"#;
+    let result = fixture
+        .s3
+        .handle(request(
+            Method::PUT,
+            "/policy-dest?policy",
+            policy,
+            OWNER,
+            Some(&fixture.admin),
+        ))
+        .await;
+    assert_eq!(result.status(), 204, "{}", body(result).await);
+    let denied = fixture
+        .s3
+        .handle(request(
+            Method::PUT,
+            "/policy-dest/raw/key",
+            "first",
+            OWNER,
+            Some(&fixture.admin),
+        ))
+        .await;
+    assert_eq!(denied.status(), 403);
+    for expected in [200, 412] {
+        let mut put = request(
+            Method::PUT,
+            "/policy-dest/raw/key",
+            "first",
+            OWNER,
+            Some(&fixture.admin),
+        );
+        put.headers
+            .insert("if-none-match", HeaderValue::from_static("*"));
+        assert_eq!(fixture.s3.handle(put).await.status(), expected);
+    }
+    let init = fixture
+        .s3
+        .handle(request(
+            Method::POST,
+            "/policy-dest/raw/multipart?uploads",
+            "",
+            OWNER,
+            Some(&fixture.admin),
+        ))
+        .await;
+    assert_eq!(init.status(), 200);
+    let id = xml(&body(init).await, "UploadId");
+    let part = fixture
+        .s3
+        .handle(request(
+            Method::PUT,
+            &format!("/policy-dest/raw/multipart?uploadId={id}&partNumber=1"),
+            "part",
+            OWNER,
+            Some(&fixture.admin),
+        ))
+        .await;
+    assert_eq!(part.status(), 200);
+    let etag = part.headers()["etag"].to_str().unwrap();
+    let completion = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>");
+    let path = format!("/policy-dest/raw/multipart?uploadId={id}");
+    assert_eq!(
+        fixture
+            .s3
+            .handle(request(
+                Method::POST,
+                &path,
+                &completion,
+                OWNER,
+                Some(&fixture.admin)
+            ))
+            .await
+            .status(),
+        403
+    );
+    let mut complete = request(
+        Method::POST,
+        &path,
+        &completion,
+        OWNER,
+        Some(&fixture.admin),
+    );
+    complete
+        .headers
+        .insert("if-none-match", HeaderValue::from_static("*"));
+    assert_eq!(fixture.s3.handle(complete).await.status(), 200);
+}

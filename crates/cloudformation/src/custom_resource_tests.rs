@@ -30,6 +30,15 @@ impl NativeHandler for Provider {
         } else {
             &mode
         };
+        if mode == "ComputeUnavailable" {
+            return Response::builder()
+                .status(501)
+                .body(Body::from(
+                    json!({"Message":"Lambda invocation is disabled: install crun or youki"})
+                        .to_string(),
+                ))
+                .unwrap();
+        }
         if mode != "Timeout" {
             let mut response = json!({
                 "Status": if mode == "Failed" { "FAILED" } else { "SUCCESS" },
@@ -178,7 +187,7 @@ async fn custom_resource_stack_lifecycle_and_replacement_use_provider_identity()
 
 #[tokio::test]
 async fn failed_missing_and_mismatched_provider_callbacks_fail_stack() {
-    for mode in ["Failed", "Timeout", "Mismatch"] {
+    for mode in ["Failed", "Timeout", "Mismatch", "ComputeUnavailable"] {
         let (_registry, handler, _requests, _control) = fixture();
         operation(
             &handler,
@@ -196,6 +205,12 @@ async fn failed_missing_and_mismatched_provider_callbacks_fail_stack() {
             .iter()
             .any(|e| e.logical_id == "Role" && e.status == "CREATE_FAILED"));
         assert!(!stack.events.iter().any(|e| e.status == "CREATE_COMPLETE"));
+        if mode == "ComputeUnavailable" {
+            assert!(stack.events.iter().any(|event| event
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("install crun or youki"))));
+        }
     }
 }
 

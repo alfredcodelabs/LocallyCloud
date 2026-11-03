@@ -8,6 +8,7 @@ pub mod error;
 pub mod expression;
 pub mod ops;
 pub mod partiql;
+mod recovery;
 pub mod service;
 pub mod store;
 pub mod streams;

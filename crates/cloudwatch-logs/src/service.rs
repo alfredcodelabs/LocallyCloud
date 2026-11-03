@@ -817,6 +817,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_and_describe_preserve_foreign_kms_key_configuration() {
+        let handler = handler();
+        let arn = "arn:aws:kms:us-east-1:111111111111:key/external";
+        let (status, _, body) = response_with(
+            &handler,
+            request(
+                "CreateLogGroup",
+                json!({"logGroupName":"encrypted", "kmsKeyId":arn}),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, _, body) = response_with(
+            &handler,
+            request(
+                "DescribeLogGroups",
+                json!({"logGroupNamePrefix":"encrypted"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["logGroups"][0]["kmsKeyId"], arn);
+    }
+
+    #[tokio::test]
     async fn scope_comes_only_from_service_request() {
         let handler = handler();
         let mut first = request("CreateLogGroup", json!({ "logGroupName": "shared" }));

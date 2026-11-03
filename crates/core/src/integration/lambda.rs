@@ -106,6 +106,11 @@ pub enum LambdaInternalError {
 
 #[async_trait]
 pub trait LambdaInternalApi: Send + Sync {
+    /// Registration may expose only Lambda's control plane when compute is unavailable.
+    fn unavailable_reason(&self) -> Option<&'static str> {
+        None
+    }
+
     fn version(&self) -> u16 {
         LAMBDA_INTERNAL_API_VERSION
     }

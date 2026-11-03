@@ -160,6 +160,9 @@ pub(crate) fn parse(document: &str) -> Result<Vec<ResourceStatement>, ResourcePo
                             | "s3:prefix"
                             | "s3:delimiter"
                             | "s3:max-keys"
+                            | "s3:if-none-match"
+                            | "s3:if-match"
+                            | "s3:objectcreationoperation"
                     ) {
                         return Err(ResourcePolicyError::Unsupported(format!(
                             "condition key {key}"
