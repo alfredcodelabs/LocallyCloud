@@ -23,6 +23,8 @@ use locallycloud_state::{StateCipher, StateDb};
 pub use persistence::{register_with_state_and_instance_runtime, Ec2StateError};
 use persistence::{Change, Persistence};
 mod authorization;
+mod security_group_tags;
+use security_group_tags::tags_xml;
 mod endpoints;
 pub mod guest_dns;
 mod nat;
@@ -76,6 +78,8 @@ struct IngressRule {
     from_port: Option<u16>,
     to_port: Option<u16>,
     peer: RulePeer,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -86,6 +90,8 @@ struct SecurityGroup {
     description: String,
     owner: String,
     is_default: bool,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
     ingress: Vec<IngressRule>,
     egress: Vec<IngressRule>,
     #[serde(skip)]
@@ -889,6 +895,7 @@ impl Ec2Handler {
                     description: "default VPC security group".into(),
                     owner: req.account_id.clone(),
                     is_default: true,
+                    tags: BTreeMap::new(),
                     ingress: Vec::new(),
                     egress: default_egress(),
                     guard: Arc::new(()),
@@ -1232,14 +1239,7 @@ impl Ec2Handler {
         region: &str,
         input: &Input,
     ) -> Result<String, Ec2Error> {
-        input.allow(&[
-            "Action",
-            "Version",
-            "DryRun",
-            "VpcId",
-            "GroupName",
-            "GroupDescription",
-        ])?;
+        let tags = input.security_group_tags()?;
         input.dry_run()?;
         let vpc_id = input.required("VpcId")?;
         let name = input.required("GroupName")?;
@@ -1281,14 +1281,16 @@ impl Ec2Handler {
             description: description.into(),
             owner: account.into(),
             is_default: false,
+            tags,
             ingress: Vec::new(),
             egress: default_egress(),
             guard: Arc::new(()),
         };
+        let tag_set = tags_xml(&group.tags);
         self.persist(&key, &[Change::put("sg", &id, &group)?])?;
         scope.security_groups.insert(id.clone(), group);
 
-        Ok(format!("<return>true</return><groupId>{}</groupId><securityGroupArn>arn:aws:ec2:{}:{}:security-group/{}</securityGroupArn>", escape(&id), escape(region), escape(account), escape(&id)))
+        Ok(format!("<return>true</return><groupId>{}</groupId><securityGroupArn>arn:aws:ec2:{}:{}:security-group/{}</securityGroupArn>{tag_set}", escape(&id), escape(region), escape(account), escape(&id)))
     }
 
     fn describe_security_groups(
@@ -3231,6 +3233,8 @@ impl Input {
             "IpPermissions.1.FromPort",
             "IpPermissions.1.ToPort",
             "IpPermissions.1.IpRanges.1.CidrIp",
+            "IpPermissions.1.IpRanges.1.Description",
+            "IpPermissions.1.Groups.1.Description",
             "IpPermissions.1.Groups.1.GroupId",
             "IpPermissions.1.Groups.1.UserId",
         ];
@@ -3242,7 +3246,7 @@ impl Input {
         Ok(())
     }
 
-    fn ingress_rule(&self) -> Result<(String, Option<u16>, Option<u16>, RulePeer), Ec2Error> {
+    fn ingress_rule(&self) -> Result<IngressRule, Ec2Error> {
         let nested = self
             .fields
             .keys()
@@ -3318,7 +3322,36 @@ impl Input {
                 "UserId requires a security group peer",
             ));
         }
-        Ok((protocol.into(), from_port, to_port, peer))
+        let description_key = match &peer {
+            RulePeer::Cidr(_) => "IpPermissions.1.IpRanges.1.Description",
+            RulePeer::Group(_) => "IpPermissions.1.Groups.1.Description",
+        };
+        let other_key = match &peer {
+            RulePeer::Cidr(_) => "IpPermissions.1.Groups.1.Description",
+            RulePeer::Group(_) => "IpPermissions.1.IpRanges.1.Description",
+        };
+        if self.one(other_key)?.is_some() {
+            return Err(Ec2Error::new(
+                "InvalidParameterValue",
+                "Description must match the rule peer",
+            ));
+        }
+        let description = self.one(description_key)?.map(str::to_owned);
+        if description.as_ref().is_some_and(|value| {
+            value.len() > 255 || (!value.is_empty() && !valid_group_text(value))
+        }) {
+            return Err(Ec2Error::new(
+                "InvalidParameterValue",
+                "Invalid security group rule description",
+            ));
+        }
+        Ok(IngressRule {
+            protocol: protocol.into(),
+            from_port,
+            to_port,
+            peer,
+            description,
+        })
     }
 
     fn eni_idempotency_params(&self) -> BTreeMap<String, String> {
@@ -3393,8 +3426,8 @@ fn group_xml(group: &SecurityGroup) -> String {
         .iter()
         .map(|rule| permission_xml(rule, &group.owner))
         .collect::<String>();
-    format!("<ownerId>{}</ownerId><groupId>{}</groupId><groupName>{}</groupName><groupDescription>{}</groupDescription><vpcId>{}</vpcId><ipPermissions>{ingress}</ipPermissions><ipPermissionsEgress>{egress}</ipPermissionsEgress><tagSet/>",
-        escape(&group.owner), escape(&group.id), escape(&group.name), escape(&group.description), escape(&group.vpc_id))
+    format!("<ownerId>{}</ownerId><groupId>{}</groupId><groupName>{}</groupName><groupDescription>{}</groupDescription><vpcId>{}</vpcId><ipPermissions>{ingress}</ipPermissions><ipPermissionsEgress>{egress}</ipPermissionsEgress>{}",
+        escape(&group.owner), escape(&group.id), escape(&group.name), escape(&group.description), escape(&group.vpc_id), tags_xml(&group.tags))
 }
 
 fn eni_xml(eni: &NetworkInterface, scope: &ScopeState, _region: &str) -> String {

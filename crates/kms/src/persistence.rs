@@ -29,6 +29,8 @@ struct SavedKey {
     explicit_policy: bool,
     material_version: u32,
     sealed_material: Vec<u8>,
+    #[serde(default)]
+    tags: std::collections::BTreeMap<String, String>,
 }
 
 impl KmsPersistence {
@@ -115,6 +117,7 @@ impl KmsPersistence {
                     explicit_policy: saved.explicit_policy,
                     material_version: saved.material_version,
                     material,
+                    tags: saved.tags,
                 },
             ))
         })
@@ -232,6 +235,7 @@ impl KmsPersistence {
             explicit_policy: key.explicit_policy,
             material_version: key.material_version,
             sealed_material: self.seal_material(scope, &key.key_id, &key.material)?,
+            tags: key.tags.clone(),
         };
         let bytes = serde_json::to_vec(&saved).map_err(|_| KmsError::Internal)?;
         conn.execute("INSERT INTO kms_keys(account,region,key_id,record) VALUES (?1,?2,?3,?4) ON CONFLICT(account,region,key_id) DO UPDATE SET record=excluded.record", params![scope.account_id, scope.region, key.key_id, bytes]).map_err(|_| KmsError::Internal)?;
@@ -371,6 +375,7 @@ mod tests {
             explicit_policy: false,
             material_version: 1,
             material: SecretMaterial::new([0x5a; 32]),
+            tags: std::collections::BTreeMap::from([("team".into(), "accounting".into())]),
         };
         let first = KmsPersistence::with_master(db.clone(), SecretMaterial::new([0x11; 32]))
             .expect("create");
@@ -381,6 +386,7 @@ mod tests {
         let keys = reopened.load_keys().expect("recover");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1.material.expose(), &[0x5a; 32]);
+        assert_eq!(keys[0].1.tags, record.tags);
         let bytes: Vec<u8> = db
             .connection()
             .expect("db")

@@ -72,17 +72,18 @@ impl KmsHandler {
         body: &serde_json::Map<String, Value>,
         operation: &str,
     ) -> Result<(), KmsError> {
-        let registry = self.registry.upgrade().ok_or(KmsError::AccessDenied)?;
-        let dispatcher = registry
-            .internal_dispatcher()
-            .ok_or(KmsError::AccessDenied)?;
         let key_id = body
             .get("KeyId")
             .and_then(Value::as_str)
             .ok_or(KmsError::Validation)?;
         if matches!(
             operation,
-            "EnableKey" | "DisableKey" | "ScheduleKeyDeletion"
+            "EnableKey"
+                | "DisableKey"
+                | "ScheduleKeyDeletion"
+                | "TagResource"
+                | "UntagResource"
+                | "ListResourceTags"
         ) && (key_id.starts_with("alias/") || key_id.contains(":alias/"))
         {
             return Err(KmsError::Validation);
@@ -90,6 +91,21 @@ impl KmsHandler {
         let (resource, policy, explicit_policy) =
             self.service
                 .key_admin_policy(key_id, &request.account_id, &request.region)?;
+        self.authorize_key_policy(request, operation, resource, policy, explicit_policy)
+    }
+
+    fn authorize_key_policy(
+        &self,
+        request: &ServiceRequest,
+        operation: &str,
+        resource: String,
+        policy: crate::policy::KeyPolicy,
+        explicit_policy: bool,
+    ) -> Result<(), KmsError> {
+        let registry = self.registry.upgrade().ok_or(KmsError::AccessDenied)?;
+        let dispatcher = registry
+            .internal_dispatcher()
+            .ok_or(KmsError::AccessDenied)?;
         let authorization = request
             .headers
             .get(http::header::AUTHORIZATION)
@@ -252,9 +268,30 @@ impl NativeHandler for KmsHandler {
                 Some(operation) => match serde_json::from_slice::<Value>(&request.body) {
                     Err(_) => Err(KmsError::Serialization.into_aws()),
                     Ok(Value::Object(body)) => {
-                        let authorization = if matches!(
+                        let planned_key_id = (operation == "CreateKey"
+                            && body
+                                .get("Tags")
+                                .and_then(Value::as_array)
+                                .is_some_and(|tags| !tags.is_empty()))
+                        .then(|| uuid::Uuid::new_v4().to_string());
+                        let authorization = if let Some(id) = &planned_key_id {
+                            self.authorize_key_policy(
+                                &request,
+                                "TagResource",
+                                crate::model::Scope::new(&request.account_id, &request.region)
+                                    .key_arn(id),
+                                crate::policy::KeyPolicy::default_for(&request.account_id),
+                                false,
+                            )
+                        } else if matches!(
                             operation,
-                            "PutKeyPolicy" | "DisableKey" | "EnableKey" | "ScheduleKeyDeletion"
+                            "PutKeyPolicy"
+                                | "DisableKey"
+                                | "EnableKey"
+                                | "ScheduleKeyDeletion"
+                                | "TagResource"
+                                | "UntagResource"
+                                | "ListResourceTags"
                         ) {
                             self.authorize_key_admin(&request, &body, operation)
                         } else {
@@ -267,8 +304,13 @@ impl NativeHandler for KmsHandler {
                                 let operation = operation.to_owned();
                                 let account = request.account_id.clone();
                                 let region = request.region.clone();
-                                match tokio::task::spawn_blocking(move || {
-                                    service.dispatch(&operation, &body, &account, &region)
+                                match tokio::task::spawn_blocking(move || match planned_key_id {
+                                    Some(id) => service.create_key(
+                                        &body,
+                                        &crate::model::Scope::new(&account, &region),
+                                        Some(id),
+                                    ),
+                                    None => service.dispatch(&operation, &body, &account, &region),
                                 })
                                 .await
                                 {
@@ -294,7 +336,12 @@ impl NativeHandler for KmsHandler {
                             .headers
                             .get("x-amz-target")
                             .and_then(|target| target.to_str().ok()),
-                        Some("TrentService.DisableKey" | "TrentService.EnableKey")
+                        Some(
+                            "TrentService.DisableKey"
+                                | "TrentService.EnableKey"
+                                | "TrentService.TagResource"
+                                | "TrentService.UntagResource"
+                        )
                     ) {
                         Body::empty()
                     } else {
@@ -315,6 +362,8 @@ fn map_internal_error(error: KmsError) -> KmsInternalError {
         KmsError::Serialization
         | KmsError::Validation
         | KmsError::InvalidAliasName
+        | KmsError::InvalidMarker
+        | KmsError::TagLimitExceeded
         | KmsError::LimitExceeded
         | KmsError::AlreadyExists
         | KmsError::Unsupported => KmsInternalError::InvalidRequest,
@@ -460,22 +509,64 @@ mod tests {
                 "x-amz-target",
                 format!("TrentService.{action}").parse().unwrap(),
             );
-            handler
+            let mut body = serde_json::json!({"KeyId":key});
+            match action {
+                "CreateKey" => {
+                    body = serde_json::json!({"Tags":[{"TagKey":"team","TagValue":"accounting"}]})
+                }
+                "TagResource" => {
+                    body["Tags"] = serde_json::json!([{"TagKey":"team","TagValue":"accounting"}])
+                }
+                "UntagResource" => body["TagKeys"] = serde_json::json!(["team"]),
+                _ => {}
+            }
+            let response = handler
                 .handle(ServiceRequest {
                     method: http::Method::POST,
                     uri: "/".parse().unwrap(),
                     headers,
-                    body: bytes::Bytes::from(serde_json::json!({"KeyId":key}).to_string()),
+                    body: bytes::Bytes::from(body.to_string()),
                     region: "us-east-1".into(),
                     account_id: "000000000000".into(),
                     request_id: "admin-test".into(),
                 })
-                .await
-                .status()
+                .await;
+            let status = response.status();
+            if status == 200 && matches!(action, "TagResource" | "UntagResource") {
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/x-amz-json-1.1"
+                );
+                assert_eq!(response.headers()["x-amzn-RequestId"], "admin-test");
+                assert!(axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+            status
         }
         // The default account grant delegates to actual IAM permission.
+        assert_eq!(admin_call(&handler, key, "CreateKey").await, 400);
+        assert_eq!(
+            handler
+                .service
+                .dispatch(
+                    "ListKeys",
+                    serde_json::json!({}).as_object().unwrap(),
+                    "000000000000",
+                    "us-east-1"
+                )
+                .unwrap()["Keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
         assert_eq!(admin_call(&handler, key, "ScheduleKeyDeletion").await, 400);
+        for action in ["TagResource", "UntagResource", "ListResourceTags"] {
+            assert_eq!(admin_call(&handler, key, action).await, 400);
+        }
         assert_eq!(
             handler
                 .service
@@ -489,6 +580,10 @@ mod tests {
             "Enabled"
         );
         admin.allowed.store(true, Ordering::Relaxed);
+        assert_eq!(admin_call(&handler, key, "CreateKey").await, 200);
+        for action in ["TagResource", "ListResourceTags", "UntagResource"] {
+            assert_eq!(admin_call(&handler, key, action).await, 200);
+        }
         assert_eq!(admin_call(&handler, key, "DisableKey").await, 200);
         let policy = |principal: &str, deny: bool| {
             serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":principal},"Action":"kms:*","Resource":"*"},{"Effect":if deny {"Deny"} else {"Allow"},"Principal":{"AWS":principal},"Action":"kms:DisableKey","Resource":"*"}]}).to_string()
@@ -502,6 +597,9 @@ mod tests {
         assert_eq!(admin_call(&handler, key, "EnableKey").await, 200);
         // Explicit identity Deny and boundaries dominate a direct grant.
         admin.denied.store(true, Ordering::Relaxed);
+        for action in ["TagResource", "UntagResource", "ListResourceTags"] {
+            assert_eq!(admin_call(&handler, key, action).await, 400);
+        }
         assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
         assert_eq!(admin_call(&handler, key, "ScheduleKeyDeletion").await, 400);
         admin.denied.store(false, Ordering::Relaxed);

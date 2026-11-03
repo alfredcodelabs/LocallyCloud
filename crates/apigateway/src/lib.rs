@@ -12,6 +12,7 @@ pub mod logging;
 pub mod proxy_event;
 pub mod service;
 pub mod store;
+mod tags;
 pub mod v1;
 pub mod v2;
 pub mod vtl;

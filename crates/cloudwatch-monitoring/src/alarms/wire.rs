@@ -9,6 +9,7 @@ pub(crate) fn query_json(query: &QueryRequest) -> Result<Value, MonitoringError>
         if key.contains(".member.") {
             if [
                 "Dimensions",
+                "Metrics",
                 "Tags",
                 "TagKeys",
                 "AlarmNames",
@@ -74,6 +75,90 @@ pub(crate) fn query_json(query: &QueryRequest) -> Result<Value, MonitoringError>
                 .map(|(name, value)| json!({"Name":name,"Value":value}))
                 .collect::<Vec<_>>()),
         );
+    }
+    if query.has_prefix("Metrics.member.") {
+        let mapped = QueryRequest {
+            params: query
+                .params
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix("Metrics.member.")
+                        .map(|suffix| (format!("MetricDataQueries.member.{suffix}"), value.clone()))
+                })
+                .collect(),
+        };
+        let parsed = crate::metric_data::query_body(&mapped)?;
+        let metrics = parsed
+            .get("MetricDataQueries")
+            .cloned()
+            .ok_or_else(|| invalid("Invalid Metrics queries"))?;
+        // Reject malformed/unknown flattened fields instead of silently discarding them.
+        for key in mapped.params.keys() {
+            let suffix = key
+                .strip_prefix("MetricDataQueries.member.")
+                .unwrap_or_default();
+            let (_, field) = suffix
+                .split_once('.')
+                .ok_or_else(|| invalid("Invalid Metrics member"))?;
+            let known = matches!(
+                field,
+                "Id" | "Label"
+                    | "Expression"
+                    | "ReturnData"
+                    | "AccountId"
+                    | "MetricStat.Period"
+                    | "MetricStat.Stat"
+                    | "MetricStat.Unit"
+                    | "MetricStat.Metric.Namespace"
+                    | "MetricStat.Metric.MetricName"
+            ) || field
+                .strip_prefix("MetricStat.Metric.Dimensions.member.")
+                .is_some_and(|dimension| {
+                    dimension.split_once('.').is_some_and(|(index, field)| {
+                        index.parse::<usize>().is_ok_and(|n| n > 0 && n <= 30)
+                            && matches!(field, "Name" | "Value")
+                    })
+                });
+            if !known {
+                return Err(invalid("Unsupported Metrics query field"));
+            }
+            let index = suffix
+                .split('.')
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .ok_or_else(|| invalid("Invalid Metrics index"))?;
+            if index == 0
+                || index > metrics.as_array().map_or(0, Vec::len)
+                || index > 20
+                || !suffix.starts_with(&format!("{index}."))
+            {
+                return Err(invalid("Metrics must use contiguous indices 1..20"));
+            }
+            if let Some(dimension) = field.strip_prefix("MetricStat.Metric.Dimensions.member.") {
+                let (dimension_index, _) = dimension
+                    .split_once('.')
+                    .ok_or_else(|| invalid("Invalid metric dimension"))?;
+                let dimension_index = dimension_index
+                    .parse::<usize>()
+                    .map_err(|_| invalid("Invalid metric dimension index"))?;
+                let count = metrics
+                    .get(index - 1)
+                    .and_then(|query| query.get("MetricStat"))
+                    .and_then(|stat| stat.get("Metric"))
+                    .and_then(|metric| metric.get("Dimensions"))
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                if dimension_index == 0
+                    || dimension_index > count
+                    || !dimension.starts_with(&format!("{dimension_index}."))
+                {
+                    return Err(invalid(
+                        "Metric dimensions must use contiguous indices 1..30",
+                    ));
+                }
+            }
+        }
+        body.insert("Metrics".into(), metrics);
     }
     Ok(body.into())
 }

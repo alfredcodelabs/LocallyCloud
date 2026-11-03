@@ -254,7 +254,7 @@ pub async fn create_rest_api(ctx: &Ctx<'_>, body: &Value) -> Out {
         "binaryMediaTypes": body.get("binaryMediaTypes").cloned().unwrap_or(json!([])),
         "minimumCompressionSize": body.get("minimumCompressionSize").cloned().unwrap_or(Value::Null),
         "policy": body.get("policy").cloned().unwrap_or(Value::Null),
-        "tags": body.get("tags").cloned().unwrap_or(json!({})),
+        "tags": crate::tags::input_tags(body.get("tags").unwrap_or(&json!({})))?,
         "disableExecuteApiEndpoint": body.get("disableExecuteApiEndpoint").and_then(Value::as_bool).unwrap_or(false),
     });
     let root = json!({ "id": root_id, "path": "/", "resourceMethods": {} });
@@ -877,6 +877,7 @@ fn stage_value(name: &str, deployment_id: &str, body: &Value) -> Result<Value, A
         "variables": body.get("variables").cloned().unwrap_or(json!({})),
         "methodSettings": body.get("methodSettings").cloned().unwrap_or(json!({})),
         "tracingEnabled": tracing_enabled,
+        "tags": crate::tags::input_tags(body.get("tags").unwrap_or(&json!({})))?,
     });
     if let Some(settings) = body.get("accessLogSettings") {
         stage["accessLogSettings"] = settings.clone();
@@ -1587,7 +1588,7 @@ pub async fn create_api_key(ctx: &Ctx<'_>, body: &Value) -> Out {
         "createdDate": now,
         "lastUpdatedDate": now,
         "stageKeys": body.get("stageKeys").cloned().unwrap_or(json!([])),
-        "tags": body.get("tags").cloned().unwrap_or(json!({})),
+        "tags": crate::tags::input_tags(body.get("tags").unwrap_or(&json!({})))?,
     });
     let shared = ctx.store.shared(ctx.account, ctx.region);
     let mut guard = shared.write().await;
@@ -1691,7 +1692,7 @@ pub async fn create_usage_plan(ctx: &Ctx<'_>, body: &Value) -> Out {
         "throttle": body.get("throttle").cloned().unwrap_or(json!({})),
         "quota": body.get("quota").cloned().unwrap_or(json!({})),
         "productCode": body.get("productCode").cloned().unwrap_or(Value::Null),
-        "tags": body.get("tags").cloned().unwrap_or(json!({})),
+        "tags": crate::tags::input_tags(body.get("tags").unwrap_or(&json!({})))?,
         "__keys": {},
     });
     let shared = ctx.store.shared(ctx.account, ctx.region);
@@ -1985,7 +1986,7 @@ pub async fn create_domain_name(ctx: &Ctx<'_>, body: &Value) -> Out {
         "securityPolicy": body.get("securityPolicy").and_then(Value::as_str).unwrap_or("TLS_1_2"),
         "mutualTlsAuthentication": body.get("mutualTlsAuthentication").cloned().unwrap_or(Value::Null),
         "ownershipVerificationCertificateArn": body.get("ownershipVerificationCertificateArn").cloned().unwrap_or(Value::Null),
-        "tags": body.get("tags").cloned().unwrap_or(json!({})),
+        "tags": crate::tags::input_tags(body.get("tags").unwrap_or(&json!({})))?,
         "__basePathMappings": {},
         "__apiMappings": {},
     });
@@ -2187,7 +2188,7 @@ pub async fn create_domain_name_access_association(ctx: &Ctx<'_>, body: &Value) 
         "accessAssociationSourceType": "VPCE",
         "domainNameAccessAssociationArn": association_arn,
         "domainNameArn": domain_arn,
-        "tags": body.get("tags").cloned().unwrap_or(json!({})),
+        "tags": crate::tags::input_tags(body.get("tags").unwrap_or(&json!({})))?,
     });
     guard
         .domain_access_associations

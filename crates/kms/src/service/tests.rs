@@ -5,6 +5,138 @@ fn test_service() -> KmsService {
     KmsService::new(crate::test_db()).expect("KMS service")
 }
 
+#[test]
+fn tags_persist_paginate_and_mutate_atomically_with_lifecycle_and_scope_checks() {
+    let db = crate::test_db();
+    let service = KmsService::new(db.clone()).unwrap();
+    let created = call_ok(
+        &service,
+        "CreateKey",
+        json!({"Tags":[{"TagKey":"a","TagValue":""},{"TagKey":"b","TagValue":"old"}]}),
+    );
+    let id = created["KeyMetadata"]["KeyId"].as_str().unwrap();
+    call_ok(
+        &service,
+        "TagResource",
+        json!({"KeyId":id,"Tags":[{"TagKey":"b","TagValue":"new"},{"TagKey":"c","TagValue":"third"}]}),
+    );
+    let first = call_ok(&service, "ListResourceTags", json!({"KeyId":id,"Limit":1}));
+    assert_eq!(first["Tags"], json!([{"TagKey":"a","TagValue":""}]));
+    assert_eq!(first["Truncated"], true);
+    let next = call_ok(
+        &service,
+        "ListResourceTags",
+        json!({"KeyId":id,"Marker":first["NextMarker"]}),
+    );
+    assert_eq!(
+        next["Tags"],
+        json!([{"TagKey":"b","TagValue":"new"},{"TagKey":"c","TagValue":"third"}])
+    );
+    assert_eq!(next["Truncated"], false);
+    for invalid in [
+        json!([{"TagKey":"valid","TagValue":"x"},{"TagKey":"aws:reserved","TagValue":"x"}]),
+        json!([{"TagKey":"duplicate","TagValue":"x"},{"TagKey":"duplicate","TagValue":"y"}]),
+        json!([{"TagKey":"x","TagValue":null}]),
+    ] {
+        assert!(call(
+            &service,
+            "TagResource",
+            json!({"KeyId":id,"Tags":invalid}),
+            ACCOUNT,
+            REGION
+        )
+        .is_err());
+    }
+    assert_eq!(
+        call_ok(&service, "ListResourceTags", json!({"KeyId":id}))["Tags"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(matches!(
+        call(
+            &service,
+            "ListResourceTags",
+            json!({"KeyId":id}),
+            ACCOUNT,
+            "us-east-2"
+        ),
+        Err(KmsError::NotFound)
+    ));
+    let (other, _) = create_key(&service, ACCOUNT, REGION);
+    assert!(matches!(
+        call(
+            &service,
+            "ListResourceTags",
+            json!({"KeyId":other,"Marker":first["NextMarker"]}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::InvalidMarker)
+    ));
+    call_ok(&service, "DisableKey", json!({"KeyId":id}));
+    call_ok(
+        &service,
+        "UntagResource",
+        json!({"KeyId":id,"TagKeys":["a","missing"]}),
+    );
+    drop(service);
+    let service = KmsService::new(db).unwrap();
+    assert_eq!(
+        call_ok(&service, "ListResourceTags", json!({"KeyId":id}))["Tags"],
+        next["Tags"]
+    );
+    call_ok(&service, "ScheduleKeyDeletion", json!({"KeyId":id}));
+    assert!(matches!(
+        call(
+            &service,
+            "TagResource",
+            json!({"KeyId":id,"Tags":[{"TagKey":"d","TagValue":"x"}]}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::InvalidState)
+    ));
+    assert!(matches!(
+        call(
+            &service,
+            "UntagResource",
+            json!({"KeyId":id,"TagKeys":["b"]}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::InvalidState)
+    ));
+}
+
+#[test]
+fn tag_quota_failure_preserves_existing_tags() {
+    let service = test_service();
+    let tags: Vec<_> = (0..50)
+        .map(|i| json!({"TagKey":format!("key-{i}"),"TagValue":"original"}))
+        .collect();
+    let created = call_ok(&service, "CreateKey", json!({"Tags":tags}));
+    let id = &created["KeyMetadata"]["KeyId"];
+    assert!(matches!(
+        call(
+            &service,
+            "TagResource",
+            json!({"KeyId":id,"Tags":[{"TagKey":"key-0","TagValue":"changed"},{"TagKey":"extra","TagValue":"x"}]}),
+            ACCOUNT,
+            REGION
+        ),
+        Err(KmsError::TagLimitExceeded)
+    ));
+    let listed = call_ok(&service, "ListResourceTags", json!({"KeyId":id}));
+    assert_eq!(listed["Tags"].as_array().unwrap().len(), 50);
+    assert!(listed["Tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tag| tag["TagValue"] == "original"));
+}
+
 const ACCOUNT: &str = "000000000000";
 const REGION: &str = "us-east-1";
 

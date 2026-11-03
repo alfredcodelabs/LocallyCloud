@@ -1,6 +1,7 @@
 //! Basic metric alarm aggregate and API operations.
 mod delivery;
 mod evaluation;
+mod math;
 mod pagination;
 mod store;
 #[cfg(test)]
@@ -35,14 +36,20 @@ struct Config {
     alarm_name: String,
     #[serde(default)]
     alarm_description: String,
+    #[serde(default)]
     namespace: String,
+    #[serde(default)]
     metric_name: String,
     #[serde(default)]
     dimensions: Vec<Dimension>,
+    #[serde(default)]
     statistic: String,
     #[serde(default)]
     unit: Option<String>,
+    #[serde(default)]
     period: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    metrics: Vec<Value>,
     evaluation_periods: u64,
     #[serde(default)]
     datapoints_to_alarm: Option<u64>,
@@ -175,7 +182,28 @@ impl Alarms {
                 if let Some(properties) = properties.as_object_mut() {
                     properties.remove("Tags");
                 }
-                let mut config: Config = serde_json::from_value(properties).map_err(|_|invalid("Basic alarms require one metric/statistic; unsupported properties are rejected"))?;
+                if properties.get("Metrics").is_some()
+                    && [
+                        "Namespace",
+                        "MetricName",
+                        "Dimensions",
+                        "Statistic",
+                        "Unit",
+                        "Period",
+                    ]
+                    .iter()
+                    .any(|key| properties.get(key).is_some())
+                {
+                    return Err(invalid(
+                        "Metrics cannot be combined with single-metric alarm properties",
+                    ));
+                }
+                let mut config: Config = serde_json::from_value(properties).map_err(|_| {
+                    invalid("Invalid metric alarm configuration or unsupported properties")
+                })?;
+                if body.get("Metrics").is_some() {
+                    config.period = math::Plan::parse(&config.metrics, scope)?.period;
+                }
                 if config.namespace == "AWS/DynamoDB" && body.get("TreatMissingData").is_none() {
                     config.treat_missing_data = "ignore".into();
                 }
@@ -593,9 +621,9 @@ fn validate(config: &Config, scope: &ScopeKey) -> Result<(), MonitoringError> {
         || config.alarm_name.len() > 255
         || config.alarm_name.chars().any(char::is_control)
         || config.alarm_description.len() > 1024
-        || config.namespace.is_empty()
+        || (config.metrics.is_empty() && config.namespace.is_empty())
         || config.namespace.len() > 255
-        || config.metric_name.is_empty()
+        || (config.metrics.is_empty() && config.metric_name.is_empty())
         || config.metric_name.len() > 255
         || !config.threshold.is_finite()
     {
@@ -619,19 +647,23 @@ fn validate(config: &Config, scope: &ScopeKey) -> Result<(), MonitoringError> {
     {
         return Err(invalid("Invalid evaluation window/datapoints"));
     }
-    if !matches!(
-        config.statistic.as_str(),
-        "Average" | "Sum" | "Minimum" | "Maximum" | "SampleCount"
-    ) || !matches!(
-        config.comparison_operator.as_str(),
-        "GreaterThanThreshold"
-            | "GreaterThanOrEqualToThreshold"
-            | "LessThanThreshold"
-            | "LessThanOrEqualToThreshold"
-    ) || !matches!(
-        config.treat_missing_data.as_str(),
-        "missing" | "ignore" | "breaching" | "notBreaching"
-    ) {
+    if (config.metrics.is_empty()
+        && !matches!(
+            config.statistic.as_str(),
+            "Average" | "Sum" | "Minimum" | "Maximum" | "SampleCount"
+        ))
+        || !matches!(
+            config.comparison_operator.as_str(),
+            "GreaterThanThreshold"
+                | "GreaterThanOrEqualToThreshold"
+                | "LessThanThreshold"
+                | "LessThanOrEqualToThreshold"
+        )
+        || !matches!(
+            config.treat_missing_data.as_str(),
+            "missing" | "ignore" | "breaching" | "notBreaching"
+        )
+    {
         return Err(invalid(
             "Unsupported statistic, comparison or missing-data policy",
         ));
@@ -728,7 +760,16 @@ fn transition(
         "OK" => &r.config.ok_actions,
         _ => &r.config.insufficient_data_actions,
     };
-    let message=json!({"AlarmName":r.config.alarm_name,"AlarmDescription":r.config.alarm_description,"AWSAccountId":scope.account_id,"NewStateValue":value,"NewStateReason":reason,"StateChangeTime":format_timestamp(now).unwrap_or_default(),"Region":scope.region,"AlarmArn":arn(scope,&r.config.alarm_name),"OldStateValue":previous,"Trigger":{"Namespace":r.config.namespace,"MetricName":r.config.metric_name,"Statistic":r.config.statistic,"Period":r.config.period,"EvaluationPeriods":r.config.evaluation_periods,"ComparisonOperator":r.config.comparison_operator,"Threshold":r.config.threshold,"TreatMissingData":r.config.treat_missing_data}}).to_string();
+    let mut message = json!({"AlarmName":r.config.alarm_name,"AlarmDescription":r.config.alarm_description,"AWSAccountId":scope.account_id,"NewStateValue":value,"NewStateReason":reason,"StateChangeTime":format_timestamp(now).unwrap_or_default(),"Region":scope.region,"AlarmArn":arn(scope,&r.config.alarm_name),"OldStateValue":previous,"Trigger":{"Namespace":r.config.namespace,"MetricName":r.config.metric_name,"Statistic":r.config.statistic,"Period":r.config.period,"EvaluationPeriods":r.config.evaluation_periods,"ComparisonOperator":r.config.comparison_operator,"Threshold":r.config.threshold,"TreatMissingData":r.config.treat_missing_data}});
+    if !r.config.metrics.is_empty() {
+        if let Some(trigger) = message.get_mut("Trigger").and_then(Value::as_object_mut) {
+            for field in ["Namespace", "MetricName", "Statistic"] {
+                trigger.remove(field);
+            }
+            trigger.insert("Metrics".into(), json!(r.config.metrics));
+        }
+    }
+    let message = message.to_string();
     actions
         .iter()
         .map(|target| Pending {
@@ -743,6 +784,18 @@ fn transition(
 fn view(scope: &ScopeKey, r: &Record) -> Value {
     let mut v = serde_json::to_value(&r.config).expect("finite validated alarm");
     let object = v.as_object_mut().unwrap();
+    if !r.config.metrics.is_empty() {
+        for field in [
+            "Namespace",
+            "MetricName",
+            "Dimensions",
+            "Statistic",
+            "Unit",
+            "Period",
+        ] {
+            object.remove(field);
+        }
+    }
     object.insert("AlarmArn".into(), arn(scope, &r.config.alarm_name).into());
     object.insert("StateValue".into(), r.state.clone().into());
     object.insert("StateReason".into(), r.reason.clone().into());

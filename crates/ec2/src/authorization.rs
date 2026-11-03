@@ -81,6 +81,17 @@ impl Ec2Handler {
             )
         };
         let mut context = BTreeMap::from([("ec2:Region".into(), vec![request.region.clone()])]);
+        let tags = if action == "CreateSecurityGroup" {
+            input.security_group_tags()?
+        } else {
+            BTreeMap::new()
+        };
+        if !tags.is_empty() {
+            context.insert("aws:TagKeys".into(), tags.keys().cloned().collect());
+            for (key, value) in &tags {
+                context.insert(format!("aws:RequestTag/{key}"), vec![value.clone()]);
+            }
+        }
         let key = (request.account_id.clone(), request.region.clone());
         let state = self.scopes.lock().map_err(|_| {
             Ec2Error::new("InternalError", "EC2 authorization topology unavailable")
@@ -93,6 +104,12 @@ impl Ec2Handler {
             vpc = vpc.or_else(|| scope?.subnets.get(subnet).map(|value| value.vpc_id.clone()));
         }
         if let Some(group) = input.one("GroupId")? {
+            if let Some(group) = scope.and_then(|scope| scope.security_groups.get(group)) {
+                for (tag, value) in &group.tags {
+                    context.insert(format!("aws:ResourceTag/{tag}"), vec![value.clone()]);
+                    context.insert(format!("ec2:ResourceTag/{tag}"), vec![value.clone()]);
+                }
+            }
             vpc = vpc.or_else(|| {
                 scope?
                     .security_groups
@@ -261,6 +278,23 @@ impl Ec2Handler {
         drop(state);
         if resources.is_empty() {
             resources.push("*".into());
+        }
+        if !tags.is_empty() {
+            let mut tag_context = context.clone();
+            tag_context.insert(
+                "ec2:CreateAction".into(),
+                vec!["CreateSecurityGroup".into()],
+            );
+            evaluator
+                .authorize(AuthorizationRequest {
+                    request_identity: caller.clone(),
+                    delegated_identity: delegated.clone(),
+                    source_service: "ec2".into(),
+                    action: "ec2:CreateTags".into(),
+                    resource: arn("security-group", &input.resource_id("sg")),
+                    context: tag_context,
+                })
+                .map_err(|_| denied())?;
         }
         for resource in resources {
             evaluator
@@ -552,5 +586,66 @@ mod tests {
             .0,
             200
         );
+    }
+    #[tokio::test]
+    async fn security_group_tag_on_create_requires_create_tags_permission() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let handler = register(&registry);
+        let (_, vpc) = crate::tests::call(
+            &handler,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.89.0.0%2F16",
+        )
+        .await;
+        let vpc = crate::tests::id(&vpc, "vpcId");
+        let policy = policy(&registry, handler.clone());
+        let group_prefix = "arn:aws:ec2:us-east-1:111:security-group/*";
+        policy.allowed.lock().unwrap().extend([
+            ("ec2:CreateSecurityGroup".into(), group_prefix.into()),
+            (
+                "ec2:CreateSecurityGroup".into(),
+                format!("arn:aws:ec2:us-east-1:111:vpc/{vpc}"),
+            ),
+        ]);
+        let form = format!("Action=CreateSecurityGroup&VpcId={vpc}&GroupName=iam-tagged&GroupDescription=tagged&TagSpecification.1.ResourceType=security-group&TagSpecification.1.Tag.1.Key=Owner&TagSpecification.1.Tag.1.Value=Accounting");
+        let (status, body) = response(&handler, request(&form)).await;
+        assert_eq!(status, 403, "{body}");
+        assert!(!handler
+            .scopes
+            .lock()
+            .unwrap()
+            .get(&("111".into(), "us-east-1".into()))
+            .unwrap()
+            .security_groups
+            .values()
+            .any(|group| group.name == "iam-tagged"));
+        policy
+            .allowed
+            .lock()
+            .unwrap()
+            .push(("ec2:CreateTags".into(), group_prefix.into()));
+        let (status, body) = response(&handler, request(&form)).await;
+        assert_eq!(status, 200, "{body}");
+        let id = crate::tests::id(&body, "groupId");
+        let calls = policy.calls.lock().unwrap();
+        let tags = calls
+            .iter()
+            .rev()
+            .find(|call| call.action == "ec2:CreateTags")
+            .unwrap();
+        assert_eq!(
+            tags.resource,
+            format!("arn:aws:ec2:us-east-1:111:security-group/{id}")
+        );
+        assert_eq!(
+            tags.context.get("ec2:CreateAction"),
+            Some(&vec!["CreateSecurityGroup".into()])
+        );
+        assert_eq!(
+            tags.context.get("aws:RequestTag/Owner"),
+            Some(&vec!["Accounting".into()])
+        );
+        assert_eq!(tags.context.get("aws:TagKeys"), Some(&vec!["Owner".into()]));
     }
 }

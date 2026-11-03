@@ -29,22 +29,37 @@ impl Alarms {
                     .map(|d| (d.name.clone(), d.value.clone()))
                     .collect(),
             };
-            let points = domain.points(
-                &scope,
-                &key,
-                end - (config.evaluation_periods as i64 + 2) * period,
-                end,
-                config.unit.as_deref(),
-            )?;
+            let points = if config.metrics.is_empty() {
+                domain.points(
+                    &scope,
+                    &key,
+                    end - (config.evaluation_periods as i64 + 2) * period,
+                    end,
+                    config.unit.as_deref(),
+                )?
+            } else {
+                Vec::new()
+            };
             let mut buckets = Vec::new();
-            for index in 0..config.evaluation_periods + 2 {
-                let upper = end - index as i64 * period;
-                let samples: Vec<_> = points
-                    .iter()
-                    .filter(|p| p.timestamp_ms >= upper - period && p.timestamp_ms < upper)
-                    .map(|p| p.value)
-                    .collect();
-                buckets.push((!samples.is_empty()).then(|| statistic(&config.statistic, &samples)));
+            if !config.metrics.is_empty() {
+                buckets = math::Plan::parse(&config.metrics, &scope)?.buckets(
+                    domain,
+                    &scope,
+                    end,
+                    config.evaluation_periods + 2,
+                )?;
+            } else {
+                for index in 0..config.evaluation_periods + 2 {
+                    let upper = end - index as i64 * period;
+                    let samples: Vec<_> = points
+                        .iter()
+                        .filter(|p| p.timestamp_ms >= upper - period && p.timestamp_ms < upper)
+                        .map(|p| p.value)
+                        .collect();
+                    buckets.push(
+                        (!samples.is_empty()).then(|| statistic(&config.statistic, &samples)),
+                    );
+                }
             }
             let values: Vec<_> = buckets
                 .iter()

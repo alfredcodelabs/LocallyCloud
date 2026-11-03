@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn default_egress() -> Vec<IngressRule> {
     vec![IngressRule {
         protocol: "-1".into(),
+        description: None,
         from_port: None,
         to_port: None,
         peer: RulePeer::Cidr(
@@ -80,7 +81,13 @@ impl Ec2Handler {
         input.allow_ingress()?;
         input.dry_run()?;
         let id = input.required("GroupId")?;
-        let (protocol, from_port, to_port, peer) = input.ingress_rule()?;
+        let IngressRule {
+            protocol,
+            from_port,
+            to_port,
+            peer,
+            description,
+        } = input.ingress_rule()?;
         let mut state = self.scopes.lock().unwrap();
         let scope = state.entry(key.clone()).or_default();
         let group = scope.security_groups.get(id).ok_or_else(|| {
@@ -148,12 +155,17 @@ impl Ec2Handler {
             RulePeer::Cidr(cidr) => format!("<cidrIpv4>{cidr}</cidrIpv4>"),
             RulePeer::Group(peer_id) => format!("<referencedGroupInfo><groupId>{}</groupId><userId>{}</userId></referencedGroupInfo>", escape(peer_id), escape(&key.0)),
         };
-        let response = format!("<return>true</return><securityGroupRuleSet><item><groupId>{}</groupId><securityGroupRuleId>{}</securityGroupRuleId><isEgress>{egress}</isEgress><ipProtocol>{}</ipProtocol>{}{peer_xml}</item></securityGroupRuleSet>", escape(id), resource_id("sgr"), escape(&protocol), ports_xml(from_port,to_port));
+        let description_xml = description
+            .as_ref()
+            .map(|value| format!("<description>{}</description>", escape(value)))
+            .unwrap_or_default();
+        let response = format!("<return>true</return><securityGroupRuleSet><item><groupId>{}</groupId><securityGroupRuleId>{}</securityGroupRuleId><isEgress>{egress}</isEgress><ipProtocol>{}</ipProtocol>{}{peer_xml}{description_xml}</item></securityGroupRuleSet>", escape(id), resource_id("sgr"), escape(&protocol), ports_xml(from_port,to_port));
         rules.push(IngressRule {
             protocol,
             from_port,
             to_port,
             peer,
+            description,
         });
         self.persist(&key, &[Change::put("sg", id, &group)?])?;
         scope.security_groups.insert(id.into(), group);
@@ -162,12 +174,17 @@ impl Ec2Handler {
 }
 
 pub(super) fn permission_xml(rule: &IngressRule, owner: &str) -> String {
+    let description = rule
+        .description
+        .as_ref()
+        .map(|value| format!("<description>{}</description>", escape(value)))
+        .unwrap_or_default();
     let peer = match &rule.peer {
         RulePeer::Cidr(cidr) => {
-            format!("<groups/><ipRanges><item><cidrIp>{cidr}</cidrIp></item></ipRanges>")
+            format!("<groups/><ipRanges><item><cidrIp>{cidr}</cidrIp>{description}</item></ipRanges>")
         }
         RulePeer::Group(id) => format!(
-            "<groups><item><userId>{}</userId><groupId>{}</groupId></item></groups><ipRanges/>",
+            "<groups><item><userId>{}</userId><groupId>{}</groupId>{description}</item></groups><ipRanges/>",
             escape(owner),
             escape(id)
         ),

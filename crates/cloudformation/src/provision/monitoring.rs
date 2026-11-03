@@ -19,14 +19,40 @@ const PROPERTIES: &[&str] = &[
     "AlarmActions",
     "OKActions",
     "InsufficientDataActions",
+    "Metrics",
 ];
 
 fn alarm_form(logical: &str, name: &str, props: &Value) -> Result<String, CfnError> {
     ensure_known_properties(logical, "AWS::CloudWatch::Alarm", props, PROPERTIES)?;
-    for key in ["Namespace", "MetricName", "Statistic", "ComparisonOperator"] {
+    let metric_math = props.get("Metrics").is_some();
+    if metric_math
+        && [
+            "Namespace",
+            "MetricName",
+            "Dimensions",
+            "Statistic",
+            "Unit",
+            "Period",
+        ]
+        .iter()
+        .any(|key| props.get(key).is_some())
+    {
+        return Err(CfnError::Validation(
+            "Alarm Metrics cannot be combined with single-metric properties".into(),
+        ));
+    }
+    for key in if metric_math {
+        &["ComparisonOperator"][..]
+    } else {
+        &["Namespace", "MetricName", "Statistic", "ComparisonOperator"][..]
+    } {
         required_property(props, key, logical)?;
     }
-    for key in ["Period", "EvaluationPeriods", "Threshold"] {
+    for key in if metric_math {
+        &["EvaluationPeriods", "Threshold"][..]
+    } else {
+        &["Period", "EvaluationPeriods", "Threshold"][..]
+    } {
         if !props.get(key).is_some_and(Value::is_number) {
             return Err(CfnError::Validation(format!(
                 "Alarm {logical} requires numeric {key}"
@@ -45,6 +71,22 @@ fn alarm_form(logical: &str, name: &str, props: &Value) -> Result<String, CfnErr
     for (key, value) in props.as_object().ok_or(CfnError::Internal)? {
         match key.as_str() {
             "AlarmName" => {}
+            "Metrics" => {
+                let metrics = value
+                    .as_array()
+                    .filter(|v| !v.is_empty() && v.len() <= 20)
+                    .ok_or_else(|| {
+                        CfnError::Validation("Alarm Metrics requires 1..20 entries".into())
+                    })?;
+                for (index, metric) in metrics.iter().enumerate() {
+                    append_metric_query(
+                        &mut form,
+                        &format!("Metrics.member.{}", index + 1),
+                        metric,
+                        0,
+                    )?;
+                }
+            }
             "Dimensions" => {
                 let dimensions = value.as_array().ok_or_else(|| {
                     CfnError::Validation("Alarm Dimensions must be an array".into())
@@ -104,6 +146,58 @@ fn alarm_form(logical: &str, name: &str, props: &Value) -> Result<String, CfnErr
         }
     }
     Ok(form)
+}
+
+fn append_metric_query(
+    form: &mut String,
+    prefix: &str,
+    value: &Value,
+    depth: usize,
+) -> Result<(), CfnError> {
+    if depth > 6 {
+        return Err(CfnError::Validation(
+            "Alarm Metrics nesting is too deep".into(),
+        ));
+    }
+    match value {
+        Value::Object(fields) => {
+            for (field, value) in fields {
+                if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                    return Err(CfnError::Validation(
+                        "Invalid Alarm Metrics field name".into(),
+                    ));
+                }
+                append_metric_query(form, &format!("{prefix}.{field}"), value, depth + 1)?;
+            }
+        }
+        Value::Array(values) if prefix.ends_with(".Dimensions") && values.len() <= 30 => {
+            for (index, value) in values.iter().enumerate() {
+                append_metric_query(
+                    form,
+                    &format!("{prefix}.member.{}", index + 1),
+                    value,
+                    depth + 1,
+                )?;
+            }
+        }
+        Value::String(value)
+            if !prefix.ends_with(".ReturnData") && !prefix.ends_with(".Period") =>
+        {
+            form.push_str(&format!("&{prefix}={}", enc(value)))
+        }
+        Value::Bool(value) if prefix.ends_with(".ReturnData") => {
+            form.push_str(&format!("&{prefix}={value}"))
+        }
+        Value::Number(value) if prefix.ends_with(".Period") && value.as_u64().is_some() => {
+            form.push_str(&format!("&{prefix}={value}"))
+        }
+        _ => {
+            return Err(CfnError::Validation(
+                "Invalid Alarm Metrics property".into(),
+            ))
+        }
+    }
+    Ok(())
 }
 
 impl Provisioner {
@@ -247,6 +341,82 @@ mod tests {
                 .unwrap()
         }
     }
+    #[tokio::test]
+    async fn math_alarm_lifecycle_serializes_native_query_and_propagates_failure() {
+        let registry = ServiceRegistry::with_known_services();
+        let monitoring = Arc::new(Monitoring::default());
+        registry.register_native(
+            ServiceName::new("monitoring"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            monitoring.clone(),
+        );
+        let provisioner = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        let mut props = json!({"Metrics":[
+            {"Id":"visible","ReturnData":false,"MetricStat":{"Metric":{"Namespace":"AWS/SQS","MetricName":"Visible","Dimensions":[{"Name":"QueueName","Value":"ledger & review"}]},"Period":300,"Stat":"Minimum"}},
+            {"Id":"deleted","ReturnData":false,"MetricStat":{"Metric":{"Namespace":"AWS/SQS","MetricName":"Deleted"},"Period":300,"Stat":"Sum"}},
+            {"Id":"stalled","ReturnData":true,"Expression":"IF(visible > 0 AND FILL(deleted, 0) == 0, 1, 0)"}
+        ],"EvaluationPeriods":3,"Threshold":1,"ComparisonOperator":"GreaterThanOrEqualToThreshold"});
+        let resource = provisioner
+            .provision("Stalled", "ledger", "AWS::CloudWatch::Alarm", &props)
+            .await
+            .unwrap();
+        let form = monitoring.calls.lock().unwrap().last().unwrap().clone();
+        assert!(form.contains("Metrics.member.1.MetricStat.Period=300"));
+        assert!(form.contains(
+            "Metrics.member.1.MetricStat.Metric.Dimensions.member.1.Value=ledger%20%26%20review"
+        ));
+        assert!(form.contains("Metrics.member.3.Expression=IF%28visible%20%3E%200%20AND%20FILL"));
+        assert!(form.contains("Metrics.member.3.ReturnData=true"));
+        let old = props.clone();
+        props["Threshold"] = json!(2);
+        provisioner
+            .update(
+                "Stalled",
+                "AWS::CloudWatch::Alarm",
+                &resource,
+                &old,
+                &props,
+                Replacement::Update(ResourcePolicy::Delete),
+            )
+            .await
+            .unwrap();
+        assert!(monitoring
+            .calls
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("Threshold=2"));
+        *monitoring.fail.lock().unwrap() = true;
+        assert!(provisioner
+            .update(
+                "Stalled",
+                "AWS::CloudWatch::Alarm",
+                &resource,
+                &old,
+                &props,
+                Replacement::Update(ResourcePolicy::Delete)
+            )
+            .await
+            .is_err());
+        *monitoring.fail.lock().unwrap() = false;
+        provisioner
+            .deprovision("AWS::CloudWatch::Alarm", &resource.ref_value, &props)
+            .await
+            .unwrap();
+        assert!(monitoring
+            .calls
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("Action=DeleteAlarms"));
+    }
+
     #[tokio::test]
     async fn basic_alarm_lifecycle_uses_scoped_query_and_rejects_unsupported_fields() {
         let registry = ServiceRegistry::with_known_services();

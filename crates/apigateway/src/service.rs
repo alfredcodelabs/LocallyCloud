@@ -188,6 +188,16 @@ impl ApiGwHandler {
         body: &Value,
     ) -> Result<(u16, Value), ApiGwError> {
         match segs.first().copied() {
+            Some("tags") => {
+                crate::tags::route(
+                    method,
+                    &segs.iter().skip(1).copied().collect::<Vec<_>>().join("/"),
+                    query,
+                    ctx,
+                    body,
+                )
+                .await
+            }
             Some(
                 "restapis"
                 | "account"
@@ -861,6 +871,10 @@ impl NativeHandler for ApiGwHandler {
         }
 
         let path = request.uri.path().to_string();
+        if path.starts_with("/tags/") && path.contains("//") {
+            return ApiGwError::BadRequest("Invalid tagging resource path".into())
+                .into_response(&request.request_id);
+        }
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let body: Value = if request.body.is_empty() {
             Value::Object(serde_json::Map::new())
@@ -876,7 +890,7 @@ impl NativeHandler for ApiGwHandler {
         if let Err(error) = self.authorize_account_role(&request, &segs, &body) {
             return error.into_response(&request.request_id);
         }
-        if request.method == Method::GET {
+        if request.method == Method::GET || segs.first() == Some(&"tags") {
             let resource = format!(
                 "arn:aws:apigateway:{}::{}",
                 request.region,
@@ -886,7 +900,7 @@ impl NativeHandler for ApiGwHandler {
                 &self.registry,
                 &request,
                 "apigateway",
-                "apigateway:GET",
+                &format!("apigateway:{}", request.method),
                 &resource,
             )
             .is_err()
@@ -1127,6 +1141,422 @@ mod tests {
         let mut handler = ApiGwHandler::new(registry);
         handler.domains = crate::domains::fixture_bindings();
         handler
+    }
+
+    #[tokio::test]
+    async fn rest_tags_lifecycle_validation_and_scope() {
+        let handler = test_handler(Weak::new());
+        let (status, api) = call(
+            &handler,
+            Method::POST,
+            "/restapis",
+            json!({"name":"tagged", "tags":{"Parent":"only"}}),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let id = api["id"].as_str().unwrap();
+        assert_eq!(
+            call(
+                &handler,
+                Method::POST,
+                &format!("/restapis/{id}/deployments"),
+                json!({"stageName":"prod"})
+            )
+            .await
+            .0,
+            201
+        );
+        let arn = format!("arn:aws:apigateway:us-east-1::/restapis/{id}/stages/prod");
+        let encoded = arn.replace(':', "%3A").replace('/', "%2F");
+        let path = format!("/tags/{encoded}");
+        // GetTags must not expose inherited REST API tags.
+        assert_eq!(
+            call(&handler, Method::GET, &path, Value::Null).await,
+            (200, json!({"tags":{}}))
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::PUT,
+                &path,
+                json!({"tags":{"Team":"Finance", "a+b":"first", "日本語":"é 1"}})
+            )
+            .await,
+            (204, Value::Null)
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::PUT,
+                &path,
+                json!({"tags":{"Team":"Accounting"}})
+            )
+            .await
+            .0,
+            204
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::GET,
+                &format!("/restapis/{id}/stages/prod"),
+                Value::Null
+            )
+            .await
+            .1["tags"]["Team"],
+            "Accounting"
+        );
+        for invalid in [
+            json!({}),
+            json!({"tags":null}),
+            json!({"tags":{"x":2}}),
+            json!({"tags":{"aws:owner":"x"}}),
+            json!({"tags":{"x":"bad\nvalue"}}),
+            json!({"tags":{"x":"x".repeat(257)}}),
+        ] {
+            assert_eq!(call(&handler, Method::PUT, &path, invalid).await.0, 400);
+        }
+        let additions: serde_json::Map<String, Value> = (0..50)
+            .map(|n| (format!("key{n}"), json!("value")))
+            .collect();
+        assert_eq!(
+            call(&handler, Method::PUT, &path, json!({"tags":additions}))
+                .await
+                .0,
+            400
+        );
+        assert_eq!(
+            call(&handler, Method::GET, &path, Value::Null).await.1["tags"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::DELETE,
+                &format!("{path}?tagKeys=Team&tagKeys=a%2Bb"),
+                Value::Null
+            )
+            .await,
+            (204, Value::Null)
+        );
+        assert_eq!(
+            call(&handler, Method::GET, &path, Value::Null).await.1,
+            json!({"tags":{"日本語":"é 1"}})
+        );
+        assert_eq!(
+            call(&handler, Method::DELETE, &path, Value::Null).await.0,
+            400
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::DELETE,
+                &format!("{path}?tagKeys=%ZZ"),
+                Value::Null
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::GET,
+                &format!("/tags/{arn}/methods/GET"),
+                Value::Null
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::GET,
+                &path.replace("us-east-1", "us-east-2"),
+                Value::Null
+            )
+            .await
+            .0,
+            400
+        );
+        let mut other = req(Method::GET, &path, Value::Null);
+        other.account_id = "111111111111".into();
+        assert_eq!(handler.handle(other).await.status(), 404);
+        assert_eq!(
+            call(
+                &handler,
+                Method::DELETE,
+                &format!("/restapis/{id}/stages/prod"),
+                Value::Null
+            )
+            .await
+            .0,
+            202
+        );
+        assert_eq!(call(&handler, Method::GET, &path, Value::Null).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn rest_tags_share_native_resource_records() {
+        let handler = test_handler(Weak::new());
+        let mut arns = Vec::new();
+        for endpoint in ["apikeys", "usageplans"] {
+            let (status, resource) = call(
+                &handler,
+                Method::POST,
+                &format!("/{endpoint}"),
+                json!({"name":"tagged","tags":{"Initial":"yes"}}),
+            )
+            .await;
+            assert_eq!(status, 201);
+            arns.push(format!(
+                "arn:aws:apigateway:us-east-1::/{endpoint}/{}",
+                resource["id"].as_str().unwrap()
+            ));
+        }
+        let (status, _) = call(&handler, Method::POST, "/domainnames", json!({"domainName":"tags.example.test", "regionalCertificateArn":"arn:aws:acm:us-east-1:000000000000:certificate/test", "endpointConfiguration":{"types":["REGIONAL"]}})).await;
+        assert_eq!(status, 201);
+        arns.push("arn:aws:apigateway:us-east-1::/domainnames/tags.example.test".into());
+        let (status, private) = call(&handler, Method::POST, "/domainnames", json!({"domainName":"private-tags.example.test", "endpointConfiguration":{"types":["PRIVATE"]}})).await;
+        assert_eq!(status, 201);
+        arns.push(private["domainNameArn"].as_str().unwrap().into());
+        let (status, association) = call(&handler, Method::POST, "/domainnameaccessassociations", json!({"domainNameArn":private["domainNameArn"], "accessAssociationSourceType":"VPCE", "accessAssociationSource":"vpce-aaaa"})).await;
+        assert_eq!(status, 201);
+        arns.push(
+            association["domainNameAccessAssociationArn"]
+                .as_str()
+                .unwrap()
+                .into(),
+        );
+        for arn in arns {
+            let path = format!("/tags/{arn}");
+            assert_eq!(
+                call(
+                    &handler,
+                    Method::PUT,
+                    &path,
+                    json!({"tags":{"Owner":"Accounting"}})
+                )
+                .await
+                .0,
+                204
+            );
+            assert_eq!(
+                call(&handler, Method::GET, &path, Value::Null).await.1["tags"]["Owner"],
+                "Accounting"
+            );
+            assert_eq!(
+                call(
+                    &handler,
+                    Method::DELETE,
+                    &format!("{path}?tagKeys=Owner"),
+                    Value::Null
+                )
+                .await
+                .0,
+                204
+            );
+            assert!(
+                call(&handler, Method::GET, &path, Value::Null).await.1["tags"]
+                    .get("Owner")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_tags_enforce_iam_on_get_put_and_delete() {
+        use locallycloud_core::integration::authorization::{
+            AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
+        };
+        struct TagAuthorization {
+            resource: String,
+            requests: std::sync::Mutex<Vec<AuthorizationRequest>>,
+        }
+        impl AuthorizationEvaluator for TagAuthorization {
+            fn strict_sigv4_required(&self) -> bool {
+                true
+            }
+            fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError> {
+                let allowed = request.resource == self.resource
+                    && matches!(request.action.as_str(), "apigateway:GET" | "apigateway:PUT");
+                self.requests.lock().unwrap().push(request);
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::Denied)
+                }
+            }
+        }
+        let registry = ServiceRegistry::with_known_services();
+        let handler = test_handler(Arc::downgrade(&registry));
+        let (_, api) = call(
+            &handler,
+            Method::POST,
+            "/restapis",
+            json!({"name":"iam-tags"}),
+        )
+        .await;
+        let path = format!(
+            "/tags/arn%3Aaws%3Aapigateway%3Aus-east-1%3A%3A%2Frestapis%2F{}",
+            api["id"].as_str().unwrap()
+        );
+        let evaluator = Arc::new(TagAuthorization {
+            resource: format!("arn:aws:apigateway:us-east-1::{path}"),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(test_handler(Weak::new())),
+            evaluator.clone(),
+        );
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            assert_eq!(
+                handler
+                    .handle(req(method, &path, json!({"tags":{"Owner":"x"}})))
+                    .await
+                    .status(),
+                403
+            );
+        }
+        for (method, suffix, status) in [
+            (Method::PUT, "", 204),
+            (Method::GET, "", 200),
+            (Method::DELETE, "?tagKeys=Owner", 403),
+        ] {
+            let mut request = req(
+                method,
+                &format!("{path}{suffix}"),
+                json!({"tags":{"Owner":"x"}}),
+            );
+            request.headers.insert(
+                "x-locallycloud-verified-external-sigv4",
+                "1".parse().unwrap(),
+            );
+            request.headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20261103/us-east-1/apigateway/aws4_request, SignedHeaders=host, Signature=test".parse().unwrap());
+            assert_eq!(handler.handle(request).await.status(), status);
+        }
+        assert_eq!(
+            evaluator
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["apigateway:PUT", "apigateway:GET", "apigateway:DELETE"]
+        );
+        assert_eq!(
+            handler
+                .store
+                .rest("000000000000", "us-east-1", api["id"].as_str().unwrap())
+                .unwrap()
+                .read()
+                .await
+                .api["tags"]["Owner"],
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_tags_persist_and_failed_commit_does_not_publish() {
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-apigw-tags-{}", uuid::Uuid::new_v4()));
+        let state =
+            Arc::new(locallycloud_state::StateDb::open(root.join("state.sqlite3")).unwrap());
+        let durable = || {
+            let mut handler = test_handler(Weak::new());
+            let persistence = crate::store::Persistence::new(
+                state.clone(),
+                locallycloud_state::StateCipher::with_key(&[7; 32]),
+            )
+            .unwrap();
+            persistence.restore(&handler.store).unwrap();
+            handler.persistence = Some(persistence);
+            handler
+        };
+        let handler = durable();
+        let (_, api) = call(
+            &handler,
+            Method::POST,
+            "/restapis",
+            json!({"name":"durable-tags"}),
+        )
+        .await;
+        let id = api["id"].as_str().unwrap();
+        let path = format!("/tags/arn:aws:apigateway:us-east-1::/restapis/{id}");
+        assert_eq!(
+            call(
+                &handler,
+                Method::PUT,
+                &path,
+                json!({"tags":{"Owner":"kept"}})
+            )
+            .await
+            .0,
+            204
+        );
+        drop(handler);
+        let restored = durable();
+        assert_eq!(
+            call(&restored, Method::GET, &path, Value::Null).await.1,
+            json!({"tags":{"Owner":"kept"}})
+        );
+        state.connection().unwrap().execute_batch("CREATE TRIGGER reject_tag_update BEFORE UPDATE ON apigateway_scopes BEGIN SELECT RAISE(ABORT,'forced commit failure'); END;").unwrap();
+        assert_eq!(
+            call(
+                &restored,
+                Method::PUT,
+                &path,
+                json!({"tags":{"Owner":"uncommitted"}})
+            )
+            .await
+            .0,
+            500
+        );
+        assert_eq!(
+            call(
+                &restored,
+                Method::DELETE,
+                &format!("{path}?tagKeys=Owner"),
+                Value::Null
+            )
+            .await
+            .0,
+            500
+        );
+        assert_eq!(
+            call(&restored, Method::GET, &path, Value::Null).await.1,
+            json!({"tags":{"Owner":"kept"}})
+        );
+        state
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_tag_update;")
+            .unwrap();
+        assert_eq!(
+            call(
+                &restored,
+                Method::DELETE,
+                &format!("{path}?tagKeys=Owner"),
+                Value::Null
+            )
+            .await
+            .0,
+            204
+        );
+        drop(restored);
+        assert_eq!(
+            call(&durable(), Method::GET, &path, Value::Null).await.1,
+            json!({"tags":{}})
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

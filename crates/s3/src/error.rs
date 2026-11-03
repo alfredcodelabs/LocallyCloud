@@ -31,6 +31,8 @@ pub enum S3Error {
     NoSuchWebsiteConfiguration,
     #[error("The bucket ownership controls were not found")]
     OwnershipControlsNotFoundError,
+    #[error("The bucket does not allow ACLs")]
+    AccessControlListNotSupported,
     #[error("The specified key does not exist.")]
     NoSuchKey,
     #[error("The specified key does not exist.")]
@@ -122,6 +124,7 @@ impl S3Error {
             S3Error::ObjectLockConfigurationNotFoundError => "ObjectLockConfigurationNotFoundError",
             S3Error::NoSuchWebsiteConfiguration => "NoSuchWebsiteConfiguration",
             S3Error::OwnershipControlsNotFoundError => "OwnershipControlsNotFoundError",
+            S3Error::AccessControlListNotSupported => "AccessControlListNotSupported",
             S3Error::NoSuchKey | S3Error::NoSuchKeyDeleteMarker => "NoSuchKey",
             S3Error::DeleteMarkerVersion(_) => "MethodNotAllowed",
             S3Error::NoSuchUpload => "NoSuchUpload",
@@ -179,6 +182,7 @@ impl S3Error {
             | S3Error::BucketAlreadyExists
             | S3Error::BucketNotEmpty => 409,
             S3Error::InvalidBucketName
+            | S3Error::AccessControlListNotSupported
             | S3Error::BadDigest
             | S3Error::InvalidDigest
             | S3Error::EntityTooLarge

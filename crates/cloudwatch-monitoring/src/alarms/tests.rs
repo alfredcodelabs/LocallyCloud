@@ -485,3 +485,227 @@ fn alarm_tags_creation_update_validation_and_legacy_record() {
         .tags
         .is_empty());
 }
+
+fn math_alarm() -> Value {
+    json!({"AlarmName":"stalled", "Metrics":[
+        {"Id":"visible","ReturnData":false,"MetricStat":{"Metric":{"Namespace":"AWS/SQS","MetricName":"ApproximateNumberOfMessagesVisible","Dimensions":[{"Name":"QueueName","Value":"ledger"}]},"Period":300,"Stat":"Minimum"}},
+        {"Id":"deleted","ReturnData":false,"MetricStat":{"Metric":{"Namespace":"AWS/SQS","MetricName":"NumberOfMessagesDeleted","Dimensions":[{"Name":"QueueName","Value":"ledger"}]},"Period":300,"Stat":"Sum"}},
+        {"Id":"stalled","ReturnData":true,"Label":"Visible messages with no deletions","Expression":"IF(visible > 0 AND FILL(deleted, 0) == 0, 1, 0)"}
+    ],"EvaluationPeriods":3,"DatapointsToAlarm":3,"Threshold":1,"ComparisonOperator":"GreaterThanOrEqualToThreshold","TreatMissingData":"notBreaching"})
+}
+
+#[test]
+fn metric_math_uses_actual_samples_fill_updates_and_delete() {
+    let scope = ScopeKey {
+        account_id: "000000000000".into(),
+        region: "us-east-2".into(),
+    };
+    let domain = MonitoringDomain::default();
+    let alarms = Alarms::new(None).unwrap();
+    let mut config = math_alarm();
+    alarms.process("PutMetricAlarm", &config, &scope).unwrap();
+    let end = now_ms() / 300_000 * 300_000;
+    let put = |metric: &str, value: f64| {
+        domain
+            .commit(
+                (0..3)
+                    .map(|index| MetricObservation {
+                        account_id: scope.account_id.clone(),
+                        region: scope.region.clone(),
+                        namespace: "AWS/SQS".into(),
+                        metric_name: metric.into(),
+                        dimensions: BTreeMap::from([("QueueName".into(), "ledger".into())]),
+                        timestamp_ms: end - index * 300_000 - 1000,
+                        value,
+                        unit: None,
+                        storage_resolution: 60,
+                        origin: MetricOrigin::AwsService,
+                        correlation_id: format!("{metric}-{index}"),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+    };
+    put("ApproximateNumberOfMessagesVisible", 4.0);
+    alarms.evaluate(&domain, end).unwrap();
+    let describe = || {
+        alarms
+            .process("DescribeAlarms", &json!({"AlarmNames":["stalled"]}), &scope)
+            .unwrap()
+    };
+    assert_eq!(describe()["MetricAlarms"][0]["StateValue"], "ALARM");
+    assert_eq!(describe()["MetricAlarms"][0]["Metrics"], config["Metrics"]);
+    assert!(describe()["MetricAlarms"][0].get("Namespace").is_none());
+    assert!(describe()["MetricAlarms"][0].get("Period").is_none());
+    // Three deleted samples make each stalled-expression point zero.
+    put("NumberOfMessagesDeleted", 1.0);
+    alarms.evaluate(&domain, end + 60_000).unwrap();
+    assert_eq!(describe()["MetricAlarms"][0]["StateValue"], "OK");
+    // Updating keeps state until a real evaluation and applies the new expression.
+    config["Metrics"][2]["Expression"] = json!("IF(visible >= 1 AND deleted > 0, 1, 0)");
+    alarms.process("PutMetricAlarm", &config, &scope).unwrap();
+    alarms.evaluate(&domain, end + 60_000).unwrap();
+    assert_eq!(describe()["MetricAlarms"][0]["StateValue"], "ALARM");
+    alarms
+        .process("DeleteAlarms", &json!({"AlarmNames":["stalled"]}), &scope)
+        .unwrap();
+    assert_eq!(describe()["MetricAlarms"], json!([]));
+}
+
+#[test]
+fn invalid_math_queries_fail_before_mutating_existing_alarm() {
+    let scope = ScopeKey {
+        account_id: "000000000000".into(),
+        region: "us-east-1".into(),
+    };
+    let alarms = Alarms::new(None).unwrap();
+    let base = math_alarm();
+    alarms.process("PutMetricAlarm", &base, &scope).unwrap();
+    let mut failures = Vec::new();
+    for expression in [
+        "ANOMALY_DETECTION_BAND(visible)",
+        "SELECT AVG(x)",
+        "IF(visible > 0, 1)",
+        "missing + 1",
+        "stalled + 1",
+        "42",
+        "IF(visible, deleted, 0)",
+        "FILL(deleted, REPEAT)",
+        "visible /",
+        "visible + NaN",
+    ] {
+        let mut bad = base.clone();
+        bad["Metrics"][2]["Expression"] = json!(expression);
+        failures.push(bad);
+    }
+    let mut mixed = base.clone();
+    mixed["Metrics"][0]["MetricStat"]["Period"] = json!(60);
+    failures.push(mixed);
+    let mut duplicate = base.clone();
+    duplicate["Metrics"][1]["Id"] = json!("visible");
+    failures.push(duplicate);
+    let mut returns = base.clone();
+    returns["Metrics"][0]["ReturnData"] = json!(true);
+    failures.push(returns);
+    let mut empty = base.clone();
+    empty["Metrics"] = json!([]);
+    failures.push(empty);
+    let mut both = base.clone();
+    both["Namespace"] = json!("AWS/SQS");
+    failures.push(both);
+    let mut unknown = base.clone();
+    unknown["Metrics"][0]["MetricStat"]["Metric"]["Unexpected"] = json!(1);
+    failures.push(unknown);
+    let mut account = base.clone();
+    account["Metrics"][0]["AccountId"] = json!("111111111111");
+    failures.push(account);
+    let mut deep = base.clone();
+    deep["Metrics"][2]["Expression"] =
+        json!(format!("{}visible{}", "(".repeat(40), ")".repeat(40)));
+    failures.push(deep);
+    for invalid_config in failures {
+        assert!(
+            matches!(
+                alarms.process("PutMetricAlarm", &invalid_config, &scope),
+                Err(MonitoringError::InvalidParameter(_))
+            ),
+            "{invalid_config}"
+        );
+    }
+    let described = alarms
+        .process("DescribeAlarms", &json!({}), &scope)
+        .unwrap();
+    assert_eq!(described["MetricAlarms"][0]["Metrics"], base["Metrics"]);
+    assert_eq!(
+        described["MetricAlarms"][0]["StateValue"],
+        "INSUFFICIENT_DATA"
+    );
+}
+
+#[test]
+fn metric_math_query_wire_preserves_nested_fields_and_rejects_dropped_fields() {
+    let query = QueryRequest::parse(b"Action=PutMetricAlarm&AlarmName=math&Metrics.member.1.Id=m&Metrics.member.1.MetricStat.Metric.Namespace=Test&Metrics.member.1.MetricStat.Metric.MetricName=Errors&Metrics.member.1.MetricStat.Period=60&Metrics.member.1.MetricStat.Stat=Sum&Metrics.member.1.ReturnData=false&Metrics.member.2.Id=e&Metrics.member.2.Expression=IF(m%3E0%2C1%2C0)&Metrics.member.2.ReturnData=true&Metrics.member.2.Label=Errors%20present&EvaluationPeriods=1&Threshold=1&ComparisonOperator=GreaterThanOrEqualToThreshold");
+    let body = query_json(&query).unwrap();
+    assert_eq!(body["Metrics"][0]["ReturnData"], false);
+    assert_eq!(body["Metrics"][0]["MetricStat"]["Period"], 60);
+    assert_eq!(body["Metrics"][1]["Expression"], "IF(m>0,1,0)");
+    let scope = ScopeKey {
+        account_id: "000000000000".into(),
+        region: "us-east-1".into(),
+    };
+    let alarms = Alarms::new(None).unwrap();
+    alarms.process("PutMetricAlarm", &body, &scope).unwrap();
+    let xml = query_xml(
+        &alarms
+            .process("DescribeAlarms", &json!({}), &scope)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(xml.contains("<Metrics><member>"));
+    assert!(xml.contains("<Expression>IF(m&gt;0,1,0)</Expression>"));
+    for field in [
+        "Metrics.member.1.Unknown",
+        "Metrics.member.4.Id",
+        "Metrics.member.1.Period",
+    ] {
+        let mut bad = QueryRequest {
+            params: query.params.clone(),
+        };
+        bad.params.insert(field.into(), "ignored".into());
+        assert!(query_json(&bad).is_err(), "{field}");
+    }
+}
+
+#[test]
+fn metric_math_configuration_survives_encrypted_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "locallycloud-math-alarm-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let db = Arc::new(locallycloud_state::StateDb::open(path.join("state.sqlite3")).unwrap());
+    let persistence = Arc::new(
+        persistence::Persistence::with_cipher(
+            db,
+            locallycloud_state::StateCipher::with_key(&[17; 32]),
+        )
+        .unwrap(),
+    );
+    let scope = ScopeKey {
+        account_id: "000000000000".into(),
+        region: "us-east-2".into(),
+    };
+    let config = math_alarm();
+    let alarms = Alarms::new(Some(persistence.clone())).unwrap();
+    alarms.process("PutMetricAlarm", &config, &scope).unwrap();
+    drop(alarms);
+    let restored = Alarms::new(Some(persistence.clone())).unwrap();
+    let result = restored
+        .process("DescribeAlarms", &json!({}), &scope)
+        .unwrap();
+    assert_eq!(result["MetricAlarms"][0]["Metrics"], config["Metrics"]);
+    let domain = MonitoringDomain::default();
+    restored.evaluate(&domain, now_ms()).unwrap();
+    assert_eq!(
+        restored
+            .process("DescribeAlarms", &json!({}), &scope)
+            .unwrap()["MetricAlarms"][0]["StateValue"],
+        "OK"
+    );
+    assert_eq!(
+        restored
+            .process(
+                "DescribeAlarms",
+                &json!({}),
+                &ScopeKey {
+                    region: "us-east-1".into(),
+                    ..scope
+                }
+            )
+            .unwrap()["MetricAlarms"],
+        json!([])
+    );
+    drop(restored);
+    drop(persistence);
+    std::fs::remove_dir_all(path).unwrap();
+}

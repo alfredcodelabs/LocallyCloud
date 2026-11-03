@@ -120,6 +120,7 @@ impl Provisioner {
                 "VpcId",
                 "GroupName",
                 "GroupDescription",
+                "Tags",
                 "SecurityGroupIngress",
                 "SecurityGroupEgress",
             ],
@@ -145,6 +146,7 @@ impl Provisioner {
                                 "FromPort",
                                 "ToPort",
                                 "CidrIp",
+                                "Description",
                                 if direction == "SecurityGroupIngress" {
                                     "SourceSecurityGroupId"
                                 } else {
@@ -159,9 +161,10 @@ impl Provisioner {
                             "DestinationSecurityGroupId"
                         };
                         let (peer_key, peer_value) = match (rule.get("CidrIp"), rule.get(peer)) {
-                            (Some(_), None) => {
-                                ("CidrIp", required_property(rule, "CidrIp", logical_id)?)
-                            }
+                            (Some(_), None) => (
+                                "IpPermissions.1.IpRanges.1.CidrIp",
+                                required_property(rule, "CidrIp", logical_id)?,
+                            ),
                             (None, Some(_)) => (
                                 "IpPermissions.1.Groups.1.GroupId",
                                 required_property(rule, peer, logical_id)?,
@@ -188,7 +191,14 @@ impl Provisioner {
                         };
                         let from = port("FromPort")?;
                         let to = port("ToPort")?;
-                        Ok::<_, CfnError>((protocol, from, to, peer_key, peer_value))
+                        Ok::<_, CfnError>((
+                            protocol,
+                            from,
+                            to,
+                            peer_key,
+                            peer_value,
+                            super::ecs_sg::rule_description(logical_id, rule)?,
+                        ))
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => {
@@ -200,16 +210,18 @@ impl Provisioner {
         };
         let ingress = parse_rules("SecurityGroupIngress")?;
         let egress = parse_rules("SecurityGroupEgress")?;
+        let mut create_fields = security_group_tag_fields(logical_id, props)?;
+        create_fields.extend([
+            ("VpcId".into(), vpc.clone()),
+            ("GroupName".into(), name),
+            ("GroupDescription".into(), description),
+        ]);
+        let borrowed: Vec<_> = create_fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
         let xml = self
-            .call_ec2(
-                "CreateSecurityGroup",
-                &[
-                    ("VpcId", &vpc),
-                    ("GroupName", &name),
-                    ("GroupDescription", &description),
-                ],
-                logical_id,
-            )
+            .call_ec2("CreateSecurityGroup", &borrowed, logical_id)
             .await?;
         let id = ec2_id(&xml, "groupId", "sg-", logical_id)?;
         let configure = async {
@@ -229,41 +241,45 @@ impl Provisioner {
                 ("AuthorizeSecurityGroupIngress", ingress),
                 ("AuthorizeSecurityGroupEgress", egress),
             ] {
-                for (protocol, from, to, peer_key, peer_value) in rules {
+                for (protocol, from, to, peer_key, peer_value, description) in rules {
                     let nested = peer_key.starts_with("IpPermissions.");
-                    self.call_ec2(
-                        action,
-                        &[
-                            ("GroupId", &id),
-                            (
-                                if nested {
-                                    "IpPermissions.1.IpProtocol"
-                                } else {
-                                    "IpProtocol"
-                                },
-                                &protocol,
-                            ),
-                            (
-                                if nested {
-                                    "IpPermissions.1.FromPort"
-                                } else {
-                                    "FromPort"
-                                },
-                                &from,
-                            ),
-                            (
-                                if nested {
-                                    "IpPermissions.1.ToPort"
-                                } else {
-                                    "ToPort"
-                                },
-                                &to,
-                            ),
-                            (peer_key, &peer_value),
-                        ],
-                        logical_id,
-                    )
-                    .await?;
+                    let mut fields = vec![
+                        ("GroupId", id.as_str()),
+                        (
+                            if nested {
+                                "IpPermissions.1.IpProtocol"
+                            } else {
+                                "IpProtocol"
+                            },
+                            protocol.as_str(),
+                        ),
+                        (
+                            if nested {
+                                "IpPermissions.1.FromPort"
+                            } else {
+                                "FromPort"
+                            },
+                            from.as_str(),
+                        ),
+                        (
+                            if nested {
+                                "IpPermissions.1.ToPort"
+                            } else {
+                                "ToPort"
+                            },
+                            to.as_str(),
+                        ),
+                        (peer_key, peer_value.as_str()),
+                    ];
+                    if let Some(description) = description.as_deref() {
+                        let key = if peer_key.contains("IpRanges") {
+                            "IpPermissions.1.IpRanges.1.Description"
+                        } else {
+                            "IpPermissions.1.Groups.1.Description"
+                        };
+                        fields.push((key, description));
+                    }
+                    self.call_ec2(action, &fields, logical_id).await?;
                 }
             }
             Ok::<_, CfnError>(())
@@ -817,10 +833,146 @@ pub(crate) fn validate_network_property_names(
     ensure_known_properties(logical_id, kind, props, allowed)
 }
 
+fn security_group_tag_fields(id: &str, props: &Value) -> Result<Vec<(String, String)>, CfnError> {
+    let Some(tags) = props.get("Tags") else {
+        return Ok(Vec::new());
+    };
+    let tags = tags
+        .as_array()
+        .filter(|tags| tags.len() <= 50)
+        .ok_or_else(|| CfnError::Validation(format!("{id} requires at most 50 Tags")))?;
+    let mut fields = Vec::new();
+    let mut keys = std::collections::BTreeSet::new();
+    for (index, tag) in tags.iter().enumerate() {
+        ensure_known_properties(id, "Tag", tag, &["Key", "Value"])?;
+        let key = tag
+            .get("Key")
+            .and_then(Value::as_str)
+            .filter(|key| {
+                !key.is_empty()
+                    && key.chars().count() <= 127
+                    && !key.to_ascii_lowercase().starts_with("aws:")
+                    && !key.contains('\0')
+            })
+            .ok_or_else(|| CfnError::Validation(format!("{id} requires a valid Tag Key")))?;
+        let value = tag
+            .get("Value")
+            .and_then(Value::as_str)
+            .filter(|value| value.chars().count() <= 256 && !value.contains('\0'))
+            .ok_or_else(|| CfnError::Validation(format!("{id} requires a valid Tag Value")))?;
+        if !keys.insert(key) {
+            return Err(CfnError::Validation(format!("{id} has duplicate Tag Key")));
+        }
+        fields.push((
+            format!("TagSpecification.1.Tag.{}.Key", index + 1),
+            key.into(),
+        ));
+        fields.push((
+            format!("TagSpecification.1.Tag.{}.Value", index + 1),
+            value.into(),
+        ));
+    }
+    if !fields.is_empty() {
+        fields.push((
+            "TagSpecification.1.ResourceType".into(),
+            "security-group".into(),
+        ));
+    }
+    Ok(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn security_group_tags_and_inline_descriptions_reach_native_ec2() {
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_ec2::register(&registry);
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let vpc = p
+            .ec2_vpc("Vpc", &json!({"CidrBlock":"10.55.0.0/16"}))
+            .await
+            .unwrap();
+        let props = json!({"VpcId":vpc.ref_value,"GroupDescription":"tagged group", "Tags":[{"Key":"Owner","Value":"Accounting&Ops"}],"SecurityGroupIngress":[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"CidrIp":"10.55.0.0/16","Description":"SAP delivery"}],"SecurityGroupEgress":[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"CidrIp":"0.0.0.0/0","Description":"SAP outbound"}]});
+        let group = p
+            .ec2_security_group("Group", "accounting", &props)
+            .await
+            .unwrap();
+        let xml = p
+            .call_ec2(
+                "DescribeSecurityGroups",
+                &[("GroupId.1", &group.ref_value)],
+                "Group",
+            )
+            .await
+            .unwrap();
+        assert!(xml.contains("<key>Owner</key><value>Accounting&amp;Ops</value>"));
+        assert!(xml.contains("<description>SAP delivery</description>"));
+        assert!(xml.contains("<description>SAP outbound</description>"));
+        let snapshot = |xml: String| {
+            xml.split_once("<securityGroupInfo>")
+                .unwrap()
+                .1
+                .split_once("</securityGroupInfo>")
+                .unwrap()
+                .0
+                .to_owned()
+        };
+        let before = snapshot(
+            p.call_ec2("DescribeSecurityGroups", &[], "Groups")
+                .await
+                .unwrap(),
+        );
+        for (field, value) in [
+            ("Tags", json!([{"Key":"x","Value":2}])),
+            (
+                "Tags",
+                json!([{"Key":"x","Value":"y"},{"Key":"x","Value":"z"}]),
+            ),
+            (
+                "SecurityGroupIngress",
+                json!([{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"CidrIp":"0.0.0.0/0","Description":"bad\nvalue"}]),
+            ),
+        ] {
+            let mut invalid = props.clone();
+            invalid[field] = value;
+            assert!(p
+                .ec2_security_group("Invalid", "accounting", &invalid)
+                .await
+                .is_err());
+            assert_eq!(
+                snapshot(
+                    p.call_ec2("DescribeSecurityGroups", &[], "Groups")
+                        .await
+                        .unwrap()
+                ),
+                before
+            );
+        }
+        let mut invalid_rule = props.clone();
+        invalid_rule["SecurityGroupIngress"][0]["CidrIp"] = json!("invalid-cidr");
+        assert!(p
+            .ec2_security_group("Rollback", "accounting", &invalid_rule)
+            .await
+            .is_err());
+        assert_eq!(
+            snapshot(
+                p.call_ec2("DescribeSecurityGroups", &[], "Groups")
+                    .await
+                    .unwrap()
+            ),
+            before
+        );
+        p.delete_ec2("DeleteSecurityGroup", "GroupId", &group.ref_value)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn security_group_explicit_egress_and_failed_rule_cleanup() {

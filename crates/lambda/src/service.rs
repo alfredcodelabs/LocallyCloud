@@ -1292,6 +1292,9 @@ impl LambdaHandler {
                     )
                     .into_response(&req.request_id);
                 }
+                if let Err(error) = executor.validate_async_capacity(account, region, &func) {
+                    return error.into_response(&req.request_id);
+                }
                 let payload = invoke_payload(&req.body);
                 let mut cfg = self.async_config(account, region, &name);
                 // The DeadLetterConfig ARN is the OnFailure fallback when no destination is set.

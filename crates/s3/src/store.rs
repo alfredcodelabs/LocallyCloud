@@ -463,6 +463,12 @@ pub struct BucketState {
     pub cors: Option<Vec<CorsRule>>,
     pub policy: Option<String>,
     pub website: Option<String>,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
+    #[serde(default)]
+    pub logging: Option<String>,
+    #[serde(default)]
+    pub ownership_controls: Option<String>,
     pub object_lock: Option<ObjectLockConfiguration>,
     pub public_access_block: Option<PublicAccessBlock>,
     pub encryption: ServerSideEncryption,
@@ -576,6 +582,9 @@ impl AccountStore {
                         cors: None,
                         policy: None,
                         website: None,
+                        lifecycle: None,
+                        logging: None,
+                        ownership_controls: None,
                         object_lock: object_lock_enabled.then_some(ObjectLockConfiguration {
                             default_retention: None,
                         }),
@@ -1069,6 +1078,9 @@ impl BucketState {
             cors: &'a Option<Vec<CorsRule>>,
             policy: &'a Option<String>,
             website: &'a Option<String>,
+            lifecycle: &'a Option<String>,
+            logging: &'a Option<String>,
+            ownership_controls: &'a Option<String>,
             object_lock: &'a Option<ObjectLockConfiguration>,
             public_access_block: &'a Option<PublicAccessBlock>,
             encryption: &'a ServerSideEncryption,
@@ -1083,6 +1095,9 @@ impl BucketState {
             cors: &self.cors,
             policy: &self.policy,
             website: &self.website,
+            lifecycle: &self.lifecycle,
+            logging: &self.logging,
+            ownership_controls: &self.ownership_controls,
             object_lock: &self.object_lock,
             public_access_block: &self.public_access_block,
             encryption: &self.encryption,

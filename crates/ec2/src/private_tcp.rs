@@ -231,6 +231,7 @@ mod tests {
                     description: String::new(),
                     owner: "111".into(),
                     is_default: false,
+                    tags: BTreeMap::new(),
                     ingress: Vec::new(),
                     egress: default_egress(),
                     guard: Arc::new(()),
@@ -285,6 +286,7 @@ mod tests {
                     from_port: Some(5432),
                     to_port: Some(5432),
                     peer: RulePeer::Cidr("10.7.1.0/24".parse().unwrap()),
+                    description: None,
                 });
         }
         assert_eq!(access(), Some(endpoint));
@@ -324,6 +326,7 @@ mod tests {
                     from_port: Some(5432),
                     to_port: Some(5432),
                     peer: RulePeer::Cidr(all),
+                    description: None,
                 });
             scope
                 .route_tables
@@ -392,6 +395,7 @@ mod tests {
                 description: String::new(),
                 owner: "111".into(),
                 is_default: false,
+                tags: BTreeMap::new(),
                 ingress: Vec::new(),
                 egress: default_egress(),
                 guard: Arc::new(()),

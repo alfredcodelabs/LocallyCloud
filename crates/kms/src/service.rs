@@ -84,7 +84,7 @@ impl KmsService {
     ) -> Result<Value, KmsError> {
         let scope = Scope::new(account_id, region);
         match operation {
-            "CreateKey" => self.create_key(body, &scope),
+            "CreateKey" => self.create_key(body, &scope, None),
             "CreateAlias" => self.create_alias(body, &scope),
             "UpdateAlias" => self.update_alias(body, &scope),
             "DeleteAlias" => self.delete_alias(body, &scope),
@@ -94,6 +94,8 @@ impl KmsService {
             "EnableKey" => self.set_enabled(body, &scope, true),
             "ListKeys" => self.list_keys(body, &scope),
             "ListResourceTags" => self.list_resource_tags(body, &scope),
+            "TagResource" => self.tag_resource(body, &scope),
+            "UntagResource" => self.untag_resource(body, &scope),
             "Encrypt" => self.encrypt(body, &scope),
             "Decrypt" => self.decrypt(body, &scope),
             "GenerateDataKey" => self.generate_data_key(body, &scope),
@@ -562,6 +564,7 @@ fn new_key_record(
         explicit_policy: false,
         material_version: 1,
         material: crypto::generate_material()?,
+        tags: BTreeMap::new(),
     })
 }
 

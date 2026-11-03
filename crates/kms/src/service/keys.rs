@@ -1,10 +1,57 @@
 use super::*;
 
+fn validate_tag_key(key: &str) -> Result<(), KmsError> {
+    if key.is_empty()
+        || key.chars().count() > 128
+        || key.to_ascii_lowercase().starts_with("aws:")
+        || key.chars().any(char::is_control)
+    {
+        return Err(KmsError::Validation);
+    }
+    Ok(())
+}
+
+fn parse_tags(value: &Value) -> Result<BTreeMap<String, String>, KmsError> {
+    let entries = value.as_array().ok_or(KmsError::Validation)?;
+    if entries.len() > 50 {
+        return Err(KmsError::TagLimitExceeded);
+    }
+    let mut tags = BTreeMap::new();
+    for entry in entries {
+        let tag = entry.as_object().ok_or(KmsError::Validation)?;
+        require_known_fields(tag, &["TagKey", "TagValue"])?;
+        let key = required_string(tag, "TagKey")?;
+        validate_tag_key(key)?;
+        let value = tag
+            .get("TagValue")
+            .and_then(Value::as_str)
+            .ok_or(KmsError::Validation)?;
+        if value.chars().count() > 256
+            || value.chars().any(char::is_control)
+            || tags.insert(key.to_owned(), value.to_owned()).is_some()
+        {
+            return Err(KmsError::Validation);
+        }
+    }
+    Ok(tags)
+}
+
+fn validate_tag_mutation(key: &KeyRecord) -> Result<(), KmsError> {
+    if key.manager != KeyManager::Customer {
+        return Err(KmsError::AccessDenied);
+    }
+    if matches!(key.state, KeyState::PendingDeletion { .. }) {
+        return Err(KmsError::InvalidState);
+    }
+    Ok(())
+}
+
 impl KmsService {
-    pub(super) fn create_key(
+    pub(crate) fn create_key(
         &self,
         body: &Map<String, Value>,
         scope: &Scope,
+        planned_key_id: Option<String>,
     ) -> Result<Value, KmsError> {
         require_known_fields(
             body,
@@ -22,7 +69,7 @@ impl KmsService {
                 "XksKeyId",
             ],
         )?;
-        for unsupported in ["CustomKeyStoreId", "Tags", "XksKeyId"] {
+        for unsupported in ["CustomKeyStoreId", "XksKeyId"] {
             if body.contains_key(unsupported) {
                 return Err(KmsError::Unsupported);
             }
@@ -41,9 +88,14 @@ impl KmsService {
             return Err(KmsError::Validation);
         }
 
+        let tags = body
+            .get("Tags")
+            .map(parse_tags)
+            .transpose()?
+            .unwrap_or_default();
         let material = crypto::generate_material()?;
         let creation_date = now_epoch()?;
-        let key_id = Uuid::new_v4().to_string();
+        let key_id = planned_key_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let policy = match optional_string(body, "Policy")? {
             Some(raw) => KeyPolicy::parse(raw.to_owned())?,
             None => KeyPolicy::default_for(&scope.account_id),
@@ -71,6 +123,7 @@ impl KmsService {
             explicit_policy,
             material_version: 1,
             material,
+            tags,
         };
         if !self.store.insert(scope, record)? {
             return Err(KmsError::Internal);
@@ -168,14 +221,112 @@ impl KmsService {
         scope: &Scope,
     ) -> Result<Value, KmsError> {
         require_known_fields(body, &["KeyId", "Limit", "Marker"])?;
-        let key_id = self.resolve_key_id(required_string(body, "KeyId")?, scope)?;
+        let key_id = parse_direct_key_id(required_string(body, "KeyId")?, scope)?;
+        let limit = match body.get("Limit") {
+            None => 50,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (1..=50).contains(n))
+                .ok_or(KmsError::Validation)? as usize,
+        };
+        let after = optional_string(body, "Marker")?
+            .map(|marker| {
+                if marker.len() > 1024 {
+                    return Err(KmsError::InvalidMarker);
+                }
+                let decoded = STANDARD
+                    .decode(marker)
+                    .map_err(|_| KmsError::InvalidMarker)?;
+                let (account, region, id, last): (String, String, String, String) =
+                    serde_json::from_slice(&decoded).map_err(|_| KmsError::InvalidMarker)?;
+                if account != scope.account_id || region != scope.region || id != key_id {
+                    return Err(KmsError::InvalidMarker);
+                }
+                Ok(last)
+            })
+            .transpose()?;
         self.store
-            .with_key(
-                scope,
-                &key_id,
-                |_| json!({ "Tags": [], "Truncated": false }),
-            )
-            .ok_or(KmsError::NotFound)
+            .with_key(scope, &key_id, |key| {
+                let entries: Vec<_> = key
+                    .tags
+                    .iter()
+                    .filter(|(name, _)| after.as_ref().is_none_or(|after| *name > after))
+                    .take(limit + 1)
+                    .collect();
+                let truncated = entries.len() > limit;
+                let tags: Vec<_> = entries
+                    .iter()
+                    .take(limit)
+                    .map(|(name, value)| json!({"TagKey":name,"TagValue":value}))
+                    .collect();
+                let mut response = json!({"Tags":tags,"Truncated":truncated});
+                if truncated {
+                    if let Some((last, _)) = entries.get(limit - 1) {
+                        let marker =
+                            serde_json::to_vec(&(&scope.account_id, &scope.region, &key_id, last))
+                                .map_err(|_| KmsError::Internal)?;
+                        response["NextMarker"] = json!(STANDARD.encode(marker));
+                    }
+                }
+                Ok(response)
+            })
+            .ok_or(KmsError::NotFound)?
+    }
+
+    pub(super) fn tag_resource(
+        &self,
+        body: &Map<String, Value>,
+        scope: &Scope,
+    ) -> Result<Value, KmsError> {
+        require_known_fields(body, &["KeyId", "Tags"])?;
+        let id = parse_direct_key_id(required_string(body, "KeyId")?, scope)?;
+        let tags = parse_tags(body.get("Tags").ok_or(KmsError::Validation)?)?;
+        if tags.is_empty() {
+            return Err(KmsError::Validation);
+        }
+        self.store
+            .with_key_mut(scope, &id, |key| {
+                validate_tag_mutation(key)?;
+                key.tags.extend(tags);
+                if key.tags.len() > 50 {
+                    return Err(KmsError::TagLimitExceeded);
+                }
+                Ok(())
+            })?
+            .ok_or(KmsError::NotFound)?;
+        Ok(json!({}))
+    }
+
+    pub(super) fn untag_resource(
+        &self,
+        body: &Map<String, Value>,
+        scope: &Scope,
+    ) -> Result<Value, KmsError> {
+        require_known_fields(body, &["KeyId", "TagKeys"])?;
+        let id = parse_direct_key_id(required_string(body, "KeyId")?, scope)?;
+        let keys = body
+            .get("TagKeys")
+            .and_then(Value::as_array)
+            .filter(|keys| !keys.is_empty() && keys.len() <= 50)
+            .ok_or(KmsError::Validation)?;
+        let keys = keys
+            .iter()
+            .map(|key| {
+                let key = key.as_str().ok_or(KmsError::Validation)?;
+                validate_tag_key(key)?;
+                Ok(key)
+            })
+            .collect::<Result<Vec<_>, KmsError>>()?;
+        self.store
+            .with_key_mut(scope, &id, |key| {
+                validate_tag_mutation(key)?;
+                for name in keys {
+                    key.tags.remove(name);
+                }
+                Ok(())
+            })?
+            .ok_or(KmsError::NotFound)?;
+        Ok(json!({}))
     }
 
     pub(super) fn get_key_rotation_status(

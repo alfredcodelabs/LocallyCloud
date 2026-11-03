@@ -33,11 +33,11 @@ impl ScanBy {
 }
 
 #[derive(Debug)]
-struct MetricStatQuery {
-    key: MetricKey,
-    period_ms: i64,
-    stat: Statistic,
-    unit: Option<MetricUnit>,
+pub(crate) struct MetricStatQuery {
+    pub(crate) key: MetricKey,
+    pub(crate) period_ms: i64,
+    pub(crate) stat: Statistic,
+    pub(crate) unit: Option<MetricUnit>,
 }
 
 #[derive(Debug)]
@@ -119,7 +119,10 @@ fn valid_period(period: u64) -> bool {
         && (matches!(period, 1 | 5 | 10 | 20 | 30) || period.is_multiple_of(60))
 }
 
-fn parse_metric_stat(value: &Value, member: &str) -> Result<MetricStatQuery, MonitoringError> {
+pub(crate) fn parse_metric_stat(
+    value: &Value,
+    member: &str,
+) -> Result<MetricStatQuery, MonitoringError> {
     let metric = json_field(value, "Metric")
         .filter(|metric| metric.is_object())
         .ok_or_else(|| invalid(format!("{member}.MetricStat.Metric is required")))?;

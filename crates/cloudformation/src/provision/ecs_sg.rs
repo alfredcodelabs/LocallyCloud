@@ -16,9 +16,31 @@ pub(super) fn validate_sg_rule_names(id: &str, kind: &str, props: &Value) -> Res
             "FromPort",
             "ToPort",
             "CidrIp",
+            "Description",
             peer,
         ],
     )
+}
+pub(super) fn rule_description(id: &str, props: &Value) -> Result<Option<String>, CfnError> {
+    props
+        .get("Description")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| {
+                    value.len() <= 255
+                        && value.chars().all(|ch| {
+                            ch.is_ascii_alphanumeric() || " ._-:/()#,@[]+=&;{}!$*".contains(ch)
+                        })
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CfnError::Validation(format!(
+                        "{id} requires a valid rule Description of at most 255 characters"
+                    ))
+                })
+        })
+        .transpose()
 }
 fn rule_fields(id: &str, kind: &str, props: &Value) -> Result<Vec<(String, String)>, CfnError> {
     validate_sg_rule_names(id, kind, props)?;
@@ -73,6 +95,14 @@ fn rule_fields(id: &str, kind: &str, props: &Value) -> Result<Vec<(String, Strin
         return Err(CfnError::Validation(format!(
             "{id} protocol -1 ports must be absent or zero"
         )));
+    }
+    if let Some(description) = rule_description(id, props)? {
+        let description_key = if key.contains("IpRanges") {
+            "IpPermissions.1.IpRanges.1.Description"
+        } else {
+            "IpPermissions.1.Groups.1.Description"
+        };
+        fields.push((description_key.into(), description));
     }
     Ok(fields)
 }
@@ -151,12 +181,21 @@ mod tests {
             .await
             .unwrap();
         let b = provisioner.ec2_security_group("B","stack",&json!({"VpcId":vpc.ref_value,"GroupDescription":"task","SecurityGroupIngress":[{"IpProtocol":"tcp","FromPort":8081,"ToPort":8081,"SourceSecurityGroupId":a.ref_value}]})).await.unwrap();
-        let props = json!({"GroupId":b.ref_value,"IpProtocol":"tcp","FromPort":8080,"ToPort":8080,"SourceSecurityGroupId":a.ref_value});
+        let props = json!({"GroupId":b.ref_value,"IpProtocol":"tcp","FromPort":8080,"ToPort":8080,"SourceSecurityGroupId":a.ref_value,"Description":"presentation worker"});
         let rule = provisioner
             .ecs_sg_rule("Ingress", "AWS::EC2::SecurityGroupIngress", &props, false)
             .await
             .unwrap();
         assert!(rule.ref_value.starts_with("sgr-"));
+        let described = provisioner
+            .call_ec2(
+                "DescribeSecurityGroups",
+                &[("GroupId.1", &b.ref_value)],
+                "B",
+            )
+            .await
+            .unwrap();
+        assert!(described.contains("<description>presentation worker</description>"));
         assert!(provisioner
             .ecs_sg_rule("Duplicate", "AWS::EC2::SecurityGroupIngress", &props, false)
             .await

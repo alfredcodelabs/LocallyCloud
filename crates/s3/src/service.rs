@@ -1037,6 +1037,20 @@ impl S3Handler {
     }
 
     fn known_strict_operation(req: &ServiceRequest, shape: &Shape, q: &QueryParams) -> bool {
+        if matches!(shape, Shape::Bucket(_))
+            && [
+                "lifecycle",
+                "logging",
+                "ownershipControls",
+                "tagging",
+                "publicAccessBlock",
+            ]
+            .iter()
+            .any(|key| q.has(key) && q.only_keys(&[key]))
+        {
+            return matches!(req.method, Method::GET | Method::PUT)
+                || (req.method == Method::DELETE && !q.has("logging"));
+        }
         match (&req.method, shape) {
             (&Method::GET, Shape::Service) => q.only_keys(&[]),
             (&Method::OPTIONS, Shape::Bucket(_) | Shape::Object(_, _)) => true,
@@ -1246,16 +1260,6 @@ impl S3Handler {
                 "SSE-C and additional KMS encryption context are not implemented".into(),
             ));
         }
-        if self.strict_request(req)
-            && req
-                .headers
-                .keys()
-                .any(|name| name == "x-amz-acl" || name.as_str().starts_with("x-amz-grant-"))
-        {
-            return Err(S3Error::NotImplemented(
-                "strict object ACL grants and ownership modes are not implemented".into(),
-            ));
-        }
         let host = req.headers.get("host").and_then(|v| v.to_str().ok());
         let q = QueryParams::parse(req.uri.query());
         let dispatcher = self
@@ -1334,11 +1338,82 @@ impl S3Handler {
         let shape = resolve(host, req.uri.path());
         if let Shape::Bucket(bucket) | Shape::Object(bucket, _) = &shape {
             self.check_expected_owner(req, bucket, "x-amz-expected-bucket-owner")?;
+            if req.method == Method::PUT && q.has("acl") {
+                let state = ops::bucket_configuration::ownership_enforced(&ctx, bucket).await?;
+                return Err(if state {
+                    S3Error::AccessControlListNotSupported
+                } else {
+                    S3Error::NotImplemented("ACL updates are not supported".into())
+                });
+            }
+            if self.strict_request(req)
+                && req
+                    .headers
+                    .keys()
+                    .any(|name| name == "x-amz-acl" || name.as_str().starts_with("x-amz-grant-"))
+            {
+                ops::bucket_configuration::validate_acl(&ctx, bucket, &req.headers).await?;
+                if !ops::bucket_configuration::ownership_enforced(&ctx, bucket).await? {
+                    return Err(S3Error::NotImplemented(
+                        "strict object ACL grants and ownership modes are not implemented".into(),
+                    ));
+                }
+            }
         }
         if self.strict_request(req) && !Self::known_strict_operation(req, &shape, &q) {
             return Err(S3Error::NotImplemented(
                 "strict IAM authorization is not mapped for this S3 operation".into(),
             ));
+        }
+        if let Shape::Bucket(name) = &shape {
+            use ops::bucket_configuration::{self, Kind};
+            let configuration = [
+                (
+                    "lifecycle",
+                    Kind::Lifecycle,
+                    "s3:GetLifecycleConfiguration",
+                    "s3:PutLifecycleConfiguration",
+                ),
+                (
+                    "logging",
+                    Kind::Logging,
+                    "s3:GetBucketLogging",
+                    "s3:PutBucketLogging",
+                ),
+                (
+                    "ownershipControls",
+                    Kind::Ownership,
+                    "s3:GetBucketOwnershipControls",
+                    "s3:PutBucketOwnershipControls",
+                ),
+            ]
+            .into_iter()
+            .find(|(key, ..)| q.has(key));
+            if let Some((key, kind, read, write)) = configuration {
+                if !q.only_keys(&[key]) {
+                    return Err(S3Error::InvalidArgument(
+                        "Conflicting bucket subresources".into(),
+                    ));
+                }
+                self.authorize_action(
+                    req,
+                    if req.method == Method::GET {
+                        read
+                    } else {
+                        write
+                    },
+                    &format!("arn:aws:s3:::{name}"),
+                )
+                .await?;
+                return match req.method {
+                    Method::GET => bucket_configuration::get(&ctx, name, kind).await,
+                    Method::PUT => bucket_configuration::put(&ctx, name, kind, &req.body).await,
+                    Method::DELETE if key != "logging" => {
+                        bucket_configuration::delete(&ctx, name, kind).await
+                    }
+                    _ => Err(S3Error::MethodNotAllowed),
+                };
+            }
         }
         match (&req.method, &shape) {
             (&Method::GET, Shape::Service) => {
@@ -1373,6 +1448,8 @@ impl S3Handler {
                 ops::put_bucket_versioning(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("tagging") => {
+                self.authorize_action(req, "s3:PutBucketTagging", &format!("arn:aws:s3:::{b}"))
+                    .await?;
                 ops::put_bucket_tagging(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("cors") => {
@@ -1391,6 +1468,12 @@ impl S3Handler {
                 ops::put_bucket_object_lock(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) if q.has("publicAccessBlock") => {
+                self.authorize_action(
+                    req,
+                    "s3:PutBucketPublicAccessBlock",
+                    &format!("arn:aws:s3:::{b}"),
+                )
+                .await?;
                 ops::put_bucket_public_access_block(&ctx, b, &req.body).await
             }
             (&Method::PUT, Shape::Bucket(b)) => {
@@ -1408,6 +1491,8 @@ impl S3Handler {
                 ops::delete_bucket_encryption(&ctx, b).await
             }
             (&Method::DELETE, Shape::Bucket(b)) if q.has("tagging") => {
+                self.authorize_action(req, "s3:PutBucketTagging", &format!("arn:aws:s3:::{b}"))
+                    .await?;
                 ops::delete_bucket_tagging(&ctx, b).await
             }
             (&Method::DELETE, Shape::Bucket(b)) if q.has("cors") => {
@@ -1419,6 +1504,12 @@ impl S3Handler {
                 ops::delete_bucket_policy(&ctx, b).await
             }
             (&Method::DELETE, Shape::Bucket(b)) if q.has("publicAccessBlock") => {
+                self.authorize_action(
+                    req,
+                    "s3:PutBucketPublicAccessBlock",
+                    &format!("arn:aws:s3:::{b}"),
+                )
+                .await?;
                 ops::delete_bucket_public_access_block(&ctx, b).await
             }
             (&Method::DELETE, Shape::Bucket(_)) if q.has("website") => {
@@ -1504,7 +1595,15 @@ impl S3Handler {
                     }
                     Some(BucketRead::Acl) => ops::get_bucket_acl(&ctx, b).await,
                     Some(BucketRead::Cors) => ops::get_bucket_cors(&ctx, b).await,
-                    Some(BucketRead::Tagging) => ops::get_bucket_tagging(&ctx, b).await,
+                    Some(BucketRead::Tagging) => {
+                        self.authorize_action(
+                            req,
+                            "s3:GetBucketTagging",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
+                        ops::get_bucket_tagging(&ctx, b).await
+                    }
                     Some(BucketRead::Lifecycle) => ops::get_bucket_lifecycle(&ctx, b).await,
                     Some(BucketRead::Replication) => ops::get_bucket_replication(&ctx, b).await,
                     Some(BucketRead::Encryption) => {
@@ -1536,6 +1635,12 @@ impl S3Handler {
                         ops::get_bucket_ownership_controls(&ctx, b).await
                     }
                     Some(BucketRead::PublicAccessBlock) => {
+                        self.authorize_action(
+                            req,
+                            "s3:GetBucketPublicAccessBlock",
+                            &format!("arn:aws:s3:::{b}"),
+                        )
+                        .await?;
                         ops::get_bucket_public_access_block(&ctx, b).await
                     }
                     None => {
@@ -6558,3 +6663,6 @@ mod encryption_storage_tests {
 #[cfg(test)]
 #[path = "visibility_tests.rs"]
 mod visibility_tests;
+
+#[cfg(test)]
+mod bucket_configuration_tests;

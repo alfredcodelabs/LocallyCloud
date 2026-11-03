@@ -1597,9 +1597,41 @@ impl Executor {
         }
     }
 
-    async fn reserve_memory(&self, env_key: &str, memory_mb: u64) -> Result<(), LambdaError> {
+    fn required_memory(&self, memory_mb: u64) -> Result<u64, LambdaError> {
         // Include bounded log capture and supervisor overhead in addition to guest memory.
         let required = memory_mb.saturating_add(32);
+        if required > self.memory_budget_mb {
+            return Err(self.memory_capacity_error(required));
+        }
+        Ok(required)
+    }
+
+    fn memory_capacity_error(&self, required: u64) -> LambdaError {
+        LambdaError::LocalCapacityExceeded(format!(
+            "Local compute memory budget exhausted ({required} MiB required, {} MiB budget). Reduce simultaneous work or increase LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB within available host RAM.",
+            self.memory_budget_mb
+        ))
+    }
+
+    /// Reject permanently impossible events before acknowledging asynchronous acceptance.
+    /// Transient contention is handled by the atomic reservation when execution starts.
+    pub(crate) fn validate_async_capacity(
+        &self,
+        account: &str,
+        region: &str,
+        func: &LambdaFunction,
+    ) -> Result<(), LambdaError> {
+        self.required_memory(u64::from(func.memory_size))
+            .map(|_| ())
+            .inspect_err(|_| {
+                self.metrics
+                    .recorder()
+                    .record_host_capacity(account, region, &func.function_name);
+            })
+    }
+
+    async fn reserve_memory(&self, env_key: &str, memory_mb: u64) -> Result<(), LambdaError> {
+        let required = self.required_memory(memory_mb)?;
         loop {
             {
                 let mut reservations = self.memory_reservations.lock().unwrap();
@@ -1631,9 +1663,7 @@ impl Executor {
             };
             match idle {
                 Some(key) => self.stop_env(&key).await,
-                None => return Err(LambdaError::LocalCapacityExceeded(
-                    format!("Local compute memory budget exhausted ({required} MiB required, {} MiB budget). Reduce simultaneous work or increase LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB within available host RAM.", self.memory_budget_mb)
-                )),
+                None => return Err(self.memory_capacity_error(required)),
             }
         }
     }
@@ -2722,7 +2752,16 @@ impl Executor {
                     }
                     // Retry on function error/timeout until attempts are exhausted.
                 }
-                Err(_) => break, // a control error (e.g. bad config) is not retried
+                Err(error) => {
+                    tracing::warn!(
+                        account,
+                        region,
+                        function = %func.function_name,
+                        error_code = error.code(),
+                        "asynchronous Lambda invocation failed before a function result"
+                    );
+                    break; // A control error is not a function error and is not retried.
+                }
             }
         }
 
@@ -3212,7 +3251,16 @@ mod tests {
                 .await,
             Err(LambdaError::LocalCapacityExceeded(_))
         ));
-        assert!(exec.memory_reservations.lock().unwrap().is_empty());
+        // An impossible invocation must not evict a healthy warm function.
+        assert_eq!(exec.owned_envs.len(), 1);
+        assert_eq!(
+            exec.memory_reservations
+                .lock()
+                .unwrap()
+                .values()
+                .sum::<u64>(),
+            160
+        );
         let invalid = func("provided.al2023", 10, code);
         assert!(exec
             .cold_start(
@@ -3228,6 +3276,91 @@ mod tests {
         assert!(exec.owned_envs.is_empty());
         assert!(exec.log_state.is_empty());
         assert!(exec.stopping.is_empty());
+    }
+
+    #[tokio::test]
+    async fn impossible_async_events_reject_before_acceptance_without_guest_or_reservation() {
+        use base64::Engine;
+        use locallycloud_core::handler::{NativeHandler, ServiceRequest};
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        let registry = observability_registry(metrics.clone());
+        let (exec, starts) = build_executor_tracked(
+            Arc::new(InvocationBroker::new()),
+            GuestBehavior::EchoUppercaseLen,
+        )
+        .await;
+        let exec = Arc::new(exec.with_service_registry(Arc::downgrade(&registry)));
+        let handler = Arc::new(crate::service::LambdaHandler::with_executor(exec.clone()));
+        let make_request = |region: &str, path: &str, body: Vec<u8>| ServiceRequest {
+            method: http::Method::POST,
+            uri: path.parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            body: body.into(),
+            region: region.into(),
+            account_id: "000000000000".into(),
+            request_id: "async-capacity".into(),
+        };
+        let mut pending = tokio::task::JoinSet::new();
+        for region in ["us-east-1", "us-east-2"] {
+            let code =
+                base64::engine::general_purpose::STANDARD.encode(zip_with(&[("index.js", b"x")]));
+            let body = serde_json::json!({
+                "FunctionName": "provider",
+                "Role": "arn:aws:iam::000000000000:role/r",
+                "Runtime": "nodejs22.x",
+                "Handler": "index.handler",
+                "MemorySize": 1024,
+                "Code": {"ZipFile": code}
+            });
+            let response = handler
+                .handle(make_request(
+                    region,
+                    "/2015-03-31/functions",
+                    serde_json::to_vec(&body).unwrap(),
+                ))
+                .await;
+            assert_eq!(response.status(), 201);
+            for _ in 0..4 {
+                let mut request = make_request(
+                    region,
+                    "/2015-03-31/functions/provider/invocations",
+                    b"{}".to_vec(),
+                );
+                request
+                    .headers
+                    .insert("x-amz-invocation-type", "Event".parse().unwrap());
+                let handler = handler.clone();
+                pending.spawn(async move { handler.handle(request).await });
+            }
+        }
+        while let Some(response) = pending.join_next().await {
+            let response = response.unwrap();
+            assert_eq!(response.status(), 503);
+            assert_eq!(
+                response.headers()["x-amzn-errortype"],
+                "LocalCapacityExceededException"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let message = body["Message"].as_str().unwrap();
+            assert!(message.contains("1056 MiB required, 1024 MiB budget"));
+            assert!(message.contains("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB"));
+        }
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(exec.memory_reservations.lock().unwrap().is_empty());
+        assert!(exec.owned_envs.is_empty());
+        flush_metrics(&exec);
+        let observations = metrics.observations.lock().unwrap();
+        assert_eq!(
+            observations.iter().map(|point| point.value).sum::<f64>(),
+            8.0
+        );
+        assert!(observations.iter().all(|point| {
+            point.namespace == "LocallyCloud/Lambda" && point.metric_name == "HostCapacityExceeded"
+        }));
     }
 
     #[tokio::test]

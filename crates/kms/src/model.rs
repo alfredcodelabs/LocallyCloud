@@ -88,6 +88,7 @@ pub(crate) struct KeyRecord {
     pub(crate) explicit_policy: bool,
     pub(crate) material_version: u32,
     pub(crate) material: SecretMaterial,
+    pub(crate) tags: std::collections::BTreeMap<String, String>,
 }
 
 impl KeyRecord {

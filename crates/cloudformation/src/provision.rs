@@ -31,6 +31,7 @@ pub(crate) use ecs_alb::validate_ecs_alb_property_names;
 mod firehose;
 mod kinesis;
 mod monitoring;
+mod s3_configuration;
 mod scheduler;
 pub(crate) use ec2::validate_network_property_names;
 
@@ -156,6 +157,11 @@ impl Provisioner {
         resource_type: &str,
         properties: &Value,
     ) -> Result<ResolvedResource, CfnError> {
+        tracing::debug!(
+            logical_id,
+            resource_type,
+            "provisioning CloudFormation resource"
+        );
         match resource_type {
             kind if is_custom_resource(kind) => {
                 self.custom_resource(logical_id, kind, properties, None, None)
@@ -470,6 +476,7 @@ impl Provisioner {
             }
             "AWS::KMS::Key" => {
                 self.update_kms_key(logical_id, current, previous_properties, properties)
+                    .await
             }
             "AWS::KMS::Alias" => {
                 self.update_kms_alias(logical_id, current, previous_properties, properties)
@@ -1202,6 +1209,9 @@ impl Provisioner {
         if let Some(policy) = props.get("KeyPolicy") {
             body.insert("Policy".into(), Value::String(policy.to_string()));
         }
+        if props.get("Tags").is_some() {
+            body.insert("Tags".into(), kms_tags(logical_id, props)?);
+        }
         let response = self
             .call_aws_json_11(
                 "kms",
@@ -1226,7 +1236,7 @@ impl Provisioner {
         })
     }
 
-    fn update_kms_key(
+    async fn update_kms_key(
         &self,
         logical_id: &str,
         current: &ResolvedResource,
@@ -1240,8 +1250,88 @@ impl Provisioner {
             "AWS::KMS::Key",
             previous,
             props,
-            &["PendingWindowInDays"],
+            &["PendingWindowInDays", "Tags"],
         )?;
+        if previous.get("Tags") != props.get("Tags") {
+            let previous_tags = kms_tags(logical_id, previous)?;
+            let desired_tags = kms_tags(logical_id, props)?;
+            let desired = desired_tags
+                .as_array()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let old = previous_tags
+                .as_array()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let removed: Vec<_> = old
+                .iter()
+                .filter(|tag| !desired.iter().any(|new| new["TagKey"] == tag["TagKey"]))
+                .map(|tag| tag["TagKey"].clone())
+                .collect();
+            let snapshot = self
+                .call_aws_json_11(
+                    "kms",
+                    "TrentService.ListResourceTags",
+                    json!({"KeyId":current.ref_value}),
+                    logical_id,
+                )
+                .await?;
+            let actual = snapshot
+                .get("Tags")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    CfnError::ResourceFailed(format!(
+                        "KMS ListResourceTags for {logical_id} returned no Tags"
+                    ))
+                })?;
+            let changed: Vec<_> = desired
+                .into_iter()
+                .filter(|tag| !actual.iter().any(|current| current == *tag))
+                .cloned()
+                .collect();
+            let restore: Vec<_> = actual
+                .iter()
+                .filter(|tag| removed.contains(&tag["TagKey"]))
+                .cloned()
+                .collect();
+            if !removed.is_empty() {
+                self.call_aws_json_11(
+                    "kms",
+                    "TrentService.UntagResource",
+                    json!({"KeyId":current.ref_value,"TagKeys":removed}),
+                    logical_id,
+                )
+                .await?;
+            }
+            if !changed.is_empty() {
+                if let Err(primary) = self
+                    .call_aws_json_11(
+                        "kms",
+                        "TrentService.TagResource",
+                        json!({"KeyId":current.ref_value,"Tags":changed}),
+                        logical_id,
+                    )
+                    .await
+                {
+                    if !restore.is_empty() {
+                        if let Err(cleanup) = self
+                            .call_aws_json_11(
+                                "kms",
+                                "TrentService.TagResource",
+                                json!({"KeyId":current.ref_value,"Tags":restore}),
+                                logical_id,
+                            )
+                            .await
+                        {
+                            return Err(with_cleanup_failure(primary, cleanup));
+                        }
+                    }
+                    return Err(primary);
+                }
+            }
+        }
         Ok(current.clone())
     }
 
@@ -2898,6 +2988,9 @@ impl Provisioner {
             ("PublicAccessBlockConfiguration", "publicAccessBlock"),
             ("Tags", "tagging"),
             ("NotificationConfiguration", "notification"),
+            ("LifecycleConfiguration", "lifecycle"),
+            ("OwnershipControls", "ownershipControls"),
+            ("LoggingConfiguration", "logging"),
         ] {
             if previous.get(property) == props.get(property) {
                 continue;
@@ -3066,6 +3159,56 @@ impl Provisioner {
         previous: Option<&Value>,
         props: &Value,
     ) -> Result<(), CfnError> {
+        for (property, query, operation, serialize) in [
+            (
+                "LifecycleConfiguration",
+                "lifecycle",
+                "PutBucketLifecycleConfiguration",
+                s3_configuration::lifecycle as fn(&str, &Value) -> Result<String, CfnError>,
+            ),
+            (
+                "OwnershipControls",
+                "ownershipControls",
+                "PutBucketOwnershipControls",
+                s3_configuration::ownership,
+            ),
+            (
+                "LoggingConfiguration",
+                "logging",
+                "PutBucketLogging",
+                s3_configuration::logging,
+            ),
+        ] {
+            let value = props.get(property);
+            if previous.map_or(value.is_some(), |old| old.get(property) != value) {
+                match value {
+                    Some(value) => {
+                        self.put_s3_bucket_configuration(
+                            logical_id,
+                            bucket,
+                            query,
+                            operation,
+                            serialize(logical_id, value)?,
+                        )
+                        .await?;
+                    }
+                    None if property == "LoggingConfiguration" => {
+                        self.put_s3_bucket_configuration(
+                            logical_id,
+                            bucket,
+                            query,
+                            operation,
+                            "<BucketLoggingStatus/>".into(),
+                        )
+                        .await?;
+                    }
+                    None => {
+                        self.delete_s3_call(&format!("/{bucket}?{query}"), bucket)
+                            .await?;
+                    }
+                }
+            }
+        }
         let encryption = props.get("BucketEncryption");
         if previous.map_or(encryption.is_some(), |value| {
             value.get("BucketEncryption") != encryption
@@ -5616,6 +5759,11 @@ impl Provisioner {
             handler.handle(request).await
         };
         let status = response.status().as_u16();
+        tracing::debug!(
+            service,
+            status,
+            "CloudFormation native resource call returned"
+        );
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .map_err(|_| CfnError::Internal)?;
@@ -5680,6 +5828,7 @@ fn validate_kms_key_properties(logical_id: &str, props: &Value) -> Result<(), Cf
             "Origin",
             "MultiRegion",
             "PendingWindowInDays",
+            "Tags",
         ],
     )?;
     if props
@@ -5722,7 +5871,46 @@ fn validate_kms_key_properties(logical_id: &str, props: &Value) -> Result<(), Cf
         )));
     }
     kms_pending_window_days(props)?;
+    kms_tags(logical_id, props)?;
     Ok(())
+}
+
+fn kms_tags(logical_id: &str, props: &Value) -> Result<Value, CfnError> {
+    let Some(value) = props.get("Tags") else {
+        return Ok(json!([]));
+    };
+    let invalid = || {
+        CfnError::Validation(format!("AWS::KMS::Key resource {logical_id} requires up to 50 unique string Tags entries with Key and Value"))
+    };
+    let entries = value
+        .as_array()
+        .filter(|entries| entries.len() <= 50)
+        .ok_or_else(invalid)?;
+    let mut keys = std::collections::BTreeSet::new();
+    let mut tags = Vec::new();
+    for entry in entries {
+        ensure_known_properties(logical_id, "AWS::KMS::Key.Tags", entry, &["Key", "Value"])?;
+        let key = entry
+            .get("Key")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        let value = entry
+            .get("Value")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        if key.is_empty()
+            || key.chars().count() > 128
+            || value.chars().count() > 256
+            || key.to_ascii_lowercase().starts_with("aws:")
+            || key.chars().any(char::is_control)
+            || value.chars().any(char::is_control)
+            || !keys.insert(key)
+        {
+            return Err(invalid());
+        }
+        tags.push(json!({"TagKey":key,"TagValue":value}));
+    }
+    Ok(Value::Array(tags))
 }
 
 fn kms_pending_window_days(props: &Value) -> Result<u64, CfnError> {
@@ -7378,6 +7566,9 @@ fn validate_s3_bucket_properties(logical_id: &str, props: &Value) -> Result<(), 
             "BucketEncryption",
             "VersioningConfiguration",
             "NotificationConfiguration",
+            "LifecycleConfiguration",
+            "OwnershipControls",
+            "LoggingConfiguration",
         ],
     )?;
     if props.get("BucketName").is_some()
@@ -7427,6 +7618,18 @@ fn validate_s3_bucket_properties(logical_id: &str, props: &Value) -> Result<(), 
     }
     if let Some(value) = props.get("NotificationConfiguration") {
         s3_bucket_notification_xml(logical_id, value)?;
+    }
+    for (property, serialize) in [
+        (
+            "LifecycleConfiguration",
+            s3_configuration::lifecycle as fn(&str, &Value) -> Result<String, CfnError>,
+        ),
+        ("OwnershipControls", s3_configuration::ownership),
+        ("LoggingConfiguration", s3_configuration::logging),
+    ] {
+        if let Some(value) = props.get(property) {
+            serialize(logical_id, value)?;
+        }
     }
     Ok(())
 }
@@ -8142,6 +8345,136 @@ mod tests {
     use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
 
     use super::*;
+
+    #[tokio::test]
+    async fn kms_tags_create_update_remove_and_compensate_failed_updates() {
+        struct TagsFixture {
+            tags: Mutex<Vec<Value>>,
+            failures: Mutex<usize>,
+        }
+        #[async_trait]
+        impl NativeHandler for TagsFixture {
+            async fn handle(&self, req: ServiceRequest) -> axum::response::Response {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let mut tags = self.tags.lock().unwrap();
+                let operation = req.headers["x-amz-target"].to_str().unwrap();
+                let output = match operation {
+                    "TrentService.CreateKey" => {
+                        *tags = body["Tags"].as_array().unwrap().clone();
+                        json!({"KeyMetadata":{"KeyId":"fixture","Arn":"arn:aws:kms:us-east-1:000000000000:key/fixture"}})
+                    }
+                    "TrentService.ListResourceTags" => json!({"Tags":*tags,"Truncated":false}),
+                    "TrentService.UntagResource" => {
+                        tags.retain(|tag| {
+                            !body["TagKeys"].as_array().unwrap().contains(&tag["TagKey"])
+                        });
+                        json!({})
+                    }
+                    "TrentService.TagResource" => {
+                        let mut failures = self.failures.lock().unwrap();
+                        if *failures > 0 {
+                            *failures -= 1;
+                            return http::Response::builder()
+                                .status(400)
+                                .body(Body::from("injected tag failure"))
+                                .unwrap();
+                        }
+                        for addition in body["Tags"].as_array().unwrap() {
+                            tags.retain(|tag| tag["TagKey"] != addition["TagKey"]);
+                            tags.push(addition.clone());
+                        }
+                        json!({})
+                    }
+                    _ => panic!("unexpected {operation}"),
+                };
+                http::Response::builder()
+                    .status(200)
+                    .body(Body::from(output.to_string()))
+                    .unwrap()
+            }
+        }
+        let fixture = Arc::new(TagsFixture {
+            tags: Mutex::new(Vec::new()),
+            failures: Mutex::new(0),
+        });
+        let registry = Arc::new(ServiceRegistry::new());
+        registry.register_native(
+            ServiceName::new("kms"),
+            ServiceMetadata::new(AwsProtocol::Json11, Some("TrentService")),
+            fixture.clone(),
+        );
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let old = json!({"Tags":[{"Key":"old","Value":"before"}]});
+        let next = json!({"Tags":[{"Key":"new","Value":"after"}]});
+        let resource = p.kms_key("Key", &old).await.unwrap();
+        assert_eq!(
+            *fixture.tags.lock().unwrap(),
+            json!([{"TagKey":"old","TagValue":"before"}])
+                .as_array()
+                .unwrap()
+                .clone()
+        );
+        *fixture.failures.lock().unwrap() = 1;
+        assert!(p
+            .update_kms_key("Key", &resource, &old, &next)
+            .await
+            .is_err());
+        assert_eq!(
+            *fixture.tags.lock().unwrap(),
+            json!([{"TagKey":"old","TagValue":"before"}])
+                .as_array()
+                .unwrap()
+                .clone()
+        );
+        p.update_kms_key("Key", &resource, &old, &next)
+            .await
+            .unwrap();
+        assert_eq!(
+            *fixture.tags.lock().unwrap(),
+            json!([{"TagKey":"new","TagValue":"after"}])
+                .as_array()
+                .unwrap()
+                .clone()
+        );
+        p.update_kms_key("Key", &resource, &next, &json!({}))
+            .await
+            .unwrap();
+        assert!(fixture.tags.lock().unwrap().is_empty());
+        fixture
+            .tags
+            .lock()
+            .unwrap()
+            .push(json!({"TagKey":"unmanaged","TagValue":"keep"}));
+        p.update_kms_key("Key", &resource, &json!({}), &next)
+            .await
+            .unwrap();
+        assert_eq!(fixture.tags.lock().unwrap().len(), 2);
+        *fixture.failures.lock().unwrap() = 2;
+        let error = p
+            .update_kms_key("Key", &resource, &next, &old)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cleanup after provisioning failure also failed"));
+        assert!(fixture
+            .tags
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["TagKey"] == "unmanaged"));
+        for invalid in [
+            json!({"Tags":[{"Key":"duplicate","Value":"x"},{"Key":"duplicate","Value":"y"}]}),
+            json!({"Tags":[{"Key":"aws:reserved","Value":"x"}]}),
+            json!({"EnableKeyRotation":true}),
+        ] {
+            assert!(p.kms_key("Key", &invalid).await.is_err());
+        }
+    }
 
     #[tokio::test]
     async fn lambda_reserved_concurrency_native_lifecycle_and_failure_cleanup() {

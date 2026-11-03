@@ -955,3 +955,96 @@ async fn old_proxy_exit_callback_and_listener_cannot_claim_resumed_generation() 
     )
     .await;
 }
+
+#[tokio::test]
+async fn security_group_tags_and_rule_descriptions_restore_atomically() {
+    let db = TestDb::new();
+    let handler = db.handler(7).unwrap();
+    let vpc = id(
+        &ok(&handler, "Action=CreateVpc&CidrBlock=10.81.0.0%2F16").await,
+        "vpcId",
+    );
+    let create = format!("Action=CreateSecurityGroup&VpcId={vpc}&GroupName=tagged&GroupDescription=tagged&TagSpecification.1.ResourceType=security-group&TagSpecification.1.Tag.1.Key=Owner&TagSpecification.1.Tag.1.Value=Accounting%26Ops");
+    let group = id(&ok(&handler, &create).await, "groupId");
+    let cidr_rule = format!("GroupId={group}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=443&IpPermissions.1.ToPort=443&IpPermissions.1.IpRanges.1.CidrIp=10.81.1.0%2F24");
+    let description = "IpPermissions.1.IpRanges.1.Description=delivery%26worker";
+    let authorized = ok(
+        &handler,
+        &format!("Action=AuthorizeSecurityGroupIngress&{cidr_rule}&{description}"),
+    )
+    .await;
+    assert!(authorized.contains("<description>delivery&amp;worker</description>"));
+    let (_, duplicate) = call(&handler,"111","us-east-1",&format!("Action=AuthorizeSecurityGroupIngress&{cidr_rule}&IpPermissions.1.IpRanges.1.Description=different")).await;
+    assert!(duplicate.contains("<Code>InvalidPermission.Duplicate</Code>"));
+    let sg_rule = format!("GroupId={group}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=8080&IpPermissions.1.ToPort=8080&IpPermissions.1.Groups.1.GroupId={group}");
+    ok(&handler,&format!("Action=AuthorizeSecurityGroupEgress&{sg_rule}&IpPermissions.1.Groups.1.Description=service-to-service")).await;
+    drop(handler);
+    let handler = db.handler(7).unwrap();
+    let xml = ok(
+        &handler,
+        &format!("Action=DescribeSecurityGroups&GroupId.1={group}"),
+    )
+    .await;
+    assert!(xml.contains(
+        "<tagSet><item><key>Owner</key><value>Accounting&amp;Ops</value></item></tagSet>"
+    ));
+    assert!(
+        xml.contains("<cidrIp>10.81.1.0/24</cidrIp><description>delivery&amp;worker</description>")
+    );
+    assert!(xml.contains("<description>service-to-service</description>"));
+    let stored = handler
+        .scopes
+        .lock()
+        .unwrap()
+        .get(&("111".into(), "us-east-1".into()))
+        .unwrap()
+        .security_groups
+        .get(&group)
+        .unwrap()
+        .clone();
+    let mut legacy = serde_json::to_value(&stored).unwrap();
+    legacy.as_object_mut().unwrap().remove("tags");
+    for direction in ["ingress", "egress"] {
+        for rule in legacy[direction].as_array_mut().unwrap() {
+            rule.as_object_mut().unwrap().remove("description");
+        }
+    }
+    let legacy: SecurityGroup = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.tags.is_empty());
+    assert!(legacy.ingress.iter().all(|rule| rule.description.is_none()));
+    // Description is metadata, never part of revoke identity.
+    ok(
+        &handler,
+        &format!("Action=RevokeSecurityGroupIngress&{cidr_rule}"),
+    )
+    .await;
+    ok(
+        &handler,
+        &format!("Action=RevokeSecurityGroupEgress&{sg_rule}"),
+    )
+    .await;
+    let before = db.count();
+    for invalid in [
+        "TagSpecification.1.ResourceType=instance&TagSpecification.1.Tag.1.Key=x",
+        "TagSpecification.1.ResourceType=security-group&TagSpecification.1.Tag.1.Key=aws%3Aowner",
+        "TagSpecification.1.ResourceType=security-group&TagSpecification.1.Tag.2.Key=x",
+        "TagSpecification.1.ResourceType=security-group&TagSpecification.1.Tag.1.Key=x&TagSpecification.1.Tag.2.Key=x",
+    ] {
+        let (status, _) = call(&handler,"111","us-east-1",&format!("Action=CreateSecurityGroup&VpcId={vpc}&GroupName=invalid&GroupDescription=invalid&{invalid}")).await;
+        assert_eq!(status,400);
+        assert_eq!(db.count(),before);
+    }
+    db.sql("CREATE TRIGGER reject_sg_insert BEFORE INSERT ON ec2_records WHEN NEW.kind = 'sg' BEGIN SELECT RAISE(ABORT, 'forced SG failure'); END;");
+    let (status, _) = call(
+        &handler,
+        "111",
+        "us-east-1",
+        &create.replace("GroupName=tagged", "GroupName=failed"),
+    )
+    .await;
+    assert_eq!(status, 500);
+    assert!(!ok(&handler, "Action=DescribeSecurityGroups")
+        .await
+        .contains("<groupName>failed</groupName>"));
+    assert_eq!(db.count(), before);
+}

@@ -5,6 +5,8 @@ pub(crate) enum KmsError {
     Serialization,
     Validation,
     InvalidAliasName,
+    InvalidMarker,
+    TagLimitExceeded,
     LimitExceeded,
     AlreadyExists,
     NotFound,
@@ -31,6 +33,16 @@ impl KmsError {
 
     pub(crate) fn into_aws(self) -> AwsError {
         let (code, message, status) = match self {
+            Self::InvalidMarker => (
+                "InvalidMarkerException",
+                "The pagination marker is invalid",
+                400,
+            ),
+            Self::TagLimitExceeded => (
+                "LimitExceededException",
+                "A KMS key cannot have more than 50 tags",
+                400,
+            ),
             Self::Serialization => (
                 "SerializationException",
                 "The request could not be deserialized",

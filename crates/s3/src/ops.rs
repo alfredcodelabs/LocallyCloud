@@ -32,6 +32,13 @@ use crate::store::{
     StoredVersion, VersionValue, VersioningState,
 };
 use crate::xml::{escape, text_el, DECL};
+pub(crate) mod bucket_configuration;
+
+/// Validate the supported lifecycle control-plane configuration without side effects.
+/// Expiration, transitions and multipart cleanup scheduling are not executed here.
+pub fn validate_lifecycle_configuration(body: &[u8]) -> Result<(), S3Error> {
+    bucket_configuration::validate_lifecycle(body)
+}
 
 /// Maximum single PutObject size (5 GiB).
 const MAX_OBJECT_SIZE: usize = 5 * 1024 * 1024 * 1024;
@@ -520,9 +527,22 @@ struct XmlNode {
 }
 
 fn parse_xml(body: &[u8]) -> Result<XmlNode, S3Error> {
+    // CompleteMultipartUpload supports 10,000 parts, each with an ETag and checksums.
+    parse_xml_with_limits(body, 16 * 1024 * 1024, 100_001)
+}
+
+fn parse_xml_with_limits(
+    body: &[u8],
+    max_bytes: usize,
+    max_nodes: usize,
+) -> Result<XmlNode, S3Error> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
+    if body.len() > max_bytes {
+        return Err(S3Error::MalformedXML);
+    }
+    let mut nodes = 0;
     let mut reader = Reader::from_reader(body);
     // XML entities split text events; trimming each event corrupts spaces around &amp;.
     reader.config_mut().trim_text(false);
@@ -532,6 +552,18 @@ fn parse_xml(body: &[u8]) -> Result<XmlNode, S3Error> {
     loop {
         let node = match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(element)) => {
+                nodes += 1;
+                if stack.len() >= 32 || nodes > max_nodes {
+                    return Err(S3Error::MalformedXML);
+                }
+                for attribute in element.attributes() {
+                    let attribute = attribute.map_err(|_| S3Error::MalformedXML)?;
+                    if attribute.key.as_ref() != "xmlns"
+                        && !attribute.key.as_ref().starts_with("xmlns:")
+                    {
+                        return Err(S3Error::MalformedXML);
+                    }
+                }
                 stack.push(XmlNode {
                     name: element.local_name().as_ref().to_owned(),
                     text: String::new(),
@@ -539,11 +571,25 @@ fn parse_xml(body: &[u8]) -> Result<XmlNode, S3Error> {
                 });
                 None
             }
-            Ok(Event::Empty(element)) => Some(XmlNode {
-                name: element.local_name().as_ref().to_owned(),
-                text: String::new(),
-                children: Vec::new(),
-            }),
+            Ok(Event::Empty(element)) => {
+                nodes += 1;
+                if nodes > max_nodes || stack.len() >= 32 {
+                    return Err(S3Error::MalformedXML);
+                }
+                for attribute in element.attributes() {
+                    let attribute = attribute.map_err(|_| S3Error::MalformedXML)?;
+                    if attribute.key.as_ref() != "xmlns"
+                        && !attribute.key.as_ref().starts_with("xmlns:")
+                    {
+                        return Err(S3Error::MalformedXML);
+                    }
+                }
+                Some(XmlNode {
+                    name: element.local_name().as_ref().to_owned(),
+                    text: String::new(),
+                    children: Vec::new(),
+                })
+            }
             Ok(Event::Text(text)) => {
                 let value = quick_xml::escape::unescape(text.as_ref())
                     .map_err(|_| S3Error::MalformedXML)?;
@@ -1052,8 +1098,7 @@ pub async fn delete_bucket_tagging(ctx: &Ctx<'_>, name: &str) -> Result<Response
 }
 
 pub async fn get_bucket_lifecycle(ctx: &Ctx<'_>, name: &str) -> Result<Response, S3Error> {
-    bucket(ctx, name).await?;
-    Err(S3Error::NoSuchLifecycleConfiguration)
+    bucket_configuration::get(ctx, name, bucket_configuration::Kind::Lifecycle).await
 }
 
 pub async fn get_bucket_replication(ctx: &Ctx<'_>, name: &str) -> Result<Response, S3Error> {
@@ -1180,8 +1225,7 @@ pub async fn get_bucket_object_lock(ctx: &Ctx<'_>, name: &str) -> Result<Respons
 }
 
 pub async fn get_bucket_ownership_controls(ctx: &Ctx<'_>, name: &str) -> Result<Response, S3Error> {
-    bucket(ctx, name).await?;
-    Err(S3Error::OwnershipControlsNotFoundError)
+    bucket_configuration::get(ctx, name, bucket_configuration::Kind::Ownership).await
 }
 
 fn parse_bucket_encryption(ctx: &Ctx<'_>, body: &[u8]) -> Result<ServerSideEncryption, S3Error> {
@@ -1403,11 +1447,7 @@ pub async fn get_bucket_accelerate(ctx: &Ctx<'_>, name: &str) -> Result<Response
 }
 
 pub async fn get_bucket_logging(ctx: &Ctx<'_>, name: &str) -> Result<Response, S3Error> {
-    bucket(ctx, name).await?;
-    Ok(xml_ok(
-        format!("{DECL}<BucketLoggingStatus xmlns=\"{S3_XMLNS}\"></BucketLoggingStatus>"),
-        ctx.request_id,
-    ))
+    bucket_configuration::get(ctx, name, bucket_configuration::Kind::Logging).await
 }
 
 pub async fn put_bucket_notification(
@@ -1894,6 +1934,7 @@ pub(crate) async fn put_object_with_event(
     event_type: EventType,
     reason: &'static str,
 ) -> Result<MutationResult, S3Error> {
+    bucket_configuration::validate_acl(ctx, bucket_name, headers).await?;
     let b = bucket(ctx, bucket_name).await?;
     let default_encryption = b.read().await.encryption.clone();
     let encryption = request_encryption(ctx, headers, &default_encryption)?;
@@ -2815,6 +2856,7 @@ pub async fn copy_object(
     dest_key: &str,
     headers: &HeaderMap,
 ) -> Result<MutationResult, S3Error> {
+    bucket_configuration::validate_acl(ctx, dest_bucket, headers).await?;
     let source = header(headers, "x-amz-copy-source")
         .ok_or_else(|| S3Error::InvalidArgument("x-amz-copy-source is required".into()))?;
     let (src_bucket, src_key, src_version) = parse_copy_source(source)?;
@@ -3064,6 +3106,7 @@ pub async fn create_multipart_upload(
     key: &str,
     headers: &HeaderMap,
 ) -> Result<Response, S3Error> {
+    bucket_configuration::validate_acl(ctx, bucket_name, headers).await?;
     let b = bucket(ctx, bucket_name).await?;
     let default_encryption = b.read().await.encryption.clone();
     let encryption = request_encryption(ctx, headers, &default_encryption)?;
@@ -3943,6 +3986,23 @@ pub(crate) fn parse_delete_request(body: &[u8]) -> Result<(Vec<DeleteTarget>, bo
 #[cfg(test)]
 mod multipart_checksum_tests {
     use super::*;
+
+    #[test]
+    fn maximum_multipart_completion_with_checksums_fits_bounded_xml_parser() {
+        let mut body = String::from("<CompleteMultipartUpload>");
+        for number in 1..=10_000 {
+            body.push_str(&format!("<Part><PartNumber>{number}</PartNumber><ETag>&quot;0123456789abcdef0123456789abcdef&quot;</ETag><ChecksumCRC32>AAAAAA==</ChecksumCRC32><ChecksumCRC32C>AAAAAA==</ChecksumCRC32C><ChecksumCRC64NVME>AAAAAAAAAAA=</ChecksumCRC64NVME><ChecksumSHA1>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ChecksumSHA1><ChecksumSHA256>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ChecksumSHA256></Part>"));
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        assert!(body.len() > 1_048_576);
+        let parts = parse_complete_parts(body.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 10_000);
+        assert_eq!(parts.last().unwrap().0, 10_000);
+        assert!(parts.iter().all(|part| part.2.len() == 5));
+        assert!(parse_xml_with_limits(body.as_bytes(), 1_048_576, 20_000).is_err());
+        assert!(parse_xml_with_limits(b"<a><b/></a>", 16, 1).is_err());
+        assert!(parse_xml_with_limits(b"<a/>", 3, 1).is_err());
+    }
 
     #[test]
     fn tagging_xml_preserves_leaf_whitespace_and_entity_text() {
