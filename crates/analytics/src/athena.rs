@@ -1227,21 +1227,17 @@ async fn iceberg_rows(
                     scanned,
                 ));
             }
-            if let Some((partition_name, source_name)) = &partition {
+            if let Some(partition) = &partition {
                 let tuple = avro_field(file, "partition", scanned)?;
-                let day = avro_date(avro_field(tuple, partition_name, scanned)?, scanned)?;
-                let date = i32::try_from(day)
-                    .ok()
-                    .and_then(|day| day.checked_add(2_440_588))
-                    .and_then(|day| time::Date::from_julian_day(day).ok())
-                    .ok_or_else(|| WorkerFailure::failed("Invalid date partition", scanned))?
-                    .to_string();
+                let value =
+                    partition.value(avro_field(tuple, &partition.name, scanned)?, scanned)?;
+                let source_name = &partition.source;
                 let mut partition_result = QueryResult {
                     columns: vec![ResultColumn {
                         name: source_name.clone(),
-                        kind: "date",
+                        kind: partition.kind,
                     }],
-                    rows: vec![vec![Some(source_name.clone())], vec![Some(date)]],
+                    rows: vec![vec![Some(source_name.clone())], vec![value]],
                 };
                 let applicable = predicates
                     .iter()
@@ -1338,11 +1334,44 @@ async fn iceberg_rows(
     Ok((result, scanned))
 }
 
+struct IcebergPartition {
+    name: String,
+    source: String,
+    kind: &'static str,
+    required: bool,
+}
+
+impl IcebergPartition {
+    fn value(&self, value: &AvroValue, scanned: u64) -> Result<Option<String>, WorkerFailure> {
+        let value = match value {
+            AvroValue::Union(_, value) => value.as_ref(),
+            value => value,
+        };
+        if matches!(value, AvroValue::Null) && !self.required {
+            return Ok(None);
+        }
+        let value = match self.kind {
+            "varchar" => avro_string(value, scanned)?.to_owned(),
+            "date" => {
+                let day = avro_date(value, scanned)?;
+                i32::try_from(day)
+                    .ok()
+                    .and_then(|day| day.checked_add(2_440_588))
+                    .and_then(|day| time::Date::from_julian_day(day).ok())
+                    .ok_or_else(|| WorkerFailure::failed("Invalid date partition", scanned))?
+                    .to_string()
+            }
+            _ => return Err(WorkerFailure::failed("Unsupported partition type", scanned)),
+        };
+        Ok(Some(value))
+    }
+}
+
 fn iceberg_partition(
     metadata: &Value,
     spec_id: i64,
     scanned: u64,
-) -> Result<Option<(String, String)>, WorkerFailure> {
+) -> Result<Option<IcebergPartition>, WorkerFailure> {
     let specs = metadata["partition-specs"]
         .as_array()
         .ok_or_else(|| WorkerFailure::failed("Iceberg partition specs missing", scanned))?;
@@ -1358,7 +1387,7 @@ fn iceberg_partition(
     }
     if fields.len() != 1 || fields[0]["transform"] != "identity" {
         return Err(WorkerFailure::failed(
-            "Only one identity date partition is supported",
+            "Only one identity partition is supported",
             scanned,
         ));
     }
@@ -1372,22 +1401,30 @@ fn iceberg_partition(
         .and_then(|schema| schema["fields"].as_array())
         .and_then(|fields_| fields_.iter().find(|f| f["id"] == fields[0]["source-id"]))
         .ok_or_else(|| WorkerFailure::failed("Partition source missing", scanned))?;
-    if source["type"] != "date" || source["required"] != true {
-        return Err(WorkerFailure::failed(
-            "Partition source must be a required date",
-            scanned,
-        ));
-    }
-    Ok(Some((
-        fields[0]["name"]
+    let kind = match source["type"].as_str() {
+        Some("date") => "date",
+        Some("string") => "varchar",
+        _ => {
+            return Err(WorkerFailure::failed(
+                "Partition source must be date or string",
+                scanned,
+            ))
+        }
+    };
+    Ok(Some(IcebergPartition {
+        name: fields[0]["name"]
             .as_str()
             .ok_or_else(|| WorkerFailure::failed("Partition name missing", scanned))?
             .into(),
-        source["name"]
+        source: source["name"]
             .as_str()
             .ok_or_else(|| WorkerFailure::failed("Partition source name missing", scanned))?
             .into(),
-    )))
+        kind,
+        required: source["required"].as_bool().ok_or_else(|| {
+            WorkerFailure::failed("Partition source required flag missing", scanned)
+        })?,
+    }))
 }
 
 fn iceberg_columns(

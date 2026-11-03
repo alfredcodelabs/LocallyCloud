@@ -1110,3 +1110,185 @@ async fn publication_failures(maintenance: Maintenance) {
         }
     }
 }
+
+#[tokio::test]
+async fn native_glue_nullable_identity_partitions_round_trip_through_firehose_and_athena() {
+    let fixture = Fixture::new().await;
+    for (kind, values) in [
+        ("string", vec![Some(""), Some("a/b?c#d % 雪"), None, None]),
+        (
+            "date",
+            vec![Some("2026-10-03"), Some("2026-10-04"), None, None],
+        ),
+    ] {
+        let table = format!("nullable_{kind}");
+        json_call(&fixture.dispatcher, "CreateTable", json!({
+            "DatabaseName":"lake", "TableInput":{"Name":table},
+            "OpenTableFormatInput":{"IcebergInput":{
+                "MetadataOperation":"CREATE","Version":"2",
+                "CreateIcebergTableInput":{
+                    "Location":format!("s3://ack-loss-lake/{table}"),
+                    "Schema":{"Type":"struct","SchemaId":0,"Fields":[
+                        {"Id":1,"Name":"id","Type":"long","Required":true},
+                        {"Id":2,"Name":"value","Type":kind,"Required":false}
+                    ]},
+                    "PartitionSpec":{"SpecId":0,"Fields":[
+                        {"SourceId":2,"FieldId":1000,"Name":"value_partition","Transform":"identity"}
+                    ]}
+                }
+            }}
+        })).await;
+        let initial = query_results(
+            &fixture.dispatcher,
+            &format!("SELECT id, value FROM lake.{table}"),
+        )
+        .await;
+        assert_eq!(initial["ResultSet"]["Rows"].as_array().unwrap().len(), 1);
+        let records = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                // Missing and explicit null must produce the same null partition.
+                if i == 3 {
+                    json!({"id":i as i64})
+                } else {
+                    json!({"id":i as i64,"value":value})
+                }
+                .to_string()
+                .into_bytes()
+            })
+            .collect::<Vec<_>>();
+        let target = Target {
+            database: "lake".into(),
+            table: table.clone(),
+            bucket: "ack-loss-lake".into(),
+        };
+        let token = Uuid::new_v4();
+        for _ in 0..2 {
+            iceberg::append(
+                Context {
+                    dispatcher: &fixture.dispatcher,
+                    account: "000000000000",
+                    region: "us-east-1",
+                    bucket: &target.bucket,
+                    role_arn: "arn:aws:iam::000000000000:role/firehose",
+                },
+                &target,
+                token,
+                &records,
+            )
+            .await
+            .unwrap();
+        }
+        let output = query_results(
+            &fixture.dispatcher,
+            &format!("SELECT id, value FROM lake.{table}"),
+        )
+        .await;
+        let mut actual = output["ResultSet"]["Rows"].as_array().unwrap()[1..]
+            .iter()
+            .map(|row| {
+                let id = row["Data"][0]["VarCharValue"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                (
+                    id,
+                    row["Data"][1]["VarCharValue"].as_str().map(str::to_owned),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual,
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, v.map(str::to_owned)))
+                .collect::<Vec<_>>()
+        );
+        let filter = values[1].unwrap().replace('\'', "''");
+        let selected = query_results(
+            &fixture.dispatcher,
+            &format!("SELECT id, value FROM lake.{table} WHERE value = '{filter}'"),
+        )
+        .await;
+        assert_eq!(selected["ResultSet"]["Rows"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            selected["ResultSet"]["Rows"][1]["Data"][0]["VarCharValue"],
+            "1"
+        );
+        let current = json_call(
+            &fixture.dispatcher,
+            "GetTable",
+            json!({"DatabaseName":"lake","Name":table}),
+        )
+        .await;
+        let invalid = iceberg::append(
+            Context {
+                dispatcher: &fixture.dispatcher,
+                account: "000000000000",
+                region: "us-east-1",
+                bucket: &target.bucket,
+                role_arn: "arn:aws:iam::000000000000:role/firehose",
+            },
+            &target,
+            Uuid::new_v4(),
+            &[br#"{"id":5,"value":42}"#.to_vec()],
+        )
+        .await;
+        assert!(matches!(invalid, Err(iceberg::Error::Unsupported)));
+        let after_invalid = json_call(
+            &fixture.dispatcher,
+            "GetTable",
+            json!({"DatabaseName":"lake","Name":table}),
+        )
+        .await;
+        assert_eq!(
+            pointer(&after_invalid),
+            pointer(&current),
+            "invalid partition must not publish a catalog commit"
+        );
+        let metadata_bytes = fixture.get(pointer(&current)).await;
+        let metadata: Value = serde_json::from_slice(&metadata_bytes).unwrap();
+        assert_eq!(
+            metadata["snapshots"].as_array().unwrap().len(),
+            1,
+            "replay must not duplicate the commit"
+        );
+        let list = fixture
+            .get(metadata["snapshots"][0]["manifest-list"].as_str().unwrap())
+            .await;
+        let descriptors = ManifestList::parse_with_version(&list, FormatVersion::V2)
+            .unwrap()
+            .consume_entries();
+        let mut partitions = Vec::new();
+        let mut physical_count = 0;
+        for descriptor in descriptors {
+            let manifest =
+                Manifest::parse_avro(&fixture.get(&descriptor.manifest_path).await).unwrap();
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                let data = entry.data_file();
+                assert_eq!(data.partition().fields().len(), 1);
+                partitions.push(data.partition().fields()[0].is_none());
+                let file_path = data.file_path();
+                let suffix = file_path
+                    .strip_prefix(&format!("s3://ack-loss-lake/{table}/data/"))
+                    .unwrap();
+                assert!(
+                    !suffix.contains('/'),
+                    "raw partition values must never become object paths"
+                );
+                let parquet = SerializedFileReader::new(fixture.get(file_path).await).unwrap();
+                for row in parquet.get_row_iter(None).unwrap() {
+                    row.unwrap();
+                    physical_count += 1;
+                }
+            }
+        }
+        partitions.sort();
+        assert_eq!(partitions, vec![false, false, true]);
+        assert_eq!(physical_count, 4);
+    }
+}

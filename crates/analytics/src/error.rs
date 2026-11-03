@@ -3,6 +3,7 @@ use locallycloud_core::error_mapping::AwsError;
 #[derive(Debug)]
 pub(crate) enum AnalyticsError {
     InvalidInput,
+    Unsupported(&'static str),
     AlreadyExists,
     EntityNotFound,
     ConcurrentModification,
@@ -14,6 +15,7 @@ pub(crate) enum AnalyticsError {
 impl From<AnalyticsError> for AwsError {
     fn from(error: AnalyticsError) -> Self {
         let (code, message, status) = match error {
+            AnalyticsError::Unsupported(message) => ("InvalidInputException", message, 400),
             AnalyticsError::InvalidInput => (
                 "InvalidInputException",
                 "The request contains invalid input",

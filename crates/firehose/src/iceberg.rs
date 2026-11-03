@@ -556,7 +556,46 @@ fn parquet_rows(records: &[Vec<u8>], fields: &[Value]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn partition_column(raw: &Value) -> Result<Option<&str>> {
+#[derive(Clone, Copy)]
+enum PartitionKind {
+    Date,
+    String,
+}
+
+struct PartitionColumn<'a> {
+    name: &'a str,
+    kind: PartitionKind,
+    required: bool,
+}
+
+impl PartitionColumn<'_> {
+    fn value(&self, row: &Value) -> Result<Option<String>> {
+        match row.get(self.name) {
+            None | Some(Value::Null) if !self.required => Ok(None),
+            Some(Value::String(value)) => {
+                if matches!(self.kind, PartitionKind::Date) {
+                    Literal::date_from_str(value).map_err(|_| Error::Unsupported)?;
+                }
+                Ok(Some(value.clone()))
+            }
+            _ => Err(Error::Unsupported),
+        }
+    }
+
+    fn tuple(&self, value: Option<&str>) -> Result<Struct> {
+        let literal = value
+            .map(|value| match self.kind {
+                PartitionKind::Date => {
+                    Literal::date_from_str(value).map_err(|_| Error::Unsupported)
+                }
+                PartitionKind::String => Ok(Literal::string(value)),
+            })
+            .transpose()?;
+        Ok(Struct::from_iter([literal]))
+    }
+}
+
+fn partition_column(raw: &Value) -> Result<Option<PartitionColumn<'_>>> {
     let spec = raw["partition-specs"]
         .as_array()
         .and_then(|specs| {
@@ -576,10 +615,16 @@ fn partition_column(raw: &Value) -> Result<Option<&str>> {
         .iter()
         .find(|f| f["id"] == partitions[0]["source-id"])
         .ok_or(Error::Unsupported)?;
-    if field["type"] != "date" || field["required"] != true {
-        return Err(Error::Unsupported);
-    }
-    field["name"].as_str().map(Some).ok_or(Error::Unsupported)
+    let kind = match field["type"].as_str() {
+        Some("date") => PartitionKind::Date,
+        Some("string") => PartitionKind::String,
+        _ => return Err(Error::Unsupported),
+    };
+    Ok(Some(PartitionColumn {
+        name: field["name"].as_str().ok_or(Error::Unsupported)?,
+        kind,
+        required: field["required"].as_bool().ok_or(Error::Unsupported)?,
+    }))
 }
 
 fn validate_metadata(raw: &Value, metadata: &TableMetadata, bucket: &str) -> Result<()> {
@@ -933,17 +978,14 @@ pub(super) async fn append(
         }
         let (remove, receipts) = retention_plan(&metadata, &raw, receipts)?;
         let receipt_plan = index.prepare(&ctx, receipts).await?;
+        let partition_column = partition_column(&raw)?;
         let mut groups: BTreeMap<Option<String>, Vec<Vec<u8>>> = BTreeMap::new();
         for record in records {
             let value: Value = serde_json::from_slice(record).map_err(|_| Error::Unsupported)?;
-            let partition = partition_column(&raw)?
-                .map(|name| {
-                    value[name]
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or(Error::Unsupported)
-                })
-                .transpose()?;
+            let partition = match &partition_column {
+                Some(column) => column.value(&value)?,
+                None => None,
+            };
             groups.entry(partition).or_default().push(record.clone());
         }
         // Validate every partition before writing any object.
@@ -974,13 +1016,11 @@ pub(super) async fn append(
         let list_uri = format!("{root}/metadata/{batch}-{snapshot_id}-list.avro");
         let new_meta_uri = format!("{root}/metadata/{batch}-{snapshot_id}.metadata.json");
         let mut files = Vec::new();
-        for (partition, count, parquet) in groups {
-            let suffix = partition.as_deref().unwrap_or("unpartitioned");
-            let data_uri = format!("{root}/data/{batch}-{suffix}.parquet");
-            let partition = match partition {
-                Some(date) => Struct::from_iter([Some(
-                    Literal::date_from_str(date).map_err(|_| Error::Unsupported)?,
-                )]),
+        for (index, (partition, count, parquet)) in groups.into_iter().enumerate() {
+            // Partition values are data, never object path fragments.
+            let data_uri = format!("{root}/data/{batch}-{index}.parquet");
+            let partition = match &partition_column {
+                Some(column) => column.tuple(partition.as_deref())?,
                 None => Struct::empty(),
             };
             let size = parquet.len();

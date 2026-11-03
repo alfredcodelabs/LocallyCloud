@@ -2259,6 +2259,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "http",
+ "iceberg",
  "locallycloud-core",
  "locallycloud-s3",
  "locallycloud-state",

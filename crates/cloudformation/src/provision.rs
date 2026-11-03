@@ -30,6 +30,8 @@ mod ecs_sg;
 pub(crate) use ecs_alb::validate_ecs_alb_property_names;
 mod event_invoke_config;
 mod firehose;
+#[cfg(test)]
+mod glue_tests;
 mod kinesis;
 #[cfg(test)]
 mod kms_rotation_tests;
@@ -1156,15 +1158,27 @@ impl Provisioner {
         props: &Value,
     ) -> Result<ResolvedResource, CfnError> {
         validate_glue_table_properties(logical_id, props)?;
-        let name = glue_input_name(logical_id, props, "TableInput", "AWS::Glue::Table")?;
+        let name = glue_table_name(logical_id, props)?;
+        let mut input = serde_json::Map::new();
+        for property in ["CatalogId", "DatabaseName", "Name", "TableInput"] {
+            if let Some(value) = props.get(property) {
+                input.insert(property.to_owned(), value.clone());
+            }
+        }
+        if let Some(open) = props.get("OpenTableFormatInput") {
+            let mut open = open.clone();
+            if let Some(iceberg) = open.get_mut("IcebergInput").and_then(Value::as_object_mut) {
+                // CloudFormation names this member differently from Glue CreateTable.
+                if let Some(table) = iceberg.remove("IcebergTableInput") {
+                    iceberg.insert("CreateIcebergTableInput".into(), table);
+                }
+            }
+            input.insert("OpenTableFormatInput".into(), open);
+        }
         self.call_aws_json_11(
             "glue",
             "AWSGlue.CreateTable",
-            json!({
-                "CatalogId": props["CatalogId"],
-                "DatabaseName": props["DatabaseName"],
-                "TableInput": props["TableInput"],
-            }),
+            Value::Object(input),
             logical_id,
         )
         .await?;
@@ -1183,9 +1197,8 @@ impl Provisioner {
     ) -> Result<ResolvedResource, CfnError> {
         validate_glue_table_properties(logical_id, previous)?;
         validate_glue_table_properties(logical_id, props)?;
-        let previous_name =
-            glue_input_name(logical_id, previous, "TableInput", "AWS::Glue::Table")?;
-        let next_name = glue_input_name(logical_id, props, "TableInput", "AWS::Glue::Table")?;
+        let previous_name = glue_table_name(logical_id, previous)?;
+        let next_name = glue_table_name(logical_id, props)?;
         if previous.get("CatalogId") != props.get("CatalogId")
             || previous.get("DatabaseName") != props.get("DatabaseName")
             || previous_name != next_name
@@ -1193,6 +1206,15 @@ impl Provisioner {
         {
             return Err(CfnError::ResourceFailed(format!(
                 "AWS::Glue::Table catalog, database, and name require replacement for {logical_id}"
+            )));
+        }
+        if previous.get("OpenTableFormatInput") != props.get("OpenTableFormatInput")
+            || ((previous.get("OpenTableFormatInput").is_some()
+                || props.get("OpenTableFormatInput").is_some())
+                && previous.get("TableInput") != props.get("TableInput"))
+        {
+            return Err(CfnError::ResourceFailed(format!(
+                "AWS::Glue::Table Iceberg metadata updates are not implemented for {logical_id}"
             )));
         }
         if previous.get("TableInput") != props.get("TableInput") {
@@ -5913,12 +5935,61 @@ fn validate_glue_table_properties(logical_id: &str, props: &Value) -> Result<(),
         logical_id,
         "AWS::Glue::Table",
         props,
-        &["CatalogId", "DatabaseName", "TableInput"],
+        &[
+            "CatalogId",
+            "DatabaseName",
+            "Name",
+            "TableInput",
+            "OpenTableFormatInput",
+        ],
     )?;
     required_property(props, "CatalogId", logical_id)?;
     required_property(props, "DatabaseName", logical_id)?;
-    glue_input_name(logical_id, props, "TableInput", "AWS::Glue::Table")?;
+    glue_table_name(logical_id, props)?;
+    if let Some(open) = props.get("OpenTableFormatInput") {
+        let iceberg = open
+            .get("IcebergInput")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| {
+                CfnError::Validation(format!(
+                    "AWS::Glue::Table resource {logical_id} requires OpenTableFormatInput.IcebergInput"
+                ))
+            })?;
+        ensure_known_properties(logical_id, "OpenTableFormatInput", open, &["IcebergInput"])?;
+        ensure_known_properties(
+            logical_id,
+            "IcebergInput",
+            iceberg,
+            &["MetadataOperation", "Version", "IcebergTableInput"],
+        )?;
+    }
     Ok(())
+}
+
+fn glue_table_name<'a>(logical_id: &str, props: &'a Value) -> Result<&'a str, CfnError> {
+    let name = props.get("Name");
+    let input_name = props.get("TableInput").and_then(|input| input.get("Name"));
+    if name.is_some() && input_name.is_some() && name != input_name {
+        return Err(CfnError::Validation(format!(
+            "AWS::Glue::Table resource {logical_id} has conflicting Name and TableInput.Name"
+        )));
+    }
+    if props
+        .get("TableInput")
+        .is_some_and(|input| !input.is_object())
+    {
+        return Err(CfnError::Validation(format!(
+            "AWS::Glue::Table resource {logical_id} requires TableInput to be an object"
+        )));
+    }
+    name.or(input_name)
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty() && name.len() <= 255)
+        .ok_or_else(|| {
+            CfnError::Validation(format!(
+                "AWS::Glue::Table resource {logical_id} requires non-empty Name or TableInput.Name"
+            ))
+        })
 }
 
 fn glue_input_name<'a>(

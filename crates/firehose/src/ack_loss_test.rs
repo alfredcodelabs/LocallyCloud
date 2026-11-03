@@ -387,7 +387,12 @@ async fn committed_glue_update_with_lost_ack_retries_once_without_duplicate_rows
     assert_eq!(rows[2]["Data"][3]["VarCharValue"], "10.25");
     assert_eq!(rows[2]["Data"][7]["VarCharValue"], "CANCELLED");
     // A pruned partition is never fetched: remove its file after validating its rows.
-    let old_file = format!("/{BUCKET}/lake/events/data/{token}-2026-10-03.parquet");
+    let old_file = format!("/{BUCKET}/lake/events/data/{token}-0.parquet");
+    let (status, _) = call(&dispatcher, Method::GET, &old_file, None, Bytes::new()).await;
+    assert!(
+        status.is_success(),
+        "pruning probe must delete an existing data file"
+    );
     let (status, _) = call(&dispatcher, Method::DELETE, &old_file, None, Bytes::new()).await;
     assert!(status.is_success());
     let count = query_results(&dispatcher, "SELECT COUNT(*) AS orders FROM lake.events WHERE order_date = '2026-10-04' AND paid = false").await;

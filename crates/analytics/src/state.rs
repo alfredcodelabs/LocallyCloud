@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
@@ -69,6 +69,7 @@ pub(crate) struct TableRecord {
 #[derive(Default)]
 pub(crate) struct Catalog {
     pub(crate) databases: BTreeMap<String, DatabaseRecord>,
+    pub(crate) pending_tables: BTreeSet<(String, String)>,
 }
 
 // Preserve the exact wire timestamp across JSON persistence without decimal rounding.
@@ -87,6 +88,7 @@ mod timestamp_bits {
 pub(crate) struct AnalyticsState {
     catalogs: DashMap<Scope, Arc<Mutex<Catalog>>>,
     pub(crate) persistence: Option<crate::persistence::Persistence>,
+    pub(crate) iceberg_creations: Arc<tokio::sync::Semaphore>,
 }
 
 impl AnalyticsState {
@@ -114,6 +116,7 @@ impl AnalyticsState {
         Self {
             catalogs: DashMap::new(),
             persistence: None,
+            iceberg_creations: Arc::new(tokio::sync::Semaphore::new(16)),
         }
     }
 

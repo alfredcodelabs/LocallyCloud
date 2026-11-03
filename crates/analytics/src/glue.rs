@@ -29,6 +29,8 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 #[path = "glue/durability_tests.rs"]
 mod durability_tests;
 
+mod iceberg;
+
 #[derive(Clone)]
 pub(crate) struct GlueHandler {
     state: Arc<AnalyticsState>,
@@ -132,7 +134,10 @@ impl GlueHandler {
             "GetDatabases" => self.get_databases(decode(&request.body)?, request),
             "UpdateDatabase" => self.update_database(decode(&request.body)?, request),
             "DeleteDatabase" => self.delete_database(decode(&request.body)?, request),
-            "CreateTable" => self.create_table(decode(&request.body)?, request),
+            "CreateTable" => {
+                let input = decode::<CreateTableRequest>(&request.body)?.normalize()?;
+                self.create_table(input, request)
+            }
             "GetTable" => self.get_table(decode(&request.body)?, request),
             "GetTables" => self.get_tables(decode(&request.body)?, request),
             "UpdateTable" => self.update_table(decode(&request.body)?, request),
@@ -288,6 +293,13 @@ impl GlueHandler {
         let scope = Scope::new(&request.account_id, &request.region);
         let slot = self.state.catalog(&scope);
         let mut catalog = lock(&slot)?;
+        if catalog
+            .pending_tables
+            .iter()
+            .any(|(database, _)| database == &input.name)
+        {
+            return Err(AnalyticsError::ConcurrentModification);
+        }
         let database = catalog
             .databases
             .get(&input.name)
@@ -306,7 +318,7 @@ impl GlueHandler {
 
     fn create_table(
         &self,
-        input: CreateTableRequest,
+        input: NormalizedCreateTableRequest,
         request: &ServiceRequest,
     ) -> Result<Value, AnalyticsError> {
         validate_name(&input.database_name)?;
@@ -327,6 +339,12 @@ impl GlueHandler {
         let scope = Scope::new(&request.account_id, &request.region);
         let slot = self.state.catalog(&scope);
         let mut catalog = lock(&slot)?;
+        if catalog
+            .pending_tables
+            .contains(&(input.database_name.clone(), input.table_input.name.clone()))
+        {
+            return Err(AnalyticsError::ConcurrentModification);
+        }
         let database = catalog
             .databases
             .get_mut(&input.database_name)
@@ -591,9 +609,23 @@ impl NativeHandler for GlueHandler {
     async fn handle(&self, request: ServiceRequest) -> Response {
         let request_id = request.request_id.clone();
         let handler = self.clone();
-        let result = tokio::task::spawn_blocking(move || handler.process(&request))
-            .await
-            .unwrap_or(Err(AnalyticsError::Internal));
+        let result = if iceberg::is_create(&request) {
+            // Own the operation independently of client cancellation: metadata publication
+            // and reservation release must finish even if the response receiver disappears.
+            match handler.state.iceberg_creations.clone().try_acquire_owned() {
+                Ok(permit) => tokio::spawn(async move {
+                    let _permit = permit;
+                    handler.create_iceberg(request).await
+                })
+                .await
+                .unwrap_or(Err(AnalyticsError::Internal)),
+                Err(_) => Err(AnalyticsError::ConcurrentModification),
+            }
+        } else {
+            tokio::task::spawn_blocking(move || handler.process(&request))
+                .await
+                .unwrap_or(Err(AnalyticsError::Internal))
+        };
         match result {
             Ok(value) => Response::builder()
                 .status(200)
@@ -820,8 +852,46 @@ struct DeleteDatabaseRequest {
 struct CreateTableRequest {
     catalog_id: Option<String>,
     database_name: String,
+    name: Option<String>,
+    table_input: Option<CreateTableInput>,
+    open_table_format_input: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct CreateTableInput {
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, Value>,
+}
+
+#[derive(Clone)]
+struct NormalizedCreateTableRequest {
+    catalog_id: Option<String>,
+    database_name: String,
     table_input: TableInput,
     open_table_format_input: Option<Value>,
+}
+
+impl CreateTableRequest {
+    fn normalize(self) -> Result<NormalizedCreateTableRequest, AnalyticsError> {
+        let (inner_name, fields) = self
+            .table_input
+            .map(|input| (input.name, input.fields))
+            .unwrap_or_default();
+        let name = match (self.name, inner_name) {
+            (Some(name), Some(inner)) if name == inner => name,
+            (Some(name), None) | (None, Some(name)) => name,
+            _ => return Err(AnalyticsError::InvalidInput),
+        };
+        let table_input = TableInput { name, fields };
+        Ok(NormalizedCreateTableRequest {
+            catalog_id: self.catalog_id,
+            database_name: self.database_name,
+            table_input,
+            open_table_format_input: self.open_table_format_input,
+        })
+    }
 }
 
 #[derive(Deserialize)]
