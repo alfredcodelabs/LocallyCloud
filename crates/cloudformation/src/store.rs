@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn durable_ownership_restart_isolation_claim_archive_and_failed_commit() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/cfn-durable-tests")
+            .join("../../.kiro/localcloud-tmp/cfn-durable-tests")
             .join(uuid::Uuid::new_v4().to_string());
         let db = StateDb::open(root.join("state.sqlite3")).unwrap();
         let reopen = || CfnStore::with_cipher(&db, StateCipher::with_key(&[31; 32])).unwrap();

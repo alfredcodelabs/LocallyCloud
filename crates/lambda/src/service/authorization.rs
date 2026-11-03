@@ -52,6 +52,28 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
         let name = resolve_function_name(&percent_decode_path(name), &req.region)?;
         Ok(function_arn(&req.region, &req.account_id, &name))
     };
+    let event_function = |name: &str| -> Result<String, LambdaError> {
+        let reference = crate::event_invoke::reference(
+            &percent_decode_path(name),
+            query_value(req.uri.query().unwrap_or(""), "Qualifier").as_deref(),
+        )?;
+        let base = function(name)?;
+        let decoded = percent_decode_path(name);
+        let has_embedded = if decoded.starts_with("arn:") {
+            decoded.split(':').nth(7).is_some()
+        } else if decoded.contains(":function:") {
+            decoded.split(':').nth(3).is_some()
+        } else {
+            decoded.contains(':')
+        };
+        if !has_embedded && query_value(req.uri.query().unwrap_or(""), "Qualifier").is_none() {
+            return Ok(base);
+        }
+        let qualifier = reference.rsplit(':').next().ok_or_else(|| {
+            LambdaError::InvalidParameterValue("Invalid function qualifier".into())
+        })?;
+        Ok(format!("{base}:{qualifier}"))
+    };
     let layer = |name: &str| -> String {
         format!(
             "arn:aws:lambda:{}:{}:layer:{}",
@@ -148,16 +170,16 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
             ("DeleteFunctionUrlConfig", function(name)?)
         }
         (["2019-09-25", "functions", name, "event-invoke-config"], "PUT") => {
-            ("PutFunctionEventInvokeConfig", function(name)?)
+            ("PutFunctionEventInvokeConfig", event_function(name)?)
         }
         (["2019-09-25", "functions", name, "event-invoke-config"], "POST") => {
-            ("UpdateFunctionEventInvokeConfig", function(name)?)
+            ("UpdateFunctionEventInvokeConfig", event_function(name)?)
         }
         (["2019-09-25", "functions", name, "event-invoke-config"], "GET") => {
-            ("GetFunctionEventInvokeConfig", function(name)?)
+            ("GetFunctionEventInvokeConfig", event_function(name)?)
         }
         (["2019-09-25", "functions", name, "event-invoke-config"], "DELETE") => {
-            ("DeleteFunctionEventInvokeConfig", function(name)?)
+            ("DeleteFunctionEventInvokeConfig", event_function(name)?)
         }
         (["2019-09-25", "functions", name, "event-invoke-config", "list"], "GET") => {
             ("ListFunctionEventInvokeConfigs", function(name)?)

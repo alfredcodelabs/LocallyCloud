@@ -2785,7 +2785,7 @@ mod tests {
     async fn durable_completed_stack_restart_updates_and_deletes_actual_queue() {
         use locallycloud_state::{StateCipher, StateDb};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/cfn-durable-tests")
+            .join("../../.kiro/localcloud-tmp/cfn-durable-tests")
             .join(uuid::Uuid::new_v4().to_string());
         let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         let make_handler = || {

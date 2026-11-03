@@ -8,6 +8,7 @@ pub(crate) enum KmsError {
     InvalidMarker,
     TagLimitExceeded,
     LimitExceeded,
+    Conflict,
     AlreadyExists,
     NotFound,
     InvalidState,
@@ -33,6 +34,11 @@ impl KmsError {
 
     pub(crate) fn into_aws(self) -> AwsError {
         let (code, message, status) = match self {
+            Self::Conflict => (
+                "ConflictException",
+                "An automatic rotation is scheduled within the next 20 minutes",
+                400,
+            ),
             Self::InvalidMarker => (
                 "InvalidMarkerException",
                 "The pagination marker is invalid",

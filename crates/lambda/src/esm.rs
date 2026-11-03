@@ -1151,9 +1151,9 @@ mod tests {
         }
         assert!(parse_scaling_config(&json!({"ScalingConfig": {}}), SourceType::Kinesis).is_err());
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
+            .join("../../.kiro/localcloud-tmp")
             .join(format!("lambda-scaling-{}", Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.join("state.sqlite");

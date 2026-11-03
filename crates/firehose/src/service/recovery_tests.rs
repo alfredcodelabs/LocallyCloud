@@ -80,7 +80,7 @@ async fn worker_restart_case(expire: bool) {
     ));
     registry.set_internal_dispatcher(dispatcher.clone());
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/firehose-tests")
+        .join("../../.kiro/localcloud-tmp/firehose-tests")
         .join(Uuid::new_v4().to_string());
     let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
     let (handler, handle) =

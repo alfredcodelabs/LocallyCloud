@@ -636,7 +636,7 @@ pub async fn create_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let fifo = name_is_fifo;
     let arn = QueueArn::new(ctx.region, ctx.account, name);
 
-    let _lifecycle = ctx.store.lifecycle_write().await;
+    let lifecycle = ctx.store.lifecycle_write().await;
     if ctx.store.deleted_recently(&arn) {
         return Err(SqsError::QueueDeletedRecently);
     }
@@ -645,29 +645,23 @@ pub async fn create_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
 
     let mut stored = default_attributes(fifo);
     stored.extend(attributes);
-    match ctx
-        .store
-        .insert_if_absent(arn.clone(), fifo, stored.clone(), tags)
-    {
-        InsertResult::Inserted(queue) => {
-            if let Some(db) = ctx.store.persistence() {
-                let state = queue.state.lock().await;
-                if let Err(error) = db.create_queue(&arn, &state) {
-                    ctx.store.forget_uncommitted(&arn);
-                    return Err(error);
+    let store = ctx.store.clone();
+    let arn = tokio::task::spawn_blocking(move || {
+        let _lifecycle = lifecycle;
+        match store.create_if_absent(arn, fifo, stored.clone(), tags)? {
+            InsertResult::Inserted(queue) => Ok(queue.arn.clone()),
+            InsertResult::Existing(existing) => {
+                if existing.state.blocking_lock().attributes == stored {
+                    Ok(existing.arn.clone())
+                } else {
+                    Err(SqsError::QueueNameExists)
                 }
             }
-            Ok(json!({ "QueueUrl": ctx.queue_urls.url(&arn) }))
         }
-        InsertResult::Existing(existing) => {
-            let state = existing.state.lock().await;
-            if state.attributes == stored {
-                Ok(json!({ "QueueUrl": ctx.queue_urls.url(&arn) }))
-            } else {
-                Err(SqsError::QueueNameExists)
-            }
-        }
-    }
+    })
+    .await
+    .map_err(|_| SqsError::StorageUnavailable)??;
+    Ok(json!({ "QueueUrl": ctx.queue_urls.url(&arn) }))
 }
 
 /// Read-only (computed) attributes that cannot be set by the client.

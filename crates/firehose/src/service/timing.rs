@@ -352,7 +352,7 @@ mod tests {
                 <= 2
         );
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/firehose-iceberg-tests")
+            .join("../../.kiro/localcloud-tmp/firehose-iceberg-tests")
             .join(format!("clock-{}", Uuid::new_v4()));
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         let (handler, handle) = FirehoseHandler::with_state(Weak::new(), state.clone()).unwrap();
@@ -464,7 +464,7 @@ mod tests {
             FailureCode::S3AccessDenied,
         ] {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/firehose-iceberg-tests")
+                .join("../../.kiro/localcloud-tmp/firehose-iceberg-tests")
                 .join(format!("backup-{}", Uuid::new_v4()));
             let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
             let (handler, handle) =

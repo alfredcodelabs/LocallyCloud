@@ -3401,8 +3401,10 @@ mod tests {
     #[tokio::test]
     async fn encrypted_graph_restart_and_failed_persistence_preserve_live_state() {
         let (db, directory) = tokio::task::spawn_blocking(|| {
-            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target")
+            let base =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiro/localcloud-tmp");
+            std::fs::create_dir_all(&base).unwrap();
+            let directory = base
                 .canonicalize()
                 .unwrap()
                 .join(format!("alb-state-{}", Uuid::new_v4().simple()));

@@ -11,7 +11,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/analytics-tests")
+            .join("../../.kiro/localcloud-tmp/analytics-tests")
             .join(Uuid::new_v4().to_string());
         let database = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         Self { root, database }

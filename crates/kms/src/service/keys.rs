@@ -94,7 +94,7 @@ impl KmsService {
             .transpose()?
             .unwrap_or_default();
         let material = crypto::generate_material()?;
-        let creation_date = now_epoch()?;
+        let creation_date = (self.clock)()?;
         let key_id = planned_key_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let policy = match optional_string(body, "Policy")? {
             Some(raw) => KeyPolicy::parse(raw.to_owned())?,
@@ -123,6 +123,8 @@ impl KmsService {
             explicit_policy,
             material_version: 1,
             material,
+            historical_materials: BTreeMap::new(),
+            rotation: Default::default(),
             tags,
         };
         if !self.store.insert(scope, record)? {
@@ -142,7 +144,7 @@ impl KmsService {
         region: &str,
     ) -> Result<(String, KeyPolicy, bool), KmsError> {
         let scope = Scope::new(account, region);
-        let id = self.resolve_key_id(selector, &scope)?;
+        let id = self.resolve_key_selector(selector, &scope)?;
         self.store
             .with_key(&scope, &id, |key| {
                 (scope.key_arn(&id), key.policy.clone(), key.explicit_policy)
@@ -327,18 +329,6 @@ impl KmsService {
             })?
             .ok_or(KmsError::NotFound)?;
         Ok(json!({}))
-    }
-
-    pub(super) fn get_key_rotation_status(
-        &self,
-        body: &Map<String, Value>,
-        scope: &Scope,
-    ) -> Result<Value, KmsError> {
-        require_known_fields(body, &["KeyId"])?;
-        let key_id = self.resolve_key_id(required_string(body, "KeyId")?, scope)?;
-        self.store
-            .with_key(scope, &key_id, |_| json!({ "KeyRotationEnabled": false }))
-            .ok_or(KmsError::NotFound)
     }
 
     pub(super) fn get_key_policy(

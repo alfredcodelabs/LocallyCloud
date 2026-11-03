@@ -30,7 +30,7 @@ use locallycloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec, Task
 use locallycloud_core::integration::correlation::CorrelationContext;
 use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::logs::{
-    LogScope, ProducerContext, ProducerGroupSpec, ProducerLogEvent, ProducerStreamSpec,
+    GroupRef, LogScope, ProducerContext, ProducerGroupSpec, ProducerLogEvent, ProducerStreamSpec,
 };
 use locallycloud_core::proxy::{forward_to_legacy, ProxyConfig};
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
@@ -647,15 +647,31 @@ struct WarmEnv {
 /// executor decoupled from cross-service wiring.
 #[async_trait::async_trait]
 pub trait DestinationRouter: Send + Sync {
-    async fn route(&self, target_arn: &str, record: serde_json::Value);
+    async fn route(&self, target_arn: &str, execution_role: &str, record: serde_json::Value);
 }
 
 /// The effective asynchronous-invocation configuration for a function.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AsyncConfig {
     pub max_retry_attempts: u32,
+    pub maximum_event_age: Duration,
+    pub accepted_at: tokio::time::Instant,
+    pub invoked_arn: Option<String>,
     pub on_success_arn: Option<String>,
     pub on_failure_arn: Option<String>,
+}
+
+impl Default for AsyncConfig {
+    fn default() -> Self {
+        Self {
+            max_retry_attempts: 0,
+            maximum_event_age: Duration::from_secs(21600),
+            accepted_at: tokio::time::Instant::now(),
+            invoked_arn: None,
+            on_success_arn: None,
+            on_failure_arn: None,
+        }
+    }
 }
 
 impl Executor {
@@ -1741,19 +1757,11 @@ impl Executor {
             },
             loop_depth: 0,
         };
-        // Resolve rather than recreate: stack deletion may intentionally remove the group.
-        let group = sink
-            .resolve_group(
-                scope.clone(),
-                ProducerGroupSpec {
-                    name: format!("/aws/lambda/{name}"),
-                },
-                context.clone(),
-            )
-            .await
-            .map_err(|error| {
-                LambdaError::InternalError(format!("final logs publication failed: {error}"))
-            })?;
+        // Final delivery must not recreate a group deleted by its stack, or require
+        // DescribeLogGroups on a standard write-only Lambda execution role.
+        let group = GroupRef {
+            name: format!("/aws/lambda/{name}"),
+        };
         let target = sink
             .ensure_stream(
                 scope.clone(),
@@ -2739,6 +2747,15 @@ impl Executor {
         let mut invoke_count = 0u32;
         let mut last: Option<InvokeResult> = None;
         for attempt in 1..=total {
+            if config.accepted_at.elapsed() >= config.maximum_event_age {
+                if let (Some(target), Some(router)) =
+                    (config.on_failure_arn.as_deref(), &self.destination_router)
+                {
+                    let record = serde_json::json!({"version":"1.0","timestamp":now_iso(),"requestContext":{"requestId":Uuid::new_v4().to_string(),"functionArn":config.invoked_arn.clone().unwrap_or_else(||format!("{}:{}",func.function_arn,func.version)),"condition":"EventAgeExceeded","approximateInvokeCount":invoke_count},"requestPayload":serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_else(|_|serde_json::Value::String(String::from_utf8_lossy(&payload).into_owned())),"responseContext":{"statusCode":200,"executedVersion":func.version},"responsePayload":null});
+                    router.route(target, &func.role, record).await;
+                }
+                return;
+            }
             invoke_count = attempt;
             match self
                 .invoke_sync_traced(account, region, func, payload.clone(), incoming_trace)
@@ -2773,8 +2790,11 @@ impl Executor {
             config.on_failure_arn.as_deref()
         };
         if let (Some(arn), Some(router)) = (target, &self.destination_router) {
-            let record = async_record(func, &payload, &result, invoke_count, succeeded);
-            router.route(arn, record).await;
+            let mut record = async_record(func, &payload, &result, invoke_count, succeeded);
+            if let Some(invoked_arn) = &config.invoked_arn {
+                record["requestContext"]["functionArn"] = serde_json::json!(invoked_arn);
+            }
+            router.route(arn, &func.role, record).await;
         }
     }
 }
@@ -2865,7 +2885,7 @@ mod tests {
     use async_trait::async_trait;
     use locallycloud_compute::runtime::{RuntimeError, TaskHandle, TaskState};
     use locallycloud_core::integration::logs::{
-        AppendOutcome, GroupRef, InternalLogSink, SinkError, StreamRef,
+        AppendOutcome, InternalLogSink, SinkError, StreamRef,
     };
     use locallycloud_core::integration::metrics::{
         EmitOutcome, MetricObservation, MetricOrigin, MetricSink, MetricUnit,
@@ -4147,6 +4167,131 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn final_output_uses_write_only_sink_and_never_recreates_deleted_group() {
+        struct TailRuntime {
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl ComputeRuntime for TailRuntime {
+            async fn start_task(&self, _: &str, _: &TaskSpec) -> Result<TaskHandle, RuntimeError> {
+                Err(RuntimeError::ExecutionFailed {
+                    reason: "unused".into(),
+                })
+            }
+            async fn stop_task(&self, id: &str) -> Result<TaskHandle, RuntimeError> {
+                Ok(TaskHandle {
+                    task_id: id.into(),
+                    state: TaskState::Stopped,
+                })
+            }
+            async fn get_output(&self, _: &str) -> Result<String, RuntimeError> {
+                Ok("late stdout\n".repeat(self.reads.fetch_add(1, Ordering::SeqCst) + 1))
+            }
+        }
+        struct WriteOnlyTail {
+            exists: AtomicBool,
+            events: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl InternalLogSink for WriteOnlyTail {
+            async fn resolve_group(
+                &self,
+                _: LogScope,
+                _: ProducerGroupSpec,
+                _: ProducerContext,
+            ) -> Result<GroupRef, SinkError> {
+                panic!("final output must not require DescribeLogGroups")
+            }
+            async fn ensure_group(
+                &self,
+                _: LogScope,
+                _: ProducerGroupSpec,
+                _: ProducerContext,
+            ) -> Result<GroupRef, SinkError> {
+                panic!("final output must not recreate a deleted group")
+            }
+            async fn ensure_stream(
+                &self,
+                _: LogScope,
+                group: GroupRef,
+                spec: ProducerStreamSpec,
+                _: ProducerContext,
+            ) -> Result<StreamRef, SinkError> {
+                if !self.exists.load(Ordering::SeqCst) {
+                    return Err(SinkError::NotFound("deleted log group".into()));
+                }
+                Ok(StreamRef {
+                    group_name: group.name,
+                    stream_name: spec.name,
+                })
+            }
+            async fn append(
+                &self,
+                _: LogScope,
+                target: StreamRef,
+                events: Vec<ProducerLogEvent>,
+                _: ProducerContext,
+            ) -> Result<AppendOutcome, SinkError> {
+                assert_eq!(target.group_name, "/aws/lambda/function");
+                assert_eq!(target.stream_name, "warm-stream");
+                let count = events.len();
+                self.events
+                    .lock()
+                    .unwrap()
+                    .extend(events.into_iter().map(|event| event.message));
+                Ok(AppendOutcome {
+                    stored_events: count,
+                })
+            }
+        }
+        let registry = ServiceRegistry::with_known_services();
+        let sink = Arc::new(WriteOnlyTail {
+            exists: AtomicBool::new(true),
+            events: Mutex::new(Vec::new()),
+        });
+        registry.register_native_with_log_sink(
+            ServiceName::new("logs"),
+            locallycloud_core::registry::ServiceMetadata::new(
+                locallycloud_core::registry::AwsProtocol::Json11,
+                None,
+            ),
+            Arc::new(StubHandler),
+            sink.clone(),
+        );
+        let mut executor = build_executor(
+            Arc::new(InvocationBroker::new()),
+            GuestBehavior::EchoUppercaseLen,
+        )
+        .await
+        .with_service_registry(Arc::downgrade(&registry));
+        executor.runtime = Arc::new(TailRuntime {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        executor.log_state.insert(
+            "tail-environment".into(),
+            ExecutionLogState {
+                stream_name: "warm-stream".into(),
+                output_bytes: 0,
+                account: "000000000000".into(),
+                region: "us-east-1".into(),
+                function_name: "function".into(),
+                role: "arn:aws:iam::000000000000:role/basic".into(),
+            },
+        );
+        executor
+            .publish_environment_tail("tail-environment")
+            .await
+            .unwrap();
+        assert_eq!(*sink.events.lock().unwrap(), vec!["late stdout"]);
+        sink.exists.store(false, Ordering::SeqCst);
+        assert!(executor
+            .publish_environment_tail("tail-environment")
+            .await
+            .is_err());
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
+    }
+
     struct AcceptingLogs;
 
     #[async_trait]
@@ -4367,6 +4512,7 @@ mod tests {
                 max_retry_attempts: 0,
                 on_success_arn: None,
                 on_failure_arn: None,
+                ..Default::default()
             },
             None,
         )
@@ -5148,6 +5294,7 @@ mod tests {
             max_retry_attempts: 2,
             on_success_arn: None,
             on_failure_arn: None,
+            ..Default::default()
         };
         let incoming = format!("{CALLER_ROOT};Parent=53995c3f42cd8ad8;Sampled=1");
         exec.invoke_async(
@@ -5705,7 +5852,7 @@ mod tests {
 
     #[async_trait]
     impl DestinationRouter for RecordingRouter {
-        async fn route(&self, target_arn: &str, record: serde_json::Value) {
+        async fn route(&self, target_arn: &str, _execution_role: &str, record: serde_json::Value) {
             self.records
                 .lock()
                 .unwrap()
@@ -5725,6 +5872,7 @@ mod tests {
             max_retry_attempts: 2,
             on_success_arn: Some("arn:aws:sqs:us-east-1:000000000000:ok".into()),
             on_failure_arn: Some("arn:aws:sqs:us-east-1:000000000000:dlq".into()),
+            ..Default::default()
         };
         exec.invoke_async("000000000000", "us-east-1", &f, b"hi".to_vec(), &cfg, None)
             .await;
@@ -5746,6 +5894,7 @@ mod tests {
             max_retry_attempts: 2,
             on_success_arn: None,
             on_failure_arn: Some("arn:aws:sqs:us-east-1:000000000000:dlq".into()),
+            ..Default::default()
         };
         exec.invoke_async("000000000000", "us-east-1", &f, b"{}".to_vec(), &cfg, None)
             .await;
@@ -5758,6 +5907,40 @@ mod tests {
         assert_eq!(recs[0].1["responseContext"]["functionError"], "Unhandled");
         // The retries reuse the environment the handler error left running.
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_async_event_routes_failure_without_starting_a_guest() {
+        let router = Arc::new(RecordingRouter::default());
+        let (exec, starts) = build_executor_tracked(
+            Arc::new(InvocationBroker::new()),
+            GuestBehavior::EchoUppercaseLen,
+        )
+        .await;
+        let exec = exec.with_destination_router(router.clone());
+        let f = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        let cfg = AsyncConfig {
+            max_retry_attempts: 2,
+            maximum_event_age: Duration::from_secs(60),
+            accepted_at: tokio::time::Instant::now() - Duration::from_secs(61),
+            on_failure_arn: Some("arn:aws:sqs:us-east-1:000000000000:errors".into()),
+            invoked_arn: Some("arn:aws:lambda:us-east-1:000000000000:function:fn:prod".into()),
+            ..Default::default()
+        };
+        exec.invoke_async("000000000000", "us-east-1", &f, b"{}".to_vec(), &cfg, None)
+            .await;
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let records = router.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].1["requestContext"]["condition"],
+            "EventAgeExceeded"
+        );
+        assert_eq!(records[0].1["requestContext"]["approximateInvokeCount"], 0);
+        assert_eq!(
+            records[0].1["requestContext"]["functionArn"],
+            cfg.invoked_arn.unwrap()
+        );
     }
 
     #[tokio::test]

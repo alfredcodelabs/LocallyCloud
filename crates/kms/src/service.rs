@@ -22,9 +22,11 @@ use crate::store::KmsStore;
 
 mod aliases;
 mod keys;
+mod rotation;
 
 pub(crate) struct KmsService {
     store: KmsStore,
+    clock: Arc<dyn Fn() -> Result<f64, KmsError> + Send + Sync>,
 }
 
 impl KmsService {
@@ -58,7 +60,12 @@ impl KmsService {
                 {
                     return Err(KmsError::AccessDenied);
                 }
-                if key.material_version != envelope.material_version {
+                if key.material_for(envelope.material_version).is_none()
+                    || (matches!(
+                        request.action,
+                        locallycloud_core::integration::kms::KmsDataKeyAction::Generate
+                    ) && key.material_version != envelope.material_version)
+                {
                     return Err(KmsError::InvalidCiphertext);
                 }
                 Ok(())
@@ -70,8 +77,15 @@ impl KmsService {
     }
 
     pub(crate) fn new(db: Arc<StateDb>) -> Result<Self, KmsError> {
+        Self::with_clock(db, Arc::new(now_epoch))
+    }
+    fn with_clock(
+        db: Arc<StateDb>,
+        clock: Arc<dyn Fn() -> Result<f64, KmsError> + Send + Sync>,
+    ) -> Result<Self, KmsError> {
         Ok(Self {
             store: KmsStore::new(db)?,
+            clock,
         })
     }
 
@@ -101,6 +115,9 @@ impl KmsService {
             "GenerateDataKey" => self.generate_data_key(body, &scope),
             "GetKeyPolicy" => self.get_key_policy(body, &scope),
             "GetKeyRotationStatus" => self.get_key_rotation_status(body, &scope),
+            "EnableKeyRotation" => self.set_key_rotation(body, &scope, true),
+            "DisableKeyRotation" => self.set_key_rotation(body, &scope, false),
+            "RotateKeyOnDemand" => self.rotate_on_demand(body, &scope),
             "PutKeyPolicy" => self.put_key_policy(body, &scope),
             "ScheduleKeyDeletion" => self.schedule_key_deletion(body, &scope),
             _ => Err(KmsError::Unsupported),
@@ -255,6 +272,7 @@ impl KmsService {
         }
         let context = crypto::canonical_context(&encryption_context)?;
         let key_id = envelope.key_id.clone();
+        self.rotate_if_due(&scope, &key_id)?;
         let plaintext = self
             .store
             .with_key(&scope, &key_id, |key| {
@@ -271,10 +289,10 @@ impl KmsService {
                 if !internal_policy_allows(key, &call, "kms:Decrypt", &encryption_context) {
                     return Err(KmsError::AccessDenied);
                 }
-                if key.material_version != envelope.material_version {
-                    return Err(KmsError::InvalidCiphertext);
-                }
-                crypto::open(&key.material, envelope, &context)
+                let material = key
+                    .material_for(envelope.material_version)
+                    .ok_or(KmsError::InvalidCiphertext)?;
+                crypto::open(material, envelope, &context)
             })
             .ok_or(KmsError::InvalidCiphertext)??;
         Ok(KmsDecryptOutput {
@@ -291,9 +309,9 @@ impl KmsService {
         let scope = Scope::new(&request.call.account_id, &request.call.region);
         let key_id =
             if self.is_own_managed_alias(&request.key_id, &scope, &request.call.source_service) {
-                self.service_default_key(&scope, &request.call.source_service)?
+                self.service_default_key_unrotated(&scope, &request.call.source_service)?
             } else {
-                self.resolve_key_id(&request.key_id, &scope)?
+                self.resolve_key_selector(&request.key_id, &scope)?
             };
         self.store
             .with_key(&scope, &key_id, |key| {
@@ -316,6 +334,16 @@ impl KmsService {
     }
 
     fn service_default_key(&self, scope: &Scope, service: &str) -> Result<String, KmsError> {
+        let id = self.service_default_key_unrotated(scope, service)?;
+        self.rotate_if_due(scope, &id)?;
+        Ok(id)
+    }
+
+    fn service_default_key_unrotated(
+        &self,
+        scope: &Scope,
+        service: &str,
+    ) -> Result<String, KmsError> {
         if !matches!(service, "ssm" | "secretsmanager" | "s3") {
             return Err(KmsError::AccessDenied);
         }
@@ -323,6 +351,8 @@ impl KmsService {
             let mut record =
                 new_key_record(format!("Default key for {service}"), KeyManager::Aws, scope)?;
             record.owner_service = Some(service.to_owned());
+            record.rotation.enabled = true;
+            record.rotation.next_date = Some((self.clock)()? + 365.0 * 86400.0);
             if service == "s3" {
                 record.policy = KeyPolicy::parse(json!({"Statement": {
                     "Effect":"Allow", "Principal":"*", "Action":["kms:GenerateDataKey","kms:Decrypt","kms:Encrypt"],
@@ -421,6 +451,7 @@ impl KmsService {
         }
         let context = crypto::canonical_context(&encryption_context(body)?)?;
         let key_id = envelope.key_id.clone();
+        self.rotate_if_due(scope, &key_id)?;
         let key_arn = scope.key_arn(&key_id);
         let mut plaintext = self
             .store
@@ -431,10 +462,10 @@ impl KmsService {
                 if !policy_allows(key, None, "kms:Decrypt", None, scope, false) {
                     return Err(KmsError::AccessDenied);
                 }
-                if key.material_version != envelope.material_version {
-                    return Err(KmsError::InvalidCiphertext);
-                }
-                crypto::open(&key.material, envelope, &context)
+                let material = key
+                    .material_for(envelope.material_version)
+                    .ok_or(KmsError::InvalidCiphertext)?;
+                crypto::open(material, envelope, &context)
             })
             .ok_or(KmsError::InvalidCiphertext)??;
         let encoded_plaintext = STANDARD.encode(&plaintext);
@@ -522,6 +553,11 @@ impl KmsService {
     }
 
     fn resolve_key_id(&self, value: &str, scope: &Scope) -> Result<String, KmsError> {
+        let id = self.resolve_key_selector(value, scope)?;
+        self.rotate_if_due(scope, &id)?;
+        Ok(id)
+    }
+    fn resolve_key_selector(&self, value: &str, scope: &Scope) -> Result<String, KmsError> {
         let alias_name = if value.starts_with("alias/") {
             validate_alias_name(value)?;
             Some(value.to_owned())
@@ -565,6 +601,8 @@ fn new_key_record(
         material_version: 1,
         material: crypto::generate_material()?,
         tags: BTreeMap::new(),
+        historical_materials: BTreeMap::new(),
+        rotation: Default::default(),
     })
 }
 

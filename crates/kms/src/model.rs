@@ -76,6 +76,24 @@ impl KeyManager {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Rotation {
+    pub(crate) enabled: bool,
+    pub(crate) period_days: u32,
+    pub(crate) next_date: Option<f64>,
+    pub(crate) on_demand_count: u8,
+}
+impl Default for Rotation {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            period_days: 365,
+            next_date: None,
+            on_demand_count: 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct KeyRecord {
     pub(crate) key_id: String,
@@ -88,10 +106,19 @@ pub(crate) struct KeyRecord {
     pub(crate) explicit_policy: bool,
     pub(crate) material_version: u32,
     pub(crate) material: SecretMaterial,
+    pub(crate) historical_materials: std::collections::BTreeMap<u32, SecretMaterial>,
+    pub(crate) rotation: Rotation,
     pub(crate) tags: std::collections::BTreeMap<String, String>,
 }
 
 impl KeyRecord {
+    pub(crate) fn material_for(&self, version: u32) -> Option<&SecretMaterial> {
+        if version == self.material_version {
+            Some(&self.material)
+        } else {
+            self.historical_materials.get(&version)
+        }
+    }
     pub(crate) fn is_enabled(&self) -> bool {
         matches!(self.state, KeyState::Enabled)
     }

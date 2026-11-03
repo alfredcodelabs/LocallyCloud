@@ -84,6 +84,10 @@ impl KmsHandler {
                 | "TagResource"
                 | "UntagResource"
                 | "ListResourceTags"
+                | "EnableKeyRotation"
+                | "DisableKeyRotation"
+                | "GetKeyRotationStatus"
+                | "RotateKeyOnDemand"
         ) && (key_id.starts_with("alias/") || key_id.contains(":alias/"))
         {
             return Err(KmsError::Validation);
@@ -91,7 +95,7 @@ impl KmsHandler {
         let (resource, policy, explicit_policy) =
             self.service
                 .key_admin_policy(key_id, &request.account_id, &request.region)?;
-        self.authorize_key_policy(request, operation, resource, policy, explicit_policy)
+        self.authorize_key_policy(request, operation, resource, policy, explicit_policy, body)
     }
 
     fn authorize_key_policy(
@@ -101,6 +105,7 @@ impl KmsHandler {
         resource: String,
         policy: crate::policy::KeyPolicy,
         explicit_policy: bool,
+        body: &serde_json::Map<String, Value>,
     ) -> Result<(), KmsError> {
         let registry = self.registry.upgrade().ok_or(KmsError::AccessDenied)?;
         let dispatcher = registry
@@ -122,6 +127,13 @@ impl KmsHandler {
             "kms:calleraccount".into(),
             vec![request.account_id.clone()],
         )]);
+        if operation == "EnableKeyRotation" {
+            let period = match body.get("RotationPeriodInDays") {
+                Some(value) => value.as_u64().ok_or(KmsError::Validation)?,
+                None => 365,
+            };
+            context.insert("kms:rotationperiodindays".into(), vec![period.to_string()]);
+        }
         if let Some(principal) = &principal {
             context.insert("aws:principalarn".into(), vec![principal.clone()]);
             context.insert(
@@ -282,6 +294,7 @@ impl NativeHandler for KmsHandler {
                                     .key_arn(id),
                                 crate::policy::KeyPolicy::default_for(&request.account_id),
                                 false,
+                                &body,
                             )
                         } else if matches!(
                             operation,
@@ -292,6 +305,10 @@ impl NativeHandler for KmsHandler {
                                 | "TagResource"
                                 | "UntagResource"
                                 | "ListResourceTags"
+                                | "EnableKeyRotation"
+                                | "DisableKeyRotation"
+                                | "GetKeyRotationStatus"
+                                | "RotateKeyOnDemand"
                         ) {
                             self.authorize_key_admin(&request, &body, operation)
                         } else {
@@ -341,6 +358,8 @@ impl NativeHandler for KmsHandler {
                                 | "TrentService.EnableKey"
                                 | "TrentService.TagResource"
                                 | "TrentService.UntagResource"
+                                | "TrentService.EnableKeyRotation"
+                                | "TrentService.DisableKeyRotation"
                         )
                     ) {
                         Body::empty()
@@ -365,6 +384,7 @@ fn map_internal_error(error: KmsError) -> KmsInternalError {
         | KmsError::InvalidMarker
         | KmsError::TagLimitExceeded
         | KmsError::LimitExceeded
+        | KmsError::Conflict
         | KmsError::AlreadyExists
         | KmsError::Unsupported => KmsInternalError::InvalidRequest,
         KmsError::NotFound => KmsInternalError::NotFound,
@@ -532,7 +552,12 @@ mod tests {
                 })
                 .await;
             let status = response.status();
-            if status == 200 && matches!(action, "TagResource" | "UntagResource") {
+            if status == 200
+                && matches!(
+                    action,
+                    "TagResource" | "UntagResource" | "EnableKeyRotation" | "DisableKeyRotation"
+                )
+            {
                 assert_eq!(
                     response.headers()["content-type"],
                     "application/x-amz-json-1.1"
@@ -564,7 +589,15 @@ mod tests {
         );
         assert_eq!(admin_call(&handler, key, "DisableKey").await, 400);
         assert_eq!(admin_call(&handler, key, "ScheduleKeyDeletion").await, 400);
-        for action in ["TagResource", "UntagResource", "ListResourceTags"] {
+        for action in [
+            "TagResource",
+            "UntagResource",
+            "ListResourceTags",
+            "EnableKeyRotation",
+            "DisableKeyRotation",
+            "GetKeyRotationStatus",
+            "RotateKeyOnDemand",
+        ] {
             assert_eq!(admin_call(&handler, key, action).await, 400);
         }
         assert_eq!(
@@ -581,7 +614,15 @@ mod tests {
         );
         admin.allowed.store(true, Ordering::Relaxed);
         assert_eq!(admin_call(&handler, key, "CreateKey").await, 200);
-        for action in ["TagResource", "ListResourceTags", "UntagResource"] {
+        for action in [
+            "TagResource",
+            "ListResourceTags",
+            "UntagResource",
+            "EnableKeyRotation",
+            "DisableKeyRotation",
+            "GetKeyRotationStatus",
+            "RotateKeyOnDemand",
+        ] {
             assert_eq!(admin_call(&handler, key, action).await, 200);
         }
         assert_eq!(admin_call(&handler, key, "DisableKey").await, 200);
@@ -677,6 +718,22 @@ mod tests {
             .authorize_cached_key(request(call.clone(), KmsDataKeyAction::Decrypt))
             .unwrap();
         assert_eq!(handler.internal_call_count.load(Ordering::Relaxed), 1);
+        handler
+            .service
+            .dispatch(
+                "RotateKeyOnDemand",
+                serde_json::json!({"KeyId":key}).as_object().unwrap(),
+                account,
+                region,
+            )
+            .unwrap();
+        assert!(matches!(
+            handler.authorize_cached_key(request(call.clone(), KmsDataKeyAction::Generate)),
+            Err(KmsInternalError::InvalidCiphertext)
+        ));
+        handler
+            .authorize_cached_key(request(call.clone(), KmsDataKeyAction::Decrypt))
+            .unwrap();
         let mut denied = call.clone();
         denied.iam_policy_denied = true;
         assert!(matches!(
@@ -737,3 +794,6 @@ mod tests {
         assert_eq!(api.version(), KMS_INTERNAL_API_VERSION);
     }
 }
+
+#[cfg(test)]
+mod rotation_authorization_tests;

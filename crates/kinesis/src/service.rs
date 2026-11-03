@@ -1133,7 +1133,7 @@ mod tests {
     #[test]
     fn disk_backlog_pages_restart_expiry_and_modeled_write_windows_are_bounded() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
+            .join("../../.kiro/localcloud-tmp")
             .join(format!("kinesis-ledger-{}", Uuid::new_v4()));
         let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         let mut handler = KinesisHandler::with_state(db.clone()).unwrap();

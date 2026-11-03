@@ -169,11 +169,10 @@ impl InternalLogSink for LogsProducerSink {
             Err(DispatchFailure::Rejected { ref code, .. })
                 if code == "ResourceAlreadyExistsException" =>
             {
-                if self.group_exists(&scope, &spec.name, &context).await? {
-                    Ok(GroupRef { name: spec.name })
-                } else {
-                    Err(SinkError::Incompatible("log group".into()))
-                }
+                // The authorized create response proves this exact group exists. Asking
+                // to describe groups would require an extra read permission that standard
+                // Lambda execution roles do not need to publish invocation logs.
+                Ok(GroupRef { name: spec.name })
             }
             Err(error) => Err(error.into()),
         }
@@ -281,5 +280,141 @@ impl From<DispatchFailure> for SinkError {
                 _ => SinkError::Rejected(code),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use locallycloud_core::integration::authorization::AuthorizationRequest;
+    use locallycloud_core::integration::{
+        correlation::CorrelationContext, identity::CallerIdentity, InternalDispatcher,
+        RequestIdentity,
+    };
+    use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+    use locallycloud_core::registry::ServiceName;
+    use locallycloud_iam_sts::{
+        enforcement::EnforcementMode, iam, query::QueryRequest, store::IamStore, sts::SessionStore,
+    };
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn lambda_basic_execution_role_can_publish_repeatedly_without_describe_permissions() {
+        let registry = ServiceRegistry::with_known_services();
+        crate::register(&registry).unwrap();
+        let account = "000000000000";
+        let region = "us-east-1";
+        let group = "/aws/lambda/basic-role";
+        let store = Arc::new(IamStore::new());
+        iam::seed_aws_managed_policies(&store);
+        let trust = json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]});
+        iam::create_role(
+            &store,
+            account,
+            &QueryRequest::parse(
+                format!("RoleName=basic&AssumeRolePolicyDocument={trust}").as_bytes(),
+            ),
+        )
+        .unwrap();
+        iam::attach_policy(&store,account,iam::Entity::Role,&QueryRequest::parse(b"RoleName=basic&PolicyArn=arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")).unwrap();
+        locallycloud_iam_sts::register_with_store_and_mode(
+            &registry,
+            store.clone(),
+            Arc::new(SessionStore::new()),
+            EnforcementMode::Strict,
+        );
+        registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            region.into(),
+            account.into(),
+        )));
+        let context = ProducerContext {
+            source_arn: None,
+            source_service: "lambda".into(),
+            identity: CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/basic".into(),
+                session_name: "invocation".into(),
+            },
+            correlation: CorrelationContext::root(),
+            loop_depth: 0,
+        };
+        let scope = LogScope::new(account, region);
+        let sink = registry.log_sink(&ServiceName::new("logs")).unwrap();
+        let evaluator = registry
+            .authorization_evaluator(&ServiceName::new("iam"))
+            .unwrap();
+        for action in ["logs:DescribeLogGroups", "logs:DescribeLogStreams"] {
+            assert!(evaluator
+                .authorize(AuthorizationRequest {
+                    request_identity: RequestIdentity {
+                        account_id: account.into(),
+                        access_key_id: None,
+                        arn: None
+                    },
+                    delegated_identity: Some(context.identity.clone()),
+                    source_service: "lambda".into(),
+                    action: action.into(),
+                    resource: "*".into(),
+                    context: Default::default()
+                })
+                .is_err());
+        }
+        for index in 0..2 {
+            let group = sink
+                .ensure_group(
+                    scope.clone(),
+                    ProducerGroupSpec { name: group.into() },
+                    context.clone(),
+                )
+                .await
+                .unwrap();
+            let stream = sink
+                .ensure_stream(
+                    scope.clone(),
+                    group,
+                    ProducerStreamSpec {
+                        name: "same-warm-environment".into(),
+                    },
+                    context.clone(),
+                )
+                .await
+                .unwrap();
+            let result = sink
+                .append(
+                    scope.clone(),
+                    stream,
+                    vec![ProducerLogEvent {
+                        timestamp_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64,
+                        message: format!("handler-error-{index}"),
+                    }],
+                    context.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.stored_events, 1);
+        }
+        let deny = json!({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"logs:CreateLogGroup","Resource":"*"}]});
+        iam::put_inline_policy(
+            &store,
+            account,
+            iam::Entity::Role,
+            &QueryRequest::parse(
+                format!("RoleName=basic&PolicyName=deny-create&PolicyDocument={deny}").as_bytes(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            sink.ensure_group(scope, ProducerGroupSpec { name: group.into() }, context)
+                .await,
+            Err(SinkError::Rejected(_))
+        ));
     }
 }

@@ -298,11 +298,11 @@ impl EventInvokeConfig {
     /// The shared event-invoke config response shape.
     pub fn to_json(&self, function_arn: &str) -> serde_json::Value {
         serde_json::json!({
-            "LastModified": self.last_modified,
+            "LastModified": time::OffsetDateTime::parse(&self.last_modified, &time::format_description::well_known::Rfc3339).map(|t| t.unix_timestamp_nanos() as f64 / 1_000_000_000.0).unwrap_or(0.0),
             "FunctionArn": function_arn,
-            "MaximumRetryAttempts": self.maximum_retry_attempts,
-            "MaximumEventAgeInSeconds": self.maximum_event_age_in_seconds,
-            "DestinationConfig": self.destination_config,
+            "MaximumRetryAttempts": self.maximum_retry_attempts.unwrap_or(2),
+            "MaximumEventAgeInSeconds": self.maximum_event_age_in_seconds.unwrap_or(21600),
+            "DestinationConfig": self.destination_config.clone().unwrap_or_else(|| serde_json::json!({})),
         })
     }
 }
@@ -340,6 +340,8 @@ pub(crate) struct FunctionRecord {
     reserved_concurrent_executions: Option<u32>,
     url_config: Option<FunctionUrlConfig>,
     event_invoke_config: Option<EventInvokeConfig>,
+    #[serde(default)]
+    event_invoke_configs: BTreeMap<String, EventInvokeConfig>,
     provisioned: BTreeMap<String, ProvisionedConfig>,
     policy: BTreeMap<String, serde_json::Value>,
 }
@@ -446,6 +448,7 @@ impl FunctionStore {
                     reserved_concurrent_executions: None,
                     url_config: None,
                     event_invoke_config: None,
+                    event_invoke_configs: BTreeMap::new(),
                     provisioned: BTreeMap::new(),
                     policy: BTreeMap::new(),
                 });
@@ -632,7 +635,10 @@ impl FunctionStore {
     ) -> Option<Alias> {
         self.records
             .get_mut(&Self::key(account_id, region, name))
-            .and_then(|mut r| r.aliases.remove(alias))
+            .and_then(|mut r| {
+                r.event_invoke_configs.remove(alias);
+                r.aliases.remove(alias)
+            })
     }
 
     pub fn list_aliases(&self, account_id: &str, region: &str, name: &str) -> Option<Vec<Alias>> {
@@ -817,41 +823,83 @@ impl FunctionStore {
 
     // ---- Event-invoke config ----
 
-    /// Read the event-invoke config. `None` if the function or its config is absent.
+    /// Configuration names carry the invoked qualifier; unqualified means `$LATEST`.
     pub fn get_event_invoke_config(
         &self,
-        account_id: &str,
+        account: &str,
         region: &str,
-        name: &str,
+        reference: &str,
     ) -> Option<EventInvokeConfig> {
+        let (name, qualifier) = reference.split_once(':').unwrap_or((reference, "$LATEST"));
         self.records
-            .get(&Self::key(account_id, region, name))
-            .and_then(|r| r.event_invoke_config.clone())
+            .get(&Self::key(account, region, name))
+            .and_then(|record| {
+                record
+                    .event_invoke_configs
+                    .get(qualifier)
+                    .cloned()
+                    .or_else(|| {
+                        (qualifier == "$LATEST")
+                            .then(|| record.event_invoke_config.clone())
+                            .flatten()
+                    })
+            })
     }
-
-    /// Insert or replace the event-invoke config. Returns `false` if the function is absent.
     pub fn set_event_invoke_config(
         &self,
-        account_id: &str,
+        account: &str,
         region: &str,
-        name: &str,
+        reference: &str,
         config: EventInvokeConfig,
     ) -> bool {
-        match self.records.get_mut(&Self::key(account_id, region, name)) {
-            Some(mut record) => {
-                record.event_invoke_config = Some(config);
-                true
-            }
-            None => false,
+        let (name, qualifier) = reference.split_once(':').unwrap_or((reference, "$LATEST"));
+        let Some(mut record) = self.records.get_mut(&Self::key(account, region, name)) else {
+            return false;
+        };
+        if qualifier == "$LATEST" {
+            record.event_invoke_config = None;
         }
+        record.event_invoke_configs.insert(qualifier.into(), config);
+        true
     }
-
-    /// Remove the event-invoke config. Returns `true` only if a config was present.
-    pub fn delete_event_invoke_config(&self, account_id: &str, region: &str, name: &str) -> bool {
-        match self.records.get_mut(&Self::key(account_id, region, name)) {
-            Some(mut record) => record.event_invoke_config.take().is_some(),
-            None => false,
+    pub fn delete_event_invoke_config(&self, account: &str, region: &str, reference: &str) -> bool {
+        let (name, qualifier) = reference.split_once(':').unwrap_or((reference, "$LATEST"));
+        let Some(mut record) = self.records.get_mut(&Self::key(account, region, name)) else {
+            return false;
+        };
+        let legacy = qualifier == "$LATEST" && record.event_invoke_config.take().is_some();
+        record.event_invoke_configs.remove(qualifier).is_some() || legacy
+    }
+    pub(crate) fn event_invoke_configs_page(
+        &self,
+        account: &str,
+        region: &str,
+        name: &str,
+        marker: Option<&str>,
+        limit: usize,
+    ) -> Option<Vec<(String, EventInvokeConfig)>> {
+        let record = self.records.get(&Self::key(account, region, name))?;
+        if marker.is_some_and(|q| {
+            !record.event_invoke_configs.contains_key(q)
+                && !(q == "$LATEST" && record.event_invoke_config.is_some())
+        }) {
+            return None;
         }
+        let mut result = Vec::new();
+        if marker.is_none() && !record.event_invoke_configs.contains_key("$LATEST") {
+            if let Some(legacy) = &record.event_invoke_config {
+                result.push(("$LATEST".into(), legacy.clone()));
+            }
+        }
+        for (q, config) in record
+            .event_invoke_configs
+            .iter()
+            .filter(|(q, _)| marker.is_none_or(|marker| q.as_str() > marker))
+            .take(limit + 1 - result.len())
+        {
+            result.push((q.clone(), config.clone()));
+        }
+        Some(result)
     }
 
     // ---- Provisioned concurrency (per qualifier) ----

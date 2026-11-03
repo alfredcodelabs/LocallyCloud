@@ -2,6 +2,8 @@
 
 mod authorization;
 mod durability;
+#[cfg(test)]
+mod event_invoke_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -18,15 +20,10 @@ use tokio::task::JoinHandle;
 
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::correlation::CorrelationContext;
-use locallycloud_core::integration::delivery::{
-    AsyncDeliveryPolicy, CrossServiceCall, DeliveryEngine,
-};
-use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::lambda::{
     LambdaCallContext, LambdaFunctionError, LambdaInternalApi, LambdaInternalError,
     LambdaInvokeOutput, LambdaInvokeRequest, SensitivePayload, MAX_TRACE_HEADER_LEN,
 };
-use locallycloud_core::integration::pattern::IntegrationPatternId;
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use locallycloud_ec2::Ec2Handler;
 
@@ -38,13 +35,12 @@ use crate::control_plane::{
     delete_function_url_config, delete_layer_version, delete_provisioned_concurrency, get_alias,
     get_function, get_function_code_signing_config, get_function_concurrency,
     get_function_configuration, get_function_event_invoke_config, get_function_url_config,
-    get_layer_version, get_policy, get_provisioned_concurrency, list_aliases,
-    list_function_event_invoke_configs, list_functions, list_layer_versions, list_layers,
-    list_provisioned_concurrency, list_tags, list_versions_by_function, parse_layers,
-    publish_layer_version, publish_version, put_function_concurrency,
-    put_function_event_invoke_config, put_provisioned_concurrency, remove_permission, tag_resource,
-    untag_resource, update_alias, update_function_code, update_function_configuration,
-    update_function_event_invoke_config, update_function_url_config,
+    get_layer_version, get_policy, get_provisioned_concurrency, list_aliases, list_functions,
+    list_layer_versions, list_layers, list_provisioned_concurrency, list_tags,
+    list_versions_by_function, parse_layers, publish_layer_version, publish_version,
+    put_function_concurrency, put_function_event_invoke_config, put_provisioned_concurrency,
+    remove_permission, tag_resource, untag_resource, update_alias, update_function_code,
+    update_function_configuration, update_function_event_invoke_config, update_function_url_config,
 };
 use crate::error::LambdaError;
 use crate::esm::{
@@ -614,25 +610,44 @@ impl LambdaHandler {
                 Method::DELETE => delete_function_url_config(&self.store, region, account, name),
                 _ => Err(unsupported()),
             },
-            ["2019-09-25", "functions", name, "event-invoke-config"] => match req.method {
-                Method::PUT => {
-                    let input = parse_json(&req.body)?;
-                    put_function_event_invoke_config(&self.store, region, account, name, &input)
+            ["2019-09-25", "functions", name, "event-invoke-config"] => {
+                let target = crate::event_invoke::reference(
+                    &percent_decode_path(name),
+                    query_value(req.uri.query().unwrap_or(""), "Qualifier").as_deref(),
+                )?;
+                match req.method {
+                    Method::PUT => put_function_event_invoke_config(
+                        &self.store,
+                        region,
+                        account,
+                        &target,
+                        &parse_json(&req.body)?,
+                    ),
+                    Method::POST => update_function_event_invoke_config(
+                        &self.store,
+                        region,
+                        account,
+                        &target,
+                        &parse_json(&req.body)?,
+                    ),
+                    Method::GET => {
+                        get_function_event_invoke_config(&self.store, region, account, &target)
+                    }
+                    Method::DELETE => {
+                        delete_function_event_invoke_config(&self.store, region, account, &target)
+                    }
+                    _ => Err(unsupported()),
                 }
-                Method::POST => {
-                    let input = parse_json(&req.body)?;
-                    update_function_event_invoke_config(&self.store, region, account, name, &input)
-                }
-                Method::GET => get_function_event_invoke_config(&self.store, region, account, name),
-                Method::DELETE => {
-                    delete_function_event_invoke_config(&self.store, region, account, name)
-                }
-                _ => Err(unsupported()),
-            },
+            }
             ["2019-09-25", "functions", name, "event-invoke-config", "list"] => match req.method {
-                Method::GET => {
-                    list_function_event_invoke_configs(&self.store, region, account, name)
-                }
+                Method::GET => crate::event_invoke::list(
+                    &self.store,
+                    region,
+                    account,
+                    &percent_decode_path(name),
+                    query_value(req.uri.query().unwrap_or(""), "Marker").as_deref(),
+                    query_value(req.uri.query().unwrap_or(""), "MaxItems").as_deref(),
+                ),
                 _ => Err(unsupported()),
             },
             ["2018-10-31", "layers"] => match req.method {
@@ -1257,7 +1272,14 @@ impl LambdaHandler {
             Ok(n) => n,
             Err(e) => return e.into_response(&req.request_id),
         };
-        let qualifier = query_value(req.uri.query().unwrap_or(""), "Qualifier");
+        let reference = match crate::event_invoke::reference(
+            &name_ref,
+            query_value(req.uri.query().unwrap_or(""), "Qualifier").as_deref(),
+        ) {
+            Ok(reference) => reference,
+            Err(error) => return error.into_response(&req.request_id),
+        };
+        let qualifier = reference.rsplit(':').next().map(str::to_owned);
         let func = match self.resolve_invoke_target(account, region, &name, qualifier.as_deref()) {
             Ok(f) => f,
             Err(e) => return e.into_response(&req.request_id),
@@ -1296,7 +1318,11 @@ impl LambdaHandler {
                     return error.into_response(&req.request_id);
                 }
                 let payload = invoke_payload(&req.body);
-                let mut cfg = self.async_config(account, region, &name);
+                let mut cfg = self.async_config(
+                    account,
+                    region,
+                    &format!("{name}:{}", qualifier.as_deref().unwrap_or("$LATEST")),
+                );
                 // The DeadLetterConfig ARN is the OnFailure fallback when no destination is set.
                 if cfg.on_failure_arn.is_none() {
                     cfg.on_failure_arn = func.dead_letter_arn.clone();
@@ -1415,6 +1441,17 @@ impl LambdaHandler {
         };
         crate::executor::AsyncConfig {
             max_retry_attempts,
+            maximum_event_age: Duration::from_secs(u64::from(
+                cfg.as_ref()
+                    .and_then(|c| c.maximum_event_age_in_seconds)
+                    .unwrap_or(21600),
+            )),
+            accepted_at: tokio::time::Instant::now(),
+            invoked_arn: Some(
+                function_arn(region, account, name.split(':').next().unwrap_or(name))
+                    + ":"
+                    + name.rsplit(':').next().unwrap_or("$LATEST"),
+            ),
             on_success_arn: arn_at("OnSuccess"),
             on_failure_arn: arn_at("OnFailure"),
         }
@@ -1625,28 +1662,140 @@ fn empty_status(status: u16) -> Response {
 
 struct RegistryDestinationRouter {
     registry: Weak<ServiceRegistry>,
+    credentials: Arc<
+        Mutex<
+            std::collections::BTreeMap<
+                String,
+                locallycloud_core::integration::authorization::ServiceRoleCredentials,
+            >,
+        >,
+    >,
+    credential_slots: Arc<tokio::sync::Semaphore>,
+}
+impl RegistryDestinationRouter {
+    fn new(registry: Weak<ServiceRegistry>) -> Self {
+        Self {
+            registry,
+            credentials: Arc::new(Mutex::new(Default::default())),
+            credential_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
+    fn role_credentials(
+        cache: &Mutex<
+            std::collections::BTreeMap<
+                String,
+                locallycloud_core::integration::authorization::ServiceRoleCredentials,
+            >,
+        >,
+        evaluator: &dyn locallycloud_core::integration::authorization::AuthorizationEvaluator,
+        account: &str,
+        role: &str,
+    ) -> Result<
+        locallycloud_core::integration::authorization::ServiceRoleCredentials,
+        locallycloud_core::integration::authorization::AuthorizationError,
+    > {
+        use locallycloud_core::integration::authorization::AuthorizationError;
+        let now = time::OffsetDateTime::now_utc() + time::Duration::seconds(30);
+        let mut cache = cache.lock().map_err(|_| AuthorizationError::Internal)?;
+        cache.retain(|_, value| {
+            time::OffsetDateTime::parse(
+                &value.expiration,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .is_ok_and(|expires| expires > now)
+        });
+        if let Some(cached) = cache.get(role) {
+            return Ok(cached.clone());
+        }
+        let issued =
+            evaluator.issue_service_role_credentials(account, role, "lambda.amazonaws.com")?;
+        if cache.len() >= 256 {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, value)| &value.expiration)
+                .map(|(role, _)| role.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(role.into(), issued.clone());
+        Ok(issued)
+    }
 }
 
 #[async_trait]
 impl DestinationRouter for RegistryDestinationRouter {
-    async fn route(&self, target_arn: &str, record: Value) {
-        let parts: Vec<&str> = target_arn.split(':').collect();
-        if parts.len() != 6 || parts[0] != "arn" || parts[2] != "sqs" || parts[5].is_empty() {
-            tracing::warn!(target_arn, "unsupported Lambda async destination");
+    async fn route(&self, target_arn: &str, execution_role: &str, record: Value) {
+        use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
+        use locallycloud_core::integration::RequestIdentity;
+        let parts: Vec<_> = target_arn.split(':').collect();
+        let ["arn", "aws", "sqs", region, account, queue] = parts.as_slice() else {
+            tracing::warn!("unsupported Lambda async destination");
+            return;
+        };
+        if queue.is_empty() || execution_role.split(':').nth(4) != Some(*account) {
+            tracing::warn!("invalid Lambda async destination scope");
             return;
         }
         let Some(registry) = self.registry.upgrade() else {
-            tracing::warn!("Lambda async destination skipped: registry unavailable");
+            tracing::warn!("Lambda destination registry unavailable");
             return;
         };
         let Some(dispatcher) = registry.internal_dispatcher() else {
-            tracing::warn!("Lambda async destination skipped: dispatcher unavailable");
+            tracing::warn!("Lambda destination dispatcher unavailable");
             return;
         };
-        let region = parts[3];
-        let account = parts[4];
-        let queue = parts[5];
+        let evaluator = registry.authorization_evaluator(&ServiceName::new("iam"));
+        let strict = evaluator
+            .as_ref()
+            .is_some_and(|evaluator| evaluator.strict_sigv4_required());
+        let role_request = ServiceRoleAuthorizationRequest {
+            source_arn: None,
+            caller: RequestIdentity {
+                account_id: (*account).into(),
+                access_key_id: None,
+                arn: None,
+            },
+            role_arn: execution_role.into(),
+            service_principal: "lambda.amazonaws.com".into(),
+            action: "sqs:SendMessage".into(),
+            resource: target_arn.into(),
+        };
+        let credentials = if strict {
+            let Some(evaluator) = evaluator else {
+                return;
+            };
+            if evaluator
+                .authorize_service_role_execution(role_request)
+                .is_err()
+            {
+                tracing::warn!("Lambda destination execution role is not authorized");
+                return;
+            }
+            let Ok(permit) = self.credential_slots.clone().acquire_owned().await else {
+                tracing::warn!("Lambda destination credential worker capacity exhausted");
+                return;
+            };
+            let cache = self.credentials.clone();
+            let role = execution_role.to_string();
+            let owner = account.to_string();
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                Self::role_credentials(&cache, evaluator.as_ref(), &owner, &role)
+            })
+            .await;
+            match result {
+                Ok(Ok(credentials)) => Some(credentials),
+                _ => {
+                    tracing::warn!("Lambda destination execution credentials unavailable");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost"));
         headers.insert(
             "x-amz-target",
             HeaderValue::from_static("AmazonSQS.SendMessage"),
@@ -1655,43 +1804,42 @@ impl DestinationRouter for RegistryDestinationRouter {
             "content-type",
             HeaderValue::from_static("application/x-amz-json-1.0"),
         );
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/{region}/sqs/aws4_request, SignedHeaders=host, Signature=locallycloud"
-        );
-        let Ok(authorization) = HeaderValue::from_str(&authorization) else {
-            tracing::warn!(target_arn, "invalid Lambda async destination region");
+        let key = credentials
+            .as_ref()
+            .map(|credentials| credentials.access_key_id.as_str())
+            .unwrap_or("locallycloud");
+        let authorization=format!("AWS4-HMAC-SHA256 Credential={key}/19700101/{region}/sqs/aws4_request, SignedHeaders=host, Signature=locallycloud");
+        let Ok(value) = HeaderValue::from_str(&authorization) else {
+            tracing::warn!("invalid Lambda destination credentials");
             return;
         };
-        headers.insert("authorization", authorization);
-        let body = json!({
-            "QueueUrl": format!("https://sqs.{region}.amazonaws.com/{account}/{queue}"),
-            "MessageBody": record.to_string(),
-        });
-        let call = CrossServiceCall {
-            source_service: ServiceName::new("lambda"),
-            account_id: account.to_string(),
-            region: region.to_string(),
-            method: Method::POST,
-            uri: "/".parse().expect("root URI is valid"),
-            headers,
-            body: Bytes::from(body.to_string()),
-            identity: CallerIdentity::ServicePrincipal {
-                service: "lambda".into(),
-            },
-            correlation: CorrelationContext::root(),
-            pattern: Some(IntegrationPatternId("lambda->sqs")),
+        headers.insert("authorization", value);
+        let Ok(principal) = HeaderValue::from_str(execution_role) else {
+            tracing::warn!("invalid Lambda destination execution role");
+            return;
         };
-        if let Err(error) = DeliveryEngine::new(dispatcher)
-            .deliver_async(
-                call,
-                &AsyncDeliveryPolicy {
-                    max_attempts: 1,
-                    on_failure: None,
-                },
+        headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            principal,
+        );
+        let body = json!({"QueueUrl":format!("https://sqs.{region}.amazonaws.com/{account}/{queue}"),"MessageBody":record.to_string()});
+        CorrelationContext::root().log_hop("lambda", "sqs", "lambda->sqs", "sync");
+        let response = dispatcher
+            .dispatch_scoped(
+                &Method::POST,
+                &"/".parse().expect("static URI"),
+                &headers,
+                Bytes::from(body.to_string()),
+                &uuid::Uuid::new_v4().to_string(),
+                account,
+                region,
             )
-            .await
-        {
-            tracing::warn!(target_arn, %error, "Lambda async destination delivery failed");
+            .await;
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = response.status().as_u16(),
+                "Lambda async destination delivery failed"
+            );
         }
     }
 }
@@ -1842,9 +1990,9 @@ pub async fn register_with_execution_config(
     .with_max_warm_total(max_warm_total)
     .with_memory_budget(memory_budget)
     .with_service_registry(Arc::downgrade(registry))
-    .with_destination_router(Arc::new(RegistryDestinationRouter {
-        registry: Arc::downgrade(registry),
-    }))
+    .with_destination_router(Arc::new(RegistryDestinationRouter::new(Arc::downgrade(
+        registry,
+    ))))
     .with_host_managed_runtime();
     let executor = Arc::new(executor);
     executor.bind_arc();
@@ -2897,7 +3045,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = std::env::current_dir()
             .unwrap()
-            .join("target")
+            .join(".kiro/localcloud-tmp")
             .join(format!("lambda-esm-tags-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();

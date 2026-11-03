@@ -28,8 +28,11 @@ mod ec2;
 mod ecs_alb;
 mod ecs_sg;
 pub(crate) use ecs_alb::validate_ecs_alb_property_names;
+mod event_invoke_config;
 mod firehose;
 mod kinesis;
+#[cfg(test)]
+mod kms_rotation_tests;
 mod monitoring;
 mod s3_configuration;
 mod scheduler;
@@ -88,6 +91,7 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::Lambda::Function",
     "AWS::Lambda::Version",
     "AWS::Lambda::Permission",
+    "AWS::Lambda::EventInvokeConfig",
     "AWS::Lambda::EventSourceMapping",
     "AWS::EC2::VPC",
     "AWS::EC2::Subnet",
@@ -258,6 +262,10 @@ impl Provisioner {
             }
             "AWS::Lambda::Version" => self.lambda_version(properties).await,
             "AWS::Lambda::Permission" => self.lambda_permission(logical_id, properties).await,
+            "AWS::Lambda::EventInvokeConfig" => {
+                self.event_invoke_config(logical_id, properties, false)
+                    .await
+            }
             "AWS::Lambda::EventSourceMapping" => {
                 self.lambda_event_source_mapping(logical_id, properties)
                     .await
@@ -575,6 +583,16 @@ impl Provisioner {
                 .await?;
                 Ok(current.clone())
             }
+            "AWS::Lambda::EventInvokeConfig" => {
+                self.update_event_invoke_config(
+                    logical_id,
+                    current,
+                    previous_properties,
+                    properties,
+                    replacement,
+                )
+                .await
+            }
             "AWS::Lambda::Version" => self.lambda_version(properties).await,
             "AWS::Lambda::Permission" => {
                 ensure_only_supported_changes(
@@ -891,6 +909,7 @@ impl Provisioner {
             // has no viable version-delete API. Treat teardown as explicitly synthetic.
             "AWS::Lambda::Version" => Ok(()),
             "AWS::Lambda::Permission" => self.delete_lambda_permission(physical_id).await,
+            "AWS::Lambda::EventInvokeConfig" => self.delete_event_invoke_config(physical_id).await,
             "AWS::Lambda::EventSourceMapping" => {
                 self.delete_lambda_event_source_mapping(physical_id).await
             }
@@ -1227,6 +1246,25 @@ impl Provisioner {
         })?;
         let key_id = required_response_string(metadata, "KeyId", logical_id)?;
         let arn = required_response_string(metadata, "Arn", logical_id)?;
+        if props.get("EnableKeyRotation").and_then(Value::as_bool) == Some(true) {
+            if let Err(primary) = self
+                .set_kms_rotation(
+                    logical_id,
+                    &key_id,
+                    true,
+                    props
+                        .get("RotationPeriodInDays")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(365),
+                )
+                .await
+            {
+                return match self.delete_kms_key(&key_id, props).await {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(with_cleanup_failure(primary, cleanup)),
+                };
+            }
+        }
         Ok(ResolvedResource {
             ref_value: key_id.clone(),
             attributes: std::collections::BTreeMap::from([
@@ -1250,89 +1288,176 @@ impl Provisioner {
             "AWS::KMS::Key",
             previous,
             props,
-            &["PendingWindowInDays", "Tags"],
+            &[
+                "PendingWindowInDays",
+                "Tags",
+                "EnableKeyRotation",
+                "RotationPeriodInDays",
+            ],
         )?;
-        if previous.get("Tags") != props.get("Tags") {
-            let previous_tags = kms_tags(logical_id, previous)?;
-            let desired_tags = kms_tags(logical_id, props)?;
-            let desired = desired_tags
-                .as_array()
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            let old = previous_tags
-                .as_array()
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            let removed: Vec<_> = old
-                .iter()
-                .filter(|tag| !desired.iter().any(|new| new["TagKey"] == tag["TagKey"]))
-                .map(|tag| tag["TagKey"].clone())
-                .collect();
+        let changed_rotation = ["EnableKeyRotation", "RotationPeriodInDays"]
+            .iter()
+            .any(|key| previous.get(*key) != props.get(*key));
+        let rotation_snapshot = if changed_rotation {
             let snapshot = self
                 .call_aws_json_11(
                     "kms",
-                    "TrentService.ListResourceTags",
+                    "TrentService.GetKeyRotationStatus",
                     json!({"KeyId":current.ref_value}),
                     logical_id,
                 )
                 .await?;
-            let actual = snapshot
-                .get("Tags")
-                .and_then(Value::as_array)
+            let enabled = snapshot
+                .get("KeyRotationEnabled")
+                .and_then(Value::as_bool)
                 .ok_or_else(|| {
                     CfnError::ResourceFailed(format!(
-                        "KMS ListResourceTags for {logical_id} returned no Tags"
+                        "KMS GetKeyRotationStatus for {logical_id} returned invalid status"
                     ))
                 })?;
-            let changed: Vec<_> = desired
-                .into_iter()
-                .filter(|tag| !actual.iter().any(|current| current == *tag))
-                .cloned()
-                .collect();
-            let restore: Vec<_> = actual
-                .iter()
-                .filter(|tag| removed.contains(&tag["TagKey"]))
-                .cloned()
-                .collect();
-            if !removed.is_empty() {
-                self.call_aws_json_11(
-                    "kms",
-                    "TrentService.UntagResource",
-                    json!({"KeyId":current.ref_value,"TagKeys":removed}),
-                    logical_id,
-                )
-                .await?;
-            }
-            if !changed.is_empty() {
-                if let Err(primary) = self
+            let period = snapshot
+                .get("RotationPeriodInDays")
+                .and_then(Value::as_u64)
+                .unwrap_or(365);
+            self.set_kms_rotation(
+                logical_id,
+                &current.ref_value,
+                props
+                    .get("EnableKeyRotation")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                props
+                    .get("RotationPeriodInDays")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(365),
+            )
+            .await?;
+            Some((enabled, period))
+        } else {
+            None
+        };
+        let tags_result: Result<(), CfnError> = async {
+            if previous.get("Tags") != props.get("Tags") {
+                let previous_tags = kms_tags(logical_id, previous)?;
+                let desired_tags = kms_tags(logical_id, props)?;
+                let desired = desired_tags
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                let old = previous_tags
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                let removed: Vec<_> = old
+                    .iter()
+                    .filter(|tag| !desired.iter().any(|new| new["TagKey"] == tag["TagKey"]))
+                    .map(|tag| tag["TagKey"].clone())
+                    .collect();
+                let snapshot = self
                     .call_aws_json_11(
                         "kms",
-                        "TrentService.TagResource",
-                        json!({"KeyId":current.ref_value,"Tags":changed}),
+                        "TrentService.ListResourceTags",
+                        json!({"KeyId":current.ref_value}),
                         logical_id,
                     )
-                    .await
-                {
-                    if !restore.is_empty() {
-                        if let Err(cleanup) = self
-                            .call_aws_json_11(
-                                "kms",
-                                "TrentService.TagResource",
-                                json!({"KeyId":current.ref_value,"Tags":restore}),
-                                logical_id,
-                            )
-                            .await
-                        {
-                            return Err(with_cleanup_failure(primary, cleanup));
+                    .await?;
+                let actual = snapshot
+                    .get("Tags")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        CfnError::ResourceFailed(format!(
+                            "KMS ListResourceTags for {logical_id} returned no Tags"
+                        ))
+                    })?;
+                let changed: Vec<_> = desired
+                    .into_iter()
+                    .filter(|tag| !actual.iter().any(|current| current == *tag))
+                    .cloned()
+                    .collect();
+                let restore: Vec<_> = actual
+                    .iter()
+                    .filter(|tag| removed.contains(&tag["TagKey"]))
+                    .cloned()
+                    .collect();
+                if !removed.is_empty() {
+                    self.call_aws_json_11(
+                        "kms",
+                        "TrentService.UntagResource",
+                        json!({"KeyId":current.ref_value,"TagKeys":removed}),
+                        logical_id,
+                    )
+                    .await?;
+                }
+                if !changed.is_empty() {
+                    if let Err(primary) = self
+                        .call_aws_json_11(
+                            "kms",
+                            "TrentService.TagResource",
+                            json!({"KeyId":current.ref_value,"Tags":changed}),
+                            logical_id,
+                        )
+                        .await
+                    {
+                        if !restore.is_empty() {
+                            if let Err(cleanup) = self
+                                .call_aws_json_11(
+                                    "kms",
+                                    "TrentService.TagResource",
+                                    json!({"KeyId":current.ref_value,"Tags":restore}),
+                                    logical_id,
+                                )
+                                .await
+                            {
+                                return Err(with_cleanup_failure(primary, cleanup));
+                            }
                         }
+                        return Err(primary);
                     }
-                    return Err(primary);
                 }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(primary) = tags_result {
+            if let Some((enabled, period)) = rotation_snapshot {
+                if let Err(cleanup) = self
+                    .set_kms_rotation(logical_id, &current.ref_value, enabled, period)
+                    .await
+                {
+                    return Err(with_cleanup_failure(primary, cleanup));
+                }
+            }
+            return Err(primary);
         }
         Ok(current.clone())
+    }
+
+    async fn set_kms_rotation(
+        &self,
+        logical_id: &str,
+        id: &str,
+        enabled: bool,
+        period: u64,
+    ) -> Result<(), CfnError> {
+        let body = if enabled {
+            json!({"KeyId":id,"RotationPeriodInDays":period})
+        } else {
+            json!({"KeyId":id})
+        };
+        self.call_aws_json_11(
+            "kms",
+            if enabled {
+                "TrentService.EnableKeyRotation"
+            } else {
+                "TrentService.DisableKeyRotation"
+            },
+            body,
+            logical_id,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn kms_alias(
@@ -5829,6 +5954,8 @@ fn validate_kms_key_properties(logical_id: &str, props: &Value) -> Result<(), Cf
             "MultiRegion",
             "PendingWindowInDays",
             "Tags",
+            "EnableKeyRotation",
+            "RotationPeriodInDays",
         ],
     )?;
     if props
@@ -5869,6 +5996,23 @@ fn validate_kms_key_properties(logical_id: &str, props: &Value) -> Result<(), Cf
         return Err(CfnError::Validation(format!(
             "AWS::KMS::Key resource {logical_id} supports only MultiRegion=false"
         )));
+    }
+    if props
+        .get("EnableKeyRotation")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(CfnError::Validation(format!(
+            "AWS::KMS::Key resource {logical_id} requires boolean EnableKeyRotation"
+        )));
+    }
+    if let Some(value) = props.get("RotationPeriodInDays") {
+        if !value
+            .as_u64()
+            .is_some_and(|days| (90..=2560).contains(&days))
+            || props.get("EnableKeyRotation").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(CfnError::Validation(format!("AWS::KMS::Key resource {logical_id} requires RotationPeriodInDays 90..2560 with EnableKeyRotation=true")));
+        }
     }
     kms_pending_window_days(props)?;
     kms_tags(logical_id, props)?;
@@ -8470,7 +8614,7 @@ mod tests {
         for invalid in [
             json!({"Tags":[{"Key":"duplicate","Value":"x"},{"Key":"duplicate","Value":"y"}]}),
             json!({"Tags":[{"Key":"aws:reserved","Value":"x"}]}),
-            json!({"EnableKeyRotation":true}),
+            json!({"EnableKeyRotation":"true"}),
         ] {
             assert!(p.kms_key("Key", &invalid).await.is_err());
         }

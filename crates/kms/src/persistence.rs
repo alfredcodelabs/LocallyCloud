@@ -31,6 +31,10 @@ struct SavedKey {
     sealed_material: Vec<u8>,
     #[serde(default)]
     tags: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    rotation: crate::model::Rotation,
+    #[serde(default)]
+    historical_materials: std::collections::BTreeMap<u32, Vec<u8>>,
 }
 
 impl KmsPersistence {
@@ -89,6 +93,36 @@ impl KmsPersistence {
                 return Err(KmsError::Internal);
             }
             let material = self.open_material(&scope, &saved.key_id, &saved.sealed_material)?;
+            if saved.material_version == 0
+                || !(90..=2560).contains(&saved.rotation.period_days)
+                || saved.rotation.on_demand_count > 25
+                || saved.rotation.enabled != saved.rotation.next_date.is_some()
+                || u32::from(saved.rotation.on_demand_count) >= saved.material_version
+                || saved.historical_materials.len() as u64 != u64::from(saved.material_version - 1)
+                || saved
+                    .rotation
+                    .next_date
+                    .is_some_and(|date| !date.is_finite() || date < 0.0)
+            {
+                return Err(KmsError::Internal);
+            }
+            let historical_materials = saved
+                .historical_materials
+                .iter()
+                .map(|(version, sealed)| {
+                    if *version == 0 || *version >= saved.material_version {
+                        return Err(KmsError::Internal);
+                    }
+                    Ok((
+                        *version,
+                        self.open_material(
+                            &scope,
+                            &format!("{}:material:{version}", saved.key_id),
+                            sealed,
+                        )?,
+                    ))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>, KmsError>>()?;
             let state = match saved.state.as_str() {
                 "Enabled" => KeyState::Enabled,
                 "Disabled" => KeyState::Disabled,
@@ -117,6 +151,8 @@ impl KmsPersistence {
                     explicit_policy: saved.explicit_policy,
                     material_version: saved.material_version,
                     material,
+                    historical_materials,
+                    rotation: saved.rotation,
                     tags: saved.tags,
                 },
             ))
@@ -236,6 +272,21 @@ impl KmsPersistence {
             material_version: key.material_version,
             sealed_material: self.seal_material(scope, &key.key_id, &key.material)?,
             tags: key.tags.clone(),
+            rotation: key.rotation.clone(),
+            historical_materials: key
+                .historical_materials
+                .iter()
+                .map(|(version, material)| {
+                    Ok((
+                        *version,
+                        self.seal_material(
+                            scope,
+                            &format!("{}:material:{version}", key.key_id),
+                            material,
+                        )?,
+                    ))
+                })
+                .collect::<Result<_, KmsError>>()?,
         };
         let bytes = serde_json::to_vec(&saved).map_err(|_| KmsError::Internal)?;
         conn.execute("INSERT INTO kms_keys(account,region,key_id,record) VALUES (?1,?2,?3,?4) ON CONFLICT(account,region,key_id) DO UPDATE SET record=excluded.record", params![scope.account_id, scope.region, key.key_id, bytes]).map_err(|_| KmsError::Internal)?;
@@ -375,6 +426,8 @@ mod tests {
             explicit_policy: false,
             material_version: 1,
             material: SecretMaterial::new([0x5a; 32]),
+            historical_materials: Default::default(),
+            rotation: Default::default(),
             tags: std::collections::BTreeMap::from([("team".into(), "accounting".into())]),
         };
         let first = KmsPersistence::with_master(db.clone(), SecretMaterial::new([0x11; 32]))

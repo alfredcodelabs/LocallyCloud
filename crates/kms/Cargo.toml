@@ -24,4 +24,5 @@ zeroize.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+locallycloud-iam-sts.workspace = true
 bytes.workspace = true

@@ -26,3 +26,4 @@ tokio.workspace = true
 regex = "=1.13.1"
 
 [dev-dependencies]
+locallycloud-iam-sts.workspace = true

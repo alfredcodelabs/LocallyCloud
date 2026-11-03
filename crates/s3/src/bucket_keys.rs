@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use locallycloud_core::integration::kms::{
     KmsAuthorizeCachedKeyRequest, KmsDataKeyAction, KmsDecryptRequest, KmsGenerateDataKeyRequest,
-    SensitiveBytes,
+    KmsInternalError, SensitiveBytes,
 };
 use sha2::{Digest, Sha256};
 
@@ -69,14 +69,20 @@ fn cache_key(ctx: &Ctx<'_>, bucket: &str, key: &str, wrapped: Option<&[u8]>) -> 
     format!("{:x}", Sha256::digest(format!("{requester:?}").as_bytes()))
 }
 
+enum CachedAuthorization {
+    Authorized,
+    Refresh,
+}
+
 async fn validate_cached(
     ctx: &Ctx<'_>,
     entry: &BucketKey,
     context: &BTreeMap<String, String>,
     action: KmsDataKeyAction,
-) -> Result<(), S3Error> {
+) -> Result<CachedAuthorization, S3Error> {
     let call = kms_call(ctx, action.as_str(), &entry.key_arn, context)?;
-    ctx.dispatcher
+    let result = ctx
+        .dispatcher
         .as_deref()
         .ok_or(S3Error::InternalError)?
         .kms_authorize_cached_key_bounded(
@@ -89,8 +95,14 @@ async fn validate_cached(
             },
             Duration::from_secs(3),
         )
-        .await
-        .map_err(kms_error)
+        .await;
+    match (action, result) {
+        (_, Ok(())) => Ok(CachedAuthorization::Authorized),
+        (KmsDataKeyAction::Generate, Err(KmsInternalError::InvalidCiphertext)) => {
+            Ok(CachedAuthorization::Refresh)
+        }
+        (_, Err(error)) => Err(kms_error(error)),
+    }
 }
 
 pub(crate) async fn for_write(
@@ -101,8 +113,12 @@ pub(crate) async fn for_write(
 ) -> Result<BucketKey, S3Error> {
     let cache_key = cache_key(ctx, bucket, key, None);
     if let Some(entry) = ctx.store.bucket_keys.get(&cache_key)? {
-        validate_cached(ctx, &entry, context, KmsDataKeyAction::Generate).await?;
-        return Ok(entry);
+        if matches!(
+            validate_cached(ctx, &entry, context, KmsDataKeyAction::Generate).await?,
+            CachedAuthorization::Authorized
+        ) {
+            return Ok(entry);
+        }
     }
     let call = kms_call(ctx, "kms:GenerateDataKey", key, context)?;
     let output = ctx
@@ -176,7 +192,7 @@ mod tests {
     use super::*;
     use locallycloud_core::integration::kms::{
         KmsDecryptOutput, KmsEncryptOutput, KmsEncryptRequest, KmsGenerateDataKeyOutput,
-        KmsInternalApi, KmsInternalError, KmsValidateKeyOutput, KmsValidateKeyRequest,
+        KmsInternalApi, KmsValidateKeyOutput, KmsValidateKeyRequest,
     };
     use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -187,6 +203,8 @@ mod tests {
         decrypt: AtomicUsize,
         authorize: AtomicUsize,
         denied: AtomicBool,
+        disabled: AtomicBool,
+        stale_before: AtomicUsize,
     }
     impl CountingKms {
         fn allowed(&self, context: &BTreeMap<String, String>) -> Result<(), KmsInternalError> {
@@ -196,6 +214,8 @@ mod tests {
             );
             if self.denied.load(Ordering::Acquire) {
                 Err(KmsInternalError::AccessDenied)
+            } else if self.disabled.load(Ordering::Acquire) {
+                Err(KmsInternalError::Disabled)
             } else {
                 Ok(())
             }
@@ -271,7 +291,19 @@ mod tests {
             request: KmsAuthorizeCachedKeyRequest,
         ) -> Result<(), KmsInternalError> {
             self.authorize.fetch_add(1, Ordering::AcqRel);
-            self.allowed(&request.encryption_context)
+            self.allowed(&request.encryption_context)?;
+            if matches!(request.action, KmsDataKeyAction::Generate)
+                && request
+                    .ciphertext
+                    .as_slice()
+                    .first()
+                    .is_some_and(|version| {
+                        usize::from(*version) <= self.stale_before.load(Ordering::Acquire)
+                    })
+            {
+                return Err(KmsInternalError::InvalidCiphertext);
+            }
+            Ok(())
         }
     }
     #[async_trait::async_trait]
@@ -367,6 +399,36 @@ mod tests {
         ));
         assert_eq!(kms.generate.load(Ordering::Acquire), 3);
         assert_eq!(kms.decrypt.load(Ordering::Acquire), 1);
+        kms.denied.store(false, Ordering::Release);
+        kms.stale_before.store(3, Ordering::Release);
+        let fresh = for_write(&ctx, "bucket", "key", &context).await.unwrap();
+        assert_ne!(fresh.wrapped, first.wrapped);
+        assert_eq!(kms.generate.load(Ordering::Acquire), 4);
+        assert_eq!(
+            for_write(&ctx, "bucket", "key", &context)
+                .await
+                .unwrap()
+                .wrapped,
+            fresh.wrapped
+        );
+        let old_plain = for_read(&ctx, "bucket", "key", &first.wrapped, &context)
+            .await
+            .unwrap();
+        assert_eq!(old_plain.as_slice(), first.plain.as_slice());
+        assert_eq!(kms.decrypt.load(Ordering::Acquire), 1);
+        kms.stale_before.store(4, Ordering::Release);
+        kms.denied.store(true, Ordering::Release);
+        assert!(matches!(
+            for_write(&ctx, "bucket", "key", &context).await,
+            Err(S3Error::AccessDenied)
+        ));
+        kms.denied.store(false, Ordering::Release);
+        kms.disabled.store(true, Ordering::Release);
+        assert!(matches!(
+            for_write(&ctx, "bucket", "key", &context).await,
+            Err(S3Error::KmsDisabled)
+        ));
+        assert_eq!(kms.generate.load(Ordering::Acquire), 4);
     }
 
     #[test]

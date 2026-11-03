@@ -10,10 +10,10 @@ use uuid::Uuid;
 use crate::error::LambdaError;
 use crate::model::{
     compute_zip_code, function_arn, function_url_id, is_supported_runtime, layer_arn,
-    resolve_function_name, Alias, EventInvokeConfig, FunctionStore, FunctionUrlConfig,
-    LambdaFunction, LayerStore, LayerVersion, TracingMode, VpcConfig, DEFAULT_EPHEMERAL_MB,
-    DEFAULT_MEMORY_MB, DEFAULT_TIMEOUT_SECS, MAX_EPHEMERAL_MB, MAX_MEMORY_MB, MAX_TIMEOUT_SECS,
-    MIN_EPHEMERAL_MB, MIN_MEMORY_MB, MIN_TIMEOUT_SECS,
+    resolve_function_name, Alias, FunctionStore, FunctionUrlConfig, LambdaFunction, LayerStore,
+    LayerVersion, TracingMode, VpcConfig, DEFAULT_EPHEMERAL_MB, DEFAULT_MEMORY_MB,
+    DEFAULT_TIMEOUT_SECS, MAX_EPHEMERAL_MB, MAX_MEMORY_MB, MAX_TIMEOUT_SECS, MIN_EPHEMERAL_MB,
+    MIN_MEMORY_MB, MIN_TIMEOUT_SECS,
 };
 
 type OpResult = Result<(u16, Option<Value>), LambdaError>;
@@ -1001,41 +1001,6 @@ pub fn delete_function_url_config(
 
 // ---- Event-invoke config ----
 
-/// Valid ranges for the asynchronous-invocation configuration.
-const MIN_RETRY_ATTEMPTS: u32 = 0;
-const MAX_RETRY_ATTEMPTS: u32 = 2;
-const MIN_EVENT_AGE_SECS: u32 = 60;
-const MAX_EVENT_AGE_SECS: u32 = 21600;
-
-/// Parse and validate the event-invoke fields into a config (with `last_modified` set).
-fn parse_event_invoke(input: &Value) -> Result<EventInvokeConfig, LambdaError> {
-    let retries = u32_field(input, "MaximumRetryAttempts");
-    if let Some(r) = retries {
-        validate_range(
-            "MaximumRetryAttempts",
-            r,
-            MIN_RETRY_ATTEMPTS,
-            MAX_RETRY_ATTEMPTS,
-        )?;
-    }
-    let age = u32_field(input, "MaximumEventAgeInSeconds");
-    if let Some(a) = age {
-        validate_range(
-            "MaximumEventAgeInSeconds",
-            a,
-            MIN_EVENT_AGE_SECS,
-            MAX_EVENT_AGE_SECS,
-        )?;
-    }
-    Ok(EventInvokeConfig {
-        maximum_retry_attempts: retries,
-        maximum_event_age_in_seconds: age,
-        destination_config: input.get("DestinationConfig").cloned(),
-        last_modified: now_iso8601(),
-    })
-}
-
-/// `PutFunctionEventInvokeConfig` — replace the config (HTTP 200).
 pub fn put_function_event_invoke_config(
     store: &FunctionStore,
     region: &str,
@@ -1043,16 +1008,15 @@ pub fn put_function_event_invoke_config(
     name: &str,
     input: &Value,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
-    let arn = store
-        .function_base_arn(account, region, &name)
-        .ok_or_else(|| not_found(&name))?;
-    let config = parse_event_invoke(input)?;
-    store.set_event_invoke_config(account, region, &name, config.clone());
-    Ok((200, Some(config.to_json(&arn))))
+    crate::event_invoke::handle(
+        store,
+        region,
+        account,
+        name,
+        crate::event_invoke::Operation::Put,
+        input,
+    )
 }
-
-/// `UpdateFunctionEventInvokeConfig` — merge supplied fields into the existing config (HTTP 200).
 pub fn update_function_event_invoke_config(
     store: &FunctionStore,
     region: &str,
@@ -1060,94 +1024,52 @@ pub fn update_function_event_invoke_config(
     name: &str,
     input: &Value,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
-    let arn = store
-        .function_base_arn(account, region, &name)
-        .ok_or_else(|| not_found(&name))?;
-    let mut config = store
-        .get_event_invoke_config(account, region, &name)
-        .ok_or_else(|| event_invoke_not_found(&name))?;
-
-    if let Some(r) = u32_field(input, "MaximumRetryAttempts") {
-        validate_range(
-            "MaximumRetryAttempts",
-            r,
-            MIN_RETRY_ATTEMPTS,
-            MAX_RETRY_ATTEMPTS,
-        )?;
-        config.maximum_retry_attempts = Some(r);
-    }
-    if let Some(a) = u32_field(input, "MaximumEventAgeInSeconds") {
-        validate_range(
-            "MaximumEventAgeInSeconds",
-            a,
-            MIN_EVENT_AGE_SECS,
-            MAX_EVENT_AGE_SECS,
-        )?;
-        config.maximum_event_age_in_seconds = Some(a);
-    }
-    if input.get("DestinationConfig").is_some() {
-        config.destination_config = input.get("DestinationConfig").cloned();
-    }
-    config.last_modified = now_iso8601();
-    store.set_event_invoke_config(account, region, &name, config.clone());
-    Ok((200, Some(config.to_json(&arn))))
+    crate::event_invoke::handle(
+        store,
+        region,
+        account,
+        name,
+        crate::event_invoke::Operation::Update,
+        input,
+    )
 }
-
-/// `GetFunctionEventInvokeConfig`.
 pub fn get_function_event_invoke_config(
     store: &FunctionStore,
     region: &str,
     account: &str,
     name: &str,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
-    let arn = store
-        .function_base_arn(account, region, &name)
-        .ok_or_else(|| not_found(&name))?;
-    let config = store
-        .get_event_invoke_config(account, region, &name)
-        .ok_or_else(|| event_invoke_not_found(&name))?;
-    Ok((200, Some(config.to_json(&arn))))
+    crate::event_invoke::handle(
+        store,
+        region,
+        account,
+        name,
+        crate::event_invoke::Operation::Get,
+        &Value::Null,
+    )
 }
-
-/// `DeleteFunctionEventInvokeConfig` (HTTP 204).
 pub fn delete_function_event_invoke_config(
     store: &FunctionStore,
     region: &str,
     account: &str,
     name: &str,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
-    if store.function_base_arn(account, region, &name).is_none() {
-        return Err(not_found(&name));
-    }
-    if store.delete_event_invoke_config(account, region, &name) {
-        Ok((204, None))
-    } else {
-        Err(event_invoke_not_found(&name))
-    }
+    crate::event_invoke::handle(
+        store,
+        region,
+        account,
+        name,
+        crate::event_invoke::Operation::Delete,
+        &Value::Null,
+    )
 }
-
-/// `ListFunctionEventInvokeConfigs` — zero or one config for the function (HTTP 200).
 pub fn list_function_event_invoke_configs(
     store: &FunctionStore,
     region: &str,
     account: &str,
     name: &str,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
-    let arn = store
-        .function_base_arn(account, region, &name)
-        .ok_or_else(|| not_found(&name))?;
-    let configs: Vec<Value> = store
-        .get_event_invoke_config(account, region, &name)
-        .map(|c| vec![c.to_json(&arn)])
-        .unwrap_or_default();
-    Ok((
-        200,
-        Some(serde_json::json!({ "FunctionEventInvokeConfigs": configs })),
-    ))
+    crate::event_invoke::list(store, region, account, name, None, None)
 }
 
 pub(crate) fn parse_layers(input: &Value) -> Result<Vec<String>, LambdaError> {
@@ -1332,10 +1254,6 @@ fn not_found(name: &str) -> LambdaError {
 
 fn url_config_not_found(name: &str) -> LambdaError {
     LambdaError::ResourceNotFound(format!("FunctionUrlConfig not found for function {name}"))
-}
-
-fn event_invoke_not_found(name: &str) -> LambdaError {
-    LambdaError::ResourceNotFound(format!("EventInvokeConfig not found for function {name}"))
 }
 
 fn layer_not_found(name: &str, version: u64) -> LambdaError {
@@ -2077,7 +1995,7 @@ mod tests {
         assert_eq!(cfg["MaximumEventAgeInSeconds"], 120);
         assert_eq!(
             cfg["FunctionArn"],
-            "arn:aws:lambda:us-east-1:000000000000:function:fn"
+            "arn:aws:lambda:us-east-1:000000000000:function:fn:$LATEST"
         );
 
         // update merges: only change retries, age preserved

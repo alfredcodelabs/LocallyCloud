@@ -274,9 +274,12 @@ async fn persistent_fixture() -> (
 ) {
     let (mut handler, runtime, query) = fixture();
     let (directory, database) = tokio::task::spawn_blocking(|| {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiro/localcloud-tmp");
+        std::fs::create_dir_all(&base).unwrap();
         let directory = tempfile::Builder::new()
             .prefix("ecs-state-")
-            .tempdir_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+            .tempdir_in(base)
             .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();

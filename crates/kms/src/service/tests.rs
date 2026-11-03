@@ -546,7 +546,7 @@ fn rotation_status_is_disabled_for_new_keys_and_scoped() {
     let (key_id, _) = create_key(&service, ACCOUNT, REGION);
     assert_eq!(
         call_ok(&service, "GetKeyRotationStatus", json!({ "KeyId": key_id })),
-        json!({ "KeyRotationEnabled": false })
+        json!({ "KeyRotationEnabled": false, "KeyId":format!("arn:aws:kms:{REGION}:{ACCOUNT}:key/{key_id}") })
     );
     assert!(matches!(
         call(

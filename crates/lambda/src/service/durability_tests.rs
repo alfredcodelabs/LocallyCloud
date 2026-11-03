@@ -343,7 +343,7 @@ async fn reserved_concurrency_get_function_restart_failure_and_delete() {
     use std::os::unix::fs::PermissionsExt;
     let root = std::env::current_dir()
         .unwrap()
-        .join("target")
+        .join(".kiro/localcloud-tmp")
         .join(format!("lambda-reservation-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();

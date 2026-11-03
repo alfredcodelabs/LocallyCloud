@@ -9,6 +9,7 @@ pub mod concurrency;
 pub mod control_plane;
 pub mod error;
 pub mod esm;
+mod event_invoke;
 pub mod exec_env;
 pub mod executor;
 pub mod function_url;

@@ -1652,7 +1652,7 @@ esac
     async fn stop_reconciles_disappearing_container_with_owned_completion() {
         use std::os::unix::fs::PermissionsExt;
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/compute-stop-tests")
+            .join("../../.kiro/localcloud-tmp/compute-stop-tests")
             .join(format!(
                 "stop-race-{}-{}",
                 std::process::id(),

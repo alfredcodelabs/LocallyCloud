@@ -640,6 +640,215 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_writer_timeout_never_exposes_uncommitted_queue_and_retry_recovers() {
+        let root =
+            std::env::temp_dir().join(format!("sqs-writer-timeout-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let registry = ServiceRegistry::with_known_services();
+        let handler = Arc::new(SqsHandler::with_state(&registry, db.clone()).unwrap());
+        let (ready_send, ready_receive) = tokio::sync::oneshot::channel();
+        let (release_send, release_receive) = std::sync::mpsc::channel();
+        let writer_db = db.clone();
+        let writer = std::thread::spawn(move || {
+            let mut connection = writer_db.connection().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            ready_send.send(()).unwrap();
+            let _ = release_receive.recv();
+            transaction.commit().unwrap();
+        });
+        ready_receive.await.unwrap();
+        let creator = handler.clone();
+        let creation = tokio::spawn(async move {
+            call(
+                &creator,
+                "CreateQueue",
+                json!({"QueueName":"pending-ledger"}),
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut observations = 0;
+        while !creation.is_finished() {
+            let (status, list) = call(&handler, "ListQueues", json!({})).await;
+            assert_eq!(status, 200);
+            assert!(
+                list.get("QueueUrls").is_none_or(|urls| {
+                    !urls.as_array().unwrap().iter().any(|url| {
+                        url.as_str()
+                            .is_some_and(|url| url.ends_with("/pending-ledger"))
+                    })
+                }),
+                "uncommitted CreateQueue must not appear in a public list"
+            );
+            observations += 1;
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "SQLite wait must remain bounded"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(observations > 0);
+        let (status, failure) = creation.await.unwrap();
+        assert_eq!(status, 500);
+        assert!(failure["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("InternalError"));
+        assert!(handler.store.is_empty());
+        let count: i64 = db
+            .connection()
+            .unwrap()
+            .query_row("SELECT count(*) FROM sqs_queues", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(
+            call(
+                &handler,
+                "GetQueueUrl",
+                json!({"QueueName":"pending-ledger"})
+            )
+            .await
+            .0,
+            400
+        );
+        release_send.send(()).unwrap();
+        tokio::task::spawn_blocking(move || writer.join().unwrap())
+            .await
+            .unwrap();
+        let (status, created) = call(
+            &handler,
+            "CreateQueue",
+            json!({"QueueName":"pending-ledger"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let url = created["QueueUrl"].clone();
+        assert_eq!(
+            call(
+                &handler,
+                "CreateQueue",
+                json!({"QueueName":"pending-ledger"})
+            )
+            .await,
+            (200, created)
+        );
+        drop(handler);
+        let restored = SqsHandler::with_state(&registry, db.clone()).unwrap();
+        assert_eq!(
+            call(
+                &restored,
+                "GetQueueUrl",
+                json!({"QueueName":"pending-ledger"})
+            )
+            .await,
+            (200, json!({"QueueUrl":url}))
+        );
+        drop(restored);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_queue_writer_wait_keeps_single_thread_runtime_live_and_survives_cancellation() {
+        let root = std::env::temp_dir().join(format!("sqs-writer-cancel-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let registry = ServiceRegistry::with_known_services();
+        let handler = Arc::new(SqsHandler::with_state(&registry, db.clone()).unwrap());
+        let (ready_send, ready_receive) = tokio::sync::oneshot::channel();
+        let (release_send, release_receive) = std::sync::mpsc::channel();
+        let writer_db = db.clone();
+        let writer = std::thread::spawn(move || {
+            let mut connection = writer_db.connection().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            ready_send.send(()).unwrap();
+            let _ = release_receive.recv();
+            transaction.commit().unwrap();
+        });
+        ready_receive.await.unwrap();
+        let creator = handler.clone();
+        let creation = tokio::spawn(async move {
+            call(
+                &creator,
+                "CreateQueue",
+                json!({"QueueName":"cancelled-ledger"}),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !creation.is_finished(),
+            "the runtime timer must run while SQLite still waits for its writer"
+        );
+        assert_eq!(
+            call(
+                &handler,
+                "GetQueueUrl",
+                json!({"QueueName":"cancelled-ledger"})
+            )
+            .await
+            .0,
+            400
+        );
+        creation.abort();
+        assert!(creation.await.unwrap_err().is_cancelled());
+        release_send.send(()).unwrap();
+        tokio::task::spawn_blocking(move || writer.join().unwrap())
+            .await
+            .unwrap();
+        let committed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (status, queue) = call(
+                    &handler,
+                    "GetQueueUrl",
+                    json!({"QueueName":"cancelled-ledger"}),
+                )
+                .await;
+                if status == 200 {
+                    break queue;
+                }
+                assert_eq!(status, 400);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (status, created) = tokio::time::timeout(
+            Duration::from_secs(5),
+            call(
+                &handler,
+                "CreateQueue",
+                json!({"QueueName":"cancelled-ledger"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(created, committed);
+        assert_eq!(
+            call(
+                &handler,
+                "GetQueueUrl",
+                json!({"QueueName":"cancelled-ledger"})
+            )
+            .await,
+            (200, created)
+        );
+        let count: i64 = db
+            .connection()
+            .unwrap()
+            .query_row("SELECT count(*) FROM sqs_queues", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(handler);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn source_policy_requires_core_internal_sns_context() {
         let h = SqsHandler::new();
@@ -927,9 +1136,9 @@ mod tests {
     async fn disk_backlog_above_64_mib_preserves_restart_attempts_and_atomic_redrive() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
+            .join("../../.kiro/localcloud-tmp")
             .join(format!("sqs-disk-backlog-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         let registry = Arc::new(ServiceRegistry::new());

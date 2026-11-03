@@ -189,10 +189,33 @@ impl SqsStore {
         attributes: BTreeMap<String, String>,
         tags: BTreeMap<String, String>,
     ) -> InsertResult {
+        self.insert_state_if_absent(arn, fifo, QueueState::new(attributes, tags))
+    }
+
+    /// The caller owns lifecycle-write admission. Persist the detached queue before
+    /// making it visible to readers that do not take that admission lock.
+    pub(crate) fn create_if_absent(
+        &self,
+        arn: QueueArn,
+        fifo: bool,
+        attributes: BTreeMap<String, String>,
+        tags: BTreeMap<String, String>,
+    ) -> Result<InsertResult, SqsError> {
+        if let Some(existing) = self.get(&arn) {
+            return Ok(InsertResult::Existing(existing));
+        }
+        let state = QueueState::new(attributes, tags);
+        if let Some(db) = self.persistence() {
+            db.create_queue(&arn, &state)?;
+        }
+        Ok(self.insert_state_if_absent(arn, fifo, state))
+    }
+
+    fn insert_state_if_absent(&self, arn: QueueArn, fifo: bool, state: QueueState) -> InsertResult {
         let q = Arc::new(GuardedQueue {
             arn: arn.clone(),
             fifo,
-            state: Mutex::new(QueueState::new(attributes, tags)),
+            state: Mutex::new(state),
             notify: Notify::new(),
             last_activity_ms: AtomicI64::new(crate::metrics::now_ms()),
         });
@@ -215,10 +238,6 @@ impl SqsStore {
 
     pub fn restore_deleted(&self, arn: QueueArn, deleted_at: Instant) {
         self.recently_deleted.insert(key(&arn), deleted_at);
-    }
-
-    pub fn forget_uncommitted(&self, arn: &QueueArn) {
-        self.queues.remove(&key(arn));
     }
 
     pub fn remove(&self, arn: &QueueArn) -> Option<Arc<GuardedQueue>> {

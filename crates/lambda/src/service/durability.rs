@@ -131,7 +131,7 @@ fn metadata_target(req: &ServiceRequest) -> Result<Option<MetadataTarget>, Lambd
             )?)))
         }
         [_, "functions", name, ..] => Ok(Some(MetadataTarget::Function(resolve_function_name(
-            name,
+            &percent_decode_path(name),
             &req.region,
         )?))),
         ["2017-03-31", "tags", arn] => {

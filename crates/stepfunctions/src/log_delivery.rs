@@ -68,7 +68,7 @@ async fn call(
 ) -> Result<(u16, Value), SfnError> {
     let dispatcher = registry
         .internal_dispatcher()
-        .ok_or_else(|| invalid("CloudWatch Logs dispatcher is unavailable"))?;
+        .ok_or_else(|| SfnError::Internal("CloudWatch Logs dispatcher is unavailable".into()))?;
     let mut headers = HeaderMap::new();
     headers.insert(
         "content-type",
@@ -98,11 +98,16 @@ async fn call(
         )
         .await;
     let status = response.status().as_u16();
+    if status >= 500 || status == 429 {
+        return Err(SfnError::Internal(format!(
+            "CloudWatch Logs {operation} failed with HTTP {status}; retry log delivery configuration"
+        )));
+    }
     let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
-        .map_err(|_| invalid("Log delivery response exceeded its limit"))?;
-    let value =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("Invalid CloudWatch Logs response"))?;
+        .map_err(|_| SfnError::Internal("Log delivery response exceeded its limit".into()))?;
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|_| SfnError::Internal("Invalid CloudWatch Logs response".into()))?;
     Ok((status, value))
 }
 
@@ -281,4 +286,106 @@ pub(crate) async fn configure(
     Err(invalid(
         "CloudWatch Logs resource policy changed concurrently; retry configuration",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::response::Response;
+    use locallycloud_core::handler::{NativeHandler, ServiceRequest};
+    use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
+
+    struct FailingLogs {
+        operation: &'static str,
+        status: u16,
+        malformed: bool,
+    }
+
+    #[async_trait]
+    impl NativeHandler for FailingLogs {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            let operation = request
+                .headers
+                .get("x-amz-target")
+                .and_then(|target| target.to_str().ok())
+                .and_then(|target| target.strip_prefix("Logs_20140328."));
+            let failing = operation == Some(self.operation);
+            let body = if failing {
+                if self.malformed {
+                    "private-backend-detail".into()
+                } else {
+                    json!({"__type":"AccessDeniedException","message":"private-backend-detail"})
+                        .to_string()
+                }
+            } else {
+                match operation {
+                    Some("DescribeResourcePolicies") => json!({"resourcePolicies":[]}).to_string(),
+                    Some("PutResourcePolicy") => "{}".into(),
+                    _ => panic!("Unexpected Logs request in delivery failure fixture"),
+                }
+            };
+            Response::builder()
+                .status(if failing { self.status } else { 200 })
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_failures_remain_retryable_server_errors_without_claiming_iam_denial() {
+        for operation in ["DescribeResourcePolicies", "PutResourcePolicy"] {
+            for (status, malformed, expected) in [
+                (500, false, 500),
+                (503, true, 500),
+                (429, false, 500),
+                (200, true, 500),
+                (403, false, 400),
+            ] {
+                let registry = ServiceRegistry::with_known_services();
+                crate::register(&registry);
+                registry.register_native(
+                    ServiceName::new("logs"),
+                    ServiceMetadata::new(AwsProtocol::Json11, Some("Logs_20140328")),
+                    Arc::new(FailingLogs {
+                        operation,
+                        status,
+                        malformed,
+                    }),
+                );
+                let error = configure(
+                    &registry,
+                    "us-east-1",
+                    "111111111111",
+                    "arn:aws:iam::111111111111:role/log-management",
+                    "arn:aws:states:us-east-1:111111111111:stateMachine:ledger",
+                    "ledger",
+                )
+                .await
+                .unwrap_err();
+                let response = error.into_response("delivery-failure");
+                assert_eq!(
+                    response.status().as_u16(),
+                    expected,
+                    "{operation}: {status}"
+                );
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let text = body.to_string();
+                assert!(!text.contains("private-backend-detail"));
+                if expected == 500 {
+                    assert_eq!(body["__type"], "InternalServerError");
+                    assert!(!text.contains("Execution role"));
+                } else {
+                    assert_eq!(body["__type"], "InvalidLoggingConfiguration");
+                    assert!(text.contains("Execution role"));
+                }
+            }
+        }
+    }
 }
