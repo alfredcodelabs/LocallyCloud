@@ -249,7 +249,7 @@ export function mount(root, ctx) {
                 h('button', { type: 'button', id: 'ar-proposal-accept', disabled: true, text: t('arAcceptProposal'), onclick: acceptProposal }),
                 h('button', { type: 'button', id: 'ar-proposal-reject', disabled: true, text: t('arDiscardProposal'), onclick: () => { proposal = null; renderReview(); } })))),
           field(t('arInspect'), h('select', { id: 'ar-target', onchange: (e) => choose(e.target.value) })),
-          h('h3', { id: 'ar-element-name', cls: 'ar-wrap' }), h('p', { id: 'ar-element-info', cls: 'ar-pre ar-mono' }),
+          h('h3', { id: 'ar-element-name', cls: 'ar-wrap' }), h('p', { id: 'ar-element-info', cls: 'ar-pre ar-mono' }), h('h4', { id: 'ar-facts-title', text: t('arFacts') }), h('dl', { id: 'ar-facts', cls: 'ar-facts' }),
           h('div', { id: 'ar-zone-editor' },
             field(t('arZone'), h('select', { id: 'ar-zone', onchange: setZone })),
             h('form', { id: 'ar-zone-form', cls: 'ar-form ar-inline', onsubmit: addZone },
@@ -380,6 +380,10 @@ export function mount(root, ctx) {
     options($('target'), targets(), selected); $('element-name').textContent = selected ? labelTarget(selected) : '';
     $('element-info').textContent = node ? `${node.type}\n${node.status}\n${t('arOrigin')}: ${originLabel(node.origin)}\n${node.id}${node.physicalId ? '\n' + node.physicalId : ''}`
       : edge ? `${kindLabel(edge.kind)}\n${edge.evidence}` : selected ? t('arAbsentElement') : '';
+    const facts = node?.facts || [];
+    $('facts-title').hidden = !facts.length;
+    $('facts').replaceChildren(...facts.flatMap((f) => [h('dt', { text: tx('arFact_' + f.id, f.id) }),
+      h('dd', { title: f.evidence, text: tx('arFactValue_' + f.value, f.value) })]));
     $('zone-editor').hidden = !node;
     options($('zone'), [['', t('arUnassigned')], ...model.zones.map((z) => [z.id, z.name])], node?.zone || '');
     $('prompts').replaceChildren(...M.prompts(model, selected).map((p) => {

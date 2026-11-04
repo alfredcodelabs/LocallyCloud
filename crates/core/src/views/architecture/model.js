@@ -4,7 +4,7 @@
 import * as Review from './engine.js';
 import * as Catalog from './catalog.js';
 
-export const LIMIT = Object.freeze({ bytes: 8 * 1024 * 1024, nodes: 512, edges: 2048, threats: 512, zones: 32, views: 32 });
+export const LIMIT = Object.freeze({ bytes: 8 * 1024 * 1024, nodes: 512, edges: 2048, threats: 512, zones: 32, views: 32, facts: 32 });
 export const STRIDE = Catalog.methodology('STRIDE').categories;
 export const KINDS = ['dependency', 'configured', 'proposed'];
 export const STATUSES = ['open', 'mitigated', 'accepted', 'not-applicable'];
@@ -47,6 +47,13 @@ function unique(items, kind) {
   }
   return ids;
 }
+const HASH = /^sha256:[0-9a-f]{64}$/;
+/** Declared configuration facts: enum values with the property path they came from. */
+function facts(value) {
+  const items = records(value || [], LIMIT.facts).map(f => ({ id: text(f.id, 64), value: text(f.value, 64), evidence: text(f.evidence, 1000) }));
+  if (items.some(f => !f.id || !f.value)) { fail('A configuration fact needs an id and a value'); }
+  return items.length ? { facts: items } : {};
+}
 function finite(value, fallback) { return Number.isFinite(value) ? Math.max(0, Math.min(100000, value)) : fallback; }
 
 export function validate(input) {
@@ -61,6 +68,7 @@ export function validate(input) {
     id: text(n.id), name: text(n.name), type: text(n.type), status: text(n.status), physicalId: text(n.physicalId, 1024),
     origin: ORIGINS.includes(n.origin) ? n.origin : n.status === 'PROPOSED' ? 'human' : input.source === 'snapshot' ? 'captured' : 'declared',
     zone: zoneIds.has(n.zone) ? n.zone : '', x: finite(n.x, 60 + (i % 4) * 250), y: finite(n.y, 100 + Math.floor(i / 4) * 160),
+    ...facts(n.facts), ...(typeof n.configHash === 'string' && HASH.test(n.configHash) ? { configHash: n.configHash } : {}),
   }));
   const nodeIds = unique(nodes, 'node');
   const edges = records(input.edges, LIMIT.edges).map(e => {
@@ -131,10 +139,34 @@ export function merge(previous, next) {
     if (edge.kind === 'proposed' && presentNodes.has(edge.from) && presentNodes.has(edge.to)) { edges.set(edge.id, edge); }
   }
   next.edges = [...edges.values()];
-  next.threats = previous.threats.map(t => ({ ...t, needsReview: true }));
+  next.threats = structuredClone(previous.threats);
   next.review = structuredClone(previous.review || Review.fresh());
-  // Captures omit IAM and other security properties: do not claim unaffected controls.
-  return validate(Review.invalidate({ ...next, version: 2 }));
+  return validate(Review.invalidate({ ...next, version: 2 }, changedTargets(previous, next)));
+}
+
+/** Targets whose decisions a refresh re-opens, or null for all of them. A capture without
+    configuration digests cannot show what stayed the same, so it re-opens everything. Otherwise a
+    node is unchanged when both captures carry the same digest; flows follow their endpoints, and
+    the system follows any resource or flow that appears or disappears. */
+function changedTargets(previous, next) {
+  const captured = next.nodes.filter(n => n.status !== 'PROPOSED');
+  // Inferred review assumptions (such as the HTTP client) have no configuration to digest.
+  if (captured.some(n => n.status !== 'INFERRED' && !n.configHash)) { return null; }
+  const before = new Map(previous.nodes.map(n => [n.id, n])), after = new Map(captured.map(n => [n.id, n]));
+  const changed = new Set([...before.keys()].filter(id => !after.has(id) && before.get(id).status !== 'PROPOSED'));
+  for (const [id, n] of after) {
+    if (!before.has(id) || before.get(id).configHash !== n.configHash) { changed.add(id); }
+  }
+  const edgesBefore = new Set(previous.edges.map(e => e.id)), edgesAfter = new Set(next.edges.map(e => e.id));
+  const targets = new Set([...changed].map(id => 'n:' + id));
+  let topologyChanged = changed.size > 0 && [...changed].some(id => !before.has(id) || !after.has(id));
+  for (const e of [...previous.edges, ...next.edges]) {
+    const moved = edgesBefore.has(e.id) !== edgesAfter.has(e.id);
+    if (moved) { topologyChanged = true; }
+    if (moved || changed.has(e.from) || changed.has(e.to)) { targets.add('e:' + e.id); }
+  }
+  if (topologyChanged) { targets.add('system'); }
+  return targets;
 }
 
 export function prompts(model, target) {

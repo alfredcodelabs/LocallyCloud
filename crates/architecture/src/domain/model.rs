@@ -39,6 +39,62 @@ pub enum Origin {
     Declared,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FactId {
+    EncryptionAtRest,
+    PublicAccessBlock,
+    Versioning,
+    PointInTimeRecovery,
+    TlsOnly,
+    ResourcePolicy,
+    DeadLetter,
+    ReservedConcurrency,
+    SecretsInEnvironment,
+    RolePrivilege,
+    LogRetention,
+    ExecutionLogging,
+    ApiAuthorization,
+    Throttling,
+    AccessLogs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FactValue {
+    Kms,
+    ServiceManaged,
+    Enabled,
+    Disabled,
+    Suspended,
+    Partial,
+    Enforced,
+    Configured,
+    Limited,
+    Public,
+    Restricted,
+    ResolvedSecret,
+    Suspected,
+    NoneDetected,
+    WildcardAction,
+    WildcardResource,
+    Scoped,
+    Retained,
+    NeverExpires,
+    AllMethods,
+    SomeOpen,
+    Open,
+    NotDeclared,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Fact {
+    pub id: FactId,
+    pub value: FactValue,
+    pub evidence: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Node {
@@ -53,6 +109,10 @@ pub struct Node {
     pub zone: String,
     pub x: u32,
     pub y: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<Fact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

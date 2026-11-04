@@ -264,9 +264,22 @@ async fn rules_and_event_source_mappings_become_configured_edges() {
     assert!(has_gap(&model, "Deliver", "Targets[].Arn"));
     assert_eq!(node(&model, "Inbox")["physicalId"], QUEUE_URL);
     let raw = model.to_string();
-    for secret in ["must-not-leak", "EventPattern", "Environment", "foreign"] {
+    for secret in ["must-not-leak", "EventPattern", "foreign"] {
         assert!(!raw.contains(secret), "{secret} leaked");
     }
+    // Environment variables are classified by name only.
+    let worker = node(&model, "Worker");
+    let secrets = worker["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "secrets-in-environment")
+        .unwrap();
+    assert_eq!(secrets["value"], "suspected");
+    assert!(worker["configHash"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     let edge = model["edges"]
         .as_array()
         .unwrap()

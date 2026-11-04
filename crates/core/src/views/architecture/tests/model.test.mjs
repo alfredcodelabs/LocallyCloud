@@ -93,3 +93,40 @@ test('saved views filter the graph, keep separate layouts and share the review',
   assert.throws(() => M.validate({ ...snapshot(), views: [{ id: 'empty', name: 'Empty', nodeIds: [] }] }), /selection/);
   assert.throws(() => M.validate({ ...snapshot(), views: Array.from({ length: 33 }, (_, i) => ({ id: 'v' + i, name: 'v', nodeIds: ['Queue'] })) }), /32/);
 });
+
+test('configuration facts are kept as data and bounded', () => {
+  const capture = snapshot();
+  capture.nodes[0].facts = [{ id: 'dead-letter', value: 'configured', evidence: 'Queue.Properties.RedrivePolicy (template)' }];
+  capture.nodes[0].configHash = 'sha256:' + 'a'.repeat(64);
+  capture.nodes[1].configHash = 'not-a-hash';
+  const v = M.validate(capture);
+  assert.deepEqual(v.nodes[0].facts, capture.nodes[0].facts);
+  assert.equal(v.nodes[0].configHash, capture.nodes[0].configHash);
+  assert(!('configHash' in v.nodes[1]) && !('facts' in v.nodes[1]));
+  assert.deepEqual(M.validate(v), v);
+  assert.throws(() => M.validate({ ...capture, nodes: [{ ...capture.nodes[0], facts: [{ id: 'x' }] }] }), /fact/);
+  assert.throws(() => M.validate({ ...capture, nodes: [{ ...capture.nodes[0], facts: Array.from({ length: 33 }, () => ({ id: 'a', value: 'b' })) }] }), /32/);
+});
+
+test('a refresh re-opens only decisions on resources whose configuration changed', () => {
+  const hashed = (changes = {}) => {
+    const capture = snapshot();
+    for (const n of capture.nodes) { n.configHash = 'sha256:' + (changes[n.id] || n.id.charCodeAt(0).toString(16).padStart(2, '0')).repeat(32).slice(0, 64); }
+    return M.validate(capture);
+  };
+  const review = hashed();
+  const decision = (id, target) => ({ id, target, title: 'Reviewed', category: 'Tampering', status: 'accepted', severity: 'low', mitigation: '', note: 'Accepted risk', needsReview: false });
+  review.threats = [decision('queue', 'n:Queue'), decision('worker', 'n:Worker'), decision('flow', 'e:configured:Queue:Worker:event mapping'), decision('rule', 'e:configured:Rule:Queue:target')];
+  const base = M.validate(review);
+  const same = M.merge(base, hashed());
+  assert(same.threats.every(t => !t.needsReview), 'identical configuration keeps decisions');
+  const workerChanged = M.merge(base, hashed({ Worker: 'ff' }));
+  const flags = Object.fromEntries(workerChanged.threats.map(t => [t.id, t.needsReview]));
+  assert.deepEqual(flags, { queue: false, worker: true, flow: true, rule: false });
+  const withClient = (capture) => ({ ...capture, nodes: [...capture.nodes, { id: 'inferred:http-client', name: 'HTTP client', type: 'External actor', status: 'INFERRED', zone: '', x: 1, y: 1 }] });
+  const clientBase = M.validate(withClient(base));
+  assert(M.merge(clientBase, withClient(hashed())).threats.every(t => !t.needsReview), 'inferred nodes need no digest');
+  assert(M.merge(base, withClient(hashed())).review.revision > base.review.revision);
+  const legacy = M.merge(base, M.validate(snapshot()));
+  assert(legacy.threats.every(t => t.needsReview), 'captures without digests re-open everything');
+});

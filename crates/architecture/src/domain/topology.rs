@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::fmt;
 
 use super::model::{
-    bounded_text, Edge, EdgeKind, EmptyList, Node, Origin, Snapshot, SnapshotMeta, SnapshotScope,
-    Unresolved, INFERRED,
+    bounded_text, Edge, EdgeKind, EmptyList, Fact, Node, Origin, Snapshot, SnapshotMeta,
+    SnapshotScope, Unresolved, INFERRED,
 };
 
 /// Same bounds the browser model enforces.
@@ -16,6 +16,7 @@ pub const MAX_UNRESOLVED: usize = 2048;
 const TEXT: usize = 256;
 const PHYSICAL_ID: usize = 1024;
 const EVIDENCE: usize = 1000;
+pub const MAX_FACTS: usize = 32;
 
 /// Node of the inferred external caller of REST APIs.
 pub const HTTP_CLIENT_ID: &str = "inferred:http-client";
@@ -59,6 +60,10 @@ pub enum Finding {
     Gap(Unresolved),
     /// A REST API exposes methods; the reviewer must validate who can call it.
     HttpInterface(String),
+    Fact {
+        target: String,
+        fact: Fact,
+    },
 }
 
 impl Finding {
@@ -102,6 +107,7 @@ pub struct Resource<'a> {
     pub resource_type: &'a str,
     pub physical_id: &'a str,
     pub status: &'a str,
+    pub config_hash: Option<String>,
 }
 
 pub struct Topology {
@@ -153,6 +159,8 @@ impl Topology {
             zone: String::new(),
             x,
             y,
+            facts: Vec::new(),
+            config_hash: resource.config_hash,
         });
         Ok(())
     }
@@ -173,6 +181,22 @@ impl Topology {
                 }
                 Ok(())
             }
+            Finding::Fact { target, fact } => {
+                self.fact(&target, fact);
+                Ok(())
+            }
+        }
+    }
+
+    fn fact(&mut self, target: &str, fact: Fact) {
+        let Some(node) = self.nodes.iter_mut().find(|n| n.id == target) else {
+            return;
+        };
+        if node.facts.len() < MAX_FACTS && !node.facts.iter().any(|f| f.id == fact.id) {
+            node.facts.push(Fact {
+                evidence: bounded_text(&fact.evidence, EVIDENCE),
+                ..fact
+            });
         }
     }
 
@@ -278,6 +302,8 @@ impl Topology {
             zone: String::new(),
             x: 60,
             y: rows.saturating_mul(160).saturating_add(100),
+            facts: Vec::new(),
+            config_hash: None,
         });
         for api in &apis {
             self.relate(

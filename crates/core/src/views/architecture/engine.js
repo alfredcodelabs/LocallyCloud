@@ -112,13 +112,15 @@ export function finding(model, id) {
   if (!Number.isSafeInteger(next.review.revision)) { fail('Review revision exhausted'); }
   return next;
 }
-export function invalidate(model) {
+/** Re-open decisions for review: all of them, or only those on `targets` ('system', 'n:…', 'e:…'). */
+export function invalidate(model, targets = null) {
   const next = structuredClone(model);
   next.review = validate(next.review);
   if (next.review.revision >= Number.MAX_SAFE_INTEGER) { fail('Review revision exhausted'); }
   next.review.revision++;
-  next.review.answers.forEach(a => { a.needsReview = true; });
-  next.threats.forEach(t => { t.needsReview = true; });
+  const affected = (target) => !targets || targets.has(target);
+  next.review.answers.forEach(a => { if (affected(a.target)) { a.needsReview = true; } });
+  next.threats.forEach(t => { if (affected(t.target)) { t.needsReview = true; } });
   return next;
 }
 function answerCommand(model, input, origin) {

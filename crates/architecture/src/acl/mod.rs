@@ -2,10 +2,12 @@
 //!
 //! Reads go only through the injected [`AwsReader`], so they re-enter the front door with
 //! the dashboard profile's identity and read-only admission. This layer is also the
-//! security boundary: identities, statuses, relationships and reasons leave it; templates,
-//! policies, environment values, state machine definitions and code do not.
+//! security boundary: identities, statuses, relationships, reasons, configuration facts (as
+//! enums) and configuration digests leave it; templates, policies, environment values, state
+//! machine definitions and code do not.
 
 mod extract;
+mod facts;
 mod identity;
 mod reads;
 mod stack;
@@ -108,6 +110,11 @@ impl CloudFormationTopology {
                 .map(|r| (r.logical_id.as_str(), r.physical_id.as_str()))
                 .collect(),
         };
+        if let Some(view) = &view {
+            for finding in facts::findings(view, &resolver) {
+                topology.record(finding).map_err(limit)?;
+            }
+        }
         let ctx = Context {
             reads: &reads,
             identities: &identities,
@@ -183,6 +190,10 @@ fn add_nodes(
                         resource_type,
                         physical_id: recorded.map_or("", |r| r.physical_id.as_str()),
                         status,
+                        config_hash: view.config_hash(
+                            declaration.logical_id,
+                            recorded.map_or("", |r| r.physical_id.as_str()),
+                        ),
                     })
                     .map_err(limit)?;
             }
@@ -205,6 +216,7 @@ fn add_nodes(
                 resource_type: &resource.resource_type,
                 physical_id: &resource.physical_id,
                 status: &resource.status,
+                config_hash: None,
             })
             .map_err(limit)?;
     }

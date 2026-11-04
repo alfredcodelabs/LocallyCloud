@@ -6,12 +6,12 @@ mod model;
 mod topology;
 
 pub use model::{
-    Edge, EdgeKind, EmptyList, Node, Origin, Snapshot, SnapshotMeta, SnapshotScope, Unresolved,
-    CONDITIONAL_NOT_RECORDED, INFERRED, NOT_RECORDED,
+    Edge, EdgeKind, EmptyList, Fact, FactId, FactValue, Node, Origin, Snapshot, SnapshotMeta,
+    SnapshotScope, Unresolved, CONDITIONAL_NOT_RECORDED, INFERRED, NOT_RECORDED,
 };
 pub use topology::{
     edge_id, grid, Finding, LimitExceeded, Resource, Topology, HTTP_CLIENT_ID, MAX_EDGES,
-    MAX_NODES, MAX_UNRESOLVED,
+    MAX_FACTS, MAX_NODES, MAX_UNRESOLVED,
 };
 
 #[cfg(test)]
@@ -34,6 +34,7 @@ mod tests {
             resource_type,
             physical_id: "physical",
             status: "CREATE_COMPLETE",
+            config_hash: None,
         }
     }
 
@@ -229,6 +230,7 @@ mod tests {
                 resource_type: "T",
                 physical_id: &"p".repeat(2000),
                 status: "S",
+                config_hash: None,
             })
             .unwrap();
         let node = &topology.finish().unwrap().nodes[0];

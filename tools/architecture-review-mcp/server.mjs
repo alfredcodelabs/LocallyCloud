@@ -47,7 +47,7 @@ export function createServer(store) {
     const nodes = graph.nodes.filter(n => !type || n.type === type), ids = new Set(nodes.map(n => n.id));
     const edges = graph.edges.filter(e => !type || ids.has(e.from) || ids.has(e.to));
     const items = [
-      ...nodes.map(n => ({ kind: 'node', target: 'n:' + n.id, name: n.name, type: n.type, status: n.status, zone: n.zone })),
+      ...nodes.map(n => ({ kind: 'node', target: 'n:' + n.id, name: n.name, type: n.type, status: n.status, zone: n.zone, factCount: n.facts?.length || 0 })),
       ...edges.map(e => ({ kind: 'edge', target: 'e:' + e.id, from: e.from, to: e.to, relationship: e.kind })),
     ];
     return paged({
@@ -55,7 +55,7 @@ export function createServer(store) {
     catalogVersion: R.CATALOG, nodeCount: model.nodes.length, edgeCount: model.edges.length, unresolvedCount: model.unresolved.length,
     filteredNodeCount: nodes.length, filteredEdgeCount: edges.length,
     views: model.views.map(v => ({ id: v.id, name: v.name.slice(0, 80), nodeCount: v.nodeIds.length })),
-    gaps: ['Snapshot configuration is not traffic or IAM verification.', 'External resources, literal ARNs and unresolved transforms may be missing.', 'Evidence references and imported provenance are self-reported.'],
+    gaps: ['Snapshot configuration is not traffic or IAM verification. Declared facts (read_evidence) classify the template, not runtime behavior.', 'External resources, literal ARNs and unresolved transforms may be missing.', 'Evidence references and imported provenance are self-reported.'],
     }, items, offset, limit, 'items');
   });
   tool('list_pending_questions', 'With target: authored questions and existing answers. Without target: paged pending counts by target and question, optionally scoped to a saved view. Blocked questions cannot be answered.', z.strictObject({ target: target.optional(), ...page, type: z.string().max(256).optional(), view: z.string().max(256).optional() }), (model, args) => {
@@ -76,6 +76,7 @@ export function createServer(store) {
     unresolved: model.unresolved.filter(u => args.target === 'system' || 'n:' + u.target === args.target).slice(args.offset, args.offset + 5),
     nextUnresolvedOffset: args.offset + 5 < model.unresolved.filter(u => args.target === 'system' || 'n:' + u.target === args.target).length ? args.offset + 5 : null,
     configured: model.edges.find(e => 'e:' + e.id === args.target)?.evidence || '',
+    declaredFacts: model.nodes.find(n => 'n:' + n.id === args.target)?.facts || [],
     answerQuestions: model.review.answers.filter(a => a.target === args.target).map(a => a.question),
     answers: model.review.answers.filter(a => a.target === args.target && a.question === args.question).slice(0, 1),
     findings: model.threats.filter(t => t.target === args.target).slice(args.offset, args.offset + 1).map(t => ({ id: t.id, evidence: t.evidence, verification: t.verification, needsReview: t.needsReview })),

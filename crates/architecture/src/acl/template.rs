@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::domain::{EdgeKind, Finding};
 
@@ -42,8 +43,44 @@ impl<'t> TemplateView<'t> {
         self.resources.get(logical_id)?.get("Properties")?.get(name)
     }
 
-    /// `reference` edges from Ref/GetAtt/Sub in properties, `DependsOn` edges from ordering;
-    /// both point from the dependency to its consumer.
+    pub(crate) fn properties(&self, logical_id: &str) -> Option<&'t Value> {
+        self.resources.get(logical_id)?.get("Properties")
+    }
+
+    pub(crate) fn of_type<'s>(
+        &'s self,
+        resource_type: &'s str,
+    ) -> impl Iterator<Item = (&'t str, &'t Value)> + 's {
+        self.resources
+            .iter()
+            .filter_map(move |(logical_id, resource)| {
+                (resource.get("Type").and_then(Value::as_str) == Some(resource_type))
+                    .then(|| Some((logical_id.as_str(), resource.get("Properties")?)))
+                    .flatten()
+            })
+    }
+
+    pub(crate) fn mentions(&self, value: &Value, logical_id: &str) -> bool {
+        references(value, self.resources).contains(&logical_id)
+    }
+
+    pub(crate) fn referenced(&self, value: &'t Value) -> Vec<&'t str> {
+        references(value, self.resources)
+    }
+
+    pub(crate) fn config_hash(&self, logical_id: &str, physical_id: &str) -> Option<String> {
+        let resource = self.resources.get(logical_id)?;
+        let mut canonical = String::new();
+        canonical.push_str(resource.get("Type").and_then(Value::as_str).unwrap_or(""));
+        canonical.push('\n');
+        canonical.push_str(physical_id);
+        canonical.push('\n');
+        if let Some(properties) = resource.get("Properties") {
+            write_canonical(properties, "", 0, &mut canonical);
+        }
+        Some(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
+    }
+
     pub(crate) fn dependency_findings(&self) -> Vec<Finding> {
         let mut findings = Vec::new();
         for (logical_id, resource) in self.resources {
@@ -127,7 +164,65 @@ fn references<'v>(value: &'v Value, known: &Map<String, Value>) -> Vec<&'v str> 
     found
 }
 
-/// Names of `${Name}` / `${Name.Attr}` variables; `${!Literal}` is an escape.
+const CANONICAL_DEPTH: usize = 64;
+
+fn write_canonical(value: &Value, parent: &str, depth: usize, out: &mut String) {
+    if depth > CANONICAL_DEPTH {
+        out.push_str("\"…\"");
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                let child = &map[key];
+                if parent == "Environment" && key == "Variables" {
+                    write_names(child, out);
+                } else {
+                    write_canonical(child, key, depth + 1, out);
+                }
+            }
+            out.push('}');
+        }
+        Value::Array(items) if parent == "Environment" => {
+            let names: Vec<&Value> = items.iter().filter_map(|item| item.get("Name")).collect();
+            write_canonical(
+                &Value::Array(names.into_iter().cloned().collect()),
+                "",
+                depth + 1,
+                out,
+            );
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, parent, depth + 1, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+fn write_names(variables: &Value, out: &mut String) {
+    let mut names: Vec<&String> = variables
+        .as_object()
+        .map(|m| m.keys().collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    out.push_str(&Value::from(names.into_iter().cloned().collect::<Vec<_>>()).to_string());
+}
+
 fn sub_variables(source: &str) -> impl Iterator<Item = &str> {
     source.split("${").skip(1).filter_map(|rest| {
         let (variable, _) = rest.split_once('}')?;
@@ -138,8 +233,6 @@ fn sub_variables(source: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Resolves a template value to a string through pseudo parameters, stack parameters and
-/// deployed physical IDs only. Conditions and other intrinsics are never evaluated.
 pub(crate) struct Resolver<'a> {
     pub pseudo: HashMap<&'static str, String>,
     pub parameters: &'a HashMap<String, String>,
@@ -209,6 +302,52 @@ mod tests {
         assert!(edges.contains(&("Table".into(), "Other".into(), "reference".into())));
         assert!(edges.contains(&("Table".into(), "Other".into(), "DependsOn".into())));
         assert!(!edges.iter().any(|(from, _, _)| from == "Queue"));
+    }
+
+    #[test]
+    fn config_hash_ignores_key_order_and_environment_values() {
+        let hash = |properties: Value, physical: &str| {
+            let template = json!({"Resources": {"Fn": {"Type": "AWS::Lambda::Function", "Properties": properties}}});
+            TemplateView::new(&template)
+                .unwrap()
+                .config_hash("Fn", physical)
+                .unwrap()
+        };
+        let base = hash(
+            json!({"Timeout": 3, "Environment": {"Variables": {"A": "one", "B": "x"}}}),
+            "fn",
+        );
+        assert!(base.starts_with("sha256:"));
+        assert_eq!(
+            base,
+            hash(
+                json!({"Environment": {"Variables": {"B": "y", "A": "two"}}, "Timeout": 3}),
+                "fn"
+            )
+        );
+        assert_ne!(
+            base,
+            hash(
+                json!({"Timeout": 4, "Environment": {"Variables": {"A": "one", "B": "x"}}}),
+                "fn"
+            )
+        );
+        assert_ne!(
+            base,
+            hash(
+                json!({"Timeout": 3, "Environment": {"Variables": {"A": "one"}}}),
+                "fn"
+            )
+        );
+        assert_ne!(
+            base,
+            hash(
+                json!({"Timeout": 3, "Environment": {"Variables": {"A": "one", "B": "x"}}}),
+                "fn-2"
+            )
+        );
+        let ecs = |value: &str| json!({"ContainerDefinitions": [{"Environment": [{"Name": "TOKEN", "Value": value}]}]});
+        assert_eq!(hash(ecs("a"), "t"), hash(ecs("b"), "t"));
     }
 
     #[test]
