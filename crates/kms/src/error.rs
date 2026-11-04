@@ -15,6 +15,7 @@ pub(crate) enum KmsError {
     Disabled,
     InvalidCiphertext,
     AccessDenied,
+    PolicyLockout,
     Unsupported,
     Internal,
     MissingMasterKey,
@@ -84,6 +85,11 @@ impl KmsError {
             Self::InvalidCiphertext => (
                 "InvalidCiphertextException",
                 "The ciphertext or encryption context is invalid",
+                400,
+            ),
+            Self::PolicyLockout => (
+                "MalformedPolicyDocumentException",
+                "The new key policy will not allow you to update the key policy in the future",
                 400,
             ),
             Self::AccessDenied => (

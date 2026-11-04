@@ -141,6 +141,7 @@ impl KeyPolicy {
         &self.raw
     }
 
+    #[cfg(test)]
     pub(crate) fn allows(
         &self,
         principal: Option<&str>,

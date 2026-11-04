@@ -101,17 +101,7 @@ impl KmsService {
             None => KeyPolicy::default_for(&scope.account_id),
         };
         let explicit_policy = body.contains_key("Policy");
-        if explicit_policy
-            && !optional_bool(body, "BypassPolicyLockoutSafetyCheck")?.unwrap_or(false)
-            && !policy.allows(
-                Some(&format!("arn:aws:iam::{}:root", scope.account_id)),
-                "kms:PutKeyPolicy",
-                None,
-                &scope.account_id,
-            )
-        {
-            return Err(KmsError::AccessDenied);
-        }
+        optional_bool(body, "BypassPolicyLockoutSafetyCheck")?;
         let record = KeyRecord {
             key_id: key_id.clone(),
             description,
@@ -363,16 +353,7 @@ impl KmsService {
         policy_name(body)?;
         let key_id = self.resolve_key_id(required_string(body, "KeyId")?, scope)?;
         let policy = KeyPolicy::parse(required_string(body, "Policy")?.to_owned())?;
-        if !optional_bool(body, "BypassPolicyLockoutSafetyCheck")?.unwrap_or(false)
-            && !policy.allows(
-                Some(&format!("arn:aws:iam::{}:root", scope.account_id)),
-                "kms:PutKeyPolicy",
-                None,
-                &scope.account_id,
-            )
-        {
-            return Err(KmsError::AccessDenied);
-        }
+        optional_bool(body, "BypassPolicyLockoutSafetyCheck")?;
         self.store
             .with_key_mut(scope, &key_id, |key| {
                 if key.manager != KeyManager::Customer {

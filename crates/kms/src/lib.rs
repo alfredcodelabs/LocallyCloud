@@ -173,6 +173,51 @@ impl KmsHandler {
         }
     }
 
+    fn validate_policy_change(
+        &self,
+        request: &ServiceRequest,
+        body: &serde_json::Map<String, Value>,
+        operation: &str,
+        planned_key_id: Option<&str>,
+    ) -> Result<(), KmsError> {
+        if !matches!(operation, "CreateKey" | "PutKeyPolicy") {
+            return Ok(());
+        }
+        let bypass = match body.get("BypassPolicyLockoutSafetyCheck") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(KmsError::Validation),
+        };
+        let Some(raw) = body.get("Policy") else {
+            return if operation == "CreateKey" {
+                Ok(())
+            } else {
+                Err(KmsError::Validation)
+            };
+        };
+        let policy =
+            crate::policy::KeyPolicy::parse(raw.as_str().ok_or(KmsError::Validation)?.to_owned())?;
+        if bypass {
+            return Ok(());
+        }
+        let resource = match planned_key_id {
+            Some(id) => crate::model::Scope::new(&request.account_id, &request.region).key_arn(id),
+            None => {
+                let key_id = body
+                    .get("KeyId")
+                    .and_then(Value::as_str)
+                    .ok_or(KmsError::Validation)?;
+                self.service
+                    .key_admin_policy(key_id, &request.account_id, &request.region)?
+                    .0
+            }
+        };
+        match self.authorize_key_policy(request, "PutKeyPolicy", resource, policy, true, body) {
+            Err(KmsError::AccessDenied) => Err(KmsError::PolicyLockout),
+            result => result,
+        }
+    }
+
     fn before_internal_call(&self) -> Result<(), KmsInternalError> {
         let call = self.internal_call_count.fetch_add(1, Ordering::Relaxed);
         match &self.internal_fault {
@@ -280,40 +325,50 @@ impl NativeHandler for KmsHandler {
                 Some(operation) => match serde_json::from_slice::<Value>(&request.body) {
                     Err(_) => Err(KmsError::Serialization.into_aws()),
                     Ok(Value::Object(body)) => {
-                        let planned_key_id = (operation == "CreateKey"
+                        let planned_key_id =
+                            (operation == "CreateKey").then(|| uuid::Uuid::new_v4().to_string());
+                        let tagged_create = operation == "CreateKey"
                             && body
                                 .get("Tags")
                                 .and_then(Value::as_array)
-                                .is_some_and(|tags| !tags.is_empty()))
-                        .then(|| uuid::Uuid::new_v4().to_string());
-                        let authorization = if let Some(id) = &planned_key_id {
-                            self.authorize_key_policy(
+                                .is_some_and(|tags| !tags.is_empty());
+                        let authorization =
+                            if let Some(id) = planned_key_id.as_ref().filter(|_| tagged_create) {
+                                self.authorize_key_policy(
+                                    &request,
+                                    "TagResource",
+                                    crate::model::Scope::new(&request.account_id, &request.region)
+                                        .key_arn(id),
+                                    crate::policy::KeyPolicy::default_for(&request.account_id),
+                                    false,
+                                    &body,
+                                )
+                            } else if matches!(
+                                operation,
+                                "PutKeyPolicy"
+                                    | "DisableKey"
+                                    | "EnableKey"
+                                    | "ScheduleKeyDeletion"
+                                    | "TagResource"
+                                    | "UntagResource"
+                                    | "ListResourceTags"
+                                    | "EnableKeyRotation"
+                                    | "DisableKeyRotation"
+                                    | "GetKeyRotationStatus"
+                                    | "RotateKeyOnDemand"
+                            ) {
+                                self.authorize_key_admin(&request, &body, operation)
+                            } else {
+                                Ok(())
+                            };
+                        let authorization = authorization.and_then(|()| {
+                            self.validate_policy_change(
                                 &request,
-                                "TagResource",
-                                crate::model::Scope::new(&request.account_id, &request.region)
-                                    .key_arn(id),
-                                crate::policy::KeyPolicy::default_for(&request.account_id),
-                                false,
                                 &body,
+                                operation,
+                                planned_key_id.as_deref(),
                             )
-                        } else if matches!(
-                            operation,
-                            "PutKeyPolicy"
-                                | "DisableKey"
-                                | "EnableKey"
-                                | "ScheduleKeyDeletion"
-                                | "TagResource"
-                                | "UntagResource"
-                                | "ListResourceTags"
-                                | "EnableKeyRotation"
-                                | "DisableKeyRotation"
-                                | "GetKeyRotationStatus"
-                                | "RotateKeyOnDemand"
-                        ) {
-                            self.authorize_key_admin(&request, &body, operation)
-                        } else {
-                            Ok(())
-                        };
+                        });
                         match authorization {
                             Err(error) => Err(error.into_aws()),
                             Ok(()) => {
@@ -380,6 +435,7 @@ fn map_internal_error(error: KmsError) -> KmsInternalError {
     match error {
         KmsError::Serialization
         | KmsError::Validation
+        | KmsError::PolicyLockout
         | KmsError::InvalidAliasName
         | KmsError::InvalidMarker
         | KmsError::TagLimitExceeded
@@ -434,8 +490,9 @@ fn test_db() -> Arc<StateDb> {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
     });
-    let path = std::env::temp_dir()
-        .join(format!("locallycloud-kms-{}", uuid::Uuid::new_v4()))
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.kiro/localcloud-tmp/kms-tests")
+        .join(uuid::Uuid::new_v4().to_string())
         .join("state.sqlite3");
     Arc::new(StateDb::open(path).expect("temporary KMS state"))
 }
@@ -797,3 +854,6 @@ mod tests {
 
 #[cfg(test)]
 mod rotation_authorization_tests;
+
+#[cfg(test)]
+mod key_policy_authorization_tests;
