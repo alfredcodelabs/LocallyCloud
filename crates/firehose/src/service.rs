@@ -29,6 +29,7 @@ use crate::TARGET_PREFIX;
 
 mod failure;
 mod persistence;
+mod routing;
 mod timing;
 
 use failure::{DeliveryPhase, ErrorBackup, FailureCode, LoggingOptions};
@@ -100,6 +101,10 @@ struct DestinationConfig {
     prefix: String,
     iceberg: Option<iceberg::Target>,
     #[serde(default)]
+    routing: Option<routing::RoutingConfiguration>,
+    #[serde(default)]
+    s3_buffering_hints: Option<BufferingHints>,
+    #[serde(default)]
     iceberg_delivery: Option<IcebergDeliveryPolicy>,
     #[serde(default)]
     error_backup: Option<ErrorBackup>,
@@ -148,6 +153,8 @@ struct DeliveryStream {
     backup_attempts: u8,
     backed_up_records: u64,
     primary_failure: FailureCode,
+    /// Server-side encryption key type; only `AWS_OWNED_CMK` is supported locally.
+    encryption: Option<String>,
 }
 
 #[derive(Clone)]
@@ -157,6 +164,7 @@ struct InFlight {
     bytes: usize,
 }
 
+#[derive(Clone)]
 struct Batch {
     phase: DeliveryPhase,
     primary_failure: FailureCode,
@@ -175,6 +183,8 @@ struct Inner {
     notify: Notify,
     shutting_down: AtomicBool,
     state: Option<Arc<StateDb>>,
+    metadata_evaluator: Arc<dyn routing::MetadataEvaluator>,
+    routing_plans: Mutex<HashMap<(StreamKey, Uuid), routing::Plan>>,
 }
 
 pub(crate) struct FirehoseHandler {
@@ -187,13 +197,29 @@ pub struct FirehoseHandle {
 
 impl FirehoseHandler {
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> (Self, FirehoseHandle) {
+        Self::from_parts(
+            registry,
+            None,
+            HashMap::new(),
+            Arc::new(routing::JqEvaluator::default()),
+        )
+    }
+
+    fn from_parts(
+        registry: Weak<ServiceRegistry>,
+        state: Option<Arc<StateDb>>,
+        streams: HashMap<StreamKey, DeliveryStream>,
+        metadata_evaluator: Arc<dyn routing::MetadataEvaluator>,
+    ) -> (Self, FirehoseHandle) {
         let inner = Arc::new(Inner {
             registry,
-            streams: Mutex::new(HashMap::new()),
+            streams: Mutex::new(streams),
             worker: Mutex::new(None),
             notify: Notify::new(),
             shutting_down: AtomicBool::new(false),
-            state: None,
+            state,
+            metadata_evaluator,
+            routing_plans: Mutex::new(HashMap::new()),
         });
         (
             Self {
@@ -208,19 +234,11 @@ impl FirehoseHandler {
         state: Arc<StateDb>,
     ) -> Result<(Self, FirehoseHandle), persistence::PersistError> {
         let streams = persistence::load(&state)?;
-        let inner = Arc::new(Inner {
+        Ok(Self::from_parts(
             registry,
-            streams: Mutex::new(streams),
-            worker: Mutex::new(None),
-            notify: Notify::new(),
-            shutting_down: AtomicBool::new(false),
-            state: Some(state),
-        });
-        Ok((
-            Self {
-                inner: inner.clone(),
-            },
-            FirehoseHandle { inner },
+            Some(state),
+            streams,
+            Arc::new(routing::JqEvaluator::default()),
         ))
     }
 
@@ -334,6 +352,22 @@ impl FirehoseHandler {
         service_request: &ServiceRequest,
     ) -> Result<Success, FirehoseError> {
         validate_stream_name(&request.delivery_stream_name)?;
+        let encryption = match request.delivery_stream_encryption_configuration_input {
+            None => None,
+            Some(input) if input.key_type == "AWS_OWNED_CMK" && input.key_arn.is_none() => {
+                Some(input.key_type)
+            }
+            Some(input) if input.key_type == "CUSTOMER_MANAGED_CMK" => {
+                return Err(unsupported(
+                    "DeliveryStreamEncryptionConfigurationInput supports only KeyType AWS_OWNED_CMK",
+                ))
+            }
+            Some(_) => {
+                return Err(FirehoseError::InvalidArgument(
+                    "DeliveryStreamEncryptionConfigurationInput requires KeyType AWS_OWNED_CMK without KeyARN".into(),
+                ))
+            }
+        };
         let source = match (
             request
                 .delivery_stream_type
@@ -401,6 +435,20 @@ impl FirehoseHandler {
             }
         };
 
+        if let Some(query) = destination
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.query.as_deref())
+        {
+            self.inner.metadata_evaluator.validate(query).await.map_err(|error| match error {
+                routing::ExtractionError::Unavailable => FirehoseError::ServiceUnavailable(
+                    "MetadataExtraction requires the jq executable; install jq from your distribution".into()),
+                routing::ExtractionError::Invalid => FirehoseError::InvalidArgument(
+                    "MetadataExtractionQuery is invalid".into()),
+                routing::ExtractionError::Limit => FirehoseError::ServiceUnavailable(
+                    "Metadata extraction capacity or evaluation limit exceeded; retry the request".into()),
+            })?;
+        }
         if destination.iceberg.is_some() {
             if source.is_some() {
                 return Err(unsupported(
@@ -421,7 +469,7 @@ impl FirehoseHandler {
         }
         let role_caller =
             self.authorize_service_roles(service_request, scope, source.as_ref(), &destination)?;
-        if let Some(target) = &destination.iceberg {
+        for target in destination.iceberg_targets() {
             let registry = self.inner.registry.upgrade().ok_or_else(|| {
                 FirehoseError::ServiceUnavailable("Glue and S3 are unavailable".into())
             })?;
@@ -436,7 +484,7 @@ impl FirehoseHandler {
                     bucket: &target.bucket,
                     role_arn: &destination.role_arn,
                 },
-                target,
+                &target,
             )
             .await
             .map_err(|error| match error {
@@ -480,6 +528,7 @@ impl FirehoseHandler {
             backup_attempts: 0,
             backed_up_records: 0,
             primary_failure: FailureCode::InternalError,
+            encryption,
         };
         self.inner.persist_create(&key, &stream)?;
         streams.insert(key, stream);
@@ -653,6 +702,20 @@ impl FirehoseHandler {
         if stream.destination.iceberg.is_some() {
             let destination = &mut description["DeliveryStreamDescription"]["Destinations"][0]
                 ["IcebergDestinationDescription"];
+            destination["AppendOnly"] = json!(stream
+                .destination
+                .routing
+                .as_ref()
+                .is_none_or(|routing| routing.append_only));
+            if let Some(routing) = &stream.destination.routing {
+                destination["DestinationTableConfigurationList"] = json!(routing.tables);
+                if let Some(processing) = routing.description() {
+                    destination["ProcessingConfiguration"] = json!(processing);
+                }
+            }
+            if let Some(hints) = &stream.destination.s3_buffering_hints {
+                destination["S3DestinationDescription"]["BufferingHints"] = json!(hints);
+            }
             if let Some(backup) = &stream.destination.error_backup {
                 destination["S3BackupMode"] = json!("FailedDataOnly");
                 if let Some(prefix) = &backup.table_prefix {
@@ -692,6 +755,10 @@ impl FirehoseHandler {
                 description["DeliveryStreamDescription"]["LocallyCloudSourceFailure"] =
                     json!(failure);
             }
+        }
+        if let Some(key_type) = &stream.encryption {
+            description["DeliveryStreamDescription"]["DeliveryStreamEncryptionConfiguration"] =
+                json!({"KeyType": key_type, "Status": "ENABLED"});
         }
         if stream.terminal_failure {
             description["DeliveryStreamDescription"]["LocallyCloudDeliveryFailure"] = json!({
@@ -749,12 +816,13 @@ impl FirehoseHandler {
             ));
         }
         self.inner.ensure_worker()?;
+        let encrypted = stream.encryption.is_some();
         self.inner.append_pending(&key, stream, vec![data])?;
         drop(streams);
         self.inner.notify.notify_one();
         Ok(Success::Json(json!({
             "RecordId": Uuid::new_v4().to_string(),
-            "Encrypted": false
+            "Encrypted": encrypted
         })))
     }
 
@@ -836,13 +904,14 @@ impl FirehoseHandler {
             accepted_data.push(data);
             accepted = true;
         }
+        let encrypted = stream.encryption.is_some();
         self.inner.append_pending(&key, stream, accepted_data)?;
         drop(streams);
         if accepted {
             self.inner.notify.notify_one();
         }
         Ok(Success::Json(json!({
-            "Encrypted": false,
+            "Encrypted": encrypted,
             "FailedPutCount": failed,
             "RequestResponses": responses
         })))
@@ -882,6 +951,11 @@ impl FirehoseHandler {
         }
         self.inner.persist_delete(&key)?;
         streams.remove(&key);
+        self.inner
+            .routing_plans
+            .lock()
+            .map_err(|_| FirehoseError::Internal)?
+            .retain(|(stream, _), _| stream != &key);
         Ok(Success::Json(json!({})))
     }
 
@@ -974,7 +1048,7 @@ fn authorize_roles(
         &objects,
         FailureCode::S3AccessDenied,
     )?;
-    if let Some(target) = &destination.iceberg {
+    for target in destination.iceberg_targets() {
         let table = format!(
             "arn:aws:glue:{}:{}:table/{}/{}",
             scope.region, scope.account_id, target.database, target.table
@@ -1488,7 +1562,8 @@ impl Inner {
                 }
                 if stream.phase == DeliveryPhase::Primary && !stream.retained.is_empty() && stream.retry_expired(now) {
                     let mut updated = stream.clone();
-                    updated.exhaust_primary();
+                    let backup_bytes=self.pending_backup_bytes(key,&updated);
+                    updated.exhaust_primary_at(now,backup_bytes);
                     match self.persist_create(key, &updated) {
                         Ok(()) => *stream = updated,
                         Err(_) => stream.retry_at = Some(now + SOURCE_POLL_INTERVAL),
@@ -1579,7 +1654,7 @@ impl Inner {
         tracing::warn!(stream = %batch.key.name, "Firehose delivery role authorization denied; batch retained");
     }
 
-    async fn deliver_batch(&self, batch: &Batch) -> Result<(), FailureCode> {
+    async fn deliver_batch(self: &Arc<Self>, batch: &Batch) -> Result<(), FailureCode> {
         let Some(registry) = self.registry.upgrade() else {
             tracing::warn!(stream = %batch.key.name, "Firehose registry is unavailable");
             return Err(FailureCode::InternalError);
@@ -1588,6 +1663,9 @@ impl Inner {
             tracing::warn!(stream = %batch.key.name, "Firehose internal dispatcher is unavailable");
             return Err(FailureCode::InternalError);
         };
+        if let Some(routing) = &batch.destination.routing {
+            return self.deliver_routed_batch(batch, routing, &dispatcher).await;
+        }
         if let Some(target) = &batch.destination.iceberg {
             return iceberg::append(
                 iceberg::Context {
@@ -1743,9 +1821,17 @@ impl Inner {
                 source.checkpoints.append(&mut source.fetched_shards);
             }
             if batch.phase == DeliveryPhase::Backup {
-                updated.backed_up_records = updated
-                    .backed_up_records
-                    .saturating_add(batch.records.len() as u64);
+                updated.backed_up_records = updated.backed_up_records.saturating_add(
+                    self.routing_plans
+                        .lock()
+                        .ok()
+                        .and_then(|plans| {
+                            plans
+                                .get(&(batch.key.clone(), batch.token))
+                                .map(|plan| plan.undelivered().len())
+                        })
+                        .unwrap_or(batch.records.len()) as u64,
+                );
             }
             updated.phase = DeliveryPhase::Primary;
             updated.primary_failure = FailureCode::InternalError;
@@ -1783,7 +1869,8 @@ impl Inner {
                         || (updated.iceberg_policy().is_none()
                             && updated.delivery_attempts >= MAX_DELIVERY_ATTEMPTS)
                     {
-                        updated.exhaust_primary();
+                        let backup_bytes = self.pending_backup_bytes(&batch.key, &updated);
+                        updated.exhaust_primary_at(now, backup_bytes);
                         tracing::error!(
                             stream = %batch.key.name,
                             attempts = updated.delivery_attempts,
@@ -1817,6 +1904,11 @@ impl Inner {
             return;
         }
         *stream = updated;
+        if delivered {
+            if let Ok(mut plans) = self.routing_plans.lock() {
+                plans.remove(&(batch.key, batch.token));
+            }
+        }
     }
 }
 
@@ -1916,6 +2008,15 @@ struct CreateDeliveryStreamRequest {
     extended_s3_destination_configuration: Option<ExtendedS3DestinationConfiguration>,
     iceberg_destination_configuration: Option<IcebergDestinationConfiguration>,
     kinesis_stream_source_configuration: Option<KinesisStreamSourceConfiguration>,
+    delivery_stream_encryption_configuration_input: Option<EncryptionConfigurationInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct EncryptionConfigurationInput {
+    key_type: String,
+    #[serde(rename = "KeyARN")]
+    key_arn: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1937,7 +2038,10 @@ struct IcebergDestinationConfiguration {
     s3_configuration: IcebergS3Configuration,
     #[serde(default)]
     append_only: bool,
+    #[serde(default)]
     destination_table_configuration_list: Vec<DestinationTableConfiguration>,
+    #[serde(default)]
+    processing_configuration: Option<routing::ProcessingConfiguration>,
     #[serde(default)]
     buffering_hints: Option<BufferingHints>,
     #[serde(default)]
@@ -1976,9 +2080,11 @@ struct IcebergS3Configuration {
     cloud_watch_logging_options: Option<LoggingOptions>,
     #[serde(default)]
     compression_format: Option<String>,
+    #[serde(default)]
+    buffering_hints: Option<BufferingHints>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct DestinationTableConfiguration {
     destination_database_name: String,
@@ -2003,7 +2109,7 @@ struct ExtendedS3DestinationConfiguration {
     compression_format: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct BufferingHints {
     #[serde(rename = "SizeInMBs")]
@@ -2045,6 +2151,21 @@ struct DeleteDeliveryStreamRequest {
 }
 
 impl DestinationConfig {
+    fn iceberg_targets(&self) -> Vec<iceberg::Target> {
+        match &self.routing {
+            Some(routing) => routing
+                .tables
+                .iter()
+                .map(|table| iceberg::Target {
+                    database: table.destination_database_name.clone(),
+                    table: table.destination_table_name.clone(),
+                    bucket: self.bucket.clone(),
+                })
+                .collect(),
+            None => self.iceberg.clone().into_iter().collect(),
+        }
+    }
+
     fn extended_s3(
         config: ExtendedS3DestinationConfiguration,
         scope: &Scope,
@@ -2088,6 +2209,8 @@ impl DestinationConfig {
             bucket,
             prefix,
             iceberg: None,
+            routing: None,
+            s3_buffering_hints: None,
             iceberg_delivery: None,
             error_backup: None,
             logging: None,
@@ -2099,29 +2222,73 @@ fn validate_iceberg_configuration(
     config: IcebergDestinationConfiguration,
     scope: &Scope,
 ) -> Result<DestinationConfig, FirehoseError> {
-    if !config.append_only {
-        return Err(unsupported("AppendOnly must be true for Iceberg delivery"));
-    }
     let policy = IcebergDeliveryPolicy::parse(
         config.buffering_hints.as_ref(),
         config.retry_options.as_ref(),
     )?;
-    if config.destination_table_configuration_list.len() != 1 {
-        return Err(unsupported(
-            "Exactly one DestinationTableConfiguration is required",
+    if config.destination_table_configuration_list.is_empty()
+        || config.destination_table_configuration_list.len() > 100
+    {
+        return Err(FirehoseError::InvalidArgument(
+            "Iceberg requires between 1 and 100 destination table configurations".into(),
         ));
+    }
+    let mut destinations = std::collections::BTreeSet::new();
+    for table in &config.destination_table_configuration_list {
+        validate_iceberg_name(&table.destination_database_name, "DestinationDatabaseName")?;
+        validate_iceberg_name(&table.destination_table_name, "DestinationTableName")?;
+        if !destinations.insert((
+            &table.destination_database_name,
+            &table.destination_table_name,
+        )) {
+            return Err(FirehoseError::InvalidArgument(
+                "Iceberg destination table configurations must be unique".into(),
+            ));
+        }
+        if table.partition_spec.is_some() {
+            return Err(unsupported("Iceberg partition spec is not supported"));
+        }
+        if table.unique_keys.len() > 100
+            || table
+                .unique_keys
+                .iter()
+                .any(|key| key.is_empty() || key.len() > 255)
+        {
+            return Err(FirehoseError::InvalidArgument(
+                "UniqueKeys must contain nonempty names with at most 255 bytes".into(),
+            ));
+        }
+        if table
+            .unique_keys
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != table.unique_keys.len()
+        {
+            return Err(FirehoseError::InvalidArgument(
+                "UniqueKeys must be unique".into(),
+            ));
+        }
+    }
+    for table in &config.destination_table_configuration_list {
+        failure::backup_configuration(
+            config.s3_backup_mode.as_deref(),
+            table.s3_error_output_prefix.as_deref(),
+            &config.s3_configuration,
+        )?;
     }
     let table = config
         .destination_table_configuration_list
-        .into_iter()
-        .next()
-        .expect("single table validated");
-    validate_iceberg_name(&table.destination_database_name, "DestinationDatabaseName")?;
-    validate_iceberg_name(&table.destination_table_name, "DestinationTableName")?;
-    if !table.unique_keys.is_empty() || table.partition_spec.is_some() {
-        return Err(unsupported(
-            "Iceberg update keys and partition spec are not supported",
-        ));
+        .first()
+        .ok_or(FirehoseError::Internal)?
+        .clone();
+    let routing = routing::RoutingConfiguration::parse(
+        config.processing_configuration.as_ref(),
+        config.append_only,
+        config.destination_table_configuration_list.clone(),
+    )?;
+    if let Some(hints) = &config.s3_configuration.buffering_hints {
+        IcebergDeliveryPolicy::parse(Some(hints), None)?;
     }
     let error_backup = failure::backup_configuration(
         config.s3_backup_mode.as_deref(),
@@ -2154,6 +2321,8 @@ fn validate_iceberg_configuration(
         bucket: bucket.clone(),
         prefix: config.s3_configuration.prefix,
         iceberg_delivery: Some(policy),
+        routing,
+        s3_buffering_hints: config.s3_configuration.buffering_hints,
         error_backup,
         logging,
         iceberg: Some(iceberg::Target {
@@ -2391,6 +2560,8 @@ mod tests {
                 bucket: "output".into(),
                 prefix: "events/".into(),
                 iceberg: None,
+                routing: None,
+                s3_buffering_hints: None,
                 iceberg_delivery: None,
                 error_backup: None,
                 logging: None,
@@ -2409,6 +2580,7 @@ mod tests {
             backup_attempts: 0,
             backed_up_records: 0,
             primary_failure: FailureCode::InternalError,
+            encryption: None,
         };
         handler.inner.persist_create(&key, &stream).unwrap();
         handler
@@ -2553,6 +2725,8 @@ mod tests {
                     bucket: "events".into(),
                     prefix: String::new(),
                     iceberg: None,
+                    routing: None,
+                    s3_buffering_hints: None,
                     iceberg_delivery: None,
                     error_backup: None,
                     logging: None,
@@ -2570,6 +2744,7 @@ mod tests {
                 backup_attempts: 0,
                 backed_up_records: 0,
                 primary_failure: FailureCode::InternalError,
+                encryption: None,
             },
         );
         let first = handler.inner.take_batches().pop().unwrap();
@@ -2640,6 +2815,8 @@ mod tests {
                     bucket: "events".into(),
                     prefix: String::new(),
                     iceberg: None,
+                    routing: None,
+                    s3_buffering_hints: None,
                     iceberg_delivery: None,
                     error_backup: None,
                     logging: None,
@@ -2657,6 +2834,7 @@ mod tests {
                 backup_attempts: 0,
                 backed_up_records: 0,
                 primary_failure: FailureCode::InternalError,
+                encryption: None,
             },
         );
         assert!(matches!(
@@ -2703,6 +2881,8 @@ mod tests {
                     bucket: "events".into(),
                     prefix: String::new(),
                     iceberg: None,
+                    routing: None,
+                    s3_buffering_hints: None,
                     iceberg_delivery: None,
                     error_backup: None,
                     logging: None,
@@ -2720,6 +2900,7 @@ mod tests {
                 backup_attempts: 0,
                 backed_up_records: 0,
                 primary_failure: FailureCode::InternalError,
+                encryption: None,
             },
         );
         let first = handler.inner.take_batches().pop().unwrap();

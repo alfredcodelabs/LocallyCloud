@@ -108,7 +108,7 @@ Installed-Size: $(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)
 Homepage: https://locallycloud.zentostudio.com
 Depends: libc6 (>= $GLIBC_REQUIRED), libgcc-s1
 Recommends: dbus-user-session, xdg-utils
-Suggests: crun, postgresql, python3
+Suggests: crun, postgresql, python3, jq
 Description: Local AWS service emulator
  LocallyCloud emulates AWS services such as S3, DynamoDB, SQS, SNS, Lambda,
  API Gateway, EventBridge, Step Functions, and CloudFormation on one local

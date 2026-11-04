@@ -26,7 +26,10 @@ use uuid::Uuid;
 
 use crate::state::Scope;
 
+mod duckdb;
 mod sql;
+pub use duckdb::DuckDbEngine;
+use duckdb::IcebergQueryEngine;
 use sql::{
     apply_predicates, sum_result, Predicate, Projection, QueryResult, ResultColumn, SqlParser,
 };
@@ -123,6 +126,7 @@ struct QueryRecord {
 }
 
 pub(crate) struct AthenaHandler {
+    query_engine: Option<Arc<dyn IcebergQueryEngine>>,
     registry: Weak<ServiceRegistry>,
     queries: Arc<DashMap<QueryKey, Arc<Mutex<QueryRecord>>>>,
     tokens: Arc<DashMap<TokenKey, TokenEntry>>,
@@ -130,7 +134,15 @@ pub(crate) struct AthenaHandler {
 
 impl AthenaHandler {
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> Self {
+        Self::with_query_engine(registry, None)
+    }
+
+    pub(crate) fn with_query_engine(
+        registry: Weak<ServiceRegistry>,
+        query_engine: Option<Arc<DuckDbEngine>>,
+    ) -> Self {
         Self {
+            query_engine: query_engine.map(|engine| engine as Arc<dyn IcebergQueryEngine>),
             registry,
             queries: Arc::new(DashMap::new()),
             tokens: Arc::new(DashMap::new()),
@@ -302,8 +314,9 @@ impl AthenaHandler {
             Arc::clone(&record),
         );
         let registry = self.registry.clone();
+        let engine = self.query_engine.clone();
         tokio::spawn(async move {
-            run_query(registry, scope, record).await;
+            run_query(registry, scope, record, engine).await;
         });
         Ok(id)
     }
@@ -795,7 +808,12 @@ fn require_iam(
         })
 }
 
-async fn run_query(registry: Weak<ServiceRegistry>, scope: Scope, record: Arc<Mutex<QueryRecord>>) {
+async fn run_query(
+    registry: Weak<ServiceRegistry>,
+    scope: Scope,
+    record: Arc<Mutex<QueryRecord>>,
+    engine: Option<Arc<dyn IcebergQueryEngine>>,
+) {
     let (spec, effective_output_location, caller) = {
         let Ok(mut query) = record.lock() else {
             return;
@@ -818,6 +836,7 @@ async fn run_query(registry: Weak<ServiceRegistry>, scope: Scope, record: Arc<Mu
         &record,
         &spec,
         &effective_output_location,
+        engine.as_deref(),
     )
     .await
     {
@@ -848,6 +867,7 @@ async fn execute_query(
     record: &Arc<Mutex<QueryRecord>>,
     spec: &QuerySpec,
     effective_output_location: &S3Location,
+    engine: Option<&dyn IcebergQueryEngine>,
 ) -> Result<(), WorkerFailure> {
     let parsed = SqlParser::new(&spec.query_string).parse().map_err(|reason| {
         WorkerFailure::failed(
@@ -870,77 +890,89 @@ async fn execute_query(
             )
         })?;
     let table = glue_table_snapshot(registry, scope, caller, &database, &parsed.table).await?;
-    let (result, scanned) =
-        if !parsed.predicates.is_empty() || matches!(parsed.projection, Projection::Sum { .. }) {
-            if !is_iceberg_table(&table) {
-                return Err(WorkerFailure::failed(
-                    "Predicates require an Iceberg table",
-                    0,
-                ));
-            }
-            let mut names = match &parsed.projection {
-                Projection::Columns(names) => names.clone(),
-                Projection::Count(_) => Vec::new(),
-                Projection::Sum { column, .. } => vec![column.clone()],
-            };
-            let projected = names.len();
-            for predicate in &parsed.predicates {
-                if !names.contains(&predicate.column) {
-                    names.push(predicate.column.clone());
-                }
-            }
-            let (mut result, scanned) = iceberg_rows(
-                registry,
-                scope,
-                caller,
-                record,
+    let (result, scanned) = if let Some(engine) = engine.filter(|_| is_iceberg_table(&table)) {
+        engine
+            .query(
+                duckdb::QueryAccess {
+                    registry,
+                    scope,
+                    caller,
+                    record,
+                },
                 &table,
-                &names,
-                &parsed.predicates,
+                &parsed,
             )
-            .await?;
-            apply_predicates(&mut result, &parsed.predicates)
-                .map_err(|reason| WorkerFailure::failed(reason, scanned))?;
-            match &parsed.projection {
-                Projection::Sum { alias, .. } => (
-                    sum_result(&result, alias)
-                        .map_err(|reason| WorkerFailure::failed(reason, scanned))?,
-                    scanned,
-                ),
-                Projection::Count(alias) => (
-                    QueryResult::count(alias.clone(), result.rows.len().saturating_sub(1) as u64),
-                    scanned,
-                ),
-                Projection::Columns(_) => {
-                    result.columns.truncate(projected);
-                    for row in &mut result.rows {
-                        row.truncate(projected);
-                    }
-                    (result, scanned)
-                }
-            }
-        } else {
-            match parsed.projection {
-                Projection::Count(alias) => {
-                    let (count, scanned) = if is_iceberg_table(&table) {
-                        iceberg_count(registry, scope, caller, record, &table).await?
-                    } else {
-                        jsonl_count(registry, scope, caller, record, &table).await?
-                    };
-                    (QueryResult::count(alias, count), scanned)
-                }
-                Projection::Columns(columns) if is_iceberg_table(&table) => {
-                    iceberg_rows(registry, scope, caller, record, &table, &columns, &[]).await?
-                }
-                Projection::Sum { .. } => unreachable!("SUM takes the row reader path"),
-                Projection::Columns(_) => {
-                    return Err(WorkerFailure::failed(
-                        "Column projection requires an Iceberg table",
-                        0,
-                    ))
-                }
-            }
+            .await?
+    } else if !parsed.predicates.is_empty() || matches!(parsed.projection, Projection::Sum { .. }) {
+        if !is_iceberg_table(&table) {
+            return Err(WorkerFailure::failed(
+                "Predicates require an Iceberg table",
+                0,
+            ));
+        }
+        let mut names = match &parsed.projection {
+            Projection::Columns(names) => names.clone(),
+            Projection::Count(_) => Vec::new(),
+            Projection::Sum { column, .. } => vec![column.clone()],
         };
+        let projected = names.len();
+        for predicate in &parsed.predicates {
+            if !names.contains(&predicate.column) {
+                names.push(predicate.column.clone());
+            }
+        }
+        let (mut result, scanned) = iceberg_rows(
+            registry,
+            scope,
+            caller,
+            record,
+            &table,
+            &names,
+            &parsed.predicates,
+        )
+        .await?;
+        apply_predicates(&mut result, &parsed.predicates)
+            .map_err(|reason| WorkerFailure::failed(reason, scanned))?;
+        match &parsed.projection {
+            Projection::Sum { alias, .. } => (
+                sum_result(&result, alias)
+                    .map_err(|reason| WorkerFailure::failed(reason, scanned))?,
+                scanned,
+            ),
+            Projection::Count(alias) => (
+                QueryResult::count(alias.clone(), result.rows.len().saturating_sub(1) as u64),
+                scanned,
+            ),
+            Projection::Columns(_) => {
+                result.columns.truncate(projected);
+                for row in &mut result.rows {
+                    row.truncate(projected);
+                }
+                (result, scanned)
+            }
+        }
+    } else {
+        match parsed.projection {
+            Projection::Count(alias) => {
+                let (count, scanned) = if is_iceberg_table(&table) {
+                    iceberg_count(registry, scope, caller, record, &table).await?
+                } else {
+                    jsonl_count(registry, scope, caller, record, &table).await?
+                };
+                (QueryResult::count(alias, count), scanned)
+            }
+            Projection::Columns(columns) if is_iceberg_table(&table) => {
+                iceberg_rows(registry, scope, caller, record, &table, &columns, &[]).await?
+            }
+            Projection::Sum { .. } => unreachable!("SUM takes the row reader path"),
+            Projection::Columns(_) => {
+                return Err(WorkerFailure::failed(
+                    "Column projection requires an Iceberg table",
+                    0,
+                ))
+            }
+        }
+    };
     ensure_running(record)?;
     let csv = result.csv();
     if csv.len() > MAX_RESULT_BYTES {
@@ -1027,6 +1059,18 @@ async fn iceberg_manifest_list(
     record: &Arc<Mutex<QueryRecord>>,
     table: &GlueTableOutput,
 ) -> Result<(Value, Bytes, u64), WorkerFailure> {
+    let (metadata, _, manifest_list, scanned) =
+        iceberg_snapshot_objects(registry, scope, caller, record, table).await?;
+    Ok((metadata, manifest_list, scanned))
+}
+
+async fn iceberg_snapshot_objects(
+    registry: &Weak<ServiceRegistry>,
+    scope: &Scope,
+    caller: Option<&AthenaCaller>,
+    record: &Arc<Mutex<QueryRecord>>,
+    table: &GlueTableOutput,
+) -> Result<(Value, Bytes, Bytes, u64), WorkerFailure> {
     // Iceberg's current snapshot is the only source of truth. Listing all objects
     // under the table prefix would count old snapshots and uncommitted writes.
     let metadata_uri = table
@@ -1074,7 +1118,7 @@ async fn iceberg_manifest_list(
             .get("current-snapshot-id")
             .is_none_or(Value::is_null)
         {
-            return Ok((metadata, Bytes::new(), scanned));
+            return Ok((metadata, metadata_body, Bytes::new(), scanned));
         }
         return Err(WorkerFailure::failed(
             "Iceberg current-snapshot-id is invalid",
@@ -1082,7 +1126,7 @@ async fn iceberg_manifest_list(
         ));
     };
     if snapshot_id == -1 {
-        return Ok((metadata, Bytes::new(), scanned));
+        return Ok((metadata, metadata_body, Bytes::new(), scanned));
     }
     if snapshot_id < 0 {
         return Err(WorkerFailure::failed(
@@ -1136,7 +1180,7 @@ async fn iceberg_manifest_list(
         ));
     }
     update_scanned(record, scanned)?;
-    Ok((metadata, manifest_body, scanned))
+    Ok((metadata, metadata_body, manifest_body, scanned))
 }
 
 const MAX_RESULT_ROWS: usize = 100_000;
@@ -3419,7 +3463,7 @@ mod tests {
             let query = record.lock().unwrap();
             (query.spec.clone(), query.effective_output_location.clone())
         };
-        execute_query(&weak, &scope, None, &record, &spec, &output)
+        execute_query(&weak, &scope, None, &record, &spec, &output, None)
             .await
             .unwrap_or_else(|_| panic!("Iceberg COUNT must succeed"));
         let result = get_object(

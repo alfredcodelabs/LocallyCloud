@@ -15,12 +15,13 @@ impl Provisioner {
             &[
                 "DeliveryStreamName",
                 "DeliveryStreamType",
+                "DeliveryStreamEncryptionConfigurationInput",
                 "ExtendedS3DestinationConfiguration",
                 "IcebergDestinationConfiguration",
                 "KinesisStreamSourceConfiguration",
             ],
         )?;
-        let mut body = props.as_object().cloned().ok_or(CfnError::Internal)?;
+        let mut body = firehose_api_properties(props)?;
         let name = match props.get("DeliveryStreamName") {
             Some(Value::String(name)) if !name.is_empty() => name.clone(),
             None => generate_name(stack, logical, 64),
@@ -63,10 +64,57 @@ impl Provisioner {
     }
 }
 
+fn firehose_api_properties(props: &Value) -> Result<serde_json::Map<String, Value>, CfnError> {
+    let mut body = props.as_object().cloned().ok_or(CfnError::Internal)?;
+    if let Some(destination) = body
+        .get_mut("IcebergDestinationConfiguration")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(mode) = destination.remove("s3BackupMode") {
+            if destination.insert("S3BackupMode".into(), mode).is_some() {
+                return Err(CfnError::Validation(
+                    "IcebergDestinationConfiguration cannot specify both s3BackupMode and S3BackupMode".into(),
+                ));
+            }
+        }
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn iceberg_backup_property_uses_aws_api_casing_and_preserves_configuration() {
+        let props = json!({"DeliveryStreamName":"accounting-iceberg",
+        "IcebergDestinationConfiguration":{
+            "s3BackupMode":"FailedDataOnly",
+            "S3Configuration":{"BufferingHints":{"SizeInMBs":64,"IntervalInSeconds":300}},
+            "ProcessingConfiguration":{"Enabled":true,"Processors":[{"Type":"MetadataExtraction"}]}
+        }});
+        let mapped = Value::Object(firehose_api_properties(&props).unwrap());
+        assert_eq!(
+            mapped["IcebergDestinationConfiguration"]["S3BackupMode"],
+            "FailedDataOnly"
+        );
+        assert!(mapped["IcebergDestinationConfiguration"]
+            .get("s3BackupMode")
+            .is_none());
+        for field in ["S3Configuration", "ProcessingConfiguration"] {
+            assert_eq!(
+                mapped["IcebergDestinationConfiguration"][field],
+                props["IcebergDestinationConfiguration"][field]
+            );
+        }
+        assert!(props["IcebergDestinationConfiguration"]
+            .get("s3BackupMode")
+            .is_some());
+        let conflicting = json!({"IcebergDestinationConfiguration":{
+            "s3BackupMode":"FailedDataOnly","S3BackupMode":"AllData"}});
+        assert!(firehose_api_properties(&conflicting).is_err());
+    }
 
     #[tokio::test]
     async fn firehose_lifecycle_reaches_the_native_service() {
@@ -77,7 +125,9 @@ mod tests {
             "us-east-1".into(),
             "000000000000".into(),
         );
-        let props = json!({"DeliveryStreamName":"accounting-ledger", "ExtendedS3DestinationConfiguration":{
+        let props = json!({"DeliveryStreamName":"accounting-ledger",
+            "DeliveryStreamEncryptionConfigurationInput":{"KeyType":"AWS_OWNED_CMK"},
+            "ExtendedS3DestinationConfiguration":{
             "RoleARN":"arn:aws:iam::000000000000:role/firehose", "BucketARN":"arn:aws:s3:::ledger",
             "Prefix":"records/", "BufferingHints":{"SizeInMBs":1,"IntervalInSeconds":60}
         }});
@@ -108,6 +158,23 @@ mod tests {
             description["DeliveryStreamDescription"]["DeliveryStreamStatus"],
             "ACTIVE"
         );
+        assert_eq!(
+            description["DeliveryStreamDescription"]["DeliveryStreamEncryptionConfiguration"],
+            json!({"KeyType":"AWS_OWNED_CMK","Status":"ENABLED"})
+        );
+        let customer = json!({"DeliveryStreamName":"accounting-cmk",
+            "DeliveryStreamEncryptionConfigurationInput":{"KeyType":"CUSTOMER_MANAGED_CMK",
+                "KeyARN":"arn:aws:kms:us-east-1:000000000000:key/x"},
+            "ExtendedS3DestinationConfiguration": props["ExtendedS3DestinationConfiguration"]});
+        assert!(provisioner
+            .provision(
+                "CmkStream",
+                "accounting",
+                "AWS::KinesisFirehose::DeliveryStream",
+                &customer
+            )
+            .await
+            .is_err());
         provisioner
             .update(
                 "LedgerStream",

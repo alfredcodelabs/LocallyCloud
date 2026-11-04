@@ -582,7 +582,33 @@ async fn main() {
         tracing::error!(%error, "failed to register Secrets Manager");
         std::process::exit(4);
     }
-    if let Err(error) = locallycloud_analytics::register_with_state(&registry, state.clone()).await
+    let iceberg_query_engine = std::env::var_os("LOCALLYCLOUD_DUCKDB_BIN").map(|executable| {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".cache"))
+            .join("locallycloud/analytics/duckdb");
+        let extensions = std::env::var_os("LOCALLYCLOUD_DUCKDB_EXTENSIONS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| cache.join("extensions"));
+        let work_dir = std::env::var_os("LOCALLYCLOUD_DUCKDB_WORK_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| cache.join("queries"));
+        Arc::new(locallycloud_analytics::DuckDbEngine::new(
+            executable.into(),
+            extensions,
+            work_dir,
+        ))
+    });
+    if let Err(error) = locallycloud_analytics::register_with_state_and_query_engine(
+        &registry,
+        state.clone(),
+        iceberg_query_engine,
+    )
+    .await
     {
         tracing::error!(%error, "failed to restore Glue catalog; check LOCALLYCLOUD_KMS_MASTER_KEY and state database compatibility");
         std::process::exit(4);

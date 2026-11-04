@@ -184,6 +184,8 @@ mod tests {
                 bucket_arn: String::new(),
                 bucket: "lake".into(),
                 prefix: String::new(),
+                routing: None,
+                s3_buffering_hints: None,
                 iceberg: Some(iceberg::Target {
                     database: "lake".into(),
                     table: "events".into(),
@@ -211,6 +213,7 @@ mod tests {
             backup_attempts: 0,
             backed_up_records: 0,
             primary_failure: FailureCode::InternalError,
+            encryption: None,
         }
     }
 

@@ -17,6 +17,7 @@ axum.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 http.workspace = true
+libc = "0.2"
 iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "f64575819ec5d61a1d8ffd7740831a2cb64df5cd" }
 quick-xml = "=0.42.0"
 parquet = { version = "=59.3.0", default-features = false, features = ["snap", "zstd", "flate2-zlib-rs"] }

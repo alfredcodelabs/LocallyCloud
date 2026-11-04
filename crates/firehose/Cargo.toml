@@ -16,6 +16,8 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 http.workspace = true
+libc = "0.2"
+sha2.workspace = true
 iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "f64575819ec5d61a1d8ffd7740831a2cb64df5cd" }
 parquet = { version = "=59.3.0", default-features = false, features = ["snap", "zstd", "flate2-zlib-rs"] }
 serde.workspace = true

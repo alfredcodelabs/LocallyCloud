@@ -36,6 +36,8 @@ struct SavedStream {
     backed_up_records: u64,
     #[serde(default)]
     primary_failure: FailureCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption: Option<String>,
 }
 
 impl SavedStream {
@@ -59,6 +61,7 @@ impl SavedStream {
             backup_attempts: stream.backup_attempts,
             backed_up_records: stream.backed_up_records,
             primary_failure: stream.primary_failure,
+            encryption: stream.encryption.clone(),
             pending_since_ms: stream.pending_since.map(|start| start.unix_ms),
             retry_started_ms: stream.retry_started.map(|start| start.unix_ms),
             retry_due_ms: stream.retry_at.map(|due| {
@@ -81,6 +84,17 @@ impl SavedStream {
             return Err(
                 std::io::Error::other("unsupported persisted Firehose delivery policy").into(),
             );
+        }
+        if self
+            .destination
+            .s3_buffering_hints
+            .as_ref()
+            .is_some_and(|hints| IcebergDeliveryPolicy::parse(Some(hints), None).is_err())
+        {
+            return Err(std::io::Error::other(
+                "unsupported persisted Firehose S3 buffering policy",
+            )
+            .into());
         }
         Ok(DeliveryStream {
             source: self.source.map(|mut source| {
@@ -120,6 +134,7 @@ impl SavedStream {
             backup_attempts: self.backup_attempts,
             backed_up_records: self.backed_up_records,
             primary_failure: self.primary_failure,
+            encryption: self.encryption,
             pending_since: self.pending_since_ms.map(StartedAt::restore),
             retry_started: self.retry_started_ms.map(StartedAt::restore),
         })
@@ -140,6 +155,12 @@ fn schema(connection: &Connection) -> Result<(), PersistError> {
             token TEXT, payload BLOB NOT NULL,
             FOREIGN KEY(account, region, name)
                 REFERENCES firehose_streams(account, region, name) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS firehose_routing_plans (
+            account TEXT NOT NULL, region TEXT NOT NULL, name TEXT NOT NULL,
+            token TEXT NOT NULL, plan TEXT NOT NULL,
+            PRIMARY KEY(account,region,name,token),
+            FOREIGN KEY(account,region,name) REFERENCES firehose_streams(account,region,name) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS firehose_queue_idx
             ON firehose_records(account, region, name, state, id);",
@@ -366,6 +387,11 @@ impl Inner {
         }.map_err(|_| FirehoseError::Internal)?;
         if changed != count {
             return Err(FirehoseError::Internal);
+        }
+        if delivered {
+            tx.execute("DELETE FROM firehose_routing_plans WHERE account=?1 AND region=?2 AND name=?3 AND token=?4",
+                params![key.scope.account_id,key.scope.region,key.name,token.to_string()])
+                .map_err(|_|FirehoseError::Internal)?;
         }
         save_config(&tx, key, stream).map_err(|_| FirehoseError::Internal)?;
         tx.commit().map_err(|_| FirehoseError::Internal)

@@ -1,4 +1,5 @@
-//! Narrow append-only Iceberg v2 delivery through the trusted service dispatcher.
+//! Iceberg v2 data and equality-delete delivery through the trusted service dispatcher.
+mod mutation;
 mod replay;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -348,8 +349,7 @@ fn s3_uri(location: &str, allowed_bucket: &str) -> Result<Uri> {
 pub(super) fn valid_record(record: &[u8]) -> bool {
     serde_json::from_slice::<Value>(record)
         .ok()
-        .and_then(|v| v.as_object().cloned())
-        .is_some_and(|v| !v.is_empty() && v.values().all(|v| !v.is_object() && !v.is_array()))
+        .is_some_and(|v| v.as_object().is_some_and(|object| !object.is_empty()))
 }
 
 fn schema_fields(raw: &Value) -> Result<&Vec<Value>> {
@@ -409,13 +409,7 @@ fn parquet_rows(records: &[Vec<u8>], fields: &[Value]) -> Result<Vec<u8>> {
         .map(|record| serde_json::from_slice::<Value>(record).map_err(|_| Error::Unsupported))
         .collect::<Result<Vec<_>>>()?;
     for row in &rows {
-        let object = row.as_object().ok_or(Error::Unsupported)?;
-        if object
-            .keys()
-            .any(|name| !fields.iter().any(|f| f["name"] == *name))
-        {
-            return Err(Error::Unsupported);
-        }
+        row.as_object().ok_or(Error::Unsupported)?;
     }
     let mut schema = String::from("message events {");
     for field in fields {
@@ -945,16 +939,35 @@ pub(super) async fn preflight(ctx: Context<'_>, target: &Target) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum WriteOperation {
+    Insert,
+    Update,
+    Delete,
+}
+
 pub(super) async fn append(
     ctx: Context<'_>,
     target: &Target,
     token: Uuid,
     records: &[Vec<u8>],
 ) -> Result<()> {
+    write(ctx, target, token, records, WriteOperation::Insert, &[]).await
+}
+
+pub(super) async fn write(
+    ctx: Context<'_>,
+    target: &Target,
+    token: Uuid,
+    records: &[Vec<u8>],
+    operation: WriteOperation,
+    unique_keys: &[String],
+) -> Result<()> {
     if records.is_empty() {
         return Ok(());
     }
-    // The data file URI remains fixed across CAS retries; failed attempts are unreachable until commit.
+    // A replay receipt is checked before generating objects for a new commit attempt.
     let batch = token.to_string();
     for _ in 0..3 {
         let (table, metadata_uri, metadata, mut manifests, manifest_count) =
@@ -978,6 +991,12 @@ pub(super) async fn append(
         }
         let (remove, receipts) = retention_plan(&metadata, &raw, receipts)?;
         let receipt_plan = index.prepare(&ctx, receipts).await?;
+        let equality_fields = match operation {
+            WriteOperation::Insert => Vec::new(),
+            WriteOperation::Update | WriteOperation::Delete => {
+                mutation::key_fields(&raw, unique_keys)?
+            }
+        };
         let partition_column = partition_column(&raw)?;
         let mut groups: BTreeMap<Option<String>, Vec<Vec<u8>>> = BTreeMap::new();
         for record in records {
@@ -992,18 +1011,34 @@ pub(super) async fn append(
         let groups = groups
             .into_iter()
             .map(|(partition, records)| {
-                let parquet = parquet_rows(&records, schema_fields(&raw)?)?;
-                Ok((partition, records.len(), parquet))
+                let group = mutation::prepare_group(
+                    partition,
+                    records,
+                    schema_fields(&raw)?,
+                    &equality_fields,
+                    operation,
+                )?;
+                Ok(group)
             })
             .collect::<Result<Vec<_>>>()?;
-        // The new snapshot and manifest must also fit the published beta bounds.
+        // An update publishes separate data and equality-delete manifests.
+        let additional_manifests = if operation == WriteOperation::Update {
+            2
+        } else {
+            1
+        };
         if metadata.snapshots().len().saturating_sub(remove.len()) >= MAX_SNAPSHOTS
-            || manifest_count >= MAX_MANIFESTS
-            || manifests.len() >= MAX_MANIFESTS
+            || manifest_count.saturating_add(additional_manifests) > MAX_MANIFESTS
+            || manifests.len().saturating_add(additional_manifests) > MAX_MANIFESTS
         {
             return Err(Error::Unsupported);
         }
-        let compacted = compacted_entries(&ctx, &metadata, &manifests).await?;
+        let compacted = match operation {
+            WriteOperation::Insert => compacted_entries(&ctx, &metadata, &manifests).await?,
+            // Delete-aware manifest maintenance requires a separate live-row gate.
+            // Never compact away equality deletes or change their sequence inheritance.
+            WriteOperation::Update | WriteOperation::Delete => None,
+        };
         if compacted
             .as_ref()
             .is_some_and(|entries| entries.len().saturating_add(groups.len()) > MAX_COMPACTED_FILES)
@@ -1011,75 +1046,141 @@ pub(super) async fn append(
             return Err(Error::Unsupported);
         }
         let snapshot_id = (Uuid::new_v4().as_u128() & i64::MAX as u128) as i64;
-        let seq = metadata.next_sequence_number();
+        let seq = metadata
+            .last_sequence_number()
+            .checked_add(1)
+            .ok_or(Error::Unsupported)?;
         let manifest_uri = format!("{root}/metadata/{batch}-{snapshot_id}.avro");
         let list_uri = format!("{root}/metadata/{batch}-{snapshot_id}-list.avro");
         let new_meta_uri = format!("{root}/metadata/{batch}-{snapshot_id}.metadata.json");
         let mut files = Vec::new();
-        for (index, (partition, count, parquet)) in groups.into_iter().enumerate() {
+        let mut delete_files = Vec::new();
+        let equality_ids = equality_fields
+            .iter()
+            .map(|field| {
+                field["id"]
+                    .as_i64()
+                    .and_then(|id| i32::try_from(id).ok())
+                    .ok_or(Error::Unsupported)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (index, group) in groups.into_iter().enumerate() {
+            let mutation::Group {
+                partition,
+                count,
+                data,
+                deletes,
+            } = group;
             // Partition values are data, never object path fragments.
-            let data_uri = format!("{root}/data/{batch}-{index}.parquet");
+            let data_uri = match operation {
+                WriteOperation::Insert => format!("{root}/data/{batch}-{index}.parquet"),
+                // A CAS retry may read a newer base image. Never replace an object
+                // another attempt has already published in a committed snapshot.
+                WriteOperation::Update | WriteOperation::Delete => {
+                    format!("{root}/data/{batch}-{snapshot_id}-{index}.parquet")
+                }
+            };
             let partition = match &partition_column {
                 Some(column) => column.tuple(partition.as_deref())?,
                 None => Struct::empty(),
             };
-            let size = parquet.len();
-            ctx.put(&data_uri, Bytes::from(parquet)).await?;
-            files.push(
-                DataFileBuilder::default()
-                    .content(DataContentType::Data)
-                    .file_path(data_uri)
-                    .file_format(DataFileFormat::Parquet)
-                    .record_count(count as u64)
-                    .file_size_in_bytes(size as u64)
-                    .partition(partition)
-                    .partition_spec_id(metadata.default_partition_spec_id())
-                    .build()
-                    .map_err(|_| Error::Unsupported)?,
-            );
+            if let Some(parquet) = data {
+                let size = parquet.len();
+                ctx.put(&data_uri, Bytes::from(parquet)).await?;
+                files.push(
+                    DataFileBuilder::default()
+                        .content(DataContentType::Data)
+                        .file_path(data_uri)
+                        .file_format(DataFileFormat::Parquet)
+                        .record_count(count as u64)
+                        .file_size_in_bytes(size as u64)
+                        .partition(partition.clone())
+                        .partition_spec_id(metadata.default_partition_spec_id())
+                        .build()
+                        .map_err(|_| Error::Unsupported)?,
+                );
+            }
+            if let Some(parquet) = deletes {
+                let delete_uri =
+                    format!("{root}/data/{batch}-{snapshot_id}-{index}-eq-delete.parquet");
+                let size = parquet.len();
+                ctx.put(&delete_uri, Bytes::from(parquet)).await?;
+                delete_files.push(
+                    DataFileBuilder::default()
+                        .content(DataContentType::EqualityDeletes)
+                        .file_path(delete_uri)
+                        .file_format(DataFileFormat::Parquet)
+                        .record_count(count as u64)
+                        .file_size_in_bytes(size as u64)
+                        .partition(partition)
+                        .partition_spec_id(metadata.default_partition_spec_id())
+                        .equality_ids(Some(equality_ids.clone()))
+                        .build()
+                        .map_err(|_| Error::Unsupported)?,
+                );
+            }
         }
         let io = FileIO::new_with_memory();
-        let manifest_mem = format!("memory:///{batch}-{snapshot_id}.avro");
-        let output = io.new_output(&manifest_mem).map_err(|_| Error::Transient)?;
-        let mut writer = ManifestWriterBuilder::new(
-            output,
-            Some(snapshot_id),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().as_ref().clone(),
-        )
-        .build_v2_data();
-        if let Some(entries) = compacted {
-            for entry in entries {
-                writer
-                    .add_existing_file(
-                        entry.data_file,
-                        entry.snapshot_id.ok_or(Error::Unsupported)?,
-                        entry.sequence_number.ok_or(Error::Unsupported)?,
-                        entry.file_sequence_number,
-                    )
-                    .map_err(|_| Error::Unsupported)?;
+        if !files.is_empty()
+            || compacted
+                .as_ref()
+                .is_some_and(|entries| !entries.is_empty())
+        {
+            let manifest_mem = format!("memory:///{batch}-{snapshot_id}.avro");
+            let output = io.new_output(&manifest_mem).map_err(|_| Error::Transient)?;
+            let mut writer = ManifestWriterBuilder::new(
+                output,
+                Some(snapshot_id),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().as_ref().clone(),
+            )
+            .build_v2_data();
+            if let Some(entries) = compacted {
+                for entry in entries {
+                    writer
+                        .add_existing_file(
+                            entry.data_file,
+                            entry.snapshot_id.ok_or(Error::Unsupported)?,
+                            entry.sequence_number.ok_or(Error::Unsupported)?,
+                            entry.file_sequence_number,
+                        )
+                        .map_err(|_| Error::Unsupported)?;
+                }
+                manifests.clear();
             }
-            manifests.clear();
+            for file in files {
+                writer.add_file(file, seq).map_err(|_| Error::Transient)?;
+            }
+            let mut manifest = writer
+                .write_manifest_file()
+                .await
+                .map_err(|_| Error::Transient)?;
+            let manifest_bytes = io
+                .new_input(&manifest_mem)
+                .map_err(|_| Error::Transient)?
+                .read()
+                .await
+                .map_err(|_| Error::Transient)?;
+            manifest.manifest_path = manifest_uri.clone();
+            if manifest_bytes.len() > MAX_BODY {
+                return Err(Error::Unsupported);
+            }
+            ctx.put(&manifest_uri, manifest_bytes).await?;
+            manifests.push(manifest);
         }
-        for file in files {
-            writer.add_file(file, seq).map_err(|_| Error::Transient)?;
+        if !delete_files.is_empty() {
+            let delete_manifest = mutation::write_delete_manifest(
+                &ctx,
+                &metadata,
+                &io,
+                &batch,
+                snapshot_id,
+                seq,
+                delete_files,
+            )
+            .await?;
+            manifests.push(delete_manifest);
         }
-        let mut manifest = writer
-            .write_manifest_file()
-            .await
-            .map_err(|_| Error::Transient)?;
-        let manifest_bytes = io
-            .new_input(&manifest_mem)
-            .map_err(|_| Error::Transient)?
-            .read()
-            .await
-            .map_err(|_| Error::Transient)?;
-        manifest.manifest_path = manifest_uri.clone();
-        if manifest_bytes.len() > MAX_BODY {
-            return Err(Error::Unsupported);
-        }
-        ctx.put(&manifest_uri, manifest_bytes).await?;
-        manifests.push(manifest);
         let list_mem = format!("memory:///{batch}-{snapshot_id}-list.avro");
         let mut list_writer = ManifestListWriter::v2(
             io.new_output(&list_mem)
@@ -1114,7 +1215,10 @@ pub(super) async fn append(
             )
             .with_manifest_list(list_uri)
             .with_summary(Summary {
-                operation: Operation::Append,
+                operation: match operation {
+                    WriteOperation::Insert => Operation::Append,
+                    WriteOperation::Update | WriteOperation::Delete => Operation::Overwrite,
+                },
                 additional_properties: HashMap::from([(
                     "locallycloud.batch-token".into(),
                     batch.clone(),
@@ -1218,6 +1322,45 @@ mod tests {
             StatusCode::FORBIDDEN,
             deep_empty.as_bytes()
         ));
+    }
+
+    #[test]
+    fn iceberg_parquet_skips_extra_routing_fields_but_validates_schema_columns() {
+        use super::parquet_rows;
+        use bytes::Bytes;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::RowAccessor;
+        use serde_json::json;
+        let fields = vec![
+            json!({"id":1,"name":"id","required":true,"type":"long"}),
+            json!({"id":2,"name":"payload","required":false,"type":"string"}),
+        ];
+        let records = vec![
+            br#"{"id":7,"payload":"kept","projection_type":"sap","extra":{"nested":true}}"#
+                .to_vec(),
+        ];
+        assert!(super::valid_record(&records[0]));
+        let bytes = parquet_rows(&records, &fields).unwrap();
+        let reader = SerializedFileReader::new(Bytes::from(bytes)).unwrap();
+        assert_eq!(
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .num_columns(),
+            2
+        );
+        let row = reader.get_row_iter(None).unwrap().next().unwrap().unwrap();
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.get_long(0).unwrap(), 7);
+        assert_eq!(row.get_string(1).unwrap(), "kept");
+        assert!(parquet_rows(&[br#"{"projection_type":"sap"}"#.to_vec()], &fields).is_err());
+        assert!(parquet_rows(
+            &[br#"{"id":"bad","projection_type":"sap"}"#.to_vec()],
+            &fields
+        )
+        .is_err());
+        assert!(parquet_rows(&[br#"[7,"bad"]"#.to_vec()], &fields).is_err());
     }
 
     #[test]

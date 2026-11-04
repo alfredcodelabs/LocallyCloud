@@ -17,6 +17,8 @@ pub(super) enum DeliveryPhase {
 pub(super) enum FailureCode {
     #[default]
     InternalError,
+    #[serde(rename = "MetadataExtraction.Failed")]
+    MetadataExtractionFailed,
     #[serde(rename = "Iceberg.NoSuchTable")]
     NoSuchTable,
     #[serde(rename = "Glue.AccessDenied")]
@@ -29,6 +31,7 @@ impl FailureCode {
     pub fn code(self) -> &'static str {
         match self {
             Self::InternalError => "InternalError",
+            Self::MetadataExtractionFailed => "MetadataExtraction.Failed",
             Self::NoSuchTable => "Iceberg.NoSuchTable",
             Self::GlueAccessDenied => "Glue.AccessDenied",
             Self::S3AccessDenied => "S3.AccessDenied",
@@ -39,6 +42,9 @@ impl FailureCode {
         match self {
             Self::InternalError => {
                 "Local Iceberg delivery failed after the configured retry duration"
+            }
+            Self::MetadataExtractionFailed => {
+                "Metadata extraction did not produce one valid Iceberg route for each record"
             }
             Self::NoSuchTable => "The configured Iceberg destination table does not exist",
             Self::GlueAccessDenied => "Access to the configured Glue catalog was denied",
@@ -127,7 +133,8 @@ pub(super) fn backup_configuration(
                 return Err(FirehoseError::InvalidArgument("S3 error output prefix exceeds its field limit".into()));
             }
             let prefix=table_prefix.or(config.error_output_prefix.as_deref()).ok_or_else(|| unsupported("FailedDataOnly requires an explicit literal ErrorOutputPrefix or S3ErrorOutputPrefix"))?;
-            if prefix.is_empty() || prefix.starts_with('/') || prefix.contains(['\0','\\','%']) || prefix.contains("!{") || prefix.split('/').any(|p|p=="..") {
+            if [table_prefix,config.error_output_prefix.as_deref()].into_iter().flatten().any(|prefix|
+                prefix.is_empty() || prefix.starts_with('/') || prefix.contains(['\0','\\','%']) || prefix.contains("!{") || prefix.split('/').any(|p|p=="..")) {
                 return Err(unsupported("S3 error output prefix must be a nonempty safe literal; automatic prefix expressions are not implemented"));
             }
             Ok(Some(ErrorBackup{prefix:prefix.into(),global_prefix:config.error_output_prefix.clone(),table_prefix:table_prefix.map(str::to_owned),logging:config.cloud_watch_logging_options.clone()}))
@@ -141,7 +148,7 @@ pub(super) fn backoff(attempt: u8) -> Duration {
 }
 
 impl DeliveryStream {
-    pub(super) fn exhaust_primary(&mut self) {
+    pub(super) fn exhaust_primary_at(&mut self, now: Instant, buffered_bytes: usize) {
         self.phase = if self.destination.error_backup.is_some() {
             DeliveryPhase::Backup
         } else {
@@ -149,7 +156,16 @@ impl DeliveryStream {
         };
         self.terminal_failure = self.destination.error_backup.is_none();
         self.backup_attempts = 0;
-        self.retry_at = None;
+        self.retry_at = self
+            .destination
+            .s3_buffering_hints
+            .as_ref()
+            .filter(|_| self.phase == DeliveryPhase::Backup)
+            .and_then(|hints| {
+                let size = hints.size_in_m_bs.unwrap_or(5) as usize * 1024 * 1024;
+                let seconds = hints.interval_in_seconds.unwrap_or(300) as u64;
+                (buffered_bytes < size && seconds > 0).then(|| now + Duration::from_secs(seconds))
+            });
     }
 }
 
@@ -186,22 +202,37 @@ impl Inner {
             .map_err(|error| role_failure(error, FailureCode::S3AccessDenied))
     }
 
-    pub(super) async fn deliver_error_backup(&self, batch: &Batch) -> Result<(), FailureCode> {
-        let Some(backup) = &batch.destination.error_backup else {
+    pub(super) async fn deliver_error_backup(
+        self: &Arc<Self>,
+        batch: &Batch,
+    ) -> Result<(), FailureCode> {
+        if batch.destination.error_backup.is_none() {
             return Err(FailureCode::InternalError);
-        };
-        let mut body = Vec::new();
-        for record in &batch.records {
-            // Bounded local error envelope; full AWS Iceberg error-file fixtures remain a gate.
-            let envelope = json!({"rawData":base64::engine::general_purpose::STANDARD.encode(record),
-                "errorCode":batch.primary_failure.code(),"errorMessage":batch.primary_failure.message()});
-            if serde_json::to_writer(&mut body, &envelope).is_err() {
-                return Err(FailureCode::InternalError);
-            }
-            body.push(b'\n');
         }
-        let key = object_key(&backup.prefix, &batch.key.name, batch.token);
-        self.put_s3(batch, &key, Bytes::from(body)).await
+        let groups = self.backup_groups(batch).await?;
+        for (prefix, indices) in groups {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut body = Vec::new();
+            for index in indices {
+                let record = batch.records.get(index).ok_or(FailureCode::InternalError)?;
+                // Bounded local error envelope; full AWS Iceberg error-file fixtures remain a gate.
+                let envelope = json!({"rawData":base64::engine::general_purpose::STANDARD.encode(record),
+                    "errorCode":batch.primary_failure.code(),"errorMessage":batch.primary_failure.message()});
+                serde_json::to_writer(&mut body, &envelope)
+                    .map_err(|_| FailureCode::InternalError)?;
+                body.push(b'\n');
+            }
+            let token = if batch.destination.routing.is_some() {
+                routing::backup_token(batch.token, &prefix)
+            } else {
+                batch.token
+            };
+            let key = object_key(&prefix, &batch.key.name, token);
+            self.put_s3(batch, &key, Bytes::from(body)).await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn log_delivery_error(&self, batch: &Batch, failure: FailureCode) {
