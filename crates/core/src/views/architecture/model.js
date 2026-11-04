@@ -2,12 +2,13 @@
    Pure functions shared by the dashboard page and the MCP companion. The topology itself is
    built by the server; every document handled here is untrusted and bounded. */
 import * as Review from './engine.js';
+import * as Catalog from './catalog.js';
 
 export const LIMIT = Object.freeze({ bytes: 8 * 1024 * 1024, nodes: 512, edges: 2048, threats: 512, zones: 32, views: 32 });
-export const STRIDE = ['Spoofing', 'Tampering', 'Repudiation', 'Information disclosure', 'Denial of service', 'Elevation of privilege'];
+export const STRIDE = Catalog.methodology('STRIDE').categories;
 export const KINDS = ['dependency', 'configured', 'proposed'];
 export const STATUSES = ['open', 'mitigated', 'accepted', 'not-applicable'];
-export const SEVERITIES = ['unrated', 'low', 'medium', 'high'];
+export const SEVERITIES = ['unrated', ...Catalog.SEVERITIES];
 const DOCUMENTS = ['review', 'snapshot', 'template'];
 const SOURCES = ['demo', 'template', 'snapshot', 'design'];
 const ORIGINS = ['human', 'agent-reviewed', 'captured', 'declared'];
@@ -68,10 +69,14 @@ export function validate(input) {
   });
   unique(edges, 'edge');
   const threats = records(input.threats || [], LIMIT.threats).map(t => {
-    if (!STRIDE.includes(t.category) || !STATUSES.includes(t.status)) { fail('Invalid STRIDE category or review status'); }
+    const methodology = t.methodology ?? 'STRIDE', entry = t.catalogId == null ? null : Catalog.threat(t.catalogId);
+    if (!Catalog.methodology(methodology)?.categories.includes(t.category) || !STATUSES.includes(t.status)) { fail('Invalid methodology category or review status'); }
+    if (t.catalogId != null && (entry?.methodology !== methodology || entry.category !== t.category)) { fail('Unknown catalog threat or mismatched category'); }
+    const risk = t.risk == null ? null : Catalog.risk(t.risk);
     const finding = {
-      id: text(t.id), target: text(t.target, 1024), title: text(t.title), category: t.category, status: t.status,
-      severity: SEVERITIES.includes(t.severity) ? t.severity : 'unrated',
+      id: text(t.id), target: text(t.target, 1024), title: text(t.title), methodology, category: t.category, status: t.status,
+      severity: risk ? Catalog.rate(risk).severity : SEVERITIES.includes(t.severity) ? t.severity : 'unrated',
+      ...(entry ? { catalogId: entry.id } : {}), ...(risk ? { risk } : {}),
       mitigation: text(t.mitigation, 5000), note: text(t.note, 5000), needsReview: t.needsReview === true || input.version === 1,
       owner: text(t.owner), evidence: text(t.evidence, 5000),
       verification: input.version === 2 && t.verification === 'recorded' && !!text(t.evidence, 5000) ? 'recorded' : 'pending',

@@ -75,6 +75,16 @@ pub(crate) const ASSETS: &[Asset] = &[
         body: include_str!("architecture/engine.js"),
     },
     Asset {
+        path: "/_locallycloud/views/architecture/catalog.js",
+        content_type: JS,
+        body: include_str!("architecture/catalog.js"),
+    },
+    Asset {
+        path: "/_locallycloud/views/architecture/catalog.json",
+        content_type: "application/json",
+        body: include_str!("architecture/catalog.json"),
+    },
+    Asset {
         path: "/_locallycloud/views/architecture/i18n.js",
         content_type: JS,
         body: include_str!("architecture/i18n.js"),

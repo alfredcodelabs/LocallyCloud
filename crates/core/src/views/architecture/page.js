@@ -369,6 +369,8 @@ export function mount(root, ctx) {
     $('threat-title').value = finding?.title || prompt?.title || '';
     $('category').value = finding?.category || prompt?.category || M.STRIDE[0];
     $('decision').value = finding?.status || 'open'; $('severity').value = finding?.severity || 'unrated';
+    // Catalog findings keep their category, and rated findings derive severity from their risk factors.
+    $('category').disabled = !!finding?.catalogId; $('severity').disabled = !!finding?.risk;
     $('mitigation').value = finding?.mitigation || ''; $('note').value = finding?.note || prompt?.note || '';
     $('owner').value = finding?.owner || ''; $('finding-evidence').value = finding?.evidence || '';
     $('threat-title').focus();
@@ -605,7 +607,8 @@ export function mount(root, ctx) {
     event.preventDefault();
     try {
       if (!editing && model.threats.length >= M.LIMIT.threats) { throw new Error(t('arThreatLimit')); }
-      const threat = { id: editing || crypto.randomUUID(), target: selected, title: $('threat-title').value.trim(), category: $('category').value, severity: $('severity').value, status: $('decision').value,
+      const kept = model.threats.find((f) => f.id === editing);
+      const threat = { methodology: kept?.methodology, catalogId: kept?.catalogId, risk: kept?.risk, id: editing || crypto.randomUUID(), target: selected, title: $('threat-title').value.trim(), category: $('category').value, severity: $('severity').value, status: $('decision').value,
         mitigation: $('mitigation').value.trim(), note: $('note').value.trim(), owner: $('owner').value.trim(), evidence: $('finding-evidence').value.trim(), verification: 'pending', needsReview: false };
       const next = { ...model, threats: [...model.threats.filter((f) => f.id !== editing), threat] };
       model = M.validate(R.finding(next, threat.id)); changed(); $('threat-form').hidden = true; editing = null; render(); $('inspector').scrollTop = 0; announce(t('arDecisionSaved'));
