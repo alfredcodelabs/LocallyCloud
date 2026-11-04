@@ -1,9 +1,11 @@
 //! SigV4 verification for AWS CLI/SDK requests and host-signed S3 query URLs.
 //!
-//! This verifier intentionally accepts only ordinary, signed, single-request payloads. It
-//! Streaming requests remain unsupported. S3 query authentication is verified against
-//! the same active IAM/STS credentials, never an unsigned public-surface exception.
+//! S3's unsigned checksum-trailer mode authenticates the canonical payload marker and
+//! framing headers; the S3 handler validates the decoded payload checksum. Signed chunk
+//! chains remain unsupported. S3 query authentication uses the same active IAM/STS keys.
 mod presign;
+#[cfg(test)]
+mod streaming_tests;
 pub use presign::{presign_s3_put, query_access_key};
 
 use hmac::{Hmac, Mac};
@@ -219,12 +221,49 @@ fn verify_at(
         canonical_headers.push_str(&normalized.join(","));
         canonical_headers.push('\n');
     }
-    let payload_hash = format!("{:x}", Sha256::digest(body));
-    if let Some(declared) = header(headers, "x-amz-content-sha256") {
-        if declared != payload_hash || !names.contains(&"x-amz-content-sha256") {
-            return false;
+    let payload_hash = match header(headers, "x-amz-content-sha256") {
+        Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER") if expected_service == "s3" => {
+            // The marker occupies the canonical request's payload-hash line, so it
+            // remains authenticated even when S3 clients omit it from SignedHeaders.
+            let framing = [
+                "content-encoding",
+                "x-amz-decoded-content-length",
+                "x-amz-trailer",
+            ];
+            if *method != Method::PUT
+                || headers.get_all("x-amz-content-sha256").iter().count() != 1
+                || framing
+                    .iter()
+                    .any(|name| !names.contains(name) || headers.get_all(*name).iter().count() != 1)
+                || !header(headers, "content-encoding").is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|encoding| encoding.trim().eq_ignore_ascii_case("aws-chunked"))
+                })
+                || !header(headers, "x-amz-decoded-content-length")
+                    .is_some_and(|value| value.parse::<usize>().is_ok())
+                || !header(headers, "x-amz-trailer").is_some_and(|value| !value.is_empty())
+            {
+                return false;
+            }
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string()
         }
-    }
+        Some("UNSIGNED-PAYLOAD") if expected_service == "s3" => {
+            if headers.get_all("x-amz-content-sha256").iter().count() != 1 {
+                return false;
+            }
+            "UNSIGNED-PAYLOAD".to_string()
+        }
+        declared => {
+            let digest = format!("{:x}", Sha256::digest(body));
+            if declared.is_some_and(|declared| {
+                declared != digest || !names.contains(&"x-amz-content-sha256")
+            }) {
+                return false;
+            }
+            digest
+        }
+    };
     let Some(canonical_uri) = canonical_uri(uri.path(), expected_service) else {
         return false;
     };

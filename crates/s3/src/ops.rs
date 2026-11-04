@@ -21,8 +21,8 @@ use tokio::sync::RwLock;
 
 use crate::error::S3Error;
 use crate::integrity::{
-    checksum_base64, decode_aws_chunked, etag, multipart_etag, validate_checksum,
-    validate_content_md5, ChecksumAlgorithm,
+    checksum_base64, decode_aws_chunked, decode_unsigned_aws_chunked, etag, multipart_etag,
+    validate_checksum, validate_content_md5, ChecksumAlgorithm,
 };
 use crate::notifications::{self, EventType, ObjectEvent};
 use crate::store::{
@@ -2026,8 +2026,10 @@ fn prepare_put_body(
     headers: &HeaderMap,
     wire_body: Bytes,
 ) -> Result<(Bytes, BTreeMap<ChecksumAlgorithm, String>), S3Error> {
-    let aws_chunked = header(headers, "x-amz-content-sha256")
-        == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+    let unsigned_trailer =
+        header(headers, "x-amz-content-sha256") == Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+    let aws_chunked = unsigned_trailer
+        || header(headers, "x-amz-content-sha256") == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
         || header(headers, "content-encoding").is_some_and(|value| {
             value
                 .split(',')
@@ -2038,7 +2040,20 @@ fn prepare_put_body(
             .ok_or_else(|| S3Error::InvalidRequest("Missing x-amz-decoded-content-length".into()))?
             .parse::<usize>()
             .map_err(|_| S3Error::InvalidRequest("Invalid x-amz-decoded-content-length".into()))?;
-        let decoded = decode_aws_chunked(&wire_body, decoded_length)?;
+        let decoded = if unsigned_trailer {
+            if headers.get_all("x-amz-trailer").iter().count() != 1 {
+                return Err(S3Error::InvalidRequest("Invalid x-amz-trailer".into()));
+            }
+            let trailer = header(headers, "x-amz-trailer")
+                .ok_or_else(|| S3Error::InvalidRequest("Missing x-amz-trailer".into()))?;
+            let algorithm = ChecksumAlgorithm::ALL
+                .into_iter()
+                .find(|algorithm| trailer.trim().eq_ignore_ascii_case(algorithm.header_name()))
+                .ok_or_else(|| S3Error::InvalidRequest("Unsupported x-amz-trailer".into()))?;
+            decode_unsigned_aws_chunked(&wire_body, decoded_length, algorithm)?
+        } else {
+            decode_aws_chunked(&wire_body, decoded_length)?
+        };
         (decoded.body, decoded.checksums)
     } else {
         (wire_body, BTreeMap::new())
@@ -2066,6 +2081,11 @@ fn prepare_put_body(
     }
     if let Some(value) = header(headers, "x-amz-sdk-checksum-algorithm") {
         let algorithm = ChecksumAlgorithm::parse(value)?;
+        if unsigned_trailer && !checksums.contains_key(&algorithm) {
+            return Err(S3Error::InvalidRequest(
+                "Checksum algorithm does not match x-amz-trailer".into(),
+            ));
+        }
         checksums
             .entry(algorithm)
             .or_insert_with(|| checksum_base64(algorithm, &body));

@@ -865,6 +865,13 @@ impl S3Handler {
         }
         let mut context =
             BTreeMap::from([("aws:requestedregion".into(), vec![req.region.clone()])]);
+        if let Some(value) = req
+            .headers
+            .get("x-amz-content-sha256")
+            .and_then(|value| value.to_str().ok())
+        {
+            context.insert("s3:x-amz-content-sha256".into(), vec![value.into()]);
+        }
         if action == "s3:PutObject" {
             let query = QueryParams::parse(req.uri.query());
             let creates_object = match req.method {
@@ -1881,6 +1888,24 @@ impl NativeHandler for S3Handler {
         let host = request.headers.get("host").and_then(|v| v.to_str().ok());
         let shape = resolve(host, request.uri.path());
         let q = QueryParams::parse(request.uri.query());
+        let unsigned_trailer = request
+            .headers
+            .get("x-amz-content-sha256")
+            .is_some_and(|value| value == "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+        let data_upload = request.method == Method::PUT
+            && matches!(shape, Shape::Object(_, _))
+            && !is_s3_control(&request, host)
+            && !request.headers.contains_key("x-amz-copy-source")
+            && (q.only_keys(&[])
+                || (q.get("uploadId").is_some()
+                    && q.get("partNumber").is_some()
+                    && q.only_keys(&["uploadId", "partNumber"])));
+        if unsigned_trailer && !data_upload {
+            return S3Error::InvalidRequest(
+                "Checksum-trailer streaming is supported only for PutObject and UploadPart".into(),
+            )
+            .into_response(request.uri.path(), &request.request_id);
+        }
         let mutating = matches!(request.method, Method::PUT | Method::POST | Method::DELETE)
             && !(request.method == Method::POST && q.has("select"));
         // Immutable gate lookup does not read bucket metadata. Independent bucket
@@ -4498,6 +4523,271 @@ mod tests {
         assert_eq!(failed.status(), 400);
         let get = h.handle(req(Method::GET, "/buck/key", "", &[])).await;
         assert_eq!(body_string(get).await.1, "Wikipedia");
+    }
+
+    #[tokio::test]
+    async fn unsigned_trailer_uploads_decode_before_object_and_part_mutations() {
+        let h = S3Handler::new();
+        h.handle(req(Method::PUT, "/buck", "", &[])).await;
+        let checksum = crate::integrity::checksum_base64(
+            crate::integrity::ChecksumAlgorithm::Crc32,
+            b"Wikipedia",
+        );
+        let wire =
+            format!("4\r\nWiki\r\n5\r\npedia\r\n0\r\nx-amz-checksum-crc32:{checksum}\r\n\r\n");
+        let headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-decoded-content-length", "9"),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+            ("x-amz-sdk-checksum-algorithm", "CRC32"),
+        ];
+        let put = h
+            .handle(req(Method::PUT, "/buck/key", &wire, &headers))
+            .await;
+        assert_eq!(put.status(), 200);
+        assert_eq!(put.headers()["x-amz-checksum-crc32"], checksum);
+        let damaged = wire.replace("Wiki", "Wikx");
+        let failed = h
+            .handle(req(Method::PUT, "/buck/key", &damaged, &headers))
+            .await;
+        assert_eq!(failed.status(), 400);
+        assert!(body_string(failed)
+            .await
+            .1
+            .contains("<Code>BadDigest</Code>"));
+        for trailer in [
+            "x-amz-checksum-sha256",
+            "",
+            "x-amz-checksum-crc32,x-amz-checksum-sha1",
+        ] {
+            let mut invalid_headers = headers;
+            invalid_headers[3].1 = trailer;
+            assert_eq!(
+                h.handle(req(Method::PUT, "/buck/key", &wire, &invalid_headers))
+                    .await
+                    .status(),
+                400
+            );
+        }
+        let mut mismatch = headers;
+        mismatch[4].1 = "SHA256";
+        assert_eq!(
+            h.handle(req(Method::PUT, "/buck/key", &wire, &mismatch))
+                .await
+                .status(),
+            400
+        );
+        let missing_trailer = headers
+            .into_iter()
+            .filter(|(name, _)| *name != "x-amz-trailer")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            h.handle(req(Method::PUT, "/buck/key", &wire, &missing_trailer))
+                .await
+                .status(),
+            400
+        );
+        let get = h.handle(req(Method::GET, "/buck/key", "", &[])).await;
+        assert_eq!(body_string(get).await.1, "Wikipedia");
+
+        let created = h
+            .handle(req(Method::POST, "/buck/multipart?uploads", "", &[]))
+            .await;
+        let id = xml_value(&body_string(created).await.1, "UploadId");
+        let path = format!("/buck/multipart?uploadId={id}&partNumber=1");
+        let part = h.handle(req(Method::PUT, &path, &wire, &headers)).await;
+        assert_eq!(part.status(), 200);
+        assert_eq!(part.headers()["x-amz-checksum-crc32"], checksum);
+        let etag = part.headers()["etag"].to_str().unwrap().to_owned();
+        assert_eq!(
+            h.handle(req(Method::PUT, &path, &damaged, &headers))
+                .await
+                .status(),
+            400
+        );
+        let completion = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>");
+        assert_eq!(
+            h.handle(req(
+                Method::POST,
+                &format!("/buck/multipart?uploadId={id}"),
+                &completion,
+                &[]
+            ))
+            .await
+            .status(),
+            200
+        );
+        let get = h.handle(req(Method::GET, "/buck/multipart", "", &[])).await;
+        assert_eq!(body_string(get).await.1, "Wikipedia");
+    }
+
+    #[tokio::test]
+    async fn unsigned_trailer_authorization_exposes_the_authenticated_payload_mode() {
+        let (h, _registry, policy) = write_policy_handler();
+        assert_eq!(
+            h.handle(req(Method::PUT, "/bucket", "", &[]))
+                .await
+                .status(),
+            200
+        );
+        let mut headers = VERIFIED_WRITE_HEADERS.to_vec();
+        headers.extend([
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-decoded-content-length", "0"),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ]);
+        assert_eq!(
+            h.handle(req(
+                Method::PUT,
+                "/bucket/key",
+                "0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n",
+                &headers
+            ))
+            .await
+            .status(),
+            403
+        );
+        let requests = policy.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].context["s3:x-amz-content-sha256"],
+            ["STREAMING-UNSIGNED-PAYLOAD-TRAILER"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_trailer_marker_cannot_bypass_control_or_copy_body_validation() {
+        let registry = ServiceRegistry::with_known_services();
+        locallycloud_iam_sts::register(&registry);
+        let h = S3Handler::with_registry(Arc::downgrade(&registry));
+        assert_eq!(
+            h.handle(req(Method::PUT, "/buck", "", &[])).await.status(),
+            200
+        );
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Sid":"original","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::buck/*"}]}"#;
+        assert_eq!(
+            h.handle(req(Method::PUT, "/buck?policy", policy, &[]))
+                .await
+                .status(),
+            204
+        );
+        let headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-decoded-content-length", "1"),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ];
+        // A valid raw policy must not be consumed under a streaming marker.
+        assert_eq!(
+            h.handle(req(
+                Method::PUT,
+                "/buck?policy",
+                &policy.replace("original", "changed"),
+                &headers
+            ))
+            .await
+            .status(),
+            400
+        );
+        let get = h.handle(req(Method::GET, "/buck?policy", "", &[])).await;
+        assert_eq!(body_string(get).await.1, policy);
+        assert_eq!(
+            h.handle(req(Method::PUT, "/created", "", &headers))
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(
+            h.handle(req(Method::HEAD, "/created", "", &[]))
+                .await
+                .status(),
+            404
+        );
+
+        assert_eq!(
+            h.handle(req(Method::PUT, "/buck/source", "source", &[]))
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            h.handle(req(Method::PUT, "/buck/destination", "original", &[]))
+                .await
+                .status(),
+            200
+        );
+        let mut copy_headers = headers.to_vec();
+        copy_headers.push(("x-amz-copy-source", "/buck/source"));
+        assert_eq!(
+            h.handle(req(
+                Method::PUT,
+                "/buck/destination",
+                "ignored body",
+                &copy_headers
+            ))
+            .await
+            .status(),
+            400
+        );
+        assert_eq!(
+            body_string(
+                h.handle(req(Method::GET, "/buck/destination", "", &[]))
+                    .await
+            )
+            .await
+            .1,
+            "original"
+        );
+        assert_eq!(
+            h.handle(req(
+                Method::PUT,
+                "/buck/destination?tagging",
+                "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>",
+                &headers
+            ))
+            .await
+            .status(),
+            400
+        );
+        let tags = h
+            .handle(req(Method::GET, "/buck/destination?tagging", "", &[]))
+            .await;
+        assert!(!body_string(tags).await.1.contains("<Key>k</Key>"));
+
+        let created = h
+            .handle(req(Method::POST, "/buck/final?uploads", "", &[]))
+            .await;
+        let id = xml_value(&body_string(created).await.1, "UploadId");
+        let path = format!("/buck/final?uploadId={id}&partNumber=1");
+        let part = h.handle(req(Method::PUT, &path, "original", &[])).await;
+        assert_eq!(part.status(), 200);
+        let etag = part.headers()["etag"].to_str().unwrap().to_owned();
+        assert_eq!(
+            h.handle(req(Method::PUT, &path, "ignored body", &copy_headers))
+                .await
+                .status(),
+            400
+        );
+        let completion = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>");
+        assert_eq!(
+            h.handle(req(
+                Method::POST,
+                &format!("/buck/final?uploadId={id}"),
+                &completion,
+                &[]
+            ))
+            .await
+            .status(),
+            200
+        );
+        assert_eq!(
+            body_string(h.handle(req(Method::GET, "/buck/final", "", &[])).await)
+                .await
+                .1,
+            "original"
+        );
     }
 
     #[tokio::test]

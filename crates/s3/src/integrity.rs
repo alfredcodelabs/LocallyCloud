@@ -157,24 +157,62 @@ fn take_line<'a>(input: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], S3Erro
     Ok(&rest[..end])
 }
 
-/// Decode and validate AWS signed chunk framing and trailing checksum headers.
+/// Decode legacy signed chunk framing. Authentication belongs to Core's SigV4 verifier.
 pub fn decode_aws_chunked(
     input: &[u8],
     decoded_content_length: usize,
 ) -> Result<DecodedAwsChunked, S3Error> {
+    decode_chunked(input, decoded_content_length, ChunkFraming::Signed)
+}
+
+/// Decode unsigned chunks and require the checksum declared by x-amz-trailer.
+pub fn decode_unsigned_aws_chunked(
+    input: &[u8],
+    decoded_content_length: usize,
+    algorithm: ChecksumAlgorithm,
+) -> Result<DecodedAwsChunked, S3Error> {
+    decode_chunked(
+        input,
+        decoded_content_length,
+        ChunkFraming::Unsigned(algorithm),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ChunkFraming {
+    Signed,
+    Unsigned(ChecksumAlgorithm),
+}
+
+fn decode_chunked(
+    input: &[u8],
+    decoded_content_length: usize,
+    framing: ChunkFraming,
+) -> Result<DecodedAwsChunked, S3Error> {
+    // Framing only adds bytes. Never reserve memory using an untrusted length
+    // that is larger than the already bounded wire body.
+    if decoded_content_length > input.len() {
+        return Err(invalid_chunked());
+    }
     let mut cursor = 0;
     let mut decoded = Vec::with_capacity(decoded_content_length);
     loop {
         let line =
             std::str::from_utf8(take_line(input, &mut cursor)?).map_err(|_| invalid_chunked())?;
-        let (size, signature) = line
-            .split_once(";chunk-signature=")
-            .ok_or_else(invalid_chunked)?;
-        if size.is_empty()
-            || !size.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || signature.len() != 64
-            || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
+        let size = match framing {
+            ChunkFraming::Signed => {
+                let (size, signature) = line
+                    .split_once(";chunk-signature=")
+                    .ok_or_else(invalid_chunked)?;
+                if signature.len() != 64 || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(invalid_chunked());
+                }
+                size
+            }
+            ChunkFraming::Unsigned(_) => line,
+        };
+        if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(invalid_chunked());
         }
         let size = usize::from_str_radix(size, 16).map_err(|_| invalid_chunked())?;
@@ -182,12 +220,18 @@ pub fn decode_aws_chunked(
             break;
         }
         let end = cursor.checked_add(size).ok_or_else(invalid_chunked)?;
+        let after_chunk = end.checked_add(2).ok_or_else(invalid_chunked)?;
         let chunk = input.get(cursor..end).ok_or_else(invalid_chunked)?;
-        decoded.extend_from_slice(chunk);
-        if input.get(end..end + 2) != Some(b"\r\n") {
+        if decoded
+            .len()
+            .checked_add(size)
+            .is_none_or(|length| length > decoded_content_length)
+            || input.get(end..after_chunk) != Some(b"\r\n")
+        {
             return Err(invalid_chunked());
         }
-        cursor = end + 2;
+        decoded.extend_from_slice(chunk);
+        cursor = after_chunk;
     }
 
     let mut trailers = BTreeMap::new();
@@ -198,20 +242,24 @@ pub fn decode_aws_chunked(
         }
         let line = std::str::from_utf8(line).map_err(|_| invalid_chunked())?;
         let (name, value) = line.split_once(':').ok_or_else(invalid_chunked)?;
-        let suffix = name
-            .trim()
-            .to_ascii_lowercase()
-            .strip_prefix("x-amz-checksum-")
-            .map(str::to_string)
+        let algorithm = ChecksumAlgorithm::ALL
+            .into_iter()
+            .find(|algorithm| name.eq_ignore_ascii_case(algorithm.header_name()))
             .ok_or_else(invalid_chunked)?;
-        let algorithm = ChecksumAlgorithm::parse(&suffix)?;
-        if trailers.contains_key(&algorithm) {
+        if trailers
+            .insert(algorithm, value.trim().to_string())
+            .is_some()
+        {
             return Err(invalid_chunked());
         }
-        trailers.insert(algorithm, value.trim().to_string());
     }
     if cursor != input.len() || decoded.len() != decoded_content_length {
         return Err(invalid_chunked());
+    }
+    if let ChunkFraming::Unsigned(algorithm) = framing {
+        if trailers.len() != 1 || !trailers.contains_key(&algorithm) {
+            return Err(invalid_chunked());
+        }
     }
     for (&algorithm, expected) in &trailers {
         validate_checksum(algorithm, expected, &decoded)?;
@@ -313,6 +361,66 @@ mod tests {
             decode_aws_chunked(wire.as_bytes(), 1),
             Err(S3Error::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn unsigned_chunked_validates_all_algorithms_and_empty_payloads() {
+        for algorithm in ChecksumAlgorithm::ALL {
+            for body in ["Wikipedia", ""] {
+                let checksum = checksum_base64(algorithm, body.as_bytes());
+                let data = if body.is_empty() {
+                    String::new()
+                } else {
+                    "4\r\nWiki\r\n5\r\npedia\r\n".to_owned()
+                };
+                let wire = format!("{data}0\r\n{}:{checksum}\r\n\r\n", algorithm.header_name());
+                let decoded =
+                    decode_unsigned_aws_chunked(wire.as_bytes(), body.len(), algorithm).unwrap();
+                assert_eq!(decoded.body.as_ref(), body.as_bytes());
+                assert_eq!(decoded.checksums[&algorithm], checksum);
+                // AWS documents an optional LF before the trailer CRLF.
+                let optional_lf =
+                    wire.replace(&format!("{checksum}\r\n"), &format!("{checksum}\n\r\n"));
+                assert!(
+                    decode_unsigned_aws_chunked(optional_lf.as_bytes(), body.len(), algorithm)
+                        .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsigned_chunked_rejects_tampering_mismatched_trailers_and_unbounded_lengths() {
+        let algorithm = ChecksumAlgorithm::Crc32;
+        let checksum = checksum_base64(algorithm, b"test");
+        let good = format!("4\r\ntest\r\n0\r\nx-amz-checksum-crc32:{checksum}\r\n\r\n");
+        assert!(matches!(
+            decode_unsigned_aws_chunked(good.replace("test", "best").as_bytes(), 4, algorithm),
+            Err(S3Error::BadDigest)
+        ));
+        for wire in [
+            good.replace("x-amz-checksum-crc32", "x-amz-checksum-crc32c"),
+            good.replace(&format!("x-amz-checksum-crc32:{checksum}\r\n"), ""),
+            good.replace(
+                &format!("x-amz-checksum-crc32:{checksum}\r\n"),
+                &format!("x-amz-checksum-crc32:{checksum}\r\nx-amz-checksum-crc32:{checksum}\r\n"),
+            ),
+            good.replace(
+                "4\r\n",
+                &format!("4;chunk-signature={}\r\n", "0".repeat(64)),
+            ),
+            good.replace("test\r\n", "testXX"),
+            format!("{good}garbage"),
+        ] {
+            assert!(
+                decode_unsigned_aws_chunked(wire.as_bytes(), 4, algorithm).is_err(),
+                "{wire:?}"
+            );
+        }
+        for length in [0, 3, 5, usize::MAX] {
+            assert!(decode_unsigned_aws_chunked(good.as_bytes(), length, algorithm).is_err());
+        }
+        assert!(decode_aws_chunked(good.as_bytes(), usize::MAX).is_err());
     }
 
     #[test]
