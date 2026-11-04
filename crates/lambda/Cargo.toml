@@ -17,6 +17,7 @@ locallycloud-ec2.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+tower = { version = "0.5", features = ["util"] }
 http.workspace = true
 bytes.workspace = true
 serde.workspace = true

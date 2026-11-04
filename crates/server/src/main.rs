@@ -10,6 +10,7 @@ mod ecs_guest;
 mod ecs_network;
 mod ecs_runtime;
 mod migration;
+mod runtime_manager;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
@@ -319,6 +320,13 @@ async fn main() {
         }
     };
     match command {
+        cli::Command::Runtime(ref options) => {
+            if let Err(error) = runtime_manager::execute(options).await {
+                eprintln!("locallycloud runtime: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         cli::Command::Help => {
             println!("{}", cli::USAGE);
             return;
@@ -496,7 +504,7 @@ async fn main() {
     if let Err(error) = locallycloud_cloudformation::register_with_state_and_endpoint(
         &registry,
         state.clone(),
-        endpoint.guest_endpoint(),
+        locallycloud_core::tls::GuestCallbackTls::ENDPOINT,
     ) {
         tracing::error!(%error, "failed to load durable CloudFormation state");
         std::process::exit(4);

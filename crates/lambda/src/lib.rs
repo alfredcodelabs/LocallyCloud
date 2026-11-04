@@ -19,6 +19,7 @@ mod persistence;
 pub mod rootfs;
 pub mod runtime_api;
 pub mod runtime_api_server;
+pub mod runtime_pack;
 pub mod service;
 pub mod trace_header;
 mod vpc_dns;

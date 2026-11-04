@@ -1242,7 +1242,7 @@ pub(crate) fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Extract the `X-Amz-Credential` query parameter value, decoding `%2F` to `/`.
-pub(crate) fn extract_x_amz_credential(query: &str) -> Option<String> {
+pub fn extract_x_amz_credential(query: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("X-Amz-Credential=") {
             return Some(value.replace("%2F", "/").replace("%2f", "/"));

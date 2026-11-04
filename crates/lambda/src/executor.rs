@@ -73,8 +73,20 @@ fn proxy_listener(
     policy: Option<VpcProxyPolicy>,
     runtime_prefix: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
+    let app = proxy_router(backend_url, policy, runtime_prefix);
     tokio::spawn(async move {
-        let app = Router::new().fallback(any(move |request: Request| {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::warn!(%error, "Lambda guest proxy stopped");
+        }
+    })
+}
+
+fn proxy_router(
+    backend_url: String,
+    policy: Option<VpcProxyPolicy>,
+    runtime_prefix: Option<String>,
+) -> Router {
+    Router::new().fallback(any(move |request: Request| {
             let backend_url = backend_url.clone();
             let policy = policy.clone();
             let runtime_prefix = runtime_prefix.clone();
@@ -89,11 +101,13 @@ fn proxy_listener(
                     }
                 }
                 if let Some(policy) = &policy {
+                    let query_credential = locallycloud_core::integration::extract_x_amz_credential(parts.uri.query().unwrap_or_default());
                     let service = parts
                         .headers
                         .get(http::header::AUTHORIZATION)
                         .and_then(|value| value.to_str().ok())
-                        .and_then(|auth| extract_service_from_credential_scope(Some(auth), None));
+                        .and_then(|auth| extract_service_from_credential_scope(Some(auth), None))
+                        .or_else(|| extract_service_from_credential_scope(None, query_credential.as_deref()));
                     if !service.as_ref().is_some_and(|service| {
                         policy.ec2.vpc_endpoint_access(
                             &policy.account,
@@ -155,11 +169,7 @@ fn proxy_listener(
                             .unwrap()
                     })
             }
-        }));
-        if let Err(error) = axum::serve(listener, app).await {
-            tracing::warn!(%error, "VPC Lambda proxy stopped");
-        }
-    })
+        }))
 }
 
 fn private_tcp_listener(
@@ -395,6 +405,10 @@ pub struct Executor {
     /// Aggregates vended `AWS/Lambda` metrics; flushed lazily to Monitoring.
     metrics: LambdaMetrics,
     install_host_runtime: bool,
+    runtime_packs: Option<Arc<crate::runtime_pack::RuntimePacks>>,
+    environment_runtime_packs: DashMap<String, Arc<crate::runtime_pack::RuntimePack>>,
+    guest_tls: tokio::sync::OnceCell<Arc<locallycloud_core::tls::GuestCallbackTls>>,
+    rootfs_workers: DashMap<String, tokio::sync::watch::Receiver<()>>,
     /// Per-environment stream identity and cumulative-output cursor.
     log_state: DashMap<String, ExecutionLogState>,
     /// Rootfs owned by this process, including environments not yet returned to a warm pool.
@@ -700,6 +714,10 @@ impl Executor {
             vpc_public_egress: DashMap::new(),
             vpc_proxies: DashMap::new(),
             runtime_api_base: runtime_api_base.into(),
+            runtime_packs: None,
+            environment_runtime_packs: DashMap::new(),
+            guest_tls: tokio::sync::OnceCell::new(),
+            rootfs_workers: DashMap::new(),
             aws_endpoint_url: aws_endpoint_url.into(),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
@@ -710,7 +728,7 @@ impl Executor {
             log_state: DashMap::new(),
             owned_envs: DashMap::new(),
             environment_functions: DashMap::new(),
-            memory_budget_mb: 1024,
+            memory_budget_mb: Self::DEFAULT_MEMORY_BUDGET_MB,
             memory_reservations: Arc::new(Mutex::new(HashMap::new())),
             stopping: DashMap::new(),
             closed: AtomicBool::new(false),
@@ -767,9 +785,11 @@ impl Executor {
         }
     }
 
+    pub(crate) const DEFAULT_MEMORY_BUDGET_MB: u64 = 4096;
+
     pub(crate) fn parse_memory_budget(value: Option<&str>) -> Result<u64, String> {
         match value {
-            None => Ok(1024),
+            None => Ok(Self::DEFAULT_MEMORY_BUDGET_MB),
             Some(raw) => raw
                 .parse::<u64>()
                 .ok()
@@ -810,6 +830,31 @@ impl Executor {
     pub fn with_host_managed_runtime(mut self) -> Self {
         self.install_host_runtime = true;
         self
+    }
+
+    /// Official filesystems are imported explicitly; invocation never downloads artifacts.
+    pub fn with_official_runtime_packs(mut self, directory: PathBuf) -> Self {
+        self.runtime_packs = Some(Arc::new(crate::runtime_pack::RuntimePacks::new(directory)));
+        self.install_host_runtime = false;
+        self
+    }
+
+    async fn rootfs_worker<T: Send + 'static>(
+        &self,
+        env_key: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let (completion, receiver) = tokio::sync::watch::channel(());
+        self.rootfs_workers.insert(env_key.to_owned(), receiver);
+        let result = tokio::task::spawn_blocking(move || {
+            // Cancellation of the async caller cannot detach filesystem work from ownership.
+            let _completion = completion;
+            work()
+        })
+        .await
+        .map_err(|e| e.to_string());
+        self.rootfs_workers.remove(env_key);
+        result
     }
 
     /// Run one synchronous invocation of `func` with `payload`, returning its outcome, logs,
@@ -1600,6 +1645,7 @@ impl Executor {
             return;
         }
         drop(marker);
+        self.environment_runtime_packs.remove(env_key);
     }
 
     fn cleanup_owned_rootfs(&self, env_key: &str) {
@@ -1842,6 +1888,35 @@ impl Executor {
         code: &[u8],
         env_key: String,
     ) -> Result<Instant, String> {
+        let pack = match &self.runtime_packs {
+            Some(packs) => {
+                let architecture = func
+                    .architectures
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("x86_64");
+                let host = match std::env::consts::ARCH {
+                    "aarch64" => "arm64",
+                    other => other,
+                };
+                if architecture != host && crate::rootfs::is_custom(func.runtime.as_deref()) {
+                    return Err(format!(
+                        "Lambda architecture {architecture} does not match host {host}"
+                    ));
+                }
+                Some(
+                    packs
+                        .load(
+                            func.runtime
+                                .as_deref()
+                                .ok_or("ZIP function runtime missing")?,
+                            host,
+                        )
+                        .await?,
+                )
+            }
+            None => None,
+        };
         let stored = self
             .code_store
             .store_zip(account, region, &func.function_name, code)
@@ -1849,6 +1924,10 @@ impl Executor {
         let rootfs_path = self.rootfs_root.join(&env_key);
         self.reserve_rootfs(&env_key)
             .map_err(|error| format!("rootfs ownership failed: {error}"))?;
+        if let Some(pack) = &pack {
+            self.environment_runtime_packs
+                .insert(env_key.clone(), pack.clone());
+        }
         let mut layer_dirs = Vec::with_capacity(func.layers.len());
         let layer_result: Result<(), String> = (|| {
             for arn in &func.layers {
@@ -1886,12 +1965,31 @@ impl Executor {
             self.cleanup_owned_rootfs(&env_key);
             return Err(error);
         }
-        let rootfs = build_rootfs(
-            &rootfs_path,
-            func.runtime.as_deref(),
-            &stored.dir,
-            &layer_dirs,
-        );
+        let rootfs = if let Some(pack) = pack.clone() {
+            let path = rootfs_path.clone();
+            let runtime = func.runtime.clone();
+            let handler = func.handler.clone();
+            let code = stored.dir.clone();
+            let layers = layer_dirs.clone();
+            self.rootfs_worker(&env_key, move || {
+                crate::rootfs::build_rootfs_with_pack(
+                    &path,
+                    runtime.as_deref(),
+                    &code,
+                    &layers,
+                    Some(&pack),
+                    handler.as_deref(),
+                )
+            })
+            .await?
+        } else {
+            build_rootfs(
+                &rootfs_path,
+                func.runtime.as_deref(),
+                &stored.dir,
+                &layer_dirs,
+            )
+        };
         let _ = std::fs::remove_dir_all(&stored.dir);
         for dir in &layer_dirs {
             let _ = std::fs::remove_dir_all(dir);
@@ -1952,6 +2050,26 @@ impl Executor {
                 let etc = rootfs.path.join("etc");
                 std::fs::create_dir_all(&etc)
                     .map_err(|e| format!("creating VPC guest DNS directory: {e}"))?;
+                if pack.is_some() {
+                    std::fs::remove_file(etc.join("hosts"))
+                        .or_else(|error| {
+                            if error.kind() == io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(error)
+                            }
+                        })
+                        .map_err(|e| format!("replace VPC hosts: {e}"))?;
+                    std::fs::remove_file(etc.join("resolv.conf"))
+                        .or_else(|error| {
+                            if error.kind() == io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(error)
+                            }
+                        })
+                        .map_err(|e| format!("replace VPC resolver: {e}"))?;
+                }
                 std::fs::write(etc.join("hosts"), hosts)
                     .map_err(|e| format!("writing VPC guest DNS hosts: {e}"))?;
                 std::fs::write(
@@ -1964,7 +2082,10 @@ impl Executor {
                 if runtime_port == aws_port {
                     return Err("Runtime API and AWS endpoint must use different ports".into());
                 }
-                crate::rootfs::install_vpc_wait_tools(&rootfs.path).map_err(|e| e.to_string())?;
+                if pack.is_none() {
+                    crate::rootfs::install_vpc_wait_tools(&rootfs.path)
+                        .map_err(|e| e.to_string())?;
+                }
                 let script = rootfs.path.join("var/runtime/vpc-wait");
                 std::fs::write(&script, VPC_WAIT_SCRIPT)
                     .map_err(|e| format!("writing VPC guest bootstrap: {e}"))?;
@@ -1995,7 +2116,10 @@ impl Executor {
             return Err(format!("extension discovery failed: {error}"));
         }
 
-        let runtime_api = format!("{}/e/{}", self.runtime_api_base, env_key);
+        let runtime_api = match &pack {
+            Some(_) => self.runtime_api_base.clone(),
+            None => format!("{}/e/{}", self.runtime_api_base, env_key),
+        };
         let log_stream = new_log_stream_name(&func.version);
         let role_credentials = self
             .registry
@@ -2037,13 +2161,41 @@ impl Executor {
                 .map(|credentials| credentials.session_token.as_str()),
             user_env: &func.environment,
         });
+        if let Some(pack) = &pack {
+            for (name, value) in &pack.environment {
+                env_map.entry(name.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        let guest_tls = if pack.is_some() {
+            let tls = self
+                .guest_tls
+                .get_or_try_init(|| async {
+                    locallycloud_core::tls::GuestCallbackTls::new()
+                        .await
+                        .map(Arc::new)
+                })
+                .await
+                .map_err(|e| format!("guest callback TLS unavailable: {e}"))?
+                .clone();
+            let path = rootfs.path.clone();
+            let ca = tls.ca_pem().to_owned();
+            env_map = self
+                .rootfs_worker(&env_key, move || {
+                    crate::runtime_pack::install_guest_trust(&path, &mut env_map, &ca)?;
+                    Ok::<_, String>(env_map)
+                })
+                .await??;
+            Some(tls)
+        } else {
+            None
+        };
         // Every environment gets its own daemon endpoint (Lambda runs the daemon in both
         // tracing modes, and a caller-sampled `PassThrough` invocation still sends SDK
         // documents), bound before the guest starts: an ephemeral loopback port for guests in
         // the host netns, a fixed address inside the isolated netns of VPC guests (bound once
         // that netns exists).
         let mut xray_socket = None;
-        let xray_endpoint = if vpc_launch.is_some() {
+        let xray_endpoint = if vpc_launch.is_some() || pack.is_some() {
             SocketAddr::V4(VPC_XRAY_DAEMON)
         } else {
             let socket = match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await {
@@ -2065,6 +2217,25 @@ impl Executor {
         };
         crate::exec_env::insert_xray_daemon_env(&mut env_map, xray_endpoint);
         let mut command = rootfs.entrypoint.clone();
+        if pack.is_some() && vpc_launch.is_none() {
+            let runtime_port = loopback_port(&format!("http://{}", self.runtime_api_base))?;
+            let aws_port = loopback_port(&self.aws_endpoint_url)?;
+            env_map.insert(
+                "LOCALLYCLOUD_VPC_RUNTIME_PORT".into(),
+                runtime_port.to_string(),
+            );
+            env_map.insert("LOCALLYCLOUD_VPC_AWS_PORT".into(), aws_port.to_string());
+            let script = rootfs.path.join("var/runtime/vpc-wait");
+            match tokio::fs::remove_file(&script).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("replace guest readiness gate: {error}")),
+            }
+            tokio::fs::write(&script, VPC_WAIT_SCRIPT)
+                .await
+                .map_err(|e| e.to_string())?;
+            command.splice(0..0, ["/bin/bash".into(), "/var/runtime/vpc-wait".into()]);
+        }
         if let Some((_, _, runtime_port, aws_port, _)) = &vpc_launch {
             env_map.insert(
                 "LOCALLYCLOUD_VPC_RUNTIME_PORT".into(),
@@ -2088,7 +2259,15 @@ impl Executor {
         if let Some((ec2, lease, runtime_port, aws_port, destinations)) = vpc_launch {
             let (handle, mut listeners) = match self
                 .runtime
-                .start_task_isolated_with_loopback(&env_key, &spec, &[runtime_port, aws_port])
+                .start_task_isolated_with_loopback(
+                    &env_key,
+                    &spec,
+                    &if pack.is_some() {
+                        vec![runtime_port, aws_port, 443]
+                    } else {
+                        vec![runtime_port, aws_port]
+                    },
+                )
                 .await
             {
                 Ok(result) => result,
@@ -2103,6 +2282,11 @@ impl Executor {
             );
             let runtime_listener = listeners.remove(0);
             let aws_listener = listeners.remove(0);
+            let callback_listener = if pack.is_some() {
+                Some(listeners.remove(0))
+            } else {
+                None
+            };
             let mut private_listeners = Vec::with_capacity(destinations.len());
             for (address, port) in destinations {
                 match self
@@ -2209,20 +2393,34 @@ impl Executor {
                 source_ip: lease.private_ip,
                 source_group_ids: lease.security_group_ids.clone(),
             };
-            proxies.extend([
-                proxy_listener(
+            if pack.is_some() {
+                let app = crate::runtime_api_server::environment_router(
+                    self.broker.clone(),
+                    env_key.clone(),
+                );
+                proxies.push(tokio::spawn(async move {
+                    let _ = axum::serve(runtime_listener, app).await;
+                }));
+            } else {
+                proxies.push(proxy_listener(
                     runtime_listener,
                     format!("http://{}", self.runtime_api_base),
                     None,
                     Some(format!("/e/{env_key}/")),
-                ),
-                proxy_listener(
-                    aws_listener,
-                    self.aws_endpoint_url.clone(),
-                    Some(policy),
-                    None,
-                ),
-            ]);
+                ));
+            }
+            if let (Some(listener), Some(tls)) = (callback_listener, guest_tls) {
+                proxies.push(tls.spawn(
+                    listener,
+                    proxy_router(self.aws_endpoint_url.clone(), Some(policy.clone()), None),
+                ));
+            }
+            proxies.push(proxy_listener(
+                aws_listener,
+                self.aws_endpoint_url.clone(),
+                Some(policy),
+                None,
+            ));
             if let Err(error) =
                 std::fs::write(rootfs.path.join("tmp/locallycloud-vpc-ready"), b"ready")
             {
@@ -2236,6 +2434,61 @@ impl Executor {
             self.vpc_networks.insert(env_key.clone(), lease);
             self.vpc_public_egress
                 .insert(env_key.clone(), public_egress_enabled);
+        } else if let Some(tls) = guest_tls {
+            let runtime_port = loopback_port(&format!("http://{}", self.runtime_api_base))?;
+            let aws_port = loopback_port(&self.aws_endpoint_url)?;
+            if runtime_port == aws_port || [runtime_port, aws_port].contains(&443) {
+                self.cleanup_owned_rootfs(&env_key);
+                return Err("official runtime guest listener ports must be distinct".into());
+            }
+            let (_, mut listeners) = match self
+                .runtime
+                .start_task_isolated_with_loopback(&env_key, &spec, &[runtime_port, aws_port, 443])
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.cleanup_failed_start(&env_key, None).await;
+                    return Err(format!("official runtime guest start failed: {error}"));
+                }
+            };
+            let callback_listener = listeners.pop().ok_or("guest callback listener missing")?;
+            let aws_listener = listeners.pop().ok_or("guest AWS listener missing")?;
+            let runtime_listener = listeners
+                .pop()
+                .ok_or("guest Runtime API listener missing")?;
+            let app =
+                crate::runtime_api_server::environment_router(self.broker.clone(), env_key.clone());
+            self.vpc_proxies.insert(
+                env_key.clone(),
+                vec![
+                    tokio::spawn(async move {
+                        let _ = axum::serve(runtime_listener, app).await;
+                    }),
+                    proxy_listener(aws_listener, self.aws_endpoint_url.clone(), None, None),
+                    tls.spawn(
+                        callback_listener,
+                        proxy_router(self.aws_endpoint_url.clone(), None, None),
+                    ),
+                ],
+            );
+            match self
+                .runtime
+                .bind_isolated_udp(&env_key, *VPC_XRAY_DAEMON.ip(), VPC_XRAY_DAEMON.port())
+                .await
+            {
+                Ok(socket) => xray_socket = Some(socket),
+                Err(error) => {
+                    self.cleanup_failed_start(&env_key, None).await;
+                    return Err(format!("guest X-Ray endpoint failed: {error}"));
+                }
+            }
+            if let Err(error) =
+                tokio::fs::write(rootfs.path.join("tmp/locallycloud-vpc-ready"), b"ready").await
+            {
+                self.cleanup_failed_start(&env_key, None).await;
+                return Err(format!("guest readiness signal failed: {error}"));
+            }
         } else if let Err(error) = self.runtime.start_task(&env_key, &spec).await {
             self.cleanup_failed_start(&env_key, None).await;
             return Err(format!("guest start failed: {error}"));
@@ -2559,6 +2812,11 @@ impl Executor {
     ) -> Option<(String, Option<String>)> {
         let gate = self.stopping.entry(env_key.to_owned()).or_default().clone();
         let mut finalized = gate.lock().await;
+        let worker = self.rootfs_workers.get(env_key).map(|entry| entry.clone());
+        if let Some(mut worker) = worker {
+            while worker.changed().await.is_ok() {}
+            self.rootfs_workers.remove(env_key);
+        }
         if !self.owned_envs.contains_key(env_key) {
             self.stop_xray_daemon(env_key).await;
             self.broker.release(env_key);
@@ -3208,6 +3466,46 @@ mod tests {
         build_executor_tracked(broker, behavior).await.0
     }
 
+    #[tokio::test]
+    async fn cancelled_rootfs_worker_keeps_cleanup_waiting_until_filesystem_work_finishes() {
+        let executor = Arc::new(
+            build_executor(
+                Arc::new(InvocationBroker::new()),
+                GuestBehavior::EchoUppercaseLen,
+            )
+            .await,
+        );
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (finish, wait) = std::sync::mpsc::channel();
+        let worker_executor = executor.clone();
+        let worker = tokio::spawn(async move {
+            worker_executor
+                .rootfs_worker("building", move || {
+                    let _ = started.send(());
+                    wait.recv().unwrap();
+                })
+                .await
+        });
+        running.await.unwrap();
+        worker.abort();
+        let _ = worker.await;
+        let cleanup_executor = executor.clone();
+        let mut cleanup = tokio::spawn(async move {
+            cleanup_executor.stop_env("building").await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut cleanup)
+                .await
+                .is_err()
+        );
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cleanup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!executor.rootfs_workers.contains_key("building"));
+    }
+
     async fn build_executor_tracked(
         broker: Arc<InvocationBroker>,
         behavior: GuestBehavior,
@@ -3233,7 +3531,9 @@ mod tests {
 
     #[tokio::test]
     async fn memory_budget_evicts_warm_and_releases_after_shutdown_and_start_failure() {
-        assert_eq!(Executor::parse_memory_budget(None).unwrap(), 1024);
+        assert_eq!(Executor::parse_memory_budget(None).unwrap(), 4096);
+
+        assert!(Executor::parse_memory_budget(None).unwrap() >= 1024 + 32);
         for invalid in ["0", "-1", "oops", "18446744073709551615"] {
             assert!(Executor::parse_memory_budget(Some(invalid)).is_err());
         }
@@ -3310,7 +3610,10 @@ mod tests {
             GuestBehavior::EchoUppercaseLen,
         )
         .await;
-        let exec = Arc::new(exec.with_service_registry(Arc::downgrade(&registry)));
+        let exec = Arc::new(
+            exec.with_memory_budget(1024)
+                .with_service_registry(Arc::downgrade(&registry)),
+        );
         let handler = Arc::new(crate::service::LambdaHandler::with_executor(exec.clone()));
         let make_request = |region: &str, path: &str, body: Vec<u8>| ServiceRequest {
             method: http::Method::POST,

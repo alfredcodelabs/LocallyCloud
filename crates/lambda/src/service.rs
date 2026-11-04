@@ -1976,6 +1976,10 @@ pub async fn register_with_execution_config(
     });
 
     let layers = Arc::new(LayerStore::new());
+    let packs = std::env::var_os("LOCALLYCLOUD_RUNTIME_PACKS_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| work.join("runtime-packs"));
     let executor = Executor::new(
         broker,
         Arc::new(CodeStore::new(work.join("code"))),
@@ -1993,7 +1997,7 @@ pub async fn register_with_execution_config(
     .with_destination_router(Arc::new(RegistryDestinationRouter::new(Arc::downgrade(
         registry,
     ))))
-    .with_host_managed_runtime();
+    .with_official_runtime_packs(packs);
     let executor = Arc::new(executor);
     executor.bind_arc();
     let reaper = Arc::downgrade(&executor);

@@ -1,4 +1,7 @@
 //! HTTP and SNI TLS on the same unprivileged listener. Certificate material stays in memory.
+mod guest_callback;
+pub use guest_callback::GuestCallbackTls;
+
 use axum::{
     extract::connect_info::Connected,
     serve::{IncomingStream, Listener},

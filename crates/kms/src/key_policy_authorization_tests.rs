@@ -149,12 +149,32 @@ async fn account_policy_delegates_key_administration_to_the_actual_iam_caller() 
 }
 
 #[tokio::test]
-async fn unknown_permissive_caller_cannot_silently_create_an_unmanageable_explicit_policy() {
+async fn unknown_permissive_caller_acts_as_account_root_like_sts() {
     let fixture = Fixture::new(EnforcementMode::Permissive);
     let policy = key_policy(&format!("arn:aws:iam::{ACCOUNT}:root"), json!("kms:*"));
+    let (status, created) = fixture
+        .call(
+            "unregistered",
+            "CreateKey",
+            json!({"Policy":policy.to_string()}),
+        )
+        .await;
+    assert_eq!(status, 200, "{created}");
+    let key = created["KeyMetadata"]["KeyId"].as_str().unwrap();
+    for operation in ["EnableKeyRotation", "ScheduleKeyDeletion"] {
+        let (status, result) = fixture
+            .call("unregistered", operation, json!({"KeyId":key}))
+            .await;
+        assert_eq!(status, 200, "{operation}: {result}");
+    }
+
+    let other = key_policy(
+        &format!("arn:aws:iam::{ACCOUNT}:user/{USER}"),
+        json!("kms:*"),
+    );
     let before = fixture.call("unregistered", "ListKeys", json!({})).await;
     for bypass in [None, Some(false)] {
-        let mut body = json!({"Policy":policy.to_string()});
+        let mut body = json!({"Policy":other.to_string()});
         if let Some(value) = bypass {
             body["BypassPolicyLockoutSafetyCheck"] = value.into();
         }
@@ -166,22 +186,20 @@ async fn unknown_permissive_caller_cannot_silently_create_an_unmanageable_explic
             before
         );
     }
-    let (status, created) = fixture
+    let (status, bypassed) = fixture
         .call(
             "unregistered",
             "CreateKey",
-            json!({"Policy":policy.to_string(),"BypassPolicyLockoutSafetyCheck":true}),
+            json!({"Policy":other.to_string(),"BypassPolicyLockoutSafetyCheck":true}),
         )
         .await;
-    assert_eq!(status, 200, "{created}");
-    let key = created["KeyMetadata"]["KeyId"].as_str().unwrap();
-    for operation in ["EnableKeyRotation", "ScheduleKeyDeletion"] {
-        let (status, error) = fixture
-            .call("unregistered", operation, json!({"KeyId":key}))
-            .await;
-        assert_eq!(status, 400);
-        assert_eq!(error["__type"], "AccessDeniedException");
-    }
+    assert_eq!(status, 200, "{bypassed}");
+    let locked = bypassed["KeyMetadata"]["KeyId"].as_str().unwrap();
+    let (status, error) = fixture
+        .call("unregistered", "EnableKeyRotation", json!({"KeyId":locked}))
+        .await;
+    assert_eq!(status, 400);
+    assert_eq!(error["__type"], "AccessDeniedException");
     let (status, default_key) = fixture.call("unregistered", "CreateKey", json!({})).await;
     assert_eq!(status, 200, "{default_key}");
 }

@@ -31,6 +31,7 @@ time.workspace = true
 tokio-rustls.workspace = true
 zeroize.workspace = true
 pem = "=3.0.6"
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [dev-dependencies]
 reqwest.workspace = true

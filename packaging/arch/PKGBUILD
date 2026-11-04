@@ -10,6 +10,7 @@ license=('Apache-2.0')
 depends=('glibc' 'libgcc' 'sqlite>=3.53.4' 'hicolor-icon-theme')
 makedepends=('cargo' 'cargo-about' 'git')
 optdepends=('crun: daemonless compute runtime'
+            'python: prepare and check official Lambda runtimes with locallycloud runtime'
             'postgresql: local RDS runtime'
             'xdg-utils: open the dashboard from the application menu')
 # GCC LTO objects from aws-lc-sys do not link with Rust's lld invocation.

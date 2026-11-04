@@ -589,10 +589,28 @@ pub fn build_rootfs(
     code_dir: &Path,
     layer_dirs: &[PathBuf],
 ) -> Result<Rootfs, LambdaError> {
+    build_rootfs_with_pack(dest, runtime, code_dir, layer_dirs, None, None)
+}
+
+pub(crate) fn build_rootfs_with_pack(
+    dest: &Path,
+    runtime: Option<&str>,
+    code_dir: &Path,
+    layer_dirs: &[PathBuf],
+    pack: Option<&crate::runtime_pack::RuntimePack>,
+    handler: Option<&str>,
+) -> Result<Rootfs, LambdaError> {
     // Start clean.
     let _ = fs::remove_dir_all(dest);
-    for dir in SKELETON {
-        fs::create_dir_all(dest.join(dir)).map_err(io("create rootfs skeleton"))?;
+    match pack {
+        Some(pack) => pack
+            .install(dest)
+            .map_err(io("install official runtime pack"))?,
+        None => {
+            for dir in SKELETON {
+                fs::create_dir_all(dest.join(dir)).map_err(io("create rootfs skeleton"))?;
+            }
+        }
     }
     make_writable(&dest.join("tmp"));
 
@@ -604,12 +622,15 @@ pub fn build_rootfs(
         copy_tree(layer, &dest.join("opt")).map_err(io("merge layer"))?;
     }
 
-    let runtime_entrypoint = entrypoint(runtime);
+    let runtime_entrypoint = match pack {
+        Some(pack) => pack.command(runtime.unwrap_or_default(), handler),
+        None => entrypoint(runtime),
+    };
     let extension_names = discover_extensions(dest)?;
     let entrypoint = if extension_names.is_empty() {
         runtime_entrypoint.clone()
     } else {
-        install_extension_supervisor(dest)?;
+        install_extension_supervisor(dest, pack.is_some())?;
         let mut command = vec![
             "/bin/bash".to_string(),
             "/var/runtime/extension-supervisor".to_string(),
@@ -658,9 +679,10 @@ report_unexpected_exit() {
     local prefix="${api#*/}"
     local host="${authority%:*}"
     local port="${authority##*:}"
-    [[ "$api" == */* && "$host" != "$port" ]] || return 0
+    [[ "$host" != "$port" ]] || return 0
+    if [[ "$api" == */* ]]; then prefix="/$prefix"; else prefix=""; fi
     if exec 3<>"/dev/tcp/$host/$port"; then
-        printf 'POST /%s/locallycloud/supervisor/exit HTTP/1.1\r\nHost: %s\r\nLocallycloud-Exited: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' "$prefix" "$authority" "$exited" >&3
+        printf 'POST %s/locallycloud/supervisor/exit HTTP/1.1\r\nHost: %s\r\nLocallycloud-Exited: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' "$prefix" "$authority" "$exited" >&3
         IFS= read -r -t 2 _ <&3 || true
         exec 3>&-
         exec 3<&-
@@ -738,13 +760,17 @@ fn discover_extensions(dest: &Path) -> Result<Vec<String>, LambdaError> {
     Ok(names)
 }
 
-fn install_extension_supervisor(dest: &Path) -> Result<(), LambdaError> {
-    let shell = find_host_executable("bash")
-        .ok_or_else(|| LambdaError::NotImplemented("Lambda extensions require host bash".into()))?;
-    copy_host_file(&shell, &dest.join("bin/bash"))?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("bash", dest.join("bin/sh")).map_err(io("link extension shell"))?;
-    copy_dynamic_dependencies(&shell, dest, &mut Default::default())?;
+fn install_extension_supervisor(dest: &Path, official: bool) -> Result<(), LambdaError> {
+    if !official {
+        let shell = find_host_executable("bash").ok_or_else(|| {
+            LambdaError::NotImplemented("Lambda extensions require host bash".into())
+        })?;
+        copy_host_file(&shell, &dest.join("bin/bash"))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("bash", dest.join("bin/sh"))
+            .map_err(io("link extension shell"))?;
+        copy_dynamic_dependencies(&shell, dest, &mut Default::default())?;
+    }
     let path = dest.join("var/runtime/extension-supervisor");
     fs::write(&path, EXTENSION_SUPERVISOR).map_err(io("write extension supervisor"))?;
     make_executable(&path);
@@ -1868,15 +1894,37 @@ fn copy_host_file(source: &Path, destination: &Path) -> Result<(), LambdaError> 
 }
 
 /// Recursively copy the contents of `src` into `dst` (which must exist), overlaying files.
+#[cfg(test)]
+pub(crate) fn copy_pack_overlay(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_tree(src, dst)
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let target = dst.join(entry.file_name());
         if file_type.is_dir() {
+            if fs::symlink_metadata(&target).is_ok_and(|meta| !meta.is_dir()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "overlay directory is not a real directory",
+                ));
+            }
             fs::create_dir_all(&target)?;
             copy_tree(&entry.path(), &target)?;
         } else {
+            if !file_type.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "overlay contains a link or special file",
+                ));
+            }
+            match fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             // `fs::copy` preserves the source permission bits (including the exec bit).
             fs::copy(entry.path(), &target)?;
         }

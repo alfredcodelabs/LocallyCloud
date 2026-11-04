@@ -314,13 +314,16 @@ fn execution_level(stage: &Value) -> Result<ExecutionLevel, ApiGwError> {
             "methodSettings contains unsupported fields".into(),
         ));
     }
-    if settings.get("dataTraceEnabled").and_then(Value::as_bool) == Some(true) {
+
+    if settings
+        .get("dataTraceEnabled")
+        .is_some_and(|value| !value.is_boolean())
+    {
         return Err(ApiGwError::BadRequest(
-            "dataTraceEnabled=true is not supported".into(),
+            "methodSettings.dataTraceEnabled must be a boolean".into(),
         ));
     }
     for key in [
-        "dataTraceEnabled",
         "metricsEnabled",
         "cachingEnabled",
         "cacheDataEncrypted",

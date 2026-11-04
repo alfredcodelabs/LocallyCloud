@@ -21,6 +21,12 @@ pub const SUPPORTED_RUNTIMES: &[&str] = &[
     "python3.14",
     "python3.13",
     "python3.12",
+    "python3.11",
+    "ruby4.0",
+    "ruby3.4",
+    "ruby3.3",
+    "dotnet10",
+    "dotnet8",
     "provided.al2023",
     "provided.al2",
 ];

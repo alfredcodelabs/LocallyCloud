@@ -184,7 +184,10 @@ impl YoukiRuntime {
         let mut config: serde_json::Value = serde_json::from_slice(&raw)
             .map_err(|e| exec_failed(format!("parsing config.json: {e}")))?;
 
-        let mut env = vec![serde_json::Value::from("PATH=/usr/local/bin:/usr/bin:/bin")];
+        let mut env = Vec::with_capacity(spec.env.len() + 1);
+        if !spec.env.contains_key("PATH") {
+            env.push(serde_json::Value::from("PATH=/usr/local/bin:/usr/bin:/bin"));
+        }
         for (key, value) in &spec.env {
             env.push(serde_json::Value::from(format!("{key}={value}")));
         }
@@ -197,7 +200,19 @@ impl YoukiRuntime {
         config["process"]["terminal"] = serde_json::Value::Bool(false);
         config["process"]["args"] = serde_json::Value::Array(args);
         config["process"]["env"] = serde_json::Value::Array(env);
-        config["process"]["cwd"] = serde_json::Value::from("/");
+        let cwd = if spec.env.get("LAMBDA_TASK_ROOT").map(String::as_str) == Some("/var/task")
+            && tokio::fs::symlink_metadata(rootfs.join("var"))
+                .await
+                .is_ok_and(|metadata| metadata.is_dir())
+            && tokio::fs::symlink_metadata(rootfs.join("var/task"))
+                .await
+                .is_ok_and(|metadata| metadata.is_dir())
+        {
+            "/var/task"
+        } else {
+            "/"
+        };
+        config["process"]["cwd"] = serde_json::Value::from(cwd);
         config["root"]["path"] = serde_json::Value::from(rootfs.display().to_string());
         config["root"]["readonly"] = serde_json::Value::Bool(true);
         if spec.memory_mb == 0 {
@@ -1437,6 +1452,50 @@ mod tests {
         );
         assert_eq!(value["hooks"]["createContainer"][0]["timeout"], 50);
         assert_eq!(value["process"]["args"], serde_json::json!(["echo", "hi"]));
+        assert_eq!(value["process"]["cwd"], "/");
+        assert_eq!(
+            value["process"]["env"],
+            serde_json::json!(["PATH=/usr/local/bin:/usr/bin:/bin"])
+        );
+        task.env
+            .insert("PATH".into(), "/var/lang/bin:/usr/bin".into());
+        task.env
+            .insert("LAMBDA_TASK_ROOT".into(), "/var/task".into());
+        rt.write_bundle_config(&root, &task, &root, false, 1024, None)
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(value["process"]["cwd"], "/");
+        tokio::fs::create_dir_all(root.join("var/task"))
+            .await
+            .unwrap();
+        rt.write_bundle_config(&root, &task, &root, false, 1024, None)
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(value["process"]["cwd"], "/var/task");
+        let paths: Vec<_> = value["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .filter(|value| value.starts_with("PATH="))
+            .collect();
+        assert_eq!(paths, vec!["PATH=/var/lang/bin:/usr/bin"]);
+        tokio::fs::rename(root.join("var/task"), root.join("var/real-task"))
+            .await
+            .unwrap();
+        tokio::fs::symlink("real-task", root.join("var/task"))
+            .await
+            .unwrap();
+        rt.write_bundle_config(&root, &task, &root, false, 1024, None)
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(value["process"]["cwd"], "/");
         for units in [0, 1, 10] {
             assert!(rt
                 .write_bundle_config(&root, &task, &root, false, units, None)

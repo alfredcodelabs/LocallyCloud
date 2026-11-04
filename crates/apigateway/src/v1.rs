@@ -2485,6 +2485,24 @@ mod tests {
     }
 
     #[test]
+    fn stage_data_trace_is_stored_but_must_be_boolean() {
+        let mut stage = stage_value("stubs", "deployment", &json!({})).unwrap();
+        let body = normalized_stage_patch(
+            &mut stage,
+            &json!({"patchOperations": [
+                {"op":"replace","path":"/*/*/logging/loglevel","value":"INFO"},
+                {"op":"replace","path":"/*/*/logging/dataTrace","value":"true"}
+            ]}),
+        )
+        .unwrap();
+        apply_patch_operations(&mut stage, &body, |_| true).unwrap();
+        assert_eq!(stage["methodSettings"]["*/*"]["dataTraceEnabled"], true);
+        assert!(rest_stage_logging(&stage, "000000000000", "us-east-1", "api", "stubs").is_ok());
+        stage["methodSettings"]["*/*"]["dataTraceEnabled"] = json!("yes");
+        assert!(rest_stage_logging(&stage, "000000000000", "us-east-1", "api", "stubs").is_err());
+    }
+
+    #[test]
     fn patch_supports_coercion_and_rejects_unknown_operations() {
         let mut target = json!({ "enabled": false, "name": "old" });
         apply_patch_operations(

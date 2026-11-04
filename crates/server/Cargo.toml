@@ -58,6 +58,7 @@ axum.workspace = true
 http.workspace = true
 uuid.workspace = true
 time.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 hmac.workspace = true

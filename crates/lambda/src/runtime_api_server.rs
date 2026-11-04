@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use http::{HeaderMap, StatusCode};
+use tower::ServiceExt;
 
 use crate::runtime_api::{
     ExtensionError, FunctionErrorType, InitError, InvocationBroker, Outcome, SupervisedExit,
@@ -58,6 +59,31 @@ pub fn router(broker: Arc<InvocationBroker>) -> Router {
             post(extension_error),
         )
         .with_state(broker)
+}
+
+/// AWS clients require an authority-only endpoint. A private listener scopes the
+/// standard paths to one environment without changing the official runtime client.
+pub fn environment_router(broker: Arc<InvocationBroker>, key: String) -> Router {
+    let native = router(broker);
+    Router::new().fallback(move |mut request: axum::extract::Request| {
+        let native = native.clone();
+        let key = key.clone();
+        async move {
+            let suffix = request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
+            let Ok(uri) = format!("/e/{key}{suffix}").parse() else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            *request.uri_mut() = uri;
+            match native.oneshot(request).await {
+                Ok(response) => response,
+                Err(never) => match never {},
+            }
+        }
+    })
 }
 
 /// `GET .../invocation/next` — long-poll the next invocation for the environment.
@@ -1040,5 +1066,44 @@ mod extension_tests {
             .wait_init_ready("err", Instant::now() + Duration::from_millis(10))
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod scoped_endpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn authority_endpoint_delivers_official_init_error_to_its_environment() {
+        let broker = Arc::new(InvocationBroker::new());
+        broker
+            .discover_expected_extensions("private", vec![], "probe", "$LATEST", "index.handler")
+            .unwrap();
+        let (_, result) = broker.submit(
+            "private",
+            b"{}".to_vec(),
+            "arn:aws:lambda:us-east-1:000000000000:function:probe",
+            1000,
+        );
+        let response = environment_router(broker.clone(), "private".into()).oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/2018-06-01/runtime/init/error")
+                .header("Lambda-Runtime-Function-Error-Type", "Runtime.ImportModuleError")
+                .body(Body::from(r#"{"errorType":"Runtime.ImportModuleError","errorMessage":"missing module"}"#))
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            broker.take_init_error("private").unwrap().error_type,
+            "Runtime.ImportModuleError"
+        );
+        assert!(matches!(
+            result.await.unwrap(),
+            Outcome::Error {
+                error_type: FunctionErrorType::Unhandled,
+                ..
+            }
+        ));
     }
 }

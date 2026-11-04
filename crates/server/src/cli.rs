@@ -9,6 +9,7 @@ Run the LocallyCloud local AWS emulator on one endpoint (default http://127.0.0.
 Commands:
   (none)                  Start the server
   migrate-s3-encryption   Encrypt S3 object bodies stored by an earlier version, then exit
+  runtime <COMMAND>      Install and manage only the Lambda runtimes you use
 
 Options:
   -h, --help              Print this help and exit
@@ -25,10 +26,14 @@ pub enum Command {
     MigrateS3Encryption,
     Help,
     Version,
+    Runtime(crate::runtime_manager::Options),
 }
 
 pub fn parse(arguments: &[String]) -> Result<Command, String> {
     match arguments {
+        [group, rest @ ..] if group == "runtime" => {
+            crate::runtime_manager::parse(rest).map(Command::Runtime)
+        }
         [] => Ok(Command::Serve),
         [single] => match single.as_str() {
             "-h" | "--help" => Ok(Command::Help),
