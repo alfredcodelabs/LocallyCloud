@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class AgentContextTest(unittest.TestCase):
     def setUp(self):
-        parent = ROOT / "target/agent-context-tests"
+        parent = ROOT / "compatibility-tests/.work/agent-context-tests"
         parent.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(prefix="workspace $ literal ", dir=parent)
         self.addCleanup(self.tmp.cleanup)
@@ -24,9 +24,9 @@ class AgentContextTest(unittest.TestCase):
         shutil.copyfile(ROOT / "scripts/agent-context", self.command)
         self.command.chmod(0o755)
         shutil.copyfile(ROOT / ".graphifyignore", self.root / ".graphifyignore")
-        work = self.root / "target/agent-context"
+        work = self.root / "compatibility-tests/.work/agent-context"
         work.mkdir(parents=True)
-        (work / "venv").symlink_to(ROOT / "target/agent-context/venv", target_is_directory=True)
+        (work / "venv").symlink_to(ROOT / "compatibility-tests/.work/agent-context/venv", target_is_directory=True)
         self.document = self.root / "docs/decision.md"
         self.document.parent.mkdir()
         self.document.write_text("# Budget\n\nLocal default: 1024 MiB.\n")
@@ -49,13 +49,13 @@ class AgentContextTest(unittest.TestCase):
         return result
 
     def graph(self):
-        return json.loads((self.root / "target/agent-context/graphify-out/graph.json").read_text())
+        return json.loads((self.root / "compatibility-tests/.work/agent-context/graphify-out/graph.json").read_text())
 
     def request(self):
         return json.loads(self.run_tool("prepare", "docs/decision.md").stdout)["request"]
 
     def fragment(self, value):
-        path = self.root / "target/fragment.json"
+        path = self.root / "compatibility-tests/.work/fragment.json"
         path.write_text(json.dumps({"nodes": [{
             "id": "docs_decision_budget", "label": "Local budget decision",
             "file_type": "rationale", "source_file": str(self.document),
@@ -69,7 +69,7 @@ class AgentContextTest(unittest.TestCase):
         spec.parent.mkdir(parents=True)
         spec.write_text("# Design\nA maintained decision.\n")
         for name in [".aws/credentials", "docs/secret.pem", "crates/demo/.env",
-                     "crates/demo/target/generated.rs"]:
+                     "crates/demo/node_modules/generated.rs"]:
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("pub fn excluded_fixture() {}\n")

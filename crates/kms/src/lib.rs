@@ -123,6 +123,15 @@ impl KmsHandler {
         let principal = dispatcher
             .resolve_caller_arn(&identity)
             .map_err(|_| KmsError::AccessDenied)?;
+        // Permissive mode treats an unregistered caller as the account root, as STS
+        // GetCallerIdentity does; otherwise every explicit key policy denies it and CreateKey
+        // reports a lockout for the standard root-delegation policy.
+        let principal = match principal {
+            None if !dispatcher.strict_sigv4_required() => {
+                Some(format!("arn:aws:iam::{}:root", request.account_id))
+            }
+            resolved => resolved,
+        };
         let mut context = std::collections::BTreeMap::from([(
             "kms:calleraccount".into(),
             vec![request.account_id.clone()],
@@ -327,40 +336,37 @@ impl NativeHandler for KmsHandler {
                     Ok(Value::Object(body)) => {
                         let planned_key_id =
                             (operation == "CreateKey").then(|| uuid::Uuid::new_v4().to_string());
-                        let tagged_create = operation == "CreateKey"
-                            && body
-                                .get("Tags")
+                        let tagged_create_key = planned_key_id.as_deref().filter(|_| {
+                            body.get("Tags")
                                 .and_then(Value::as_array)
-                                .is_some_and(|tags| !tags.is_empty());
-                        let authorization =
-                            if let Some(id) = planned_key_id.as_ref().filter(|_| tagged_create) {
-                                self.authorize_key_policy(
-                                    &request,
-                                    "TagResource",
-                                    crate::model::Scope::new(&request.account_id, &request.region)
-                                        .key_arn(id),
-                                    crate::policy::KeyPolicy::default_for(&request.account_id),
-                                    false,
-                                    &body,
-                                )
-                            } else if matches!(
-                                operation,
+                                .is_some_and(|tags| !tags.is_empty())
+                        });
+                        let authorization = match (operation, tagged_create_key) {
+                            ("CreateKey", Some(id)) => self.authorize_key_policy(
+                                &request,
+                                "TagResource",
+                                crate::model::Scope::new(&request.account_id, &request.region)
+                                    .key_arn(id),
+                                crate::policy::KeyPolicy::default_for(&request.account_id),
+                                false,
+                                &body,
+                            ),
+                            (
                                 "PutKeyPolicy"
-                                    | "DisableKey"
-                                    | "EnableKey"
-                                    | "ScheduleKeyDeletion"
-                                    | "TagResource"
-                                    | "UntagResource"
-                                    | "ListResourceTags"
-                                    | "EnableKeyRotation"
-                                    | "DisableKeyRotation"
-                                    | "GetKeyRotationStatus"
-                                    | "RotateKeyOnDemand"
-                            ) {
-                                self.authorize_key_admin(&request, &body, operation)
-                            } else {
-                                Ok(())
-                            };
+                                | "DisableKey"
+                                | "EnableKey"
+                                | "ScheduleKeyDeletion"
+                                | "TagResource"
+                                | "UntagResource"
+                                | "ListResourceTags"
+                                | "EnableKeyRotation"
+                                | "DisableKeyRotation"
+                                | "GetKeyRotationStatus"
+                                | "RotateKeyOnDemand",
+                                _,
+                            ) => self.authorize_key_admin(&request, &body, operation),
+                            _ => Ok(()),
+                        };
                         let authorization = authorization.and_then(|()| {
                             self.validate_policy_change(
                                 &request,

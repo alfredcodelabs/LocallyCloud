@@ -12,7 +12,7 @@ import sys
 
 VERSION = "0.9.90"
 ROOT = Path(__file__).resolve().parent.parent
-WORK = ROOT / "target/agent-context"
+WORK = ROOT / "compatibility-tests/.work/agent-context"
 VENV = WORK / "venv"
 OUT = WORK / "graphify-out"
 GRAPH = OUT / "graph.json"

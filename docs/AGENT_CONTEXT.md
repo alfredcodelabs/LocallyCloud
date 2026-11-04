@@ -5,7 +5,7 @@
 Graphify is an optional development tool for navigating code, specifications and
 decisions across sessions. It is independent of the emulator and runs locally.
 The repository pins Graphify 0.9.90; each checkout keeps its own environment,
-graph and caches under `target/agent-context/`. Nothing is shared through SQL.
+graph and caches under `compatibility-tests/.work/agent-context/`. Nothing is shared through SQL.
 
 [⚙️ Setup](#setup-and-navigation) · [🧭 Decisions and AWS contracts](#decisions-and-aws-contracts)
 
@@ -37,7 +37,7 @@ changing `.gitignore`. Do not put secrets in the included documents.
 > context. Ordinary indexing and queries make no model calls.
 
 At task start, check status. Unindexed documents are listed in
-`target/agent-context/graphify-out/pending-documents.json`; select the documents
+`compatibility-tests/.work/agent-context/graphify-out/pending-documents.json`; select the documents
 relevant to the task rather than processing the full corpus every session.
 
 ```sh
