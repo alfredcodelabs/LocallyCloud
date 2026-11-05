@@ -38,5 +38,6 @@ zeroize.workspace = true
 futures-util = "0.3"
 
 [dev-dependencies]
+reqwest.workspace = true
 locallycloud-iam-sts.workspace = true
 proptest = "1"

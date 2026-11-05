@@ -673,6 +673,7 @@ impl Provisioner {
                         "RequestModels",
                         "RequestValidatorId",
                         "Integration",
+                        "MethodResponses",
                     ],
                 )?;
                 let previous_id = apigateway_method_id(previous_properties);
@@ -4518,6 +4519,27 @@ impl Provisioner {
         logical_id: &str,
         props: &Value,
     ) -> Result<ResolvedResource, CfnError> {
+        let method_responses = apigateway_responses(
+            props.get("MethodResponses"),
+            logical_id,
+            "MethodResponses",
+            &[
+                ("StatusCode", "statusCode"),
+                ("ResponseParameters", "responseParameters"),
+                ("ResponseModels", "responseModels"),
+            ],
+        )?;
+        let integration_responses = apigateway_responses(
+            props.pointer("/Integration/IntegrationResponses"),
+            logical_id,
+            "Integration.IntegrationResponses",
+            &[
+                ("StatusCode", "statusCode"),
+                ("ResponseParameters", "responseParameters"),
+                ("ResponseTemplates", "responseTemplates"),
+                ("SelectionPattern", "selectionPattern"),
+            ],
+        )?;
         let api = required_property(props, "RestApiId", logical_id)?;
         let resource = required_property(props, "ResourceId", logical_id)?;
         let method = required_property(props, "HttpMethod", logical_id)?;
@@ -4540,12 +4562,24 @@ impl Provisioner {
             logical_id,
         )
         .await?;
+        for (status, body) in method_responses {
+            self.call_json(
+                "apigateway",
+                Method::PUT,
+                &format!(
+                    "/restapis/{api}/resources/{resource}/methods/{method}/responses/{status}"
+                ),
+                body,
+                logical_id,
+            )
+            .await?;
+        }
         if let Some(integration) = props.get("Integration") {
             let body = mapped_properties(
                 integration,
                 &[
                     ("Type", "type"),
-                    ("IntegrationHttpMethod", "integrationHttpMethod"),
+                    ("IntegrationHttpMethod", "httpMethod"),
                     ("Uri", "uri"),
                     ("Credentials", "credentials"),
                     ("RequestParameters", "requestParameters"),
@@ -4563,6 +4597,11 @@ impl Provisioner {
                 logical_id,
             )
             .await?;
+        }
+        for (status, body) in integration_responses {
+            self.call_json("apigateway", Method::PUT,
+                &format!("/restapis/{api}/resources/{resource}/methods/{method}/integration/responses/{status}"),
+                body, logical_id).await?;
         }
         Ok(ResolvedResource {
             ref_value: format!("{api}:{resource}:{method}"),
@@ -7561,6 +7600,53 @@ fn parse_apigateway_method_id(physical_id: &str) -> Option<(&str, &str, &str)> {
     Some((parts.next()?, parts.next()?, parts.next()?))
 }
 
+fn apigateway_responses(
+    value: Option<&Value>,
+    logical_id: &str,
+    property: &str,
+    fields: &[(&str, &str)],
+) -> Result<Vec<(String, Value)>, CfnError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let responses = value.as_array().ok_or_else(|| {
+        CfnError::Validation(format!("{logical_id} property {property} must be a list"))
+    })?;
+    let mut statuses = std::collections::HashSet::new();
+    responses
+        .iter()
+        .map(|response| {
+            let mut body = mapped_object_property(response, logical_id, property, fields)?;
+            let status = match response.get("StatusCode") {
+                Some(Value::String(status)) => status.clone(),
+                Some(Value::Number(status)) => status.to_string(),
+                _ => {
+                    return Err(CfnError::Validation(format!(
+                        "{logical_id} property {property} requires StatusCode"
+                    )))
+                }
+            };
+            if !status.bytes().all(|b| b.is_ascii_digit())
+                || status.len() != 3
+                || !status
+                    .parse::<u16>()
+                    .is_ok_and(|value| (100..=599).contains(&value))
+            {
+                return Err(CfnError::Validation(format!(
+                    "{logical_id} property {property} requires a StatusCode between 100 and 599"
+                )));
+            }
+            if !statuses.insert(status.clone()) {
+                return Err(CfnError::Validation(format!(
+                    "{logical_id} property {property} has duplicate StatusCode {status}"
+                )));
+            }
+            body["statusCode"] = json!(status);
+            Ok((status, body))
+        })
+        .collect()
+}
+
 fn mapped_object_property(
     value: &Value,
     logical_id: &str,
@@ -8662,6 +8748,42 @@ fn enc(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_gateway_response_statuses_are_validated_before_provisioning() {
+        let fields = [
+            ("StatusCode", "statusCode"),
+            ("ResponseTemplates", "responseTemplates"),
+        ];
+        let result = super::apigateway_responses(
+            Some(&serde_json::json!([
+                {"StatusCode":200,"ResponseTemplates":{"application/json":"$input.body"}},
+                {"StatusCode":"400"}
+            ])),
+            "Method",
+            "Integration.IntegrationResponses",
+            &fields,
+        )
+        .unwrap();
+        assert_eq!(result[0].0, "200");
+        assert_eq!(result[0].1["statusCode"], "200");
+        for invalid in [
+            serde_json::json!({"StatusCode":"200"}),
+            serde_json::json!([{}]),
+            serde_json::json!([{"StatusCode":"200/extra"}]),
+            serde_json::json!([{"StatusCode":600}]),
+            serde_json::json!([{"StatusCode":"200"},{"StatusCode":200}]),
+            serde_json::json!([{"StatusCode":200,"Unknown":true}]),
+        ] {
+            assert!(super::apigateway_responses(
+                Some(&invalid),
+                "Method",
+                "Integration.IntegrationResponses",
+                &fields
+            )
+            .is_err());
+        }
+    }
+
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;

@@ -2041,6 +2041,10 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
 }
 
 #[cfg(test)]
+#[path = "blob_isolation_tests.rs"]
+mod blob_isolation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

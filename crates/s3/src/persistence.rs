@@ -203,7 +203,10 @@ fn canonical_null_version(
 
 impl S3Persistence {
     pub(super) fn new(state: Arc<StateDb>) -> Result<Self, String> {
-        let blobs = state.path().with_extension("s3-blobs");
+        let mut blobs = state.path().as_os_str().to_owned();
+        // Keep the entire filename and a distinct suffix, including for extensionless DBs.
+        blobs.push(".s3-blobs-v2");
+        let blobs = PathBuf::from(blobs);
         let new_blobs = !blobs.exists();
         std::fs::create_dir_all(&blobs).map_err(|error| error.to_string())?;
         if new_blobs {
@@ -633,7 +636,13 @@ impl S3Persistence {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
+        let legacy_blobs = self.state.path().with_extension("s3-blobs");
         for path in candidates {
+            if path.parent() == Some(legacy_blobs.as_path()) {
+                // Legacy directories may belong to multiple databases. Keep their existing
+                // references readable, but never unlink data whose owner is ambiguous.
+                continue;
+            }
             if path.parent() != Some(self.blobs.as_path()) {
                 return Err("S3 blob reference escapes private blob directory".into());
             }
@@ -764,6 +773,136 @@ mod tests {
             subkey: String::new(),
             payload: payload.map(|value| encoded(&value).unwrap()),
         }
+    }
+
+    #[test]
+    fn database_filename_extensions_isolate_blob_writes_cleanup_and_restart() {
+        for (first_name, second_name) in [
+            ("state.db", "state.sqlite3"),
+            ("state.sqlite3", "state.db"),
+            ("state", "state.db"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let first_db = Arc::new(StateDb::open(root.path().join(first_name)).unwrap());
+            let first = S3Persistence::new(first_db.clone()).unwrap();
+            let first_blob = first.blobs.join("same-object-name");
+            std::fs::write(&first_blob, b"first database body").unwrap();
+            first
+                .save_delta(
+                    &[
+                        row("bucket", "", Some(json!({"region":"us-east-1"}))),
+                        row("object", "first", Some(json!({"body":{"File":first_blob}}))),
+                    ],
+                    &[],
+                    2,
+                )
+                .unwrap();
+
+            let second_db = Arc::new(StateDb::open(root.path().join(second_name)).unwrap());
+            let second = S3Persistence::new(second_db.clone()).unwrap();
+            assert_ne!(first.blobs, second.blobs);
+            second.remove_orphan_blobs().unwrap();
+            assert_eq!(std::fs::read(&first_blob).unwrap(), b"first database body");
+            let second_blob = second.blobs.join("same-object-name");
+            std::fs::write(&second_blob, b"second database body").unwrap();
+            second
+                .save_delta(
+                    &[
+                        row("bucket", "", Some(json!({"region":"us-east-2"}))),
+                        row(
+                            "object",
+                            "second",
+                            Some(json!({"body":{"File":second_blob}})),
+                        ),
+                    ],
+                    &[],
+                    2,
+                )
+                .unwrap();
+            first.remove_orphan_blobs().unwrap();
+            first
+                .save_delta(&[row("bucket", "", None)], &[], 3)
+                .unwrap();
+            assert!(!first_blob.exists());
+            assert_eq!(
+                std::fs::read(&second_blob).unwrap(),
+                b"second database body"
+            );
+
+            drop(first);
+            let first = S3Persistence::new(first_db).unwrap();
+            first.remove_orphan_blobs().unwrap();
+            drop(second);
+            let second = S3Persistence::new(second_db).unwrap();
+            second.remove_orphan_blobs().unwrap();
+            let loaded: Value = serde_json::from_slice(&second.load().unwrap().unwrap()).unwrap();
+            let body: crate::store::StoredBody = serde_json::from_value(
+                loaded["buckets"][0][2]["objects"]["second"]["body"].clone(),
+            )
+            .unwrap();
+            assert_eq!(body.read_all().unwrap().as_ref(), b"second database body");
+        }
+    }
+
+    #[test]
+    fn ambiguous_legacy_blobs_remain_readable_and_are_never_garbage_collected() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let first_db = Arc::new(StateDb::open(root.path().join("state")).unwrap());
+        let second_db = Arc::new(StateDb::open(root.path().join("state.db")).unwrap());
+        let legacy = first_db.path().with_extension("s3-blobs");
+        assert_eq!(legacy, second_db.path().with_extension("s3-blobs"));
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shared_blob = legacy.join("shared-legacy-body");
+        std::fs::write(&shared_blob, b"legacy body").unwrap();
+        let unowned_blob = legacy.join("unknown-owner");
+        std::fs::write(&unowned_blob, b"other database body").unwrap();
+        let first = S3Persistence::new(first_db).unwrap();
+        let second = S3Persistence::new(second_db.clone()).unwrap();
+        assert_ne!(first.blobs, legacy);
+        assert_ne!(second.blobs, legacy);
+        for persistence in [&first, &second] {
+            persistence
+                .save_delta(
+                    &[
+                        row("bucket", "", Some(json!({"region":"us-east-1"}))),
+                        row(
+                            "object",
+                            "legacy",
+                            Some(json!({"body":{"File":shared_blob}})),
+                        ),
+                    ],
+                    &[],
+                    2,
+                )
+                .unwrap();
+            persistence.remove_orphan_blobs().unwrap();
+        }
+        first
+            .save_delta(&[row("bucket", "", None)], &[], 3)
+            .unwrap();
+        first.remove_orphan_blobs().unwrap();
+        assert!(shared_blob.exists());
+        assert!(unowned_blob.exists());
+        drop(second);
+        let second = S3Persistence::new(second_db).unwrap();
+        let loaded: Value = serde_json::from_slice(&second.load().unwrap().unwrap()).unwrap();
+        let body: crate::store::StoredBody =
+            serde_json::from_value(loaded["buckets"][0][2]["objects"]["legacy"]["body"].clone())
+                .unwrap();
+        assert_eq!(body.read_all().unwrap().as_ref(), b"legacy body");
+        second
+            .save_delta(&[row("bucket", "", None)], &[], 3)
+            .unwrap();
+        assert!(shared_blob.exists());
+        let unrelated = root.path().join("unrelated");
+        std::fs::write(&unrelated, b"not an S3 blob").unwrap();
+        assert!(second
+            .remove_candidates(&BTreeSet::from([unrelated.clone()]))
+            .is_err());
+        assert!(unrelated.exists());
     }
 
     #[test]

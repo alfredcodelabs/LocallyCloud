@@ -705,6 +705,31 @@ mod tests {
 mod body_tests {
     use super::*;
 
+    #[test]
+    fn body_restore_preserves_missing_blob_diagnostics_and_legacy_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-ciphertext");
+        let value = serde_json::json!({"Encrypted": {
+            "version": 1, "logical_len": 3, "id": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "wrapped_key": [],
+            "kms_key": null, "context": {}, "ciphertext": {"File": path}
+        }});
+        let error = serde_json::from_value::<StoredBody>(value)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot restore S3 blob"), "{error}");
+        assert!(error.contains("missing-ciphertext"), "{error}");
+        assert!(error.contains("No such file"), "{error}");
+        assert!(!error.contains("untagged enum"));
+        for value in [
+            serde_json::json!([97, 98]),
+            serde_json::json!({"Inline":[97,98]}),
+            serde_json::json!({"Inline":"YWI="}),
+        ] {
+            let body = serde_json::from_value::<StoredBody>(value).unwrap();
+            assert_eq!(body.read_all().unwrap(), Bytes::from_static(b"ab"));
+        }
+    }
+
     #[tokio::test]
     async fn durable_bodies_retain_no_idle_readers_and_pin_encrypted_composite_streams() {
         let dir = tempfile::tempdir().unwrap();
@@ -893,21 +918,22 @@ impl<'de> Deserialize<'de> for StoredBody {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum CompatibleBody {
-            Durable(DurableBody),
-            LegacyPart(Vec<u8>),
-        }
-        let durable = match CompatibleBody::deserialize(deserializer)? {
-            CompatibleBody::Durable(body) => body,
-            CompatibleBody::LegacyPart(bytes) => DurableBody::Inline(bytes),
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let durable = if value.is_array() {
+            DurableBody::Inline(serde_json::from_value(value).map_err(serde::de::Error::custom)?)
+        } else {
+            serde_json::from_value::<DurableBody>(value).map_err(serde::de::Error::custom)?
         };
         match durable {
             DurableBody::Encrypted(body) => Ok(Self::Encrypted(Arc::new(body))),
             DurableBody::Inline(bytes) => Ok(Self::Inline(Bytes::from(bytes))),
             DurableBody::File(path) => {
-                let metadata = std::fs::metadata(&path).map_err(serde::de::Error::custom)?;
+                let metadata = std::fs::metadata(&path).map_err(|error| {
+                    serde::de::Error::custom(format!(
+                        "cannot restore S3 blob {}: {error}",
+                        path.display()
+                    ))
+                })?;
                 let len = usize::try_from(metadata.len()).map_err(serde::de::Error::custom)?;
                 Ok(Self::DurableFile { path, len })
             }
