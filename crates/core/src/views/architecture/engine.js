@@ -1,35 +1,15 @@
 /* Deterministic review workflow shared by the dashboard page and the optional MCP companion.
    Pure functions: no DOM, no network, no storage. Every input is untrusted and bounded. */
+import * as Catalog from './catalog.js';
+
 export const CATALOG = 1;
 export const STAGES = ['Context', 'Access and data', 'Trust boundaries', 'Risks', 'Decisions'];
 const UNKNOWN = ['unknown', 'not-applicable'];
-const COMPONENTS = new Set([
-  'External actor', 'Process', 'Data store',
-  'AWS::Lambda::Function', 'AWS::StepFunctions::StateMachine', 'AWS::SQS::Queue',
-  'AWS::SNS::Topic', 'AWS::Events::EventBus', 'AWS::Events::Rule',
-  'AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable', 'AWS::S3::Bucket',
-  'AWS::ApiGateway::RestApi', 'AWS::ApiGatewayV2::Api',
-  'AWS::Kinesis::Stream', 'AWS::KinesisFirehose::DeliveryStream',
-]);
-const ASYNC_COMPONENTS = new Set([
-  'AWS::Lambda::Function', 'AWS::StepFunctions::StateMachine', 'AWS::SQS::Queue',
-  'AWS::SNS::Topic', 'AWS::Events::Rule', 'AWS::Kinesis::Stream',
-  'AWS::KinesisFirehose::DeliveryStream',
-]);
-export const catalog = [
-  { id: 'purpose', stage: 0, title: 'What does this system do, and what must it protect?', kind: 'system', category: 'Tampering', choices: ['documented'], explain: 'Describe the business outcome and the impact of misuse.' },
-  { id: 'actors', stage: 0, title: 'Who uses or supplies data to this system?', kind: 'system', category: 'Spoofing', choices: ['internal', 'customers', 'third-parties', 'public'], explain: 'Include operators and external systems, not only application users.', requires: 'purpose' },
-  { id: 'data', stage: 1, title: 'What is the highest sensitivity of the data?', kind: 'system', category: 'Information disclosure', choices: ['public', 'internal', 'sensitive', 'regulated'], explain: 'Record what data is involved; do not paste actual personal data or secrets.', requires: 'actors' },
-  { id: 'tenants', stage: 1, title: 'Does the system separate different customers or tenants?', kind: 'system', category: 'Elevation of privilege', choices: ['single', 'multiple'], explain: 'A shared AWS account does not establish tenant isolation.', requires: 'actors' },
-  { id: 'isolation', stage: 1, title: 'How is access between tenants prevented?', kind: 'system', category: 'Elevation of privilege', choices: ['documented'], explain: 'Describe the enforcement point and tests, not just a tenant ID field.', branch: ['tenants', 'multiple'] },
-  { id: 'access', stage: 1, title: 'Which identities may access this component?', kind: 'node', category: 'Elevation of privilege', choices: ['service-only', 'users', 'third-parties', 'public'], explain: 'Capture intended access. This importer does not evaluate IAM.', requires: 'actors' },
-  { id: 'privilege', stage: 1, title: 'Are this component’s permissions limited to its task?', kind: 'node', category: 'Elevation of privilege', choices: ['declared', 'not-established'], explain: 'Name the permissions and scope to review. A declaration is not a verified control.', localRequires: 'access' },
-  { id: 'boundary', stage: 2, title: 'Does this flow cross a trust boundary?', kind: 'flow', category: 'Spoofing', choices: ['crossing', 'same-trust'], explain: 'Compare identity, owner, tenant, exposure and isolation. Zone colors alone are not proof.', requires: 'actors' },
-  { id: 'identity', stage: 2, title: 'How is the sender authenticated at this boundary?', kind: 'flow', category: 'Spoofing', choices: ['documented', 'not-established'], explain: 'Identify the receiving enforcement point and identity.', localBranch: ['boundary', 'crossing'] },
-  { id: 'payload', stage: 3, title: 'How are untrusted payloads and replayed messages handled?', kind: 'flow', category: 'Tampering', choices: ['documented', 'not-established'], explain: 'Describe validation, size limits and replay protection.', localRequires: 'boundary' },
-  { id: 'retries', stage: 3, title: 'Are retries, duplicates, failures and dead-letter handling bounded?', kind: 'async-node', category: 'Denial of service', choices: ['documented', 'not-established'], explain: 'Record retry budgets, idempotency and DLQ tests.', localRequires: 'access' },
-  { id: 'audit', stage: 4, title: 'What evidence would demonstrate the intended controls?', kind: 'system', category: 'Repudiation', choices: ['documented'], explain: 'List tests, captures and owners. This answer does not verify those controls.', requires: 'data' },
-];
+const SCOPES = ['system', 'node', 'flow'];
+const INACTIVE = ['NOT_RECORDED', 'CONDITIONAL_NOT_RECORDED', 'DELETE_COMPLETE'];
+const PREDICATE_DEPTH = 8;
+/** Question definitions from the catalog: a DAG through `after` (blocking) and `when` (visibility). */
+export const catalog = Catalog.questions().map(q => ({ ...q, after: q.after || [] }));
 const definitions = new Map(catalog.map(q => [q.id, q]));
 function fail(message) { throw new Error(message); }
 function object(value, keys) {
@@ -39,6 +19,63 @@ function string(value, max, required = false) {
   if (typeof value !== 'string' || value.length > max || (required && !value.trim())) { fail('Invalid or oversized text field'); }
   return value.trim();
 }
+/** Validate a visibility predicate against `lookup` (question ID → definition). `scope` is the
+    owner's scope, or null for target-neutral rules. */
+export function validatePredicate(p, scope, lookup = definitions, depth = 0) {
+  const keys = p && typeof p === 'object' && !Array.isArray(p) ? Object.keys(p) : [];
+  if (depth > PREDICATE_DEPTH || !keys.length) { fail('Invalid or too deeply nested predicate'); }
+  if (keys.length === 1 && ['all', 'any'].includes(keys[0])) {
+    if (!Array.isArray(p[keys[0]]) || !p[keys[0]].length) { fail('Predicate lists need entries'); }
+    p[keys[0]].forEach(item => validatePredicate(item, scope, lookup, depth + 1));
+    return;
+  }
+  if (keys.length === 1 && keys[0] === 'not') { validatePredicate(p.not, scope, lookup, depth + 1); return; }
+  const values = Array.isArray(p.is) && p.is.length && p.is.every(v => typeof v === 'string');
+  if ('answer' in p) {
+    object(p, ['answer', 'on', 'is']);
+    const q = lookup.get(p.answer);
+    const compatible = p.on === 'system' ? q?.scope === 'system' : p.on === 'target' && (scope === null || q?.scope === scope);
+    if (!q || !compatible || !values || p.is.some(v => !q.choices.includes(v))) { fail(`Predicate on ${p.answer} has an unknown question, scope or choice`); }
+    return;
+  }
+  object(p, ['fact', 'is']);
+  if (typeof p.fact !== 'string' || !values || (scope !== null && scope !== 'node')) { fail('Fact predicates need a fact, values and a node'); }
+}
+/** Answers a question depends on, as [on, question] pairs: its `after` list and its `when` predicate. */
+function dependencies(q) {
+  const found = q.after.map(d => [d.on, d.question]), pending = q.when ? [q.when] : [];
+  while (pending.length) {
+    const p = pending.pop();
+    if (p.answer) { found.push([p.on, p.answer]); }
+    pending.push(...(p.all || []), ...(p.any || []), ...(p.not ? [p.not] : []));
+  }
+  return found;
+}
+/** Validate question definitions: fields, references, scopes and an acyclic dependency graph. */
+export function checkQuestions(list) {
+  const lookup = new Map();
+  for (const q of list) {
+    if (typeof q.id !== 'string' || !q.id || lookup.has(q.id)) { fail('Missing or duplicate question ID'); }
+    lookup.set(q.id, q);
+  }
+  for (const q of list) {
+    if (!Number.isInteger(q.stage) || !STAGES[q.stage] || !SCOPES.includes(q.scope) || !Catalog.methodology('STRIDE').categories.includes(q.category)) { fail(`Question ${q.id} has an invalid stage, scope or category`); }
+    if ((q.scope === 'node') !== !!Catalog.typeSet(q.types) || !Array.isArray(q.after) || !q.choices?.length || q.choices.some(c => UNKNOWN.includes(c))) { fail(`Question ${q.id} has invalid types, prerequisites or choices`); }
+    for (const d of q.after) { validatePredicate({ answer: d.question, on: d.on, is: lookup.get(d.question)?.choices || [] }, q.scope, lookup); }
+    if (q.when) { validatePredicate(q.when, q.scope, lookup); }
+  }
+  // The graph must stay acyclic so prerequisites always resolve.
+  const state = new Map();
+  const visit = (id) => {
+    if (state.get(id) === 'done') { return; }
+    if (state.get(id) === 'open') { fail(`Question graph has a cycle through ${id}`); }
+    state.set(id, 'open');
+    dependencies(lookup.get(id)).forEach(([, question]) => visit(question));
+    state.set(id, 'done');
+  };
+  list.forEach(q => visit(q.id));
+}
+checkQuestions(catalog);
 export function fresh() { return { catalogVersion: CATALOG, revision: 0, legacy: false, answers: [] }; }
 export function validate(input) {
   if (input == null) { return fresh(); }
@@ -63,13 +100,26 @@ export function targetExists(model, target) {
 export function answer(model, target, question) { return model.review.answers.find(a => a.target === target && a.question === question); }
 function resolved(a) { return a && !a.needsReview && !UNKNOWN.includes(a.value); }
 function usablePrerequisite(a) { return a && !UNKNOWN.includes(a.value); }
+const at = (on, target) => on === 'system' ? 'system' : target;
+/** Evaluate a predicate for `target`. With `current`, answers awaiting review do not count. */
+export function matches(model, target, p, current = false) {
+  if (p.all) { return p.all.every(item => matches(model, target, item, current)); }
+  if (p.any) { return p.any.some(item => matches(model, target, item, current)); }
+  if (p.not) { return !matches(model, target, p.not, current); }
+  if (p.answer) {
+    const a = answer(model, at(p.on, target), p.answer);
+    return usablePrerequisite(a) && (!current || !a.needsReview) && p.is.includes(a.value);
+  }
+  const fact = model.nodes.find(n => 'n:' + n.id === target)?.facts?.find(f => f.id === p.fact);
+  return !!fact && p.is.includes(fact.value);
+}
 function prerequisites(target, definition) {
   const found = new Set(), pending = [[target, definition]];
   while (pending.length) {
     const [scope, q] = pending.pop();
-    for (const [nextTarget, id] of [['system', q.requires], [scope, q.localRequires], ['system', q.branch?.[0]], [scope, q.localBranch?.[0]]]) {
-      const key = nextTarget + '|' + id;
-      if (id && !found.has(key)) { found.add(key); pending.push([nextTarget, definitions.get(id)]); }
+    for (const [on, id] of dependencies(q)) {
+      const nextTarget = at(on, scope), key = nextTarget + '|' + id;
+      if (!found.has(key)) { found.add(key); pending.push([nextTarget, definitions.get(id)]); }
     }
   }
   return found;
@@ -77,25 +127,20 @@ function prerequisites(target, definition) {
 export function questions(model, target = 'system') {
   if (!targetExists(model, target)) { return []; }
   const node = model.nodes.find(n => 'n:' + n.id === target), edge = model.edges.find(e => 'e:' + e.id === target);
-  if (node && (!COMPONENTS.has(node.type) || ['NOT_RECORDED', 'CONDITIONAL_NOT_RECORDED', 'DELETE_COMPLETE'].includes(node.status))) { return []; }
-  const kinds = new Set(['system']);
-  if (node) { kinds.clear(); kinds.add('node'); if (ASYNC_COMPONENTS.has(node.type)) { kinds.add('async-node'); } }
-  if (edge) { kinds.clear(); if (edge.kind !== 'dependency') { kinds.add('flow'); } }
-  return catalog.filter(q => kinds.has(q.kind)).filter(q => {
-    const branch = q.branch || q.localBranch;
-    return !branch || (usablePrerequisite(answer(model, q.branch ? 'system' : target, branch[0])) && answer(model, q.branch ? 'system' : target, branch[0]).value === branch[1]);
-  }).map(q => {
-    const prerequisite = q.requires || q.localRequires;
+  if (node && INACTIVE.includes(node.status)) { return []; }
+  const scope = node ? 'node' : edge ? (edge.kind === 'dependency' ? null : 'flow') : 'system';
+  return catalog.filter(q => q.scope === scope && (!node || Catalog.typeSet(q.types).includes(node.type)) && (!q.when || matches(model, target, q.when))).map(q => {
     const inherited = [...prerequisites(target, q)].find(key => {
       const separator = key.lastIndexOf('|');
       const a = answer(model, key.slice(0, separator), key.slice(separator + 1));
       return a?.value === 'not-applicable' && !a.needsReview && !!a.note.trim();
     });
     const notApplicable = !!inherited;
-    const prior = prerequisite ? answer(model, q.requires ? 'system' : target, prerequisite) : null;
-    const blocked = notApplicable || (prerequisite && !usablePrerequisite(prior));
-    const blockedReason = notApplicable ? `Not applicable: prerequisite ${inherited} has a current justified N/A. Change that answer to reopen this question.` : blocked ? 'Answer ' + prerequisite + ' first; unknown answers remain pending.' : '';
-    return { ...q, choices: [...q.choices, ...UNKNOWN], target, notApplicable, prerequisiteNeedsReview: prior?.needsReview === true, blocked: !!blocked, blockedReason, answer: answer(model, target, q.id) || null };
+    const priors = q.after.map(d => answer(model, at(d.on, target), d.question));
+    const waiting = q.after.find((d, i) => !usablePrerequisite(priors[i]));
+    const blocked = notApplicable || !!waiting;
+    const blockedReason = notApplicable ? `Not applicable: prerequisite ${inherited} has a current justified N/A. Change that answer to reopen this question.` : waiting ? 'Answer ' + waiting.question + ' first; unknown answers remain pending.' : '';
+    return { ...q, choices: [...q.choices, ...UNKNOWN], target, notApplicable, prerequisiteNeedsReview: priors.some(a => a?.needsReview === true), blocked, blockedReason, waitingOn: waiting?.question || '', answer: answer(model, target, q.id) || null };
   });
 }
 export function pending(model) {

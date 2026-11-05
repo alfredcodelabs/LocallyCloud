@@ -106,6 +106,30 @@ for (const t of threats.values()) {
   }
   rate(t.risk);
 }
+const typeSets = new Map(Object.entries(data.typeSets));
+const rules = index(data.riskRules, "risk rule");
+const categories = new Set(
+  [...methodologies.values()].flatMap((m) => m.categories),
+);
+for (const r of rules.values()) {
+  const changes = [r.raise, r.lower].filter(Boolean);
+  if (
+    !r.title?.en ||
+    !changes.length ||
+    (r.categories || []).some((c) => !categories.has(c))
+  ) {
+    fail(`Risk rule ${r.id} needs a title, a change and known categories`);
+  }
+  for (const change of changes) {
+    for (const [group, values] of Object.entries(change)) {
+      const names = data.risk[group];
+      if (!names) {
+        fail(`Risk rule ${r.id} changes an unknown factor group`);
+      }
+      factors({ ...Object.fromEntries(names.map((n) => [n, 0])), ...values }, names, group);
+    }
+  }
+}
 
 export const VERSION = data.version;
 export const SEVERITIES = ["note", "low", "medium", "high", "critical"];
@@ -117,3 +141,8 @@ export const threatIds = () => [...threats.keys()];
 /** Localized catalog text, falling back to English. */
 export const label = (entry, language) =>
   entry?.title?.[language] || entry?.title?.en || "";
+/** Review questions as data: a DAG through `after` and `when` (validated by the engine). */
+export const questions = () => data.questions;
+export const typeSet = (name) => typeSets.get(name);
+export const riskRules = () => [...rules.values()];
+export const riskRule = (id) => rules.get(id);

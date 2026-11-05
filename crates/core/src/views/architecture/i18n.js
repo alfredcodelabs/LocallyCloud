@@ -145,6 +145,7 @@ export const I18N = {
     "arCheck_evidence-questions": "Unanswered evidence questions",
     "arCheck_needs-review": "Answers or findings to review again",
     "arCheck_orphaned-findings": "Findings on removed elements",
+    arRiskAdjusted: "Risk factors adjusted by the review answers (catalog severity: {base}): {rules}",
     arCatalog: "OWASP catalog assessment",
     arCatalogNote:
       "Catalog threats that apply to each element, checked against the declared configuration. Declared means the template shows the controls, not that they were observed or tested; review means no fact shows them. Record a finding to take a decision.",
@@ -512,6 +513,7 @@ export const I18N = {
     "arCheck_evidence-questions": "Preguntas de evidencia sin responder",
     "arCheck_needs-review": "Respuestas o hallazgos por revisar de nuevo",
     "arCheck_orphaned-findings": "Hallazgos sobre elementos eliminados",
+    arRiskAdjusted: "Factores de riesgo ajustados por las respuestas de la revisión (severidad del catálogo: {base}): {rules}",
     arCatalog: "Evaluación del catálogo OWASP",
     arCatalogNote:
       'Amenazas del catálogo que aplican a cada elemento, contrastadas con la configuración declarada. "Declarado" significa que la plantilla muestra los controles, no que se hayan observado o probado; "por revisar" significa que ningún hecho los muestra. Registra un hallazgo para tomar una decisión.',
@@ -883,6 +885,7 @@ export const I18N = {
     "arCheck_evidence-questions": "Perguntas de evidência sem resposta",
     "arCheck_needs-review": "Respostas ou achados a revisar novamente",
     "arCheck_orphaned-findings": "Achados sobre elementos removidos",
+    arRiskAdjusted: "Fatores de risco ajustados pelas respostas da revisão (severidade do catálogo: {base}): {rules}",
     arCatalog: "Avaliação do catálogo OWASP",
     arCatalogNote:
       'Ameaças do catálogo que se aplicam a cada elemento, comparadas com a configuração declarada. "Declarado" significa que o template mostra os controles, não que foram observados ou testados; "a revisar" significa que nenhum fato os mostra. Registre um achado para tomar uma decisão.',

@@ -389,7 +389,7 @@ export function mount(root, ctx) {
     }
     return q.blocked
       ? t("arBlocked", {
-          prerequisite: questionName(q.requires || q.localRequires || ""),
+          prerequisite: questionName(q.waitingOn),
         })
       : "";
   }
@@ -1384,6 +1384,18 @@ export function mount(root, ctx) {
           item.catalogId,
         ].join(" · "),
       }),
+      item.rules.length
+        ? h("p", {
+            cls: "ar-rules",
+            title: item.rules.join("\n"),
+            text: t("arRiskAdjusted", {
+              base: severityLabel(item.baseSeverity),
+              rules: item.rules
+                .map((id) => Catalog.label(Catalog.riskRule(id), ctx.lang()))
+                .join("; "),
+            }),
+          })
+        : null,
       h(
         "ul",
         { cls: "ar-controls" },

@@ -35,6 +35,42 @@ function control(id, node) {
   return { id, state, facts };
 }
 
+const RULES = Catalog.riskRules();
+for (const rule of RULES) {
+  Review.validatePredicate(rule.when, null);
+}
+
+/** Catalog risk factors adjusted by the review's current answers, with the rules that changed them. */
+function adjusted(model, target, threat) {
+  const risk = structuredClone(threat.risk),
+    rules = [];
+  for (const rule of RULES) {
+    if (
+      (rule.categories && !rule.categories.includes(threat.category)) ||
+      !Review.matches(model, target, rule.when, true)
+    ) {
+      continue;
+    }
+    let changed = false;
+    for (const [direction, pick] of [
+      [rule.raise, Math.max],
+      [rule.lower, Math.min],
+    ]) {
+      for (const [group, values] of Object.entries(direction || {})) {
+        for (const [name, value] of Object.entries(values)) {
+          const next = pick(risk[group][name], value);
+          changed ||= next !== risk[group][name];
+          risk[group][name] = next;
+        }
+      }
+    }
+    if (changed) {
+      rules.push(rule.id);
+    }
+  }
+  return { risk, rules };
+}
+
 function state(controls) {
   if (controls.some((c) => c.state === "unmet")) {
     return "gap";
@@ -60,7 +96,7 @@ export function assess(model) {
   const items = [];
   for (const id of Catalog.threatIds()) {
     const threat = Catalog.threat(id),
-      rating = Catalog.rate(threat.risk);
+      base = Catalog.rate(threat.risk).severity;
     for (const element of elements) {
       if (
         element.flow
@@ -71,11 +107,15 @@ export function assess(model) {
       }
       const controls = threat.controls.map((c) => control(c, element.node));
       const finding = recorded.get(id + "|" + element.target);
+      const { risk, rules } = adjusted(model, element.target, threat);
       items.push({
         catalogId: id,
         target: element.target,
         category: threat.category,
-        severity: rating.severity,
+        severity: Catalog.rate(risk).severity,
+        baseSeverity: base,
+        risk,
+        rules,
         state: state(controls),
         controls,
         finding: finding
@@ -111,6 +151,12 @@ export function summary(items) {
       declared: 0,
       items: [],
     };
+    if (
+      Catalog.SEVERITIES.indexOf(item.severity) >
+      Catalog.SEVERITIES.indexOf(group.severity)
+    ) {
+      group.severity = item.severity;
+    }
     group.total++;
     group[item.state]++;
     group.recorded += Number(!!item.finding);
@@ -127,7 +173,7 @@ export function draft(item, language) {
   return {
     methodology: threat.methodology,
     catalogId: threat.id,
-    risk: structuredClone(threat.risk),
+    risk: structuredClone(item.risk),
     category: threat.category,
     target: item.target,
     title: Catalog.label(threat, language),
