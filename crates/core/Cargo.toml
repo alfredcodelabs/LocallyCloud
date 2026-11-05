@@ -30,8 +30,12 @@ sha2.workspace = true
 time.workspace = true
 tokio-rustls.workspace = true
 zeroize.workspace = true
+flate2.workspace = true
 pem = "=3.0.6"
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+[build-dependencies]
+flate2.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

@@ -2540,6 +2540,7 @@ dependencies = [
  "bytes",
  "ciborium",
  "dashmap",
+ "flate2",
  "hmac 0.12.1",
  "http",
  "http-body-util",
