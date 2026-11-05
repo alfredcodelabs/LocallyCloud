@@ -18,6 +18,8 @@ change re-opens. You keep the judgment; the tool does the bookkeeping.
   Rating Methodology, and references to ASVS 5.0, Top 10:2025 and API Top 10:2023.
 - **Agents that propose, people that decide.** An MCP companion lets an AI agent
   fill in the review quickly; every proposal waits for your approval.
+- **Works with Threat Dragon.** Open OWASP Threat Dragon v2 models and export
+  reviews back to them.
 - **Local and private.** Runs inside the emulator on your machine. No account, no
   upload, no telemetry.
 
@@ -125,6 +127,23 @@ flows appear or disappear. A review saved without digests re-opens everything.
 Saved views restrict the diagram to selected resources with their own layout; they
 share answers and findings with the full review. **Export SVG** writes the current
 diagram.
+
+### OWASP Threat Dragon
+
+**Export Threat Dragon** writes a [Threat Dragon](https://owasp.org/www-project-threat-dragon/)
+v2 model that opens in Threat Dragon 2.x: components become actors, processes and
+stores, configured and proposed flows become data flows, trust zones become trust
+boundary boxes, and recorded findings become threats with their status, severity
+and mitigation. Answers, facts, digests, evidence states and system-level findings
+stay in the review JSON, and dependencies are not data flows, so they are not
+exported. The dashboard lists what was left out.
+
+**Open review JSON** also accepts a Threat Dragon v2 model and turns it into a
+design review: every element is a proposed component or flow, each diagram becomes
+a saved view, and boxes become trust zones for the components inside them. STRIDE
+threats become findings that await review; closed threats without a mitigation or
+description are reopened. Threats of other methodologies, curved boundaries and
+flows without two connected components are skipped and listed.
 
 ## Agent companion (MCP)
 

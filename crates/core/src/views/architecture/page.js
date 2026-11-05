@@ -3,6 +3,7 @@ import * as Catalog from "./catalog.js";
 import * as R from "./engine.js";
 import { I18N } from "./i18n.js";
 import * as M from "./model.js";
+import * as TD from "./threatdragon.js";
 
 const TOPOLOGY_URL = "/_locallycloud/views/architecture/topology";
 const ICONS_URL = "/_locallycloud/icons.svg";
@@ -503,7 +504,7 @@ export function mount(root, ctx) {
           }),
           h(
             "label",
-            { cls: "ar-file" },
+            { cls: "ar-file", title: t("arOpenJsonHint") },
             h("span", { text: t("arOpenJson") }),
             h("input", {
               id: "ar-import",
@@ -523,6 +524,12 @@ export function mount(root, ctx) {
             id: "ar-export-svg",
             text: t("arExportSvg"),
             onclick: exportSvg,
+          }),
+          h("button", {
+            type: "button",
+            id: "ar-export-threat-dragon",
+            text: t("arExportThreatDragon"),
+            onclick: exportThreatDragon,
           }),
           h("a", {
             href: ctx.contextual(ctx.homePath() + "architecture/"),
@@ -2061,13 +2068,17 @@ export function mount(root, ctx) {
       if (dirty && !confirm(t("arConfirmReplace"))) {
         return;
       }
-      const next = M.importModel(M.parse(raw));
+      const parsed = M.parse(raw);
+      const dragon = TD.isThreatDragon(parsed)
+        ? TD.fromThreatDragon(parsed)
+        : null;
+      const next = dragon ? dragon.model : M.importModel(parsed);
       const merged = next.documentType === "snapshot" && model;
       model = merged ? M.merge(model, next) : next;
       selected = model.nodes.length ? "n:" + model.nodes[0].id : "";
       editing = null;
       $("threat-form").hidden = true;
-      dirty = next.documentType !== "review";
+      dirty = !!dragon || next.documentType !== "review";
       proposal = null;
       questionIndex = 0;
       activeView = "";
@@ -2077,7 +2088,13 @@ export function mount(root, ctx) {
         scope = model.scope.stack;
       const mismatch =
         scope && scope !== stack && !scope.includes(`:stack/${stack}/`);
-      announce(t(mismatch ? "arOpenedOtherStack" : "arOpened"), mismatch);
+      if (dragon) {
+        announce(
+          t("arImportedThreatDragon", { skipped: notCarried(dragon.skipped) }),
+        );
+      } else {
+        announce(t(mismatch ? "arOpenedOtherStack" : "arOpened"), mismatch);
+      }
     } catch (error) {
       fail(error);
     }
@@ -2096,6 +2113,25 @@ export function mount(root, ctx) {
       dirty = false;
       renderReview();
       announce(t("arSaved"));
+    } catch (error) {
+      fail(error);
+    }
+  }
+  function notCarried(counts) {
+    const items = Object.entries(counts).map(([key, n]) =>
+      t("arTd_" + key, { n }),
+    );
+    return items.length ? t("arTdNotCarried", { items: items.join("; ") }) : "";
+  }
+  function exportThreatDragon() {
+    try {
+      const { document: exported, omitted } = TD.toThreatDragon(model);
+      download(
+        fileName("threat-dragon.json"),
+        JSON.stringify(exported, null, 2),
+        "application/json",
+      );
+      announce(t("arExportedThreatDragon", { omitted: notCarried(omitted) }));
     } catch (error) {
       fail(error);
     }
