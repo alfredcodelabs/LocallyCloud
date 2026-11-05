@@ -104,3 +104,11 @@
 .ar .ar-assessed.gap { border-left: 3px solid var(--bad); }
 .ar .ar-assessed.review { border-left: 3px solid var(--warn); }
 .ar .ar-catalog-items { margin: 4px 0; padding-left: 18px; font-size: 12px; }
+.ar .ar-off { display: none !important; }
+.ar .ar-phases { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+.ar .ar-phases button { font-size: 13px; padding: 6px 10px; }
+.ar .ar-phases button[aria-current="step"] { border-color: var(--accent); font-weight: 700; }
+.ar .ar-phases .badge { margin-left: 4px; }
+.ar .ar-coverage { list-style: none; padding: 0; margin: 8px 0; font-size: 13px; display: grid; gap: 8px; }
+.ar .ar-coverage li.ready { color: var(--ok); }
+.ar .ar-coverage button.link { margin-right: 8px; }

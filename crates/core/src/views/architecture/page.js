@@ -148,8 +148,10 @@ export function mount(root, ctx) {
     }
   };
   window.addEventListener("beforeunload", unload);
+  let resized = null;
   function unmount() {
     controller.abort();
+    resized?.disconnect();
     window.removeEventListener("beforeunload", unload);
     timers.forEach(clearTimeout);
     timers.clear();
@@ -287,6 +289,8 @@ export function mount(root, ctx) {
     drag = null,
     activeView = "";
   let assessment = [];
+  let phase = A.PHASES[0].id,
+    autoFit = true;
   let dirty = false,
     questionIndex = 0,
     proposal = null,
@@ -297,6 +301,20 @@ export function mount(root, ctx) {
   function changed() {
     dirty = true;
     proposal = null;
+  }
+  const phaseStages = () => A.PHASES.find((p) => p.id === phase).stages;
+  function showPhase(next) {
+    phase = next;
+    questionIndex = 0;
+    render();
+  }
+  /** Fit the diagram to the viewport width until the reviewer zooms; never below legible text. */
+  function fit() {
+    const width = $("viewport")?.clientWidth;
+    if (!autoFit || !model || !width) {
+      return;
+    }
+    scale = Math.max(0.6, Math.min(1, width / extent().width));
   }
   function topologyChanged() {
     model = R.invalidate(model);
@@ -520,9 +538,26 @@ export function mount(root, ctx) {
       }),
       h("p", { cls: "dim ar-evidence", text: t("arEvidenceNote") }),
       h("p", { cls: "dim", id: "ar-counts" }),
+      h("nav", {
+        id: "ar-phases",
+        cls: "ar-phases",
+        "aria-label": t("arPhases"),
+      }),
+      h("p", { id: "ar-phase-note", cls: "dim" }),
+      h(
+        "section",
+        {
+          cls: "panel ar-register-panel",
+          id: "ar-coverage-panel",
+          "data-phase": "validation",
+        },
+        h("div", { cls: "phead" }, h("h2", { text: t("arCoverage") })),
+        h("p", { cls: "dim", text: t("arCoverageNote") }),
+        h("ul", { id: "ar-coverage", cls: "ar-coverage" }),
+      ),
       h(
         "details",
-        { cls: "ar-box" },
+        { cls: "ar-box", "data-phase": "scope" },
         h("summary", { text: t("arUnresolved") }),
         h("p", { cls: "dim", text: t("arUnresolvedNote") }),
         h("ul", { id: "ar-unresolved-list" }),
@@ -575,6 +610,7 @@ export function mount(root, ctx) {
                 "aria-label": t("arZoomOut"),
                 text: "−",
                 onclick: () => {
+                  autoFit = false;
                   scale = Math.max(0.25, scale - 0.25);
                   renderGraph();
                 },
@@ -584,6 +620,7 @@ export function mount(root, ctx) {
                 "aria-label": t("arZoomIn"),
                 text: "+",
                 onclick: () => {
+                  autoFit = false;
                   scale = Math.min(2.5, scale + 0.25);
                   renderGraph();
                 },
@@ -592,10 +629,8 @@ export function mount(root, ctx) {
                 type: "button",
                 text: t("arFit"),
                 onclick: () => {
-                  scale = Math.max(
-                    0.25,
-                    Math.min(1, $("viewport").clientWidth / extent().width),
-                  );
+                  autoFit = true;
+                  fit();
                   renderGraph();
                   $("viewport").scrollTo(0, 0);
                 },
@@ -740,7 +775,11 @@ export function mount(root, ctx) {
           },
           h(
             "section",
-            { cls: "ar-guided", "aria-label": t("arGuided") },
+            {
+              cls: "ar-guided",
+              "aria-label": t("arGuided"),
+              "data-phase": "scope threats validation",
+            },
             h("h3", { text: t("arGuided") }),
             h("p", { id: "ar-save-state", cls: "dim", role: "status" }),
             field(
@@ -841,11 +880,15 @@ export function mount(root, ctx) {
           ),
           h("h3", { id: "ar-element-name", cls: "ar-wrap" }),
           h("p", { id: "ar-element-info", cls: "ar-pre ar-mono" }),
-          h("h4", { id: "ar-facts-title", text: t("arFacts") }),
-          h("dl", { id: "ar-facts", cls: "ar-facts" }),
           h(
             "div",
-            { id: "ar-zone-editor" },
+            { "data-phase": "scope threats" },
+            h("h4", { id: "ar-facts-title", text: t("arFacts") }),
+            h("dl", { id: "ar-facts", cls: "ar-facts" }),
+          ),
+          h(
+            "div",
+            { id: "ar-zone-editor", "data-phase": "scope" },
             field(
               t("arZone"),
               h("select", { id: "ar-zone", onchange: setZone }),
@@ -871,7 +914,7 @@ export function mount(root, ctx) {
           ),
           h(
             "section",
-            null,
+            { "data-phase": "threats" },
             h(
               "h3",
               null,
@@ -882,7 +925,7 @@ export function mount(root, ctx) {
           ),
           h(
             "section",
-            null,
+            { "data-phase": "threats" },
             h(
               "h3",
               null,
@@ -893,7 +936,7 @@ export function mount(root, ctx) {
           ),
           h(
             "section",
-            null,
+            { "data-phase": "threats responses validation" },
             h("h3", { text: t("arThreats") }),
             h("div", { id: "ar-threat-list" }),
             h("button", {
@@ -995,14 +1038,22 @@ export function mount(root, ctx) {
       ),
       h(
         "section",
-        { cls: "panel ar-register-panel", id: "ar-catalog-panel" },
+        {
+          cls: "panel ar-register-panel",
+          id: "ar-catalog-panel",
+          "data-phase": "threats",
+        },
         h("div", { cls: "phead" }, h("h2", { text: t("arCatalog") })),
         h("p", { cls: "dim", text: t("arCatalogNote") }),
         h("div", { id: "ar-catalog-groups" }),
       ),
       h(
         "section",
-        { cls: "panel ar-register-panel", id: "ar-register-panel" },
+        {
+          cls: "panel ar-register-panel",
+          id: "ar-register-panel",
+          "data-phase": "responses validation",
+        },
         h("div", { cls: "phead" }, h("h2", { text: t("arRegister") })),
         h("p", { cls: "dim", text: t("arRegisterNote") }),
         h(
@@ -1090,6 +1141,14 @@ export function mount(root, ctx) {
     canvas.onpointercancel = () => {
       drag = null;
     };
+    resized?.disconnect();
+    resized = new ResizeObserver(() => {
+      if (autoFit && model) {
+        fit();
+        renderGraph();
+      }
+    });
+    resized.observe($("viewport"));
   }
 
   function extent() {
@@ -1504,6 +1563,8 @@ export function mount(root, ctx) {
     $("workspace").hidden = !model;
     $("register-panel").hidden = !model;
     $("catalog-panel").hidden = !model;
+    $("coverage-panel").hidden = !model;
+    $("phases").hidden = !model;
     if (!model) {
       $("title").textContent = ctx.stack;
       $("scope").textContent = loading ? t("loading") : loadError;
@@ -1615,6 +1676,8 @@ export function mount(root, ctx) {
       );
     }
     assessment = A.assess(graph);
+    renderPhases(graph);
+    fit();
     renderGraph();
     renderCatalog();
     renderInspector();
@@ -1624,7 +1687,79 @@ export function mount(root, ctx) {
     return R.questions(
       model,
       $("review-scope").value === "system" ? "system" : selected,
+    ).filter((q) => phaseStages().includes(q.stage));
+  }
+  function renderPhases(graph) {
+    const result = A.coverage(graph);
+    const open = (id) =>
+      result.checks
+        .filter((c) => c.phase === id)
+        .reduce((sum, c) => sum + c.count, 0);
+    $("phases").replaceChildren(
+      ...A.PHASES.map((p, i) =>
+        h(
+          "button",
+          {
+            type: "button",
+            "aria-current": p.id === phase ? "step" : "false",
+            onclick: () => showPhase(p.id),
+          },
+          `${i + 1}. ${t("arPhase_" + p.id)} `,
+          h("span", { cls: "badge", text: String(open(p.id)) }),
+        ),
+      ),
     );
+    $("phase-note").textContent = t("arPhaseNote_" + phase);
+    for (const element of root.querySelectorAll("[data-phase]")) {
+      element.classList.toggle(
+        "ar-off",
+        !element.dataset.phase.split(" ").includes(phase),
+      );
+    }
+    $("coverage").replaceChildren(
+      ...(result.ready
+        ? [h("li", { cls: "ready", text: t("arCoverageReady") })]
+        : result.checks
+            .filter((c) => c.count)
+            .map((c) =>
+              h(
+                "li",
+                null,
+                h("strong", {
+                  text: `${t("arCheck_" + c.id)} (${c.count}) · ${t("arPhase_" + c.phase)}`,
+                }),
+                " ",
+                ...c.targets.slice(0, 8).map((target) => coverageLink(c, target)),
+                c.count > 8
+                  ? h("span", {
+                      cls: "dim",
+                      text: t("arCoverageMore", { count: c.count - 8 }),
+                    })
+                  : null,
+              ),
+            )),
+    );
+  }
+  function coverageLink(check, target) {
+    if (!R.targetExists(model, target)) {
+      return h("span", { cls: "dim", text: labelTarget(target) + " " });
+    }
+    return h("button", {
+      type: "button",
+      cls: "link",
+      text: target === "system" ? t("arWholeSystem") : labelTarget(target),
+      onclick: () => {
+        phase = check.phase;
+        $("review-scope").value = target === "system" ? "system" : "element";
+        if (target === "system") {
+          questionIndex = 0;
+          render();
+        } else {
+          choose(target);
+        }
+        $("inspector").scrollIntoView({ block: "nearest" });
+      },
+    });
   }
   function renderReview() {
     $("save-state").textContent = t(dirty ? "arUnsaved" : "arExplicitSave");
@@ -1635,7 +1770,7 @@ export function mount(root, ctx) {
     box.replaceChildren();
     const graph = diagram();
     $("review-steps").replaceChildren(
-      ...R.STAGES.map((_, stage) => {
+      ...phaseStages().map((stage) => {
         const destination = [
           "system",
           selected,

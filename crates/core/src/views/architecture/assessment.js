@@ -1,4 +1,5 @@
 import * as Catalog from "./catalog.js";
+import * as Review from "./engine.js";
 export const STATES = ["gap", "review", "declared"];
 
 export const CONTROL_STATES = ["met", "unmet", "unknown"];
@@ -135,4 +136,66 @@ export function draft(item, language) {
       .join("\n"),
     note: evidence.join("\n"),
   };
+}
+
+/** The four OWASP threat modeling questions, with the review stages each one asks. */
+export const PHASES = [
+  { id: "scope", stages: [0, 1, 2] },
+  { id: "threats", stages: [3] },
+  { id: "responses", stages: [] },
+  { id: "validation", stages: [4] },
+];
+const QUESTION_CHECKS = ["scope-questions", "risk-questions", "evidence-questions"];
+
+function phaseOf(stage) {
+  return PHASES.find((p) => p.stages.includes(stage)).id;
+}
+
+/** What the review still lacks, per OWASP question, with the targets to visit. */
+export function coverage(model) {
+  const present = new Set([
+    "system",
+    ...model.nodes.map((n) => "n:" + n.id),
+    ...model.edges.map((e) => "e:" + e.id),
+  ]);
+  const unique = (targets) => [...new Set(targets)];
+  const pending = Review.pending(model);
+  const questions = (phase) =>
+    unique(pending.filter((q) => phaseOf(q.stage) === phase).map((q) => q.target));
+  const items = assess(model);
+  // Components are the nodes the review asks about; configuration glue needs no zone.
+  const components = model.nodes.filter(
+    (n) => n.status !== "INFERRED" && Review.questions(model, "n:" + n.id).length > 0,
+  );
+  const checks = [
+    { id: QUESTION_CHECKS[0], phase: "scope", targets: questions("scope") },
+    { id: "unresolved", phase: "scope", targets: unique(model.unresolved.map((u) => "n:" + u.target)) },
+    { id: "unzoned", phase: "scope", targets: components.filter((n) => !n.zone).map((n) => "n:" + n.id) },
+    { id: QUESTION_CHECKS[1], phase: "threats", targets: questions("threats") },
+    {
+      id: "unrecorded-gaps",
+      phase: "threats",
+      targets: unique(items.filter((i) => i.state === "gap" && !i.finding).map((i) => i.target)),
+    },
+    {
+      id: "open-findings",
+      phase: "responses",
+      targets: unique(model.threats.filter((t) => t.status === "open").map((t) => t.target)),
+    },
+    { id: QUESTION_CHECKS[2], phase: "validation", targets: questions("validation") },
+    {
+      id: "needs-review",
+      phase: "validation",
+      targets: unique([
+        ...model.review.answers.filter((a) => a.needsReview).map((a) => a.target),
+        ...model.threats.filter((t) => t.needsReview).map((t) => t.target),
+      ]),
+    },
+    {
+      id: "orphaned-findings",
+      phase: "validation",
+      targets: unique(model.threats.filter((t) => !present.has(t.target)).map((t) => t.target)),
+    },
+  ].map((c) => ({ ...c, count: c.targets.length }));
+  return { checks, ready: checks.every((c) => c.count === 0) };
 }
