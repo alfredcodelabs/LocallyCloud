@@ -19,7 +19,7 @@ pub struct TaskSpec {
     pub env: HashMap<String, String>,
     /// Memory limit in MB.
     pub memory_mb: u32,
-    /// vCPU count (used by the Firecracker backend).
+    /// vCPU count, applied as the guest CPU quota.
     pub vcpu_count: u32,
 }
 
@@ -48,8 +48,6 @@ pub enum RuntimeError {
     TaskAlreadyCompleted { task_id: String },
     #[error("KVM unavailable: {reason}")]
     KvmUnavailable { reason: String },
-    #[error("firecracker control socket unreachable: {path}")]
-    FirecrackerSocketUnreachable { path: String },
     #[error("microVM boot failed: {reason}")]
     BootFailed { reason: String },
     #[error("OCI runtime not found: {binary}")]

@@ -8,13 +8,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Which compute runtime to use, when overridden explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeChoice {
-    Firecracker,
-    Youki,
-}
-
 /// Shape of the SQS queue URLs returned to clients (`LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqsEndpointStrategy {
@@ -47,8 +40,8 @@ pub struct LocallyCloudConfig {
     pub max_request_body_bytes: usize,
     /// Graceful shutdown grace period. Default: 5s.
     pub shutdown_grace_period: Duration,
-    /// Runtime override: `None` = auto-detect.
-    pub runtime_override: Option<RuntimeChoice>,
+    /// Retired settings present in the environment; they no longer have an effect.
+    pub ignored_settings: Vec<&'static str>,
     /// AWS account id used in ARNs and responses. Default: `000000000000`.
     pub account_id: String,
     /// Default AWS region applied when a request carries none. Default: `us-east-1`.
@@ -175,6 +168,8 @@ const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 5;
 const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
+/// Settings that no longer change behavior: compute selection was removed with Firecracker.
+const RETIRED_SETTINGS: &[&str] = &["LOCALLYCLOUD_RUNTIME", "LOCALSTACK_RUNTIME"];
 const DEFAULT_ACCOUNT_ID: &str = "000000000000";
 const DEFAULT_REGION: &str = "us-east-1";
 
@@ -284,10 +279,12 @@ impl LocallyCloudConfig {
             None => DEFAULT_MAX_REQUEST_BODY_BYTES,
         };
 
-        let runtime_override = match resolve(get, &["LOCALLYCLOUD_RUNTIME", "LOCALSTACK_RUNTIME"]) {
-            Some((v, src)) => parse_runtime(&v, src)?,
-            None => None,
-        };
+        // Compute always uses the OCI backend; a leftover selection must not stop startup.
+        let ignored_settings = RETIRED_SETTINGS
+            .iter()
+            .copied()
+            .filter(|name| get(name).is_some())
+            .collect();
 
         let account_id = resolve(get, &["LOCALLYCLOUD_ACCOUNT_ID", "LOCALSTACK_ACCOUNT_ID"])
             .map(|(v, _)| v)
@@ -343,7 +340,7 @@ impl LocallyCloudConfig {
             legacy_health_check_interval,
             max_request_body_bytes,
             shutdown_grace_period,
-            runtime_override,
+            ignored_settings,
             account_id,
             default_region,
             tls,
@@ -440,18 +437,6 @@ fn resolve_secs(
             Ok(Duration::from_secs(secs))
         }
         None => Ok(Duration::from_secs(default)),
-    }
-}
-
-fn parse_runtime(value: &str, src: &'static str) -> Result<Option<RuntimeChoice>, ConfigError> {
-    match value.to_ascii_lowercase().as_str() {
-        "auto" => Ok(None),
-        "firecracker" => Ok(Some(RuntimeChoice::Firecracker)),
-        "youki" => Ok(Some(RuntimeChoice::Youki)),
-        other => Err(ConfigError::new(
-            src,
-            format!("expected one of auto|firecracker|youki, got `{other}`"),
-        )),
     }
 }
 
@@ -590,7 +575,7 @@ mod tests {
         assert_eq!(cfg.legacy_health_check_interval, Duration::from_secs(5));
         assert_eq!(cfg.max_request_body_bytes, 128 * 1024 * 1024);
         assert_eq!(cfg.shutdown_grace_period, Duration::from_secs(5));
-        assert_eq!(cfg.runtime_override, None);
+        assert!(cfg.ignored_settings.is_empty());
         assert_eq!(cfg.account_id, "000000000000");
         assert_eq!(cfg.default_region, "us-east-1");
     }
@@ -672,14 +657,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_override_parsing() {
-        let fc =
-            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_RUNTIME", "firecracker")])).unwrap();
-        assert_eq!(fc.runtime_override, Some(RuntimeChoice::Firecracker));
-        let yk = LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_RUNTIME", "YOUKI")])).unwrap();
-        assert_eq!(yk.runtime_override, Some(RuntimeChoice::Youki));
-        let auto = LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_RUNTIME", "auto")])).unwrap();
-        assert_eq!(auto.runtime_override, None);
+    fn retired_runtime_selection_is_reported_not_rejected() {
+        for value in ["firecracker", "youki", "auto", "podman"] {
+            let cfg =
+                LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_RUNTIME", value)])).unwrap();
+            assert_eq!(cfg.ignored_settings, vec!["LOCALLYCLOUD_RUNTIME"]);
+        }
     }
 
     #[test]
@@ -737,12 +720,5 @@ mod tests {
         let err = strategy("domain").unwrap_err();
         assert_eq!(err.setting, "LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY");
         assert!(err.to_string().contains("path|aws"));
-    }
-
-    #[test]
-    fn invalid_runtime_is_rejected() {
-        let err =
-            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_RUNTIME", "podman")])).unwrap_err();
-        assert_eq!(err.setting, "LOCALLYCLOUD_RUNTIME");
     }
 }

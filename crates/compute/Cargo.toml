@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "locallycloud compute: ComputeRuntime trait with Firecracker (primary) and youki (fallback) backends"
+description = "locallycloud compute: ComputeRuntime trait with a rootless OCI backend (crun or youki)"
 
 # Hard constraint (Requirement 1.4 / 16.3): no Docker daemon, no bollard.
 

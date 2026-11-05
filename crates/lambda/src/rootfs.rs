@@ -2,7 +2,7 @@
 //!
 //! Composes a self-contained rootfs directory the [`ComputeRuntime`](locallycloud_compute)
 //! consumes: the function code at [`LAMBDA_TASK_ROOT`](crate::exec_env::LAMBDA_TASK_ROOT), a
-//! writable `/tmp`, the standard mountpoint directories crun/Firecracker expect, and layer
+//! writable `/tmp`, the standard mountpoint directories an OCI runtime expects, and layer
 //! contents merged under `/opt` in listed order (Requirements 15.6, 15.7, 20.1–20.7). A
 //! custom-runtime (`provided.*`) function runs its own `bootstrap`; a managed runtime runs
 //! the platform Runtime Interface Client shipped by its base layer.

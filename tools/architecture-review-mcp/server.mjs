@@ -119,5 +119,5 @@ async function main() {
 }
 // The entrypoint is intentionally separate from the factory used by tests.
 if (import.meta.url === new URL(process.argv[1], 'file:').href) {
-  main().catch(() => { console.error('Architecture review MCP could not start. Use a private workspace containing a valid review.json; see docs/ARCHITECTURE_REVIEW.md.'); process.exitCode = 1; });
+  main().catch(() => { console.error('Threat modeling MCP could not start. Use a private workspace containing a valid review.json; see docs/THREAT_MODELING.md.'); process.exitCode = 1; });
 }

@@ -6,11 +6,9 @@
 //! injected endpoint + credentials — as an in-Guest AWS SDK would — reaches locallycloud and
 //! resolves to the expected routing decision.
 //!
-//! The injected environment is identical for both compute runtimes (Firecracker and youki),
-//! so this validates the shared contract for both. Booting a live microVM/container to run a
-//! real SDK inside it is an environment boundary (no firecracker kernel/rootfs, no static
-//! guest SDK artifact here), so the in-Guest hop is exercised over the same loopback HTTP path
-//! the Guest uses (youki shares the host netns; Firecracker reaches the host over its tap).
+//! Booting a live container to run a real SDK inside it is an environment boundary (no OCI
+//! runtime or static guest SDK artifact here), so the in-Guest hop is exercised over the same
+//! loopback HTTP path the Guest uses (the OCI backend shares the host network namespace).
 
 use std::sync::Arc;
 use std::time::Duration;

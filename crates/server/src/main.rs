@@ -15,8 +15,7 @@ mod runtime_manager;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 
-use locallycloud_compute::selector::{RuntimeKind, RuntimeSelector, SelectionError};
-use locallycloud_core::config::{LocallyCloudConfig, RuntimeChoice, SqsEndpointStrategy};
+use locallycloud_core::config::{LocallyCloudConfig, SqsEndpointStrategy};
 use locallycloud_core::endpoint::EndpointResolver;
 use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::authorization::{
@@ -385,17 +384,11 @@ async fn main() {
         "resolved guest endpoint"
     );
 
-    let kvm_available = RuntimeSelector::check_kvm_availability();
-    let runtime_override = config.runtime_override.map(|choice| match choice {
-        RuntimeChoice::Firecracker => RuntimeKind::Firecracker,
-        RuntimeChoice::Youki => RuntimeKind::Youki,
-    });
-    match RuntimeSelector::select(runtime_override, kvm_available) {
-        Ok(kind) => tracing::info!(?kind, kvm_available, "selected compute runtime"),
-        Err(SelectionError::FirecrackerRequiresKvm) => {
-            tracing::error!("FirecrackerRuntime was requested but /dev/kvm is unavailable");
-            std::process::exit(3);
-        }
+    for setting in &config.ignored_settings {
+        tracing::warn!(
+            setting,
+            "ignored: compute always uses the rootless OCI runtime (crun or youki)"
+        );
     }
 
     let state = match tokio::task::spawn_blocking(|| {

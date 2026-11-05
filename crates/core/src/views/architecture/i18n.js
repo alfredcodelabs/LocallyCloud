@@ -2,9 +2,9 @@ export const I18N = {
   en: {
     arLeaveUnsaved:
       "Leave the architecture review? Unsaved decisions are lost unless you save the review JSON first.",
-    arTitle: "Architecture review",
+    arTitle: "Threat modeling",
     arIntro:
-      "Review a deployed CloudFormation stack: explore its topology, make assumptions visible and record threat-model decisions.",
+      "Threat-model a deployed CloudFormation stack: the diagram and missing controls come from its configuration, and you record the decisions.",
     arEvidenceNote:
       "Relationships come from configuration read from the emulator, not from observed traffic. A configured flow does not prove delivery, and nothing here verifies a control.",
     arChooseStack: "Choose a stack",
@@ -365,9 +365,9 @@ export const I18N = {
   es: {
     arLeaveUnsaved:
       "¿Salir de la revisión de arquitectura? Las decisiones sin guardar se pierden si no guardas antes el JSON de la revisión.",
-    arTitle: "Revisión de arquitectura",
+    arTitle: "Modelado de amenazas",
     arIntro:
-      "Revisa un stack de CloudFormation desplegado: explora su topología, haz visibles las suposiciones y registra decisiones del modelo de amenazas.",
+      "Modela las amenazas de un stack de CloudFormation desplegado: el diagrama y los controles faltantes salen de su configuración, y tú registras las decisiones.",
     arEvidenceNote:
       "Las relaciones provienen de la configuración leída del emulador, no de tráfico observado. Un flujo configurado no prueba la entrega y nada aquí verifica un control.",
     arChooseStack: "Elige un stack",
@@ -739,9 +739,9 @@ export const I18N = {
   pt: {
     arLeaveUnsaved:
       "Sair da revisão de arquitetura? As decisões não salvas serão perdidas se você não salvar antes o JSON da revisão.",
-    arTitle: "Revisão de arquitetura",
+    arTitle: "Modelagem de ameaças",
     arIntro:
-      "Revise uma stack do CloudFormation implantada: explore a topologia, torne as suposições visíveis e registre decisões do modelo de ameaças.",
+      "Modele as ameaças de uma stack do CloudFormation implantada: o diagrama e os controles ausentes vêm da configuração, e você registra as decisões.",
     arEvidenceNote:
       "As relações vêm da configuração lida do emulador, não de tráfego observado. Um fluxo configurado não prova a entrega e nada aqui verifica um controle.",
     arChooseStack: "Escolha uma stack",

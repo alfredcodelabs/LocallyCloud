@@ -3153,7 +3153,7 @@ mod tests {
 
     /// A test `ComputeRuntime` that launches a real in-process guest: it reads the injected
     /// `AWS_LAMBDA_RUNTIME_API`, polls `next` over HTTP, and posts a transformed response —
-    /// exercising the whole host orchestration without a hypervisor. (The real crun/Firecracker
+    /// exercising the whole host orchestration without a hypervisor. (The real OCI
     /// path is validated separately by the compute crate's `oci_hello_task` test.)
     struct InProcessGuest {
         behavior: GuestBehavior,

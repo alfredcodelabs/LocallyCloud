@@ -1,13 +1,12 @@
 //! Guest endpoint injection.
 //!
-//! Produces the environment a started compute Guest (a Firecracker microVM or a youki/OCI
-//! container) receives so an in-Guest AWS SDK targets locallycloud instead of real AWS: the
+//! Produces the environment a started compute Guest (an OCI container) receives so an in-Guest AWS SDK targets locallycloud instead of real AWS: the
 //! Core-resolved endpoint, the region, and the development credentials. In-Guest SDK calls
 //! then re-enter through the same [`InternalDispatcher`](super::InternalDispatcher) path as
 //! any other cross-service call, so they honour the target's disposition identically.
 //!
-//! The injector is backend-agnostic: it yields a plain variable map that both the Firecracker
-//! and youki backends merge into their `TaskSpec` environment, keeping `locallycloud-core`
+//! The injector is backend-agnostic: it yields a plain variable map that the compute backend
+//! merges into its `TaskSpec` environment, keeping `locallycloud-core`
 //! decoupled from the compute crate. It also probes the endpoint's reachability from the host
 //! and emits a diagnostic when it cannot be reached, so an in-Guest SDK failure is
 //! explainable rather than silent. See Requirement 4.

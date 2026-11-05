@@ -103,7 +103,7 @@ export function validate(input) {
   unique(views, 'view');
   for (const v of views) { unique(v.layout, 'view layout'); if (!v.name || !v.nodeIds.length) { fail('A view needs a name and resource selection'); } }
   return {
-    version: 2, documentType: DOCUMENTS.includes(input.documentType) ? input.documentType : 'review', id: text(input.id, 1024) || 'local-design', title: text(input.title) || 'Architecture review',
+    version: 2, documentType: DOCUMENTS.includes(input.documentType) ? input.documentType : 'review', id: text(input.id, 1024) || 'local-design', title: text(input.title) || 'Threat model',
     source: SOURCES.includes(input.source) ? input.source : 'design',
     scope: { account: text(input.scope?.account), region: text(input.scope?.region), stack: text(input.scope?.stack, 1024), capturedAt: text(input.scope?.capturedAt) },
     zones, nodes, edges, threats, views,

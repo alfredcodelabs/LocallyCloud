@@ -9,7 +9,7 @@
 //! Each hop emits a correlated routing record via the dispatcher's `log_routing_decision`, so
 //! the boundary is visible in logs. The per-hop dispositions are asserted here by outcome.
 //! Running the guest workloads that would originate these hops live is an environment boundary
-//! (no firecracker kernel/rootfs, no OCI registry pull here); the dispatch contract they rely
+//! (no OCI runtime or registry pull here); the dispatch contract they rely
 //! on is what this test exercises.
 
 use std::sync::{Arc, Mutex};

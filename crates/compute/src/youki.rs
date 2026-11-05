@@ -1,9 +1,9 @@
-//! Daemonless OCI fallback backend.
+//! Rootless, daemonless OCI backend: the compute runtime for Lambda, ECS and EC2.
 //!
 //! Implements [`ComputeRuntime`] using a daemonless OCI runtime (`youki` / `crun`).
 //! Requires neither `/dev/kvm` nor Docker / the Docker daemon / `bollard`. See Requirement 16.
 //!
-//! Execution model (shared with [`crate::firecracker`]): `start_task` builds an OCI bundle
+//! Execution model: `start_task` builds an OCI bundle
 //! around the caller-supplied rootfs (`TaskSpec::image`), launches it in the background and
 //! reports `Running`; the workload's stdout is captured as it runs and exposed via
 //! `get_output`; `stop_task` terminates a still-running task. A one-shot task transitions to
@@ -243,7 +243,7 @@ impl YoukiRuntime {
 
         // Share the host network namespace so the guest reaches the Runtime API and the
         // locallycloud endpoint on the host loopback. This is the daemonless egress mechanism
-        // for the OCI backend (Firecracker uses vsock + TAP/nftables instead). Removing the
+        // for the OCI backend. Removing the
         // `network` namespace entry makes the container inherit the host netns.
         if !isolated_network {
             if let Some(namespaces) = config["linux"]["namespaces"].as_array_mut() {
