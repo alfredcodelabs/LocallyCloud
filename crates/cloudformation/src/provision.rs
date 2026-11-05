@@ -5872,19 +5872,24 @@ impl Provisioner {
                     access_key_id: Some(access_key.clone()),
                     arn: None,
                 };
-                match dispatcher.resolve_caller_arn(&identity) {
-                    Ok(Some(principal)) => {
-                        headers.insert(
-                            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
-                            HeaderValue::from_str(&principal).map_err(|_| CfnError::Internal)?,
-                        );
+                let principal = match dispatcher.resolve_caller_arn(&identity) {
+                    Ok(Some(principal)) => Some(principal),
+                    Ok(None) if !dispatcher.strict_sigv4_required() => {
+                        // Match STS's permissive identity for unregistered local credentials.
+                        Some(format!("arn:aws:iam::{}:root", self.account))
                     }
                     _ if dispatcher.strict_sigv4_required() => {
                         return Err(CfnError::ResourceFailed(
                             "CloudFormation caller identity could not be resolved".into(),
                         ))
                     }
-                    _ => {}
+                    _ => None,
+                };
+                if let Some(principal) = principal {
+                    headers.insert(
+                        locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+                        HeaderValue::from_str(&principal).map_err(|_| CfnError::Internal)?,
+                    );
                 }
             } else if dispatcher.strict_sigv4_required() {
                 return Err(CfnError::ResourceFailed(
@@ -8560,6 +8565,63 @@ mod tests {
     use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
 
     use super::*;
+
+    #[tokio::test]
+    async fn permissive_operator_can_remove_eventbridge_queue_policy_but_not_explicit_deny() {
+        use locallycloud_core::integration::InternalDispatcher;
+        use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_iam_sts::register(&registry);
+        locallycloud_sqs::register(&registry);
+        registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: std::time::Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )));
+        let provisioner = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )
+        .with_caller_access_key(Some("test".into()));
+        let queue = provisioner
+            .provision("Queue", "policy-delete", "AWS::SQS::Queue", &json!({}))
+            .await
+            .unwrap();
+        let mut props = json!({
+            "Queues": [queue.ref_value],
+            "PolicyDocument": {"Version":"2012-10-17", "Statement": [{
+                "Effect":"Allow", "Principal":{"Service":"events.amazonaws.com"},
+                "Action":"sqs:SendMessage", "Resource":queue.attributes["Arn"],
+                "Condition":{"ArnEquals":{"aws:SourceArn":"arn:aws:events:us-east-1:000000000000:rule/accounting"}}
+            }]}
+        });
+        provisioner
+            .provision("Policy", "policy-delete", "AWS::SQS::QueuePolicy", &props)
+            .await
+            .unwrap();
+        provisioner.delete_sqs_queue_policy(&props).await.unwrap();
+        props["PolicyDocument"]["Statement"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "Effect":"Deny", "Principal":"*", "Action":"sqs:SetQueueAttributes", "Resource":"*"
+            }));
+        provisioner
+            .provision("Policy", "policy-delete", "AWS::SQS::QueuePolicy", &props)
+            .await
+            .unwrap();
+        let error = provisioner
+            .delete_sqs_queue_policy(&props)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("403"), "{error}");
+    }
 
     #[tokio::test]
     async fn kms_tags_create_update_remove_and_compensate_failed_updates() {
