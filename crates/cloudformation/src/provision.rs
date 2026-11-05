@@ -5372,18 +5372,115 @@ impl Provisioner {
     }
 
     async fn delete_events_rule(&self, name: &str, props: &Value) -> Result<(), CfnError> {
-        self.call_aws_json(
-            "events",
-            "AWSEvents.DeleteRule",
+        let bus = event_bus_name(props);
+        let mut request = json!({"Rule": name, "EventBusName": bus, "Limit": 100});
+        let mut ids = Vec::new();
+        let mut tokens = std::collections::BTreeSet::new();
+        loop {
+            let Some(page) = self
+                .call_events_rule("ListTargetsByRule", request.clone(), name)
+                .await?
+            else {
+                return Ok(());
+            };
+            let targets = page
+                .get("Targets")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    CfnError::ResourceFailed(format!(
+                        "EventBridge target list for {name} is invalid"
+                    ))
+                })?;
+            for target in targets {
+                ids.push(Value::String(required_response_string(target, "Id", name)?));
+            }
+            if ids.len() > 1000 {
+                return Err(CfnError::ResourceFailed(format!(
+                    "EventBridge target list for {name} exceeds the deletion limit"
+                )));
+            }
+            let Some(token) = page
+                .get("NextToken")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                break;
+            };
+            if !tokens.insert(token.to_string()) || tokens.len() > 100 {
+                return Err(CfnError::ResourceFailed(format!(
+                    "EventBridge target pagination for {name} did not complete"
+                )));
+            }
+            request["NextToken"] = Value::String(token.to_string());
+        }
+        for batch in ids.chunks(10) {
+            let Some(result) = self
+                .call_events_rule(
+                    "RemoveTargets",
+                    json!({"Rule": name, "EventBusName": bus, "Ids": batch, "Force": true}),
+                    name,
+                )
+                .await?
+            else {
+                return Ok(());
+            };
+            if result.get("FailedEntryCount").and_then(Value::as_u64) != Some(0) {
+                return Err(CfnError::ResourceFailed(format!(
+                    "EventBridge target removal for {name} failed: {result}"
+                )));
+            }
+        }
+        self.call_events_rule(
+            "DeleteRule",
             json!({
                 "Name": name,
-                "EventBusName": event_bus_name(props),
+                "EventBusName": bus,
                 "Force": true,
             }),
             name,
         )
         .await
         .map(|_| ())
+    }
+
+    async fn call_events_rule(
+        &self,
+        operation: &str,
+        body: Value,
+        name: &str,
+    ) -> Result<Option<Value>, CfnError> {
+        let mut headers = json_11_host();
+        headers.insert(
+            "x-amz-target",
+            HeaderValue::from_str(&format!("AWSEvents.{operation}"))
+                .map_err(|_| CfnError::Internal)?,
+        );
+        let (status, response) = self
+            .call(
+                "events",
+                Method::POST,
+                "/",
+                headers,
+                Bytes::from(body.to_string()),
+            )
+            .await?;
+        if aws_json_error_is(status, &response, "ResourceNotFoundException") {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            return Err(CfnError::ResourceFailed(format!(
+                "EventBridge {operation} for {name} failed ({status}): {}",
+                String::from_utf8_lossy(&response)
+            )));
+        }
+        if response.is_empty() {
+            return Ok(Some(Value::Null));
+        }
+        serde_json::from_slice(&response).map(Some).map_err(|_| {
+            CfnError::ResourceFailed(format!(
+                "EventBridge {operation} for {name} returned invalid JSON"
+            ))
+        })
     }
 
     async fn delete_pipes_pipe(&self, name: &str) -> Result<(), CfnError> {
@@ -8518,13 +8615,16 @@ fn coerce_number(v: &Value) -> Value {
 
 /// Generate an AWS-like physical name `{stack}-{logical}-{rand}` within `max` chars, lowercased.
 fn generate_name(stack: &str, logical: &str, max: usize) -> String {
+    let suffix = short_id();
+    if max <= suffix.len() {
+        return suffix.chars().take(max).collect();
+    }
     let base = format!(
-        "{}-{}-{}",
+        "{}-{}",
         stack.to_ascii_lowercase(),
-        logical.to_ascii_lowercase(),
-        short_id()
+        logical.to_ascii_lowercase()
     );
-    let cleaned: String = base
+    let mut cleaned: String = base
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -8534,7 +8634,12 @@ fn generate_name(stack: &str, logical: &str, max: usize) -> String {
             }
         })
         .collect();
-    cleaned.chars().take(max).collect()
+    cleaned.truncate(cleaned.len().min(max - suffix.len() - 1));
+    let prefix = cleaned.trim_end_matches('-');
+    if prefix.is_empty() {
+        return suffix;
+    }
+    format!("{prefix}-{suffix}")
 }
 
 fn short_id() -> String {
@@ -9486,6 +9591,155 @@ mod tests {
         assert!(n.len() <= 63);
         assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
         assert!(n.starts_with("lc-compat-dev-serverlessdeploymentbucket-"));
+    }
+
+    #[test]
+    fn generated_names_keep_the_full_unique_suffix_after_truncation() {
+        let stack = "accounting-stubs";
+        let logical_ids = [
+            "LedgerMaintenanceStepFunctionsEventsRuleSchedule1",
+            "LedgerMaintenanceStepFunctionsEventsRuleSchedule2",
+            "InputAthenaStepFunctionsEventsRuleSchedule1",
+            "InputAthenaStepFunctionsEventsRuleSchedule2",
+        ];
+        let mut names = std::collections::BTreeSet::new();
+        for logical_id in logical_ids {
+            let name = generate_name(stack, logical_id, 64);
+            assert_eq!(name.len(), 64);
+            let (_, suffix) = name.rsplit_once('-').unwrap();
+            assert_eq!(suffix.len(), 12, "{name}");
+            assert!(suffix.bytes().all(|c| c.is_ascii_hexdigit()));
+            assert!(names.insert(name));
+        }
+        for max in [0, 1, 12, 13, 32, 63, 64, 75, 80, 255, 256, 512] {
+            let name = generate_name(&"s".repeat(128), &"l".repeat(255), max);
+            assert!(name.len() <= max);
+            if max >= 32 {
+                assert_eq!(name.rsplit_once('-').unwrap().1.len(), 12);
+            }
+        }
+        let name = generate_name("../日本語", "a/b_é", 64);
+        assert!(name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
+    }
+
+    #[tokio::test]
+    async fn event_rule_deletion_checks_pages_batches_and_modeled_errors() {
+        #[derive(Clone, Copy)]
+        enum Case {
+            Paged,
+            Missing(u16),
+            Denied,
+            Unknown404,
+            Partial,
+            Cycle,
+        }
+        struct Events {
+            case: Case,
+            calls: Mutex<Vec<(String, Value)>>,
+        }
+        #[async_trait]
+        impl NativeHandler for Events {
+            async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+                let operation = request.headers["x-amz-target"]
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("AWSEvents.")
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    request.headers["content-type"],
+                    "application/x-amz-json-1.1"
+                );
+                assert_eq!(body["EventBusName"], "review-bus");
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((operation.into(), body.clone()));
+                let (status, response) = match (operation, self.case) {
+                    ("ListTargetsByRule", Case::Missing(status)) => {
+                        (status, json!({"__type":"ResourceNotFoundException"}))
+                    }
+                    ("ListTargetsByRule", Case::Denied) => {
+                        (403, json!({"__type":"AccessDeniedException"}))
+                    }
+                    ("ListTargetsByRule", Case::Unknown404) => (404, json!({"__type":"NotFound"})),
+                    ("ListTargetsByRule", Case::Cycle) => {
+                        (200, json!({"Targets":[], "NextToken":"again"}))
+                    }
+                    ("ListTargetsByRule", _) => match body.get("NextToken") {
+                        None => (
+                            200,
+                            json!({"Targets":(0..10).map(|i| json!({"Id":format!("t{i}")})).collect::<Vec<_>>(),"NextToken":"second"}),
+                        ),
+                        Some(token) => {
+                            assert_eq!(token, "second");
+                            (200, json!({"Targets":[{"Id":"t10"}]}))
+                        }
+                    },
+                    ("RemoveTargets", Case::Partial) => (
+                        200,
+                        json!({"FailedEntryCount":1,"FailedEntries":[{"TargetId":"t0","ErrorCode":"InternalException"}]}),
+                    ),
+                    ("RemoveTargets", _) => (200, json!({"FailedEntryCount":0,"FailedEntries":[]})),
+                    ("DeleteRule", _) => (200, json!({})),
+                    _ => panic!("unexpected operation {operation}"),
+                };
+                http::Response::builder()
+                    .status(status)
+                    .body(Body::from(response.to_string()))
+                    .unwrap()
+            }
+        }
+        for (case, succeeds) in [
+            (Case::Paged, true),
+            (Case::Missing(400), true),
+            (Case::Missing(404), true),
+            (Case::Denied, false),
+            (Case::Unknown404, false),
+            (Case::Partial, false),
+            (Case::Cycle, false),
+        ] {
+            let registry = Arc::new(ServiceRegistry::new());
+            let events = Arc::new(Events {
+                case,
+                calls: Mutex::new(Vec::new()),
+            });
+            registry.register_native(
+                ServiceName::new("events"),
+                ServiceMetadata::new(AwsProtocol::Json11, None),
+                events.clone(),
+            );
+            let provisioner = Provisioner::new(
+                Arc::downgrade(&registry),
+                "us-east-1".into(),
+                "000000000000".into(),
+            );
+            let result = provisioner
+                .delete_events_rule("rule", &json!({"EventBusName":"review-bus"}))
+                .await;
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            let calls = events.calls.lock().unwrap();
+            if matches!(case, Case::Paged) {
+                assert_eq!(
+                    calls.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+                    [
+                        "ListTargetsByRule",
+                        "ListTargetsByRule",
+                        "RemoveTargets",
+                        "RemoveTargets",
+                        "DeleteRule"
+                    ]
+                );
+                let sizes = calls
+                    .iter()
+                    .filter(|(op, _)| op == "RemoveTargets")
+                    .map(|(_, body)| body["Ids"].as_array().unwrap().len())
+                    .collect::<Vec<_>>();
+                assert_eq!(sizes, [10, 1]);
+            } else {
+                assert!(calls.iter().all(|(op, _)| op != "DeleteRule"));
+            }
+        }
     }
 
     #[test]

@@ -708,12 +708,10 @@ impl EventsService {
         let bus = state.buses.get_mut(&bus_name).ok_or_else(|| {
             EventsError::ResourceNotFound(format!("Event bus {bus_name} does not exist"))
         })?;
-        let rule = bus
-            .rules
-            .get(name)
-            .ok_or_else(|| EventsError::ResourceNotFound(format!("Rule {name} does not exist")))?;
-        if !rule.targets.is_empty() && !body.get("Force").and_then(Value::as_bool).unwrap_or(false)
-        {
+        let Some(rule) = bus.rules.get(name) else {
+            return Ok(json!({}));
+        };
+        if !rule.targets.is_empty() {
             return Err(EventsError::Validation(
                 "Rule can't be deleted since it has targets".into(),
             ));

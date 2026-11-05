@@ -2411,6 +2411,7 @@ dependencies = [
  "locallycloud-ec2",
  "locallycloud-ecs",
  "locallycloud-elbv2",
+ "locallycloud-eventbridge",
  "locallycloud-firehose",
  "locallycloud-iam-sts",
  "locallycloud-kinesis",

@@ -69,6 +69,67 @@ async fn call_ok(handler: &Arc<dyn NativeHandler>, request: ServiceRequest) -> V
     body
 }
 
+#[tokio::test]
+async fn delete_rule_is_idempotent_but_force_does_not_remove_targets() {
+    let registry = Arc::new(ServiceRegistry::new());
+    crate::register(&registry);
+    let events = registry
+        .native_handler(&ServiceName::new("events"))
+        .unwrap();
+    call_ok(
+        &events,
+        event_request("DeleteRule", json!({"Name":"missing"})),
+    )
+    .await;
+    call_ok(
+        &events,
+        event_request(
+            "PutRule",
+            json!({
+                "Name":"cleanup", "EventPattern":"{\"source\":[\"test\"]}"
+            }),
+        ),
+    )
+    .await;
+    call_ok(&events, event_request("PutTargets", json!({
+        "Rule":"cleanup", "Targets":[{"Id":"queue", "Arn":"arn:aws:sqs:us-east-1:000000000000:test"}]
+    }))).await;
+    let (status, _, body) = response_parts(
+        events
+            .handle(event_request(
+                "DeleteRule",
+                json!({"Name":"cleanup", "Force":true}),
+            ))
+            .await,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["__type"], "ValidationException");
+    call_ok(
+        &events,
+        event_request("RemoveTargets", json!({"Rule":"cleanup", "Ids":["queue"]})),
+    )
+    .await;
+    for _ in 0..2 {
+        call_ok(
+            &events,
+            event_request("DeleteRule", json!({"Name":"cleanup"})),
+        )
+        .await;
+    }
+    let (status, _, body) = response_parts(
+        events
+            .handle(event_request(
+                "DeleteRule",
+                json!({"Name":"missing", "EventBusName":"missing-bus"}),
+            ))
+            .await,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["__type"], "ResourceNotFoundException");
+}
+
 fn tags_array(tags: &BTreeMap<String, String>) -> Value {
     Value::Array(
         tags.iter()

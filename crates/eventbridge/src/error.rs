@@ -26,7 +26,7 @@ macro_rules! error_type {
 
 error_type!(EventsError, AwsProtocol::Json11, {
     AccessDenied => ("AccessDeniedException", 403),
-    ResourceNotFound => ("ResourceNotFoundException", 404),
+    ResourceNotFound => ("ResourceNotFoundException", 400),
     ResourceAlreadyExists => ("ResourceAlreadyExistsException", 409),
     InvalidEventPattern => ("InvalidEventPatternException", 400),
     Validation => ("ValidationException", 400),
