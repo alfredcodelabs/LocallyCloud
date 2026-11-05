@@ -1,6 +1,6 @@
 # Setup and configuration
 
-[← README](../README.md) · [Services](SERVICES.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
+[← README](../README.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
 
 Start with the [quick start](../README.md#quick-start). Use this reference for
 installation choices, host dependencies and settings.
@@ -70,7 +70,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Use the filename for your downloaded release and choose one installation method. Extraction does not resolve dependencies or install desktop integration. This user-only installation is not managed by `apt` or `pacman`. Add `~/.local/bin` to your shell's `PATH` if it is not already there.
 
-An agent can then start `locallycloud`, set up the `locallycloud` AWS profile, and use AWS CLI, SDKs, or HTTP requests under the same user. Host preparation for optional features may still need administrator access: installing dependencies, enabling rootless user namespaces, or granting access to `/dev/kvm`. Rootless OCI execution depends on the host's kernel and security configuration; access to port 4566 itself does not require root.
+An agent can then start `locallycloud`, set up the `locallycloud` AWS profile, and use AWS CLI, SDKs, or HTTP requests under the same user. Host preparation for optional features may still need administrator access: installing dependencies or enabling rootless user namespaces and cgroup delegation. Rootless OCI execution depends on the host's kernel and security configuration; access to port 4566 itself does not require root.
 
 ## Optional runtime dependencies
 
@@ -78,19 +78,26 @@ The server can start without a compute runtime. Install these dependencies only 
 
 | Workflow | Requirement |
 | --- | --- |
-| Invoke Lambda, run ECS/Fargate tasks, or run EC2 instances | `crun` or `youki` available in `PATH`, a systemd user session with a user D-Bus (`dbus-user-session` on Debian and Ubuntu), and delegated cgroup v2 memory control on a compatible Linux host. Custom-runtime binaries (`provided.al2023`) must match the host architecture. |
+| Invoke Lambda, run ECS/Fargate tasks, or run EC2 instances | `crun` or `youki` available in `PATH`, a systemd user session with a user D-Bus (`dbus-user-session` on Debian and Ubuntu), and delegated cgroup v2 memory control on a compatible Linux host. |
 | Run ECS/Fargate tasks | The OCI prerequisites above, delegated cgroup v2 CPU control, `ip` and `nft` in `PATH` (`iproute2` and `nftables` packages), and kernel netfilter redirect support (`nft_redir`). Task networking is configured inside owned guest namespaces; run the emulator as your ordinary user. |
-| Run ZIP-based Node.js or Python Lambda functions | An OCI runtime above and the matching language executable: `node` or, for example, `python3.13`. Debian 13's `nodejs` is Node 20; choose a version compatible with the declared function runtime. |
-| Use the runtime-included AWS SDK (`import boto3`) in Python functions without packaging it | The distribution's boto3 for that interpreter: `python3-boto3` (Debian and Ubuntu) or `python-boto3` (Arch). LocallyCloud copies boto3 and its pure-Python dependencies into the runtime; packaged copies in the function or its layers take precedence. Without it, functions must package boto3. Node.js runtimes do not include the AWS SDK for JavaScript v3 locally, so bundle `@aws-sdk/*` with the function. |
+| Run Lambda code | A matching [official runtime pack](LAMBDA.md). Python 3 is needed only to install, check or update packs. |
+| Route Firehose Iceberg records with `MetadataExtraction` | `jq` available in `PATH`. |
+| Run broader Athena SQL on Iceberg tables | DuckDB, with `LOCALLYCLOUD_DUCKDB_BIN` set to its executable. Without it, Athena uses a built-in reader for a smaller SQL subset. |
+| Run EC2 instances | The OCI prerequisites above and `LOCALLYCLOUD_EC2_IMAGE_ROOTFS` pointing to the image's root filesystem. |
 | Run RDS PostgreSQL or Aurora PostgreSQL, including RDS Data API access | PostgreSQL 16 or later; use the newest version your distribution provides. `initdb`, `pg_ctl`, `postgres`, `psql`, and `pg_basebackup` must have matching versions. LocallyCloud starts its own databases. |
 | Open the dashboard from the applications menu | `xdg-utils`. Opening the URL directly in a browser does not require it. |
 
-On Debian and Ubuntu, install the components you need with `sudo apt install crun dbus-user-session`, `sudo apt install postgresql`, `sudo apt install python3-boto3`, or `sudo apt install xdg-utils`; on Arch, use `sudo pacman -S crun postgresql python-boto3 xdg-utils`. RDS finds PostgreSQL on `PATH` (Arch) or the newest version under `/usr/lib/postgresql/<version>/bin` (Debian and Ubuntu). Set `LOCALLYCLOUD_PG_BIN_DIR` only to use a different installation.
+On Debian and Ubuntu, install the components you need with `sudo apt install crun dbus-user-session`, `sudo apt install postgresql`, or `sudo apt install xdg-utils`; add `python3` for runtime preparation or `jq` for metadata extraction. On Arch, the equivalent packages are `crun`, `postgresql`, `xdg-utils`, `python` and `jq`. RDS finds PostgreSQL on `PATH` (Arch) or the newest version under `/usr/lib/postgresql/<version>/bin` (Debian and Ubuntu). Set `LOCALLYCLOUD_PG_BIN_DIR` only to use a different installation.
 
+### Official Lambda runtime packs
 
-OCI execution requires a working systemd user D-Bus session and cgroup delegation.
-On WSL 2, enable systemd first. See [platform setup](PLATFORMS.md#wsl-2) and
-[Debian runtime troubleshooting](FAQ.md#why-does-lambda-report-d-bus-errors-and-then-toomanyrequestsexception-on-debian).
+Install only the runtimes your functions use with `locallycloud runtime install
+nodejs22.x`. See [Lambda runtimes](LAMBDA.md) for prerequisites, updates, rollback
+and the shared memory budget. No runtimes are downloaded at server startup or
+invocation.
+
+For session setup, see [WSL 2](PLATFORMS.md#wsl-2) and
+[D-Bus troubleshooting](FAQ.md#why-does-lambda-report-d-bus-errors-on-debian).
 
 ## Local AWS profile
 
@@ -146,9 +153,9 @@ See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com
 | `LOCALLYCLOUD_STATE_DB` | SQLite state file | `~/.local/share/locallycloud/state.sqlite3`, or under `XDG_DATA_HOME` when set |
 | `LOCALLYCLOUD_KMS_MASTER_KEY` | Base64-encoded 32-byte master key | Required; no default |
 | `LOCALLYCLOUD_IAM_ENFORCEMENT` | IAM mode; `strict` evaluates policies | Permissive |
-| `LOCALLYCLOUD_RUNTIME` | Compute runtime: `auto`, `firecracker`, or `youki` (OCI) | `auto` |
 | `LOCALLYCLOUD_WORK_DIR` | Lambda work files | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/lambda` |
-| `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | Memory budget for Lambda environments | `1024` |
+| `LOCALLYCLOUD_RUNTIME_PACKS_DIR` | Installed Lambda runtime packs; relative paths resolve from the server working directory | `<Lambda work directory>/runtime-packs` |
+| `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | Shared Lambda environment budget in MiB; see [memory accounting](LAMBDA.md#memory-budget) | `4096` |
 | `LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY` | Independent Lambda execution quota for each account/region; integer from 1 to 2147483647 | `1000` |
 | `LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE` | Classic EventBridge rules: multiply retry delays and maximum event age by this factor; finite number from 0.000001 to 1 | `1` (real time) |
 | `LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY` | Shape of returned SQS queue URLs: `path` (`http://127.0.0.1:4566/<account>/<queue>`, on the endpoint advertised to Lambda as `AWS_ENDPOINT_URL`, so SDKs that call the queue URL host stay local) or `aws` (`https://sqs.<region>.amazonaws.com/<account>/<queue>`). Both forms are accepted as input | `path` |
@@ -159,6 +166,38 @@ See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com
 | `LOCALLYCLOUD_PG_BIN_DIR` | PostgreSQL binaries for RDS | Found on `PATH`, then the newest under `/usr/lib/postgresql` |
 | `LOCALLYCLOUD_COGNITO_MAILBOX_DIR` | Directory that receives Cognito confirmation codes | Disabled |
 | `LOCALLYCLOUD_UI` | Dashboard: `on` or `off`. `off` returns 404 for the dashboard and its read endpoints, which sign reads with your local AWS profiles; health and status stay available | `on` |
+| `LOCALLYCLOUD_ENDPOINT_URL` | Endpoint that Lambda, ECS and EC2 guests use to call back into the emulator. `AWS_ENDPOINT_URL` takes priority when set | Derived from the listen address; a wildcard bind becomes `127.0.0.1` |
+| `LOCALLYCLOUD_LEGACY_BACKEND_URL` | Optional external backend for services without a native handler | `http://localhost:4567` |
+| `LOCALLYCLOUD_MAX_REQUEST_BODY_BYTES` | Maximum request body size in bytes | `134217728` (128 MiB) |
+| `LOCALLYCLOUD_SHUTDOWN_GRACE_PERIOD_SECS` | Seconds to finish in-flight requests on shutdown | `5` |
+| `LOCALLYCLOUD_TLS_HOSTNAME`, `LOCALLYCLOUD_TLS_CERT_PATH`, `LOCALLYCLOUD_TLS_KEY_PATH` | Serve HTTPS for this DNS hostname on the same port, with a PEM certificate and PKCS#8 key. Set all three or none | Disabled |
+| `LOCALLYCLOUD_ROUTE53_DNS_BIND` | Address for the Route 53 DNS server, for example `127.0.0.1:5353`. An invalid or busy address stops startup | Disabled |
+| `LOCALLYCLOUD_RDS_DATA_DIR` | Absolute directory for local RDS databases | `${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/rds` |
+| `LOCALLYCLOUD_EC2_IMAGE_ROOTFS` | Root filesystem directory for the `ami-locallycloud-http` image; required to run EC2 instances | None |
+| `LOCALLYCLOUD_DUCKDB_BIN` | DuckDB executable for Athena queries on Iceberg tables; without it, a built-in reader handles a smaller SQL subset | Disabled |
+| `LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL` | Maximum warm Lambda environments across all functions; integer from 0 to 1024 | `16` |
+| `LOCALLYCLOUD_KINESIS_MAX_BUFFERED_BYTES` | Maximum bytes of records Kinesis keeps in memory | `67108864` (64 MiB) |
+| `LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID`, `LOCALLYCLOUD_BOOTSTRAP_SECRET_ACCESS_KEY` | Administrator credentials for strict IAM; see [strict IAM credentials](#strict-iam-credentials) | None |
+| `LOCALLYCLOUD_ROOT_ACCESS_KEY_ID`, `LOCALLYCLOUD_ROOT_SECRET_ACCESS_KEY` | Root user credentials for the configured account | None |
+
+### Strict IAM credentials
+
+With `LOCALLYCLOUD_IAM_ENFORCEMENT=strict`, the `test`/`test` credentials are
+denied, so the server needs an initial administrator. Set both bootstrap variables
+before the first strict startup:
+
+- The access key ID has 20 characters: `AKIA` followed by uppercase letters and digits.
+- The secret access key has exactly 40 characters from `A-Z`, `a-z`, `0-9`, `+` and `/`.
+
+LocallyCloud creates the IAM user `locallycloud-bootstrap` with an inline
+`Action: "*"` policy once per account and keeps it in the state database. Use
+those keys in a separate AWS profile to create the users and roles you want to
+test. In strict mode, missing or malformed bootstrap credentials stop startup;
+error messages never include the values.
+
+The root variables follow the same format, provision the account's root user,
+and must not reuse the bootstrap access key ID. Both are optional in permissive
+mode.
 
 For scaled concurrency and retry experiments, see the [throttling guide](THROTTLING.md).
 
@@ -203,9 +242,9 @@ Uninstalling the program preserves resources, keys, and client settings in your 
 | Location | Contents and cleanup |
 | --- | --- |
 | `${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/` | Default persistent state, including `state.sqlite3`, local RDS databases, and RDS Data API files. Delete only if you want to discard those resources. |
-| `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/` | PostgreSQL and language runtime caches; Lambda code/root filesystems and compute bundles under `lambda/`, `oci/`, `ecs/`, and `firecracker/`. Stop LocallyCloud before removing this cache. |
+| `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/` | PostgreSQL and language runtime caches; Lambda code/root filesystems and compute bundles under `lambda/`, `oci/` and `ecs/`. Stop LocallyCloud before removing this cache. |
 | `${TMPDIR:-/tmp}/locallycloud-lambda-<uid>/` | Legacy/fallback Lambda work directory. Inspect leftovers after stopping LocallyCloud. `<uid>` is the output of `id -u`. |
-| `${TMPDIR:-/tmp}/locallycloud-oci-<uid>/`, `locallycloud-ecs-<uid>/`, and `locallycloud-firecracker-<uid>/` | Legacy/fallback compute work directories. Remove only after their tasks have stopped. |
+| `${TMPDIR:-/tmp}/locallycloud-oci-<uid>/` and `locallycloud-ecs-<uid>/` | Legacy/fallback compute work directories. Remove only after their tasks have stopped. |
 | `/tmp/lc-rds-<token>/` | PostgreSQL socket directories for local RDS instances. Inspect ownership and the corresponding stopped instance before removing a leftover directory; do not delete other instances' directories. |
 | `~/.config/locallycloud/kms.key`, if created using the website's example | Your saved KMS master key. This is user-created, not installed by the package. Retain it if you plan to reuse encrypted state. Remove only the dedicated key file or directory you created. |
 | `~/.aws/config` and `~/.aws/credentials` | Remove only `[profile locallycloud]` and `[locallycloud]`, respectively, if you no longer need that profile. Keep your other AWS profiles. |

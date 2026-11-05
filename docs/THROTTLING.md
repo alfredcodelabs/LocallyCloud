@@ -1,6 +1,6 @@
 # Throttling
 
-[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Platforms](PLATFORMS.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
 
 Compare burst handling at workstation scale. Each service has independent limits;
 there is no shared throttle across Lambda, DynamoDB and Kinesis.
@@ -24,15 +24,11 @@ have separate retry policies.
 
 ## Configuration
 
-| Variable | Default | Controls |
-| --- | --- | --- |
-| `LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY` | `1000` | Execution quota per account/region. |
-| `LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY` | `100` | Minimum capacity left by function reservations. |
-| `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | `1024` | Host budget for Lambda environments. |
-| `LOCALLYCLOUD_SQS_ESM_MAX_POLLERS` | `10` | Local worker ceiling per SQS mapping, independent of RC. |
-| `LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE` | `1` | Multiplier for classic EventBridge retry delays and event age. |
-| `LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS` | Disabled | Set `1` to enforce controlled table write limits. |
-| `LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS` | Disabled | Set `1` to enforce modeled shard write limits. |
+Use the [configuration reference](SETUP.md#configuration) for variable defaults
+and ranges. Lambda account/region quotas and function reserved concurrency are
+independent of the process-wide [memory budget](LAMBDA.md#memory-budget).
+`LOCALLYCLOUD_SQS_ESM_MAX_POLLERS` limits mapping workers;
+`LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE` accelerates retry experiments.
 
 Example: quota `10` with minimum unreserved `2` permits eight reserved slots. Defaults
 are independent; quotas below 100 require an explicit smaller minimum. Incompatible saved
@@ -42,9 +38,9 @@ Time scale `0.01` makes one retry second last 10 ms and reduces event age propor
 See the [configuration reference](SETUP.md#configuration) for accepted ranges.
 
 > [!TIP]
-> Use disposable state and disk-backed caches; `/tmp` may be tmpfs. Budget roughly
-> simultaneous environments × (`MemorySize` + 32 MiB), plus warm environments and
-> room for other applications. Increasing a quota allocates no RAM.
+> Use disposable state and disk-backed caches; `/tmp` may be tmpfs. Keep host
+> capacity above the experiment's demand. Increasing an execution quota does not
+> increase the memory budget.
 
 ## Diagnosis
 

@@ -19,9 +19,9 @@ VMs must keep working, but they are secondary targets.
   dispatches to a **native in-process handler**. Services not yet implemented natively can be
   forwarded to a **configurable external fallback backend** (default `http://localhost:4567`);
   this is optional and name-independent.
-- **Compute isolation:** **Firecracker** microVMs (`/dev/kvm`) primary — the same isolation
-  model AWS uses for Lambda — with a **daemonless OCI** fallback (`youki`/`crun`) when KVM is
-  unavailable. **No Docker daemon, no `bollard`.**
+- **Compute isolation:** **rootless, daemonless OCI** (`crun`, then `youki`, from `PATH`),
+  running as the regular user with no device access such as `/dev/kvm`.
+  **No Docker daemon, no `bollard`.**
 - **Goal:** maximum fidelity to real AWS wire behavior (strict SDK/CLI (de)serialization),
   millisecond starts, low memory.
 
@@ -37,7 +37,7 @@ crates/
 ├── core/                  # server, router, proxy, registry, error_mapping, config, endpoint,
 │                          # observability, dashboard (`/_locallycloud/ui`)
 ├── state/                 # SQLite state database and encryption shared by services
-├── compute/               # ComputeRuntime trait + Firecracker + OCI (youki/crun) + selector
+├── compute/               # ComputeRuntime trait + rootless OCI backend (crun/youki)
 └── <service>/             # one crate per AWS service: lambda, s3, dynamodb, sqs, sns, iam-sts,
                            # eventbridge, stepfunctions, apigateway, cloudformation, kinesis, …
 packaging/                 # Debian (`debian/build-deb.sh`), Arch (`arch/PKGBUILD`), desktop assets
@@ -114,30 +114,32 @@ pub trait ComputeRuntime: Send + Sync {
 }
 ```
 
-- **`FirecrackerRuntime`** (primary): talks to the Firecracker control socket and uses
-  `/dev/kvm` to launch microVMs; snapshot/restore for fast warm starts.
-- **`YoukiRuntime`** (fallback): daemonless OCI runtime (`youki`/`crun`) when `/dev/kvm` is
-  unavailable. No Docker, no `bollard`.
-- **`RuntimeSelector`** picks automatically by KVM availability, with a config override.
+- **`YoukiRuntime`** is the only backend: a rootless, daemonless OCI runtime (`crun`
+  preferred, then `youki`) used by Lambda, ECS and EC2. No Docker, no `bollard`.
+- Firecracker was removed: it needed `/dev/kvm`, a kernel and a rootfs, and never ran
+  workloads. A future microVM backend (for example Apple Containerization on macOS) must
+  implement `ComputeRuntime` and keep the user-only, no-runtime-download constraints.
 
-### Runtime footprint (host-provided, optional)
+### Runtime footprint (optional host tools and runtime packs)
 
 The emulator is a **single binary with no eager runtime dependencies**: the server starts and
 serves every in-process service without any compute backend. Only code-executing services
-(Lambda, ECS, EC2) and RDS need host tools, and nothing is downloaded at runtime.
+(Lambda, ECS, EC2) and RDS need host tools. Downloads happen only through explicit
+`locallycloud runtime install/update` commands, never startup or invocation.
 
 - **Host tools come from the distribution:** `crun`/`youki` from `PATH`
-  (`YoukiRuntime::discover`), language executables (`python3.x`, `node`) for ZIP Lambdas, and
-  PostgreSQL 16+ binaries for RDS (`LOCALLYCLOUD_PG_BIN_DIR`, then `PATH`, then the newest
-  `/usr/lib/postgresql/<major>/bin`). They are optional package
+  (`YoukiRuntime::discover`), and PostgreSQL 16+ binaries for RDS
+  (`LOCALLYCLOUD_PG_BIN_DIR`, then `PATH`, then the newest `/usr/lib/postgresql/<major>/bin`). They are optional package
   dependencies (`Suggests`/`optdepends`), never hard ones. A missing tool must surface a typed,
   actionable AWS error on first use, not a startup failure.
-- **Caches are derived from the host:** Lambda builds per-runtime root filesystems under
-  `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/lambda/runtime-cache/` from the host interpreter.
-  Cached trees are read-only (`0o555`/`0o444`); any code that removes or rebuilds them must
-  restore write permission first, or the user cannot delete the cache.
-- **Only the selected backend is used:** `/dev/kvm` accessible → Firecracker; otherwise OCI.
-  Never both.
+- **Prefer official AWS components:** reuse maintained upstream runtimes and clients;
+  implement only the missing integration and remove compatibility adaptations when
+  upstream covers them. Lambda uses explicitly pre-imported, digest-verified official
+  runtime packs managed by `locallycloud runtime` under `LOCALLYCLOUD_RUNTIME_PACKS_DIR` (default
+  `<Lambda work directory>/runtime-packs`). No startup/invocation downloads. Runtime
+  files are shared between read-only guests; host overlays must replace files rather
+  than modifying shared inodes. Retained host-derived cache cleanup must restore
+  directory write permissions before deletion. See [docs/LAMBDA.md](docs/LAMBDA.md).
 
 ## Configuration
 
@@ -177,7 +179,6 @@ default independently. Common values:
 - `LOCALLYCLOUD_HOST` / `LOCALLYCLOUD_PORT` (`127.0.0.1:4566`)
 - `LOCALLYCLOUD_ACCOUNT_ID` (`000000000000`)
 - `LOCALLYCLOUD_DEFAULT_REGION` (`us-east-1`)
-- `LOCALLYCLOUD_RUNTIME` (`auto|firecracker|youki`)
 - `LOCALLYCLOUD_IAM_ENFORCEMENT` (permissive by default; `strict` to test policies)
 - `LOCALLYCLOUD_WORK_DIR` for Lambda work files (relative paths resolve from the process
   working directory); default `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/lambda`.
@@ -218,8 +219,8 @@ user-facing source of truth for support levels; keep it in sync with this sectio
 | Rust | repo `rust`/`cargo` | `rustup` pinned to `rust-version` |
 | SQLite | repo `sqlite>=3.53.4` (dynamic) | 3.53.4 from sqlite.org, SHA-256 verified, **linked statically** |
 | Runtime deps | `glibc`, `gcc-libs`, `sqlite` | `libc6 (>= <computed>)`, `libgcc-s1` |
-| Recommends | — | `dbus-user-session` (installed by default by `apt`) |
-| Optional | `optdepends`: `crun`, `postgresql`, `xdg-utils` | `Suggests`: `crun`, `postgresql`, `xdg-utils` |
+| Recommends | — | `dbus-user-session`, `xdg-utils` (installed by `apt` unless recommendations are disabled) |
+| Optional | `optdepends`: `crun`, `postgresql`, `python`, `jq`, `xdg-utils` | `Suggests`: `crun`, `postgresql`, `python3`, `jq` |
 
 Rules:
 
@@ -234,9 +235,8 @@ Rules:
 - The `.deb` binary is built in a Debian container, never copied from an Arch build: an Arch
   binary links against a newer glibc and will not run on the LTS releases.
 - Host tools are optional and resolved at runtime (see Runtime footprint); support the versions
-  the LTS releases ship and prefer the newest one each platform offers (e.g. Node.js 20 and
-  PostgreSQL 17 on Debian 13, PostgreSQL 16 on Ubuntu 24.04, the current PostgreSQL on Arch;
-  Python 3.12 on Ubuntu 24.04, 3.13 on Debian 13). Do not assume the newest versions Arch has.
+  the LTS releases ship. Language runtimes come from official AWS packs; host Python 3 is
+  only for runtime preparation/checks. Do not assume the newest tools Arch has.
 - Rootless OCI (Lambda, ECS, EC2) needs a systemd user session with a user D-Bus. The `.deb`
   recommends `dbus-user-session`; on WSL 2, systemd must be enabled (`[boot] systemd=true` in
   `/etc/wsl.conf`). Without a user bus, fail with an actionable error and release the guest's

@@ -1,6 +1,6 @@
 # Available services
 
-[← README](../README.md) · [Setup](SETUP.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
 
 [📦 Service catalog](#available-services) · [🔌 Compatibility](#tool-compatibility) · [⚡ Compute limits](#compute-and-networking-limits) · [💾 Persistence](#persistence-and-beta-limits)
 
@@ -41,6 +41,26 @@ types are rejected; nonempty `Globals.HttpApi` settings are not supported.
 Some `LOCALSTACK_*` configuration aliases and `/_localstack/health` are accepted. Other LocalStack plugins may require APIs that LocallyCloud does not implement.
 
 IAM defaults to permissive mode. To test permissions, enable `LOCALLYCLOUD_IAM_ENFORCEMENT=strict` with bootstrap credentials. Lambda receives a temporary session for its role. DynamoDB evaluates direct actions and each affected table in supported batch, transaction, and PartiQL operations. The workflow with and without `dynamodb:PutItem` permission has been tested; this does not establish compatibility with all AWS policies.
+
+### API Gateway mapping templates
+
+REST API integrations support a bounded VTL subset: `#set`, `#if`/`#elseif`/`#else`,
+`#foreach`, line comments, references, double-quoted interpolation, comparisons,
+boolean operators, `+`, `-` and `%`.
+
+String methods: `isEmpty`, `toLowerCase`, `startsWith`, `split`, `length`,
+`substring` and `replaceAll`. Map/list methods: `isEmpty`, `size`, `get`, `keySet`,
+`containsKey` and `remove`, as appropriate to the value type. Utilities include
+escaping, URL/base64 encoding, JSON parsing and `$util.qr`.
+
+Templates are limited to 300 KiB; rendered output, concatenation and string
+method results to 1 MiB, with bounded nesting and work. Unknown constructs fail
+with HTTP 500 and log the mapping phase and error category. This is not a full Velocity/Java implementation: regex features
+such as lookaround/backreferences are rejected, and assigned collections are
+copied rather than shared aliases. Direct/nested variable `remove` mutations
+are supported. A regression test covers request and response mapping to a Step
+Functions EXPRESS workflow with application templates; validate the rest of your
+application separately.
 
 ## Compute and networking limits
 

@@ -1,6 +1,6 @@
 # Agent context
 
-[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
 
 Graphify is an optional development tool for navigating code, specifications and
 decisions across sessions. It is independent of the emulator and runs locally.

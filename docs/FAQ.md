@@ -1,6 +1,6 @@
 # Frequently asked questions
 
-[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [Agent context](AGENT_CONTEXT.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [Agent context](AGENT_CONTEXT.md)
 
 Practical answers for using LocallyCloud during the beta. Start with the [installation and quick-start guide](../README.md#installation) if this is your first visit.
 
@@ -36,9 +36,16 @@ Stop the emulator, then remove the system package with `sudo apt remove locallyc
 
 With the server running at its default address, open [http://127.0.0.1:4566/_locallycloud/ui](http://127.0.0.1:4566/_locallycloud/ui). The application-menu launcher opens this URL; it does not start the server.
 
-Select an account/profile and region to inspect resources. The active-service filter uses existing resources. Read-only explorers include DynamoDB items, S3 objects, Lambda, Step Functions, SQS, CloudWatch Logs, EventBridge buses/rules/targets, SNS topics/subscriptions, API Gateway APIs and CloudFormation stacks/resources/events. Lists offer continuation when another page exists; configured log and resource links help investigate errors. Resource status alone does not confirm an entire application workflow succeeded.
+Select an account/profile and region to inspect resources. The active-service filter uses existing resources. Read-only explorers include DynamoDB items, S3 objects, Lambda, Step Functions, SQS, CloudWatch Logs, EventBridge buses/rules/targets, SNS topics/subscriptions, API Gateway APIs and CloudFormation stacks/resources/events. The **Threat modeling** view builds an OWASP threat model from a stack; see [Threat modeling](THREAT_MODELING.md). Lists offer continuation when another page exists; configured log and resource links help investigate errors. Resource status alone does not confirm an entire application workflow succeeded.
 
 In strict IAM mode, recent activity diagnostics also require `cloudtrail:LookupEvents` on `*`. A denied diagnostic view does not mean the emulator is offline; resource explorers still use their own service permissions.
+
+### Can I threat-model my stack?
+
+Yes. Open **Threat modeling** in the dashboard and choose a CloudFormation stack.
+The diagram, flows and missing controls come from its deployed configuration, and
+the review follows the four OWASP threat modeling questions. Decisions are saved as
+a local JSON file. See [Threat modeling](THREAT_MODELING.md).
 
 ### How do I encrypt objects created by an older version?
 
@@ -56,30 +63,9 @@ Create a Route 53 Alias A/AAAA record using the domain’s regional target and h
 
 ### Do I need to include the endpoint and port in every command?
 
-No. Save them once in the `locallycloud` AWS CLI v2 profile. In `~/.aws/config`:
-
-```ini
-[profile locallycloud]
-region = us-east-1
-endpoint_url = http://127.0.0.1:4566
-```
-
-In `~/.aws/credentials`:
-
-```ini
-[locallycloud]
-aws_access_key_id = test
-aws_secret_access_key = test
-```
-
-Then use only the profile selector:
-
-```sh
-aws --profile locallycloud sts get-caller-identity
-aws --profile locallycloud s3 ls
-```
-
-The profile stores the endpoint, including its port, and the region. Keep your other profiles when adding these entries. See [Local AWS profile](SETUP.md#local-aws-profile) for setup commands and configuration precedence.
+No. Save the endpoint, region and test credentials in the `locallycloud` AWS
+profile, then use `aws --profile locallycloud <service> <command>`. See
+[profile setup and precedence](SETUP.md#local-aws-profile).
 
 ### Can I make LocallyCloud the default for my terminal?
 
@@ -110,7 +96,8 @@ AWS CLI and SDK clients can target the local endpoint for implemented AWS operat
 
 ### Can I use Terraform, Serverless Framework, or AWS SAM?
 
-Terraform with AWS provider 6.x has been tested with `apply`, a `plan` with no changes, a server restart, and `destroy` for common serverless resources (S3, SQS, SNS, DynamoDB, IAM roles, Lambda, KMS, SSM, Secrets Manager, CloudWatch Logs, EventBridge, HTTP APIs, Kinesis) and ECS clusters. Serverless Framework workflows with `serverless-localstack` have also been tested. SAM CLI 1.166.2 has been tested with `sam deploy` for HTTP API → Lambda ZIP → DynamoDB SimpleTable, including creation, updates, deployment without changes, and cleanup. This is workflow-level compatibility, not complete support for every feature. See the [compatibility table](SERVICES.md#tool-compatibility).
+Yes, for specific tested workflows. See the [tool compatibility table](SERVICES.md#tool-compatibility)
+for scope and versions; support is not complete for every tool feature.
 
 ### Are all AWS operations supported for listed services?
 
@@ -154,9 +141,13 @@ Encrypted state requires the same master key used to create it. An environment v
 
 ### The server runs, but Lambda, ECS, or EC2 execution fails. Why?
 
-The control plane can start without an isolated compute runtime. Check that `crun` or `youki` is available in `PATH` and supported by your Linux host. OCI execution also requires a systemd user session with a user D-Bus and delegated cgroup v2 memory control; it applies the configured guest memory limit without using host swap. ECS tasks additionally require delegated cgroup v2 CPU control, `ip` and `nft` in `PATH`, and kernel netfilter redirect support (`nft_redir`), even for private-only tasks. Missing prerequisites fail task execution rather than server startup. See [ECS networking requirements](SETUP.md#optional-runtime-dependencies). ZIP-based Node.js or Python Lambda functions require the executable for the declared language runtime. See [Optional runtime dependencies](SETUP.md#optional-runtime-dependencies).
+Compute dependencies are optional at startup but required when executing code.
+Check the [host requirements](SETUP.md#optional-runtime-dependencies), including
+OCI's systemd user session, D-Bus and cgroup delegation. ECS also needs the listed
+networking tools. Lambda requires its [official runtime pack](LAMBDA.md);
+installing a host interpreter does not replace it.
 
-### Why does Lambda report D-Bus errors and then TooManyRequestsException on Debian?
+### Why does Lambda report D-Bus errors on Debian?
 
 Minimal Debian installations may lack the user D-Bus session needed by the current OCI runtime. Install the optional dependencies:
 
@@ -166,7 +157,16 @@ sudo apt install crun dbus-user-session
 
 Log out and log back in, or reboot, and verify the user session with `systemctl --user status dbus`. The host must also delegate cgroup v2 memory control to that session. Start LocallyCloud without `sudo`. The `.deb` recommends `dbus-user-session`, but APT may skip it, including when its dependencies require upgrading preinstalled libraries on a minimal image. Install it explicitly with the command above. `crun` is never installed automatically. On WSL 2, systemd must also be enabled; see [Supported platforms](PLATFORMS.md#wsl-2).
 
-On Debian 13 with `crun` 1.21, a failed guest launch can retain its local memory reservation. Repeated attempts then report `TooManyRequestsException` with a memory-budget error even though no guest is running; with the default budget this starts after about six failures. This is a known beta issue, not proof that a running Lambda consumed all available RAM. After resolving the session requirements, restart LocallyCloud with the same state database and `LOCALLYCLOUD_KMS_MASTER_KEY`; do not delete the state or generate a replacement key. Raising the budget only postpones the failure. See [runtime dependencies](SETUP.md#optional-runtime-dependencies).
+### Why does an API Gateway mapping return 500 before invoking its backend?
+
+Check the server's mapping diagnostic: it identifies the request/response phase
+and a parse, evaluation or unsupported-construct error. Bodies and interpolated
+error details are not logged. Compare the template with the
+[supported VTL subset](SERVICES.md#api-gateway-mapping-templates).
+
+If mapping reaches Step Functions but execution fails, inspect the generated
+workflow input. Templates that insert `$input.body` directly as JSON must handle
+an empty request body; LocallyCloud does not replace it with `{}`.
 
 ### RDS cannot start a PostgreSQL database. What is missing?
 
@@ -208,9 +208,11 @@ If you configured a different address or port, update both the health-check URL 
 
 ### How is Lambda memory usage limited?
 
-The guest limit follows the function's `MemorySize`. The local Lambda environment budget defaults to 1,024 MiB and includes each active or warm guest's configured memory plus 32 MiB of estimated host overhead. Set `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` before startup to adjust it; invalid or zero values disable invocation with a startup diagnostic. When no environment fits, Lambda returns `TooManyRequestsException`. This budget accounts for Lambda environments, not total server RSS, stored resources, EC2 or ECS.
-
-Compute output is bounded and read incrementally. Logs exceeding a capture limit include an explicit dropped-output notice. Work files default to the per-user cache; use `LOCALLYCLOUD_WORK_DIR` to select another location. Putting work files on tmpfs consumes RAM.
+Each function's `MemorySize` sets its guest limit. The separate **4096 MiB budget
+is shared across all active and warm Lambda environments**, with 32 MiB of
+estimated overhead per environment. It reserves no RAM at startup. See
+[Lambda memory accounting](LAMBDA.md#memory-budget) for configuration and rejection
+behavior.
 
 ### Does deleting a stack remove its logs and runtime files?
 

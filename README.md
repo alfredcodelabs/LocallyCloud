@@ -8,7 +8,8 @@
 **Local AWS workflows. One endpoint. No Docker daemon.**
 
 Develop and test serverless applications, event pipelines and data workflows on
-Linux using your AWS CLI or SDK clients.
+Linux using your AWS CLI or SDK clients, then [threat-model what you deployed](docs/THREAT_MODELING.md)
+from the dashboard.
 
 [Quick start](#quick-start) · [Services](docs/SERVICES.md) · [Documentation](#documentation)
 
@@ -127,6 +128,8 @@ and the [environment variable reference](docs/SETUP.md#configuration).
 ## Documentation
 
 - [Setup and configuration](docs/SETUP.md): installation, AWS profiles, variables and uninstallation.
+- [Lambda runtimes](docs/LAMBDA.md): install, update, rollback and shared memory budget.
+- [Threat modeling](docs/THREAT_MODELING.md): OWASP threat models generated from your deployed stacks, with an agent companion.
 - [Available services](docs/SERVICES.md): compatibility, persistence and principal limits.
 - [FAQ](docs/FAQ.md): usage and troubleshooting.
 - [Supported platforms](docs/PLATFORMS.md): Linux distributions, architectures, WSL 2 and VMs.
