@@ -33,4 +33,5 @@ jsonschema = { version = "=0.58.1", default-features = false }
 regex = "=1.13.1"
 
 [dev-dependencies]
+locallycloud-stepfunctions.workspace = true
 proptest = "=1.11.0"

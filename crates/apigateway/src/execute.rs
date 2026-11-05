@@ -25,7 +25,7 @@ use crate::proxy_event::{
     build_event, interpret_response, percent_decode, EventInput, ProxyResponse,
 };
 use crate::store::ApiGwStore;
-use crate::vtl::{ContextBinding, InputBinding, UtilBinding, VtlContext, VtlEngine};
+use crate::vtl::{ContextBinding, InputBinding, UtilBinding, VtlContext, VtlEngine, VtlError};
 use crate::xray::{CallOutcome, Sampler, StageTrace, TracedStage};
 
 pub struct ExecuteCtx<'a> {
@@ -1914,7 +1914,7 @@ async fn execute_rest_integration(
             }
         }
         "AWS" => {
-            let mapped = match map_request(integration, &request) {
+            let mapped = match map_request(ctx, integration, &request) {
                 Ok(body) => body,
                 Err(415) => {
                     return rest_error(
@@ -1972,7 +1972,7 @@ async fn execute_rest_integration(
                 }
             };
             match response {
-                Ok(response) => map_integration_response(integration, response, &request),
+                Ok(response) => map_integration_response(ctx, integration, response, &request),
                 Err(InvokeFailure::Timeout) => rest_error(
                     gateway_responses,
                     "INTEGRATION_TIMEOUT",
@@ -1996,7 +1996,7 @@ async fn execute_rest_integration(
             forward_http(ctx, integration, &request, &uri, request.body.clone()).await
         }
         "HTTP" => {
-            let mapped = match map_request(integration, &request) {
+            let mapped = match map_request(ctx, integration, &request) {
                 Ok(body) => body,
                 Err(415) => {
                     return rest_error(
@@ -2022,7 +2022,7 @@ async fn execute_rest_integration(
             );
             let response = forward_http_raw(ctx, integration, &request, &uri, mapped).await;
             match response {
-                Ok(response) => map_integration_response(integration, response, &request),
+                Ok(response) => map_integration_response(ctx, integration, response, &request),
                 Err(InvokeFailure::Timeout) => rest_error(
                     gateway_responses,
                     "INTEGRATION_TIMEOUT",
@@ -2038,7 +2038,7 @@ async fn execute_rest_integration(
             }
         }
         "MOCK" => {
-            let mapped = match map_request(integration, &request) {
+            let mapped = match map_request(ctx, integration, &request) {
                 Ok(body) => body,
                 Err(415) => {
                     return rest_error(
@@ -2062,6 +2062,7 @@ async fn execute_rest_integration(
                 .and_then(|value| value.get("statusCode").and_then(Value::as_u64))
                 .unwrap_or(200) as u16;
             map_integration_response(
+                ctx,
                 integration,
                 RawIntegrationResponse {
                     status,
@@ -2268,7 +2269,11 @@ fn append_query(uri: &str, query: Option<&str>) -> String {
     }
 }
 
-fn map_request(integration: &Value, request: &IntegrationRequest<'_>) -> Result<Bytes, u16> {
+fn map_request(
+    ctx: &ExecuteCtx<'_>,
+    integration: &Value,
+    request: &IntegrationRequest<'_>,
+) -> Result<Bytes, u16> {
     let templates = string_map(integration.get("requestTemplates"));
     let engine = VtlEngine::new();
     let selected = engine.select_template(&templates, content_type(request.headers));
@@ -2284,9 +2289,12 @@ fn map_request(integration: &Value, request: &IntegrationRequest<'_>) -> Result<
         };
     };
     let body = String::from_utf8_lossy(&request.body);
-    evaluate_vtl(request, template, &body)
+    evaluate_vtl(ctx, request, template, &body)
         .map(|mapped| Bytes::from(mapped.0))
-        .map_err(|_| 500)
+        .map_err(|error| {
+            log_vtl_error(&error, "request");
+            500
+        })
 }
 
 fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
@@ -2307,13 +2315,39 @@ fn content_type(headers: &HeaderMap) -> Option<&str> {
 type EvaluatedVtl = (String, Option<u16>, BTreeMap<String, String>);
 
 fn evaluate_vtl(
+    ctx: &ExecuteCtx<'_>,
     request: &IntegrationRequest<'_>,
     template: &str,
     body: &str,
-) -> Result<EvaluatedVtl, ()> {
+) -> Result<EvaluatedVtl, VtlError> {
     let query = query_map(request.uri.query().unwrap_or(""));
     let header = headers_map(request.headers);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut authorizer = request
+        .auth
+        .lambda
+        .clone()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some((claims, _)) = &request.auth.jwt {
+        authorizer["claims"] = claims.clone();
+    }
     let values = BTreeMap::from([
+        ("accountId".into(), json!(ctx.account)),
+        ("apiId".into(), json!(request.api_id)),
+        ("requestId".into(), json!(ctx.request_id)),
+        ("resourceId".into(), json!(request.resource_id)),
+        ("requestTimeEpoch".into(), json!(now.as_millis() as u64)),
+        ("authorizer".into(), authorizer),
+        (
+            "identity".into(),
+            json!({
+                "sourceIp": ctx.trusted_peer_ip.unwrap_or(""),
+                "userAgent": request_user_agent(request.headers).unwrap_or_default(),
+            }),
+        ),
         (
             "httpMethod".to_string(),
             Value::String(request.method.to_string()),
@@ -2339,19 +2373,27 @@ fn evaluate_vtl(
         context: ContextBinding { values: &values },
         stage_variables: request.variables,
     };
-    VtlEngine::new()
-        .evaluate(template, &context)
-        .map(|mapped| {
-            (
-                mapped.output,
-                mapped.status_override,
-                mapped.header_overrides,
-            )
-        })
-        .map_err(|_| ())
+    VtlEngine::new().evaluate(template, &context).map(|mapped| {
+        (
+            mapped.output,
+            mapped.status_override,
+            mapped.header_overrides,
+        )
+    })
+}
+
+fn log_vtl_error(error: &VtlError, phase: &'static str) {
+    let error_kind = match error {
+        VtlError::Parse(_) => "parse",
+        VtlError::Evaluation(_) => "evaluation",
+        VtlError::Unsupported(_) => "unsupported",
+    };
+    // Error details may contain request bodies or credentials interpolated by the template.
+    tracing::warn!(phase, error_kind, "API Gateway mapping template failed");
 }
 
 fn map_integration_response(
+    ctx: &ExecuteCtx<'_>,
     integration: &Value,
     raw: RawIntegrationResponse,
     request: &IntegrationRequest<'_>,
@@ -2386,7 +2428,7 @@ fn map_integration_response(
         );
         if let Some(template) = selected_template {
             let text = String::from_utf8_lossy(&raw.body);
-            match evaluate_vtl(request, template, &text) {
+            match evaluate_vtl(ctx, request, template, &text) {
                 Ok((output, status_override, header_overrides)) => {
                     body = Bytes::from(output);
                     if let Some(override_status) = status_override {
@@ -2394,7 +2436,10 @@ fn map_integration_response(
                     }
                     overrides = header_overrides;
                 }
-                Err(_) => return plain(500, "Internal server error"),
+                Err(error) => {
+                    log_vtl_error(&error, "response");
+                    return plain(500, "Internal server error");
+                }
             }
         }
     }

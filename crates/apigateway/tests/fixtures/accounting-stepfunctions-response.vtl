@@ -1,0 +1,27 @@
+#set($output = $util.parseJson($input.json('$.output')))
+#set($native = $util.parseJson($output))
+#if($native.statusCode)
+    #set($statusCode = $native.statusCode)
+    #set($toReplaceBase = '\"statusCode\":' + $statusCode)
+    #set($toReplace = "$toReplaceBase" + ',')
+    #set($toReplaceEnd = ',' + "$toReplaceBase")
+    #foreach($attribute in $native.keySet())
+        #if($attribute == 'statusCode' && $foreach.hasNext) #set($output = $output.replaceAll("$toReplace", "")) #end
+        #if($attribute == 'statusCode' && !$foreach.hasNext)
+            #set($output = $output.replaceAll("$toReplaceEnd", ""))
+            #set($output = $output.replaceAll("$toReplaceBase", ""))
+        #end
+    #end
+    #set($outputLength = $output.length() - 1)
+    #set($output = $output.substring(1,$outputLength))
+    #set($beginWithBody = $output.substring(0,7))
+    #if($beginWithBody == '"body":')
+        #set($outputLength = $output.length())
+        #set($output = $output.substring(7,$outputLength))
+    #else
+        #set($output = $output.replaceAll('\"body\":', ""))
+    #end
+    #set($context.responseOverride.status = $statusCode)
+#end
+#if( !$output.isEmpty() )
+$output#end

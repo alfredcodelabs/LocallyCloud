@@ -1,0 +1,81 @@
+#set($step-function = "sfn-sm-acct-get-flows-dev")
+#set($arn-step = 'arn:aws:states:' + "us-east-1" + ':' + "0" + ':stateMachine:' + "$step-function")
+## clientId and clientName extraction - STEP 1
+#set($clientId = "")
+#set($clientName = "")
+## Try to get from authorizer claims first
+#if($context.authorizer.claims && $context.authorizer.claims.client_id && !$context.authorizer.claims.client_id.isEmpty())
+  #set($clientId = $context.authorizer.claims.client_id)
+#elseif($context.authorizer.claims && $context.authorizer.claims.clientId && !$context.authorizer.claims.clientId.isEmpty())
+  #set($clientId = $context.authorizer.claims.clientId)
+#elseif($context.authorizer.principalId && !$context.authorizer.principalId.isEmpty())
+  #set($clientId = $context.authorizer.principalId)
+#end
+## Extract and decode JWT - STEP 2
+#set($jwtToken = "")
+#foreach($headerName in $input.params().header.keySet())
+  #if($headerName.toLowerCase() == "authorization")
+    #set($authValue = $input.params().header.get($headerName))
+    #if($authValue.startsWith("Bearer "))
+      #set($jwtToken = $authValue.substring(7))
+      ## Now decode the JWT payload in VTL
+      #set($jwtParts = $jwtToken.split("\."))
+      #if($jwtParts.size() >= 2)
+        ## Get the payload part (second part) and decode it
+        #set($payloadPart = $jwtParts.get(1))
+        ## Add padding if needed for base64 decoding
+        #set($remainder = $payloadPart.length() % 4)
+        #if($remainder == 2)
+          #set($payloadPart = $payloadPart + "==")
+        #elseif($remainder == 3)
+          #set($payloadPart = $payloadPart + "=")
+        #end
+        ## Decode base64 payload
+        #set($decodedPayload = $util.base64Decode($payloadPart))
+        ## Parse JSON payload
+        #set($jwtClaims = $util.parseJson($decodedPayload))
+        ## Extract clientName from custom claim
+        #set($naranjaInfoKey = "https://naranja.com/info")
+        #if($jwtClaims.containsKey($naranjaInfoKey))
+          #set($naranjaInfo = $jwtClaims.get($naranjaInfoKey))
+          #if($naranjaInfo.containsKey("clientName"))
+            #set($clientName = $naranjaInfo.get("clientName"))
+          #end
+          ## Also update clientId from JWT if available and authorizer didn't provide it
+          #if($clientId == "" && $naranjaInfo.containsKey("clientId"))
+            #set($clientId = $naranjaInfo.get("clientId"))
+          #end
+        #end
+      #end
+    #end
+  #end
+#end
+## Try to get clientName from authorizer context if available (fallback)
+#if($clientName.isEmpty() && $context.authorizer.clientName)
+  #set($clientName = $context.authorizer.clientName)
+#end
+## Add timestamp - STEP 3
+#set($timestamp = $context.requestTimeEpoch)
+#set($context-data = '{ "owner": "'+ "accounting" + '",  "project-owner": "'+ "nave" + '", "service": "'+"accounting"+'", "custom-service-name": "'+"accounting"+'", "vertical": "'+"nave"+'", "environment": "'+"sandbox"+'", "version":"'+ "1.0.64" +'", "account-id": "' + "$context.accountId" + '", "region": "'+"us-east-1"+'", "node-version": "'+"nodejs22.x"+'", "api-id": "' + "$context.apiId" + '", "api-key": "' + "$context.identity.apiKey" + '", "authorizer-principal-id": "' +  "$context.authorizer.principalId" + '", "caller": "' + "$context.identity.caller" + '", "cognito-authentication-provider": "' + "$context.identity.cognitoAuthenticationProvider" + '", "cognito-authentication-type": "' + "$context.identity.cognitoAuthenticationType" + '", "cognito-identity-id": "' + "$context.identity.cognitoIdentityId" + '", "cognito-identity-pool-id": "' + "$context.identity.cognitoIdentityPoolId" + '", "http-method": "' + "$context.httpMethod" + '", "stage": "' + "$context.stage" + '", "source-ip": "' + "$context.identity.sourceIp" + '", "user": "' + "$context.identity.user" + '", "user-agent": "' + "$context.identity.userAgent" + '", "user-arn": "' + "$context.identity.userArn" + '", "request-id": "' + "$context.requestId" + '", "resource-id": "' + "$context.resourceId" + '", "resource-path": "' + "$context.resourcePath" + '", "query": "'+ "$context.httpMethod" + " " + "$context.resourcePath" + '", "client-id": "' + "$clientId" + '", "client-name": "' + "$clientName" + '", "timestamp": ' + "$timestamp" + '}')
+## PARAMS FACTORY START.**
+#set($allParams = $input.params())
+$util.qr($allParams.remove("header"))
+#set($params-data = '{')
+#foreach($type in $allParams.keySet())
+    #set($params = $allParams.get($type))
+    #set($params-data = $params-data + '"' + "$type" + '": {')
+        #foreach($paramName in $params.keySet())
+            #set($params-data = $params-data + '"' + "$paramName" + '": "' + "$params.get($paramName)" + '"')
+            #if($foreach.hasNext) #set($params-data = $params-data + ', ') #end
+        #end
+    #if($foreach.hasNext) #set($params-data = $params-data + '},') #else #set($params-data = $params-data + '}') #end
+#end
+#set($params-data = $params-data + '}')
+## PARAMS FACTORY END.**
+## Add JWT token safely to a separate field
+#set($rawBody = $input.body)
+#set($sanitizedBody = $rawBody.replaceAll("[\r\n]", ""))
+
+#set($data = '{ "context": ' + $context-data + ', "body": ' + $sanitizedBody + ', "params": ' + $params-data + ' }')
+#set($data = $util.escapeJavaScript($data).replaceAll("\\'", "'"))
+{"input": "$data","name": "$context.requestId","stateMachineArn": "$arn-step"}

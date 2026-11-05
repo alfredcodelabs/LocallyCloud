@@ -11,6 +11,11 @@ use base64::Engine as _;
 use http::{HeaderName, HeaderValue};
 use serde_json::{Map, Number, Value};
 
+const MAX_VTL_VALUE_BYTES: usize = 1024 * 1024;
+
+mod methods;
+use methods::{append_bounded, apply_value_method, extend_pointer};
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VtlError {
     #[error("invalid VTL syntax: {0}")]
@@ -107,6 +112,9 @@ impl VtlEngine {
         template: &str,
         context: &VtlContext<'_>,
     ) -> Result<EvaluatedTemplate, VtlError> {
+        if template.len() > 300 * 1024 {
+            return Err(VtlError::Parse("template size limit exceeded".into()));
+        }
         let mut parser = TemplateParser::new(template);
         let (nodes, stop) = parser.parse_nodes(&[])?;
         if stop.is_some() {
@@ -116,6 +124,11 @@ impl VtlEngine {
         let mut evaluator = Evaluator::new(context);
         let mut output = String::new();
         evaluator.render_nodes(&nodes, &mut output)?;
+        if output.len() > MAX_VTL_VALUE_BYTES {
+            return Err(VtlError::Evaluation(
+                "rendered output size limit exceeded".into(),
+            ));
+        }
         Ok(EvaluatedTemplate {
             output,
             status_override: evaluator.status_override,
@@ -152,6 +165,7 @@ enum Node {
 #[derive(Debug, Clone)]
 enum Expr {
     Literal(Value),
+    Interpolated(String),
     Array(Vec<Expr>),
     Object(Vec<(String, Expr)>),
     Reference(Reference),
@@ -169,6 +183,9 @@ enum BinaryOp {
     LessEqual,
     Greater,
     GreaterEqual,
+    Add,
+    Subtract,
+    Remainder,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +211,7 @@ enum StopDirective {
 struct TemplateParser<'a> {
     source: &'a str,
     position: usize,
+    depth: usize,
 }
 
 impl<'a> TemplateParser<'a> {
@@ -201,6 +219,7 @@ impl<'a> TemplateParser<'a> {
         Self {
             source,
             position: 0,
+            depth: 0,
         }
     }
 
@@ -208,6 +227,10 @@ impl<'a> TemplateParser<'a> {
         &mut self,
         stops: &[StopDirective],
     ) -> Result<(Vec<Node>, Option<StopDirective>), VtlError> {
+        if self.depth >= 32 {
+            return Err(VtlError::Parse("directive nesting limit exceeded".into()));
+        }
+        self.depth += 1;
         let mut nodes = Vec::new();
         let mut text_start = self.position;
 
@@ -217,6 +240,14 @@ impl<'a> TemplateParser<'a> {
                 continue;
             }
 
+            if self.source[self.position..].starts_with("##") {
+                self.push_text(&mut nodes, text_start, self.position);
+                self.position = self.source[self.position..]
+                    .find('\n')
+                    .map_or(self.source.len(), |end| self.position + end + 1);
+                text_start = self.position;
+                continue;
+            }
             let Some((name, after_name)) = self.peek_directive() else {
                 if matches!(
                     self.source.as_bytes().get(self.position + 1),
@@ -237,6 +268,7 @@ impl<'a> TemplateParser<'a> {
                 if stops.contains(&stop) {
                     self.push_text(&mut nodes, text_start, self.position);
                     self.position = after_name;
+                    self.depth -= 1;
                     return Ok((nodes, Some(stop)));
                 }
                 return Err(VtlError::Parse(format!("unexpected #{name}")));
@@ -256,6 +288,7 @@ impl<'a> TemplateParser<'a> {
         }
 
         self.push_text(&mut nodes, text_start, self.position);
+        self.depth -= 1;
         Ok((nodes, None))
     }
 
@@ -466,6 +499,8 @@ fn parse_complete_expression(source: &str) -> Result<Expr, VtlError> {
 struct ExpressionParser<'a> {
     source: &'a str,
     position: usize,
+    depth: usize,
+    operations: usize,
 }
 
 impl<'a> ExpressionParser<'a> {
@@ -473,6 +508,8 @@ impl<'a> ExpressionParser<'a> {
         Self {
             source,
             position: 0,
+            depth: 0,
+            operations: 0,
         }
     }
 
@@ -525,7 +562,7 @@ impl<'a> ExpressionParser<'a> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, VtlError> {
-        let mut expression = self.parse_unary()?;
+        let mut expression = self.parse_additive()?;
         loop {
             let operation = if self.consume_operator("<=") {
                 Some(BinaryOp::LessEqual)
@@ -542,6 +579,35 @@ impl<'a> ExpressionParser<'a> {
             expression = Expr::Binary(
                 Box::new(expression),
                 operation,
+                Box::new(self.parse_additive()?),
+            );
+        }
+        Ok(expression)
+    }
+
+    fn parse_additive(&mut self) -> Result<Expr, VtlError> {
+        let mut expression = self.parse_remainder()?;
+        loop {
+            let operation = match () {
+                _ if self.consume_operator("+") => BinaryOp::Add,
+                _ if self.consume_operator("-") => BinaryOp::Subtract,
+                _ => break,
+            };
+            expression = Expr::Binary(
+                Box::new(expression),
+                operation,
+                Box::new(self.parse_remainder()?),
+            );
+        }
+        Ok(expression)
+    }
+
+    fn parse_remainder(&mut self) -> Result<Expr, VtlError> {
+        let mut expression = self.parse_unary()?;
+        while self.consume_operator("%") {
+            expression = Expr::Binary(
+                Box::new(expression),
+                BinaryOp::Remainder,
                 Box::new(self.parse_unary()?),
             );
         }
@@ -549,6 +615,19 @@ impl<'a> ExpressionParser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, VtlError> {
+        if self.depth >= 32 || self.operations >= 256 {
+            return Err(VtlError::Parse(
+                "expression complexity limit exceeded".into(),
+            ));
+        }
+        self.depth += 1;
+        self.operations += 1;
+        let result = self.parse_unary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, VtlError> {
         if self.consume_operator("!") {
             return Ok(Expr::UnaryNot(Box::new(self.parse_unary()?)));
         }
@@ -559,7 +638,8 @@ impl<'a> ExpressionParser<'a> {
         self.skip_whitespace();
         match self.current_byte() {
             Some(b'$') => Ok(Expr::Reference(self.parse_reference()?)),
-            Some(b'\'') | Some(b'"') => Ok(Expr::Literal(Value::String(self.parse_string()?))),
+            Some(b'"') => Ok(Expr::Interpolated(self.parse_string()?)),
+            Some(b'\'') => Ok(Expr::Literal(Value::String(self.parse_string()?))),
             Some(b'[') => self.parse_array(),
             Some(b'{') => self.parse_object(),
             Some(b'(') => {
@@ -630,17 +710,36 @@ impl<'a> ExpressionParser<'a> {
     fn parse_number(&mut self) -> Result<Expr, VtlError> {
         self.skip_whitespace();
         let start = self.position;
-        while self.current_byte().is_some_and(|byte| {
-            byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E')
-        }) {
+        self.consume_byte(b'-');
+        while self
+            .current_byte()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
             self.position += 1;
+        }
+        if self.consume_byte(b'.') {
+            while self
+                .current_byte()
+                .is_some_and(|byte| byte.is_ascii_digit())
+            {
+                self.position += 1;
+            }
+        }
+        if matches!(self.current_byte(), Some(b'e' | b'E')) {
+            self.position += 1;
+            if matches!(self.current_byte(), Some(b'+' | b'-')) {
+                self.position += 1;
+            }
+            while self
+                .current_byte()
+                .is_some_and(|byte| byte.is_ascii_digit())
+            {
+                self.position += 1;
+            }
         }
         let text = &self.source[start..self.position];
         let value = serde_json::from_str::<Value>(text)
-            .map_err(|_| VtlError::Parse(format!("invalid number `{text}`")))?;
-        if !value.is_number() {
-            return Err(VtlError::Parse(format!("invalid number `{text}`")));
-        }
+            .map_err(|_| VtlError::Parse("invalid number".into()))?;
         Ok(Expr::Literal(value))
     }
 
@@ -715,17 +814,24 @@ impl<'a> ExpressionParser<'a> {
                 .next()
                 .ok_or_else(|| VtlError::Parse("unterminated string escape".into()))?;
             self.position += escaped.len_utf8();
-            output.push(match escaped {
+            let decoded = match escaped {
                 'n' => '\n',
                 'r' => '\r',
                 't' => '\t',
                 'b' => '\u{0008}',
                 'f' => '\u{000c}',
-                '\\' => '\\',
+                '\\' => {
+                    output.push('\\');
+                    '\\'
+                }
                 '\'' => '\'',
                 '"' => '"',
-                other => other,
-            });
+                other => {
+                    output.push('\\');
+                    other
+                }
+            };
+            output.push(decoded);
         }
         Err(VtlError::Parse("unterminated string".into()))
     }
@@ -745,7 +851,7 @@ impl<'a> ExpressionParser<'a> {
         let start = self.position;
         while self
             .current_byte()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
             self.position += 1;
         }
@@ -809,6 +915,7 @@ struct Evaluator<'a, 'ctx> {
     variables: BTreeMap<String, Value>,
     status_override: Option<u16>,
     header_overrides: BTreeMap<String, String>,
+    steps_remaining: usize,
 }
 
 impl<'a, 'ctx> Evaluator<'a, 'ctx> {
@@ -818,11 +925,21 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
             variables: BTreeMap::new(),
             status_override: None,
             header_overrides: BTreeMap::new(),
+            steps_remaining: 100_000,
         }
     }
 
     fn render_nodes(&mut self, nodes: &[Node], output: &mut String) -> Result<(), VtlError> {
         for node in nodes {
+            self.steps_remaining = self
+                .steps_remaining
+                .checked_sub(1)
+                .ok_or_else(|| VtlError::Evaluation("template work limit exceeded".into()))?;
+            if output.len() > MAX_VTL_VALUE_BYTES {
+                return Err(VtlError::Evaluation(
+                    "rendered output size limit exceeded".into(),
+                ));
+            }
             match node {
                 Node::Text(text) => self.render_text(text, output)?,
                 Node::Set { target, expression } => {
@@ -917,11 +1034,24 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
         let mut position = 0;
         while position < text.len() {
             let Some(relative) = text[position..].find('$') else {
-                output.push_str(&text[position..]);
+                append_bounded(output, &text[position..])?;
                 break;
             };
             let reference_start = position + relative;
-            output.push_str(&text[position..reference_start]);
+            append_bounded(output, &text[position..reference_start])?;
+            let escaped = text[..reference_start]
+                .bytes()
+                .rev()
+                .take_while(|byte| *byte == b'\\')
+                .count()
+                % 2
+                == 1;
+            if escaped {
+                output.pop();
+                append_bounded(output, "$")?;
+                position = reference_start + 1;
+                continue;
+            }
             let after_dollar = text.as_bytes().get(reference_start + 1).copied();
             if after_dollar == Some(b'!') {
                 return Err(VtlError::Unsupported("quiet references".into()));
@@ -929,22 +1059,31 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
             if !after_dollar
                 .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_' || byte == b'{')
             {
-                output.push('$');
+                append_bounded(output, "$")?;
                 position = reference_start + 1;
                 continue;
             }
             let mut parser = ExpressionParser::new(&text[reference_start..]);
             let reference = parser.parse_reference()?;
             let value = self.evaluate_reference(&reference)?;
-            output.push_str(&render_value(&value));
+            append_bounded(output, &render_value(&value))?;
             position = reference_start + parser.position;
         }
         Ok(())
     }
 
     fn evaluate(&mut self, expression: &Expr) -> Result<Value, VtlError> {
+        self.steps_remaining = self
+            .steps_remaining
+            .checked_sub(1)
+            .ok_or_else(|| VtlError::Evaluation("template work limit exceeded".into()))?;
         match expression {
             Expr::Literal(value) => Ok(value.clone()),
+            Expr::Interpolated(text) => {
+                let mut output = String::new();
+                self.render_text(text, &mut output)?;
+                Ok(Value::String(output))
+            }
             Expr::Array(values) => values
                 .iter()
                 .map(|value| self.evaluate(value))
@@ -976,7 +1115,12 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
             Expr::Binary(left, operation, right) => {
                 let left = self.evaluate(left)?;
                 let right = self.evaluate(right)?;
-                Ok(Value::Bool(compare_values(&left, *operation, &right)?))
+                match operation {
+                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Remainder => {
+                        arithmetic(&left, *operation, &right)
+                    }
+                    _ => Ok(Value::Bool(compare_values(&left, *operation, &right)?)),
+                }
             }
         }
     }
@@ -998,7 +1142,7 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
                     self.variables.get(root).cloned().ok_or_else(|| {
                         VtlError::Unsupported(format!("reference root `${root}`"))
                     })?;
-                self.apply_segments(value, &reference.segments)
+                self.apply_segments_with_root(value, &reference.segments, Some(root))
             }
         }
     }
@@ -1085,6 +1229,7 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
                         .map_err(|_| VtlError::Evaluation("decoded base64 is not UTF-8".into()))?,
                 )
             }
+            "qr" | "quiet" => Value::String(String::new()),
             "parseJson" => serde_json::from_str(&value_as_string(&argument))
                 .map_err(|error| VtlError::Evaluation(format!("invalid JSON: {error}")))?,
             _ => return Err(VtlError::Unsupported(format!("$util.{name}"))),
@@ -1092,25 +1237,35 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
         self.apply_segments(value, remaining)
     }
 
-    fn apply_segments(
+    fn apply_segments(&mut self, value: Value, segments: &[RefSegment]) -> Result<Value, VtlError> {
+        self.apply_segments_with_root(value, segments, None)
+    }
+
+    fn apply_segments_with_root(
         &mut self,
         mut value: Value,
         segments: &[RefSegment],
+        root: Option<&str>,
     ) -> Result<Value, VtlError> {
+        let mut pointer = root.map(|_| String::new());
         for segment in segments {
             value = match segment {
-                RefSegment::Property(name) => match value {
-                    Value::Object(object) => object.get(name).cloned().unwrap_or_default(),
-                    Value::Null => Value::Null,
-                    other => {
-                        return Err(VtlError::Evaluation(format!(
-                            "cannot read property `{name}` from {}",
-                            value_kind(&other)
-                        )));
+                RefSegment::Property(name) => {
+                    extend_pointer(&mut pointer, name);
+                    match value {
+                        Value::Object(object) => object.get(name).cloned().unwrap_or_default(),
+                        Value::Null => Value::Null,
+                        other => {
+                            return Err(VtlError::Evaluation(format!(
+                                "cannot read property `{name}` from {}",
+                                value_kind(&other)
+                            )));
+                        }
                     }
-                },
+                }
                 RefSegment::Index(expression) => {
                     let index = self.evaluate(expression)?;
+                    extend_pointer(&mut pointer, &value_as_string(&index));
                     match (value, index) {
                         (Value::Array(values), Value::Number(index)) => index
                             .as_u64()
@@ -1128,8 +1283,31 @@ impl<'a, 'ctx> Evaluator<'a, 'ctx> {
                         }
                     }
                 }
-                RefSegment::Call(name, _) => {
-                    return Err(VtlError::Unsupported(format!("method `{name}` on a value")));
+                RefSegment::Call(name, expressions) => {
+                    let arguments = expressions
+                        .iter()
+                        .map(|arg| self.evaluate(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let result = apply_value_method(&mut value, name, &arguments)?;
+                    if name == "remove" {
+                        if let (Some(root), Some(pointer)) = (root, pointer.as_ref()) {
+                            if let Some(destination) = self
+                                .variables
+                                .get_mut(root)
+                                .and_then(|root| root.pointer_mut(pointer))
+                            {
+                                *destination = value;
+                            }
+                        }
+                    }
+                    if name == "get" {
+                        if let Some(key) = arguments.first() {
+                            extend_pointer(&mut pointer, &value_as_string(key));
+                        }
+                    } else {
+                        pointer = None;
+                    }
+                    result
                 }
             };
         }
@@ -1185,6 +1363,42 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
+fn arithmetic(left: &Value, operation: BinaryOp, right: &Value) -> Result<Value, VtlError> {
+    if matches!(operation, BinaryOp::Add) && (left.is_string() || right.is_string()) {
+        let left = value_as_string(left);
+        let right = value_as_string(right);
+        if left.len().saturating_add(right.len()) > MAX_VTL_VALUE_BYTES {
+            return Err(VtlError::Evaluation("string size limit exceeded".into()));
+        }
+        return Ok(Value::String(format!("{left}{right}")));
+    }
+    if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
+        let result = match operation {
+            BinaryOp::Add => left.checked_add(right),
+            BinaryOp::Subtract => left.checked_sub(right),
+            BinaryOp::Remainder => left.checked_rem(right),
+            _ => None,
+        };
+        return result
+            .map(Value::from)
+            .ok_or_else(|| VtlError::Evaluation("integer overflow or remainder by zero".into()));
+    }
+    let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) else {
+        return Err(VtlError::Evaluation(
+            "arithmetic requires two numbers".into(),
+        ));
+    };
+    let result = match operation {
+        BinaryOp::Add => left + right,
+        BinaryOp::Subtract => left - right,
+        BinaryOp::Remainder => left % right,
+        _ => return Err(VtlError::Evaluation("invalid arithmetic operator".into())),
+    };
+    Number::from_f64(result)
+        .map(Value::Number)
+        .ok_or_else(|| VtlError::Evaluation("non-finite arithmetic result".into()))
+}
+
 fn compare_values(left: &Value, operation: BinaryOp, right: &Value) -> Result<bool, VtlError> {
     match operation {
         BinaryOp::Equal => Ok(left == right),
@@ -1208,7 +1422,9 @@ fn compare_values(left: &Value, operation: BinaryOp, right: &Value) -> Result<bo
                 _ => unreachable!(),
             })
         }
-        BinaryOp::Or | BinaryOp::And => unreachable!(),
+        BinaryOp::Or | BinaryOp::And | BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Remainder => {
+            unreachable!()
+        }
     }
 }
 
@@ -1641,13 +1857,121 @@ mod tests {
             "$util.toJson('x')",
             "$input.path('$..name')",
             "$!context.requestId",
-            "## comment",
         ] {
             assert!(matches!(
                 evaluate(template, "{}", &empty, &empty, &empty, &values, &empty),
                 Err(VtlError::Unsupported(_))
             ));
         }
+    }
+
+    #[test]
+    fn comments_interpolation_and_arithmetic_match_accounting_syntax() {
+        let empty = maps([]);
+        let values = empty_values();
+        let template = r##"## a comment with $ignored and #bad()
+#set($step-function = 'orders')#set($arn-step = 'arn:' + "$step-function")
+#set($n = 1+7%4-1)#set($literal = '$step-function')
+$arn-step|$n|$literal|"##;
+        let output = evaluate(template, "{}", &empty, &empty, &empty, &values, &empty).unwrap();
+        assert_eq!(output.trim(), "arn:orders|3|$step-function|");
+        for expression in [
+            "1 % 0",
+            "9223372036854775807 + 1",
+            "1e308 + 1e308",
+            "true + 1",
+        ] {
+            let template = format!("#set($n = {expression})$n");
+            assert!(matches!(
+                evaluate(&template, "{}", &empty, &empty, &empty, &values, &empty),
+                Err(VtlError::Evaluation(_))
+            ));
+        }
+        let output = evaluate(
+            "#set($n = 1e+2 + 0.5)$n",
+            "{}",
+            &empty,
+            &empty,
+            &empty,
+            &values,
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(output, "100.5");
+        let output = evaluate(
+            r#"#set($x = 'secret')#set($s = "\$x")$s"#,
+            "{}",
+            &empty,
+            &empty,
+            &empty,
+            &values,
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(output, "$x");
+    }
+
+    #[test]
+    fn rejects_excessive_nesting_and_expansion() {
+        let empty = maps([]);
+        let values = empty_values();
+        for template in [
+            format!("{}true{}", "#if(true)".repeat(40), "#end".repeat(40)),
+            format!("#set($x = {}true{})", "!".repeat(40), ""),
+            format!("#set($x = {}1{})", "(".repeat(40), ")".repeat(40)),
+        ] {
+            assert!(evaluate(&template, "{}", &empty, &empty, &empty, &values, &empty).is_err());
+        }
+        let mut template = "#set($s = '0123456789abcdef')".to_owned();
+        for _ in 0..16 {
+            template.push_str("#set($s = $s + $s)");
+        }
+        template.push_str("$s$s");
+        assert!(matches!(
+            evaluate(&template, "{}", &empty, &empty, &empty, &values, &empty),
+            Err(VtlError::Evaluation(_))
+        ));
+    }
+
+    #[test]
+    fn evaluates_accounting_request_and_response_templates() {
+        let empty = maps([]);
+        let values = BTreeMap::from([
+            ("requestId".into(), json!("fixture-request")),
+            ("requestTimeEpoch".into(), json!(1234)),
+            ("authorizer".into(), json!({})),
+            ("identity".into(), json!({})),
+        ]);
+        let request = evaluate(
+            include_str!("../tests/fixtures/accounting-stepfunctions-request.vtl"),
+            "{\"marker\":\"O'Reilly\"}",
+            &empty,
+            &empty,
+            &empty,
+            &values,
+            &empty,
+        )
+        .unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+        assert_eq!(input["body"]["marker"], "O'Reilly");
+        assert!(input["params"].get("header").is_none());
+        let response = evaluate_template(
+            include_str!("../tests/fixtures/accounting-stepfunctions-response.vtl"),
+            &json!({"output": json!({"statusCode":201,"body":{"ok":true}}).to_string()})
+                .to_string(),
+            &empty,
+            &empty,
+            &empty,
+            &values,
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(response.status_override, Some(201));
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.output).unwrap(),
+            json!({"ok":true})
+        );
     }
 
     #[test]
