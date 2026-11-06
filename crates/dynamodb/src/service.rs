@@ -21,8 +21,8 @@ use crate::partiql;
 use crate::store::TableStore;
 use crate::streams;
 
-const TARGET_PREFIX: &str = "DynamoDB_20120810";
-const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810";
+pub(crate) const TARGET_PREFIX: &str = "DynamoDB_20120810";
+pub(crate) const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810";
 
 /// The natively-implemented DynamoDB service.
 pub struct DynamoHandler {
@@ -131,13 +131,13 @@ impl DynamoHandler {
     }
 }
 
-fn operation(request: &ServiceRequest, prefix: &str) -> Option<String> {
+pub(crate) fn operation(request: &ServiceRequest, prefix: &str) -> Option<String> {
     let target = request.headers.get("x-amz-target")?.to_str().ok()?;
     let op = target.strip_prefix(prefix)?.strip_prefix('.')?;
     (!op.is_empty() && !op.contains('.')).then(|| op.to_string())
 }
 
-fn parse_body(request: &ServiceRequest) -> Result<Value, DdbError> {
+pub(crate) fn parse_body(request: &ServiceRequest) -> Result<Value, DdbError> {
     let body = if request.body.is_empty() {
         Value::Object(serde_json::Map::new())
     } else {
@@ -160,7 +160,7 @@ fn context<'a>(store: &'a TableStore, request: &'a ServiceRequest) -> Ctx<'a> {
     }
 }
 
-fn authorize(
+pub(crate) fn authorize(
     registry: &Weak<ServiceRegistry>,
     request: &ServiceRequest,
     op: &str,
@@ -175,17 +175,17 @@ fn authorize(
     if !evaluator.strict_sigv4_required() {
         return Ok(());
     }
-    // Core rejects unsigned external requests in strict mode. Requests that reach
-    // this handler without a signature are internal service calls.
-    let Some(access_key) = request
+    let access_key = request
         .headers
         .get(http::header::AUTHORIZATION)
         .and_then(|header| header.to_str().ok())
-        .and_then(RequestIdentity::access_key_from_authorization)
-    else {
-        return Ok(());
-    };
+        .and_then(RequestIdentity::access_key_from_authorization);
     let delegated_identity = locallycloud_core::integration::identity::trusted_role(request);
+    if access_key.is_none() && delegated_identity.is_none() {
+        // Core rejects unsigned external requests in strict mode. Internal service
+        // calls without an execution role retain their existing authorization path.
+        return Ok(());
+    }
     for (action, table) in authorization_targets(op, body)? {
         let resource = if table == "*" {
             table
@@ -198,7 +198,7 @@ fn authorize(
                     request.region, request.account_id
                 )
             };
-            if matches!(op, "Query" | "Scan") {
+            if matches!(op, "Query" | "Scan" | "SearchVectors") {
                 body.get("IndexName")
                     .and_then(Value::as_str)
                     .map(|index| format!("{table_arn}/index/{index}"))
@@ -211,7 +211,7 @@ fn authorize(
             .authorize(AuthorizationRequest {
                 request_identity: RequestIdentity {
                     account_id: request.account_id.clone(),
-                    access_key_id: Some(access_key.clone()),
+                    access_key_id: access_key.clone(),
                     arn: None,
                 },
                 delegated_identity: delegated_identity.clone(),
@@ -227,7 +227,10 @@ fn authorize(
     Ok(())
 }
 
-fn authorization_targets(op: &str, body: &Value) -> Result<Vec<(String, String)>, DdbError> {
+pub(crate) fn authorization_targets(
+    op: &str,
+    body: &Value,
+) -> Result<Vec<(String, String)>, DdbError> {
     let mut targets = Vec::new();
     match op {
         "RestoreTableToPointInTime" => {
@@ -284,6 +287,7 @@ fn authorization_targets(op: &str, body: &Value) -> Result<Vec<(String, String)>
                 .get("TableName")
                 .or_else(|| body.get("ResourceArn"))
                 .or_else(|| body.get("TableArn"))
+                .or_else(|| body.get("StreamArn"))
                 .and_then(Value::as_str)
                 .unwrap_or("*");
             targets.push((op.into(), table.into()));

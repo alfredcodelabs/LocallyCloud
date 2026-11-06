@@ -59,8 +59,9 @@ http.workspace = true
 uuid.workspace = true
 time.workspace = true
 libc = "0.2"
+reqwest.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 hmac.workspace = true
-reqwest.workspace = true
-sha2.workspace = true

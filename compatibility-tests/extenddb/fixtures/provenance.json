@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/boto/botocore",
+  "commit": "c3d26e46c064a2e19ebc00f46cd3c390e0f3bf37",
+  "source": "https://raw.githubusercontent.com/boto/botocore/c3d26e46c064a2e19ebc00f46cd3c390e0f3bf37/botocore/data/dynamodb/2012-08-10/service-2.json",
+  "sha256": "1e427b97e61dc839908822f78b9f86bdf4715232b9c3b106a33bc3a0e763fc89",
+  "bytes": 556253,
+  "license": "Apache-2.0"
+}

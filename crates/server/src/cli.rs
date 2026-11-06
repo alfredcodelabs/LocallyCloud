@@ -10,6 +10,7 @@ Commands:
   (none)                  Start the server
   migrate-s3-encryption   Encrypt S3 object bodies stored by an earlier version, then exit
   runtime <COMMAND>      Install and manage only the Lambda runtimes you use
+  component <COMMAND>    Install optional native service components
 
 Options:
   -h, --help              Print this help and exit
@@ -27,10 +28,14 @@ pub enum Command {
     Help,
     Version,
     Runtime(crate::runtime_manager::Options),
+    Component(crate::component_manager::Options),
 }
 
 pub fn parse(arguments: &[String]) -> Result<Command, String> {
     match arguments {
+        [group, rest @ ..] if group == "component" => {
+            crate::component_manager::parse(rest).map(Command::Component)
+        }
         [group, rest @ ..] if group == "runtime" => {
             crate::runtime_manager::parse(rest).map(Command::Runtime)
         }

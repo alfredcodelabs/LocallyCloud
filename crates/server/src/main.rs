@@ -4,7 +4,9 @@
 //! service registry, and the Axum server together, then runs until a shutdown signal.
 
 mod cli;
+mod component_manager;
 mod domain_tls;
+mod dynamodb_engine;
 mod ec2_runtime;
 mod ecs_guest;
 mod ecs_network;
@@ -319,6 +321,13 @@ async fn main() {
         }
     };
     match command {
+        cli::Command::Component(ref options) => {
+            if let Err(error) = component_manager::execute(options).await {
+                eprintln!("locallycloud component: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         cli::Command::Runtime(ref options) => {
             if let Err(error) = runtime_manager::execute(options).await {
                 eprintln!("locallycloud runtime: {error}");
@@ -435,7 +444,39 @@ async fn main() {
             std::process::exit(4);
         }
     }
-    if let Err(error) = locallycloud_dynamodb::register_with_state(&registry, state.clone()) {
+    let dynamodb_engine =
+        std::env::var("LOCALLYCLOUD_DYNAMODB_ENGINE").unwrap_or_else(|_| "native".into());
+    if !matches!(dynamodb_engine.as_str(), "native" | "extenddb") {
+        tracing::error!("LOCALLYCLOUD_DYNAMODB_ENGINE must be native or extenddb");
+        std::process::exit(4);
+    }
+    let dynamodb_state = state.clone();
+    let selected_engine = dynamodb_engine.clone();
+    match tokio::task::spawn_blocking(move || {
+        dynamodb_engine::bind_store(&dynamodb_state, &selected_engine)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        result => {
+            tracing::error!(?result, "DynamoDB engine cannot open this state");
+            std::process::exit(4);
+        }
+    }
+    let mut managed_dynamodb = None;
+    let dynamodb_registration = match dynamodb_engine.as_str() {
+        "extenddb" => dynamodb_engine::ExtendDb::new(&state)
+            .map(|engine| {
+                let engine = Arc::new(engine);
+                locallycloud_dynamodb::register_with_engine(&registry, engine.clone());
+                managed_dynamodb = Some(engine);
+            })
+            .map_err(|e| e.to_string()),
+        "native" => locallycloud_dynamodb::register_with_state(&registry, state.clone())
+            .map_err(|e| e.to_string()),
+        _ => Err("LOCALLYCLOUD_DYNAMODB_ENGINE must be native or extenddb".into()),
+    };
+    if let Err(error) = dynamodb_registration {
         tracing::error!(%error, "failed to register DynamoDB");
         std::process::exit(4);
     }
@@ -778,6 +819,9 @@ async fn main() {
     ec2.shutdown().await;
     if let Some(handler) = lambda_handler {
         handler.shutdown().await;
+    }
+    if let Some(engine) = managed_dynamodb {
+        engine.shutdown().await;
     }
     firehose_handle.shutdown().await;
     rds_data_handle.shutdown().await;

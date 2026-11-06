@@ -4,6 +4,7 @@
 //! `ServiceRegistry`. Operations are selected from the `X-Amz-Target` header.
 
 mod capacity;
+mod engine;
 pub mod error;
 pub mod expression;
 pub mod ops;
@@ -14,4 +15,5 @@ pub mod store;
 pub mod streams;
 pub mod value;
 
+pub use engine::register_with_engine;
 pub use service::{register, register_with_state};
