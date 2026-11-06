@@ -333,6 +333,57 @@ async fn s3_asl_pages_lists_and_conditionally_copies_a_source_version() {
     );
 }
 
+#[tokio::test]
+async fn s3_head_and_get_metadata_drive_source_validation_choices() {
+    let registry = registry();
+    s3(&registry, request(Method::PUT, "/source-data", "")).await;
+    for format in ["TXT", "CSV"] {
+        let definition = json!({"StartAt":"Upload","States":{
+            "Upload":{"Type":"Task","Resource":"arn:aws:states:::aws-sdk:s3:putObject",
+                "Parameters":{"Bucket":"source-data","Key":format,"Body":"source content",
+                    "Metadata":{"FORMAT":format,"source-id":"tenant42 / raw+data"}},
+                "ResultPath":"$.upload","Next":"Head"},
+            "Head":{"Type":"Task","Resource":"arn:aws:states:::aws-sdk:s3:headObject",
+                "Parameters":{"Bucket":"source-data","Key":format},
+                "ResultPath":"$.head","Next":"VALIDATE_SOURCE"},
+            "VALIDATE_SOURCE":{"Type":"Choice","Choices":[{
+                "Variable":"$.head.Metadata.format","StringEquals":format,"Next":"Get"
+            }],"Default":"InvalidSource"},
+            "InvalidSource":{"Type":"Fail","Error":"SourceMetadataMissing"},
+            "Get":{"Type":"Task","Resource":"arn:aws:states:::aws-sdk:s3:getObject",
+                "Parameters":{"Bucket":"source-data","Key":format},
+                "ResultPath":"$.get","End":true}
+        }});
+        let output = execute(&registry, &format!("validate-source-{format}"), definition).await;
+        let expected = json!({"format":format,"source-id":"tenant42 / raw+data"});
+        assert_eq!(output["head"]["Metadata"], expected);
+        assert_eq!(output["get"]["Metadata"], expected);
+        assert_eq!(output["get"]["Body"], "source content");
+        assert!(output["upload"].get("Metadata").is_none());
+        assert!(output["head"].get("Body").is_none());
+    }
+    s3(
+        &registry,
+        request(Method::PUT, "/source-data/plain", "plain"),
+    )
+    .await;
+    let output = execute(
+        &registry,
+        "source-without-metadata",
+        json!({"StartAt":"Head","States":{
+            "Head":{"Type":"Task","Resource":"arn:aws:states:::aws-sdk:s3:headObject",
+                "Parameters":{"Bucket":"source-data","Key":"plain"},
+                "ResultPath":"$.head","Next":"Get"},
+            "Get":{"Type":"Task","Resource":"arn:aws:states:::aws-sdk:s3:getObject",
+                "Parameters":{"Bucket":"source-data","Key":"plain"},
+                "ResultPath":"$.get","End":true}
+        }}),
+    )
+    .await;
+    assert_eq!(output["head"]["Metadata"], json!({}));
+    assert_eq!(output["get"]["Metadata"], json!({}));
+}
+
 struct CopyBodyFailure;
 
 #[async_trait]

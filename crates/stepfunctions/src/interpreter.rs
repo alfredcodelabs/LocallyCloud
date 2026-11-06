@@ -3045,6 +3045,25 @@ impl Interpreter {
                 result.insert(field.into(), value);
             }
         }
+        if matches!(action, S3Action::GetObject | S3Action::HeadObject) {
+            let mut metadata = serde_json::Map::new();
+            for header in response_headers.keys() {
+                let Some(key) = header.as_str().strip_prefix("x-amz-meta-") else {
+                    continue;
+                };
+                let values = response_headers
+                    .get_all(header)
+                    .iter()
+                    .map(|value| {
+                        value.to_str().map_err(|_| {
+                            AslError::task_failed("Invalid S3 user metadata header value")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                metadata.insert(key.into(), Value::String(values.join(", ")));
+            }
+            result.insert("Metadata".into(), Value::Object(metadata));
+        }
         if action == S3Action::GetObject {
             let body = serde_json::from_slice(&body)
                 .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));

@@ -488,7 +488,9 @@ pub(crate) fn install_guest_trust(
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
-        contents.extend(b"\n127.0.0.1 localhost\n");
+        // These are the supported isolated guest endpoint hosts. Smithy prefixes
+        // StartSyncExecution with `sync-`; it must reach the same private proxy.
+        contents.extend(b"\n127.0.0.1 localhost sync-localhost sync-127.0.0.1\n");
         match fs::remove_file(&hosts) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -507,6 +509,51 @@ pub(crate) fn install_guest_trust(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn guest_hosts_include_sdk_prefixes_without_mutating_pack_files() {
+        for symlinked in [false, true] {
+            let fixture = Fixture::new();
+            let root = fixture.0.join("guest");
+            fs::create_dir_all(root.join("etc/pki/tls/certs")).unwrap();
+            fs::create_dir_all(root.join("var/runtime")).unwrap();
+            fs::write(
+                root.join("etc/pki/tls/certs/ca-bundle.crt"),
+                b"system trust",
+            )
+            .unwrap();
+            let shared_hosts = fixture.0.join("pack-hosts");
+            let original = b"10.0.0.10 private.database.internal\n";
+            fs::write(&shared_hosts, original).unwrap();
+            if symlinked {
+                fs::hard_link(&shared_hosts, root.join("etc/hosts-source")).unwrap();
+                symlink("hosts-source", root.join("etc/hosts")).unwrap();
+            } else {
+                fs::hard_link(&shared_hosts, root.join("etc/hosts")).unwrap();
+            }
+            let original_inode = fs::metadata(&shared_hosts).unwrap().ino();
+            let mut environment = BTreeMap::new();
+
+            install_guest_trust(&root, &mut environment, "guest callback CA").unwrap();
+
+            assert_eq!(fs::read(&shared_hosts).unwrap(), original);
+            assert_ne!(
+                fs::metadata(root.join("etc/hosts")).unwrap().ino(),
+                original_inode
+            );
+            let hosts = fs::read_to_string(root.join("etc/hosts")).unwrap();
+            assert!(hosts.contains("10.0.0.10 private.database.internal"));
+            for endpoint in ["127.0.0.1", "localhost"] {
+                let prefixed = format!("sync-{endpoint}");
+                let resolved = hosts.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let address = fields.next()?;
+                    fields.any(|name| name == prefixed).then_some(address)
+                });
+                assert_eq!(resolved, Some("127.0.0.1"));
+            }
+        }
+    }
 
     #[test]
     fn official_images_map_managed_families_and_reject_invalid_names() {
