@@ -27,6 +27,7 @@ const MAX_WORKERS: usize = 4;
 type Reply = Result<(u16, Value), String>;
 
 pub fn bind_store(state: &locallycloud_state::StateDb, engine: &str) -> io::Result<()> {
+    crate::dynamodb_migration::ensure_no_pending(state.path())?;
     let connection = state.connection().map_err(io::Error::other)?;
     connection.execute_batch("CREATE TABLE IF NOT EXISTS locallycloud_service_engines (service TEXT PRIMARY KEY, engine TEXT NOT NULL)")
         .map_err(io::Error::other)?;
@@ -44,7 +45,7 @@ pub fn bind_store(state: &locallycloud_state::StateDb, engine: &str) -> io::Resu
     drop(statement);
     if let Some(selected) = selected {
         if selected != engine {
-            return Err(io::Error::other("DynamoDB engine differs from this state's engine; keep the original engine or use a fresh state database. migrate-dynamodb --dry-run only inspects native state; cutover is not implemented"));
+            return Err(io::Error::other("DynamoDB engine differs from this state's engine; keep the original engine or use a fresh state database. migrate-dynamodb --dry-run inspects native state; use migrate-dynamodb --apply for a supported offline cutover"));
         }
         return Ok(());
     }
@@ -57,7 +58,7 @@ pub fn bind_store(state: &locallycloud_state::StateDb, engine: &str) -> io::Resu
             .map_err(io::Error::other)?;
         if populated {
             return Err(io::Error::other(
-                "native DynamoDB tables exist; keep the native engine or use a fresh state database. migrate-dynamodb --dry-run only inspects state; cutover is not implemented",
+                "native DynamoDB tables exist; keep the native engine or use a fresh state database. migrate-dynamodb --dry-run inspects state; use migrate-dynamodb --apply for a supported offline cutover",
             ));
         }
     }
@@ -218,13 +219,20 @@ impl WorkerPool {
     ) -> io::Result<Self> {
         let mut data = state.path().as_os_str().to_owned();
         data.push(".extenddb");
+        Self::in_directory(PathBuf::from(data), notifier)
+    }
+
+    pub(crate) fn in_directory(
+        data: PathBuf,
+        notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
+    ) -> io::Result<Self> {
         let key = std::env::var("LOCALLYCLOUD_KMS_MASTER_KEY")
             .map_err(|_| io::Error::other("LOCALLYCLOUD_KMS_MASTER_KEY is required"))?;
         // Validate before ever passing key material to the private worker.
         locallycloud_state::StateCipher::from_env().map_err(io::Error::other)?;
         Ok(Self {
             components: component_manager::directory()?,
-            data: PathBuf::from(data),
+            data,
             key: Arc::new(Zeroizing::new(key)),
             workers: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),

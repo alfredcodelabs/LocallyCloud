@@ -17,4 +17,6 @@ pub mod service;
 pub mod store;
 pub mod sts;
 
+pub use persistence::authenticate_state_key;
+
 pub use service::{register, register_with_store_and_mode};

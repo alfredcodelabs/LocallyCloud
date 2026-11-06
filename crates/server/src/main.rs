@@ -324,6 +324,13 @@ async fn main() {
         }
     };
     match command {
+        cli::Command::ApplyDynamoDbMigration => {
+            if let Err(error) = dynamodb_migration::apply().await {
+                eprintln!("locallycloud migrate-dynamodb: {error}");
+                std::process::exit(5);
+            }
+            return;
+        }
         cli::Command::InspectDynamoDbMigration => {
             if let Err(error) = dynamodb_migration::inspect().await {
                 eprintln!("locallycloud migrate-dynamodb: {error}");

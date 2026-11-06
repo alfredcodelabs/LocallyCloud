@@ -10,6 +10,10 @@ use serde::Serialize;
 use crate::error::DdbError;
 use crate::store::{StoredKey, StreamRecord, TableData};
 
+#[path = "migration_export.rs"]
+mod export;
+pub use export::{export_native, export_native_recovery, NativeRecord};
+
 const MAX_RECORD: i64 = 8 * 1024 * 1024;
 const KNOWN_TABLES: &[&str] = &[
     "dynamodb_tables",
@@ -51,7 +55,7 @@ pub struct TableInspection {
     pub blocking_features: Vec<BlockingFeature>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InspectionSummary {
     pub source_engine: &'static str,
@@ -101,7 +105,16 @@ fn invalid() -> DdbError {
     )
 }
 
-fn source_schema(connection: &Connection) -> Result<(BTreeSet<String>, bool), DdbError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceBinding {
+    Native,
+    CommittedExtendDb,
+}
+
+fn source_schema_with_binding(
+    connection: &Connection,
+    binding: SourceBinding,
+) -> Result<(BTreeSet<String>, bool), DdbError> {
     let mut query = connection.prepare("SELECT substr(name,1,65) FROM sqlite_master WHERE type='table' AND (name GLOB 'dynamodb_*' OR name='locallycloud_service_engines') LIMIT 129").map_err(|_| invalid())?;
     let mut schema = BTreeSet::new();
     for name in query
@@ -126,7 +139,10 @@ fn source_schema(connection: &Connection) -> Result<(BTreeSet<String>, bool), Dd
             .map_err(|_| invalid())?;
         match engine.as_deref() {
             None => {}
-            Some("native") => {
+            Some("native") if binding == SourceBinding::Native => {
+                native_bound = true;
+            }
+            Some("extenddb") if binding == SourceBinding::CommittedExtendDb => {
                 native_bound = true;
             }
             Some("extenddb") => return Err(DdbError::Validation(
@@ -135,6 +151,11 @@ fn source_schema(connection: &Connection) -> Result<(BTreeSet<String>, bool), Dd
             )),
             Some(_) => return Err(invalid()),
         }
+    }
+    if binding == SourceBinding::CommittedExtendDb && !native_bound {
+        return Err(DdbError::Validation(
+            "Committed migration recovery requires an ExtendDB engine binding".into(),
+        ));
     }
     Ok((schema, native_bound))
 }
@@ -273,8 +294,13 @@ fn validate_items(
 pub fn inspect_native(
     path: &Path,
     cipher: &StateCipher,
-    mut visit: impl FnMut(TableInspection) -> Result<(), DdbError>,
+    visit: impl FnMut(TableInspection) -> Result<(), DdbError>,
 ) -> Result<InspectionSummary, DdbError> {
+    let connection = open_snapshot(path)?;
+    inspect_snapshot(&connection, cipher, visit)
+}
+
+fn open_snapshot(path: &Path) -> Result<Connection, DdbError> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -288,11 +314,47 @@ pub fn inspect_native(
     connection
         .execute_batch("BEGIN DEFERRED")
         .map_err(|_| invalid())?;
-    let (schema, native_bound) = source_schema(&connection)?;
-    check_orphans(&connection, &schema)?;
-    let encrypted = authenticate(&connection, cipher, &schema)?;
+    Ok(connection)
+}
+
+/// Read the administrative engine marker without creating or initializing source state.
+/// This is not key authentication; callers must authenticate an export before mutation.
+pub fn engine_binding(path: &Path) -> Result<Option<String>, DdbError> {
+    let connection = open_snapshot(path)?;
+    let present = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='locallycloud_service_engines')",
+        [], |row| row.get::<_, bool>(0),
+    ).map_err(|_| invalid())?;
+    if !present {
+        return Ok(None);
+    }
+    connection.query_row(
+        "SELECT CASE WHEN length(CAST(engine AS BLOB))<=64 THEN engine END FROM locallycloud_service_engines WHERE service='dynamodb'",
+        [], |row| row.get::<_, String>(0),
+    ).optional().map_err(|_| invalid())
+}
+
+fn inspect_snapshot(
+    connection: &Connection,
+    cipher: &StateCipher,
+    visit: impl FnMut(TableInspection) -> Result<(), DdbError>,
+) -> Result<InspectionSummary, DdbError> {
+    inspect_snapshot_with_binding(connection, cipher, SourceBinding::Native, visit)
+}
+
+fn inspect_snapshot_with_binding(
+    connection: &Connection,
+    cipher: &StateCipher,
+    binding: SourceBinding,
+    mut visit: impl FnMut(TableInspection) -> Result<(), DdbError>,
+) -> Result<InspectionSummary, DdbError> {
+    let (schema, native_bound) = source_schema_with_binding(connection, binding)?;
+    check_orphans(connection, &schema)?;
+    let encrypted = authenticate(connection, cipher, &schema)?;
     let mut summary = InspectionSummary {
-        source_engine: if native_bound || schema.contains("dynamodb_tables") {
+        source_engine: if binding == SourceBinding::CommittedExtendDb {
+            "extenddb"
+        } else if native_bound || schema.contains("dynamodb_tables") {
             "native"
         } else {
             "unbound"
@@ -337,13 +399,13 @@ pub fn inspect_native(
         let (data, unknown) =
             crate::store::migration_table(cipher, &account, &region, &name, &encoded)?;
         let scope = [account.as_str(), region.as_str(), name.as_str()];
-        let item_count = validate_items(&connection, cipher, &schema, scope, &data)?;
-        let stream_records = scoped_count(&connection, &schema, "dynamodb_stream_records", scope)?;
+        let item_count = validate_items(connection, cipher, &schema, scope, &data)?;
+        let stream_records = scoped_count(connection, &schema, "dynamodb_stream_records", scope)?;
         let recovery_versions =
-            scoped_count(&connection, &schema, "dynamodb_recovery_items", scope)?;
+            scoped_count(connection, &schema, "dynamodb_recovery_items", scope)?;
         let replication_versions =
-            scoped_count(&connection, &schema, "dynamodb_replica_versions", scope)?;
-        let recovery_windows = scoped_count(&connection, &schema, "dynamodb_recovery", scope)?;
+            scoped_count(connection, &schema, "dynamodb_replica_versions", scope)?;
+        let recovery_windows = scoped_count(connection, &schema, "dynamodb_recovery", scope)?;
         let mut blocking_features = Vec::new();
         for (present, feature) in [
             (
@@ -728,5 +790,299 @@ mod tests {
         assert_eq!(summary.table_count, 0);
         assert!(!summary.source_key_authenticated);
         assert!(!summary.apply_ready);
+    }
+
+    #[test]
+    fn export_preserves_wire_types_keys_schema_tags_and_source_bytes() {
+        let fixture = Fixture::new();
+        fixture.table("orders", false, |metadata| {
+            metadata["tags"] = json!({"owner":"synthetic"});
+            metadata["def"]["billing_mode"] = json!("PROVISIONED");
+            metadata["def"]["read_capacity"] = json!(3);
+            metadata["def"]["write_capacity"] = json!(4);
+            metadata["def"]["warm_throughput"] = json!({"read":12000,"write":4000});
+            metadata["def"]["indexes"] = json!([{"name":"by-pk","key_schema":[{"name":"pk","key_type":"Hash"}],
+                "projection":{"projection_type":"Include","non_key_attributes":["payload"]},"global":true,
+                "read_capacity":5,"write_capacity":6,"warm_throughput":null}]);
+        });
+        let wire = json!({"pk":{"S":"row"},"payload":{"M":{"nested":{"L":[{"BOOL":true},{"NULL":true},{"B":"AAH/"},{"N":"123.45"}]}}},
+            "strings":{"SS":["a","b"]},"numbers":{"NS":["1","2"]},"bytes":{"BS":["AA==","AQ=="]}});
+        let item = crate::value::item_from_json(&wire).unwrap();
+        let encoded = serde_json::to_string(&item).unwrap();
+        fixture
+            .state
+            .connection()
+            .unwrap()
+            .execute("UPDATE dynamodb_items SET item=?1", [encoded])
+            .unwrap();
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        let mut records = Vec::new();
+        let summary = export_native(
+            fixture.state.path(),
+            &StateCipher::with_key(&[7; 32]),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.item_count, 1);
+        assert_eq!(records.len(), 2);
+        let NativeRecord::Table {
+            account,
+            region,
+            table,
+            create,
+            tags,
+            ttl_attribute,
+            item_count,
+        } = &records[0]
+        else {
+            panic!("table must precede item")
+        };
+        assert_eq!(
+            (account.as_str(), region.as_str(), table.as_str()),
+            (ACCOUNT, REGION, "orders")
+        );
+        assert_eq!(*item_count, 1);
+        assert_eq!(*ttl_attribute, None);
+        assert_eq!(*tags, json!([{"Key":"owner","Value":"synthetic"}]));
+        assert_eq!(
+            create["ProvisionedThroughput"],
+            json!({"ReadCapacityUnits":3,"WriteCapacityUnits":4})
+        );
+        assert_eq!(
+            create["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"],
+            json!({"ReadCapacityUnits":5,"WriteCapacityUnits":6})
+        );
+        assert_eq!(
+            create["GlobalSecondaryIndexes"][0]["Projection"],
+            json!({"ProjectionType":"INCLUDE","NonKeyAttributes":["payload"]})
+        );
+        let NativeRecord::Item {
+            item: actual, key, ..
+        } = &records[1]
+        else {
+            panic!("item expected")
+        };
+        assert_eq!(actual, &wire);
+        assert_eq!(*key, json!({"pk":{"S":"row"}}));
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn export_rejects_late_unsupported_metadata_before_first_record() {
+        for feature in [
+            "ttl",
+            "warm",
+            "nested",
+            "sse",
+            "unknown-table",
+            "transaction",
+        ] {
+            let fixture = Fixture::new();
+            fixture.table("aaa-plain", false, |_| {});
+            fixture.table("zzz-blocked", feature == "sse", |metadata| match feature {
+                "ttl" => metadata["ttl_attribute"] = json!("expires"),
+                "warm" => metadata["def"]["warm_throughput"] = json!({"read":24000,"write":4000}),
+                "nested" => metadata["def"]["key_schema"][0]["future_semantics"] = json!(true),
+                _ => {}
+            });
+            match feature {
+                "unknown-table" => {
+                    fixture
+                        .state
+                        .connection()
+                        .unwrap()
+                        .execute_batch("CREATE TABLE dynamodb_future(data TEXT)")
+                        .unwrap();
+                }
+                "transaction" => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    fixture.state.connection().unwrap().execute("INSERT INTO dynamodb_txn_tokens(account,region,token,fingerprint,created_unix,result) VALUES(?1,?2,'token','fingerprint',?3,'{}')",params![ACCOUNT,REGION,now]).unwrap();
+                }
+                _ => {}
+            }
+            let mut calls = 0;
+            assert!(
+                export_native(
+                    fixture.state.path(),
+                    &StateCipher::with_key(&[7; 32]),
+                    |_| {
+                        calls += 1;
+                        Ok(())
+                    }
+                )
+                .is_err(),
+                "{feature}"
+            );
+            assert_eq!(calls, 0, "{feature}");
+        }
+    }
+
+    #[test]
+    fn export_uses_one_snapshot_even_if_source_changes_after_first_record() {
+        let fixture = Fixture::new();
+        fixture.table("orders", false, |_| {});
+        let cipher = StateCipher::with_key(&[7; 32]);
+        let mut emitted = 0;
+        let summary = export_native(fixture.state.path(), &cipher, |record| {
+            match record {
+                NativeRecord::Table { item_count, .. } => {
+                    assert_eq!(item_count, 1);
+                    fixture.item("orders", "later", false, &cipher);
+                }
+                NativeRecord::Item { .. } => emitted += 1,
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(summary.item_count, 1);
+        assert_eq!(emitted, 1);
+        assert_eq!(
+            fixture
+                .state
+                .connection()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM dynamodb_items", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn export_callback_failure_stops_without_source_mutation() {
+        let fixture = Fixture::new();
+        fixture.table("orders", false, |_| {});
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        let mut calls = 0;
+        let error = export_native(
+            fixture.state.path(),
+            &StateCipher::with_key(&[7; 32]),
+            |_| {
+                calls += 1;
+                Err(DdbError::Internal("destination unavailable".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("destination unavailable"));
+        assert_eq!(calls, 1);
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn export_authenticates_all_source_envelopes_before_any_callback() {
+        let fixture = Fixture::new();
+        fixture.table("aaa-plain", false, |_| {});
+        fixture.table("zzz-encrypted", true, |_| {});
+        let mut calls = 0;
+        assert!(export_native(
+            fixture.state.path(),
+            &StateCipher::with_key(&[8; 32]),
+            |_| {
+                calls += 1;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn committed_recovery_requires_extenddb_binding_and_keeps_normal_export_closed() {
+        let fixture = Fixture::new();
+        fixture.table("orders", true, |metadata| {
+            metadata["def"]["sse_type"] = Value::Null
+        });
+        let cipher = StateCipher::with_key(&[7; 32]);
+        let mut calls = 0;
+        assert!(export_native_recovery(fixture.state.path(), &cipher, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        fixture.state.connection().unwrap().execute_batch("CREATE TABLE locallycloud_service_engines(service TEXT PRIMARY KEY,engine TEXT); INSERT INTO locallycloud_service_engines VALUES('dynamodb','native');").unwrap();
+        assert!(export_native_recovery(fixture.state.path(), &cipher, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
+        fixture
+            .state
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE locallycloud_service_engines SET engine='extenddb'",
+                [],
+            )
+            .unwrap();
+        assert!(export_native(fixture.state.path(), &cipher, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert!(inspect_native(fixture.state.path(), &cipher, |_| Ok(())).is_err());
+        assert!(export_native_recovery(
+            fixture.state.path(),
+            &StateCipher::with_key(&[8; 32]),
+            |_| {
+                calls += 1;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(calls, 0);
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        let summary = export_native_recovery(fixture.state.path(), &cipher, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(summary.source_engine, "extenddb");
+        assert_eq!(summary.table_count, 1);
+        assert!(summary.source_key_authenticated);
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn engine_binding_is_read_only_bounded_and_does_not_create_missing_source() {
+        let fixture = Fixture::new();
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        assert_eq!(engine_binding(fixture.state.path()).unwrap(), None);
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+        let missing = fixture.root.join("missing.db");
+        assert!(engine_binding(&missing).is_err());
+        assert!(!missing.exists());
+        fixture.state.connection().unwrap().execute_batch("CREATE TABLE locallycloud_service_engines(service TEXT PRIMARY KEY,engine TEXT); INSERT INTO locallycloud_service_engines VALUES('dynamodb','native');").unwrap();
+        for name in ["native", "extenddb", "future"] {
+            fixture
+                .state
+                .connection()
+                .unwrap()
+                .execute("UPDATE locallycloud_service_engines SET engine=?1", [name])
+                .unwrap();
+            let before = std::fs::read(fixture.state.path()).unwrap();
+            assert_eq!(
+                engine_binding(fixture.state.path()).unwrap().as_deref(),
+                Some(name)
+            );
+            assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+        }
+        fixture
+            .state
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE locallycloud_service_engines SET engine=?1",
+                ["x".repeat(65)],
+            )
+            .unwrap();
+        assert!(engine_binding(fixture.state.path()).is_err());
     }
 }

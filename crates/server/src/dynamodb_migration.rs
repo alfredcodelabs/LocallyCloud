@@ -1,4 +1,4 @@
-//! Explicit offline inspection; native data and engine selection remain unchanged.
+//! Explicit offline native inspection and verified ExtendDB cutover.
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -27,7 +27,7 @@ fn write_json(output: &mut impl Write, value: &impl Serialize) -> Result<(), Ddb
         .map_err(|_| DdbError::Internal("Cannot write migration inspection output".into()))
 }
 
-fn inspect_path(path: &Path, cipher: &StateCipher, output: &mut impl Write) -> Result<(), String> {
+fn lock_source(path: &Path) -> Result<std::fs::File, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| "Native source database must already exist".to_owned())?;
     let parent = path
@@ -63,6 +63,11 @@ fn inspect_path(path: &Path, cipher: &StateCipher, output: &mut impl Write) -> R
         .map_err(|_| "Cannot open the source runtime lock".to_owned())?;
     lock.try_lock()
         .map_err(|_| "Stop the server before inspecting native DynamoDB state".to_owned())?;
+    Ok(lock)
+}
+
+fn inspect_path(path: &Path, cipher: &StateCipher, output: &mut impl Write) -> Result<(), String> {
+    let _lock = lock_source(path)?;
     let summary = locallycloud_dynamodb::migration::inspect_native(path, cipher, |table| {
         write_json(
             output,
@@ -71,7 +76,7 @@ fn inspect_path(path: &Path, cipher: &StateCipher, output: &mut impl Write) -> R
     })
     .map_err(|error| error.to_string())?;
     write_json(output,&Completion {kind:"summary",inspection_only:true,summary,
-        next_step:"Import and verified atomic cutover are not implemented; continue using the native engine for this state"})
+        next_step:"Run migrate-dynamodb --apply offline to migrate supported state; blockers must be resolved first"})
         .map_err(|error|error.to_string())
 }
 
@@ -84,6 +89,10 @@ pub async fn inspect() -> Result<(), String> {
     .await
     .map_err(|_| "Migration inspection task failed".to_owned())?
 }
+
+#[path = "dynamodb_migration_apply.rs"]
+mod cutover;
+pub(crate) use cutover::{apply, ensure_no_pending};
 
 #[cfg(test)]
 mod tests {
