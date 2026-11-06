@@ -5,11 +5,14 @@
 //! the change records captured on each table (see `TableData::emit_stream`). A stream is
 //! modeled as a single open shard whose records are addressed by a positional shard iterator.
 
+use async_trait::async_trait;
 use base64::Engine;
+use locallycloud_core::integration::dynamodb::DynamoDbStreamsApi;
 use serde_json::{json, Map, Value};
 
 use crate::error::DdbError;
 use crate::ops::Ctx;
+use crate::store::TableStore;
 use crate::store::{KeyType, StreamRecord, TableData};
 use crate::value::item_to_json;
 
@@ -40,7 +43,7 @@ fn table_name_from_stream_arn(arn: &str) -> Result<&str, DdbError> {
         .ok_or_else(|| DdbError::Validation(format!("invalid stream ARN: {arn}")))
 }
 
-async fn resolve_stream_table(
+pub(crate) async fn resolve_stream_table(
     ctx: &Ctx<'_>,
     stream_arn: &str,
 ) -> Result<std::sync::Arc<tokio::sync::RwLock<TableData>>, DdbError> {
@@ -162,27 +165,75 @@ pub async fn get_shard_iterator(ctx: &Ctx<'_>, req: &Value) -> Result<Value, Ddb
 pub async fn get_records(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let iterator = req_str(req, "ShardIterator")?;
     let (stream_arn, position) = decode_iterator(iterator)?;
-    let limit = req
-        .get("Limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(1000)
-        .max(1) as usize;
+    let limit = get_records_limit(req)?;
     let table = resolve_stream_table(ctx, &stream_arn).await?;
     let guard = table.read().await;
 
-    let end = (position + limit).min(guard.stream_records.len());
+    let end = position
+        .saturating_add(limit)
+        .min(guard.stream_records.len());
     let slice = if position <= guard.stream_records.len() {
         &guard.stream_records[position..end]
     } else {
         &[]
     };
-    let records: Vec<Value> = slice.iter().map(|r| record_json(ctx.region, r)).collect();
+    let mut records = Vec::new();
+    let (mut logical_bytes, mut wire_bytes) = (0usize, 0usize);
+    for record in slice {
+        let value = record_json(ctx.region, record);
+        let wire = value.to_string().len();
+        let logical = crate::value::item_size(&record.keys)
+            .saturating_add(
+                record
+                    .old_image
+                    .as_ref()
+                    .map(crate::value::item_size)
+                    .unwrap_or(0),
+            )
+            .saturating_add(
+                record
+                    .new_image
+                    .as_ref()
+                    .map(crate::value::item_size)
+                    .unwrap_or(0),
+            )
+            .max(record.size_bytes);
+        if logical_bytes.saturating_add(logical) > 1024 * 1024
+            || wire_bytes.saturating_add(wire) > 32 * 1024 * 1024 - 4096
+        {
+            if records.is_empty() {
+                return Err(DdbError::Internal(
+                    "Stream record exceeds the GetRecords response limit".into(),
+                ));
+            }
+            break;
+        }
+        logical_bytes += logical;
+        wire_bytes += wire;
+        records.push(value);
+    }
     let next_position = position + records.len();
     Ok(json!({
         "Records": records,
         // The shard stays open, so a next iterator is always returned.
         "NextShardIterator": encode_iterator(&stream_arn, next_position),
     }))
+}
+
+pub(crate) fn get_records_limit(body: &Value) -> Result<usize, DdbError> {
+    let Some(value) = body.get("Limit") else {
+        return Ok(1000);
+    };
+    let limit = value
+        .as_u64()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| DdbError::Validation("Limit must be a positive integer".into()))?;
+    if limit > 1000 {
+        return Err(DdbError::LimitExceeded(
+            "GetRecords cannot return more than 1000 records".into(),
+        ));
+    }
+    Ok(limit as usize)
 }
 
 pub(crate) fn record_json(region: &str, r: &StreamRecord) -> Value {
@@ -212,7 +263,10 @@ fn encode_iterator(stream_arn: &str, position: usize) -> String {
     b64().encode(format!("{stream_arn}|{position}"))
 }
 
-fn decode_iterator(iterator: &str) -> Result<(String, usize), DdbError> {
+pub(crate) fn decode_iterator(iterator: &str) -> Result<(String, usize), DdbError> {
+    if iterator.is_empty() || iterator.len() > 2048 {
+        return Err(DdbError::Validation("invalid shard iterator".into()));
+    }
     let decoded = b64()
         .decode(iterator)
         .ok()
@@ -225,6 +279,77 @@ fn decode_iterator(iterator: &str) -> Result<(String, usize), DdbError> {
         .parse::<usize>()
         .map_err(|_| DdbError::Validation("invalid shard iterator".into()))?;
     Ok((arn.to_string(), position))
+}
+
+pub(crate) fn validate_scope_values(account: &str, region: &str) -> Result<(), DdbError> {
+    if account.len() != 12
+        || !account.bytes().all(|byte| byte.is_ascii_digit())
+        || !(3..=64).contains(&region.len())
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(DdbError::Validation(
+            "invalid account or region scope".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_stream_scope(
+    account: &str,
+    region: &str,
+    arn: &str,
+) -> Result<(), DdbError> {
+    validate_scope_values(account, region)?;
+    let prefix = format!("arn:aws:dynamodb:{region}:{account}:table/");
+    let resource = arn.strip_prefix(&prefix).ok_or_else(|| {
+        DdbError::Validation("stream ARN must match the account and region".into())
+    })?;
+    let (table, label) = resource
+        .split_once("/stream/")
+        .ok_or_else(|| DdbError::Validation("invalid stream ARN".into()))?;
+    if table.is_empty() || label.is_empty() || table.contains('/') || label.contains('/') {
+        return Err(DdbError::Validation("invalid stream ARN".into()));
+    }
+    Ok(())
+}
+
+pub(crate) struct NativeStreamsApi {
+    pub(crate) store: std::sync::Arc<TableStore>,
+}
+
+#[async_trait]
+impl DynamoDbStreamsApi for NativeStreamsApi {
+    async fn sequence_after_iterator(
+        &self,
+        account: &str,
+        region: &str,
+        iterator: &str,
+    ) -> Result<String, String> {
+        let (arn, position) = decode_iterator(iterator).map_err(|error| error.to_string())?;
+        validate_stream_scope(account, region, &arn).map_err(|error| error.to_string())?;
+        let ctx = Ctx {
+            store: &self.store,
+            account,
+            region,
+        };
+        let table = resolve_stream_table(&ctx, &arn)
+            .await
+            .map_err(|error| error.to_string())?;
+        let guard = table.read().await;
+        if guard.stream_arn().as_deref() != Some(arn.as_str()) {
+            return Err("stream was replaced".into());
+        }
+        match position.checked_sub(1) {
+            None => Ok(String::new()),
+            Some(index) => guard
+                .stream_records
+                .get(index)
+                .map(|record| record.sequence_number.clone())
+                .ok_or_else(|| "invalid shard iterator position".into()),
+        }
+    }
 }
 
 #[cfg(test)]

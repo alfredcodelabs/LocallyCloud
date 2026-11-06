@@ -8,6 +8,7 @@
 use crate::audit::{CompletionObserver, DispatchOutcome};
 use crate::handler::NativeHandler;
 use crate::integration::authorization::{AuthorizationEvaluator, AUTHORIZATION_EVALUATOR_VERSION};
+use crate::integration::dynamodb::{DynamoDbStreamsApi, DYNAMODB_STREAMS_API_VERSION};
 use crate::integration::kms::{KmsInternalApi, KMS_INTERNAL_API_VERSION};
 use crate::integration::lambda::{LambdaInternalApi, LAMBDA_INTERNAL_API_VERSION};
 use crate::integration::logs::{InternalLogSink, INTERNAL_LOG_SINK_VERSION};
@@ -86,6 +87,7 @@ pub struct ServiceEntry {
     lambda_api: Option<Arc<dyn LambdaInternalApi>>,
     /// Optional typed capability published atomically with the IAM handler.
     authorization_evaluator: Option<Arc<dyn AuthorizationEvaluator>>,
+    dynamodb_streams_api: Option<Arc<dyn DynamoDbStreamsApi>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -270,6 +272,7 @@ impl ServiceRegistry {
                 kms_api: None,
                 lambda_api: None,
                 authorization_evaluator: None,
+                dynamodb_streams_api: None,
             },
         );
     }
@@ -282,7 +285,7 @@ impl ServiceRegistry {
         metadata: ServiceMetadata,
         handler: Arc<dyn NativeHandler>,
     ) {
-        self.register_native_entry(name, metadata, handler, None, None, None, None, None);
+        self.register_native_entry(name, metadata, handler, None, None, None, None, None, None);
     }
 
     /// Register Monitoring and its typed receiver in one observable transition.
@@ -298,6 +301,7 @@ impl ServiceRegistry {
             metadata,
             handler,
             Some(metric_sink),
+            None,
             None,
             None,
             None,
@@ -322,6 +326,7 @@ impl ServiceRegistry {
             None,
             None,
             None,
+            None,
         );
     }
 
@@ -340,6 +345,7 @@ impl ServiceRegistry {
             None,
             None,
             Some(kms_api),
+            None,
             None,
             None,
         );
@@ -362,6 +368,7 @@ impl ServiceRegistry {
             None,
             Some(lambda_api),
             None,
+            None,
         );
     }
 
@@ -382,6 +389,7 @@ impl ServiceRegistry {
             None,
             None,
             Some(authorization_evaluator),
+            None,
         );
     }
 
@@ -396,6 +404,7 @@ impl ServiceRegistry {
         kms_api: Option<Arc<dyn KmsInternalApi>>,
         lambda_api: Option<Arc<dyn LambdaInternalApi>>,
         authorization_evaluator: Option<Arc<dyn AuthorizationEvaluator>>,
+        dynamodb_streams_api: Option<Arc<dyn DynamoDbStreamsApi>>,
     ) {
         self.services.insert(
             name,
@@ -408,6 +417,7 @@ impl ServiceRegistry {
                 kms_api,
                 lambda_api,
                 authorization_evaluator,
+                dynamodb_streams_api,
             },
         );
     }
@@ -459,6 +469,40 @@ impl ServiceRegistry {
                 .kms_api
                 .as_ref()
                 .filter(|api| api.version() == KMS_INTERNAL_API_VERSION)
+                .cloned()
+        })
+    }
+
+    /// Publish the stream handler and its cursor metadata capability atomically.
+    pub fn register_native_with_dynamodb_streams_api(
+        &self,
+        name: ServiceName,
+        metadata: ServiceMetadata,
+        handler: Arc<dyn NativeHandler>,
+        api: Arc<dyn DynamoDbStreamsApi>,
+    ) {
+        self.register_native_entry(
+            name,
+            metadata,
+            handler,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(api),
+        );
+    }
+
+    pub fn dynamodb_streams_api(&self, name: &ServiceName) -> Option<Arc<dyn DynamoDbStreamsApi>> {
+        self.services.get(name).and_then(|entry| {
+            if entry.disposition != Disposition::Native || entry.handler.is_none() {
+                return None;
+            }
+            entry
+                .dynamodb_streams_api
+                .as_ref()
+                .filter(|api| api.version() == DYNAMODB_STREAMS_API_VERSION)
                 .cloned()
         })
     }
@@ -800,5 +844,43 @@ mod tests {
             Some(ServiceName::new("sns"))
         );
         assert_eq!(reg.lookup_by_action("Unknown"), None);
+    }
+
+    #[test]
+    fn stream_cursor_capability_is_versioned_and_replaced_with_its_handler() {
+        struct CursorApi(u16);
+        #[async_trait::async_trait]
+        impl DynamoDbStreamsApi for CursorApi {
+            fn version(&self) -> u16 {
+                self.0
+            }
+            async fn sequence_after_iterator(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<String, String> {
+                Err("unused test cursor".into())
+            }
+        }
+        let registry = ServiceRegistry::new();
+        let name = ServiceName::new("streams.dynamodb");
+        let metadata = ServiceMetadata::new(AwsProtocol::Json10, Some("DynamoDBStreams_20120810"));
+        registry.register_native_with_dynamodb_streams_api(
+            name.clone(),
+            metadata.clone(),
+            Arc::new(TestHandler),
+            Arc::new(CursorApi(1)),
+        );
+        assert!(registry.dynamodb_streams_api(&name).is_some());
+        registry.register_native_with_dynamodb_streams_api(
+            name.clone(),
+            metadata.clone(),
+            Arc::new(TestHandler),
+            Arc::new(CursorApi(2)),
+        );
+        assert!(registry.dynamodb_streams_api(&name).is_none());
+        registry.register_native(name.clone(), metadata, Arc::new(TestHandler));
+        assert!(registry.dynamodb_streams_api(&name).is_none());
     }
 }

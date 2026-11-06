@@ -31,6 +31,7 @@ pub mod arn;
 pub mod authorization;
 pub mod correlation;
 pub mod delivery;
+pub mod dynamodb;
 pub mod guest;
 pub mod identity;
 pub mod kms;

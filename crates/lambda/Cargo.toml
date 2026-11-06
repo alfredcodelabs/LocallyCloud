@@ -33,6 +33,7 @@ zip.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+locallycloud-dynamodb.workspace = true
 locallycloud-iam-sts.workspace = true
 locallycloud-kinesis.workspace = true
 locallycloud-sqs.workspace = true

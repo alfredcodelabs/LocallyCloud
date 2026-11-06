@@ -38,6 +38,31 @@ impl Persistence {
         ).map_err(|_| state_error())?;
         Ok(())
     }
+
+    pub(super) fn save_with_frontiers(
+        &self,
+        mapping: &EventSourceMapping,
+        frontiers: &[(String, String)],
+    ) -> Result<(), LambdaError> {
+        let config = serde_json::to_string(mapping).map_err(|_| state_error())?;
+        let mut connection = self.state.connection().map_err(|_| state_error())?;
+        let transaction = connection.transaction().map_err(|_| state_error())?;
+        transaction
+            .execute(
+                "INSERT INTO lambda_event_source_mappings VALUES (?1,?2)",
+                params![mapping.uuid, config],
+            )
+            .map_err(|_| state_error())?;
+        for (shard, sequence) in frontiers {
+            transaction
+                .execute(
+                    "INSERT INTO lambda_stream_checkpoints VALUES (?1,?2,0,?3)",
+                    params![mapping.uuid, shard, sequence],
+                )
+                .map_err(|_| state_error())?;
+        }
+        transaction.commit().map_err(|_| state_error())
+    }
     pub(super) fn remove(&self, uuid: &str) -> Result<(), LambdaError> {
         self.state
             .connection()

@@ -15,5 +15,5 @@ pub mod store;
 pub mod streams;
 pub mod value;
 
-pub use engine::register_with_engine;
+pub use engine::{register_with_engine, DynamoEngine};
 pub use service::{register, register_with_state};

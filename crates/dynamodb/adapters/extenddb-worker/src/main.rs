@@ -1,4 +1,6 @@
 mod cipher;
+mod replication;
+mod streams;
 
 use std::collections::HashMap;
 use std::io;
@@ -205,6 +207,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ServerComponentsOptions::default(),
     )
     .await?;
+    let engine: Arc<dyn std::any::Any + Send + Sync> = components.engine.clone();
+    let sqlite = engine
+        .downcast::<extenddb_storage_sqlite::SqliteEngine>()
+        .map_err(|_| "SQLite replication extension is unavailable")?;
+    let replication =
+        replication::Replication::open(&init.database, &init.account_id, &init.region).await?;
+    sqlite.install_mutation_hook(replication.clone())?;
     if storage(
         components
             .catalog_store
@@ -249,7 +258,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
     };
-    write_frame(&mut writer, &json!({"version":1,"ready":true})).await?;
+    write_frame(
+        &mut writer,
+        &json!({"version":1,"ready":true,"features":["stream-cursors-v1","mrec-outbox-v1"]}),
+    )
+    .await?;
     let result: Result<(), Box<dyn std::error::Error>> = async {
         loop {
             let frame = tokio::select! {
@@ -260,15 +273,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             };
             let request: Request = serde_json::from_slice(&frame)?;
-            let (status, body) = match extenddb_engine::dispatch(
-                &request.operation,
-                request.body,
-                &context,
-                "localhost",
-            )
-            .await
-            {
-                Ok(result) => (200, result.body),
+            let result = match request.operation.as_str() {
+                "__locallycloud_resolve_stream_iterator" => streams::resolve(&request.body),
+                "GetRecords" => streams::get_records(request.body, &context).await,
+                op if op.starts_with("__locallycloud_global_") => replication
+                    .dispatch(&sqlite, op, request.body)
+                    .await
+                    .map_err(|error| match error {
+                        extenddb_storage::error::StorageError::Validation(message) => {
+                            extenddb_core::error::DynamoDbError::ValidationException(message)
+                        }
+                        extenddb_storage::error::StorageError::TableNotFound(_) => {
+                            extenddb_core::error::DynamoDbError::ResourceNotFoundException(
+                                "Table not found".into(),
+                            )
+                        }
+                        extenddb_storage::error::StorageError::IndexesInUse(_) => {
+                            extenddb_core::error::DynamoDbError::ResourceInUseException(
+                                "replica has pending writes or is retiring".into(),
+                            )
+                        }
+                        extenddb_storage::error::StorageError::TableAlreadyExists(_) => {
+                            extenddb_core::error::DynamoDbError::ResourceInUseException(
+                                "Table already exists".into(),
+                            )
+                        }
+                        _ => extenddb_core::error::DynamoDbError::InternalServerError(
+                            "replication control operation failed".into(),
+                        ),
+                    }),
+                _ => extenddb_engine::dispatch(
+                    &request.operation,
+                    request.body,
+                    &context,
+                    "localhost",
+                )
+                .await
+                .map(|result| result.body),
+            };
+            let (status, body) = match result {
+                Ok(body) => (200, body),
                 Err(error) => (error.status_code(), aws_error(&error)),
             };
             write_frame(
@@ -308,7 +352,7 @@ fn main() {
     }
     match std::env::args().nth(1).as_deref() {
         Some("--version") => {
-            println!("locallycloud-extenddb-worker 0.1.0 (ExtendDB 0.1.14; protocol 1)");
+            println!("locallycloud-extenddb-worker 0.1.0 (ExtendDB 0.1.14 + mutation hook 1; protocol 1)");
             return;
         }
         Some("--help") => {

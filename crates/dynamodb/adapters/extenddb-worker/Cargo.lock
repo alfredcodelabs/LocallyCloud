@@ -510,7 +510,6 @@ dependencies = [
 [[package]]
 name = "extenddb-auth"
 version = "0.1.14"
-source = "git+https://github.com/ExtendDB/extenddb?rev=b5bffa3803758c6028bb40ecdf2bfcae4a051a88#b5bffa3803758c6028bb40ecdf2bfcae4a051a88"
 dependencies = [
  "async-trait",
  "axum",
@@ -530,7 +529,6 @@ dependencies = [
 [[package]]
 name = "extenddb-cache"
 version = "0.1.14"
-source = "git+https://github.com/ExtendDB/extenddb?rev=b5bffa3803758c6028bb40ecdf2bfcae4a051a88#b5bffa3803758c6028bb40ecdf2bfcae4a051a88"
 dependencies = [
  "futures",
  "moka",
@@ -542,7 +540,6 @@ dependencies = [
 [[package]]
 name = "extenddb-core"
 version = "0.1.14"
-source = "git+https://github.com/ExtendDB/extenddb?rev=b5bffa3803758c6028bb40ecdf2bfcae4a051a88#b5bffa3803758c6028bb40ecdf2bfcae4a051a88"
 dependencies = [
  "base64",
  "bigdecimal",
@@ -556,7 +553,6 @@ dependencies = [
 [[package]]
 name = "extenddb-engine"
 version = "0.1.14"
-source = "git+https://github.com/ExtendDB/extenddb?rev=b5bffa3803758c6028bb40ecdf2bfcae4a051a88#b5bffa3803758c6028bb40ecdf2bfcae4a051a88"
 dependencies = [
  "base64",
  "crc32fast",
@@ -576,7 +572,6 @@ dependencies = [
 [[package]]
 name = "extenddb-storage"
 version = "0.1.14"
-source = "git+https://github.com/ExtendDB/extenddb?rev=b5bffa3803758c6028bb40ecdf2bfcae4a051a88#b5bffa3803758c6028bb40ecdf2bfcae4a051a88"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -601,7 +596,6 @@ dependencies = [
 [[package]]
 name = "extenddb-storage-sqlite"
 version = "0.1.14"
-source = "git+https://github.com/ExtendDB/extenddb?rev=b5bffa3803758c6028bb40ecdf2bfcae4a051a88#b5bffa3803758c6028bb40ecdf2bfcae4a051a88"
 dependencies = [
  "aes-gcm",
  "async-trait",

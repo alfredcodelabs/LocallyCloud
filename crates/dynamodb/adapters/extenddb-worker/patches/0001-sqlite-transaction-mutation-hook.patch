@@ -1,0 +1,325 @@
+diff --git a/crates/storage-sqlite/src/data/data_engine.rs b/crates/storage-sqlite/src/data/data_engine.rs
+index 964ea5f..0413901 100644
+--- a/crates/storage-sqlite/src/data/data_engine.rs
++++ b/crates/storage-sqlite/src/data/data_engine.rs
+@@ -45,6 +45,7 @@ impl DataEngine for SqliteEngine {
+                 condition.as_ref(),
+                 &maps,
+                 stream.as_ref(),
++                None,
+             )
+             .await
+         })
+@@ -82,6 +83,7 @@ impl DataEngine for SqliteEngine {
+                 condition.as_ref(),
+                 &maps,
+                 stream.as_ref(),
++                None,
+             )
+             .await
+         })
+diff --git a/crates/storage-sqlite/src/data/delete_item.rs b/crates/storage-sqlite/src/data/delete_item.rs
+index 91c0d8e..1aaabbe 100644
+--- a/crates/storage-sqlite/src/data/delete_item.rs
++++ b/crates/storage-sqlite/src/data/delete_item.rs
+@@ -22,6 +22,7 @@ impl SqliteEngine {
+         condition: Option<&Expr>,
+         maps: &ExpressionMaps,
+         stream: Option<&StreamCapture>,
++        context: Option<&serde_json::Value>,
+     ) -> Result<Option<Item>, StorageError> {
+         // Read the propagation delay BEFORE taking the write lock. It is a
+         // runtime setting, not an invariant of this write, so it does not need
+@@ -52,6 +53,13 @@ impl SqliteEngine {
+             }
+         }
+ 
++        if self
++            .capture_mutation(&mut tx, key_info, key, old.as_ref(), None, context)
++            .await?
++            == crate::mutation_hook::MutationDecision::Skip
++        {
++            return Ok(if return_old { old } else { None });
++        }
+         // Only mutate when an item actually exists; deleting a missing item is
+         // a no-op (no row removed, no index change, no stream record).
+         let mut enqueued = false;
+diff --git a/crates/storage-sqlite/src/data/put_item.rs b/crates/storage-sqlite/src/data/put_item.rs
+index 4efbaeb..5399e53 100644
+--- a/crates/storage-sqlite/src/data/put_item.rs
++++ b/crates/storage-sqlite/src/data/put_item.rs
+@@ -29,6 +29,7 @@ impl SqliteEngine {
+         condition: Option<&Expr>,
+         maps: &ExpressionMaps,
+         stream: Option<&StreamCapture>,
++        context: Option<&serde_json::Value>,
+     ) -> Result<Option<Item>, StorageError> {
+         // Read the index set only after acquiring the write lock, so a GSI added
+         // by a concurrent UpdateTable (which holds the same lock) cannot be missed
+@@ -61,7 +62,11 @@ impl SqliteEngine {
+             .map_err(|e| StorageError::Validation(e.to_string()))?;
+         }
+ 
+-        let need_old = condition.is_some() || return_old || !indexes.is_empty() || stream.is_some();
++        let need_old = condition.is_some()
++            || return_old
++            || !indexes.is_empty()
++            || stream.is_some()
++            || self.mutation_hook.get().is_some();
+ 
+         let mut tx = self
+             .pool
+@@ -86,6 +91,13 @@ impl SqliteEngine {
+             }
+         }
+ 
++        if self
++            .capture_mutation(&mut tx, key_info, &item, old.as_ref(), Some(&item), context)
++            .await?
++            == crate::mutation_hook::MutationDecision::Skip
++        {
++            return Ok(if return_old { old } else { None });
++        }
+         upsert_item_in_tx(&mut tx, key_info, &item).await?;
+ 
+         // Synchronous indexes (LSIs + zero-delay GSIs) are applied in-txn;
+diff --git a/crates/storage-sqlite/src/data/transactions.rs b/crates/storage-sqlite/src/data/transactions.rs
+index 93e278f..cd2708c 100644
+--- a/crates/storage-sqlite/src/data/transactions.rs
++++ b/crates/storage-sqlite/src/data/transactions.rs
+@@ -139,6 +139,23 @@ impl SqliteEngine {
+             return Err(StorageError::TransactionCanceled(reasons));
+         }
+ 
++        // Capture committed mutations in this transaction, including absent deletes.
++        for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
++            let key = match op {
++                TransactWriteOp::Put { item, .. } => *item,
++                TransactWriteOp::Delete { key, .. } | TransactWriteOp::Update { key, .. } => *key,
++                TransactWriteOp::ConditionCheck { .. } => continue,
++            };
++            self.capture_mutation(
++                &mut tx,
++                op_key_info(op),
++                key,
++                old_item.as_ref(),
++                new_item.as_ref(),
++                None,
++            )
++            .await?;
++        }
+         // Capture stream records after all writes are staged.
+         for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
+             let capture = match op {
+diff --git a/crates/storage-sqlite/src/data/update_item.rs b/crates/storage-sqlite/src/data/update_item.rs
+index c0875a6..e980305 100644
+--- a/crates/storage-sqlite/src/data/update_item.rs
++++ b/crates/storage-sqlite/src/data/update_item.rs
+@@ -90,6 +90,8 @@ impl SqliteEngine {
+             .map_err(|e| StorageError::Validation(e.to_string()))?;
+         }
+ 
++        self.capture_mutation(&mut tx, key_info, key, old.as_ref(), Some(&item), None)
++            .await?;
+         upsert_item_in_tx(&mut tx, key_info, &item).await?;
+ 
+         if !indexes.is_empty() {
+diff --git a/crates/storage-sqlite/src/lib.rs b/crates/storage-sqlite/src/lib.rs
+index 35f16c4..836abf7 100644
+--- a/crates/storage-sqlite/src/lib.rs
++++ b/crates/storage-sqlite/src/lib.rs
+@@ -33,6 +33,7 @@ mod delete_table;
+ mod hooks;
+ mod management_store;
+ mod metadata;
++pub mod mutation_hook;
+ mod number_key;
+ mod operations;
+ mod schema;
+diff --git a/crates/storage-sqlite/src/mutation_hook.rs b/crates/storage-sqlite/src/mutation_hook.rs
+new file mode 100644
+index 0000000..35dc29b
+--- /dev/null
++++ b/crates/storage-sqlite/src/mutation_hook.rs
+@@ -0,0 +1,110 @@
++// Copyright 2026 LocalCloud contributors
++// SPDX-License-Identifier: Apache-2.0
++
++//! Optional transaction-local mutation observer; absent by default.
++use crate::SqliteEngine;
++use extenddb_core::expression::ExpressionMaps;
++use extenddb_core::types::{Item, TableKeyInfo};
++use extenddb_storage::{StreamCapture, error::StorageError};
++use futures::future::BoxFuture;
++use sqlx::{Sqlite, Transaction};
++use std::sync::Arc;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum MutationDecision {
++    Apply,
++    Skip,
++}
++
++pub struct Mutation<'a> {
++    pub key_info: &'a TableKeyInfo,
++    pub key: &'a Item,
++    pub old: Option<&'a Item>,
++    pub new: Option<&'a Item>,
++    pub context: Option<&'a serde_json::Value>,
++}
++
++pub trait MutationHook: Send + Sync {
++    fn capture<'a, 'c>(
++        &'a self,
++        tx: &'a mut Transaction<'c, Sqlite>,
++        mutation: Mutation<'a>,
++    ) -> BoxFuture<'a, Result<MutationDecision, StorageError>>;
++}
++
++impl SqliteEngine {
++    pub fn install_mutation_hook(&self, hook: Arc<dyn MutationHook>) -> Result<(), StorageError> {
++        self.mutation_hook
++            .set(hook)
++            .map_err(|_| StorageError::Validation("mutation hook already installed".into()))
++    }
++
++    pub(crate) async fn capture_mutation(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++        key_info: &TableKeyInfo,
++        key: &Item,
++        old: Option<&Item>,
++        new: Option<&Item>,
++        context: Option<&serde_json::Value>,
++    ) -> Result<MutationDecision, StorageError> {
++        match self.mutation_hook.get() {
++            Some(hook) => {
++                hook.capture(
++                    tx,
++                    Mutation {
++                        key_info,
++                        key,
++                        old,
++                        new,
++                        context,
++                    },
++                )
++                .await
++            }
++            None => Ok(MutationDecision::Apply),
++        }
++    }
++
++    /// Apply an externally committed image through normal index/vector/stream maintenance.
++    pub async fn apply_replica_change(
++        &self,
++        key_info: &TableKeyInfo,
++        key: &Item,
++        item: Option<Item>,
++        context: &serde_json::Value,
++        stream: Option<&StreamCapture>,
++    ) -> Result<(), StorageError> {
++        if self.mutation_hook.get().is_none() {
++            return Err(StorageError::Validation(
++                "replica apply requires a mutation hook".into(),
++            ));
++        }
++        match item {
++            Some(item) => self
++                .put_item_impl(
++                    key_info,
++                    item,
++                    false,
++                    None,
++                    &ExpressionMaps::default(),
++                    stream,
++                    Some(context),
++                )
++                .await
++                .map(|_| ()),
++            None => self
++                .delete_item_impl(
++                    key_info,
++                    key,
++                    false,
++                    None,
++                    &ExpressionMaps::default(),
++                    stream,
++                    Some(context),
++                )
++                .await
++                .map(|_| ()),
++        }
++    }
++}
+diff --git a/crates/storage-sqlite/src/store.rs b/crates/storage-sqlite/src/store.rs
+index 055bac8..3cbb40e 100644
+--- a/crates/storage-sqlite/src/store.rs
++++ b/crates/storage-sqlite/src/store.rs
+@@ -54,6 +54,7 @@ use crate::sqlite_util::sqlite_url;
+ /// stream/worker/backup traits) over a single SQLite database.
+ #[derive(Clone)]
+ pub struct SqliteEngine {
++    pub(crate) mutation_hook: Arc<std::sync::OnceLock<Arc<dyn crate::mutation_hook::MutationHook>>>,
+     pub(crate) pool: SqlitePool,
+     pub(crate) region: String,
+     pub(crate) max_item_size_bytes: usize,
+@@ -114,7 +115,7 @@ impl SqliteEngine {
+                     use sqlx::Executor;
+                     conn.execute("PRAGMA journal_mode = WAL").await?;
+                     conn.execute("PRAGMA foreign_keys = ON").await?;
+-                    conn.execute("PRAGMA synchronous = NORMAL").await?;
++                    conn.execute("PRAGMA synchronous = FULL").await?;
+                     conn.execute("PRAGMA busy_timeout = 5000").await?;
+                     conn.execute("PRAGMA cache_size = -32000").await?;
+                     Ok(())
+@@ -150,6 +151,7 @@ impl SqliteEngine {
+                 .unwrap_or(10);
+ 
+         Ok(Self {
++            mutation_hook: Arc::new(std::sync::OnceLock::new()),
+             pool,
+             region: region.to_owned(),
+             max_item_size_bytes,
+diff --git a/crates/storage-sqlite/src/workers.rs b/crates/storage-sqlite/src/workers.rs
+index 05b3004..9b85769 100644
+--- a/crates/storage-sqlite/src/workers.rs
++++ b/crates/storage-sqlite/src/workers.rs
+@@ -165,6 +165,8 @@ pub(crate) async fn ttl_cleanup_worker(
+     token: CancellationToken,
+ ) {
+     let region: Arc<str> = Arc::from(storage.region.as_str());
++    retry_pending_indexes(&storage).await;
++    sweep_expired_items(&storage, &metrics, &region).await;
+     while sleep_or_shutdown(&token, TTL_SCAN_INTERVAL).await {
+         retry_pending_indexes(&storage).await;
+         sweep_expired_items(&storage, &metrics, &region).await;
+diff --git a/crates/storage/src/lib.rs b/crates/storage/src/lib.rs
+index f83b42c..5062858 100755
+--- a/crates/storage/src/lib.rs
++++ b/crates/storage/src/lib.rs
+@@ -772,7 +772,15 @@ pub trait BackupEngine: Send + Sync {
+ /// DynamoDB-compatible API. This trait has NO additional methods beyond
+ /// the trait bounds — backend-specific concerns belong in `ServerRuntimeHooks`.
+ pub trait StorageEngine:
+-    TableEngine + DataEngine + MetadataEngine + StreamEngine + BackupEngine + WorkerStore + Send + Sync
++    TableEngine
++    + DataEngine
++    + MetadataEngine
++    + StreamEngine
++    + BackupEngine
++    + WorkerStore
++    + Send
++    + Sync
++    + std::any::Any
+ {
+ }
+ 
+@@ -786,6 +794,7 @@ impl<T> StorageEngine for T where
+         + WorkerStore
+         + Send
+         + Sync
++        + 'static
+ {
+ }
+ 

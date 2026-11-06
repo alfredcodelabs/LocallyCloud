@@ -809,9 +809,24 @@ pub async fn restore_table_to_point_in_time(ctx: &Ctx<'_>, req: &Value) -> Resul
     Ok(json!({"TableDescription":result}))
 }
 
+fn scoped_table_name<'a>(ctx: &Ctx<'_>, arn: &'a str) -> Result<&'a str, DdbError> {
+    let name = name_from_arn(arn)?;
+    if arn
+        != format!(
+            "arn:aws:dynamodb:{}:{}:table/{name}",
+            ctx.region, ctx.account
+        )
+    {
+        return Err(DdbError::ResourceNotFound(
+            "Resource not found in this account and region".into(),
+        ));
+    }
+    Ok(name)
+}
+
 pub async fn list_tags_of_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let arn = req_str(req, "ResourceArn")?;
-    let table = get_table(ctx, name_from_arn(arn)?).await?;
+    let table = get_table(ctx, scoped_table_name(ctx, arn)?).await?;
     let guard = table.read().await;
     let tags: Vec<Value> = guard
         .tags
@@ -823,7 +838,7 @@ pub async fn list_tags_of_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, 
 
 pub async fn tag_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let arn = req_str(req, "ResourceArn")?;
-    let table = get_table(ctx, name_from_arn(arn)?).await?;
+    let table = get_table(ctx, scoped_table_name(ctx, arn)?).await?;
     let mut guard = table.write().await;
     if let Some(arr) = req.get("Tags").and_then(Value::as_array) {
         for (k, v) in parse_tag_list(arr) {
@@ -835,7 +850,7 @@ pub async fn tag_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
 
 pub async fn untag_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let arn = req_str(req, "ResourceArn")?;
-    let table = get_table(ctx, name_from_arn(arn)?).await?;
+    let table = get_table(ctx, scoped_table_name(ctx, arn)?).await?;
     let mut guard = table.write().await;
     if let Some(keys) = req.get("TagKeys").and_then(Value::as_array) {
         for key in keys.iter().filter_map(Value::as_str) {
@@ -2730,6 +2745,47 @@ pub async fn list_exports(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
 #[cfg(test)]
 mod global_table_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreign_resource_arns_cannot_read_or_mutate_local_tags() {
+        let store = TableStore::new();
+        let ctx = Ctx {
+            store: &store,
+            account: "123456789012",
+            region: "us-east-1",
+        };
+        let description = create_table(&ctx,&json!({"TableName":"tagged-local", "BillingMode":"PAY_PER_REQUEST", "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}], "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}], "Tags":[{"Key":"owner","Value":"local"}]})).await.unwrap();
+        let arn = description["TableDescription"]["TableArn"]
+            .as_str()
+            .unwrap();
+        for foreign in [
+            arn.replace("us-east-1", "us-west-2"),
+            arn.replace("123456789012", "999999999999"),
+        ] {
+            assert!(matches!(
+                list_tags_of_resource(&ctx, &json!({"ResourceArn":foreign})).await,
+                Err(DdbError::ResourceNotFound(_))
+            ));
+            assert!(matches!(
+                tag_resource(
+                    &ctx,
+                    &json!({"ResourceArn":foreign,"Tags":[{"Key":"owner","Value":"foreign"}]})
+                )
+                .await,
+                Err(DdbError::ResourceNotFound(_))
+            ));
+            assert!(matches!(
+                untag_resource(&ctx, &json!({"ResourceArn":foreign,"TagKeys":["owner"]})).await,
+                Err(DdbError::ResourceNotFound(_))
+            ));
+        }
+        assert_eq!(
+            list_tags_of_resource(&ctx, &json!({"ResourceArn":arn}))
+                .await
+                .unwrap()["Tags"],
+            json!([{"Key":"owner","Value":"local"}])
+        );
+    }
 
     #[tokio::test]
     async fn replica_preserves_new_image_stream_and_queryable_indexes() {

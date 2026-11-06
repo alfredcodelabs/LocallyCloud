@@ -7,6 +7,7 @@ mod cli;
 mod component_manager;
 mod domain_tls;
 mod dynamodb_engine;
+mod dynamodb_replication;
 mod ec2_runtime;
 mod ecs_guest;
 mod ecs_network;
@@ -465,7 +466,8 @@ async fn main() {
     }
     let mut managed_dynamodb = None;
     let dynamodb_registration = match dynamodb_engine.as_str() {
-        "extenddb" => dynamodb_engine::ExtendDb::new(&state)
+        "extenddb" => dynamodb_engine::ExtendDb::new(state.clone())
+            .await
             .map(|engine| {
                 let engine = Arc::new(engine);
                 locallycloud_dynamodb::register_with_engine(&registry, engine.clone());
@@ -804,8 +806,12 @@ async fn main() {
         ));
 
     let restored_lambda = lambda_handler.clone();
+    let restored_dynamodb = managed_dynamodb.clone();
     let server_result = server
         .run_with_listener(listener, move || {
+            if let Some(engine) = restored_dynamodb {
+                engine.resume();
+            }
             if let Err(error) = ecs_recovery.resume() {
                 tracing::error!(%error, "failed to resume durable ECS services");
                 std::process::exit(4);

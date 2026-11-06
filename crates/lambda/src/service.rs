@@ -46,7 +46,7 @@ use crate::error::LambdaError;
 use crate::esm::{
     create_mapping, parse_batching_window, parse_scaling_config, run_workers,
     update_response_types, validate_batch_configuration, validate_batch_size, BatchSource,
-    EsmStore, KinesisBatchSource, SourceType, SqsBatchSource,
+    DynamoDbBatchSource, EsmStore, KinesisBatchSource, SourceType, SqsBatchSource,
 };
 use crate::executor::{DestinationRouter, Executor};
 use crate::model::{function_arn, resolve_function_name, FunctionStore, LayerStore, VpcConfig};
@@ -761,7 +761,35 @@ impl LambdaHandler {
                             esm.function_arn, esm.event_source_arn
                         )));
                     }
-                    self.esm.insert(esm.clone())?;
+                    if SourceType::from_arn(&esm.event_source_arn)
+                        == Some(SourceType::DynamoDbStreams)
+                    {
+                        let frontiers = DynamoDbBatchSource::new(
+                            self.registry.clone(),
+                            self.esm.clone(),
+                            self.store.clone(),
+                            esm.clone(),
+                            account,
+                            region,
+                        )
+                        .map_err(LambdaError::InvalidParameterValue)?
+                        .validate()
+                        .await
+                        .map_err(LambdaError::InvalidParameterValue)?;
+                        let store = self.esm.clone();
+                        let mapping = esm.clone();
+                        tokio::task::spawn_blocking(move || {
+                            store.insert_with_stream_frontiers(mapping, frontiers)
+                        })
+                        .await
+                        .map_err(|_| {
+                            LambdaError::InternalError(
+                                "event source mapping persistence failed".into(),
+                            )
+                        })??;
+                    } else {
+                        self.esm.insert(esm.clone())?;
+                    }
                     self.reconcile_esm(account, region, &esm);
                     Ok((202, Some(self.esm.get(&esm.uuid).unwrap_or(esm).to_json())))
                 }
@@ -996,6 +1024,20 @@ impl LambdaHandler {
             return;
         }
         let source: Arc<dyn BatchSource> = match SourceType::from_arn(&mapping.event_source_arn) {
+            Some(SourceType::DynamoDbStreams) => match DynamoDbBatchSource::new(
+                self.registry.clone(),
+                self.esm.clone(),
+                self.store.clone(),
+                mapping.clone(),
+                account,
+                region,
+            ) {
+                Ok(source) => Arc::new(source),
+                Err(error) => {
+                    tracing::warn!(%error,"could not start event source mapping");
+                    return;
+                }
+            },
             Some(SourceType::Sqs) => match SqsBatchSource::new(
                 self.registry.clone(),
                 self.store.clone(),

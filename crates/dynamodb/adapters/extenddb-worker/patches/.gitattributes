@@ -1,0 +1,2 @@
+# Unified diff context lines preserve the upstream blank-line prefix.
+*.patch -whitespace

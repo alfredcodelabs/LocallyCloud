@@ -78,11 +78,44 @@ struct Request {
 }
 
 pub struct ExtendDb {
+    pool: Arc<WorkerPool>,
+    coordinator: Arc<crate::dynamodb_replication::Coordinator>,
+}
+
+impl ExtendDb {
+    pub async fn new(state: Arc<locallycloud_state::StateDb>) -> io::Result<Self> {
+        let notifier = crate::dynamodb_replication::RelayNotifier::new();
+        let pool = Arc::new(WorkerPool::new(&state, notifier.clone())?);
+        let coordinator =
+            crate::dynamodb_replication::Coordinator::new(pool.clone(), state, notifier).await?;
+        Ok(Self { pool, coordinator })
+    }
+    pub fn resume(&self) {
+        self.coordinator.resume();
+    }
+    pub async fn shutdown(&self) {
+        self.coordinator.shutdown().await;
+        self.pool.shutdown().await;
+    }
+}
+
+#[async_trait]
+impl NativeHandler for ExtendDb {
+    async fn handle(&self, request: ServiceRequest) -> Response {
+        self.coordinator.handle(request).await
+    }
+    async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
+        self.pool.resource_regions(account).await
+    }
+}
+
+pub(crate) struct WorkerPool {
     components: PathBuf,
     data: PathBuf,
     key: Arc<Zeroizing<String>>,
     workers: Mutex<HashMap<(String, String), WorkerTask>>,
     closing: AtomicBool,
+    notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
     slots: Arc<Semaphore>,
 }
 
@@ -91,7 +124,49 @@ struct WorkerTask {
     task: tokio::task::JoinHandle<()>,
 }
 
-impl ExtendDb {
+impl WorkerPool {
+    async fn stream_position(
+        &self,
+        account: &str,
+        region: &str,
+        token: &str,
+    ) -> Result<Value, DdbError> {
+        if account.len() != 12
+            || !account.bytes().all(|b| b.is_ascii_digit())
+            || !(3..=64).contains(&region.len())
+            || !region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(DdbError::Validation("invalid stream scope".into()));
+        }
+        let (status, body) = self
+            .query(
+                account,
+                region,
+                "__locallycloud_resolve_stream_iterator".into(),
+                json!({"ShardIterator":token}),
+            )
+            .await
+            .map_err(DdbError::Internal)?;
+        match status {
+            200 => Ok(body),
+            400 if body
+                .get("__type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.ends_with("ExpiredIteratorException")) =>
+            {
+                Err(DdbError::ExpiredIterator(
+                    "Shard iterator has expired".into(),
+                ))
+            }
+            400 => Err(DdbError::Validation("Invalid ShardIterator".into())),
+            _ => Err(DdbError::Internal(
+                "could not resolve stream iterator".into(),
+            )),
+        }
+    }
+
     pub async fn shutdown(&self) {
         self.closing.store(true, Ordering::Release);
         let workers = match self.workers.lock() {
@@ -113,7 +188,13 @@ impl ExtendDb {
         }
     }
 
-    async fn query(&self, account: &str, region: &str, operation: String, body: Value) -> Reply {
+    pub(crate) async fn query(
+        &self,
+        account: &str,
+        region: &str,
+        operation: String,
+        body: Value,
+    ) -> Reply {
         let sender = self.worker(account, region).map_err(|e| e.to_string())?;
         let (reply, response) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
@@ -131,7 +212,10 @@ impl ExtendDb {
             .map_err(|_| "ExtendDB worker stopped")?
     }
 
-    pub fn new(state: &locallycloud_state::StateDb) -> io::Result<Self> {
+    pub fn new(
+        state: &locallycloud_state::StateDb,
+        notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
+    ) -> io::Result<Self> {
         let mut data = state.path().as_os_str().to_owned();
         data.push(".extenddb");
         let key = std::env::var("LOCALLYCLOUD_KMS_MASTER_KEY")
@@ -144,6 +228,7 @@ impl ExtendDb {
             key: Arc::new(Zeroizing::new(key)),
             workers: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
+            notifier,
             slots: Arc::new(Semaphore::new(MAX_WORKERS)),
         })
     }
@@ -174,6 +259,7 @@ impl ExtendDb {
             scope.clone(),
             self.key.clone(),
             self.slots.clone(),
+            self.notifier.clone(),
             receiver,
         ));
         workers.insert(
@@ -184,6 +270,42 @@ impl ExtendDb {
             },
         );
         Ok(sender)
+    }
+}
+
+#[async_trait]
+impl locallycloud_dynamodb::DynamoEngine for ExtendDb {
+    fn supports_mrec(&self) -> bool {
+        true
+    }
+    async fn resolve_stream_iterator(
+        &self,
+        account: &str,
+        region: &str,
+        token: &str,
+    ) -> Result<String, DdbError> {
+        self.pool
+            .stream_position(account, region, token)
+            .await?
+            .get("StreamArn")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| DdbError::Internal("iterator resolver omitted stream ARN".into()))
+    }
+
+    async fn resolve_stream_sequence(
+        &self,
+        account: &str,
+        region: &str,
+        token: &str,
+    ) -> Result<String, DdbError> {
+        self.pool
+            .stream_position(account, region, token)
+            .await?
+            .get("Sequence")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| DdbError::Internal("iterator resolver omitted sequence".into()))
     }
 }
 
@@ -285,6 +407,19 @@ impl Worker {
                 "ExtendDB initialization failed; check worker compatibility or database master key",
             ));
         }
+        let features = ready.get("features").and_then(Value::as_array);
+        if !["stream-cursors-v1", "mrec-outbox-v1"]
+            .iter()
+            .all(|required| {
+                features.is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature.as_str() == Some(*required))
+                })
+            })
+        {
+            return Err(io::Error::other("Installed ExtendDB worker is outdated; reinstall a worker supporting stream cursors and durable MREC"));
+        }
         drop(executable);
         Ok(worker)
     }
@@ -333,6 +468,7 @@ async fn serve_worker(
     scope: (String, String),
     key: Arc<Zeroizing<String>>,
     slots: Arc<Semaphore>,
+    notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
     mut requests: mpsc::Receiver<Request>,
 ) {
     let mut worker = None;
@@ -372,6 +508,12 @@ async fn serve_worker(
                 worker.stop().await;
             }
         }
+        if matches!(
+            request.operation.as_str(),
+            "PutItem" | "UpdateItem" | "DeleteItem" | "BatchWriteItem" | "TransactWriteItems"
+        ) {
+            notifier.notify(&scope.0, &scope.1);
+        }
         let _ = request.reply.send(result.map_err(|e| e.to_string()));
     }
     if let Some(worker) = worker {
@@ -380,7 +522,7 @@ async fn serve_worker(
 }
 
 #[async_trait]
-impl NativeHandler for ExtendDb {
+impl NativeHandler for WorkerPool {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
         if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
             return Err("invalid account");
@@ -494,6 +636,7 @@ mod tests {
             ("000000000000".into(), "us-east-1".into()),
             Arc::new(Zeroizing::new(String::new())),
             Arc::new(Semaphore::new(1)),
+            crate::dynamodb_replication::RelayNotifier::new(),
             receiver,
         )
         .await;

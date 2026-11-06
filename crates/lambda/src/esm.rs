@@ -1,11 +1,13 @@
 //! Event source mappings (ESM): lifecycle store + the poll→batch→invoke contract.
 //!
 //! The control plane creates/updates/deletes mappings for SQS, DynamoDB Streams, and Kinesis
-//! sources. SQS and Kinesis have source adapters; DynamoDB Streams remains control plane only.
+//! sources. Each adapter dispatches AWS operations through the shared service registry.
 
+mod dynamodb;
 mod kinesis;
 mod persistence;
 mod scaling;
+pub use dynamodb::DynamoDbBatchSource;
 pub use kinesis::KinesisBatchSource;
 pub(crate) use scaling::PollingControl;
 
@@ -145,6 +147,7 @@ fn now() -> f64 {
 pub struct EsmStore {
     mappings: DashMap<String, EventSourceMapping>,
     persistence: std::sync::Mutex<Option<persistence::Persistence>>,
+    creation: std::sync::Mutex<()>,
     checkpoints: DashMap<(String, String), (f64, Option<String>)>,
 }
 
@@ -156,6 +159,31 @@ impl EsmStore {
     pub fn insert(&self, esm: EventSourceMapping) -> Result<(), LambdaError> {
         self.save(&esm)?;
         self.mappings.insert(esm.uuid.clone(), esm);
+        Ok(())
+    }
+
+    pub(crate) fn insert_with_stream_frontiers(
+        &self,
+        esm: EventSourceMapping,
+        frontiers: Vec<(String, String)>,
+    ) -> Result<(), LambdaError> {
+        let creation = self.creation.lock().map_err(|_| state_error())?;
+        if self.mappings.iter().any(|entry| {
+            entry.function_arn == esm.function_arn && entry.event_source_arn == esm.event_source_arn
+        }) {
+            return Err(LambdaError::ResourceConflict(
+                "event source mapping already exists for this function and source".into(),
+            ));
+        }
+        if let Some(state) = self.persistence.lock().map_err(|_| state_error())?.as_ref() {
+            state.save_with_frontiers(&esm, &frontiers)?;
+        }
+        for (shard, sequence) in frontiers {
+            self.checkpoints
+                .insert((esm.uuid.clone(), shard), (0.0, Some(sequence)));
+        }
+        self.mappings.insert(esm.uuid.clone(), esm);
+        drop(creation);
         Ok(())
     }
 
@@ -700,7 +728,10 @@ where
         .iter()
         .filter(|record| {
             let failed = failed.contains(&record.item_identifier);
-            if source_type == SourceType::Kinesis {
+            if matches!(
+                source_type,
+                SourceType::Kinesis | SourceType::DynamoDbStreams
+            ) {
                 blocked |= failed;
                 !blocked
             } else {

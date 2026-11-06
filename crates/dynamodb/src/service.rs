@@ -34,6 +34,7 @@ pub struct DynamoHandler {
 /// DynamoDB Streams uses a separate target prefix while sharing the same table store.
 pub struct StreamsHandler {
     store: Arc<TableStore>,
+    registry: Weak<ServiceRegistry>,
 }
 
 impl Default for DynamoHandler {
@@ -59,6 +60,7 @@ impl DynamoHandler {
     pub fn streams_handler(&self) -> StreamsHandler {
         StreamsHandler {
             store: self.store.clone(),
+            registry: self.registry.clone(),
         }
     }
 
@@ -233,6 +235,13 @@ pub(crate) fn authorization_targets(
 ) -> Result<Vec<(String, String)>, DdbError> {
     let mut targets = Vec::new();
     match op {
+        "TagResource" | "UntagResource" | "ListTagsOfResource" => {
+            let arn = body
+                .get("ResourceArn")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DdbError::Validation("ResourceArn is required".into()))?;
+            targets.push((op.into(), arn.into()));
+        }
         "RestoreTableToPointInTime" => {
             for field in ["SourceTableName", "TargetTableName"] {
                 let table = body
@@ -383,6 +392,32 @@ impl NativeHandler for StreamsHandler {
             Ok(body) => body,
             Err(err) => return err.into_response(&request.request_id),
         };
+        let authorization_body = match op.as_str() {
+            "GetRecords" => {
+                let iterator = body
+                    .get("ShardIterator")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match streams::decode_iterator(iterator) {
+                    Ok((arn, _)) => serde_json::json!({"StreamArn":arn}),
+                    Err(error) => return error.into_response(&request.request_id),
+                }
+            }
+            "DescribeStream" | "GetShardIterator" => {
+                serde_json::json!({"StreamArn":body.get("StreamArn")})
+            }
+            _ => body.clone(),
+        };
+        if let Some(arn) = authorization_body.get("StreamArn").and_then(Value::as_str) {
+            if let Err(error) =
+                streams::validate_stream_scope(&request.account_id, &request.region, arn)
+            {
+                return error.into_response(&request.request_id);
+            }
+        }
+        if let Err(error) = authorize(&self.registry, &request, &op, &authorization_body) {
+            return error.into_response(&request.request_id);
+        }
         let _gate = self.store.operation_gate.lock().await;
         if self.store.has_uncommitted() {
             if let Err(err) = self.store.persist().await {
@@ -437,10 +472,14 @@ fn register_store(registry: &Arc<ServiceRegistry>, store: Arc<TableStore>) {
             registry_ref.clone(),
         )),
     );
-    registry.register_native(
+    registry.register_native_with_dynamodb_streams_api(
         ServiceName::new("streams.dynamodb"),
         ServiceMetadata::new(AwsProtocol::Json10, Some(STREAMS_TARGET_PREFIX)),
-        Arc::new(StreamsHandler { store }),
+        Arc::new(StreamsHandler {
+            store: store.clone(),
+            registry: registry_ref,
+        }),
+        Arc::new(streams::NativeStreamsApi { store }),
     );
 }
 

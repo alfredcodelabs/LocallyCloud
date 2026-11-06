@@ -23,6 +23,10 @@ pub enum DdbError {
     #[error("{0}")]
     Validation(String),
     #[error("{0}")]
+    ExpiredIterator(String),
+    #[error("{0}")]
+    LimitExceeded(String),
+    #[error("{0}")]
     ProvisionedThroughputExceeded(String),
     #[error("{0}")]
     Throttling(String),
@@ -74,6 +78,8 @@ impl DdbError {
             DdbError::ResourceInUse(_) => "ResourceInUseException",
             DdbError::ConditionalCheckFailed(_) => "ConditionalCheckFailedException",
             DdbError::Validation(_) => "ValidationException",
+            DdbError::ExpiredIterator(_) => "ExpiredIteratorException",
+            DdbError::LimitExceeded(_) => "LimitExceededException",
             DdbError::ProvisionedThroughputExceeded(_) => "ProvisionedThroughputExceededException",
             DdbError::Throttling(_) => "ThrottlingException",
             DdbError::TransactionCanceled(_) => "TransactionCanceledException",
@@ -94,6 +100,8 @@ impl DdbError {
             | DdbError::ResourceInUse(_)
             | DdbError::ConditionalCheckFailed(_)
             | DdbError::Validation(_)
+            | DdbError::ExpiredIterator(_)
+            | DdbError::LimitExceeded(_)
             | DdbError::ProvisionedThroughputExceeded(_)
             | DdbError::Throttling(_)
             | DdbError::TransactionCanceled(_)
