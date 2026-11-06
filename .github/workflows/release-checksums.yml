@@ -31,10 +31,15 @@ jobs:
           mkdir dist
           cd dist
           gh release download "$RELEASE_TAG" --pattern '*.deb' --pattern '*.pkg.tar.zst' --pattern SHA256SUMS
+          assets=( *.deb *.pkg.tar.zst )
+          if grep -Eq '^[a-f0-9]{64}  components\.json$' SHA256SUMS; then
+            gh release download "$RELEASE_TAG" --pattern components.json --pattern 'locallycloud-extenddb-worker-linux-*'
+            assets+=(components.json locallycloud-extenddb-worker-linux-*)
+          fi
           # The original manifest names Debian files before GitHub normalizes '~'.
           sed -i 's/~/./g' SHA256SUMS
           sha256sum --check --strict SHA256SUMS
-          sha256sum -- *.deb *.pkg.tar.zst | sort -k2 > SHA256SUMS.corrected
+          sha256sum -- "${assets[@]}" | sort -k2 > SHA256SUMS.corrected
           sort -k2 SHA256SUMS | cmp - SHA256SUMS.corrected
           mv SHA256SUMS.corrected SHA256SUMS
           sha256sum --check --strict SHA256SUMS

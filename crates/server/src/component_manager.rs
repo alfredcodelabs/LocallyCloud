@@ -7,18 +7,49 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-pub const USAGE: &str = "Usage: locallycloud component <install|update|list|rollback|remove> [extenddb]\n\nInstall/update: component install|update extenddb --source PATH|HTTPS_URL --sha256 HEX\n\nInstalls the private ExtendDB worker, not the upstream development HTTP server.\nDownloads occur only through install/update. Rollback is offline. Database files are preserved.";
-const MAX_BINARY: usize = 128 * 1024 * 1024;
-const MISSING_COMPONENT: &str = "ExtendDB worker is not installed; use locallycloud component install extenddb --source PATH --sha256 HEX";
+use crate::component_catalog;
+
+pub const USAGE: &str = "Usage: locallycloud component <install|update|check-updates|list|rollback|remove> [extenddb]\n\nInstall/update: component install|update extenddb [--catalog PATH|HTTPS_URL]\nCheck: component check-updates extenddb [--catalog PATH|HTTPS_URL]\nExplicit artifact: component install|update extenddb --source PATH|HTTPS_URL --sha256 HEX\n\nThe default catalog is pinned to this LocalCloud release and selects this machine's architecture.\nDownloads occur only through explicit install/update/check-updates commands. Rollback is offline. Database files are preserved.";
+pub(super) const MAX_BINARY: usize = 128 * 1024 * 1024;
+const MISSING_COMPONENT: &str =
+    "ExtendDB worker is not installed; use locallycloud component install extenddb";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CatalogAction {
+    Install,
+    Update,
+    CheckUpdates,
+}
+
+impl CatalogAction {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "install" => Ok(Self::Install),
+            "update" => Ok(Self::Update),
+            "check-updates" => Ok(Self::CheckUpdates),
+            _ => Err(USAGE.into()),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Options {
     Help,
     List,
-    Install { source: String, digest: String },
-    Update { source: String, digest: String },
+    Install {
+        source: String,
+        digest: String,
+    },
+    Update {
+        source: String,
+        digest: String,
+    },
     Rollback,
     Remove,
+    Catalog {
+        action: CatalogAction,
+        source: Option<String>,
+    },
 }
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
@@ -30,6 +61,16 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     {
         [] | ["--help" | "-h"] => Ok(Options::Help),
         ["list"] => Ok(Options::List),
+        [action, "extenddb"] if matches!(*action, "install" | "update" | "check-updates") => {
+            Ok(Options::Catalog {
+                action: CatalogAction::parse(action)?,
+                source: None,
+            })
+        }
+        [action, "extenddb", "--catalog", source] if !source.is_empty() => Ok(Options::Catalog {
+            action: CatalogAction::parse(action)?,
+            source: Some((*source).into()),
+        }),
         ["remove", "extenddb"] => Ok(Options::Remove),
         ["rollback", "extenddb"] => Ok(Options::Rollback),
         [action @ ("install" | "update"), "extenddb", "--source", source, "--sha256", digest]
@@ -45,7 +86,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     }
 }
 
-fn valid_digest(digest: &str) -> bool {
+pub(super) fn valid_digest(digest: &str) -> bool {
     digest.len() == 64
         && digest
             .bytes()
@@ -230,6 +271,42 @@ pub async fn execute(options: &Options) -> io::Result<()> {
                 .map_err(io::Error::other)??;
             println!("{}", json!({"operation":"rollback", "sha256":digest}));
         }
+        Options::Catalog { action, source } => {
+            let installed_root = root.clone();
+            let installed = tokio::task::spawn_blocking(move || match manifest(&installed_root) {
+                Ok(value) => Ok(Some(value.sha256)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            })
+            .await
+            .map_err(io::Error::other)??;
+            if *action == CatalogAction::Update && installed.is_none() {
+                return Err(io::Error::other(MISSING_COMPONENT));
+            }
+            let release = component_catalog::resolve(source.as_deref()).await?;
+            let digest = release.digest().to_owned();
+            match action {
+                CatalogAction::CheckUpdates => {
+                    println!(
+                        "{}",
+                        json!({"component":"extenddb", "version":release.version,
+                        "installedSha256":installed, "availableSha256":digest,
+                        "updateAvailable":installed.as_deref() != Some(digest.as_str())})
+                    );
+                }
+                CatalogAction::Install | CatalogAction::Update => {
+                    let (binary, notices) = release.download().await?;
+                    let update = *action == CatalogAction::Update;
+                    tokio::task::spawn_blocking(move || {
+                        install_version(&root, &digest, &binary, update, Some(&notices))
+                    })
+                    .await
+                    .map_err(io::Error::other)??;
+                    println!("ExtendDB worker installed from verified release catalog");
+                }
+            }
+        }
+
         Options::Install { source, digest } | Options::Update { source, digest } => {
             let update = matches!(options, Options::Update { .. });
             if update {
@@ -238,49 +315,7 @@ pub async fn execute(options: &Options) -> io::Result<()> {
                     .await
                     .map_err(io::Error::other)??;
             }
-            let bytes = if source.starts_with("https://") {
-                let client = reqwest::Client::builder()
-                    .https_only(true)
-                    .redirect(reqwest::redirect::Policy::limited(5))
-                    .timeout(std::time::Duration::from_secs(180))
-                    .build()
-                    .map_err(io::Error::other)?;
-                let mut response = client
-                    .get(source)
-                    .send()
-                    .await
-                    .map_err(|error| io::Error::other(error.without_url()))?
-                    .error_for_status()
-                    .map_err(|error| io::Error::other(error.without_url()))?;
-                let mut bytes = Vec::new();
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|error| io::Error::other(error.without_url()))?
-                {
-                    if bytes.len().saturating_add(chunk.len()) > MAX_BINARY {
-                        return Err(io::Error::other("component exceeds 128 MiB"));
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                bytes
-            } else {
-                let file = tokio::fs::File::open(source).await?;
-                let mut bytes = Vec::new();
-                use tokio::io::AsyncReadExt;
-                file.take(MAX_BINARY as u64 + 1)
-                    .read_to_end(&mut bytes)
-                    .await?;
-                bytes
-            };
-            if bytes.len() > MAX_BINARY
-                || !bytes.starts_with(b"\x7fELF")
-                || format!("{:x}", Sha256::digest(&bytes)) != *digest
-            {
-                return Err(io::Error::other(
-                    "component is not an ELF executable with the expected SHA-256",
-                ));
-            }
+            let bytes = component_catalog::download_explicit(source, digest).await?;
             let digest = digest.clone();
             tokio::task::spawn_blocking(move || install(&root, &digest, &bytes, update))
                 .await
@@ -292,6 +327,16 @@ pub async fn execute(options: &Options) -> io::Result<()> {
 }
 
 fn install(root: &Path, digest: &str, bytes: &[u8], update: bool) -> io::Result<()> {
+    install_version(root, digest, bytes, update, None)
+}
+
+fn install_version(
+    root: &Path,
+    digest: &str,
+    bytes: &[u8],
+    update: bool,
+    notices: Option<&[u8]>,
+) -> io::Result<()> {
     let _installation = installation_lock(root)?;
     let prior = match manifest(root) {
         Ok(value) => Some(value),
@@ -304,17 +349,10 @@ fn install(root: &Path, digest: &str, bytes: &[u8], update: bool) -> io::Result<
     let _usage = usage_lock(root, changes_version)?;
     let version = component.join("versions").join(digest);
     private_directory(&version)?;
-    let staging_worker = version.join(format!("worker-{}", uuid::Uuid::new_v4()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&staging_worker)?;
-    use std::io::Write;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(staging_worker, version.join("worker"))?;
-    std::fs::File::open(&version)?.sync_all()?;
+    write_atomic(&version, "worker", bytes, 0o700)?;
+    if let Some(notices) = notices {
+        write_atomic(&version, "LICENSES.txt", notices, 0o600)?;
+    }
     let previous_sha256 = match prior {
         Some(prior) if prior.sha256 != digest => Some(prior.sha256),
         Some(prior) => prior.previous_sha256,
@@ -331,18 +369,23 @@ fn install(root: &Path, digest: &str, bytes: &[u8], update: bool) -> io::Result<
 }
 
 fn activate(root: &Path, value: &Manifest) -> io::Result<()> {
-    let component = root.join("extenddb");
-    let staging = component.join(format!("active-{}.json", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    write_atomic(&root.join("extenddb"), "active.json", &bytes, 0o600)
+}
+
+fn write_atomic(directory: &Path, name: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write;
+    let staging = directory.join(format!(".{name}-{}", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut manifest = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&staging)?;
-        serde_json::to_writer(&mut manifest, value).map_err(io::Error::other)?;
-        manifest.sync_all()?;
-        std::fs::rename(&staging, component.join("active.json"))?;
-        std::fs::File::open(&component)?.sync_all()
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&staging, directory.join(name))?;
+        std::fs::File::open(directory)?.sync_all()
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(staging);
@@ -384,21 +427,38 @@ fn remove(root: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn install_requires_an_explicit_source_and_digest() {
-        for args in [
-            vec!["install", "extenddb"],
-            vec![
-                "install",
-                "extenddb",
-                "--source",
-                "x",
-                "--sha256",
-                "../invalid",
-            ],
-        ] {
-            assert!(parse(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
-        }
+    fn explicit_artifacts_require_a_valid_digest() {
+        let args = [
+            "install",
+            "extenddb",
+            "--source",
+            "x",
+            "--sha256",
+            "../invalid",
+        ]
+        .map(String::from);
+        assert!(parse(&args).is_err());
         assert_eq!(parse(&["list".into()]).unwrap(), Options::List);
+        assert_eq!(
+            parse(&["install".into(), "extenddb".into()]).unwrap(),
+            Options::Catalog {
+                action: CatalogAction::Install,
+                source: None
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "check-updates".into(),
+                "extenddb".into(),
+                "--catalog".into(),
+                "/index".into()
+            ])
+            .unwrap(),
+            Options::Catalog {
+                action: CatalogAction::CheckUpdates,
+                source: Some("/index".into())
+            }
+        );
     }
 
     #[test]
@@ -531,5 +591,39 @@ mod tests {
             .to_string()
             .contains("component install extenddb"));
         assert!(!root.exists());
+    }
+    #[test]
+    fn catalog_notices_are_persisted_before_activation_and_failed_writes_preserve_active() {
+        let root = std::env::temp_dir().join(format!("component-notices-{}", uuid::Uuid::new_v4()));
+        let bytes = b"\x7fELFfixture";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        install_version(&root, &digest, bytes, false, Some(b"license notices")).unwrap();
+        let version = version_path(&root, &digest).parent().unwrap().to_owned();
+        assert_eq!(
+            std::fs::read(version.join("LICENSES.txt")).unwrap(),
+            b"license notices"
+        );
+        let other_bytes = b"\x7fELFnext";
+        let other_digest = format!("{:x}", Sha256::digest(other_bytes));
+        let other_version = root.join("extenddb/versions").join(&other_digest);
+        private_directory(&other_version).unwrap();
+        std::fs::create_dir(other_version.join("LICENSES.txt")).unwrap();
+        assert!(install_version(
+            &root,
+            &other_digest,
+            other_bytes,
+            true,
+            Some(b"license notices")
+        )
+        .is_err());
+        assert_eq!(active(&root).unwrap().1, digest);
+        assert!(
+            !std::fs::read_dir(&other_version).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with('.'))
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

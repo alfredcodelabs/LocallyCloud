@@ -4,6 +4,7 @@
 //! service registry, and the Axum server together, then runs until a shutdown signal.
 
 mod cli;
+mod component_catalog;
 mod component_manager;
 mod domain_tls;
 mod dynamodb_engine;

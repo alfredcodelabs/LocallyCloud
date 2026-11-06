@@ -189,9 +189,44 @@ jobs:
           path: packaging/arch/locallycloud-*.pkg.tar.zst
           if-no-files-found: error
 
+  extenddb:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config clang libclang-dev perl python3
+      - name: Install declared Rust toolchain and license scanner
+        env:
+          RUST_VERSION: ${{ needs.version.outputs.rust }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup override set "$RUST_VERSION"
+          cargo install --locked cargo-about@0.8.4
+      - name: Build and verify the optional component
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: bash packaging/extenddb/build-worker.sh "$RUNNER_TEMP/extenddb-dist" "$RUNNER_TEMP/extenddb-work"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-extenddb-${{ matrix.arch }}
+          path: ${{ runner.temp }}/extenddb-dist/*
+          if-no-files-found: error
+
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [architecture-review, debian, debian-install, arch]
+    needs: [architecture-review, debian, debian-install, arch, extenddb]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -216,7 +251,28 @@ jobs:
               mv -- "$package" "$published_name"
             fi
           done
-          sha256sum -- *.deb *.pkg.tar.zst > SHA256SUMS
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          fragments = [json.loads(Path(f'extenddb-{arch}.json').read_text()) for arch in ('x86_64', 'arm64')]
+          catalog = {key:value for key,value in fragments[0].items() if key != 'artifacts'}
+          artifacts = []
+          for arch, fragment in zip(('x86_64', 'arm64'), fragments):
+              assert {key:value for key,value in fragment.items() if key != 'artifacts'} == catalog
+              assert len(fragment['artifacts']) == 1
+              artifact = fragment['artifacts'][0]
+              assert artifact['architecture'] == arch
+              for kind, suffix in [('binary', ''), ('notices', '.LICENSES.txt')]:
+                  item = artifact[kind]
+                  assert item['name'] == f'locallycloud-extenddb-worker-linux-{arch}{suffix}'
+                  body = Path(item['name']).read_bytes()
+                  assert len(body) == item['size'] and hashlib.sha256(body).hexdigest() == item['sha256']
+              artifacts.append(artifact)
+          catalog['artifacts'] = artifacts
+          Path('components.json').write_text(json.dumps(catalog, indent=2) + '\n')
+          PY
+          sha256sum -- *.deb *.pkg.tar.zst locallycloud-extenddb-worker-linux-* components.json > SHA256SUMS
           sha256sum --check SHA256SUMS
           flags=(--verify-tag --generate-notes --title "LocallyCloud $RELEASE_TAG")
           if [[ "$RELEASE_TAG" == *-* ]]; then
@@ -224,4 +280,4 @@ jobs:
           else
             flags+=(--latest)
           fi
-          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst SHA256SUMS
+          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst locallycloud-extenddb-worker-linux-* components.json SHA256SUMS
