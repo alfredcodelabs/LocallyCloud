@@ -7,6 +7,7 @@ mod capacity;
 mod engine;
 pub mod error;
 pub mod expression;
+pub mod migration;
 pub mod ops;
 pub mod partiql;
 mod recovery;

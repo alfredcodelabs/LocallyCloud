@@ -1,3 +1,4 @@
+mod backups;
 mod cipher;
 mod replication;
 mod streams;
@@ -260,7 +261,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     write_frame(
         &mut writer,
-        &json!({"version":1,"ready":true,"features":["stream-cursors-v1","mrec-outbox-v1"]}),
+        &json!({"version":1,"ready":true,"features":["stream-cursors-v1","mrec-outbox-v1","backups-v1"]}),
     )
     .await?;
     let result: Result<(), Box<dyn std::error::Error>> = async {
@@ -276,6 +277,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let result = match request.operation.as_str() {
                 "__locallycloud_resolve_stream_iterator" => streams::resolve(&request.body),
                 "GetRecords" => streams::get_records(request.body, &context).await,
+                op @ ("CreateBackup"
+                | "DescribeBackup"
+                | "ListBackups"
+                | "DeleteBackup"
+                | "RestoreTableFromBackup") => {
+                    backups::dispatch(op, request.body, &context, &sqlite).await
+                }
                 op if op.starts_with("__locallycloud_global_") => replication
                     .dispatch(&sqlite, op, request.body)
                     .await

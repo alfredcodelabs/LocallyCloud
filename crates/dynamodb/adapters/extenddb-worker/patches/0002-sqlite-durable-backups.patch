@@ -1,0 +1,556 @@
+diff --git a/crates/storage-sqlite/src/backup.rs b/crates/storage-sqlite/src/backup.rs
+--- a/crates/storage-sqlite/src/backup.rs
++++ b/crates/storage-sqlite/src/backup.rs
+@@ -10,16 +10,15 @@
+ //! PostgreSQL backend's behaviour.
+ 
+ use extenddb_core::types::{
+-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingMode,
+-    ContinuousBackupsDescription, CreateTableInput, KeySchemaElement,
+-    PointInTimeRecoveryDescription, ProvisionedThroughput, SourceTableDetails, TableDescription,
+-    TableKeyInfo,
++    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
++    CreateTableInput, KeySchemaElement, PointInTimeRecoveryDescription, SourceTableDetails,
++    TableDescription, TableKeyInfo,
+ };
+ use extenddb_storage::BackupEngine;
+ use extenddb_storage::error::StorageError;
+ use futures::future::BoxFuture;
+ 
+-use crate::data::{data_table_name, upsert_item_in_tx};
++use crate::data::{data_table_name, fetch_restore_indexes, sync_indexes, upsert_item_in_tx};
+ use crate::sqlite_util::parse_timestamp;
+ use crate::store::SqliteEngine;
+ 
+@@ -42,8 +41,101 @@
+ #[allow(clippy::cast_precision_loss)]
+ fn ts_to_epoch(s: &str) -> f64 {
+     parse_timestamp(s)
+-        .map(|dt| dt.unix_timestamp() as f64)
++        .map(|dt| dt.unix_timestamp() as f64 + f64::from(dt.nanosecond()) / 1_000_000_000.0)
+         .unwrap_or(0.0)
++}
++
++const BACKUP_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS backup_table_schema (backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn) ON DELETE CASCADE, description TEXT NOT NULL)";
++
++fn restore_input(
++    snapshot: &serde_json::Value,
++    target: &str,
++) -> Result<CreateTableInput, StorageError> {
++    let mut input = serde_json::json!({"TableName":target});
++    for field in [
++        "KeySchema",
++        "AttributeDefinitions",
++        "GlobalSecondaryIndexes",
++        "LocalSecondaryIndexes",
++        "OnDemandThroughput",
++    ] {
++        if let Some(value) = snapshot.get(field) {
++            input[field] = value.clone();
++        }
++    }
++    let billing = snapshot
++        .get("BillingModeSummary")
++        .and_then(|s| s.get("BillingMode"))
++        .and_then(serde_json::Value::as_str)
++        .unwrap_or("PROVISIONED");
++    input["BillingMode"] = serde_json::json!(billing);
++    if billing == "PROVISIONED" {
++        input["ProvisionedThroughput"] = snapshot
++            .get("ProvisionedThroughput")
++            .cloned()
++            .ok_or_else(|| {
++                StorageError::Unsupported("backup throughput snapshot is unavailable".into())
++            })?;
++    }
++    if let Some(class) = snapshot
++        .get("TableClassSummary")
++        .and_then(|v| v.get("TableClass"))
++    {
++        input["TableClass"] = class.clone();
++    }
++    // AWS restores neither streams, tags, TTL nor deletion protection.
++    serde_json::from_value(input).map_err(|e| StorageError::Internal(e.to_string()))
++}
++
++impl SqliteEngine {
++    pub async fn backup_snapshot(
++        &self,
++        account: &str,
++        arn: &str,
++    ) -> Result<Option<serde_json::Value>, StorageError> {
++        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='backup_table_schema')")
++            .fetch_one(&self.pool).await.map_err(|e| StorageError::Internal(e.to_string()))?;
++        if !exists {
++            return Ok(None);
++        }
++        let row: Option<(String,)> = sqlx::query_as("SELECT s.description FROM backup_table_schema s JOIN backups b ON b.backup_arn=s.backup_arn WHERE b.backup_arn=? AND b.account_id=? AND b.backup_status='AVAILABLE'")
++            .bind(arn).bind(account).fetch_optional(&self.pool).await
++            .map_err(|e| StorageError::Internal(e.to_string()))?;
++        row.map(|r| serde_json::from_str(&r.0).map_err(|e| StorageError::Internal(e.to_string())))
++            .transpose()
++    }
++
++    pub async fn list_backup_page(
++        &self,
++        account: &str,
++        table: Option<&str>,
++        start: &str,
++        lower: Option<f64>,
++        upper: Option<f64>,
++        limit: u32,
++    ) -> Result<Vec<BackupSummary>, StorageError> {
++        let limit = limit.min(101);
++        let rows: Vec<(String,String,String,String,i64,String,String)> = sqlx::query_as(
++            "SELECT b.backup_arn,b.backup_name,b.table_name,b.backup_status,b.backup_size_bytes,             'arn:aws:dynamodb:' || ? || ':' || b.account_id || ':table/' || b.table_name,b.created_at              FROM backups b WHERE b.account_id=? AND b.backup_status='AVAILABLE'              AND (? IS NULL OR b.table_name=?) AND b.backup_arn>?              AND (? IS NULL OR CAST(strftime('%s',b.created_at) AS REAL)+CAST(substr(b.created_at,21,3) AS REAL)/1000.0>=?)              AND (? IS NULL OR CAST(strftime('%s',b.created_at) AS REAL)+CAST(substr(b.created_at,21,3) AS REAL)/1000.0<?)              ORDER BY b.backup_arn LIMIT ?"
++        ).bind(&self.region).bind(account).bind(table).bind(table).bind(start)
++            .bind(lower).bind(lower).bind(upper).bind(upper).bind(i64::from(limit))
++            .fetch_all(&self.pool).await.map_err(|e| StorageError::Internal(e.to_string()))?;
++        Ok(rows
++            .into_iter()
++            .map(
++                |(arn, name, table, status, size, table_arn, created)| BackupSummary {
++                    backup_arn: arn,
++                    backup_name: name,
++                    table_name: table,
++                    backup_status: status,
++                    backup_size_bytes: size,
++                    table_arn,
++                    backup_creation_date_time: ts_to_epoch(&created),
++                    backup_type: "USER".into(),
++                },
++            )
++            .collect())
++    }
+ }
+ 
+ impl BackupEngine for SqliteEngine {
+@@ -57,40 +149,73 @@
+         let table_name = table_name.to_owned();
+         let backup_name = backup_name.to_owned();
+         Box::pin(async move {
+-            let row: Option<(String, String, String, String, i64)> = sqlx::query_as(
+-                "SELECT table_id, key_schema, attribute_definitions, billing_mode, table_size_bytes \
+-                 FROM tables WHERE account_id = ? AND table_name = ? AND table_status = 'ACTIVE'",
++            let _writer = self.write_lock.lock().await;
++            let mut tx = self
++                .pool
++                .begin_with("BEGIN IMMEDIATE")
++                .await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            let description = self
++                .build_table_description_on(&mut tx, &account_id, &table_name)
++                .await?;
++            if description.table_status != extenddb_core::types::TableStatus::Active {
++                return Err(StorageError::TableNotFound(table_name));
++            }
++            if description
++                .global_secondary_indexes
++                .as_ref()
++                .is_some_and(|indexes| indexes.iter().any(|index| index.index_status != "ACTIVE"))
++            {
++                return Err(StorageError::Unsupported(
++                    "backup source index update is still in progress".into(),
++                ));
++            }
++            let table_id = description.table_id.clone();
++            let key_schema = serde_json::to_string(&description.key_schema)
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            let attr_defs = serde_json::to_string(&description.attribute_definitions)
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            let billing_mode = description
++                .billing_mode_summary
++                .as_ref()
++                .map(|mode| mode.billing_mode)
++                .unwrap_or(extenddb_core::types::BillingMode::Provisioned);
++            let billing_mode = match billing_mode {
++                extenddb_core::types::BillingMode::PayPerRequest => "PAY_PER_REQUEST",
++                extenddb_core::types::BillingMode::Provisioned => "PROVISIONED",
++            };
++            let size_bytes = description.table_size_bytes;
++            let mut snapshot = serde_json::to_value(&description)
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            let ttl: (Option<String>,) = sqlx::query_as(
++                "SELECT ttl_attribute FROM tables WHERE account_id = ? AND table_name = ?",
+             )
+             .bind(&account_id)
+             .bind(&table_name)
+-            .fetch_optional(&self.pool)
++            .fetch_one(&mut *tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
+-            let (table_id, key_schema, attr_defs, billing_mode, size_bytes) =
+-                row.ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
+-
++            snapshot["TimeToLiveDescription"] = match ttl.0 {
++                Some(attribute) => {
++                    serde_json::json!({"TimeToLiveStatus":"ENABLED", "AttributeName":attribute})
++                }
++                None => serde_json::json!({"TimeToLiveStatus":"DISABLED"}),
++            };
+             let backup_arn = format!(
+                 "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{id}",
+                 region = self.region,
+                 id = backup_id()
+             );
+-
+             let ddb_table = data_table_name(&table_id);
+-            let items: Vec<(String,)> =
+-                sqlx::query_as(&format!("SELECT item_data FROM {ddb_table}"))
+-                    .fetch_all(&self.pool)
+-                    .await
+-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let item_count = i64::try_from(items.len()).unwrap_or(i64::MAX);
+-
+-            let _writer = self.write_lock.lock().await;
+-            let mut tx = self
+-                .pool
+-                .begin_with("BEGIN IMMEDIATE")
+-                .await
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
++            sqlx::query(BACKUP_SCHEMA)
++                .execute(&mut *tx)
++                .await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            let item_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ddb_table}"))
++                .fetch_one(&mut *tx)
++                .await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            snapshot["ItemCount"] = serde_json::json!(item_count);
+             sqlx::query(
+                 "INSERT INTO backups (backup_arn, backup_name, table_id, table_name, account_id, \
+                  backup_status, backup_size_bytes, item_count, key_schema, attribute_definitions, \
+@@ -110,16 +235,16 @@
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+ 
+-            for (item_data,) in &items {
+-                sqlx::query(
+-                    "INSERT INTO backup_items (backup_arn, pk, sk, item_data) VALUES (?, '', NULL, ?)",
+-                )
++            sqlx::query(&format!(
++                "INSERT INTO backup_items (backup_arn, pk, sk, item_data) SELECT ?, pk, NULL, item_data FROM {ddb_table}"
++            )).bind(&backup_arn).execute(&mut *tx).await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            sqlx::query("INSERT INTO backup_table_schema (backup_arn, description) VALUES (?, ?)")
+                 .bind(&backup_arn)
+-                .bind(item_data)
++                .bind(snapshot.to_string())
+                 .execute(&mut *tx)
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            }
+ 
+             let created_at: (String,) =
+                 sqlx::query_as("SELECT created_at FROM backups WHERE backup_arn = ?")
+@@ -276,6 +401,18 @@
+             // past a concurrent locked writer's busy_timeout.
+             let _writer = self.write_lock.lock().await;
+ 
++            let mut tx = self
++                .pool
++                .begin_with("BEGIN IMMEDIATE")
++                .await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            sqlx::query(BACKUP_SCHEMA)
++                .execute(&mut *tx)
++                .await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++            sqlx::query("DELETE FROM backup_table_schema WHERE backup_arn = ? AND EXISTS (SELECT 1 FROM backups WHERE backup_arn = ? AND account_id = ?)")
++                .bind(&backup_arn).bind(&backup_arn).bind(&account_id).execute(&mut *tx).await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
+             // The account predicate is repeated on both writes rather than
+             // relying on the lookup above, so the statements are correct on
+             // their own terms.
+@@ -285,7 +422,7 @@
+             )
+             .bind(&backup_arn)
+             .bind(&account_id)
+-            .execute(&self.pool)
++            .execute(&mut *tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+             sqlx::query(
+@@ -294,9 +431,12 @@
+             )
+             .bind(&backup_arn)
+             .bind(&account_id)
+-            .execute(&self.pool)
++            .execute(&mut *tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
++            tx.commit()
++                .await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
+             Ok(BackupDescription {
+                 backup_details: BackupDetails {
+                     backup_status: "DELETED".to_owned(),
+@@ -317,50 +457,32 @@
+         let target_table_name = target_table_name.to_owned();
+         let backup_arn = backup_arn.to_owned();
+         Box::pin(async move {
+-            let row: Option<(String, String, String)> = sqlx::query_as(
+-                "SELECT key_schema, attribute_definitions, billing_mode \
+-                 FROM backups WHERE backup_arn = ? AND account_id = ? \
+-                 AND backup_status = 'AVAILABLE'",
+-            )
+-            .bind(&backup_arn)
+-            .bind(&account_id)
+-            .fetch_optional(&self.pool)
+-            .await
+-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
+-            let (ks, ad, billing) = row.ok_or_else(|| {
+-                StorageError::Validation(format!("Backup not found: {backup_arn}"))
+-            })?;
+-            let key_schema: Vec<KeySchemaElement> =
+-                serde_json::from_str(&ks).map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let attr_defs: Vec<AttributeDefinition> =
+-                serde_json::from_str(&ad).map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let billing_mode = Some(if billing == "PAY_PER_REQUEST" {
+-                BillingMode::PayPerRequest
+-            } else {
+-                BillingMode::Provisioned
+-            });
+-
+-            let create_input = CreateTableInput {
+-                table_name: target_table_name.clone(),
+-                key_schema: key_schema.clone(),
+-                attribute_definitions: attr_defs.clone(),
+-                billing_mode,
+-                provisioned_throughput: Some(ProvisionedThroughput {
+-                    read_capacity_units: 5,
+-                    write_capacity_units: 5,
+-                }),
+-                global_secondary_indexes: None,
+-                local_secondary_indexes: None,
+-                stream_specification: None,
+-                tags: None,
+-                deletion_protection_enabled: None,
+-                sse_specification: None,
+-                table_class: None,
+-                on_demand_throughput: None,
+-                ..Default::default()
+-            };
+-
++            self.describe_backup(&account_id, &backup_arn).await?;
++            let snapshot = self
++                .backup_snapshot(&account_id, &backup_arn)
++                .await?
++                .ok_or_else(|| {
++                    StorageError::Unsupported(
++                        "this backup has no restorable schema snapshot".into(),
++                    )
++                })?;
++            if snapshot
++                .get("VectorIndexes")
++                .and_then(serde_json::Value::as_array)
++                .is_some_and(|v| !v.is_empty())
++            {
++                return Err(StorageError::Unsupported(
++                    "restoring backups with vector indexes is not yet supported".into(),
++                ));
++            }
++            if snapshot.get("SSEDescription").is_some_and(|v| !v.is_null()) {
++                return Err(StorageError::Unsupported(
++                    "restoring backups with explicit SSE configuration is not yet supported".into(),
++                ));
++            }
++            let create_input = restore_input(&snapshot, &target_table_name)?;
++            let key_schema = create_input.key_schema.clone();
++            let attr_defs = create_input.attribute_definitions.clone();
+             // `defer_active`: the target is written CREATING with no scheduled
+             // transition, so the control-plane worker cannot report it ACTIVE
+             // while the copy below is still running. The explicit ACTIVE update
+@@ -368,6 +490,7 @@
+             let desc = self
+                 .create_table_impl(&account_id, create_input, true)
+                 .await?;
++            let indexes = fetch_restore_indexes(&desc.table_id, &self.pool).await?;
+             let key_info = TableKeyInfo {
+                 table_name: target_table_name.clone(),
+                 account_id: account_id.clone(),
+@@ -376,32 +499,47 @@
+                 key_schema,
+                 attribute_definitions: attr_defs,
+                 has_lsi: false,
+-                // The restored table is created above without secondary
+-                // indexes, so there is no index metadata to carry.
++                // This key info is used only by the base upsert; index maintenance below
++                // uses the full catalog IndexMeta snapshot.
+                 global_secondary_indexes: Vec::new(),
+                 local_secondary_indexes: Vec::new(),
+                 stream_specification: None,
+                 ..Default::default()
+             };
+ 
+-            let items: Vec<(String,)> =
+-                sqlx::query_as("SELECT item_data FROM backup_items WHERE backup_arn = ?")
+-                    .bind(&backup_arn)
+-                    .fetch_all(&self.pool)
+-                    .await
+-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let item_count = i64::try_from(items.len()).unwrap_or(i64::MAX);
+-
+             let _writer = self.write_lock.lock().await;
+             let mut tx = self
+                 .pool
+                 .begin_with("BEGIN IMMEDIATE")
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            for (item_json,) in &items {
+-                let item: extenddb_core::types::Item = serde_json::from_str(item_json)
++            let mut cursor = 0i64;
++            let mut item_count = 0i64;
++            loop {
++                let items: Vec<(i64, String)> = sqlx::query_as(
++                    "SELECT rowid, item_data FROM backup_items WHERE backup_arn = ? AND rowid > ? ORDER BY rowid LIMIT 32"
++                ).bind(&backup_arn).bind(cursor).fetch_all(&mut *tx).await
+                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+-                upsert_item_in_tx(&mut tx, &key_info, &item).await?;
++                if items.is_empty() {
++                    break;
++                }
++                for (rowid, item_json) in items {
++                    let item: extenddb_core::types::Item = serde_json::from_str(&item_json)
++                        .map_err(|e| StorageError::Internal(e.to_string()))?;
++                    upsert_item_in_tx(&mut tx, &key_info, &item).await?;
++                    sync_indexes(
++                        &mut tx,
++                        &key_info.key_schema,
++                        &key_info.attribute_definitions,
++                        &indexes,
++                        None,
++                        Some(&item),
++                        0,
++                    )
++                    .await?;
++                    cursor = rowid;
++                    item_count += 1;
++                }
+             }
+             sqlx::query("UPDATE tables SET item_count = ? WHERE account_id = ? AND table_name = ?")
+                 .bind(item_count)
+@@ -542,3 +680,37 @@
+         })
+     }
+ }
++
++#[cfg(test)]
++mod backup_schema_tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn restore_keeps_indexes_and_capacity_but_does_not_copy_streams_tags_or_ttl() {
++        let snapshot = json!({"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],
++            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"},{"AttributeName":"group","AttributeType":"S"}],
++            "ProvisionedThroughput":{"ReadCapacityUnits":7,"WriteCapacityUnits":11,"LastIncreaseDateTime":1},
++            "GlobalSecondaryIndexes":[{"IndexName":"by-group","KeySchema":[{"AttributeName":"group","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":3,"WriteCapacityUnits":4},"IndexStatus":"ACTIVE"}],
++            "LocalSecondaryIndexes":[{"IndexName":"by-local","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"group","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}],
++            "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"},"Tags":[{"Key":"owner","Value":"source"}],"TimeToLiveDescription":{"TimeToLiveStatus":"ENABLED"}});
++        let input = restore_input(&snapshot, "restored").unwrap();
++        assert_eq!(input.table_name, "restored");
++        assert_eq!(input.provisioned_throughput.unwrap().read_capacity_units, 7);
++        assert_eq!(
++            input.global_secondary_indexes.unwrap()[0]
++                .provisioned_throughput
++                .as_ref()
++                .unwrap()
++                .write_capacity_units,
++            4
++        );
++        assert_eq!(
++            input.local_secondary_indexes.unwrap()[0].index_name,
++            "by-local"
++        );
++        assert!(input.stream_specification.is_none());
++        assert!(input.tags.is_none());
++        assert!(input.sse_specification.is_none());
++    }
++}
+diff --git a/crates/storage-sqlite/src/data/index.rs b/crates/storage-sqlite/src/data/index.rs
+--- a/crates/storage-sqlite/src/data/index.rs
++++ b/crates/storage-sqlite/src/data/index.rs
+@@ -176,6 +176,18 @@
+             })
+         })
+         .collect()
++}
++
++/// Restore builds every secondary index before publishing the restored table ACTIVE.
++pub(crate) async fn fetch_restore_indexes(
++    table_id: &str,
++    pool: &sqlx::SqlitePool,
++) -> Result<Vec<IndexMeta>, StorageError> {
++    let mut indexes = fetch_indexes_for_table(table_id, pool).await?;
++    for index in &mut indexes {
++        index.propagation_delay_ms = Some(0);
++    }
++    Ok(indexes)
+ }
+ 
+ /// Effective GSI propagation delay (ms): per-GSI override, else system default.
+diff --git a/crates/storage-sqlite/src/data/mod.rs b/crates/storage-sqlite/src/data/mod.rs
+--- a/crates/storage-sqlite/src/data/mod.rs
++++ b/crates/storage-sqlite/src/data/mod.rs
+@@ -44,6 +44,7 @@
+ pub(crate) use index::{
+     PendingApplyContext, apply_pending_context, insert_index_row_multi, project_item_for_index,
+ };
++pub(crate) use index::{fetch_restore_indexes, sync_indexes};
+ pub(crate) use tx_helpers::upsert_item_in_tx;
+ 
+ /// Quoted SQL identifier for a virtual DynamoDB table's data table.
+diff --git a/crates/storage-sqlite/src/table_helpers.rs b/crates/storage-sqlite/src/table_helpers.rs
+--- a/crates/storage-sqlite/src/table_helpers.rs
++++ b/crates/storage-sqlite/src/table_helpers.rs
+@@ -122,12 +122,27 @@
+         account_id: &str,
+         table_name: &str,
+     ) -> Result<TableDescription, StorageError> {
++        let mut connection = self
++            .pool
++            .acquire()
++            .await
++            .map_err(|error| StorageError::Internal(error.to_string()))?;
++        self.build_table_description_on(&mut connection, account_id, table_name)
++            .await
++    }
++
++    pub(crate) async fn build_table_description_on(
++        &self,
++        connection: &mut sqlx::SqliteConnection,
++        account_id: &str,
++        table_name: &str,
++    ) -> Result<TableDescription, StorageError> {
+         let row: Option<TableRow> = sqlx::query_as(&format!(
+             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ?"
+         ))
+         .bind(account_id)
+         .bind(table_name)
+-        .fetch_optional(&self.pool)
++        .fetch_optional(&mut *connection)
+         .await
+         .map_err(|e| StorageError::Internal(e.to_string()))?;
+ 
+@@ -137,7 +152,7 @@
+             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
+         ))
+         .bind(&row.table_id)
+-        .fetch_all(&self.pool)
++        .fetch_all(&mut *connection)
+         .await
+         .map_err(|e| StorageError::Internal(e.to_string()))?;
+ 
+@@ -145,7 +160,7 @@
+             "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
+         ))
+         .bind(&row.table_id)
+-        .fetch_all(&self.pool)
++        .fetch_all(&mut *connection)
+         .await
+         .map_err(|e| StorageError::Internal(e.to_string()))?;
+ 

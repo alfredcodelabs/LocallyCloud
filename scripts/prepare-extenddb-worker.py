@@ -17,6 +17,7 @@ ARCHIVE_URL = f'https://codeload.github.com/ExtendDB/extenddb/tar.gz/{COMMIT}'
 PACKAGES = ('auth', 'cache', 'core', 'engine', 'storage', 'storage-sqlite')
 ROOT = Path(__file__).resolve().parent.parent
 PATCH = ROOT / 'crates/dynamodb/adapters/extenddb-worker/patches/0001-sqlite-transaction-mutation-hook.patch'
+PATCHES = (PATCH, PATCH.with_name('0002-sqlite-durable-backups.patch'))
 MAX_COMPRESSED = 32 * 1024 * 1024
 MAX_EXPANDED = 128 * 1024 * 1024
 
@@ -91,7 +92,8 @@ def prepare(directory, supplied_archive=None):
     source = directory / 'source'
     marker = directory / 'prepared.json'
     expected = {'commit': COMMIT, 'archive_sha256': ARCHIVE_SHA256,
-                'patch_sha256': digest(PATCH)}
+                'patch_sha256': digest(PATCH),
+                'patches': [{'name': patch.name, 'sha256': digest(patch)} for patch in PATCHES]}
     if source.is_symlink() or marker.is_symlink():
         raise ValueError('prepared source and marker must not be symlinks')
     if source.exists():
@@ -123,9 +125,10 @@ def prepare(directory, supplied_archive=None):
             environment = {name: value for name, value in os.environ.items() if not name.startswith('GIT_')}
             environment.update(GIT_CEILING_DIRECTORIES=str(tree.parent),
                                GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
-            for arguments in (['--check'], []):
-                subprocess.run(['git', 'apply', *arguments, str(PATCH)], cwd=tree,
-                               env=environment, check=True, capture_output=True)
+            for patch in PATCHES:
+                for arguments in (['--check'], []):
+                    subprocess.run(['git', 'apply', *arguments, str(patch)], cwd=tree,
+                                   env=environment, check=True, capture_output=True)
             expected['tree_sha256'] = tree_digest(tree)
             tree.rename(source)
             marker.write_text(json.dumps(expected, indent=2) + '\n')

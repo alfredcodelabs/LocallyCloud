@@ -18,7 +18,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
-use crate::component_manager;
+use crate::{component_catalog, component_manager};
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -44,7 +44,7 @@ pub fn bind_store(state: &locallycloud_state::StateDb, engine: &str) -> io::Resu
     drop(statement);
     if let Some(selected) = selected {
         if selected != engine {
-            return Err(io::Error::other("DynamoDB engine differs from this state's engine; use a fresh state database or an explicit migration"));
+            return Err(io::Error::other("DynamoDB engine differs from this state's engine; keep the original engine or use a fresh state database. migrate-dynamodb --dry-run only inspects native state; cutover is not implemented"));
         }
         return Ok(());
     }
@@ -57,7 +57,7 @@ pub fn bind_store(state: &locallycloud_state::StateDb, engine: &str) -> io::Resu
             .map_err(io::Error::other)?;
         if populated {
             return Err(io::Error::other(
-                "native DynamoDB tables exist; use a fresh state database or an explicit migration",
+                "native DynamoDB tables exist; keep the native engine or use a fresh state database. migrate-dynamodb --dry-run only inspects state; cutover is not implemented",
             ));
         }
     }
@@ -275,6 +275,9 @@ impl WorkerPool {
 
 #[async_trait]
 impl locallycloud_dynamodb::DynamoEngine for ExtendDb {
+    fn supports_backups(&self) -> bool {
+        true
+    }
     fn supports_mrec(&self) -> bool {
         true
     }
@@ -408,7 +411,7 @@ impl Worker {
             ));
         }
         let features = ready.get("features").and_then(Value::as_array);
-        if !["stream-cursors-v1", "mrec-outbox-v1"]
+        if !component_catalog::REQUIRED_CAPABILITIES
             .iter()
             .all(|required| {
                 features.is_some_and(|features| {
@@ -418,7 +421,7 @@ impl Worker {
                 })
             })
         {
-            return Err(io::Error::other("Installed ExtendDB worker is outdated; reinstall a worker supporting stream cursors and durable MREC"));
+            return Err(io::Error::other("Installed ExtendDB worker is outdated; reinstall a worker supporting stream cursors, durable MREC and schema-preserving backups"));
         }
         drop(executable);
         Ok(worker)

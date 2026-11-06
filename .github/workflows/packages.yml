@@ -130,7 +130,7 @@ jobs:
           if-no-files-found: error
 
   debian-install:
-    needs: debian
+    needs: [debian, extenddb]
     strategy:
       fail-fast: false
       matrix:
@@ -140,16 +140,23 @@ jobs:
     container: ${{ matrix.image }}
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: package-debian-${{ matrix.arch }}
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-extenddb-${{ matrix.arch == 'amd64' && 'x86_64' || 'arm64' }}
+          path: components
       - name: Install with apt and start as an unprivileged user
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           # APT can skip Recommends that need upgrades to preinstalled base libraries.
-          apt-get install -y curl openssl dbus-user-session ./dist/*.deb
+          apt-get install -y curl openssl dbus-user-session python3 ./dist/*.deb
           dpkg-query -W -f='${Recommends}\n' locallycloud | grep -qw dbus-user-session
           dpkg-query -W -f='${Status}\n' dbus-user-session | grep -q 'install ok installed'
           useradd --create-home tester
@@ -161,6 +168,13 @@ jobs:
             for _ in $(seq 1 200); do curl -fs http://127.0.0.1:4566/_locallycloud/health && break; sleep 0.1; done
             curl -fs http://127.0.0.1:4566/_locallycloud/status | grep -q "\"ready\":true" || { cat /tmp/locallycloud.log; exit 1; }
             kill "$pid"'
+      - name: Install and exercise the downloaded component as an unprivileged user
+        env:
+          COMPONENT_ARCH: ${{ matrix.arch == 'amd64' && 'x86_64' || 'arm64' }}
+        run: |
+          chmod -R a+rX components
+          runuser -u tester -- python3 "$GITHUB_WORKSPACE/packaging/extenddb/smoke-component.py" \
+            --catalog "$GITHUB_WORKSPACE/components/extenddb-$COMPONENT_ARCH.json" --work-dir /home/tester
 
   arch:
     needs: version
@@ -224,9 +238,36 @@ jobs:
           path: ${{ runner.temp }}/extenddb-dist/*
           if-no-files-found: error
 
+  arch-extenddb-install:
+    needs: [arch, extenddb]
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    timeout-minutes: 15
+    steps:
+      - name: Install validation tools
+        run: pacman -Syu --noconfirm --needed python sqlite git
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-arch-x86_64
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-extenddb-x86_64
+          path: components
+      - name: Install and exercise the downloaded component as an unprivileged user
+        run: |
+          pacman -U --noconfirm ./dist/*.pkg.tar.zst
+          useradd --create-home tester
+          chmod -R a+rX components
+          runuser -u tester -- python3 "$GITHUB_WORKSPACE/packaging/extenddb/smoke-component.py" \
+            --catalog "$GITHUB_WORKSPACE/components/extenddb-x86_64.json" --work-dir /home/tester
+
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [architecture-review, debian, debian-install, arch, extenddb]
+    needs: [architecture-review, debian, debian-install, arch, extenddb, arch-extenddb-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

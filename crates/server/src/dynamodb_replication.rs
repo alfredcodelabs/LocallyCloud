@@ -387,7 +387,11 @@ impl Coordinator {
         let op = operation(&request).unwrap_or_default();
         if matches!(
             op.as_str(),
-            "CreateTable" | "DeleteTable" | "UpdateTable" | "UpdateTimeToLive"
+            "CreateTable"
+                | "DeleteTable"
+                | "UpdateTable"
+                | "UpdateTimeToLive"
+                | "RestoreTableFromBackup"
         ) {
             if !self.started.load(Ordering::Acquire) {
                 return failure(
@@ -487,8 +491,14 @@ impl Coordinator {
                     .into_response(&request.request_id)
             }
         };
-        let Some(name) = table_name(&body) else {
-            return DdbError::Validation("TableName is required".into())
+        let name_field = if op == "RestoreTableFromBackup" {
+            "TargetTableName"
+        } else {
+            "TableName"
+        };
+        let lookup = json!({"TableName":body.get(name_field)});
+        let Some(name) = table_name(&lookup) else {
+            return DdbError::Validation(format!("{name_field} is required"))
                 .into_response(&request.request_id);
         };
         body["TableName"] = json!(name);
@@ -497,7 +507,7 @@ impl Coordinator {
             Err(error) => return failure(&error, &request.request_id),
         };
         let result = match op.as_str() {
-            "CreateTable"
+            "CreateTable" | "RestoreTableFromBackup"
                 if global
                     .as_ref()
                     .is_some_and(|g| g.regions.contains(&request.region)) =>

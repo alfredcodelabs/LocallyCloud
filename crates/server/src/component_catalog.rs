@@ -9,7 +9,8 @@ use crate::component_manager::{valid_digest, MAX_BINARY};
 
 const MAX_CATALOG: usize = 64 * 1024;
 const MAX_NOTICES: usize = 2 * 1024 * 1024;
-const REQUIRED_CAPABILITIES: &[&str] = &["stream-cursors-v1", "mrec-outbox-v1"];
+pub(super) const REQUIRED_CAPABILITIES: &[&str] =
+    &["stream-cursors-v1", "mrec-outbox-v1", "backups-v1"];
 
 #[derive(Deserialize)]
 struct Catalog {

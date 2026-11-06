@@ -10,7 +10,7 @@ use crate::error::DdbError;
 use crate::store::{StoredKey, TableData};
 use crate::value::Item;
 
-const SEALED: &str = "dynamodb-sealed-v1:";
+pub(crate) const SEALED: &str = "dynamodb-sealed-v1:";
 
 pub(crate) fn encode(
     cipher: Option<&StateCipher>,

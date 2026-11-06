@@ -1205,6 +1205,87 @@ impl PersistedTable {
     }
 }
 
+/// Decode one persisted table for read-only administrative inspection.
+pub(crate) fn migration_table(
+    cipher: &StateCipher,
+    account: &str,
+    region: &str,
+    name: &str,
+    encoded: &str,
+) -> Result<(TableData, bool), DdbError> {
+    let invalid = || {
+        DdbError::Internal("Native DynamoDB metadata is invalid or cannot be authenticated".into())
+    };
+    crate::streams::validate_scope_values(account, region).map_err(|_| invalid())?;
+    validate_table_name(name).map_err(|_| invalid())?;
+    let plaintext = crate::recovery::decode(
+        Some(cipher),
+        &["dynamodb-metadata", account, region, name],
+        encoded,
+    )
+    .map_err(|_| invalid())?;
+    let value: Value = serde_json::from_str(&plaintext).map_err(|_| invalid())?;
+    let known = [
+        "def",
+        "persist_id",
+        "tags",
+        "ttl_attribute",
+        "pitr_enabled",
+        "stream_seq",
+        "kinesis_destinations",
+        "kinesis_pending",
+        "exports",
+        "replica_pending",
+    ];
+    let object = value.as_object().ok_or_else(invalid)?;
+    let definition_fields = [
+        "sse_type",
+        "name",
+        "arn",
+        "key_schema",
+        "attribute_definitions",
+        "indexes",
+        "billing_mode",
+        "read_capacity",
+        "write_capacity",
+        "warm_throughput",
+        "stream_spec",
+        "creation_date",
+        "status",
+        "replicas",
+    ];
+    let definition = object
+        .get("def")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let unknown = object.keys().any(|key| !known.contains(&key.as_str()))
+        || definition
+            .keys()
+            .any(|key| !definition_fields.contains(&key.as_str()));
+    let saved: PersistedTable = serde_json::from_value(value).map_err(|_| invalid())?;
+    let hash_keys = saved
+        .def
+        .key_schema
+        .iter()
+        .filter(|key| key.key_type == KeyType::Hash)
+        .count();
+    let range_keys = saved
+        .def
+        .key_schema
+        .iter()
+        .filter(|key| key.key_type == KeyType::Range)
+        .count();
+    if saved.def.name != name
+        || saved.def.arn != format!("arn:aws:dynamodb:{region}:{account}:table/{name}")
+        || hash_keys != 1
+        || range_keys > 1
+        || saved.def.key_schema.len() != hash_keys + range_keys
+    {
+        return Err(invalid());
+    }
+    Ok((saved.into_data(), unknown))
+}
+
 fn persist_error(error: impl std::fmt::Display) -> DdbError {
     DdbError::Internal(format!("DynamoDB persistence failed: {error}"))
 }

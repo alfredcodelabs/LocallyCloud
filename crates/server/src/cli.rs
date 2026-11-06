@@ -9,6 +9,7 @@ Run the LocallyCloud local AWS emulator on one endpoint (default http://127.0.0.
 Commands:
   (none)                  Start the server
   migrate-s3-encryption   Encrypt S3 object bodies stored by an earlier version, then exit
+  migrate-dynamodb --dry-run  Inspect native DynamoDB migration blockers without changing data
   runtime <COMMAND>      Install and manage only the Lambda runtimes you use
   component <COMMAND>    Install optional native service components
 
@@ -25,6 +26,7 @@ pub enum Command {
     Serve,
     OciSetupGate(String),
     MigrateS3Encryption,
+    InspectDynamoDbMigration,
     Help,
     Version,
     Runtime(crate::runtime_manager::Options),
@@ -33,6 +35,13 @@ pub enum Command {
 
 pub fn parse(arguments: &[String]) -> Result<Command, String> {
     match arguments {
+        [group, rest @ ..] if group == "migrate-dynamodb" => match rest {
+            [flag] if flag == "--dry-run" => Ok(Command::InspectDynamoDbMigration),
+            _ => Err(
+                "migrate-dynamodb supports --dry-run only; applying a migration is not implemented"
+                    .into(),
+            ),
+        },
         [group, rest @ ..] if group == "component" => {
             crate::component_manager::parse(rest).map(Command::Component)
         }
@@ -82,5 +91,19 @@ mod tests {
         assert!(parse(&args(&["migrate-s3-encription"])).is_err());
         assert!(parse(&args(&["--port", "4567"])).is_err());
         assert!(parse(&args(&["migrate-s3-encryption", "extra"])).is_err());
+    }
+    #[test]
+    fn dynamodb_migration_requires_explicit_read_only_mode() {
+        assert_eq!(
+            parse(&args(&["migrate-dynamodb", "--dry-run"])),
+            Ok(Command::InspectDynamoDbMigration)
+        );
+        for values in [
+            vec!["migrate-dynamodb"],
+            vec!["migrate-dynamodb", "--apply"],
+            vec!["migrate-dynamodb", "--dry-run", "--apply"],
+        ] {
+            assert!(parse(&args(&values)).is_err());
+        }
     }
 }

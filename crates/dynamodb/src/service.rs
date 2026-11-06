@@ -235,6 +235,37 @@ pub(crate) fn authorization_targets(
 ) -> Result<Vec<(String, String)>, DdbError> {
     let mut targets = Vec::new();
     match op {
+        "ListBackups" => targets.push((op.into(), "*".into())),
+        "DescribeBackup" | "DeleteBackup" => {
+            let arn = body
+                .get("BackupArn")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DdbError::Validation("BackupArn is required".into()))?;
+            targets.push((op.into(), arn.into()));
+        }
+        "RestoreTableFromBackup" => {
+            let backup = body
+                .get("BackupArn")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DdbError::Validation("BackupArn is required".into()))?;
+            let target = body
+                .get("TargetTableName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DdbError::Validation("TargetTableName is required".into()))?;
+            targets.push((op.into(), backup.into()));
+            targets.push((op.into(), target.into()));
+            for action in [
+                "BatchWriteItem",
+                "DeleteItem",
+                "GetItem",
+                "PutItem",
+                "Query",
+                "Scan",
+                "UpdateItem",
+            ] {
+                targets.push((action.into(), target.into()));
+            }
+        }
         "TagResource" | "UntagResource" | "ListTagsOfResource" => {
             let arn = body
                 .get("ResourceArn")

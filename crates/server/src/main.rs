@@ -8,6 +8,7 @@ mod component_catalog;
 mod component_manager;
 mod domain_tls;
 mod dynamodb_engine;
+mod dynamodb_migration;
 mod dynamodb_replication;
 mod ec2_runtime;
 mod ecs_guest;
@@ -323,6 +324,13 @@ async fn main() {
         }
     };
     match command {
+        cli::Command::InspectDynamoDbMigration => {
+            if let Err(error) = dynamodb_migration::inspect().await {
+                eprintln!("locallycloud migrate-dynamodb: {error}");
+                std::process::exit(5);
+            }
+            return;
+        }
         cli::Command::Component(ref options) => {
             if let Err(error) = component_manager::execute(options).await {
                 eprintln!("locallycloud component: {error}");

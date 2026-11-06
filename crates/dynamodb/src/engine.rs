@@ -22,6 +22,9 @@ struct EngineHandler {
 /// The backend resolves its own token format; the wrapper owns authorization.
 #[async_trait]
 pub trait DynamoEngine: NativeHandler {
+    fn supports_backups(&self) -> bool {
+        false
+    }
     fn supports_mrec(&self) -> bool {
         false
     }
@@ -126,6 +129,11 @@ fn supported(prefix: &str, op: &str) -> bool {
                 | "SearchVectors"
                 | "DescribeTimeToLive"
                 | "UpdateTimeToLive"
+                | "CreateBackup"
+                | "DescribeBackup"
+                | "ListBackups"
+                | "DeleteBackup"
+                | "RestoreTableFromBackup"
                 | "ListTagsOfResource"
                 | "TagResource"
                 | "UntagResource"
@@ -158,6 +166,67 @@ fn validate_scope(
             return Err(DdbError::Validation(
                 "resource ARN must match the request account and region".into(),
             ));
+        }
+    }
+    if op == "ListBackups" {
+        if let Some(table) = body.get("TableName").and_then(Value::as_str) {
+            if table.starts_with("arn:") && !table.starts_with(&arn_prefix) {
+                return Err(DdbError::Validation(
+                    "table ARN must match the request account and region".into(),
+                ));
+            }
+        }
+    }
+    if matches!(
+        op,
+        "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup"
+    ) {
+        let arn = body
+            .get("BackupArn")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DdbError::Validation("BackupArn is required".into()))?;
+        let resource = arn
+            .strip_prefix(&format!("{arn_prefix}table/"))
+            .ok_or_else(|| {
+                DdbError::Validation("backup ARN must match the request account and region".into())
+            })?;
+        let (table, backup) = resource
+            .split_once("/backup/")
+            .ok_or_else(|| DdbError::Validation("invalid backup ARN".into()))?;
+        if arn.len() > 1024
+            || table.is_empty()
+            || backup.is_empty()
+            || table.contains('/')
+            || backup.contains('/')
+        {
+            return Err(DdbError::Validation("invalid backup ARN".into()));
+        }
+    }
+    if op == "RestoreTableFromBackup" {
+        let unsupported = [
+            "BillingModeOverride",
+            "ProvisionedThroughputOverride",
+            "OnDemandThroughputOverride",
+            "GlobalSecondaryIndexOverride",
+            "LocalSecondaryIndexOverride",
+            "SSESpecificationOverride",
+            "VectorIndexOverride",
+        ];
+        if let Some(field) = unsupported.iter().find(|field| body.get(**field).is_some()) {
+            return Err(DdbError::Validation(format!(
+                "{field} is not supported by the optional DynamoDB engine"
+            )));
+        }
+        let target = body
+            .get("TargetTableName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DdbError::Validation("TargetTableName is required".into()))?;
+        if !(3..=255).contains(&target.len())
+            || !target
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            return Err(DdbError::Validation("invalid TargetTableName".into()));
         }
     }
     if matches!(op, "CreateTable" | "UpdateTable") {
@@ -251,6 +320,20 @@ impl NativeHandler for EngineHandler {
                 .into_response(&request.request_id);
             }
         };
+        if matches!(
+            op.as_str(),
+            "CreateBackup"
+                | "DescribeBackup"
+                | "ListBackups"
+                | "DeleteBackup"
+                | "RestoreTableFromBackup"
+        ) && !self.engine.supports_backups()
+        {
+            return DdbError::UnknownOperation(
+                "backups are not supported by this DynamoDB engine".into(),
+            )
+            .into_response(&request.request_id);
+        }
         let body = match service::parse_body(&request) {
             Ok(body) => body,
             Err(error) => return error.into_response(&request.request_id),
@@ -303,6 +386,9 @@ mod tests {
 
     #[async_trait]
     impl DynamoEngine for Engine {
+        fn supports_backups(&self) -> bool {
+            true
+        }
         async fn resolve_stream_iterator(
             &self,
             _: &str,
@@ -464,6 +550,61 @@ mod tests {
             engine.calls.lock().unwrap()[0].headers["x-amz-target"],
             "DynamoDBStreams_20120810.ListStreams"
         );
+    }
+
+    #[tokio::test]
+    async fn backup_scope_and_restore_overrides_fail_before_dispatch() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let engine = Arc::new(Engine::default());
+        let handler = handler(&registry, &engine);
+        let backup = "arn:aws:dynamodb:us-east-1:000000000000:table/orders/backup/123-abc";
+        for body in [
+            json!({"BackupArn":backup,"TargetTableName":"target","SSESpecificationOverride":{"Enabled":true}}),
+            json!({"BackupArn":backup,"TargetTableName":"target","GlobalSecondaryIndexOverride":[]}),
+            json!({"BackupArn":backup,"TargetTableName":"../target"}),
+            json!({"BackupArn":"arn:aws:dynamodb:us-east-2:000000000000:table/orders/backup/123-abc","TargetTableName":"target"}),
+        ] {
+            assert_eq!(
+                handler
+                    .handle(request(
+                        TARGET_PREFIX,
+                        "RestoreTableFromBackup",
+                        &body.to_string()
+                    ))
+                    .await
+                    .status(),
+                400
+            );
+        }
+        assert!(engine.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn backup_iam_targets_ignore_forged_table_fields_and_cover_restore_writes() {
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/orders/backup/123-abc";
+        let targets = service::authorization_targets(
+            "DescribeBackup",
+            &json!({"BackupArn":arn,"TableName":"forged"}),
+        )
+        .unwrap();
+        assert_eq!(targets, vec![("DescribeBackup".into(), arn.into())]);
+        assert_eq!(
+            service::authorization_targets("ListBackups", &json!({"TableName":"orders"})).unwrap(),
+            vec![("ListBackups".into(), "*".into())]
+        );
+        let targets = service::authorization_targets(
+            "RestoreTableFromBackup",
+            &json!({"BackupArn":arn,"TargetTableName":"restored"}),
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 9);
+        assert_eq!(targets[0], ("RestoreTableFromBackup".into(), arn.into()));
+        assert!(targets
+            .iter()
+            .any(|(action, table)| action == "PutItem" && table == "restored"));
+        assert!(targets
+            .iter()
+            .any(|(action, table)| action == "GetItem" && table == "restored"));
     }
 
     const ALLOWED_STREAM: &str =
