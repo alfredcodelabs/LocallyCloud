@@ -22,6 +22,9 @@ struct EngineHandler {
 /// The backend resolves its own token format; the wrapper owns authorization.
 #[async_trait]
 pub trait DynamoEngine: NativeHandler {
+    fn supports_owned_encryption(&self) -> bool {
+        false
+    }
     fn supports_backups(&self) -> bool {
         false
     }
@@ -243,7 +246,6 @@ fn validate_scope(
             }
         }
         const UNSUPPORTED_FIELDS: &[&str] = &[
-            "SSESpecification",
             "Replicas",
             "GlobalTableVersion",
             "GlobalTableSettingsReplicationMode",
@@ -259,6 +261,29 @@ fn validate_scope(
                 "{field} is not supported by the optional DynamoDB engine"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_owned_encryption(op: &str, body: &Value, supported: bool) -> Result<(), DdbError> {
+    if !matches!(op, "CreateTable" | "UpdateTable") {
+        return Ok(());
+    }
+    let Some(specification) = body.get("SSESpecification") else {
+        return Ok(());
+    };
+    let owned = specification.as_object().is_some_and(|specification| {
+        specification.is_empty()
+            || (specification.len() == 1
+                && specification.get("Enabled").and_then(Value::as_bool) == Some(false))
+    });
+    if !supported {
+        return Err(DdbError::Validation(
+            "SSESpecification is not supported by this DynamoDB engine".into(),
+        ));
+    }
+    if !owned {
+        return Err(DdbError::Validation("This DynamoDB engine supports only default AWS-owned encryption with SSESpecification {} or {Enabled:false}; customer-managed encryption is unavailable".into()));
     }
     Ok(())
 }
@@ -351,6 +376,13 @@ impl NativeHandler for EngineHandler {
             &authorization_body,
             self.engine.supports_mrec(),
         )
+        .and_then(|()| {
+            validate_owned_encryption(
+                &op,
+                &authorization_body,
+                self.engine.supports_owned_encryption(),
+            )
+        })
         .and_then(|()| service::authorize(&self.registry, &request, &op, &authorization_body))
         {
             return error.into_response(&request.request_id);
@@ -373,6 +405,7 @@ mod tests {
     #[derive(Default)]
     struct Engine {
         calls: Mutex<Vec<ServiceRequest>>,
+        owned_encryption: bool,
     }
 
     #[async_trait]
@@ -386,6 +419,9 @@ mod tests {
 
     #[async_trait]
     impl DynamoEngine for Engine {
+        fn supports_owned_encryption(&self) -> bool {
+            self.owned_encryption
+        }
         fn supports_backups(&self) -> bool {
             true
         }
@@ -456,6 +492,76 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].account_id, "000000000000");
         assert_eq!(calls[0].region, "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn owned_encryption_accepts_empty_or_explicit_false_only_on_capable_engines() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let engine = Arc::new(Engine {
+            owned_encryption: true,
+            ..Engine::default()
+        });
+        let handler = handler(&registry, &engine);
+        for operation in ["CreateTable", "UpdateTable"] {
+            for specification in [json!({}), json!({"Enabled":false})] {
+                let body =
+                    json!({"TableName":"owned-table","SSESpecification":specification}).to_string();
+                // The fake engine returns500; reaching it proves boundary admission.
+                assert_eq!(
+                    handler
+                        .handle(request(TARGET_PREFIX, operation, &body))
+                        .await
+                        .status(),
+                    500
+                );
+            }
+        }
+        assert_eq!(engine.calls.lock().unwrap().len(), 4);
+        for specification in [
+            Value::Null,
+            json!(false),
+            json!({"Enabled":"false"}),
+            json!({"Enabled":0}),
+            json!({"Enabled":true}),
+            json!({"Enabled":false,"SSEType":"AES256"}),
+            json!({"Enabled":false,"SSEType":"KMS"}),
+            json!({"Enabled":false,"KMSMasterKeyId":"key"}),
+            json!({"Enabled":false,"unexpected":false}),
+        ] {
+            for operation in ["CreateTable", "UpdateTable"] {
+                let body =
+                    json!({"TableName":"owned-table","SSESpecification":specification}).to_string();
+                assert_eq!(
+                    handler
+                        .handle(request(TARGET_PREFIX, operation, &body))
+                        .await
+                        .status(),
+                    400
+                );
+            }
+        }
+        assert_eq!(engine.calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn default_engine_capability_does_not_claim_owned_encryption() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let engine = Arc::new(Engine::default());
+        let handler = handler(&registry, &engine);
+        for operation in ["CreateTable", "UpdateTable"] {
+            assert_eq!(
+                handler
+                    .handle(request(
+                        TARGET_PREFIX,
+                        operation,
+                        r#"{"TableName":"owned-table","SSESpecification":{"Enabled":false}}"#
+                    ))
+                    .await
+                    .status(),
+                400
+            );
+        }
+        assert!(engine.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

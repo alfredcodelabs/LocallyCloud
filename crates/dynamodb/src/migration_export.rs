@@ -7,11 +7,25 @@ use serde_json::{json, Value};
 
 use super::{
     inspect_snapshot_with_binding, invalid, open_snapshot, scoped_count,
-    source_schema_with_binding, InspectionSummary, SourceBinding, MAX_RECORD,
+    source_schema_with_binding, BlockingFeature, InspectionSummary, SourceBinding, MAX_RECORD,
 };
 use crate::error::DdbError;
 use crate::store::{KeySchemaElement, KeyType, ProjectionType, TableData, WarmThroughput};
 use crate::value::{item_from_json, item_size, item_to_json, Item, MAX_ITEM_SIZE};
+
+/// Metadata preservation is the default; normalization always requires explicit consent.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationPolicy {
+    #[default]
+    Preserve,
+    NormalizeLegacyAes256,
+}
+
+impl MigrationPolicy {
+    fn normalizes(self, sse_type: Option<&str>) -> bool {
+        self == Self::NormalizeLegacyAes256 && sse_type == Some("AES256")
+    }
+}
 
 /// Each table precedes its items; values and primary keys use DynamoDB JSON wire types.
 #[derive(Debug)]
@@ -25,6 +39,8 @@ pub enum NativeRecord {
         tags: Value,
         /// TTL configuration; the offline importer must suspend expiration until cutover.
         ttl_attribute: Option<String>,
+        /// Legacy SSE metadata is deliberately replaced by the default-owned descriptor.
+        normalized_legacy_aes256: bool,
         item_count: u64,
     },
     Item {
@@ -230,7 +246,16 @@ pub fn export_native(
     cipher: &StateCipher,
     visit: impl FnMut(NativeRecord) -> Result<(), DdbError>,
 ) -> Result<InspectionSummary, DdbError> {
-    export_with_binding(path, cipher, SourceBinding::Native, visit)
+    export_native_with_policy(path, cipher, MigrationPolicy::Preserve, visit)
+}
+
+pub fn export_native_with_policy(
+    path: &Path,
+    cipher: &StateCipher,
+    policy: MigrationPolicy,
+    visit: impl FnMut(NativeRecord) -> Result<(), DdbError>,
+) -> Result<InspectionSummary, DdbError> {
+    export_with_binding(path, cipher, SourceBinding::Native, policy, visit)
 }
 
 /// Re-read the preserved native source solely for an already-committed cutover recovery.
@@ -242,18 +267,37 @@ pub fn export_native_recovery(
     cipher: &StateCipher,
     visit: impl FnMut(NativeRecord) -> Result<(), DdbError>,
 ) -> Result<InspectionSummary, DdbError> {
-    export_with_binding(path, cipher, SourceBinding::CommittedExtendDb, visit)
+    export_native_recovery_with_policy(path, cipher, MigrationPolicy::Preserve, visit)
+}
+
+pub fn export_native_recovery_with_policy(
+    path: &Path,
+    cipher: &StateCipher,
+    policy: MigrationPolicy,
+    visit: impl FnMut(NativeRecord) -> Result<(), DdbError>,
+) -> Result<InspectionSummary, DdbError> {
+    export_with_binding(
+        path,
+        cipher,
+        SourceBinding::CommittedExtendDb,
+        policy,
+        visit,
+    )
 }
 
 fn export_with_binding(
     path: &Path,
     cipher: &StateCipher,
     binding: SourceBinding,
+    policy: MigrationPolicy,
     mut visit: impl FnMut(NativeRecord) -> Result<(), DdbError>,
 ) -> Result<InspectionSummary, DdbError> {
     let connection = open_snapshot(path)?;
     let summary = inspect_snapshot_with_binding(&connection, cipher, binding, |table| {
-        if !table.blocking_features.is_empty() {
+        if table.blocking_features.iter().any(|feature| {
+            !matches!(feature, BlockingFeature::ServerSideEncryption)
+                || !policy.normalizes(table.sse_type.as_deref())
+        }) {
             return Err(unsupported(
                 "the table features reported by migrate-dynamodb --dry-run",
             ));
@@ -298,6 +342,7 @@ fn export_with_binding(
                             .collect(),
                     ),
                     ttl_attribute: data.ttl_attribute.clone(),
+                    normalized_legacy_aes256: policy.normalizes(data.def.sse_type.as_deref()),
                     item_count: count,
                 })?;
             }

@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use locallycloud_dynamodb::migration::{export_native, export_native_recovery, NativeRecord};
+use locallycloud_dynamodb::migration::{
+    export_native_recovery_with_policy, export_native_with_policy, MigrationPolicy, NativeRecord,
+};
 use locallycloud_state::{StateCipher, StateDb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,6 +23,8 @@ struct Journal {
     schema: u32,
     stage: String,
     phase: Phase,
+    #[serde(default)]
+    normalize_legacy_aes256: bool,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -324,7 +328,14 @@ async fn require_migration_ttl(component: &(PathBuf, File, File)) -> Result<(), 
     Err(error)
 }
 
-fn prepare(guard: SourceGuard) -> Result<Prepared, String> {
+fn require_journal_policy(journal: &Journal, policy: MigrationPolicy) -> Result<(), String> {
+    if journal.normalize_legacy_aes256 != (policy == MigrationPolicy::NormalizeLegacyAes256) {
+        return Err("Migration normalization policy differs from its durable journal; retry with the original --normalize-legacy-aes256 choice".into());
+    }
+    Ok(())
+}
+
+fn prepare(guard: SourceGuard, policy: MigrationPolicy) -> Result<Prepared, String> {
     let SourceGuard {
         source,
         cipher,
@@ -350,8 +361,10 @@ fn prepare(guard: SourceGuard) -> Result<Prepared, String> {
                 uuid::Uuid::new_v4()
             ),
             phase: Phase::Copying,
+            normalize_legacy_aes256: policy == MigrationPolicy::NormalizeLegacyAes256,
         }
     };
+    require_journal_policy(&journal, policy)?;
     let stage = source
         .parent()
         .ok_or("Source has no parent")?
@@ -366,7 +379,8 @@ fn prepare(guard: SourceGuard) -> Result<Prepared, String> {
         && selected.as_deref() == Some("extenddb");
     if completed {
         private(&destination, true).map_err(|e| e.to_string())?;
-        export_native_recovery(&source, &cipher, |_| Ok(())).map_err(|e| e.to_string())?;
+        export_native_recovery_with_policy(&source, &cipher, policy, |_| Ok(()))
+            .map_err(|e| e.to_string())?;
         let state = StateDb::open(source.clone()).map_err(|e| e.to_string())?;
         return Ok(Prepared {
             source,
@@ -385,7 +399,8 @@ fn prepare(guard: SourceGuard) -> Result<Prepared, String> {
         return Err("Source is not bound to the native engine; migrations never switch a written ExtendDB store back to native".into());
     }
     // Export authenticates every encrypted row and rejects every blocker before yielding any record.
-    let summary = export_native(&source, &cipher, |_| Ok(())).map_err(|e| e.to_string())?;
+    let summary = export_native_with_policy(&source, &cipher, policy, |_| Ok(()))
+        .map_err(|e| e.to_string())?;
     if summary.table_count == 0 {
         return Err(
             "Native source has no tables to migrate; use a fresh state for ExtendDB".into(),
@@ -454,6 +469,10 @@ fn schema_matches(expected: &Value, actual: &Value) -> bool {
                 result.insert(key.into(), value.clone());
             }
         }
+        result.insert(
+            "SSEDescription".into(),
+            value.get("SSEDescription").cloned().unwrap_or(Value::Null),
+        );
         let billing = value
             .get("BillingMode")
             .or_else(|| value.pointer("/BillingModeSummary/BillingMode"))
@@ -672,7 +691,8 @@ async fn transfer(
     destination: PathBuf,
     import: bool,
     recovery: bool,
-) -> Result<(), String> {
+    policy: MigrationPolicy,
+) -> Result<u64, String> {
     let notifier = crate::dynamodb_replication::RelayNotifier::new();
     let mut pool = WorkerPool::for_migration(destination.clone(), notifier.clone())
         .map_err(|e| e.to_string())?;
@@ -687,14 +707,15 @@ async fn transfer(
             })
         };
         if recovery {
-            export_native_recovery(&source, &cipher, emit)
+            export_native_recovery_with_policy(&source, &cipher, policy, emit)
         } else {
-            export_native(&source, &cipher, emit)
+            export_native_with_policy(&source, &cipher, policy, emit)
         }
         .map_err(|e| e.to_string())
     });
     let mut current: Option<Table> = None;
     let result = async {
+        let mut normalized_tables = 0u64;
         while let Some(record) = receiver.recv().await {
             match record {
                 NativeRecord::Table {
@@ -705,6 +726,7 @@ async fn transfer(
                     tags,
                     item_count,
                     ttl_attribute,
+                    normalized_legacy_aes256,
                 } => {
                     if let Some(previous) = current.take() {
                         verify_count(&pool, &previous).await?;
@@ -734,6 +756,9 @@ async fn transfer(
                         .await?;
                     }
                     verify_table(&pool, &table, &create, &tags).await?;
+                    if normalized_legacy_aes256 {
+                        normalized_tables = normalized_tables.checked_add(1).ok_or("Normalized table count overflow")?;
+                    }
                     if let (true, Some(attribute)) = (import, &ttl_attribute) {
                         query(
                             &pool, &table.account, &table.region, "UpdateTimeToLive",
@@ -782,7 +807,7 @@ async fn transfer(
         if let Some(table) = current {
             verify_count(&pool, &table).await?;
         }
-        Ok(())
+        Ok(normalized_tables)
     }
     .await;
     drop(receiver);
@@ -790,9 +815,9 @@ async fn transfer(
     let exported = producer
         .await
         .map_err(|_| "Native migration export task failed".to_owned())?;
-    result?;
+    let normalized_tables = result?;
     exported?;
-    Ok(())
+    Ok(normalized_tables)
 }
 
 fn commit(prepared: &mut Prepared) -> Result<(), String> {
@@ -845,15 +870,15 @@ fn commit(prepared: &mut Prepared) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) async fn apply() -> Result<(), String> {
+pub(crate) async fn apply(policy: MigrationPolicy) -> Result<(), String> {
     let guard = tokio::task::spawn_blocking(source_guard)
         .await
         .map_err(|_| "Migration source preflight task failed".to_owned())??;
     require_migration_ttl(&guard.component).await?;
-    let mut prepared = tokio::task::spawn_blocking(move || prepare(guard))
+    let mut prepared = tokio::task::spawn_blocking(move || prepare(guard, policy))
         .await
         .map_err(|_| "Migration destination preflight task failed".to_owned())??;
-    if prepared.completed {
+    let normalized_tables = if prepared.completed {
         // Trusted recovery is restricted to the validated, already-committed durable intent.
         // A full reopened destination read authenticates its key before clearing the startup guard.
         transfer(
@@ -861,8 +886,9 @@ pub(crate) async fn apply() -> Result<(), String> {
             prepared.destination.clone(),
             false,
             true,
+            policy,
         )
-        .await?;
+        .await?
     } else {
         let destination = if prepared.published {
             prepared.destination.clone()
@@ -870,11 +896,18 @@ pub(crate) async fn apply() -> Result<(), String> {
             prepared.stage.clone()
         };
         if prepared.journal.phase == Phase::Copying {
-            transfer(prepared.source.clone(), destination.clone(), true, false).await?;
+            transfer(
+                prepared.source.clone(),
+                destination.clone(),
+                true,
+                false,
+                policy,
+            )
+            .await?;
         }
         // Every pool has shut down. This opens fresh workers and verifies all source records again.
-        transfer(prepared.source.clone(), destination, false, false).await?;
-    }
+        transfer(prepared.source.clone(), destination, false, false, policy).await?
+    };
     tokio::task::spawn_blocking(move || commit(&mut prepared))
         .await
         .map_err(|_| "Migration cutover task failed".to_owned())??;
@@ -882,7 +915,9 @@ pub(crate) async fn apply() -> Result<(), String> {
         "{}",
         json!({"kind":"migration-complete","engine":"extenddb","nativeRowsRetained":true,
         "preserved":["logicalSchema","billingAndCapacity","indexes","tags","ttl","items"],
-        "physicalTableIdentity":"regenerated"})
+        "physicalTableIdentity":"regenerated",
+        "legacyAes256Normalization":{"tables":normalized_tables,"sourceSseType":"AES256",
+        "destinationStorage":"SQLCipher","destinationSseDescriptor":"default-owned","kmsMigrated":false}})
     );
     Ok(())
 }
@@ -915,6 +950,7 @@ mod tests {
             schema: 1,
             stage: stage.file_name().unwrap().to_str().unwrap().into(),
             phase: Phase::Copying,
+            normalize_legacy_aes256: false,
         };
         let marker = sibling(&source, ".dynamodb-migration.json");
         journal_write(&marker, &journal).unwrap();
@@ -1040,6 +1076,7 @@ mod tests {
             schema: 1,
             stage: "../other.extenddb-migration-00000000-0000-0000-0000-000000000000".into(),
             phase: Phase::Verified,
+            normalize_legacy_aes256: false,
         };
         journal_write(&prepared.marker, &bad).unwrap();
         assert!(journal_read(&prepared.marker, &prepared.source).is_err());
@@ -1123,5 +1160,63 @@ mod tests {
             None,
             &json!({"TimeToLiveDescription":{"TimeToLiveStatus":"DISABLED","AttributeName":"old"}})
         ));
+    }
+
+    #[test]
+    fn legacy_journals_default_to_preserve_and_every_recovery_phase_requires_matching_policy() {
+        let mut journal: Journal =
+            serde_json::from_value(json!({"schema":1,"stage":"unused","phase":"copying"})).unwrap();
+        assert!(!journal.normalize_legacy_aes256);
+        for phase in [Phase::Copying, Phase::Verified] {
+            journal.phase = phase;
+            for normalize in [false, true] {
+                journal.normalize_legacy_aes256 = normalize;
+                let matched = if normalize {
+                    MigrationPolicy::NormalizeLegacyAes256
+                } else {
+                    MigrationPolicy::Preserve
+                };
+                let mismatched = if normalize {
+                    MigrationPolicy::Preserve
+                } else {
+                    MigrationPolicy::NormalizeLegacyAes256
+                };
+                require_journal_policy(&journal, matched).unwrap();
+                assert!(require_journal_policy(&journal, mismatched)
+                    .unwrap_err()
+                    .contains("normalization policy differs"));
+            }
+        }
+    }
+
+    #[test]
+    fn normalization_policy_mismatch_keeps_source_and_journal_untouched() {
+        let mut prepared = fixture();
+        prepared.journal.normalize_legacy_aes256 = true;
+        journal_write(&prepared.marker, &prepared.journal).unwrap();
+        let source_before = fs::read(&prepared.source).unwrap();
+        let journal_before = fs::read(&prepared.marker).unwrap();
+        let recovered = journal_read(&prepared.marker, &prepared.source).unwrap();
+        assert!(require_journal_policy(&recovered, MigrationPolicy::Preserve).is_err());
+        assert_eq!(fs::read(&prepared.source).unwrap(), source_before);
+        assert_eq!(fs::read(&prepared.marker).unwrap(), journal_before);
+        assert!(!prepared.destination.exists());
+        fs::remove_dir_all(prepared.source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn migration_schema_requires_default_owned_sse_descriptor() {
+        let expected = json!({"TableName":"orders"});
+        assert!(schema_matches(&expected, &json!({"TableName":"orders"})));
+        assert!(schema_matches(
+            &expected,
+            &json!({"TableName":"orders","SSEDescription":null})
+        ));
+        for kind in ["AES256", "KMS"] {
+            assert!(!schema_matches(
+                &expected,
+                &json!({"TableName":"orders","SSEDescription":{"Status":"ENABLED","SSEType":kind,"KMSMasterKeyArn":"arn:aws:kms:us-east-1:000000000000:key/default"}})
+            ));
+        }
     }
 }

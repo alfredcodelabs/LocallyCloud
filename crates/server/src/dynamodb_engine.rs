@@ -217,6 +217,36 @@ impl WorkerPool {
         operation: String,
         body: Value,
     ) -> Reply {
+        if operation == "UpdateTable" && body.get("SSESpecification").is_some() {
+            let (status, description) = self
+                .query_raw(
+                    account,
+                    region,
+                    "DescribeTable".into(),
+                    json!({"TableName":body.get("TableName")}),
+                )
+                .await?;
+            if status != 200 {
+                return Ok((status, description));
+            }
+            let description = match owned_encryption_description(description) {
+                Ok(description) => description,
+                Err(error) => return error_reply(error).await,
+            };
+            if body.as_object().is_some_and(|body| body.len() == 2) {
+                return Ok((200, description));
+            }
+        }
+        self.query_raw(account, region, operation, body).await
+    }
+
+    async fn query_raw(
+        &self,
+        account: &str,
+        region: &str,
+        operation: String,
+        body: Value,
+    ) -> Reply {
         let sender = self.worker(account, region).map_err(|e| e.to_string())?;
         let (reply, response) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
@@ -322,6 +352,9 @@ impl WorkerPool {
 
 #[async_trait]
 impl locallycloud_dynamodb::DynamoEngine for ExtendDb {
+    fn supports_owned_encryption(&self) -> bool {
+        true
+    }
     fn supports_backups(&self) -> bool {
         true
     }
@@ -635,25 +668,173 @@ impl NativeHandler for WorkerPool {
                 .await
         }
         .await;
-        match result {
-            Ok((status, body)) => match Response::builder()
-                .status(status)
-                .header("content-type", "application/x-amz-json-1.0")
-                .header("x-amzn-requestid", &request.request_id)
-                .body(Body::from(body.to_string()))
-            {
-                Ok(response) => response,
-                Err(_) => DdbError::Internal("could not encode engine response".into())
-                    .into_response(&request.request_id),
-            },
-            Err(error) => DdbError::Internal(error).into_response(&request.request_id),
-        }
+        engine_response(&request.request_id, result.map_err(DdbError::Internal))
+    }
+}
+
+async fn error_reply(error: DdbError) -> Reply {
+    // Reuse the service's protocol renderer instead of maintaining another AWS error map.
+    let response = error.into_response("");
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .map_err(|_| "could not render engine error")?;
+    Ok((
+        status,
+        serde_json::from_slice(&body).map_err(|_| "could not render engine error")?,
+    ))
+}
+
+fn owned_encryption_description(body: Value) -> Result<Value, DdbError> {
+    let description = body
+        .get("Table")
+        .ok_or_else(|| DdbError::Internal("missing owned-encryption table description".into()))?;
+    if description.get("TableStatus").and_then(Value::as_str) != Some("ACTIVE") {
+        return Err(DdbError::ResourceInUse(
+            "Table must be ACTIVE to update encryption".into(),
+        ));
+    }
+    if description
+        .get("SSEDescription")
+        .is_some_and(|description| !description.is_null())
+    {
+        return Err(DdbError::Validation(
+            "Changing customer-managed encryption is not supported by this DynamoDB engine".into(),
+        ));
+    }
+    Ok(json!({"TableDescription":description}))
+}
+
+fn engine_response(request_id: &str, result: Result<(u16, Value), DdbError>) -> Response {
+    match result {
+        Ok((status, body)) => match Response::builder()
+            .status(status)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amzn-requestid", request_id)
+            .body(Body::from(body.to_string()))
+        {
+            Ok(response) => response,
+            Err(_) => DdbError::Internal("could not encode engine response".into())
+                .into_response(request_id),
+        },
+        Err(error) => error.into_response(request_id),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scripted_pool(
+        replies: Vec<(&'static str, (u16, Value))>,
+    ) -> (WorkerPool, Arc<Mutex<Vec<String>>>) {
+        let (sender, mut receiver) = mpsc::channel::<Request>(8);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let task = tokio::spawn(async move {
+            for (expected, reply) in replies {
+                let request = receiver.recv().await.unwrap();
+                assert_eq!(request.operation, expected);
+                observed.lock().unwrap().push(request.operation);
+                request.reply.send(Ok(reply)).unwrap();
+            }
+        });
+        let pool = WorkerPool {
+            launch: WorkerLaunch {
+                components: PathBuf::from("/never-executed"),
+                mode: WorkerMode::Normal,
+            },
+            data: PathBuf::from("/never-opened"),
+            key: Arc::new(Zeroizing::new(String::new())),
+            workers: Mutex::new(HashMap::from([(
+                ("000000000000".into(), "us-east-1".into()),
+                WorkerTask { sender, task },
+            )])),
+            closing: AtomicBool::new(false),
+            notifier: crate::dynamodb_replication::RelayNotifier::new(),
+            slots: Arc::new(Semaphore::new(1)),
+        };
+        (pool, calls)
+    }
+
+    #[tokio::test]
+    async fn owned_encryption_noop_reads_real_active_table_without_updating_storage() {
+        let description = json!({"TableName":"owned","TableStatus":"ACTIVE","TableArn":"arn:aws:dynamodb:us-east-1:000000000000:table/owned","ItemCount":3});
+        for specification in [json!({}), json!({"Enabled":false})] {
+            let (pool, calls) =
+                scripted_pool(vec![("DescribeTable", (200, json!({"Table":description})))]);
+            let (status, body) = pool
+                .query(
+                    "000000000000",
+                    "us-east-1",
+                    "UpdateTable".into(),
+                    json!({"TableName":"owned","SSESpecification":specification}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(body, json!({"TableDescription":description}));
+            assert_eq!(*calls.lock().unwrap(), ["DescribeTable"]);
+            pool.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_encryption_combined_update_checks_current_security_then_runs_real_update() {
+        let updated = json!({"TableDescription":{"TableName":"owned","TableStatus":"ACTIVE","DeletionProtectionEnabled":true}});
+        let (pool, calls) = scripted_pool(vec![
+            (
+                "DescribeTable",
+                (
+                    200,
+                    json!({"Table":{"TableName":"owned","TableStatus":"ACTIVE"}}),
+                ),
+            ),
+            ("UpdateTable", (200, updated.clone())),
+        ]);
+        let result=pool.query("000000000000","us-east-1","UpdateTable".into(),json!({"TableName":"owned","SSESpecification":{"Enabled":false},"DeletionProtectionEnabled":true})).await.unwrap();
+        assert_eq!(result, (200, updated));
+        assert_eq!(*calls.lock().unwrap(), ["DescribeTable", "UpdateTable"]);
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owned_encryption_update_never_claims_a_missing_inactive_or_customer_key_table() {
+        for (status, source, expected) in [
+            (
+                400,
+                json!({"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"missing"}),
+                "ResourceNotFoundException",
+            ),
+            (
+                200,
+                json!({"Table":{"TableName":"owned","TableStatus":"CREATING"}}),
+                "ResourceInUseException",
+            ),
+            (
+                200,
+                json!({"Table":{"TableName":"owned","TableStatus":"ACTIVE","SSEDescription":{"Status":"ENABLED","SSEType":"KMS","KMSMasterKeyArn":"legacy-placeholder"}}}),
+                "ValidationException",
+            ),
+        ] {
+            for combined in [false, true] {
+                let (pool, calls) =
+                    scripted_pool(vec![("DescribeTable", (status, source.clone()))]);
+                let mut body = json!({"TableName":"owned","SSESpecification":{"Enabled":false}});
+                if combined {
+                    body["DeletionProtectionEnabled"] = json!(true);
+                }
+                let (status, result) = pool
+                    .query("000000000000", "us-east-1", "UpdateTable".into(), body)
+                    .await
+                    .unwrap();
+                assert_eq!(status, 400);
+                assert!(result["__type"].as_str().unwrap().ends_with(expected));
+                assert_eq!(*calls.lock().unwrap(), ["DescribeTable"]);
+                pool.shutdown().await;
+            }
+        }
+    }
 
     #[test]
     fn engine_selection_cannot_hide_existing_data() {

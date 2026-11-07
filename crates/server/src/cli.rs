@@ -1,6 +1,8 @@
 //! Command-line parsing. Configuration comes from environment variables; arguments only
 //! select what the process does, so help and version never open state or start services.
 
+use locallycloud_dynamodb::migration::MigrationPolicy;
+
 pub const USAGE: &str = "\
 Usage: locallycloud [COMMAND]
 
@@ -11,6 +13,8 @@ Commands:
   migrate-s3-encryption   Encrypt S3 object bodies stored by an earlier version, then exit
   migrate-dynamodb --dry-run  Inspect native DynamoDB migration blockers
   migrate-dynamodb --apply    Verify and migrate supported native DynamoDB state offline
+    --normalize-legacy-aes256  Explicitly replace legacy AES256 SSE metadata with the
+                               default-owned descriptor; SQLCipher encrypts storage, no KMS migration
   runtime <COMMAND>      Install and manage only the Lambda runtimes you use
   component <COMMAND>    Install optional native service components
 
@@ -28,7 +32,7 @@ pub enum Command {
     OciSetupGate(String),
     MigrateS3Encryption,
     InspectDynamoDbMigration,
-    ApplyDynamoDbMigration,
+    ApplyDynamoDbMigration(MigrationPolicy),
     Help,
     Version,
     Runtime(crate::runtime_manager::Options),
@@ -39,7 +43,20 @@ pub fn parse(arguments: &[String]) -> Result<Command, String> {
     match arguments {
         [group, rest @ ..] if group == "migrate-dynamodb" => match rest {
             [flag] if flag == "--dry-run" => Ok(Command::InspectDynamoDbMigration),
-            [flag] if flag == "--apply" => Ok(Command::ApplyDynamoDbMigration),
+            [flag] if flag == "--apply" => {
+                Ok(Command::ApplyDynamoDbMigration(MigrationPolicy::Preserve))
+            }
+            [first, second]
+                if matches!(
+                    (first.as_str(), second.as_str()),
+                    ("--apply", "--normalize-legacy-aes256")
+                        | ("--normalize-legacy-aes256", "--apply")
+                ) =>
+            {
+                Ok(Command::ApplyDynamoDbMigration(
+                    MigrationPolicy::NormalizeLegacyAes256,
+                ))
+            }
             _ => Err("migrate-dynamodb requires exactly one of --dry-run or --apply".into()),
         },
         [group, rest @ ..] if group == "component" => {
@@ -67,7 +84,7 @@ pub fn parse(arguments: &[String]) -> Result<Command, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Command};
+    use super::{parse, Command, MigrationPolicy};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -100,11 +117,24 @@ mod tests {
         );
         assert_eq!(
             parse(&args(&["migrate-dynamodb", "--apply"])),
-            Ok(Command::ApplyDynamoDbMigration)
+            Ok(Command::ApplyDynamoDbMigration(MigrationPolicy::Preserve))
         );
+        for flags in [
+            ["--apply", "--normalize-legacy-aes256"],
+            ["--normalize-legacy-aes256", "--apply"],
+        ] {
+            assert_eq!(
+                parse(&args(&["migrate-dynamodb", flags[0], flags[1]])),
+                Ok(Command::ApplyDynamoDbMigration(
+                    MigrationPolicy::NormalizeLegacyAes256
+                ))
+            );
+        }
         for values in [
             vec!["migrate-dynamodb"],
             vec!["migrate-dynamodb", "--dry-run", "--apply"],
+            vec!["migrate-dynamodb", "--normalize-legacy-aes256"],
+            vec!["migrate-dynamodb", "--dry-run", "--normalize-legacy-aes256"],
         ] {
             assert!(parse(&args(&values)).is_err());
         }

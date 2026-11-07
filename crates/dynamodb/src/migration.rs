@@ -12,7 +12,10 @@ use crate::store::{StoredKey, StreamRecord, TableData};
 
 #[path = "migration_export.rs"]
 mod export;
-pub use export::{export_native, export_native_recovery, NativeRecord};
+pub use export::{
+    export_native, export_native_recovery, export_native_recovery_with_policy,
+    export_native_with_policy, MigrationPolicy, NativeRecord,
+};
 
 const MAX_RECORD: i64 = 8 * 1024 * 1024;
 const KNOWN_TABLES: &[&str] = &[
@@ -51,6 +54,8 @@ pub struct TableInspection {
     pub replication_versions: u64,
     pub tag_count: usize,
     pub ttl_configured: bool,
+    pub sse_type: Option<String>,
+    pub proposed_normalization: Option<&'static str>,
     pub secondary_indexes: usize,
     pub blocking_features: Vec<BlockingFeature>,
 }
@@ -455,6 +460,9 @@ fn inspect_snapshot_with_binding(
             replication_versions,
             tag_count: data.tags.len(),
             ttl_configured: data.ttl_attribute.is_some(),
+            proposed_normalization: (data.def.sse_type.as_deref() == Some("AES256")).then_some(
+                "Explicit opt-in replaces legacy AES256 SSE metadata with the default-owned descriptor; SQLCipher encrypts destination storage; KMS is not migrated"),
+            sse_type: data.def.sse_type.clone(),
             secondary_indexes: data.def.indexes.len(),
             blocking_features,
         })?;
@@ -835,6 +843,7 @@ mod tests {
             create,
             tags,
             ttl_attribute,
+            normalized_legacy_aes256,
             item_count,
         } = &records[0]
         else {
@@ -846,6 +855,7 @@ mod tests {
         );
         assert_eq!(*item_count, 1);
         assert_eq!(*ttl_attribute, None);
+        assert!(!*normalized_legacy_aes256);
         assert_eq!(*tags, json!([{"Key":"owner","Value":"synthetic"}]));
         assert_eq!(
             create["ProvisionedThroughput"],
@@ -1136,5 +1146,138 @@ mod tests {
             assert_eq!(summary.item_count, 1);
             assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn legacy_aes256_requires_opt_in_and_reports_metadata_normalization_without_source_changes() {
+        let fixture = Fixture::new();
+        fixture.table("aaa-plain", false, |_| {});
+        fixture.table("zzz-legacy", true, |_| {});
+        let cipher = StateCipher::with_key(&[7; 32]);
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        let mut calls = 0;
+        assert!(export_native(fixture.state.path(), &cipher, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
+        assert!(export_native_with_policy(
+            fixture.state.path(),
+            &StateCipher::with_key(&[8; 32]),
+            MigrationPolicy::NormalizeLegacyAes256,
+            |_| {
+                calls += 1;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(calls, 0);
+        let mut normalized = 0;
+        let mut items = 0;
+        let summary = export_native_with_policy(
+            fixture.state.path(),
+            &cipher,
+            MigrationPolicy::NormalizeLegacyAes256,
+            |record| {
+                match record {
+                    NativeRecord::Table {
+                        table,
+                        create,
+                        normalized_legacy_aes256,
+                        ..
+                    } => {
+                        assert_eq!(normalized_legacy_aes256, table == "zzz-legacy");
+                        if normalized_legacy_aes256 {
+                            normalized += 1;
+                        }
+                        assert!(create.get("SSESpecification").is_none());
+                    }
+                    NativeRecord::Item { .. } => items += 1,
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(normalized, 1);
+        assert_eq!(items, 2);
+        assert!(summary.source_key_authenticated);
+        let mut found = false;
+        inspect_native(fixture.state.path(), &cipher, |table| {
+            if table.table == "zzz-legacy" {
+                assert_eq!(table.sse_type.as_deref(), Some("AES256"));
+                assert!(table
+                    .proposed_normalization
+                    .unwrap()
+                    .contains("Explicit opt-in"));
+                assert!(table
+                    .blocking_features
+                    .iter()
+                    .any(|feature| matches!(feature, BlockingFeature::ServerSideEncryption)));
+                found = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(found);
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn normalization_never_accepts_kms_unknown_types_or_other_unsupported_features() {
+        for kind in ["KMS", "FUTURE", "AES256-with-pitr"] {
+            let fixture = Fixture::new();
+            fixture.table("aaa-plain", false, |_| {});
+            fixture.table("zzz-blocked", true, |metadata| match kind {
+                "AES256-with-pitr" => metadata["pitr_enabled"] = json!(true),
+                _ => metadata["def"]["sse_type"] = json!(kind),
+            });
+            let cipher = StateCipher::with_key(&[7; 32]);
+            let before = std::fs::read(fixture.state.path()).unwrap();
+            let mut calls = 0;
+            assert!(
+                export_native_with_policy(
+                    fixture.state.path(),
+                    &cipher,
+                    MigrationPolicy::NormalizeLegacyAes256,
+                    |_| {
+                        calls += 1;
+                        Ok(())
+                    }
+                )
+                .is_err(),
+                "{kind}"
+            );
+            assert_eq!(calls, 0, "{kind}");
+            assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn committed_legacy_aes256_recovery_also_requires_explicit_normalization() {
+        let fixture = Fixture::new();
+        fixture.table("orders", true, |_| {});
+        fixture.state.connection().unwrap().execute_batch("CREATE TABLE locallycloud_service_engines(service TEXT PRIMARY KEY,engine TEXT); INSERT INTO locallycloud_service_engines VALUES('dynamodb','extenddb');").unwrap();
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        let cipher = StateCipher::with_key(&[7; 32]);
+        let mut calls = 0;
+        assert!(export_native_recovery(fixture.state.path(), &cipher, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
+        export_native_recovery_with_policy(
+            fixture.state.path(),
+            &cipher,
+            MigrationPolicy::NormalizeLegacyAes256,
+            |_| {
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
     }
 }
