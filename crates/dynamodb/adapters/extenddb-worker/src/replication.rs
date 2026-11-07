@@ -923,3 +923,290 @@ impl MutationHook for Replication {
         })
     }
 }
+
+#[cfg(test)]
+mod pitr_tests {
+    use super::*;
+    use extenddb_core::expression::ExpressionMaps;
+    use extenddb_core::types::CreateTableInput;
+    use extenddb_storage::bootstrapper::Bootstrapper;
+    use extenddb_storage::management_store::ManagementStore;
+    use extenddb_storage::DataEngine;
+    use extenddb_storage_sqlite::{SqliteBootstrapper, SqliteCatalogStore};
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::{Path, PathBuf};
+
+    const ACCOUNT: &str = "000000000000";
+    const TABLE: &str = "replicated-history";
+    const GLOBAL: &str = "replicated-history-generation";
+    const A: &str = "us-east-1";
+    const B: &str = "us-east-2";
+    const DAY_US: i64 = 86_400_000_000;
+
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "worker-mrec-pitr-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn open(path: &Path, region: &str) -> (SqliteEngine, Arc<Replication>) {
+        let path = path.to_str().unwrap();
+        let bootstrap = SqliteBootstrapper::new(path);
+        if !bootstrap.is_catalog_initialized().await.unwrap() {
+            bootstrap.run_catalog_migrations().await.unwrap();
+            bootstrap.bootstrap_encryption_key().await.unwrap();
+            bootstrap.bootstrap_default_account().await.unwrap();
+        }
+        let engine = SqliteEngine::new(path, 1, region, 409_600).await.unwrap();
+        let replication = Replication::open(path, ACCOUNT, region).await.unwrap();
+        engine.install_mutation_hook(replication.clone()).unwrap();
+        // Bootstrap chooses its default account; production also ensures the explicit worker scope.
+        let catalog = SqliteCatalogStore::new(replication.pool.clone());
+        if catalog.get_account_detail(ACCOUNT).await.unwrap().is_none() {
+            catalog.create_account(ACCOUNT, ACCOUNT).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('control_plane_delay_seconds','0')",
+        )
+        .execute(&replication.pool)
+        .await
+        .unwrap();
+        (engine, replication)
+    }
+
+    async fn table(engine: &SqliteEngine) -> TableKeyInfo {
+        let input: CreateTableInput = serde_json::from_value(serde_json::json!({
+            "TableName":TABLE,"BillingMode":"PAY_PER_REQUEST",
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]
+        }))
+        .unwrap();
+        engine.create_table(ACCOUNT, input).await.unwrap();
+        engine.table_key_info(ACCOUNT, TABLE).await.unwrap()
+    }
+
+    fn item(value: &str) -> Item {
+        serde_json::from_value(serde_json::json!({"pk":{"S":"key"},"payload":{"S":value}})).unwrap()
+    }
+    fn key() -> Item {
+        serde_json::from_value(serde_json::json!({"pk":{"S":"key"}})).unwrap()
+    }
+    fn now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+            .try_into()
+            .unwrap()
+    }
+    async fn history(replication: &Replication) -> (i64, i64) {
+        sqlx::query_as("SELECT COUNT(*),COALESCE(MAX(at_us),0) FROM lc_pitr_versions WHERE table_id=(SELECT table_id FROM tables WHERE account_id=? AND table_name=?)")
+            .bind(ACCOUNT).bind(TABLE).fetch_one(&replication.pool).await.unwrap()
+    }
+    async fn version(replication: &Replication, info: &TableKeyInfo) -> i64 {
+        sqlx::query_scalar("SELECT clock FROM lc_replication_versions WHERE global_id=? AND table_id=? AND item_key=?")
+            .bind(GLOBAL).bind(&info.table_id).bind(key_json(info,&key()).unwrap())
+            .fetch_one(&replication.pool).await.unwrap()
+    }
+    async fn pending(replication: &Replication) -> Delivery {
+        let mut changes = replication.pending_for_target(B, 10).await.unwrap();
+        assert_eq!(changes.len(), 1);
+        changes.remove(0)
+    }
+    async fn put(engine: &SqliteEngine, info: &TableKeyInfo, value: &str) {
+        engine
+            .put_item(
+                info,
+                item(value),
+                false,
+                None,
+                &ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_commit_history_is_atomic_replay_safe_and_survives_reopen() {
+        // This is the worker suite's only database test and owns its normal one-time VFS setup.
+        crate::cipher::install(zeroize::Zeroizing::new([73; 32])).unwrap();
+        let directory = tokio::task::spawn_blocking(Directory::new).await.unwrap();
+        let a_path = directory.0.join("a.sqlite3");
+        let b_path = directory.0.join("b.sqlite3");
+        let (a, source) = open(&a_path, A).await;
+        let (b, receiver) = open(&b_path, B).await;
+        let a_info = table(&a).await;
+        let b_info = table(&b).await;
+        let source_window = a
+            .pitr_configure(ACCOUNT, TABLE, true, Some(35))
+            .await
+            .unwrap();
+        source
+            .configure(TABLE, GLOBAL, vec![A.into(), B.into()])
+            .await
+            .unwrap();
+        receiver
+            .configure(TABLE, GLOBAL, vec![A.into(), B.into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            b.pitr_describe(ACCOUNT, TABLE).await.unwrap()["ContinuousBackupsDescription"]
+                ["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"],
+            "DISABLED"
+        );
+        b.pitr_configure(ACCOUNT, TABLE, true, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            a.pitr_describe(ACCOUNT, TABLE).await.unwrap()["ContinuousBackupsDescription"]
+                ["PointInTimeRecoveryDescription"]["EarliestRestorableDateTime"],
+            source_window["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
+                ["EarliestRestorableDateTime"]
+        );
+        assert_eq!(
+            b.pitr_describe(ACCOUNT, TABLE).await.unwrap()["ContinuousBackupsDescription"]
+                ["PointInTimeRecoveryDescription"]["RecoveryPeriodInDays"],
+            1
+        );
+
+        // MREC's ordering clock may lead wall time; PITR must use the actual local commit time.
+        sqlx::query("UPDATE lc_replication_clock SET clock=? WHERE singleton=1")
+            .bind(now() + DAY_US)
+            .execute(&source.pool)
+            .await
+            .unwrap();
+        put(&a, &a_info, "v1").await;
+        let first = pending(&source).await;
+        let before = now();
+        receiver.apply(&b, first.change.clone()).await.unwrap();
+        let after = now();
+        let first_history = history(&receiver).await;
+        assert_eq!(first_history.0, 1);
+        assert!((before..=after).contains(&first_history.1));
+        assert!(first_history.1 < first.change.clock);
+        assert_eq!(version(&receiver, &b_info).await, first.change.clock);
+        assert_eq!(b.get_item(&b_info, &key()).await.unwrap(), Some(item("v1")));
+        source.acknowledge(first.seq, B).await.unwrap();
+        receiver.apply(&b, first.change.clone()).await.unwrap();
+        assert_eq!(history(&receiver).await, first_history);
+
+        put(&a, &a_info, "v2").await;
+        let second = pending(&source).await;
+        sqlx::query("UPDATE lc_pitr_clock SET last_us=? WHERE singleton=1")
+            .bind(now() + DAY_US)
+            .execute(&receiver.pool)
+            .await
+            .unwrap();
+        assert!(receiver.apply(&b, second.change.clone()).await.is_err());
+        assert_eq!(b.get_item(&b_info, &key()).await.unwrap(), Some(item("v1")));
+        assert_eq!(version(&receiver, &b_info).await, first.change.clock);
+        assert_eq!(history(&receiver).await, first_history);
+        assert_eq!(
+            pending(&source).await.seq,
+            second.seq,
+            "failed receiver commit must not acknowledge source outbox"
+        );
+        sqlx::query("UPDATE lc_pitr_clock SET last_us=? WHERE singleton=1")
+            .bind(first_history.1)
+            .execute(&receiver.pool)
+            .await
+            .unwrap();
+        receiver.pool.close().await;
+        drop(b);
+        drop(receiver);
+        let (b, receiver) = open(&b_path, B).await;
+        assert_eq!(history(&receiver).await, first_history);
+        assert_eq!(
+            b.pitr_describe(ACCOUNT, TABLE).await.unwrap()["ContinuousBackupsDescription"]
+                ["PointInTimeRecoveryDescription"]["RecoveryPeriodInDays"],
+            1
+        );
+        receiver.apply(&b, second.change.clone()).await.unwrap();
+        source.acknowledge(second.seq, B).await.unwrap();
+        assert_eq!(b.get_item(&b_info, &key()).await.unwrap(), Some(item("v2")));
+        let second_history = history(&receiver).await;
+        assert_eq!(second_history.0, 2);
+        receiver.apply(&b, first.change.clone()).await.unwrap();
+        assert_eq!(
+            history(&receiver).await,
+            second_history,
+            "stale LWW delivery cannot append history"
+        );
+
+        put(&a, &a_info, "v2").await;
+        let unchanged = pending(&source).await;
+        receiver.apply(&b, unchanged.change.clone()).await.unwrap();
+        source.acknowledge(unchanged.seq, B).await.unwrap();
+        assert_eq!(version(&receiver, &b_info).await, unchanged.change.clock);
+        assert_eq!(
+            history(&receiver).await,
+            second_history,
+            "higher-version identical image is a PITR no-op"
+        );
+
+        a.delete_item(
+            &a_info,
+            &key(),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let deleted = pending(&source).await;
+        receiver.apply(&b, deleted.change.clone()).await.unwrap();
+        source.acknowledge(deleted.seq, B).await.unwrap();
+        assert_eq!(b.get_item(&b_info, &key()).await.unwrap(), None);
+        assert_eq!(history(&receiver).await.0, 3);
+        receiver.apply(&b, first.change).await.unwrap();
+        assert_eq!(b.get_item(&b_info, &key()).await.unwrap(), None);
+        assert_eq!(history(&receiver).await.0, 3);
+
+        #[allow(clippy::cast_precision_loss)]
+        let at = first_history.1 as f64 / 1_000_000.0;
+        b.pitr_restore(ACCOUNT, TABLE, "regional-restored", Some(at))
+            .await
+            .unwrap();
+        let restored = b
+            .table_key_info(ACCOUNT, "regional-restored")
+            .await
+            .unwrap();
+        assert_eq!(
+            b.get_item(&restored, &key()).await.unwrap(),
+            Some(item("v1"))
+        );
+        assert_eq!(
+            b.pitr_describe(ACCOUNT, "regional-restored").await.unwrap()
+                ["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
+                ["PointInTimeRecoveryStatus"],
+            "DISABLED"
+        );
+        let global: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM lc_replication_topology WHERE table_name='regional-restored')").fetch_one(&receiver.pool).await.unwrap();
+        assert!(!global);
+        assert!(source.pending_for_target(B, 10).await.unwrap().is_empty());
+        receiver.pool.close().await;
+        source.pool.close().await;
+        drop(b);
+        drop(a);
+    }
+}

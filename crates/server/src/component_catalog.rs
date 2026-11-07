@@ -15,6 +15,7 @@ pub(super) const REQUIRED_CAPABILITIES: &[&str] = &[
     "backups-v1",
     "migration-ttl-v1",
     "pitr-history-v1",
+    "pitr-global-v1",
 ];
 
 #[derive(Deserialize)]

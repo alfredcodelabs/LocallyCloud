@@ -646,10 +646,10 @@ index 4621b38..fc4d929 100644
                   WHERE account_id = ? AND table_name = ?",
 diff --git a/crates/storage-sqlite/src/history.rs b/crates/storage-sqlite/src/history.rs
 new file mode 100644
-index 0000000..6541b76
+index 0000000..293c735
 --- /dev/null
 +++ b/crates/storage-sqlite/src/history.rs
-@@ -0,0 +1,1076 @@
+@@ -0,0 +1,1168 @@
 +// Copyright 2026 LocalCloud contributors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -689,7 +689,7 @@ index 0000000..6541b76
 +}
 +fn unsupported() -> StorageError {
 +    StorageError::Unsupported(
-+        "PITR supports only active regional scalar tables with default-owned encryption".into(),
++        "PITR supports only active scalar tables with default-owned encryption".into(),
 +    )
 +}
 +fn unavailable() -> StorageError {
@@ -816,11 +816,25 @@ index 0000000..6541b76
 +        {
 +            return Err(unsupported());
 +        }
-+        let topology:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lc_replication_topology')").fetch_one(&mut **tx).await.map_err(storage)?;
++        Ok(description)
++    }
++
++    async fn history_user_source(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++        account: &str,
++        table: &str,
++    ) -> Result<TableDescription> {
++        let description = self.history_source(tx, account, table).await?;
++        let topology:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lc_replication_topology')")
++            .fetch_one(&mut **tx).await.map_err(storage)?;
 +        if topology {
-+            let global:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM lc_replication_topology WHERE table_name=? AND table_id=?)").bind(table).bind(&description.table_id).fetch_one(&mut **tx).await.map_err(storage)?;
-+            if global {
-+                return Err(unsupported());
++            let busy:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM lc_replication_topology WHERE table_id=? AND frozen=1 UNION ALL SELECT 1 FROM lc_replication_retired WHERE table_id=? UNION ALL SELECT 1 FROM lc_replication_reservations WHERE table_name=?)")
++                .bind(&description.table_id).bind(&description.table_id).bind(table).fetch_one(&mut **tx).await.map_err(storage)?;
++            if busy {
++                return Err(StorageError::IndexesInUse(
++                    "Replica lifecycle operation is in progress".into(),
++                ));
 +            }
 +        }
 +        Ok(description)
@@ -948,7 +962,7 @@ index 0000000..6541b76
 +                .begin_with("BEGIN IMMEDIATE")
 +                .await
 +                .map_err(storage)?;
-+            let description = self.history_source(&mut tx, account, table).await?;
++            let description = self.history_user_source(&mut tx, account, table).await?;
 +            let old = window(&mut tx, &description.table_id).await?;
 +            let days = days
 +                .map(i64::from)
@@ -1040,7 +1054,7 @@ index 0000000..6541b76
 +            if exists {
 +                return Err(StorageError::TableAlreadyExists(target.into()));
 +            }
-+            let description = self.history_source(&mut tx, account, source).await?;
++            let description = self.history_user_source(&mut tx, account, source).await?;
 +            let window = window(&mut tx, &description.table_id)
 +                .await?
 +                .filter(|w| w.enabled)
@@ -1588,6 +1602,84 @@ index 0000000..6541b76
 +            .pitr_configure(ACCOUNT, "deletion-source", true, Some(1))
 +            .await
 +            .unwrap();
++        sqlx::raw_sql("CREATE TABLE lc_replication_topology(table_id TEXT PRIMARY KEY,frozen INTEGER NOT NULL); CREATE TABLE lc_replication_reservations(table_name TEXT PRIMARY KEY); CREATE TABLE lc_replication_retired(table_id TEXT PRIMARY KEY);")
++            .execute(&engine.pool).await.unwrap();
++        sqlx::query("INSERT INTO lc_replication_topology VALUES(?,0)")
++            .bind(&info.table_id)
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        // A ready replica keeps its existing local history and can configure independently.
++        engine
++            .pitr_configure(ACCOUNT, "deletion-source", true, Some(1))
++            .await
++            .unwrap();
++        sqlx::query("INSERT INTO lc_replication_reservations VALUES('deletion-source')")
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        assert!(
++            engine
++                .pitr_configure(ACCOUNT, "deletion-source", false, None)
++                .await
++                .is_err()
++        );
++        assert!(
++            engine
++                .pitr_restore(ACCOUNT, "deletion-source", "reserved-target", None)
++                .await
++                .is_err()
++        );
++        sqlx::query("DELETE FROM lc_replication_reservations")
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        sqlx::query("UPDATE lc_replication_topology SET frozen=1")
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        assert!(
++            engine
++                .pitr_configure(ACCOUNT, "deletion-source", false, None)
++                .await
++                .is_err()
++        );
++        assert!(
++            engine
++                .pitr_restore(ACCOUNT, "deletion-source", "frozen-target", None)
++                .await
++                .is_err()
++        );
++        sqlx::query("UPDATE lc_replication_topology SET frozen=0")
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        sqlx::query("INSERT INTO lc_replication_retired VALUES(?)")
++            .bind(&info.table_id)
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        assert!(
++            engine
++                .pitr_configure(ACCOUNT, "deletion-source", false, None)
++                .await
++                .is_err()
++        );
++        assert!(
++            engine
++                .pitr_restore(ACCOUNT, "deletion-source", "retired-target", None)
++                .await
++                .is_err()
++        );
++        sqlx::query("DELETE FROM lc_replication_retired")
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        sqlx::query("UPDATE lc_replication_topology SET frozen=1")
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        // Deletion must still snapshot a frozen retiring replica in its own transaction.
 +        let input: DeleteTableInput =
 +            serde_json::from_value(json!({"TableName":"deletion-source"})).unwrap();
 +        engine.delete_table_impl(ACCOUNT, input).await.unwrap();

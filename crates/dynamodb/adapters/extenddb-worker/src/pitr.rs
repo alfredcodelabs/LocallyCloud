@@ -220,23 +220,6 @@ pub async fn dispatch(
     }
 }
 
-pub async fn guard_global_configuration(
-    body: &Value,
-    context: &OperationContext,
-    sqlite: &SqliteEngine,
-) -> std::result::Result<(), StorageError> {
-    let table = body
-        .get("TableName")
-        .and_then(Value::as_str)
-        .ok_or_else(|| StorageError::Validation("TableName is required".into()))?;
-    let description = sqlite.pitr_describe(&context.account_id, table).await?;
-    match description.pointer("/ContinuousBackupsDescription/PointInTimeRecoveryDescription/PointInTimeRecoveryStatus").and_then(Value::as_str) {
-        Some("DISABLED")=>Ok(()),
-        Some("ENABLED")=>Err(StorageError::Validation("PITR enabled sources cannot join a global table until recovery settings are synchronized".into())),
-        _=>Err(StorageError::Internal("PITR state is unavailable".into())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

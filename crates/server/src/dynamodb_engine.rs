@@ -888,17 +888,11 @@ mod tests {
     }
 
     #[test]
-    fn worker_mode_handshake_requires_exact_mode_and_migration_capability() {
-        let mut features = component_catalog::REQUIRED_CAPABILITIES
+    fn worker_mode_handshake_requires_exact_mode_and_all_capabilities() {
+        let features = component_catalog::REQUIRED_CAPABILITIES
             .iter()
             .map(|feature| json!(feature))
             .collect::<Vec<_>>();
-        if !features
-            .iter()
-            .any(|feature| feature.as_str() == Some("migration-ttl-v1"))
-        {
-            features.push(json!("migration-ttl-v1"));
-        }
         for mode in [WorkerMode::Normal, WorkerMode::Migration] {
             let mut ready =
                 json!({"ready":true,"version":1,"mode":mode.as_str(),"features":features});
@@ -911,10 +905,21 @@ mod tests {
             ready.as_object_mut().unwrap().remove("mode");
             assert!(!ready_for_mode(&ready, mode));
         }
-        features.retain(|feature| feature.as_str() != Some("migration-ttl-v1"));
-        assert!(!ready_for_mode(
-            &json!({"ready":true,"version":1,"mode":"migration","features":features}),
-            WorkerMode::Migration
-        ));
+        for required in component_catalog::REQUIRED_CAPABILITIES {
+            let missing = features
+                .iter()
+                .filter(|feature| feature.as_str() != Some(*required))
+                .cloned()
+                .collect::<Vec<_>>();
+            for mode in [WorkerMode::Normal, WorkerMode::Migration] {
+                assert!(
+                    !ready_for_mode(
+                        &json!({"ready":true,"version":1,"mode":mode.as_str(),"features":missing}),
+                        mode
+                    ),
+                    "must reject a worker missing {required}"
+                );
+            }
+        }
     }
 }

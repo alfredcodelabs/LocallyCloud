@@ -428,7 +428,7 @@ impl Coordinator {
             };
             for name in names {
                 match self.metadata.get(&request.account_id, &name).await {
-                    Ok(Some(global)) if matches!(&global.phase,Phase::Creating{target,..}|Phase::Deleting{target,..} if target==&request.region) => {
+                    Ok(Some(global)) if replica_transitioning(&global, &request.region) => {
                         return DdbError::ResourceInUse(
                             "replica is not writable while its lifecycle operation is in progress"
                                 .into(),
@@ -519,9 +519,9 @@ impl Coordinator {
                 }
             };
             match self.metadata.get(&request.account_id, &source).await {
-                Ok(Some(global)) if global.regions.contains(&request.region) => {
-                    return DdbError::Validation(
-                        "PITR restore from global-table members is not supported".into(),
+                Ok(Some(global)) if replica_transitioning(&global, &request.region) => {
+                    return DdbError::ResourceInUse(
+                        "PITR source replica is not ready while its lifecycle operation is in progress".into(),
                     )
                     .into_response(&request.request_id)
                 }
@@ -552,10 +552,10 @@ impl Coordinator {
             "UpdateContinuousBackups"
                 if global
                     .as_ref()
-                    .is_some_and(|global| global.regions.contains(&request.region)) =>
+                    .is_some_and(|global| replica_transitioning(global, &request.region)) =>
             {
-                Err(DdbError::Validation(
-                    "PITR configuration for global-table members is not supported".into(),
+                Err(DdbError::ResourceInUse(
+                    "PITR replica is not ready while its lifecycle operation is in progress".into(),
                 ))
             }
             "UpdateTimeToLive"
@@ -748,23 +748,6 @@ impl Coordinator {
             != Some("DISABLED")
         {
             return Err(DdbError::Validation("TTL-enabled sources require synchronized replica settings; this integration is not yet supported".into()));
-        }
-        if action == "Create" {
-            let (status, pitr) = self
-                .rpc(
-                    &request.account_id,
-                    &request.region,
-                    "DescribeContinuousBackups",
-                    json!({"TableName":name}),
-                )
-                .await
-                .map_err(DdbError::Internal)?;
-            if status != 200 {
-                return Err(DdbError::Internal(
-                    "could not verify source PITR configuration".into(),
-                ));
-            }
-            require_pitr_disabled(&pitr)?;
         }
         let mut global = match global {
             Some(global) => global,
@@ -1427,12 +1410,8 @@ fn operation(request: &ServiceRequest) -> Option<String> {
         .split_once('.')
         .map(|(_, op)| op.to_owned())
 }
-fn require_pitr_disabled(description: &Value) -> Result<(), DdbError> {
-    match description.pointer("/ContinuousBackupsDescription/PointInTimeRecoveryDescription/PointInTimeRecoveryStatus").and_then(Value::as_str) {
-        Some("DISABLED")=>Ok(()),
-        Some("ENABLED")=>Err(DdbError::Validation("PITR-enabled sources cannot join a global table until recovery settings are synchronized".into())),
-        _=>Err(DdbError::Internal("source PITR state is unavailable".into())),
-    }
+fn replica_transitioning(global: &Global, region: &str) -> bool {
+    matches!(&global.phase, Phase::Creating { target, .. } | Phase::Deleting { target, .. } if target == region)
 }
 
 fn table_name(body: &Value) -> Option<String> {
@@ -1795,12 +1774,5 @@ mod tests {
             assert!(schema[field][0].get("IndexStatus").is_none());
         }
         assert_eq!(schema["VectorIndexes"][0]["Dimensions"], 3);
-    }
-
-    #[test]
-    fn replica_admission_requires_verified_disabled_pitr_not_missing_or_enabled_metadata() {
-        assert!(require_pitr_disabled(&json!({"ContinuousBackupsDescription":{"PointInTimeRecoveryDescription":{"PointInTimeRecoveryStatus":"DISABLED"}}})).is_ok());
-        assert!(require_pitr_disabled(&json!({"ContinuousBackupsDescription":{"PointInTimeRecoveryDescription":{"PointInTimeRecoveryStatus":"ENABLED"}}})).is_err());
-        assert!(require_pitr_disabled(&json!({})).is_err());
     }
 }
