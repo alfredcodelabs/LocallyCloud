@@ -86,7 +86,7 @@ def artifact(path):
 
 catalog = {
     'schema':1, 'component':'extenddb', 'protocol':1, 'version':version,
-    'capabilities':['stream-cursors-v1', 'mrec-outbox-v1', 'backups-v1'],
+    'capabilities':['stream-cursors-v1', 'mrec-outbox-v1', 'backups-v1', 'migration-ttl-v1'],
     'upstream': json.loads((work / 'source/prepared.json').read_text()),
     'artifacts':[{'architecture':arch, 'binary':artifact(output / name),
                   'notices':artifact(output / f'{name}.LICENSES.txt')}],

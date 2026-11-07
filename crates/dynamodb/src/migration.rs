@@ -873,7 +873,8 @@ mod tests {
     #[test]
     fn export_rejects_late_unsupported_metadata_before_first_record() {
         for feature in [
-            "ttl",
+            "invalid-ttl",
+            "unsupported-ttl",
             "warm",
             "nested",
             "sse",
@@ -883,7 +884,8 @@ mod tests {
             let fixture = Fixture::new();
             fixture.table("aaa-plain", false, |_| {});
             fixture.table("zzz-blocked", feature == "sse", |metadata| match feature {
-                "ttl" => metadata["ttl_attribute"] = json!("expires"),
+                "invalid-ttl" => metadata["ttl_attribute"] = json!(""),
+                "unsupported-ttl" => metadata["ttl_attribute"] = json!("expires:mañana"),
                 "warm" => metadata["def"]["warm_throughput"] = json!({"read":24000,"write":4000}),
                 "nested" => metadata["def"]["key_schema"][0]["future_semantics"] = json!(true),
                 _ => {}
@@ -1084,5 +1086,55 @@ mod tests {
             )
             .unwrap();
         assert!(engine_binding(fixture.state.path()).is_err());
+    }
+
+    #[test]
+    fn export_preserves_enabled_and_disabled_ttl_without_reaping_expired_items() {
+        for enabled in [false, true] {
+            let fixture = Fixture::new();
+            fixture.table("orders", false, |metadata| {
+                if enabled {
+                    metadata["ttl_attribute"] = json!("expires");
+                }
+            });
+            let item = crate::value::item_from_json(&json!({"pk":{"S":"row"},"expires":{"N":"1"}}))
+                .unwrap();
+            fixture
+                .state
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE dynamodb_items SET item=?1",
+                    [serde_json::to_string(&item).unwrap()],
+                )
+                .unwrap();
+            let before = std::fs::read(fixture.state.path()).unwrap();
+            let mut metadata_seen = false;
+            let mut expired_seen = false;
+            let summary = export_native(
+                fixture.state.path(),
+                &StateCipher::with_key(&[7; 32]),
+                |record| {
+                    match record {
+                        NativeRecord::Table { ttl_attribute, .. } => {
+                            assert_eq!(
+                                ttl_attribute.as_deref(),
+                                if enabled { Some("expires") } else { None }
+                            );
+                            metadata_seen = true;
+                        }
+                        NativeRecord::Item { item, .. } => {
+                            assert_eq!(item["expires"], json!({"N":"1"}));
+                            expired_seen = true;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(metadata_seen && expired_seen);
+            assert_eq!(summary.item_count, 1);
+            assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+        }
     }
 }

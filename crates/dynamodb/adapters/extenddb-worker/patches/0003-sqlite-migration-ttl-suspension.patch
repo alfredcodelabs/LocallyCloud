@@ -1,0 +1,76 @@
+diff --git a/crates/storage/src/server_components.rs b/crates/storage/src/server_components.rs
+--- a/crates/storage/src/server_components.rs
++++ b/crates/storage/src/server_components.rs
+@@ -95,6 +95,10 @@
+     /// Backends whose bootstrap requires operator input ignore this and fail
+     /// as usual; backends with a self-contained bootstrap (SQLite) honor it.
+     pub bootstrap_if_uninitialized: bool,
++    /// Keep enabled TTL metadata/indexes while omitting the expiration worker.
++    /// SQLite embedding consumers use this only for offline import/verification;
++    /// normal server creation leaves it false and starts ordinary TTL cleanup.
++    pub suspend_ttl_expiration: bool,
+ }
+ 
+ /// Factory function type for creating server components.
+diff --git a/crates/storage-sqlite/src/lib.rs b/crates/storage-sqlite/src/lib.rs
+--- a/crates/storage-sqlite/src/lib.rs
++++ b/crates/storage-sqlite/src/lib.rs
+@@ -332,6 +332,7 @@
+         let runtime_hooks = Box::new(SqliteRuntimeHooks {
+             engine: engine.clone(),
+             control_plane_notify,
++            suspend_ttl_expiration: options.suspend_ttl_expiration,
+         });
+ 
+         Ok(ServerComponents {
+diff --git a/crates/storage-sqlite/src/hooks.rs b/crates/storage-sqlite/src/hooks.rs
+--- a/crates/storage-sqlite/src/hooks.rs
++++ b/crates/storage-sqlite/src/hooks.rs
+@@ -16,6 +16,7 @@
+ pub(crate) struct SqliteRuntimeHooks {
+     pub(crate) engine: Arc<SqliteEngine>,
+     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
++    pub(crate) suspend_ttl_expiration: bool,
+ }
+ 
+ #[async_trait]
+@@ -51,12 +52,6 @@
+             workers::idempotency_token_cleanup_worker(engine, metrics, token).await;
+         });
+ 
+-        let engine = self.engine.clone();
+-        let metrics = ctx.metrics.clone();
+-        let token = ctx.shutdown.clone();
+-        let ttl_cleanup =
+-            tokio::spawn(async move { workers::ttl_cleanup_worker(engine, metrics, token).await });
+-
+         // GSI propagation: drain gsi_pending after each write / on a sweep.
+         let engine = self.engine.clone();
+         let gsi_notify = engine.gsi_notify();
+@@ -73,15 +68,23 @@
+             workers::poll_index_propagation_delay(catalog_store, index_delay_cache, token).await;
+         });
+ 
+-        vec![
++        let mut handles = vec![
+             control_plane,
+             table_size,
+             stream_cleanup,
+             idempotency_cleanup,
+-            ttl_cleanup,
+             gsi_propagation,
+             gsi_delay,
+-        ]
++        ];
++        if !self.suspend_ttl_expiration {
++            let engine = self.engine.clone();
++            let metrics = ctx.metrics.clone();
++            let token = ctx.shutdown.clone();
++            handles.push(tokio::spawn(async move {
++                workers::ttl_cleanup_worker(engine, metrics, token).await;
++            }));
++        }
++        handles
+     }
+ 
+     fn backend_info(&self) -> Option<String> {

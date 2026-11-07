@@ -16,7 +16,7 @@ use extenddb_storage::bootstrapper::Bootstrapper;
 use extenddb_storage::hooks::{CancellationToken, WorkerContext};
 use extenddb_storage::server_components::ServerComponentsOptions;
 use extenddb_storage_sqlite::{SqliteBootstrapper, SqliteConfig};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{ConnectOptions, Connection};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -24,6 +24,56 @@ use tracing_subscriber::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
+
+const FEATURES: &[&str] = &[
+    "stream-cursors-v1",
+    "mrec-outbox-v1",
+    "backups-v1",
+    "migration-ttl-v1",
+];
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WorkerMode {
+    #[default]
+    Normal,
+    Migration,
+}
+
+fn capabilities() -> Value {
+    json!({"version":1,"features":FEATURES})
+}
+
+fn ready(mode: WorkerMode) -> Value {
+    json!({"version":1,"ready":true,"features":FEATURES,"mode":mode})
+}
+
+fn runtime_options(mode: WorkerMode) -> ServerComponentsOptions {
+    let mut options = ServerComponentsOptions::default();
+    options.suspend_ttl_expiration = mode == WorkerMode::Migration;
+    options
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    Run,
+    Version,
+    Help,
+    Capabilities,
+}
+
+fn cli(arguments: &[String]) -> Result<CliCommand, &'static str> {
+    match arguments {
+        [] => Ok(CliCommand::Run),
+        [argument] => match argument.as_str() {
+            "--version" => Ok(CliCommand::Version),
+            "--help" => Ok(CliCommand::Help),
+            "--capabilities" => Ok(CliCommand::Capabilities),
+            _ => Err("unsupported argument"),
+        },
+        _ => Err("unsupported arguments"),
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +83,8 @@ struct Initialize {
     database: String,
     account_id: String,
     region: String,
+    #[serde(default)]
+    mode: WorkerMode,
 }
 
 impl Drop for Initialize {
@@ -205,7 +257,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let components = extenddb_storage::create_server_components(
         &config,
         &init.region,
-        ServerComponentsOptions::default(),
+        runtime_options(init.mode),
     )
     .await?;
     let engine: Arc<dyn std::any::Any + Send + Sync> = components.engine.clone();
@@ -259,11 +311,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
     };
-    write_frame(
-        &mut writer,
-        &json!({"version":1,"ready":true,"features":["stream-cursors-v1","mrec-outbox-v1","backups-v1"]}),
-    )
-    .await?;
+    write_frame(&mut writer, &ready(init.mode)).await?;
     let result: Result<(), Box<dyn std::error::Error>> = async {
         loop {
             let frame = tokio::select! {
@@ -358,20 +406,24 @@ fn main() {
             std::process::exit(1);
         }
     }
-    match std::env::args().nth(1).as_deref() {
-        Some("--version") => {
+    match cli(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(CliCommand::Version) => {
             println!("locallycloud-extenddb-worker 0.1.0 (ExtendDB 0.1.14 + mutation hook 1; protocol 1)");
             return;
         }
-        Some("--help") => {
+        Ok(CliCommand::Help) => {
             println!("Private LocalCloud ExtendDB worker. Receives initialization and requests over stdin; responses over stdout. No listening sockets.");
             return;
         }
-        Some(_) => {
-            eprintln!("unsupported argument");
+        Ok(CliCommand::Capabilities) => {
+            println!("{}", capabilities());
+            return;
+        }
+        Ok(CliCommand::Run) => {}
+        Err(message) => {
+            eprintln!("{message}");
             std::process::exit(2);
         }
-        None => {}
     }
     // SAFETY: main has not started threads; restrict created database sidecars.
     unsafe {
@@ -427,6 +479,7 @@ mod tests {
             database: "/tmp/test.sqlite".to_owned(),
             account_id: "000000000000".to_owned(),
             region: "us-east-1".to_owned(),
+            mode: WorkerMode::Normal,
         };
         assert!(validate_initialize(&init).is_ok());
         init.database = "/tmp/test.sqlite?mode=memory".to_owned();
@@ -434,5 +487,43 @@ mod tests {
         init.database = "/tmp/test.sqlite".to_owned();
         init.account_id = "../other".to_owned();
         assert!(validate_initialize(&init).is_err());
+    }
+
+    #[test]
+    fn migration_is_explicit_and_controls_only_ttl_runtime_option() {
+        let mut value = json!({"version":1,"key":"not-used","database":"/not/opened.sqlite3","account_id":"000000000000","region":"us-east-1"});
+        let default: Initialize = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(default.mode, WorkerMode::Normal);
+        assert!(!runtime_options(default.mode).suspend_ttl_expiration);
+        value["mode"] = json!("migration");
+        let migration: Initialize = serde_json::from_value(value.clone()).unwrap();
+        let options = runtime_options(migration.mode);
+        assert!(options.suspend_ttl_expiration);
+        assert!(!options.bootstrap_if_uninitialized);
+        assert_eq!(ready(migration.mode)["mode"], "migration");
+        assert_eq!(ready(default.mode)["mode"], "normal");
+        value["mode"] = json!("pretend-migration");
+        assert!(serde_json::from_value::<Initialize>(value.clone()).is_err());
+        value["mode"] = Value::Null;
+        assert!(serde_json::from_value::<Initialize>(value).is_err());
+    }
+
+    #[test]
+    fn capabilities_are_static_bounded_and_match_ready_features() {
+        let value = capabilities();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["features"], ready(WorkerMode::Migration)["features"]);
+        assert!(value["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feature| feature == "migration-ttl-v1"));
+        assert!(serde_json::to_vec(&value).unwrap().len() < 4096);
+        assert_eq!(
+            cli(&["--capabilities".into()]),
+            Ok(CliCommand::Capabilities)
+        );
+        assert!(cli(&["--capabilities".into(), "extra".into()]).is_err());
+        assert!(cli(&["--unknown".into()]).is_err());
     }
 }

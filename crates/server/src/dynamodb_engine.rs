@@ -110,8 +110,29 @@ impl NativeHandler for ExtendDb {
     }
 }
 
-pub(crate) struct WorkerPool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerMode {
+    Normal,
+    Migration,
+}
+
+impl WorkerMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Migration => "migration",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorkerLaunch {
     components: PathBuf,
+    mode: WorkerMode,
+}
+
+pub(crate) struct WorkerPool {
+    launch: WorkerLaunch,
     data: PathBuf,
     key: Arc<Zeroizing<String>>,
     workers: Mutex<HashMap<(String, String), WorkerTask>>,
@@ -226,12 +247,30 @@ impl WorkerPool {
         data: PathBuf,
         notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
     ) -> io::Result<Self> {
+        Self::with_mode(data, notifier, WorkerMode::Normal)
+    }
+
+    pub(crate) fn for_migration(
+        data: PathBuf,
+        notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
+    ) -> io::Result<Self> {
+        Self::with_mode(data, notifier, WorkerMode::Migration)
+    }
+
+    fn with_mode(
+        data: PathBuf,
+        notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
+        mode: WorkerMode,
+    ) -> io::Result<Self> {
         let key = std::env::var("LOCALLYCLOUD_KMS_MASTER_KEY")
             .map_err(|_| io::Error::other("LOCALLYCLOUD_KMS_MASTER_KEY is required"))?;
         // Validate before ever passing key material to the private worker.
         locallycloud_state::StateCipher::from_env().map_err(io::Error::other)?;
         Ok(Self {
-            components: component_manager::directory()?,
+            launch: WorkerLaunch {
+                components: component_manager::directory()?,
+                mode,
+            },
             data,
             key: Arc::new(Zeroizing::new(key)),
             workers: Mutex::new(HashMap::new()),
@@ -262,7 +301,7 @@ impl WorkerPool {
         let (sender, receiver) = mpsc::channel(8);
         let database = self.data.join(account).join(format!("{region}.sqlite3"));
         let task = tokio::spawn(serve_worker(
-            self.components.clone(),
+            self.launch.clone(),
             database,
             scope.clone(),
             self.key.clone(),
@@ -348,14 +387,35 @@ async fn frame(output: &mut BufReader<ChildStdout>) -> io::Result<Value> {
     }
 }
 
+fn ready_for_mode(ready: &Value, mode: WorkerMode) -> bool {
+    let Some(features) = ready.get("features").and_then(Value::as_array) else {
+        return false;
+    };
+    ready.get("ready").and_then(Value::as_bool) == Some(true)
+        && ready.get("version").and_then(Value::as_u64) == Some(1)
+        && ready.get("mode").and_then(Value::as_str) == Some(mode.as_str())
+        && component_catalog::REQUIRED_CAPABILITIES
+            .iter()
+            .all(|required| {
+                features
+                    .iter()
+                    .any(|feature| feature.as_str() == Some(*required))
+            })
+        && (mode == WorkerMode::Normal
+            || features
+                .iter()
+                .any(|feature| feature.as_str() == Some("migration-ttl-v1")))
+}
+
 impl Worker {
     async fn start(
-        components: PathBuf,
+        launch: WorkerLaunch,
         database: PathBuf,
         scope: &(String, String),
         key: &str,
         slots: Arc<Semaphore>,
     ) -> io::Result<Self> {
+        let WorkerLaunch { components, mode } = launch;
         let slot = slots
             .acquire_owned()
             .await
@@ -406,30 +466,13 @@ impl Worker {
             _lease: lease,
             _slot: slot,
         };
-        let mut init = Zeroizing::new(serde_json::to_vec(&json!({"version":1,"key":key,"database":database,"account_id":scope.0,"region":scope.1})).map_err(io::Error::other)?);
+        let mut init = Zeroizing::new(serde_json::to_vec(&json!({"version":1,"key":key,"database":database,"account_id":scope.0,"region":scope.1,"mode":mode.as_str()})).map_err(io::Error::other)?);
         init.push(b'\n');
         worker.input.write_all(&init).await?;
         worker.input.flush().await?;
         let ready = frame(&mut worker.output).await?;
-        if ready.get("ready").and_then(Value::as_bool) != Some(true)
-            || ready.get("version").and_then(Value::as_u64) != Some(1)
-        {
-            return Err(io::Error::other(
-                "ExtendDB initialization failed; check worker compatibility or database master key",
-            ));
-        }
-        let features = ready.get("features").and_then(Value::as_array);
-        if !component_catalog::REQUIRED_CAPABILITIES
-            .iter()
-            .all(|required| {
-                features.is_some_and(|features| {
-                    features
-                        .iter()
-                        .any(|feature| feature.as_str() == Some(*required))
-                })
-            })
-        {
-            return Err(io::Error::other("Installed ExtendDB worker is outdated; reinstall a worker supporting stream cursors, durable MREC and schema-preserving backups"));
+        if !ready_for_mode(&ready, mode) {
+            return Err(io::Error::other("ExtendDB worker handshake or mode is incompatible; reinstall a current worker with migration TTL support"));
         }
         drop(executable);
         Ok(worker)
@@ -474,7 +517,7 @@ impl Worker {
 }
 
 async fn serve_worker(
-    components: PathBuf,
+    launch: WorkerLaunch,
     database: PathBuf,
     scope: (String, String),
     key: Arc<Zeroizing<String>>,
@@ -494,7 +537,7 @@ async fn serve_worker(
             if worker.is_none() {
                 worker = Some(
                     Worker::start(
-                        components.clone(),
+                        launch.clone(),
                         database.clone(),
                         &scope,
                         key.as_str(),
@@ -642,7 +685,10 @@ mod tests {
             .unwrap();
         drop(sender);
         serve_worker(
-            PathBuf::from("/missing-component"),
+            WorkerLaunch {
+                components: PathBuf::from("/missing-component"),
+                mode: WorkerMode::Normal,
+            },
             PathBuf::from("/missing-database"),
             ("000000000000".into(), "us-east-1".into()),
             Arc::new(Zeroizing::new(String::new())),
@@ -655,5 +701,36 @@ mod tests {
             result.await.unwrap().unwrap_err(),
             "ExtendDB request expired before execution"
         );
+    }
+
+    #[test]
+    fn worker_mode_handshake_requires_exact_mode_and_migration_capability() {
+        let mut features = component_catalog::REQUIRED_CAPABILITIES
+            .iter()
+            .map(|feature| json!(feature))
+            .collect::<Vec<_>>();
+        if !features
+            .iter()
+            .any(|feature| feature.as_str() == Some("migration-ttl-v1"))
+        {
+            features.push(json!("migration-ttl-v1"));
+        }
+        for mode in [WorkerMode::Normal, WorkerMode::Migration] {
+            let mut ready =
+                json!({"ready":true,"version":1,"mode":mode.as_str(),"features":features});
+            assert!(ready_for_mode(&ready, mode));
+            let other = match mode {
+                WorkerMode::Normal => WorkerMode::Migration,
+                WorkerMode::Migration => WorkerMode::Normal,
+            };
+            assert!(!ready_for_mode(&ready, other));
+            ready.as_object_mut().unwrap().remove("mode");
+            assert!(!ready_for_mode(&ready, mode));
+        }
+        features.retain(|feature| feature.as_str() != Some("migration-ttl-v1"));
+        assert!(!ready_for_mode(
+            &json!({"ready":true,"version":1,"mode":"migration","features":features}),
+            WorkerMode::Migration
+        ));
     }
 }

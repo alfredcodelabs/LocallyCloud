@@ -23,7 +23,7 @@ pub enum NativeRecord {
         create: Value,
         /// AWS tag array containing `Key` and `Value` fields.
         tags: Value,
-        /// Configured TTL is rejected until destination verification can suspend expiration.
+        /// TTL configuration; the offline importer must suspend expiration until cutover.
         ttl_attribute: Option<String>,
         item_count: u64,
     },
@@ -134,6 +134,20 @@ fn throughput(read: u64, write: u64) -> Result<Value, DdbError> {
 
 fn create_table(data: &TableData) -> Result<Value, DdbError> {
     let def = &data.def;
+    if data.ttl_attribute.as_ref().is_some_and(|attribute| {
+        attribute.is_empty() || attribute.len() > 255 || attribute.contains('\0')
+    }) {
+        return Err(unsupported("invalid TTL attribute metadata"));
+    }
+    if data.ttl_attribute.as_ref().is_some_and(|attribute| {
+        !attribute
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    }) {
+        return Err(unsupported(
+            "TTL attribute names not supported by the optional engine",
+        ));
+    }
     let provisioned = match def.billing_mode.as_str() {
         "PROVISIONED" => true,
         "PAY_PER_REQUEST" if def.read_capacity == 0 && def.write_capacity == 0 => false,
@@ -244,9 +258,6 @@ fn export_with_binding(
                 "the table features reported by migrate-dynamodb --dry-run",
             ));
         }
-        if table.ttl_configured {
-            return Err(unsupported("configured TTL during offline verification"));
-        }
         Ok(())
     })?;
     if !summary.unrecognized_storage_tables.is_empty() {
@@ -286,7 +297,7 @@ fn export_with_binding(
                             .map(|(key, value)| json!({"Key":key,"Value":value}))
                             .collect(),
                     ),
-                    ttl_attribute: None,
+                    ttl_attribute: data.ttl_attribute.clone(),
                     item_count: count,
                 })?;
             }

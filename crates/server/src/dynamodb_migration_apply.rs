@@ -3,12 +3,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use locallycloud_dynamodb::migration::{export_native, export_native_recovery, NativeRecord};
 use locallycloud_state::{StateCipher, StateDb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::dynamodb_engine::WorkerPool;
@@ -233,17 +235,104 @@ fn authenticate_source(path: &Path, cipher: &StateCipher) -> Result<(), String> 
     Ok(())
 }
 
-fn prepare() -> Result<Prepared, String> {
+struct SourceGuard {
+    source: PathBuf,
+    cipher: StateCipher,
+    lock: File,
+    component: (PathBuf, File, File),
+}
+
+fn source_guard() -> Result<SourceGuard, String> {
     let source = StateDb::default_path().map_err(|e| e.to_string())?;
     let lock = super::lock_source(&source)?;
     let cipher = StateCipher::from_env().map_err(|e| e.to_string())?;
     authenticate_source(&source, &cipher)?;
-    let marker = sibling(&source, ".dynamodb-migration.json");
-    let destination = sibling(&source, ".extenddb");
     let component = crate::component_manager::verified(
         &crate::component_manager::directory().map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    Ok(SourceGuard {
+        source,
+        cipher,
+        lock,
+        component,
+    })
+}
+
+fn supports_migration_ttl(bytes: &[u8]) -> bool {
+    if bytes.len() > 4096 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    let Some(features) = value.get("features").and_then(Value::as_array) else {
+        return false;
+    };
+    value.get("version").and_then(Value::as_u64) == Some(1)
+        && features
+            .iter()
+            .any(|feature| feature.as_str() == Some("migration-ttl-v1"))
+        && crate::component_catalog::REQUIRED_CAPABILITIES
+            .iter()
+            .all(|required| {
+                features
+                    .iter()
+                    .any(|feature| feature.as_str() == Some(*required))
+            })
+}
+
+async fn require_migration_ttl(component: &(PathBuf, File, File)) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    // Execute the checksum-verified inode while its shared installation lease remains held.
+    let executable = format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        component.1.as_raw_fd()
+    );
+    let mut child = tokio::process::Command::new(executable)
+        .arg("--capabilities")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "Cannot inspect installed ExtendDB worker capabilities".to_owned())?;
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let output = child.stdout.take().ok_or("ExtendDB capability output unavailable")?;
+        let mut bytes = Vec::new();
+        output.take(4097).read_to_end(&mut bytes).await
+            .map_err(|_| "Cannot read ExtendDB worker capabilities")?;
+        if bytes.len() > 4096 {
+            return Err("ExtendDB capability output exceeds its limit");
+        }
+        let status = child.wait().await.map_err(|_| "Cannot reap ExtendDB capability probe")?;
+        if !status.success() || !supports_migration_ttl(&bytes) {
+            return Err("Installed ExtendDB worker lacks migration TTL support; install a current worker before retrying");
+        }
+        Ok(())
+    }).await;
+    let error = match result {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => error.to_owned(),
+        Err(_) => "ExtendDB capability probe timed out".to_owned(),
+    };
+    // Every failure path kills and reaps the probe before source/component guards drop.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    Err(error)
+}
+
+fn prepare(guard: SourceGuard) -> Result<Prepared, String> {
+    let SourceGuard {
+        source,
+        cipher,
+        lock,
+        component,
+    } = guard;
+    let marker = sibling(&source, ".dynamodb-migration.json");
+    let destination = sibling(&source, ".extenddb");
     let selected =
         locallycloud_dynamodb::migration::engine_binding(&source).map_err(|e| e.to_string())?;
     let pending = exists(&marker).map_err(|e| e.to_string())?;
@@ -537,6 +626,47 @@ async fn verify_table(
     Ok(())
 }
 
+fn ttl_matches(expected: Option<&str>, actual: &Value) -> bool {
+    let Some(description) = actual
+        .get("TimeToLiveDescription")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    match expected {
+        Some(attribute) => {
+            description.get("TimeToLiveStatus").and_then(Value::as_str) == Some("ENABLED")
+                && description.get("AttributeName").and_then(Value::as_str) == Some(attribute)
+        }
+        None => {
+            description.get("TimeToLiveStatus").and_then(Value::as_str) == Some("DISABLED")
+                && !description.contains_key("AttributeName")
+        }
+    }
+}
+
+async fn verify_ttl(
+    pool: &WorkerPool,
+    table: &Table,
+    attribute: Option<&str>,
+) -> Result<(), String> {
+    let actual = query(
+        pool,
+        &table.account,
+        &table.region,
+        "DescribeTimeToLive",
+        json!({"TableName":table.name}),
+    )
+    .await?;
+    if !ttl_matches(attribute, &actual) {
+        return Err(format!(
+            "Migration TTL configuration differs for {}",
+            table.name
+        ));
+    }
+    Ok(())
+}
+
 async fn transfer(
     source: PathBuf,
     destination: PathBuf,
@@ -544,7 +674,7 @@ async fn transfer(
     recovery: bool,
 ) -> Result<(), String> {
     let notifier = crate::dynamodb_replication::RelayNotifier::new();
-    let mut pool = WorkerPool::in_directory(destination.clone(), notifier.clone())
+    let mut pool = WorkerPool::for_migration(destination.clone(), notifier.clone())
         .map_err(|e| e.to_string())?;
     let (sender, mut receiver) = mpsc::channel(4);
     let producer = tokio::task::spawn_blocking(move || {
@@ -574,13 +704,13 @@ async fn transfer(
                     mut create,
                     tags,
                     item_count,
-                    ..
+                    ttl_attribute,
                 } => {
                     if let Some(previous) = current.take() {
                         verify_count(&pool, &previous).await?;
                         if previous.account != account || previous.region != region {
                             pool.shutdown().await;
-                            pool = WorkerPool::in_directory(destination.clone(), notifier.clone())
+                            pool = WorkerPool::for_migration(destination.clone(), notifier.clone())
                                 .map_err(|e| e.to_string())?;
                         }
                     }
@@ -604,6 +734,13 @@ async fn transfer(
                         .await?;
                     }
                     verify_table(&pool, &table, &create, &tags).await?;
+                    if let (true, Some(attribute)) = (import, &ttl_attribute) {
+                        query(
+                            &pool, &table.account, &table.region, "UpdateTimeToLive",
+                            json!({"TableName":table.name,"TimeToLiveSpecification":{"Enabled":true,"AttributeName":attribute}}),
+                        ).await?;
+                    }
+                    verify_ttl(&pool, &table, ttl_attribute.as_deref()).await?;
                     current = Some(table);
                 }
                 NativeRecord::Item {
@@ -709,9 +846,13 @@ fn commit(prepared: &mut Prepared) -> Result<(), String> {
 }
 
 pub(crate) async fn apply() -> Result<(), String> {
-    let mut prepared = tokio::task::spawn_blocking(prepare)
+    let guard = tokio::task::spawn_blocking(source_guard)
         .await
-        .map_err(|_| "Migration preflight task failed".to_owned())??;
+        .map_err(|_| "Migration source preflight task failed".to_owned())??;
+    require_migration_ttl(&guard.component).await?;
+    let mut prepared = tokio::task::spawn_blocking(move || prepare(guard))
+        .await
+        .map_err(|_| "Migration destination preflight task failed".to_owned())??;
     if prepared.completed {
         // Trusted recovery is restricted to the validated, already-committed durable intent.
         // A full reopened destination read authenticates its key before clearing the startup guard.
@@ -740,7 +881,7 @@ pub(crate) async fn apply() -> Result<(), String> {
     println!(
         "{}",
         json!({"kind":"migration-complete","engine":"extenddb","nativeRowsRetained":true,
-        "preserved":["logicalSchema","billingAndCapacity","indexes","tags","items"],
+        "preserved":["logicalSchema","billingAndCapacity","indexes","tags","ttl","items"],
         "physicalTableIdentity":"regenerated"})
     );
     Ok(())
@@ -945,5 +1086,42 @@ mod tests {
         actual = expected.clone();
         actual["ProvisionedThroughput"]["WriteCapacityUnits"] = json!(8);
         assert!(!schema_matches(&expected, &actual));
+    }
+
+    #[test]
+    fn capability_probe_rejects_old_malformed_or_oversized_descriptions() {
+        let features = crate::component_catalog::REQUIRED_CAPABILITIES
+            .iter()
+            .map(|feature| json!(feature))
+            .chain(std::iter::once(json!("migration-ttl-v1")))
+            .collect::<Vec<_>>();
+        let valid = json!({"version":1,"features":features});
+        assert!(supports_migration_ttl(&serde_json::to_vec(&valid).unwrap()));
+        for invalid in [
+            json!({"version":1,"features":["stream-cursors-v1"]}),
+            json!({"version":2,"features":valid["features"]}),
+            json!({"version":1,"features":"migration-ttl-v1"}),
+        ] {
+            assert!(!supports_migration_ttl(
+                &serde_json::to_vec(&invalid).unwrap()
+            ));
+        }
+        assert!(!supports_migration_ttl(&vec![b' '; 4097]));
+        assert!(!supports_migration_ttl(b"not json"));
+    }
+
+    #[test]
+    fn ttl_verification_preserves_enabled_disabled_and_attribute_identity() {
+        let enabled = json!({"TimeToLiveDescription":{"TimeToLiveStatus":"ENABLED","AttributeName":"expires"}});
+        let disabled = json!({"TimeToLiveDescription":{"TimeToLiveStatus":"DISABLED"}});
+        assert!(ttl_matches(Some("expires"), &enabled));
+        assert!(ttl_matches(None, &disabled));
+        assert!(!ttl_matches(None, &enabled));
+        assert!(!ttl_matches(Some("other"), &enabled));
+        assert!(!ttl_matches(Some("expires"), &disabled));
+        assert!(!ttl_matches(
+            None,
+            &json!({"TimeToLiveDescription":{"TimeToLiveStatus":"DISABLED","AttributeName":"old"}})
+        ));
     }
 }
