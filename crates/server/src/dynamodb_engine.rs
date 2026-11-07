@@ -352,6 +352,9 @@ impl WorkerPool {
 
 #[async_trait]
 impl locallycloud_dynamodb::DynamoEngine for ExtendDb {
+    fn supports_pitr(&self) -> bool {
+        true
+    }
     fn supports_owned_encryption(&self) -> bool {
         true
     }

@@ -250,7 +250,7 @@ def main():
         architecture = {'x86_64':'x86_64', 'aarch64':'arm64'}[os.uname().machine]
         artifact = next(item for item in catalog['artifacts'] if item['architecture'] == architecture)
         capabilities = set(catalog['capabilities'])
-        if not {'stream-cursors-v1', 'mrec-outbox-v1', 'backups-v1', 'migration-ttl-v1'} <= capabilities:
+        if not {'stream-cursors-v1', 'mrec-outbox-v1', 'backups-v1', 'migration-ttl-v1', 'pitr-history-v1'} <= capabilities:
             raise RuntimeError('catalog lacks required component capabilities')
         cli(args.binary, environment, 'install', 'extenddb', '--catalog', args.catalog.resolve())
         active = json.loads(cli(args.binary, environment, 'list'))['extenddb']

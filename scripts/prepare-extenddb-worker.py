@@ -18,7 +18,8 @@ PACKAGES = ('auth', 'cache', 'core', 'engine', 'storage', 'storage-sqlite')
 ROOT = Path(__file__).resolve().parent.parent
 PATCH = ROOT / 'crates/dynamodb/adapters/extenddb-worker/patches/0001-sqlite-transaction-mutation-hook.patch'
 PATCHES = (PATCH, PATCH.with_name('0002-sqlite-durable-backups.patch'),
-           PATCH.with_name('0003-sqlite-migration-ttl-suspension.patch'))
+           PATCH.with_name('0003-sqlite-migration-ttl-suspension.patch'),
+           PATCH.with_name('0004-sqlite-point-in-time-history.patch'))
 MAX_COMPRESSED = 32 * 1024 * 1024
 MAX_EXPANDED = 128 * 1024 * 1024
 

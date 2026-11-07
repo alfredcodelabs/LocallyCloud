@@ -13,11 +13,23 @@ fn validation(message: &str) -> DynamoDbError {
 
 fn storage(error: StorageError) -> DynamoDbError {
     match error {
+        StorageError::Validation(message) if message.starts_with("Backup not found:") => {
+            DynamoDbError::BackupNotFoundException("Backup does not exist or has expired".into())
+        }
         StorageError::Validation(message) | StorageError::Unsupported(message) => {
             validation(&message)
         }
         StorageError::TableNotFound(message) => DynamoDbError::ResourceNotFoundException(message),
         _ => DynamoDbError::InternalServerError("backup metadata operation failed".into()),
+    }
+}
+
+fn require_public_backup(kind: &str) -> Result<()> {
+    match kind {
+        "USER" | "SYSTEM" => Ok(()),
+        _ => Err(DynamoDbError::BackupNotFoundException(
+            "Backup does not exist".into(),
+        )),
     }
 }
 
@@ -72,13 +84,32 @@ fn required<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 #[derive(Debug, PartialEq)]
+enum BackupFilter {
+    User,
+    System,
+    All,
+    External,
+}
+
+impl BackupFilter {
+    fn storage_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::User => Some("USER"),
+            Self::System => Some("SYSTEM"),
+            Self::All => None,
+            Self::External => Some("AWS_BACKUP"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct Listing {
     table: Option<String>,
     start: String,
     lower: Option<f64>,
     upper: Option<f64>,
     limit: u32,
-    user: bool,
+    backup_type: BackupFilter,
 }
 
 fn listing(body: &Value, account: &str, region: &str) -> Result<Listing> {
@@ -124,11 +155,13 @@ fn listing(body: &Value, account: &str, region: &str) -> Result<Listing> {
     if matches!((lower, upper), (Some(lower),Some(upper)) if lower>upper) {
         return Err(validation("invalid backup time range"));
     }
-    let user = match body.get("BackupType") {
-        None => true,
+    let backup_type = match body.get("BackupType") {
+        None => BackupFilter::User,
         Some(Value::String(value)) => match value.as_str() {
-            "USER" | "ALL" => true,
-            "SYSTEM" | "AWS_BACKUP" => false,
+            "USER" => BackupFilter::User,
+            "SYSTEM" => BackupFilter::System,
+            "ALL" => BackupFilter::All,
+            "AWS_BACKUP" => BackupFilter::External,
             _ => return Err(validation("invalid BackupType")),
         },
         _ => return Err(validation("invalid BackupType")),
@@ -139,7 +172,7 @@ fn listing(body: &Value, account: &str, region: &str) -> Result<Listing> {
         lower,
         upper,
         limit,
-        user,
+        backup_type,
     })
 }
 
@@ -224,24 +257,43 @@ pub async fn dispatch(
     match operation {
         "ListBackups" => {
             let request = listing(&body, &context.account_id, &context.region)?;
-            if !request.user {
+            if request.backup_type == BackupFilter::External {
                 return Ok(json!({"BackupSummaries":[]}));
             }
             let mut records = sqlite
-                .list_backup_page(
+                .list_backup_page_typed(
                     &context.account_id,
                     request.table.as_deref(),
                     &request.start,
                     request.lower,
                     request.upper,
                     request.limit + 1,
+                    request.backup_type.storage_kind(),
                 )
                 .await
                 .map_err(storage)?;
             let more = records.len() > request.limit as usize;
             records.truncate(request.limit as usize);
             let cursor = records.last().map(|v| v.backup_arn.clone());
-            let mut output = json!({"BackupSummaries":records});
+            let mut summaries = Vec::with_capacity(records.len());
+            for record in records {
+                let expiry = if record.backup_type == "SYSTEM" {
+                    sqlite
+                        .backup_expiry(&context.account_id, &record.backup_arn)
+                        .await
+                        .map_err(storage)?
+                } else {
+                    None
+                };
+                let mut value = serde_json::to_value(record).map_err(|_| {
+                    DynamoDbError::InternalServerError("Cannot serialize backup summary".into())
+                })?;
+                if let Some(expiry) = expiry {
+                    value["BackupExpiryDateTime"] = json!(expiry);
+                }
+                summaries.push(value);
+            }
+            let mut output = json!({"BackupSummaries":summaries});
             if more {
                 output["LastEvaluatedBackupArn"] = json!(cursor);
             }
@@ -278,6 +330,24 @@ pub async fn dispatch(
         )?,
         _ => return Err(validation("invalid backup operation")),
     }
+    let identity = if matches!(
+        operation,
+        "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup"
+    ) {
+        let arn = required(&body, "BackupArn")?;
+        let kind = sqlite
+            .backup_kind(&context.account_id, arn)
+            .await
+            .map_err(storage)?;
+        require_public_backup(&kind)?;
+        let expiry = sqlite
+            .backup_expiry(&context.account_id, arn)
+            .await
+            .map_err(storage)?;
+        Some((kind, expiry))
+    } else {
+        None
+    };
     let snapshot = if matches!(operation, "DescribeBackup" | "DeleteBackup") {
         sqlite
             .backup_snapshot(&context.account_id, required(&body, "BackupArn")?)
@@ -291,6 +361,22 @@ pub async fn dispatch(
         .body;
     if let Some(snapshot) = snapshot {
         decorate(&mut output, &snapshot);
+    }
+    if let Some((kind, expiry)) =
+        identity.filter(|_| matches!(operation, "DescribeBackup" | "DeleteBackup"))
+    {
+        let details = output
+            .pointer_mut("/BackupDescription/BackupDetails")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                DynamoDbError::InternalServerError(
+                    "Backup description is missing its details".into(),
+                )
+            })?;
+        details.insert("BackupType".into(), json!(kind));
+        if let Some(expiry) = expiry {
+            details.insert("BackupExpiryDateTime".into(), json!(expiry));
+        }
     }
     Ok(output)
 }
@@ -334,11 +420,17 @@ mod tests {
         let region = "us-east-1";
         let parse = |body: &Value| listing(body, account, region);
         assert_eq!(parse(&json!({})).unwrap().limit, 100);
-        assert!(
-            !parse(&json!({"Limit":1,"BackupType":"SYSTEM"}))
+        assert_eq!(
+            parse(&json!({"Limit":1,"BackupType":"SYSTEM"}))
                 .unwrap()
-                .user
+                .backup_type,
+            BackupFilter::System
         );
+        assert_eq!(
+            parse(&json!({"BackupType":"ALL"})).unwrap().backup_type,
+            BackupFilter::All
+        );
+        assert_eq!(parse(&json!({})).unwrap().backup_type, BackupFilter::User);
         for body in [
             json!({"Limit":0}),
             json!({"Limit":101}),
@@ -354,5 +446,27 @@ mod tests {
         assert_eq!(request.table.as_deref(), Some("orders"));
         assert_eq!(request.lower, Some(1.0));
         assert_eq!(request.upper, Some(2.0));
+    }
+
+    #[test]
+    fn absent_or_expired_backup_metadata_uses_canonical_backup_not_found_error() {
+        assert!(matches!(
+            storage(StorageError::Validation(
+                "Backup not found: private arn".into()
+            )),
+            DynamoDbError::BackupNotFoundException(_)
+        ));
+    }
+
+    #[test]
+    fn public_backup_operations_never_admit_internal_snapshot_arns() {
+        assert!(require_public_backup("USER").is_ok());
+        assert!(require_public_backup("SYSTEM").is_ok());
+        for kind in ["INTERNAL", "FUTURE", ""] {
+            assert!(matches!(
+                require_public_backup(kind),
+                Err(DynamoDbError::BackupNotFoundException(_))
+            ));
+        }
     }
 }

@@ -1,0 +1,1849 @@
+diff --git a/crates/core/src/error/mod.rs b/crates/core/src/error/mod.rs
+index c0a28c0..2c59f9e 100644
+--- a/crates/core/src/error/mod.rs
++++ b/crates/core/src/error/mod.rs
+@@ -17,6 +17,16 @@ pub enum DynamoDbError {
+     ValidationException(String),
+     #[error("{0}")]
+     ResourceNotFoundException(String),
++    #[error("{0}")]
++    PointInTimeRecoveryUnavailableException(String),
++    #[error("{0}")]
++    InvalidRestoreTimeException(String),
++    #[error("{0}")]
++    TableNotFoundException(String),
++    #[error("{0}")]
++    TableAlreadyExistsException(String),
++    #[error("{0}")]
++    TableInUseException(String),
+     /// SP-ERR-002: HTTP 400. Backup-specific not-found, distinct from
+     /// `ResourceNotFoundException`. Returned by `DescribeBackup`, `DeleteBackup`
+     /// and `RestoreTableFromBackup` for a backup ARN in the caller's account
+@@ -112,6 +122,11 @@ impl DynamoDbError {
+     pub fn status_code(&self) -> u16 {
+         match self {
+             Self::ValidationException(_)
++            | Self::PointInTimeRecoveryUnavailableException(_)
++            | Self::InvalidRestoreTimeException(_)
++            | Self::TableInUseException(_)
++            | Self::TableAlreadyExistsException(_)
++            | Self::TableNotFoundException(_)
+             | Self::ResourceNotFoundException(_)
+             | Self::BackupNotFoundException(_)
+             | Self::ResourceInUseException(_)
+@@ -154,6 +169,13 @@ impl DynamoDbError {
+         match self {
+             Self::ValidationException(_) => "ValidationException",
+             Self::ResourceNotFoundException(_) => "ResourceNotFoundException",
++            Self::PointInTimeRecoveryUnavailableException(_) => {
++                "PointInTimeRecoveryUnavailableException"
++            }
++            Self::InvalidRestoreTimeException(_) => "InvalidRestoreTimeException",
++            Self::TableNotFoundException(_) => "TableNotFoundException",
++            Self::TableAlreadyExistsException(_) => "TableAlreadyExistsException",
++            Self::TableInUseException(_) => "TableInUseException",
+             Self::BackupNotFoundException(_) => "BackupNotFoundException",
+             Self::ResourceInUseException(_) => "ResourceInUseException",
+             Self::LimitExceededException(_) => "LimitExceededException",
+@@ -219,6 +241,11 @@ impl DynamoDbError {
+     pub fn message(&self) -> &str {
+         match self {
+             Self::ValidationException(m)
++            | Self::PointInTimeRecoveryUnavailableException(m)
++            | Self::InvalidRestoreTimeException(m)
++            | Self::TableInUseException(m)
++            | Self::TableAlreadyExistsException(m)
++            | Self::TableNotFoundException(m)
+             | Self::ResourceNotFoundException(m)
+             | Self::BackupNotFoundException(m)
+             | Self::ResourceInUseException(m)
+diff --git a/crates/core/src/types/table.rs b/crates/core/src/types/table.rs
+index 531c409..901a2ca 100644
+--- a/crates/core/src/types/table.rs
++++ b/crates/core/src/types/table.rs
+@@ -860,6 +860,8 @@ pub struct TableDescription {
+ /// `RestoreInProgress: true` there.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct RestoreSummary {
++    #[serde(rename = "SourceTableArn", skip_serializing_if = "Option::is_none")]
++    pub source_table_arn: Option<String>,
+     #[serde(rename = "SourceBackupArn", skip_serializing_if = "Option::is_none")]
+     pub source_backup_arn: Option<String>,
+     #[serde(rename = "RestoreDateTime")]
+diff --git a/crates/engine/src/backup.rs b/crates/engine/src/backup.rs
+index 81e6eb6..9bc1b6a 100644
+--- a/crates/engine/src/backup.rs
++++ b/crates/engine/src/backup.rs
+@@ -165,6 +165,7 @@ pub(crate) async fn handle_restore_table_from_backup(
+         .unwrap_or_default();
+     desc.restore_summary = Some(extenddb_core::types::RestoreSummary {
+         source_backup_arn: Some(backup_arn.clone()),
++        source_table_arn: None,
+         restore_date_time: now,
+         restore_in_progress: true,
+     });
+diff --git a/crates/storage-sqlite/src/backup.rs b/crates/storage-sqlite/src/backup.rs
+index 4029051..a9b0abc 100644
+--- a/crates/storage-sqlite/src/backup.rs
++++ b/crates/storage-sqlite/src/backup.rs
+@@ -5,9 +5,7 @@
+ //!
+ //! A backup snapshots every item's `item_data` into `backup_items`. Restore
+ //! recreates the table via `create_table` and upserts the snapshot under the
+-//! engine write lock. `RestoreTableToPointInTime` is implemented as a
+-//! snapshot-then-restore (then discard the temporary backup), matching the
+-//! PostgreSQL backend's behaviour.
++//! engine write lock. Historical materialization is provided by `history.rs`.
+ 
+ use extenddb_core::types::{
+     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
+@@ -87,12 +85,153 @@ fn restore_input(
+     serde_json::from_value(input).map_err(|e| StorageError::Internal(e.to_string()))
+ }
+ 
++pub(crate) enum SnapshotData {
++    Current,
++    Historical(i64),
++}
++
+ impl SqliteEngine {
++    pub(crate) async fn snapshot_on(
++        &self,
++        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
++        account: &str,
++        table: &str,
++        name: &str,
++        data: SnapshotData,
++        kind: &str,
++        expires: Option<i64>,
++    ) -> Result<BackupDetails, StorageError> {
++        let description = self.build_table_description_on(tx, account, table).await?;
++        if description.table_status != extenddb_core::types::TableStatus::Active {
++            return Err(StorageError::TableNotFound(table.into()));
++        }
++        if description
++            .global_secondary_indexes
++            .as_ref()
++            .is_some_and(|indexes| indexes.iter().any(|index| index.index_status != "ACTIVE"))
++        {
++            return Err(StorageError::Unsupported(
++                "backup source index update is still in progress".into(),
++            ));
++        }
++        let billing = description
++            .billing_mode_summary
++            .as_ref()
++            .map(|mode| mode.billing_mode)
++            .unwrap_or(extenddb_core::types::BillingMode::Provisioned);
++        let billing = match billing {
++            extenddb_core::types::BillingMode::PayPerRequest => "PAY_PER_REQUEST",
++            extenddb_core::types::BillingMode::Provisioned => "PROVISIONED",
++        };
++        let arn = format!(
++            "arn:aws:dynamodb:{}:{account}:table/{table}/backup/{}",
++            self.region,
++            backup_id()
++        );
++        sqlx::query(BACKUP_SCHEMA)
++            .execute(&mut **tx)
++            .await
++            .map_err(crate::history::storage)?;
++        sqlx::query("INSERT INTO backups(backup_arn,backup_name,table_id,table_name,account_id,backup_status,backup_size_bytes,item_count,key_schema,attribute_definitions,billing_mode) VALUES(?,?,?,?,?,'AVAILABLE',0,0,?,?,?)")
++            .bind(&arn).bind(name).bind(&description.table_id).bind(table).bind(account)
++            .bind(serde_json::to_string(&description.key_schema).map_err(|e|StorageError::Internal(e.to_string()))?)
++            .bind(serde_json::to_string(&description.attribute_definitions).map_err(|e|StorageError::Internal(e.to_string()))?)
++            .bind(billing).execute(&mut **tx).await.map_err(crate::history::storage)?;
++        match data {
++            SnapshotData::Current => {
++                let source = data_table_name(&description.table_id);
++                sqlx::query(&format!("INSERT INTO backup_items(backup_arn,pk,sk,item_data) SELECT ?,pk,NULL,item_data FROM {source}"))
++                    .bind(&arn).execute(&mut **tx).await.map_err(crate::history::storage)?;
++            }
++            SnapshotData::Historical(at) => {
++                sqlx::query("INSERT INTO backup_items(backup_arn,pk,sk,item_data) SELECT ?,h.pk,h.sk,h.item_data FROM lc_pitr_versions h WHERE h.table_id=? AND h.at_us<=? AND h.item_data IS NOT NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_versions n WHERE n.table_id=h.table_id AND n.pk=h.pk AND n.sk=h.sk AND n.at_us>h.at_us AND n.at_us<=?)")
++                    .bind(&arn).bind(&description.table_id).bind(at).bind(at).execute(&mut **tx).await.map_err(crate::history::storage)?;
++            }
++        }
++        let (count,size):(i64,i64)=sqlx::query_as("SELECT COUNT(*),COALESCE(SUM(length(CAST(item_data AS BLOB))),0) FROM backup_items WHERE backup_arn=?")
++            .bind(&arn).fetch_one(&mut **tx).await.map_err(crate::history::storage)?;
++        sqlx::query("UPDATE backups SET item_count=?,backup_size_bytes=? WHERE backup_arn=?")
++            .bind(count)
++            .bind(size)
++            .bind(&arn)
++            .execute(&mut **tx)
++            .await
++            .map_err(crate::history::storage)?;
++        let ttl: (Option<String>,) =
++            sqlx::query_as("SELECT ttl_attribute FROM tables WHERE table_id=?")
++                .bind(&description.table_id)
++                .fetch_one(&mut **tx)
++                .await
++                .map_err(crate::history::storage)?;
++        let mut snapshot = serde_json::to_value(&description)
++            .map_err(|e| StorageError::Internal(e.to_string()))?;
++        snapshot["ItemCount"] = serde_json::json!(count);
++        snapshot["TableSizeBytes"] = serde_json::json!(size);
++        snapshot["TimeToLiveDescription"] = match ttl.0 {
++            Some(attribute) => {
++                serde_json::json!({"TimeToLiveStatus":"ENABLED","AttributeName":attribute})
++            }
++            None => serde_json::json!({"TimeToLiveStatus":"DISABLED"}),
++        };
++        sqlx::query("INSERT INTO backup_table_schema VALUES(?,?)")
++            .bind(&arn)
++            .bind(snapshot.to_string())
++            .execute(&mut **tx)
++            .await
++            .map_err(crate::history::storage)?;
++        if kind != "USER" {
++            sqlx::query("INSERT INTO lc_backup_retention VALUES(?,?,?)")
++                .bind(&arn)
++                .bind(kind)
++                .bind(expires)
++                .execute(&mut **tx)
++                .await
++                .map_err(crate::history::storage)?;
++        }
++        let created: String =
++            sqlx::query_scalar("SELECT created_at FROM backups WHERE backup_arn=?")
++                .bind(&arn)
++                .fetch_one(&mut **tx)
++                .await
++                .map_err(crate::history::storage)?;
++        Ok(BackupDetails {
++            backup_arn: arn,
++            backup_name: name.into(),
++            backup_status: "AVAILABLE".into(),
++            backup_type: kind.into(),
++            backup_size_bytes: size,
++            backup_creation_date_time: ts_to_epoch(&created),
++        })
++    }
++
++    pub async fn backup_kind(&self, account: &str, arn: &str) -> Result<String, StorageError> {
++        let now = crate::history::now_us()?;
++        sqlx::query_scalar("SELECT COALESCE(r.kind,'USER') FROM backups b LEFT JOIN lc_backup_retention r USING(backup_arn) WHERE b.backup_arn=? AND b.account_id=? AND b.backup_status='AVAILABLE' AND (r.expires_us IS NULL OR r.expires_us>?)")
++            .bind(arn).bind(account).bind(now).fetch_optional(&self.pool).await.map_err(crate::history::storage)?
++            .ok_or_else(||StorageError::Validation(format!("Backup not found: {arn}")))
++    }
++
++    pub async fn backup_expiry(
++        &self,
++        account: &str,
++        arn: &str,
++    ) -> Result<Option<f64>, StorageError> {
++        self.backup_kind(account, arn).await?;
++        let expiry: Option<(Option<i64>,)> =
++            sqlx::query_as("SELECT expires_us FROM lc_backup_retention WHERE backup_arn=?")
++                .bind(arn)
++                .fetch_optional(&self.pool)
++                .await
++                .map_err(crate::history::storage)?;
++        Ok(expiry.and_then(|row| row.0).map(crate::history::seconds))
++    }
++
+     pub async fn backup_snapshot(
+         &self,
+         account: &str,
+         arn: &str,
+     ) -> Result<Option<serde_json::Value>, StorageError> {
++        self.backup_kind(account, arn).await?;
+         let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='backup_table_schema')")
+             .fetch_one(&self.pool).await.map_err(|e| StorageError::Internal(e.to_string()))?;
+         if !exists {
+@@ -114,16 +253,28 @@ impl SqliteEngine {
+         upper: Option<f64>,
+         limit: u32,
+     ) -> Result<Vec<BackupSummary>, StorageError> {
+-        let limit = limit.min(101);
+-        let rows: Vec<(String,String,String,String,i64,String,String)> = sqlx::query_as(
+-            "SELECT b.backup_arn,b.backup_name,b.table_name,b.backup_status,b.backup_size_bytes,             'arn:aws:dynamodb:' || ? || ':' || b.account_id || ':table/' || b.table_name,b.created_at              FROM backups b WHERE b.account_id=? AND b.backup_status='AVAILABLE'              AND (? IS NULL OR b.table_name=?) AND b.backup_arn>?              AND (? IS NULL OR CAST(strftime('%s',b.created_at) AS REAL)+CAST(substr(b.created_at,21,3) AS REAL)/1000.0>=?)              AND (? IS NULL OR CAST(strftime('%s',b.created_at) AS REAL)+CAST(substr(b.created_at,21,3) AS REAL)/1000.0<?)              ORDER BY b.backup_arn LIMIT ?"
+-        ).bind(&self.region).bind(account).bind(table).bind(table).bind(start)
+-            .bind(lower).bind(lower).bind(upper).bind(upper).bind(i64::from(limit))
+-            .fetch_all(&self.pool).await.map_err(|e| StorageError::Internal(e.to_string()))?;
++        self.list_backup_page_typed(account, table, start, lower, upper, limit, Some("USER"))
++            .await
++    }
++
++    pub async fn list_backup_page_typed(
++        &self,
++        account: &str,
++        table: Option<&str>,
++        start: &str,
++        lower: Option<f64>,
++        upper: Option<f64>,
++        limit: u32,
++        kind: Option<&str>,
++    ) -> Result<Vec<BackupSummary>, StorageError> {
++        let rows:Vec<(String,String,String,String,i64,String,String,String)>=sqlx::query_as(
++            "SELECT b.backup_arn,b.backup_name,b.table_name,b.backup_status,b.backup_size_bytes,'arn:aws:dynamodb:' || ? || ':' || b.account_id || ':table/' || b.table_name,b.created_at,COALESCE(r.kind,'USER') FROM backups b LEFT JOIN lc_backup_retention r USING(backup_arn) WHERE b.account_id=? AND b.backup_status='AVAILABLE' AND COALESCE(r.kind,'USER')!='INTERNAL' AND (r.expires_us IS NULL OR r.expires_us>?) AND (? IS NULL OR COALESCE(r.kind,'USER')=?) AND (? IS NULL OR b.table_name=?) AND b.backup_arn>? AND (? IS NULL OR CAST(strftime('%s',b.created_at) AS REAL)+CAST(substr(b.created_at,21,3) AS REAL)/1000.0>=?) AND (? IS NULL OR CAST(strftime('%s',b.created_at) AS REAL)+CAST(substr(b.created_at,21,3) AS REAL)/1000.0<?) ORDER BY b.backup_arn LIMIT ?")
++            .bind(&self.region).bind(account).bind(crate::history::now_us()?).bind(kind).bind(kind).bind(table).bind(table).bind(start).bind(lower).bind(lower).bind(upper).bind(upper).bind(i64::from(limit.min(101)))
++            .fetch_all(&self.pool).await.map_err(crate::history::storage)?;
+         Ok(rows
+             .into_iter()
+             .map(
+-                |(arn, name, table, status, size, table_arn, created)| BackupSummary {
++                |(arn, name, table, status, size, table_arn, created, kind)| BackupSummary {
+                     backup_arn: arn,
+                     backup_name: name,
+                     table_name: table,
+@@ -131,7 +282,7 @@ impl SqliteEngine {
+                     backup_size_bytes: size,
+                     table_arn,
+                     backup_creation_date_time: ts_to_epoch(&created),
+-                    backup_type: "USER".into(),
++                    backup_type: kind,
+                 },
+             )
+             .collect())
+@@ -154,117 +305,20 @@ impl BackupEngine for SqliteEngine {
+                 .pool
+                 .begin_with("BEGIN IMMEDIATE")
+                 .await
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let description = self
+-                .build_table_description_on(&mut tx, &account_id, &table_name)
++                .map_err(crate::history::storage)?;
++            let result = self
++                .snapshot_on(
++                    &mut tx,
++                    &account_id,
++                    &table_name,
++                    &backup_name,
++                    SnapshotData::Current,
++                    "USER",
++                    None,
++                )
+                 .await?;
+-            if description.table_status != extenddb_core::types::TableStatus::Active {
+-                return Err(StorageError::TableNotFound(table_name));
+-            }
+-            if description
+-                .global_secondary_indexes
+-                .as_ref()
+-                .is_some_and(|indexes| indexes.iter().any(|index| index.index_status != "ACTIVE"))
+-            {
+-                return Err(StorageError::Unsupported(
+-                    "backup source index update is still in progress".into(),
+-                ));
+-            }
+-            let table_id = description.table_id.clone();
+-            let key_schema = serde_json::to_string(&description.key_schema)
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let attr_defs = serde_json::to_string(&description.attribute_definitions)
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let billing_mode = description
+-                .billing_mode_summary
+-                .as_ref()
+-                .map(|mode| mode.billing_mode)
+-                .unwrap_or(extenddb_core::types::BillingMode::Provisioned);
+-            let billing_mode = match billing_mode {
+-                extenddb_core::types::BillingMode::PayPerRequest => "PAY_PER_REQUEST",
+-                extenddb_core::types::BillingMode::Provisioned => "PROVISIONED",
+-            };
+-            let size_bytes = description.table_size_bytes;
+-            let mut snapshot = serde_json::to_value(&description)
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let ttl: (Option<String>,) = sqlx::query_as(
+-                "SELECT ttl_attribute FROM tables WHERE account_id = ? AND table_name = ?",
+-            )
+-            .bind(&account_id)
+-            .bind(&table_name)
+-            .fetch_one(&mut *tx)
+-            .await
+-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            snapshot["TimeToLiveDescription"] = match ttl.0 {
+-                Some(attribute) => {
+-                    serde_json::json!({"TimeToLiveStatus":"ENABLED", "AttributeName":attribute})
+-                }
+-                None => serde_json::json!({"TimeToLiveStatus":"DISABLED"}),
+-            };
+-            let backup_arn = format!(
+-                "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{id}",
+-                region = self.region,
+-                id = backup_id()
+-            );
+-            let ddb_table = data_table_name(&table_id);
+-            sqlx::query(BACKUP_SCHEMA)
+-                .execute(&mut *tx)
+-                .await
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let item_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ddb_table}"))
+-                .fetch_one(&mut *tx)
+-                .await
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            snapshot["ItemCount"] = serde_json::json!(item_count);
+-            sqlx::query(
+-                "INSERT INTO backups (backup_arn, backup_name, table_id, table_name, account_id, \
+-                 backup_status, backup_size_bytes, item_count, key_schema, attribute_definitions, \
+-                 billing_mode) VALUES (?, ?, ?, ?, ?, 'AVAILABLE', ?, ?, ?, ?, ?)",
+-            )
+-            .bind(&backup_arn)
+-            .bind(&backup_name)
+-            .bind(&table_id)
+-            .bind(&table_name)
+-            .bind(&account_id)
+-            .bind(size_bytes)
+-            .bind(item_count)
+-            .bind(&key_schema)
+-            .bind(&attr_defs)
+-            .bind(&billing_mode)
+-            .execute(&mut *tx)
+-            .await
+-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
+-            sqlx::query(&format!(
+-                "INSERT INTO backup_items (backup_arn, pk, sk, item_data) SELECT ?, pk, NULL, item_data FROM {ddb_table}"
+-            )).bind(&backup_arn).execute(&mut *tx).await
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            sqlx::query("INSERT INTO backup_table_schema (backup_arn, description) VALUES (?, ?)")
+-                .bind(&backup_arn)
+-                .bind(snapshot.to_string())
+-                .execute(&mut *tx)
+-                .await
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
+-            let created_at: (String,) =
+-                sqlx::query_as("SELECT created_at FROM backups WHERE backup_arn = ?")
+-                    .bind(&backup_arn)
+-                    .fetch_one(&mut *tx)
+-                    .await
+-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
+-            tx.commit()
+-                .await
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
+-            Ok(BackupDetails {
+-                backup_arn,
+-                backup_name,
+-                backup_status: "AVAILABLE".to_owned(),
+-                backup_type: "USER".to_owned(),
+-                backup_size_bytes: size_bytes,
+-                backup_creation_date_time: ts_to_epoch(&created_at.0),
+-            })
++            tx.commit().await.map_err(crate::history::storage)?;
++            Ok(result)
+         })
+     }
+ 
+@@ -276,6 +330,7 @@ impl BackupEngine for SqliteEngine {
+         let account_id = account_id.to_owned();
+         let backup_arn = backup_arn.to_owned();
+         Box::pin(async move {
++            let kind = self.backup_kind(&account_id, &backup_arn).await?;
+             #[allow(clippy::type_complexity)]
+             let row: Option<(String, String, String, String, i64, i64, String, String, String, String)> =
+                 sqlx::query_as(
+@@ -308,7 +363,7 @@ impl BackupEngine for SqliteEngine {
+                     backup_arn: backup_arn.clone(),
+                     backup_name: name,
+                     backup_status: status,
+-                    backup_type: "USER".to_owned(),
++                    backup_type: kind,
+                     backup_size_bytes: size,
+                     backup_creation_date_time: ts_to_epoch(&created),
+                 },
+@@ -334,52 +389,30 @@ impl BackupEngine for SqliteEngine {
+         let account_id = account_id.to_owned();
+         let table_name = table_name.map(str::to_owned);
+         Box::pin(async move {
+-            let rows: Vec<(String, String, String, String, i64, String, String)> =
+-                if let Some(tn) = table_name {
+-                    sqlx::query_as(
+-                        "SELECT b.backup_arn, b.backup_name, b.table_name, b.backup_status, \
+-                         b.backup_size_bytes, \
+-                         COALESCE(t.table_arn, 'arn:aws:dynamodb:' || ? || ':' || b.account_id || ':table/' || b.table_name), \
+-                         b.created_at FROM backups b LEFT JOIN tables t ON t.table_id = b.table_id \
+-                         WHERE b.account_id = ? AND b.table_name = ? AND b.backup_status != 'DELETED' \
+-                         ORDER BY b.created_at DESC",
+-                    )
+-                    .bind(&self.region)
+-                    .bind(&account_id)
+-                    .bind(tn)
+-                    .fetch_all(&self.pool)
+-                    .await
+-                } else {
+-                    sqlx::query_as(
+-                        "SELECT b.backup_arn, b.backup_name, b.table_name, b.backup_status, \
+-                         b.backup_size_bytes, \
+-                         COALESCE(t.table_arn, 'arn:aws:dynamodb:' || ? || ':' || b.account_id || ':table/' || b.table_name), \
+-                         b.created_at FROM backups b LEFT JOIN tables t ON t.table_id = b.table_id \
+-                         WHERE b.account_id = ? AND b.backup_status != 'DELETED' \
+-                         ORDER BY b.created_at DESC",
++            let mut cursor = String::new();
++            let mut summaries = Vec::new();
++            loop {
++                let page = self
++                    .list_backup_page_typed(
++                        &account_id,
++                        table_name.as_deref(),
++                        &cursor,
++                        None,
++                        None,
++                        101,
++                        None,
+                     )
+-                    .bind(&self.region)
+-                    .bind(&account_id)
+-                    .fetch_all(&self.pool)
+-                    .await
++                    .await?;
++                let full = page.len() == 101;
++                if let Some(last) = page.last() {
++                    cursor = last.backup_arn.clone();
+                 }
+-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+-
+-            Ok(rows
+-                .into_iter()
+-                .map(
+-                    |(arn, name, tn, status, size, table_arn, created)| BackupSummary {
+-                        backup_arn: arn,
+-                        backup_name: name,
+-                        table_name: tn,
+-                        table_arn,
+-                        backup_status: status,
+-                        backup_type: "USER".to_owned(),
+-                        backup_size_bytes: size,
+-                        backup_creation_date_time: ts_to_epoch(&created),
+-                    },
+-                )
+-                .collect())
++                summaries.extend(page);
++                if !full {
++                    break;
++                }
++            }
++            Ok(summaries)
+         })
+     }
+ 
+@@ -548,6 +581,27 @@ impl BackupEngine for SqliteEngine {
+                 .execute(&mut *tx)
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
++            let historical: Option<(String, i64)> = sqlx::query_as(
++                "SELECT source_arn,at_us FROM lc_pitr_restore_requests WHERE backup_arn=?",
++            )
++            .bind(&backup_arn)
++            .fetch_optional(&mut *tx)
++            .await
++            .map_err(crate::history::storage)?;
++            if let Some((source, at)) = historical {
++                sqlx::query("INSERT INTO lc_pitr_restores VALUES(?,?,?)")
++                    .bind(&desc.table_id)
++                    .bind(source)
++                    .bind(at)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(crate::history::storage)?;
++                sqlx::query("DELETE FROM backups WHERE backup_arn=?")
++                    .bind(&backup_arn)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(crate::history::storage)?;
++            }
+             // Mark the restored table ACTIVE immediately: the data is fully
+             // populated and ready to serve. This matches the Postgres backend
+             // and real DynamoDB, where a restored table becomes ACTIVE once the
+diff --git a/crates/storage-sqlite/src/data/delete_item.rs b/crates/storage-sqlite/src/data/delete_item.rs
+index 1aaabbe..2bb8cac 100644
+--- a/crates/storage-sqlite/src/data/delete_item.rs
++++ b/crates/storage-sqlite/src/data/delete_item.rs
+@@ -115,6 +115,7 @@ impl SqliteEngine {
+             }
+         }
+ 
++        self.before_commit(&mut tx).await?;
+         tx.commit()
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+diff --git a/crates/storage-sqlite/src/data/put_item.rs b/crates/storage-sqlite/src/data/put_item.rs
+index 5399e53..f092a3f 100644
+--- a/crates/storage-sqlite/src/data/put_item.rs
++++ b/crates/storage-sqlite/src/data/put_item.rs
+@@ -74,7 +74,7 @@ impl SqliteEngine {
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+ 
+-        let old = if need_old {
++        let old = if need_old || crate::history::enabled(&mut tx, &key_info.table_id).await? {
+             fetch_item_in_tx(&mut tx, key_info, &item).await?
+         } else {
+             None
+@@ -151,6 +151,7 @@ impl SqliteEngine {
+                 .await?;
+         }
+ 
++        self.before_commit(&mut tx).await?;
+         tx.commit()
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+diff --git a/crates/storage-sqlite/src/data/transactions.rs b/crates/storage-sqlite/src/data/transactions.rs
+index cd2708c..dc63146 100644
+--- a/crates/storage-sqlite/src/data/transactions.rs
++++ b/crates/storage-sqlite/src/data/transactions.rs
+@@ -222,6 +222,7 @@ impl SqliteEngine {
+             }
+         }
+ 
++        self.before_commit(&mut tx).await?;
+         tx.commit()
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+diff --git a/crates/storage-sqlite/src/data/update_item.rs b/crates/storage-sqlite/src/data/update_item.rs
+index e980305..d627a86 100644
+--- a/crates/storage-sqlite/src/data/update_item.rs
++++ b/crates/storage-sqlite/src/data/update_item.rs
+@@ -90,8 +90,15 @@ impl SqliteEngine {
+             .map_err(|e| StorageError::Validation(e.to_string()))?;
+         }
+ 
+-        self.capture_mutation(&mut tx, key_info, key, old.as_ref(), Some(&item), None)
+-            .await?;
++        if self
++            .capture_mutation(&mut tx, key_info, key, old.as_ref(), Some(&item), None)
++            .await?
++            == crate::mutation_hook::MutationDecision::Skip
++        {
++            let old_ret = if return_old { old.clone() } else { None };
++            let new_ret = if return_new { old } else { None };
++            return Ok((old_ret, new_ret));
++        }
+         upsert_item_in_tx(&mut tx, key_info, &item).await?;
+ 
+         if !indexes.is_empty() {
+@@ -142,6 +149,7 @@ impl SqliteEngine {
+                 .await?;
+         }
+ 
++        self.before_commit(&mut tx).await?;
+         tx.commit()
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+diff --git a/crates/storage-sqlite/src/delete_table.rs b/crates/storage-sqlite/src/delete_table.rs
+index 4621b38..fc4d929 100644
+--- a/crates/storage-sqlite/src/delete_table.rs
++++ b/crates/storage-sqlite/src/delete_table.rs
+@@ -74,6 +74,8 @@ impl SqliteEngine {
+             // on the write lock is still caught: the check and the cascade
+             // delete are atomic against a concurrent UpdateTable.
+             Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
++            self.history_before_delete(&mut tx, account_id, &input.table_name, &row.table_id)
++                .await?;
+             sqlx::query("DELETE FROM tags WHERE resource_arn = ?")
+                 .bind(&table_arn)
+                 .execute(&mut *tx)
+@@ -115,6 +117,8 @@ impl SqliteEngine {
+             // reason: without it, a build committing between an earlier check
+             // and this flip would have its table deleted underneath it.
+             Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
++            self.history_before_delete(&mut tx, account_id, &input.table_name, &row.table_id)
++                .await?;
+             sqlx::query(
+                 "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
+                  WHERE account_id = ? AND table_name = ?",
+diff --git a/crates/storage-sqlite/src/history.rs b/crates/storage-sqlite/src/history.rs
+new file mode 100644
+index 0000000..6541b76
+--- /dev/null
++++ b/crates/storage-sqlite/src/history.rs
+@@ -0,0 +1,1076 @@
++// Copyright 2026 LocalCloud contributors
++// SPDX-License-Identifier: Apache-2.0
++
++//! Transaction-local scalar history. Official SQLite writes and restore maintain all indexes.
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use extenddb_core::types::{Item, TableDescription, TableKeyInfo, TableStatus};
++use extenddb_storage::BackupEngine;
++use extenddb_storage::error::StorageError;
++use extenddb_storage::util::{parse_sk, pk_to_text, sk_column, sk_info};
++use serde_json::{Value, json};
++use sqlx::{Sqlite, SqlitePool, Transaction};
++
++use crate::backup::SnapshotData;
++use crate::data::{BoundValue, data_table_name, sk_bound};
++use crate::store::SqliteEngine;
++
++type Result<T> = std::result::Result<T, StorageError>;
++const DAY: i64 = 86_400_000_000;
++const SCHEMA: &str = "
++CREATE TABLE IF NOT EXISTS lc_pitr_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_us INTEGER NOT NULL);
++INSERT OR IGNORE INTO lc_pitr_clock VALUES(1,0);
++CREATE TABLE IF NOT EXISTS lc_pitr_windows(table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE,
++ account_id TEXT NOT NULL,table_name TEXT NOT NULL,enabled INTEGER NOT NULL,started_us INTEGER NOT NULL,floor_us INTEGER NOT NULL,days INTEGER NOT NULL CHECK(days BETWEEN 1 AND 35));
++CREATE TABLE IF NOT EXISTS lc_pitr_versions(table_id TEXT NOT NULL REFERENCES lc_pitr_windows(table_id) ON DELETE CASCADE,
++ pk TEXT NOT NULL,sk TEXT NOT NULL,at_us INTEGER NOT NULL,item_data TEXT,PRIMARY KEY(table_id,pk,sk,at_us));
++CREATE INDEX IF NOT EXISTS lc_pitr_age ON lc_pitr_versions(table_id,at_us);
++CREATE TABLE IF NOT EXISTS lc_pitr_pending(table_id TEXT NOT NULL REFERENCES lc_pitr_windows(table_id) ON DELETE CASCADE,
++ pk TEXT NOT NULL,sk TEXT NOT NULL,item_data TEXT,PRIMARY KEY(table_id,pk,sk));
++CREATE TABLE IF NOT EXISTS lc_backup_retention(backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn) ON DELETE CASCADE,kind TEXT NOT NULL,expires_us INTEGER);
++CREATE TABLE IF NOT EXISTS lc_pitr_restore_requests(backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn) ON DELETE CASCADE,source_arn TEXT NOT NULL,at_us INTEGER NOT NULL);
++CREATE TABLE IF NOT EXISTS lc_pitr_restores(table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE,source_arn TEXT NOT NULL,at_us INTEGER NOT NULL);
++";
++
++pub(crate) fn storage(error: sqlx::Error) -> StorageError {
++    StorageError::Internal(error.to_string())
++}
++fn unsupported() -> StorageError {
++    StorageError::Unsupported(
++        "PITR supports only active regional scalar tables with default-owned encryption".into(),
++    )
++}
++fn unavailable() -> StorageError {
++    StorageError::Validation(
++        "PITR_UNAVAILABLE: Point-in-time recovery is not enabled for this table".into(),
++    )
++}
++fn invalid_time() -> StorageError {
++    StorageError::Validation(
++        "PITR_INVALID_TIME: RestoreDateTime is outside the restorable interval".into(),
++    )
++}
++pub(crate) fn now_us() -> Result<i64> {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map_err(|_| StorageError::Transient("PITR clock precedes the epoch".into()))?
++        .as_micros()
++        .try_into()
++        .map_err(|_| StorageError::Transient("PITR clock is out of range".into()))
++}
++#[allow(clippy::cast_precision_loss)]
++pub(crate) fn seconds(at: i64) -> f64 {
++    at as f64 / 1_000_000.0
++}
++
++fn restore_time(at: Option<f64>, now: i64, earliest: i64) -> Result<i64> {
++    let Some(at) = at else { return Ok(now) };
++    let scaled = at * 1_000_000.0;
++    if !scaled.is_finite() || scaled < 0.0 || scaled > seconds(now) * 1_000_000.0 {
++        return Err(invalid_time());
++    }
++    #[allow(clippy::cast_possible_truncation)]
++    let requested = scaled.round() as i64;
++    if requested < earliest || requested > now {
++        return Err(invalid_time());
++    }
++    Ok(requested)
++}
++
++pub(crate) async fn initialize(pool: &SqlitePool) -> Result<()> {
++    sqlx::raw_sql(SCHEMA).execute(pool).await.map_err(storage)?;
++    Ok(())
++}
++
++#[derive(sqlx::FromRow)]
++struct Window {
++    enabled: bool,
++    started_us: i64,
++    floor_us: i64,
++    days: i64,
++}
++async fn window(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Option<Window>> {
++    sqlx::query_as("SELECT enabled,started_us,floor_us,days FROM lc_pitr_windows WHERE table_id=?")
++        .bind(id)
++        .fetch_optional(&mut **tx)
++        .await
++        .map_err(storage)
++}
++pub(crate) async fn enabled(tx: &mut Transaction<'_, Sqlite>, table_id: &str) -> Result<bool> {
++    sqlx::query_scalar(
++        "SELECT EXISTS(SELECT 1 FROM lc_pitr_windows WHERE table_id=? AND enabled=1)",
++    )
++    .bind(table_id)
++    .fetch_one(&mut **tx)
++    .await
++    .map_err(storage)
++}
++
++async fn checked_now(tx: &mut Transaction<'_, Sqlite>) -> Result<i64> {
++    let now = now_us()?;
++    let last: i64 = sqlx::query_scalar("SELECT last_us FROM lc_pitr_clock WHERE singleton=1")
++        .fetch_one(&mut **tx)
++        .await
++        .map_err(storage)?;
++    if now < last {
++        return Err(StorageError::Transient(
++            "PITR system clock moved backwards; restore the clock and retry".into(),
++        ));
++    }
++    Ok(now)
++}
++async fn commit_stamp(tx: &mut Transaction<'_, Sqlite>) -> Result<i64> {
++    let now = checked_now(tx).await?;
++    let changed = sqlx::query("UPDATE lc_pitr_clock SET last_us=? WHERE singleton=1 AND last_us<?")
++        .bind(now)
++        .bind(now)
++        .execute(&mut **tx)
++        .await
++        .map_err(storage)?;
++    if changed.rows_affected() != 1 {
++        return Err(StorageError::Transient(
++            "PITR commit clock has not advanced; retry the write".into(),
++        ));
++    }
++    Ok(now)
++}
++fn floor(window: &Window, now: i64) -> i64 {
++    window
++        .started_us
++        .max(window.floor_us)
++        .max(now - window.days * DAY)
++}
++
++impl SqliteEngine {
++    async fn history_source(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++        account: &str,
++        table: &str,
++    ) -> Result<TableDescription> {
++        let description = self.build_table_description_on(tx, account, table).await?;
++        if description.table_status != TableStatus::Active {
++            return Err(StorageError::TableNotActive(table.into()));
++        }
++        if description
++            .vector_indexes
++            .as_ref()
++            .is_some_and(|i| !i.is_empty())
++            || description.sse_description.is_some()
++            || description
++                .global_secondary_indexes
++                .as_ref()
++                .is_some_and(|i| i.iter().any(|i| i.index_status != "ACTIVE"))
++        {
++            return Err(unsupported());
++        }
++        let topology:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lc_replication_topology')").fetch_one(&mut **tx).await.map_err(storage)?;
++        if topology {
++            let global:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM lc_replication_topology WHERE table_name=? AND table_id=?)").bind(table).bind(&description.table_id).fetch_one(&mut **tx).await.map_err(storage)?;
++            if global {
++                return Err(unsupported());
++            }
++        }
++        Ok(description)
++    }
++
++    pub(crate) async fn history_stage(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++        info: &TableKeyInfo,
++        key: &Item,
++        new: Option<&Item>,
++    ) -> Result<()> {
++        if !enabled(tx, &info.table_id).await? {
++            return Ok(());
++        }
++        let partition = info.key_schema.first().ok_or_else(unsupported)?;
++        let pk = pk_to_text(key.get(&partition.attribute_name).ok_or_else(unsupported)?)?;
++        let bytes =
++            if let Some((name, kind)) = sk_info(&info.key_schema, &info.attribute_definitions) {
++                match sk_bound(&parse_sk(key.get(name).ok_or_else(unsupported)?, kind)?) {
++                    BoundValue::Text(value) => value.into_bytes(),
++                    BoundValue::Blob(value) => value,
++                }
++            } else {
++                Vec::new()
++            };
++        let sk: String = sqlx::query_scalar("SELECT hex(?)")
++            .bind(bytes)
++            .fetch_one(&mut **tx)
++            .await
++            .map_err(storage)?;
++        let item = new
++            .map(serde_json::to_string)
++            .transpose()
++            .map_err(|e| StorageError::Internal(e.to_string()))?;
++        sqlx::query("INSERT INTO lc_pitr_pending VALUES(?,?,?,?) ON CONFLICT(table_id,pk,sk) DO UPDATE SET item_data=excluded.item_data")
++            .bind(&info.table_id).bind(pk.as_ref()).bind(sk).bind(item).execute(&mut **tx).await.map_err(storage)?;
++        Ok(())
++    }
++
++    pub(crate) async fn history_commit(&self, tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
++        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM lc_pitr_pending)")
++            .fetch_one(&mut **tx)
++            .await
++            .map_err(storage)?;
++        if !pending {
++            return Ok(());
++        }
++        self.history_prune(tx, None).await?;
++        let at = commit_stamp(tx).await?;
++        sqlx::query(
++            "INSERT INTO lc_pitr_versions SELECT table_id,pk,sk,?,item_data FROM lc_pitr_pending",
++        )
++        .bind(at)
++        .execute(&mut **tx)
++        .await
++        .map_err(storage)?;
++        sqlx::query("DELETE FROM lc_pitr_pending")
++            .execute(&mut **tx)
++            .await
++            .map_err(storage)?;
++        Ok(())
++    }
++
++    pub(crate) async fn history_prune(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++        table: Option<&str>,
++    ) -> Result<()> {
++        let now = checked_now(tx).await?;
++        sqlx::query(
++            "UPDATE lc_pitr_windows SET floor_us=MAX(floor_us,started_us,?-days*86400000000) WHERE table_id=? OR (? IS NULL AND table_id IN (SELECT table_id FROM lc_pitr_pending))",
++        )
++        .bind(now)
++        .bind(table)
++        .bind(table)
++        .execute(&mut **tx)
++        .await
++        .map_err(storage)?;
++        sqlx::query("DELETE FROM lc_pitr_versions WHERE rowid IN (SELECT old.rowid FROM lc_pitr_versions old JOIN lc_pitr_windows w USING(table_id) WHERE (w.table_id=? OR (? IS NULL AND w.table_id IN (SELECT table_id FROM lc_pitr_pending))) AND old.at_us<w.floor_us AND (EXISTS(SELECT 1 FROM lc_pitr_versions newer WHERE newer.table_id=old.table_id AND newer.pk=old.pk AND newer.sk=old.sk AND newer.at_us>old.at_us AND newer.at_us<=w.floor_us) OR (old.item_data IS NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_versions older WHERE older.table_id=old.table_id AND older.pk=old.pk AND older.sk=old.sk AND older.at_us<old.at_us))) LIMIT 128)")
++            .bind(table).bind(table).execute(&mut **tx).await.map_err(storage)?;
++        sqlx::query("DELETE FROM backup_items WHERE rowid IN (SELECT i.rowid FROM backup_items i JOIN lc_backup_retention r USING(backup_arn) WHERE r.expires_us<=? LIMIT 128)").bind(now).execute(&mut **tx).await.map_err(storage)?;
++        sqlx::query("DELETE FROM backups WHERE backup_arn IN (SELECT r.backup_arn FROM lc_backup_retention r WHERE r.expires_us<=? AND NOT EXISTS(SELECT 1 FROM backup_items i WHERE i.backup_arn=r.backup_arn) LIMIT 1)").bind(now).execute(&mut **tx).await.map_err(storage)?;
++        Ok(())
++    }
++
++    pub async fn pitr_describe(&self, account: &str, table: &str) -> Result<Value> {
++        let mut tx = self.pool.begin().await.map_err(storage)?;
++        let id: String =
++            sqlx::query_scalar("SELECT table_id FROM tables WHERE account_id=? AND table_name=?")
++                .bind(account)
++                .bind(table)
++                .fetch_optional(&mut *tx)
++                .await
++                .map_err(storage)?
++                .ok_or_else(|| StorageError::TableNotFound(table.into()))?;
++        let recovery = match window(&mut tx, &id).await?.filter(|w| w.enabled) {
++            Some(window) => {
++                let now = checked_now(&mut tx).await?;
++                json!({"PointInTimeRecoveryStatus":"ENABLED","RecoveryPeriodInDays":window.days,"EarliestRestorableDateTime":seconds(floor(&window,now)),"LatestRestorableDateTime":seconds(now)})
++            }
++            None => json!({"PointInTimeRecoveryStatus":"DISABLED"}),
++        };
++        Ok(
++            json!({"ContinuousBackupsDescription":{"ContinuousBackupsStatus":"ENABLED","PointInTimeRecoveryDescription":recovery}}),
++        )
++    }
++
++    pub async fn pitr_configure(
++        &self,
++        account: &str,
++        table: &str,
++        enabled: bool,
++        days: Option<u32>,
++    ) -> Result<Value> {
++        if days.is_some_and(|days| !(1..=35).contains(&days)) {
++            return Err(StorageError::Validation(
++                "RecoveryPeriodInDays must be between 1 and 35".into(),
++            ));
++        }
++        {
++            let _writer = self.write_lock.lock().await;
++            let mut tx = self
++                .pool
++                .begin_with("BEGIN IMMEDIATE")
++                .await
++                .map_err(storage)?;
++            let description = self.history_source(&mut tx, account, table).await?;
++            let old = window(&mut tx, &description.table_id).await?;
++            let days = days
++                .map(i64::from)
++                .or_else(|| old.as_ref().map(|w| w.days))
++                .unwrap_or(35);
++            let now = checked_now(&mut tx).await?;
++            let reset = enabled && !old.as_ref().is_some_and(|w| w.enabled);
++            if reset {
++                sqlx::query("DELETE FROM lc_pitr_windows WHERE table_id=?")
++                    .bind(&description.table_id)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(storage)?;
++                let at = commit_stamp(&mut tx).await?;
++                sqlx::query("INSERT INTO lc_pitr_windows VALUES(?,?,?,1,?,?,?)")
++                    .bind(&description.table_id)
++                    .bind(account)
++                    .bind(table)
++                    .bind(at)
++                    .bind(at)
++                    .bind(days)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(storage)?;
++                let sk = sk_info(&description.key_schema, &description.attribute_definitions)
++                    .map(|(_, kind)| format!("hex(CAST({} AS BLOB))", sk_column(kind)))
++                    .unwrap_or_else(|| "''".into());
++                let source = data_table_name(&description.table_id);
++                sqlx::query(&format!(
++                    "INSERT INTO lc_pitr_versions SELECT ?,pk,{sk},?,item_data FROM {source}"
++                ))
++                .bind(&description.table_id)
++                .bind(at)
++                .execute(&mut *tx)
++                .await
++                .map_err(storage)?;
++            } else {
++                let started = old.as_ref().map(|w| w.started_us).unwrap_or(now);
++                let floor = old
++                    .as_ref()
++                    .map(|w| w.floor_us)
++                    .unwrap_or(now)
++                    .max(started)
++                    .max(now - days * DAY);
++                sqlx::query("INSERT INTO lc_pitr_windows VALUES(?,?,?,?,?,?,?) ON CONFLICT(table_id) DO UPDATE SET enabled=excluded.enabled,floor_us=excluded.floor_us,days=excluded.days")
++                    .bind(&description.table_id).bind(account).bind(table).bind(enabled).bind(started).bind(floor).bind(days).execute(&mut *tx).await.map_err(storage)?;
++            }
++            if !enabled {
++                sqlx::query("DELETE FROM lc_pitr_versions WHERE table_id=?")
++                    .bind(&description.table_id)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(storage)?;
++                sqlx::query("DELETE FROM lc_pitr_pending WHERE table_id=?")
++                    .bind(&description.table_id)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(storage)?;
++            }
++            self.history_prune(&mut tx, Some(&description.table_id))
++                .await?;
++            tx.commit().await.map_err(storage)?;
++        }
++        self.pitr_describe(account, table).await
++    }
++
++    pub async fn pitr_restore(
++        &self,
++        account: &str,
++        source: &str,
++        target: &str,
++        at: Option<f64>,
++    ) -> Result<Value> {
++        let arn = {
++            let _writer = self.write_lock.lock().await;
++            let mut tx = self
++                .pool
++                .begin_with("BEGIN IMMEDIATE")
++                .await
++                .map_err(storage)?;
++            let exists: bool = sqlx::query_scalar(
++                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id=? AND table_name=?)",
++            )
++            .bind(account)
++            .bind(target)
++            .fetch_one(&mut *tx)
++            .await
++            .map_err(storage)?;
++            if exists {
++                return Err(StorageError::TableAlreadyExists(target.into()));
++            }
++            let description = self.history_source(&mut tx, account, source).await?;
++            let window = window(&mut tx, &description.table_id)
++                .await?
++                .filter(|w| w.enabled)
++                .ok_or_else(unavailable)?;
++            let now = checked_now(&mut tx).await?;
++            let requested = restore_time(at, now, floor(&window, now))?;
++            let backup = self
++                .snapshot_on(
++                    &mut tx,
++                    account,
++                    source,
++                    "__pitr_restore__",
++                    SnapshotData::Historical(requested),
++                    "INTERNAL",
++                    Some(now + DAY),
++                )
++                .await?;
++            sqlx::query("INSERT INTO lc_pitr_restore_requests VALUES(?,?,?)")
++                .bind(&backup.backup_arn)
++                .bind(&description.table_arn)
++                .bind(requested)
++                .execute(&mut *tx)
++                .await
++                .map_err(storage)?;
++            tx.commit().await.map_err(storage)?;
++            backup.backup_arn
++        };
++        if let Err(error) = self.restore_table_from_backup(account, target, &arn).await {
++            self.delete_backup(account, &arn).await?;
++            return Err(error);
++        }
++        let description = self.build_table_description(account, target).await?;
++        Ok(json!({"TableDescription":description}))
++    }
++
++    pub(crate) async fn history_before_delete(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++        account: &str,
++        table: &str,
++        id: &str,
++    ) -> Result<()> {
++        if window(tx, id).await?.is_some_and(|w| w.enabled) {
++            let source = self.history_source(tx, account, table).await?;
++            if source.table_id != id {
++                return Err(StorageError::TableNotFound(table.into()));
++            }
++            let now = checked_now(tx).await?;
++            const SUFFIX: &str = "$DeletedTableBackup";
++            let prefix = table
++                .get(..table.len().min(255 - SUFFIX.len()))
++                .ok_or_else(unsupported)?;
++            let name = format!("{prefix}{SUFFIX}");
++            self.snapshot_on(
++                tx,
++                account,
++                table,
++                &name,
++                SnapshotData::Current,
++                "SYSTEM",
++                Some(now + 35 * DAY),
++            )
++            .await?;
++        }
++        sqlx::query("DELETE FROM lc_pitr_windows WHERE table_id=?")
++            .bind(id)
++            .execute(&mut **tx)
++            .await
++            .map_err(storage)?;
++        Ok(())
++    }
++
++    pub(crate) async fn history_refuse_vector_update(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++        id: &str,
++    ) -> Result<()> {
++        if window(tx, id).await?.is_some_and(|w| w.enabled) {
++            return Err(unsupported());
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use extenddb_core::expression::ExpressionMaps;
++    use extenddb_core::types::{
++        CreateTableInput, DeleteTableInput, ReturnValuesOnConditionCheckFailure,
++    };
++    use extenddb_storage::{DataEngine, TableEngine, TransactWriteOp};
++
++    const ACCOUNT: &str = "000000000000";
++    async fn engine() -> SqliteEngine {
++        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
++            .await
++            .unwrap();
++        crate::schema::apply(&engine.pool).await.unwrap();
++        sqlx::query("INSERT INTO accounts(account_id,account_name) VALUES(?,'default')")
++            .bind(ACCOUNT)
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        sqlx::query(
++            "INSERT OR REPLACE INTO settings(key,value) VALUES('control_plane_delay_seconds','0')",
++        )
++        .execute(&engine.pool)
++        .await
++        .unwrap();
++        engine
++    }
++    async fn table(engine: &SqliteEngine, name: &str) -> TableKeyInfo {
++        let input:CreateTableInput=serde_json::from_value(json!({"TableName":name,"BillingMode":"PAY_PER_REQUEST","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]})).unwrap();
++        engine
++            .create_table_impl(ACCOUNT, input, false)
++            .await
++            .unwrap();
++        engine.table_key_info(ACCOUNT, name).await.unwrap()
++    }
++    fn item(key: &str, value: &str) -> Item {
++        serde_json::from_value(json!({"pk":{"S":key},"value":{"S":value}})).unwrap()
++    }
++    fn key(key: &str) -> Item {
++        serde_json::from_value(json!({"pk":{"S":key}})).unwrap()
++    }
++    async fn put(engine: &SqliteEngine, info: &TableKeyInfo, item: Item) {
++        engine
++            .put_item(info, item, false, None, &ExpressionMaps::default(), None)
++            .await
++            .unwrap();
++    }
++    async fn versions(engine: &SqliteEngine) -> i64 {
++        sqlx::query_scalar("SELECT COUNT(*) FROM lc_pitr_versions")
++            .fetch_one(&engine.pool)
++            .await
++            .unwrap()
++    }
++
++    #[test]
++    fn timestamp_roundtrip_is_exact_and_invalid_times_are_refused() {
++        for now in [1_793_995_929_739_001, 1_793_995_929_739_999] {
++            assert_eq!(restore_time(None, now, now - 1).unwrap(), now);
++            assert_eq!(restore_time(Some(seconds(now)), now, now).unwrap(), now);
++            assert!(restore_time(Some(seconds(now - 100)), now, now).is_err());
++        }
++        for value in [f64::NAN, f64::INFINITY, -1.0] {
++            assert!(restore_time(Some(value), 100, 0).is_err());
++        }
++    }
++
++    #[tokio::test]
++    async fn baseline_updates_tombstones_and_noop_writes_restore_real_older_data() {
++        let engine = engine().await;
++        let info = table(&engine, "history-source").await;
++        put(&engine, &info, item("first", "before-enable")).await;
++        engine
++            .pitr_configure(ACCOUNT, "history-source", true, Some(1))
++            .await
++            .unwrap();
++        let at: i64 = sqlx::query_scalar("SELECT MAX(at_us) FROM lc_pitr_versions")
++            .fetch_one(&engine.pool)
++            .await
++            .unwrap();
++        assert_eq!(versions(&engine).await, 1);
++        put(&engine, &info, item("first", "before-enable")).await;
++        assert_eq!(
++            versions(&engine).await,
++            1,
++            "same-image PutItem must not create a version"
++        );
++        put(&engine, &info, item("first", "after-enable")).await;
++        engine
++            .delete_item(
++                &info,
++                &key("first"),
++                false,
++                None,
++                &ExpressionMaps::default(),
++                None,
++            )
++            .await
++            .unwrap();
++        assert_eq!(versions(&engine).await, 3);
++        engine
++            .delete_item(
++                &info,
++                &key("absent"),
++                false,
++                None,
++                &ExpressionMaps::default(),
++                None,
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            versions(&engine).await,
++            3,
++            "absent DeleteItem must not create a tombstone"
++        );
++        let update:extenddb_core::types::UpdateTableInput=serde_json::from_value(json!({"TableName":"history-source","BillingMode":"PROVISIONED","ProvisionedThroughput":{"ReadCapacityUnits":7,"WriteCapacityUnits":9}})).unwrap();
++        engine.update_table_impl(ACCOUNT, update).await.unwrap();
++        let result = engine
++            .pitr_restore(
++                ACCOUNT,
++                "history-source",
++                "historical-target",
++                Some(seconds(at)),
++            )
++            .await
++            .unwrap();
++        assert_eq!(result["TableDescription"]["TableStatus"], "ACTIVE");
++        assert_eq!(
++            result["TableDescription"]["ProvisionedThroughput"]["ReadCapacityUnits"],
++            7
++        );
++        assert_eq!(
++            result["TableDescription"]["RestoreSummary"]["SourceTableArn"],
++            "arn:aws:dynamodb:us-east-1:000000000000:table/history-source"
++        );
++        let restored = engine
++            .table_key_info(ACCOUNT, "historical-target")
++            .await
++            .unwrap();
++        assert_eq!(
++            engine.get_item(&restored, &key("first")).await.unwrap(),
++            Some(item("first", "before-enable"))
++        );
++        let internal: i64 =
++            sqlx::query_scalar("SELECT COUNT(*) FROM lc_backup_retention WHERE kind='INTERNAL'")
++                .fetch_one(&engine.pool)
++                .await
++                .unwrap();
++        assert_eq!(
++            internal, 0,
++            "successful restore consumes its internal snapshot atomically"
++        );
++        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backups")
++            .fetch_one(&engine.pool)
++            .await
++            .unwrap();
++        assert!(
++            engine
++                .pitr_restore(ACCOUNT, "history-source", "historical-target", None)
++                .await
++                .is_err()
++        );
++        assert_eq!(
++            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM backups")
++                .fetch_one(&engine.pool)
++                .await
++                .unwrap(),
++            count,
++            "existing target must not materialize a snapshot"
++        );
++    }
++
++    #[tokio::test]
++    async fn transaction_uses_one_commit_stamp_and_clock_failure_rolls_back_base_and_history() {
++        let engine = engine().await;
++        let info = table(&engine, "transaction-source").await;
++        engine
++            .pitr_configure(ACCOUNT, "transaction-source", true, None)
++            .await
++            .unwrap();
++        let left = item("left", "committed");
++        let right = item("right", "committed");
++        let maps = ExpressionMaps::default();
++        let operations = [
++            TransactWriteOp::Put {
++                key_info: &info,
++                item: &left,
++                condition: None,
++                maps: &maps,
++                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
++                stream: None,
++            },
++            TransactWriteOp::Put {
++                key_info: &info,
++                item: &right,
++                condition: None,
++                maps: &maps,
++                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
++                stream: None,
++            },
++        ];
++        engine
++            .transact_write_items_impl(&operations, None)
++            .await
++            .unwrap();
++        let (rows, stamps): (i64, i64) =
++            sqlx::query_as("SELECT COUNT(*),COUNT(DISTINCT at_us) FROM lc_pitr_versions")
++                .fetch_one(&engine.pool)
++                .await
++                .unwrap();
++        assert_eq!((rows, stamps), (2, 1));
++        sqlx::query("UPDATE lc_pitr_clock SET last_us=?")
++            .bind(now_us().unwrap() + DAY)
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        assert!(
++            engine
++                .put_item(
++                    &info,
++                    item("failure", "must-rollback"),
++                    false,
++                    None,
++                    &maps,
++                    None
++                )
++                .await
++                .is_err()
++        );
++        assert_eq!(engine.get_item(&info, &key("failure")).await.unwrap(), None);
++        assert_eq!(versions(&engine).await, 2);
++        assert_eq!(
++            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM lc_pitr_pending")
++                .fetch_one(&engine.pool)
++                .await
++                .unwrap(),
++            0
++        );
++    }
++
++    #[tokio::test]
++    async fn shrinking_retention_keeps_anchor_and_tombstone_without_resurrecting_old_window() {
++        let engine = engine().await;
++        let info = table(&engine, "retention-source").await;
++        engine
++            .pitr_configure(ACCOUNT, "retention-source", true, Some(35))
++            .await
++            .unwrap();
++        let now = now_us().unwrap();
++        sqlx::query("UPDATE lc_pitr_windows SET started_us=?,floor_us=? WHERE table_id=?")
++            .bind(now - 40 * DAY)
++            .bind(now - 40 * DAY)
++            .bind(&info.table_id)
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        for (at, value) in [
++            (now - 3 * DAY, Some("old")),
++            (now - 2 * DAY, Some("anchor")),
++            (now - DAY / 2, None),
++        ] {
++            let value = value.map(|value| serde_json::to_string(&item("key", value)).unwrap());
++            sqlx::query("INSERT INTO lc_pitr_versions VALUES(?,'key','',?,?)")
++                .bind(&info.table_id)
++                .bind(at)
++                .bind(value)
++                .execute(&engine.pool)
++                .await
++                .unwrap();
++        }
++        engine
++            .pitr_configure(ACCOUNT, "retention-source", true, Some(1))
++            .await
++            .unwrap();
++        assert_eq!(versions(&engine).await, 2);
++        let old_floor: i64 = sqlx::query_scalar("SELECT floor_us FROM lc_pitr_windows")
++            .fetch_one(&engine.pool)
++            .await
++            .unwrap();
++        engine
++            .pitr_configure(ACCOUNT, "retention-source", true, Some(35))
++            .await
++            .unwrap();
++        let floor: i64 = sqlx::query_scalar("SELECT floor_us FROM lc_pitr_windows")
++            .fetch_one(&engine.pool)
++            .await
++            .unwrap();
++        assert!(floor >= old_floor);
++        let result = engine
++            .pitr_restore(ACCOUNT, "retention-source", "retention-restored", None)
++            .await
++            .unwrap();
++        assert_eq!(
++            result["TableDescription"]["ItemCount"], 0,
++            "tombstone prevents resurrection"
++        );
++
++        let churn = table(&engine, "churn-source").await;
++        engine
++            .pitr_configure(ACCOUNT, "churn-source", true, Some(1))
++            .await
++            .unwrap();
++        let floor = now_us().unwrap() - DAY;
++        sqlx::query("UPDATE lc_pitr_windows SET started_us=?,floor_us=? WHERE table_id=?")
++            .bind(floor - DAY)
++            .bind(floor)
++            .bind(&churn.table_id)
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        for n in 0..300 {
++            sqlx::query("INSERT INTO lc_pitr_versions VALUES(?,'deleted','',?,?)")
++                .bind(&churn.table_id)
++                .bind(floor - 1000 + n)
++                .bind(serde_json::to_string(&item("deleted", "old-alive")).unwrap())
++                .execute(&engine.pool)
++                .await
++                .unwrap();
++        }
++        for (key, at, value) in [
++            ("deleted", floor - 500, None),
++            ("recreated", floor - 500, None),
++            ("recreated", floor + DAY / 2, Some("new-alive")),
++            ("live", floor - 500, Some("anchor")),
++        ] {
++            let value = value.map(|value| serde_json::to_string(&item(key, value)).unwrap());
++            sqlx::query("INSERT INTO lc_pitr_versions VALUES(?,?,'',?,?)")
++                .bind(&churn.table_id)
++                .bind(key)
++                .bind(at)
++                .bind(value)
++                .execute(&engine.pool)
++                .await
++                .unwrap();
++        }
++        for _ in 0..5 {
++            let before: i64 =
++                sqlx::query_scalar("SELECT COUNT(*) FROM lc_pitr_versions WHERE table_id=?")
++                    .bind(&churn.table_id)
++                    .fetch_one(&engine.pool)
++                    .await
++                    .unwrap();
++            let mut tx = engine.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
++            engine
++                .history_prune(&mut tx, Some(&churn.table_id))
++                .await
++                .unwrap();
++            tx.commit().await.unwrap();
++            let after: i64 =
++                sqlx::query_scalar("SELECT COUNT(*) FROM lc_pitr_versions WHERE table_id=?")
++                    .bind(&churn.table_id)
++                    .fetch_one(&engine.pool)
++                    .await
++                    .unwrap();
++            assert!(before - after <= 128, "history cleanup must remain bounded");
++            for (key, at, expected) in [
++                ("deleted", floor + DAY / 4, None),
++                ("recreated", floor + DAY / 4, None),
++                ("recreated", floor + DAY / 2, Some("new-alive")),
++                ("live", floor + DAY / 4, Some("anchor")),
++            ] {
++                let row:Option<(Option<String>,)>=sqlx::query_as("SELECT item_data FROM lc_pitr_versions WHERE table_id=? AND pk=? AND sk='' AND at_us<=? ORDER BY at_us DESC LIMIT 1")
++                    .bind(&churn.table_id).bind(key).bind(at).fetch_optional(&engine.pool).await.unwrap();
++                let actual = row.and_then(|row| row.0);
++                let expected =
++                    expected.map(|value| serde_json::to_string(&item(key, value)).unwrap());
++                assert_eq!(
++                    actual, expected,
++                    "pruning must preserve absence and future recreation"
++                );
++            }
++        }
++        let remaining: i64 = sqlx::query_scalar(
++            "SELECT COUNT(*) FROM lc_pitr_versions WHERE table_id=? AND pk='deleted'",
++        )
++        .bind(&churn.table_id)
++        .fetch_one(&engine.pool)
++        .await
++        .unwrap();
++        assert_eq!(
++            remaining, 0,
++            "old tombstones cannot accumulate after prior versions are gone"
++        );
++    }
++
++    #[tokio::test]
++    async fn disable_discards_unrestorable_history_and_reenable_captures_a_new_baseline() {
++        let engine = engine().await;
++        let info = table(&engine, "toggle-source").await;
++        put(&engine, &info, item("key", "initial")).await;
++        engine
++            .pitr_configure(ACCOUNT, "toggle-source", true, Some(1))
++            .await
++            .unwrap();
++        let old: i64 = sqlx::query_scalar("SELECT started_us FROM lc_pitr_windows")
++            .fetch_one(&engine.pool)
++            .await
++            .unwrap();
++        engine
++            .pitr_configure(ACCOUNT, "toggle-source", false, None)
++            .await
++            .unwrap();
++        assert_eq!(versions(&engine).await, 0);
++        assert_eq!(
++            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM lc_pitr_pending")
++                .fetch_one(&engine.pool)
++                .await
++                .unwrap(),
++            0
++        );
++        put(&engine, &info, item("key", "while-disabled")).await;
++        assert_eq!(versions(&engine).await, 0);
++        assert!(
++            engine
++                .pitr_restore(ACCOUNT, "toggle-source", "disabled-target", None)
++                .await
++                .is_err()
++        );
++        engine
++            .pitr_configure(ACCOUNT, "toggle-source", true, None)
++            .await
++            .unwrap();
++        let new: i64 = sqlx::query_scalar("SELECT started_us FROM lc_pitr_windows")
++            .fetch_one(&engine.pool)
++            .await
++            .unwrap();
++        assert!(new > old);
++        assert_eq!(versions(&engine).await, 1);
++        assert!(
++            engine
++                .pitr_restore(
++                    ACCOUNT,
++                    "toggle-source",
++                    "old-time-target",
++                    Some(seconds(old))
++                )
++                .await
++                .is_err()
++        );
++        engine
++            .pitr_restore(ACCOUNT, "toggle-source", "new-time-target", None)
++            .await
++            .unwrap();
++        let restored = engine
++            .table_key_info(ACCOUNT, "new-time-target")
++            .await
++            .unwrap();
++        assert_eq!(
++            engine.get_item(&restored, &key("key")).await.unwrap(),
++            Some(item("key", "while-disabled"))
++        );
++    }
++
++    #[tokio::test]
++    async fn deleting_pitr_table_keeps_a_real_system_snapshot_and_recreation_has_no_old_history() {
++        let engine = engine().await;
++        let info = table(&engine, "deletion-source").await;
++        put(&engine, &info, item("key", "latest-before-delete")).await;
++        engine
++            .pitr_configure(ACCOUNT, "deletion-source", true, Some(1))
++            .await
++            .unwrap();
++        let input: DeleteTableInput =
++            serde_json::from_value(json!({"TableName":"deletion-source"})).unwrap();
++        engine.delete_table_impl(ACCOUNT, input).await.unwrap();
++        let backups = engine
++            .list_backup_page_typed(ACCOUNT, None, "", None, None, 100, Some("SYSTEM"))
++            .await
++            .unwrap();
++        assert_eq!(backups.len(), 1);
++        let arn = &backups[0].backup_arn;
++        assert_eq!(backups[0].backup_type, "SYSTEM");
++        assert_eq!(backups[0].backup_name, "deletion-source$DeletedTableBackup");
++        assert!(
++            engine.backup_expiry(ACCOUNT, arn).await.unwrap().unwrap()
++                > seconds(now_us().unwrap() + 34 * DAY)
++        );
++        engine
++            .restore_table_from_backup(ACCOUNT, "system-restored", arn)
++            .await
++            .unwrap();
++        let restored = engine
++            .table_key_info(ACCOUNT, "system-restored")
++            .await
++            .unwrap();
++        assert_eq!(
++            engine.get_item(&restored, &key("key")).await.unwrap(),
++            Some(item("key", "latest-before-delete"))
++        );
++        let replacement = table(&engine, "deletion-source").await;
++        assert_ne!(replacement.table_id, info.table_id);
++        assert_eq!(
++            engine
++                .pitr_describe(ACCOUNT, "deletion-source")
++                .await
++                .unwrap()["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"],
++            "DISABLED"
++        );
++        sqlx::query("UPDATE lc_backup_retention SET expires_us=0 WHERE backup_arn=?")
++            .bind(arn)
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++        assert!(engine.backup_kind(ACCOUNT, arn).await.is_err());
++        assert!(
++            engine
++                .restore_table_from_backup(ACCOUNT, "expired-target", arn)
++                .await
++                .is_err()
++        );
++        assert!(
++            engine
++                .list_backup_page_typed(ACCOUNT, None, "", None, None, 100, Some("SYSTEM"))
++                .await
++                .unwrap()
++                .is_empty()
++        );
++    }
++}
++
++#[cfg(test)]
++mod compound_key_tests {
++    use super::*;
++    use extenddb_core::expression::ExpressionMaps;
++    use extenddb_core::types::CreateTableInput;
++    use extenddb_storage::{DataEngine, TableEngine};
++
++    #[tokio::test]
++    async fn numeric_and_binary_sort_keys_share_baseline_and_mutation_identity() {
++        for (kind, sort) in [("N", json!({"N":"1.00"})), ("B", json!({"B":"AAEC"}))] {
++            let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
++                .await
++                .unwrap();
++            crate::schema::apply(&engine.pool).await.unwrap();
++            sqlx::query(
++                "INSERT INTO accounts(account_id,account_name) VALUES('000000000000','default')",
++            )
++            .execute(&engine.pool)
++            .await
++            .unwrap();
++            sqlx::query("INSERT OR REPLACE INTO settings(key,value) VALUES('control_plane_delay_seconds','0')").execute(&engine.pool).await.unwrap();
++            let input:CreateTableInput=serde_json::from_value(json!({"TableName":"compound-source","BillingMode":"PAY_PER_REQUEST","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":kind}]})).unwrap();
++            engine
++                .create_table_impl("000000000000", input, false)
++                .await
++                .unwrap();
++            let info = engine
++                .table_key_info("000000000000", "compound-source")
++                .await
++                .unwrap();
++            let before: Item = serde_json::from_value(
++                json!({"pk":{"S":"key"},"sk":sort,"payload":{"S":"baseline"}}),
++            )
++            .unwrap();
++            let after: Item = serde_json::from_value(
++                json!({"pk":{"S":"key"},"sk":sort,"payload":{"S":"changed"}}),
++            )
++            .unwrap();
++            let key: Item = serde_json::from_value(json!({"pk":{"S":"key"},"sk":sort})).unwrap();
++            engine
++                .put_item(&info, before, false, None, &ExpressionMaps::default(), None)
++                .await
++                .unwrap();
++            engine
++                .pitr_configure("000000000000", "compound-source", true, None)
++                .await
++                .unwrap();
++            engine
++                .put_item(
++                    &info,
++                    after.clone(),
++                    false,
++                    None,
++                    &ExpressionMaps::default(),
++                    None,
++                )
++                .await
++                .unwrap();
++            let (rows, identities): (i64, i64) =
++                sqlx::query_as("SELECT COUNT(*),COUNT(DISTINCT sk) FROM lc_pitr_versions")
++                    .fetch_one(&engine.pool)
++                    .await
++                    .unwrap();
++            assert_eq!(
++                (rows, identities),
++                (2, 1),
++                "canonical sort key must match baseline and mutation"
++            );
++            engine
++                .pitr_restore("000000000000", "compound-source", "compound-restored", None)
++                .await
++                .unwrap();
++            let restored = engine
++                .table_key_info("000000000000", "compound-restored")
++                .await
++                .unwrap();
++            assert_eq!(engine.get_item(&restored, &key).await.unwrap(), Some(after));
++        }
++    }
++}
+diff --git a/crates/storage-sqlite/src/lib.rs b/crates/storage-sqlite/src/lib.rs
+index 48864d5..4324eb8 100644
+--- a/crates/storage-sqlite/src/lib.rs
++++ b/crates/storage-sqlite/src/lib.rs
+@@ -30,6 +30,7 @@ mod create_table;
+ mod credential_store;
+ mod data;
+ mod delete_table;
++mod history;
+ mod hooks;
+ mod management_store;
+ mod metadata;
+diff --git a/crates/storage-sqlite/src/mutation_hook.rs b/crates/storage-sqlite/src/mutation_hook.rs
+index 35dc29b..9c61f54 100644
+--- a/crates/storage-sqlite/src/mutation_hook.rs
++++ b/crates/storage-sqlite/src/mutation_hook.rs
+@@ -25,6 +25,12 @@ pub struct Mutation<'a> {
+ }
+ 
+ pub trait MutationHook: Send + Sync {
++    fn before_commit<'a, 'c>(
++        &'a self,
++        _tx: &'a mut Transaction<'c, Sqlite>,
++    ) -> BoxFuture<'a, Result<(), StorageError>> {
++        Box::pin(async { Ok(()) })
++    }
+     fn capture<'a, 'c>(
+         &'a self,
+         tx: &'a mut Transaction<'c, Sqlite>,
+@@ -48,7 +54,7 @@ impl SqliteEngine {
+         new: Option<&Item>,
+         context: Option<&serde_json::Value>,
+     ) -> Result<MutationDecision, StorageError> {
+-        match self.mutation_hook.get() {
++        let decision = match self.mutation_hook.get() {
+             Some(hook) => {
+                 hook.capture(
+                     tx,
+@@ -60,10 +66,24 @@ impl SqliteEngine {
+                         context,
+                     },
+                 )
+-                .await
++                .await?
+             }
+-            None => Ok(MutationDecision::Apply),
++            None => MutationDecision::Apply,
++        };
++        if decision == MutationDecision::Apply && old != new {
++            self.history_stage(tx, key_info, key, new).await?;
++        }
++        Ok(decision)
++    }
++
++    pub(crate) async fn before_commit(
++        &self,
++        tx: &mut Transaction<'_, Sqlite>,
++    ) -> Result<(), StorageError> {
++        if let Some(hook) = self.mutation_hook.get() {
++            hook.before_commit(tx).await?;
+         }
++        self.history_commit(tx).await
+     }
+ 
+     /// Apply an externally committed image through normal index/vector/stream maintenance.
+diff --git a/crates/storage-sqlite/src/store.rs b/crates/storage-sqlite/src/store.rs
+index 3cbb40e..8ea4a53 100644
+--- a/crates/storage-sqlite/src/store.rs
++++ b/crates/storage-sqlite/src/store.rs
+@@ -150,6 +150,7 @@ impl SqliteEngine {
+                 .and_then(|(v,)| v.parse::<u64>().ok())
+                 .unwrap_or(10);
+ 
++        crate::history::initialize(&pool).await?;
+         Ok(Self {
+             mutation_hook: Arc::new(std::sync::OnceLock::new()),
+             pool,
+diff --git a/crates/storage-sqlite/src/table_helpers.rs b/crates/storage-sqlite/src/table_helpers.rs
+index 8aeca27..0fc48d5 100644
+--- a/crates/storage-sqlite/src/table_helpers.rs
++++ b/crates/storage-sqlite/src/table_helpers.rs
+@@ -172,6 +172,20 @@ impl SqliteEngine {
+             .collect::<Result<Vec<_>, _>>()?;
+         desc.vector_indexes =
+             vector_index_descriptions(&self.region, account_id, &table_name_owned, catalog_rows)?;
++        let recovery: Option<(String, i64)> =
++            sqlx::query_as("SELECT source_arn,at_us FROM lc_pitr_restores WHERE table_id=?")
++                .bind(&desc.table_id)
++                .fetch_optional(&mut *connection)
++                .await
++                .map_err(|e| StorageError::Internal(e.to_string()))?;
++        if let Some((source, at)) = recovery {
++            desc.restore_summary = Some(extenddb_core::types::RestoreSummary {
++                source_table_arn: Some(source),
++                source_backup_arn: None,
++                restore_date_time: crate::history::seconds(at),
++                restore_in_progress: false,
++            });
++        }
+         Ok(desc)
+     }
+ 
+diff --git a/crates/storage-sqlite/src/update_table.rs b/crates/storage-sqlite/src/update_table.rs
+index d527c3e..fcd5b44 100644
+--- a/crates/storage-sqlite/src/update_table.rs
++++ b/crates/storage-sqlite/src/update_table.rs
+@@ -90,6 +90,14 @@ impl SqliteEngine {
+             return Err(StorageError::TableNotActive(input.table_name.clone()));
+         }
+ 
++        if input
++            .vector_index_updates
++            .as_ref()
++            .is_some_and(|updates| !updates.is_empty())
++        {
++            self.history_refuse_vector_update(&mut tx, &table_id)
++                .await?;
++        }
+         // A table holding vector indexes cannot leave PAY_PER_REQUEST. Same
+         // message as CreateTable's rejection; measured 2026-08-13 by switching
+         // a live vector table to PROVISIONED.

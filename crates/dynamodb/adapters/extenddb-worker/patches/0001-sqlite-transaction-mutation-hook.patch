@@ -323,3 +323,15 @@ index f83b42c..5062858 100755
  {
  }
  
+diff --git a/crates/storage-sqlite/src/vector_bench.rs b/crates/storage-sqlite/src/vector_bench.rs
+--- a/crates/storage-sqlite/src/vector_bench.rs
++++ b/crates/storage-sqlite/src/vector_bench.rs
+@@ -156,7 +156,7 @@
+             );
+             item.insert("filler".to_owned(), AttributeValue::S(filler.clone()));
+             engine
+-                .put_item_impl(&key_info, item, false, None, &maps, None)
++                .put_item_impl(&key_info, item, false, None, &maps, None, None)
+                 .await
+                 .expect("put item");
+         }

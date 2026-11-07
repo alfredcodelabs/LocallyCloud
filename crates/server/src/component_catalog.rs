@@ -14,6 +14,7 @@ pub(super) const REQUIRED_CAPABILITIES: &[&str] = &[
     "mrec-outbox-v1",
     "backups-v1",
     "migration-ttl-v1",
+    "pitr-history-v1",
 ];
 
 #[derive(Deserialize)]

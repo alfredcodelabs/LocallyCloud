@@ -25,6 +25,9 @@ pub trait DynamoEngine: NativeHandler {
     fn supports_owned_encryption(&self) -> bool {
         false
     }
+    fn supports_pitr(&self) -> bool {
+        false
+    }
     fn supports_backups(&self) -> bool {
         false
     }
@@ -137,6 +140,9 @@ fn supported(prefix: &str, op: &str) -> bool {
                 | "ListBackups"
                 | "DeleteBackup"
                 | "RestoreTableFromBackup"
+                | "DescribeContinuousBackups"
+                | "UpdateContinuousBackups"
+                | "RestoreTableToPointInTime"
                 | "ListTagsOfResource"
                 | "TagResource"
                 | "UntagResource"
@@ -288,6 +294,123 @@ fn validate_owned_encryption(op: &str, body: &Value, supported: bool) -> Result<
     Ok(())
 }
 
+fn pitr_table(request: &ServiceRequest, value: &Value, field: &str) -> Result<(), DdbError> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| DdbError::Validation(format!("{field} must be a string")))?;
+    let name = if raw.starts_with("arn:") {
+        raw.strip_prefix(&format!(
+            "arn:aws:dynamodb:{}:{}:table/",
+            request.region, request.account_id
+        ))
+        .ok_or_else(|| {
+            DdbError::Validation("PITR source ARN must match the request account and region".into())
+        })?
+    } else {
+        raw
+    };
+    crate::store::validate_table_name(name)
+}
+
+fn validate_pitr(request: &ServiceRequest, operation: &str, body: &Value) -> Result<(), DdbError> {
+    let fields = match operation {
+        "DescribeContinuousBackups" => &["TableName"][..],
+        "UpdateContinuousBackups" => &["TableName", "PointInTimeRecoverySpecification"][..],
+        "RestoreTableToPointInTime" => &[
+            "SourceTableName",
+            "SourceTableArn",
+            "TargetTableName",
+            "RestoreDateTime",
+            "UseLatestRestorableTime",
+        ][..],
+        _ => return Ok(()),
+    };
+    let object = body
+        .as_object()
+        .ok_or_else(|| DdbError::Validation("PITR request must be an object".into()))?;
+    if object.keys().any(|field| !fields.contains(&field.as_str())) {
+        return Err(DdbError::Validation(
+            "PITR restore overrides and unknown fields are not supported by this engine".into(),
+        ));
+    }
+    if operation == "RestoreTableToPointInTime" {
+        let source = service::pitr_source(body)?;
+        if body.get("SourceTableArn").is_some() && !source.starts_with("arn:") {
+            return Err(DdbError::Validation(
+                "SourceTableArn must be a table ARN".into(),
+            ));
+        }
+        pitr_table(request, &Value::String(source.into()), "PITR source")?;
+        let target = body
+            .get("TargetTableName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DdbError::Validation("TargetTableName is required".into()))?;
+        crate::store::validate_table_name(target)?;
+        let latest = match body.get("UseLatestRestorableTime") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                DdbError::Validation("UseLatestRestorableTime must be a boolean".into())
+            })?,
+        };
+        let timestamp = body
+            .get("RestoreDateTime")
+            .map(|value| {
+                value
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| {
+                        DdbError::Validation("RestoreDateTime must be a finite number".into())
+                    })
+            })
+            .transpose()?;
+        if latest == timestamp.is_some() {
+            return Err(DdbError::Validation(
+                "Specify either RestoreDateTime or UseLatestRestorableTime=true".into(),
+            ));
+        }
+        return Ok(());
+    }
+    pitr_table(
+        request,
+        body.get("TableName")
+            .ok_or_else(|| DdbError::Validation("TableName is required".into()))?,
+        "TableName",
+    )?;
+    if operation == "UpdateContinuousBackups" {
+        let specification = body
+            .get("PointInTimeRecoverySpecification")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                DdbError::Validation("PointInTimeRecoverySpecification is required".into())
+            })?;
+        if specification.keys().any(|field| {
+            !matches!(
+                field.as_str(),
+                "PointInTimeRecoveryEnabled" | "RecoveryPeriodInDays"
+            )
+        }) {
+            return Err(DdbError::Validation(
+                "unknown point-in-time recovery setting".into(),
+            ));
+        }
+        specification
+            .get("PointInTimeRecoveryEnabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                DdbError::Validation("PointInTimeRecoveryEnabled must be a boolean".into())
+            })?;
+        if specification
+            .get("RecoveryPeriodInDays")
+            .is_some_and(|value| value.as_u64().is_none_or(|days| !(1..=35).contains(&days)))
+        {
+            return Err(DdbError::Validation(
+                "RecoveryPeriodInDays must be an integer from 1 to 35".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl EngineHandler {
     async fn authorization_body(
         &self,
@@ -359,6 +482,16 @@ impl NativeHandler for EngineHandler {
             )
             .into_response(&request.request_id);
         }
+        if matches!(
+            op.as_str(),
+            "DescribeContinuousBackups" | "UpdateContinuousBackups" | "RestoreTableToPointInTime"
+        ) && !self.engine.supports_pitr()
+        {
+            return DdbError::UnknownOperation(
+                "point-in-time recovery is not supported by this DynamoDB engine".into(),
+            )
+            .into_response(&request.request_id);
+        }
         let body = match service::parse_body(&request) {
             Ok(body) => body,
             Err(error) => return error.into_response(&request.request_id),
@@ -376,6 +509,7 @@ impl NativeHandler for EngineHandler {
             &authorization_body,
             self.engine.supports_mrec(),
         )
+        .and_then(|()| validate_pitr(&request, &op, &authorization_body))
         .and_then(|()| {
             validate_owned_encryption(
                 &op,
@@ -404,6 +538,7 @@ mod tests {
 
     #[derive(Default)]
     struct Engine {
+        pitr: bool,
         calls: Mutex<Vec<ServiceRequest>>,
         owned_encryption: bool,
     }
@@ -419,6 +554,9 @@ mod tests {
 
     #[async_trait]
     impl DynamoEngine for Engine {
+        fn supports_pitr(&self) -> bool {
+            self.pitr
+        }
         fn supports_owned_encryption(&self) -> bool {
             self.owned_encryption
         }
@@ -1163,5 +1301,156 @@ mod tests {
         )
         .await;
         assert!(end["Records"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pitr_capability_and_validation_gate_all_requests_before_engine_dispatch() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let old = Arc::new(Engine::default());
+        for op in [
+            "DescribeContinuousBackups",
+            "UpdateContinuousBackups",
+            "RestoreTableToPointInTime",
+        ] {
+            assert_eq!(
+                handler(&registry, &old)
+                    .handle(request(TARGET_PREFIX, op, "{}"))
+                    .await
+                    .status(),
+                400
+            );
+        }
+        assert!(old.calls.lock().unwrap().is_empty());
+        let engine = Arc::new(Engine {
+            pitr: true,
+            ..Engine::default()
+        });
+        let handler = handler(&registry, &engine);
+        for (op, body) in [
+            ("DescribeContinuousBackups", json!({"TableName":"source"})),
+            (
+                "UpdateContinuousBackups",
+                json!({"TableName":"source","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true,"RecoveryPeriodInDays":7}}),
+            ),
+            (
+                "RestoreTableToPointInTime",
+                json!({"SourceTableArn":"arn:aws:dynamodb:us-east-1:000000000000:table/source","TargetTableName":"target","UseLatestRestorableTime":true}),
+            ),
+        ] {
+            assert_eq!(
+                handler
+                    .handle(request(TARGET_PREFIX, op, &body.to_string()))
+                    .await
+                    .status(),
+                500
+            );
+        }
+        assert_eq!(engine.calls.lock().unwrap().len(), 3);
+        engine.calls.lock().unwrap().clear();
+        for body in [
+            json!({"SourceTableName":"source","TargetTableName":"target"}),
+            json!({"SourceTableName":"source","TargetTableName":"target","RestoreDateTime":"123"}),
+            json!({"SourceTableName":"source","TargetTableName":"target","RestoreDateTime":123,"UseLatestRestorableTime":true}),
+            json!({"SourceTableArn":"arn:aws:dynamodb:us-west-2:000000000000:table/source","TargetTableName":"target","UseLatestRestorableTime":true}),
+            json!({"SourceTableName":"source","TargetTableName":"target","UseLatestRestorableTime":true,"SSESpecificationOverride":{}}),
+        ] {
+            assert_eq!(
+                handler
+                    .handle(request(
+                        TARGET_PREFIX,
+                        "RestoreTableToPointInTime",
+                        &body.to_string()
+                    ))
+                    .await
+                    .status(),
+                400
+            );
+        }
+        for days in [json!(0), json!(36), json!(1.2), json!("7")] {
+            let body = json!({"TableName":"source","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true,"RecoveryPeriodInDays":days}});
+            assert_eq!(
+                handler
+                    .handle(request(
+                        TARGET_PREFIX,
+                        "UpdateContinuousBackups",
+                        &body.to_string()
+                    ))
+                    .await
+                    .status(),
+                400
+            );
+        }
+        assert!(engine.calls.lock().unwrap().is_empty());
+    }
+
+    struct MissingRestoreAction {
+        denied: &'static str,
+        calls: Mutex<Vec<AuthorizationRequest>>,
+    }
+    impl AuthorizationEvaluator for MissingRestoreAction {
+        fn strict_sigv4_required(&self) -> bool {
+            true
+        }
+        fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError> {
+            let denied = request.action.strip_prefix("dynamodb:") == Some(self.denied);
+            self.calls.lock().unwrap().push(request);
+            if denied {
+                Err(AuthorizationError::Denied)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pitr_authorizes_source_restore_and_every_target_data_permission_before_dispatch() {
+        for denied in [
+            "RestoreTableToPointInTime",
+            "BatchWriteItem",
+            "DeleteItem",
+            "GetItem",
+            "PutItem",
+            "Query",
+            "Scan",
+            "UpdateItem",
+            "",
+        ] {
+            let registry = Arc::new(ServiceRegistry::new());
+            let engine = Arc::new(Engine {
+                pitr: true,
+                ..Engine::default()
+            });
+            let evaluator = Arc::new(MissingRestoreAction {
+                denied,
+                calls: Mutex::new(Vec::new()),
+            });
+            registry.register_native_with_authorization_evaluator(
+                ServiceName::new("iam"),
+                ServiceMetadata::new(AwsProtocol::Query, None),
+                engine.clone(),
+                evaluator.clone(),
+            );
+            let mut request = request(
+                TARGET_PREFIX,
+                "RestoreTableToPointInTime",
+                r#"{"SourceTableName":"source","TargetTableName":"target","UseLatestRestorableTime":true}"#,
+            );
+            request.headers.insert(http::header::AUTHORIZATION,HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=AKIATEST/20261107/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=test"));
+            let response = handler(&registry, &engine).handle(request).await;
+            if denied.is_empty() {
+                assert_eq!(response.status(), 500);
+                assert_eq!(engine.calls.lock().unwrap().len(), 1);
+                let calls = evaluator.calls.lock().unwrap();
+                assert_eq!(calls.len(), 8);
+                assert_eq!(calls[0].action, "dynamodb:RestoreTableToPointInTime");
+                assert!(calls[0].resource.ends_with("table/source"));
+                assert!(calls[1..]
+                    .iter()
+                    .all(|request| request.resource.ends_with("table/target")));
+            } else {
+                assert_eq!(response.status(), 400);
+                assert!(engine.calls.lock().unwrap().is_empty(), "{denied}");
+            }
+        }
     }
 }

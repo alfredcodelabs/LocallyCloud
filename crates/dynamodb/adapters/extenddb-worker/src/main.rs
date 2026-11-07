@@ -1,5 +1,6 @@
 mod backups;
 mod cipher;
+mod pitr;
 mod replication;
 mod streams;
 
@@ -30,6 +31,7 @@ const FEATURES: &[&str] = &[
     "mrec-outbox-v1",
     "backups-v1",
     "migration-ttl-v1",
+    "pitr-history-v1",
 ];
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -325,6 +327,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let result = match request.operation.as_str() {
                 "__locallycloud_resolve_stream_iterator" => streams::resolve(&request.body),
                 "GetRecords" => streams::get_records(request.body, &context).await,
+                op @ ("DescribeContinuousBackups"
+                | "UpdateContinuousBackups"
+                | "RestoreTableToPointInTime") => {
+                    pitr::dispatch(op, request.body, &context, &sqlite).await
+                }
                 op @ ("CreateBackup"
                 | "DescribeBackup"
                 | "ListBackups"
@@ -332,32 +339,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 | "RestoreTableFromBackup") => {
                     backups::dispatch(op, request.body, &context, &sqlite).await
                 }
-                op if op.starts_with("__locallycloud_global_") => replication
-                    .dispatch(&sqlite, op, request.body)
-                    .await
-                    .map_err(|error| match error {
-                        extenddb_storage::error::StorageError::Validation(message) => {
-                            extenddb_core::error::DynamoDbError::ValidationException(message)
-                        }
-                        extenddb_storage::error::StorageError::TableNotFound(_) => {
-                            extenddb_core::error::DynamoDbError::ResourceNotFoundException(
-                                "Table not found".into(),
-                            )
-                        }
-                        extenddb_storage::error::StorageError::IndexesInUse(_) => {
-                            extenddb_core::error::DynamoDbError::ResourceInUseException(
-                                "replica has pending writes or is retiring".into(),
-                            )
-                        }
-                        extenddb_storage::error::StorageError::TableAlreadyExists(_) => {
-                            extenddb_core::error::DynamoDbError::ResourceInUseException(
-                                "Table already exists".into(),
-                            )
-                        }
-                        _ => extenddb_core::error::DynamoDbError::InternalServerError(
-                            "replication control operation failed".into(),
-                        ),
-                    }),
+                op if op.starts_with("__locallycloud_global_") => async {
+                    if op == "__locallycloud_global_configure" {
+                        pitr::guard_global_configuration(&request.body, &context, &sqlite).await?;
+                    }
+                    replication.dispatch(&sqlite, op, request.body).await
+                }
+                .await
+                .map_err(|error| match error {
+                    extenddb_storage::error::StorageError::Validation(message) => {
+                        extenddb_core::error::DynamoDbError::ValidationException(message)
+                    }
+                    extenddb_storage::error::StorageError::TableNotFound(_) => {
+                        extenddb_core::error::DynamoDbError::ResourceNotFoundException(
+                            "Table not found".into(),
+                        )
+                    }
+                    extenddb_storage::error::StorageError::IndexesInUse(_) => {
+                        extenddb_core::error::DynamoDbError::ResourceInUseException(
+                            "replica has pending writes or is retiring".into(),
+                        )
+                    }
+                    extenddb_storage::error::StorageError::TableAlreadyExists(_) => {
+                        extenddb_core::error::DynamoDbError::ResourceInUseException(
+                            "Table already exists".into(),
+                        )
+                    }
+                    _ => extenddb_core::error::DynamoDbError::InternalServerError(
+                        "replication control operation failed".into(),
+                    ),
+                }),
                 _ => extenddb_engine::dispatch(
                     &request.operation,
                     request.body,

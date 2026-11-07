@@ -229,6 +229,27 @@ pub(crate) fn authorize(
     Ok(())
 }
 
+pub(crate) fn pitr_source(body: &Value) -> Result<&str, DdbError> {
+    match (body.get("SourceTableName"), body.get("SourceTableArn")) {
+        (Some(source), None) | (None, Some(source)) => source
+            .as_str()
+            .ok_or_else(|| DdbError::Validation("PITR source must be a string".into())),
+        _ => Err(DdbError::Validation(
+            "Specify exactly one SourceTableName or SourceTableArn".into(),
+        )),
+    }
+}
+
+const RESTORE_DATA_ACTIONS: &[&str] = &[
+    "BatchWriteItem",
+    "DeleteItem",
+    "GetItem",
+    "PutItem",
+    "Query",
+    "Scan",
+    "UpdateItem",
+];
+
 pub(crate) fn authorization_targets(
     op: &str,
     body: &Value,
@@ -254,16 +275,8 @@ pub(crate) fn authorization_targets(
                 .ok_or_else(|| DdbError::Validation("TargetTableName is required".into()))?;
             targets.push((op.into(), backup.into()));
             targets.push((op.into(), target.into()));
-            for action in [
-                "BatchWriteItem",
-                "DeleteItem",
-                "GetItem",
-                "PutItem",
-                "Query",
-                "Scan",
-                "UpdateItem",
-            ] {
-                targets.push((action.into(), target.into()));
+            for action in RESTORE_DATA_ACTIONS {
+                targets.push(((*action).into(), target.into()));
             }
         }
         "TagResource" | "UntagResource" | "ListTagsOfResource" => {
@@ -274,12 +287,14 @@ pub(crate) fn authorization_targets(
             targets.push((op.into(), arn.into()));
         }
         "RestoreTableToPointInTime" => {
-            for field in ["SourceTableName", "TargetTableName"] {
-                let table = body
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| DdbError::Validation(format!("{field} is required")))?;
-                targets.push((op.into(), table.into()));
+            let source = pitr_source(body)?;
+            let target = body
+                .get("TargetTableName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DdbError::Validation("TargetTableName is required".into()))?;
+            targets.push((op.into(), source.into()));
+            for action in RESTORE_DATA_ACTIONS {
+                targets.push(((*action).into(), target.into()));
             }
         }
         "BatchGetItem" | "BatchWriteItem" => {
