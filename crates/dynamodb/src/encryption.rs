@@ -1,4 +1,6 @@
 //! Table-scoped KMS data keys for encrypted storage. This does not enable public SSE support.
+pub mod catalog;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -20,12 +22,35 @@ const MAX_ENVELOPE: usize = 64 * 1024;
 const MAX_WRAPPED_KEY: usize = 16 * 1024;
 
 /// Physical identity is independent of the reusable AWS table name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "StoredScope")]
 pub struct TableKeyScope {
     account: String,
     region: String,
     table: String,
     storage_id: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredScope {
+    account: String,
+    region: String,
+    table: String,
+    storage_id: Uuid,
+}
+
+impl TryFrom<StoredScope> for TableKeyScope {
+    type Error = DdbError;
+
+    fn try_from(scope: StoredScope) -> Result<Self, Self::Error> {
+        Self::new(
+            &scope.account,
+            &scope.region,
+            &scope.table,
+            scope.storage_id,
+        )
+    }
 }
 
 impl TableKeyScope {
@@ -213,6 +238,29 @@ impl TableKeys {
         envelope: &TableKeyEnvelope,
     ) -> Result<SensitiveBytes, KmsInternalError> {
         scope.validate_call(&call)?;
+        let wrapped = self.wrapped_key(scope, envelope)?;
+        let opened = self
+            .dispatcher
+            .kms_decrypt_bounded(
+                KmsDecryptRequest {
+                    call,
+                    key_id: Some(wrapped.key_arn.clone()),
+                    ciphertext: SensitiveBytes::new(wrapped.ciphertext),
+                    encryption_context: scope.context(),
+                },
+                KMS_TIMEOUT,
+            )
+            .await?;
+        if opened.key_id != wrapped.key_arn || opened.plaintext.as_slice().len() != 32 {
+            return Err(KmsInternalError::InvalidCiphertext);
+        }
+        Ok(opened.plaintext)
+    }
+    fn wrapped_key(
+        &self,
+        scope: &TableKeyScope,
+        envelope: &TableKeyEnvelope,
+    ) -> Result<WrappedKey, KmsInternalError> {
         if envelope.version != 1 || envelope.sealed.len() > MAX_ENVELOPE {
             return Err(KmsInternalError::InvalidCiphertext);
         }
@@ -236,21 +284,6 @@ impl TableKeys {
         if wrapped.ciphertext.is_empty() || wrapped.ciphertext.len() > MAX_WRAPPED_KEY {
             return Err(KmsInternalError::InvalidCiphertext);
         }
-        let opened = self
-            .dispatcher
-            .kms_decrypt_bounded(
-                KmsDecryptRequest {
-                    call,
-                    key_id: Some(wrapped.key_arn.clone()),
-                    ciphertext: SensitiveBytes::new(wrapped.ciphertext),
-                    encryption_context: scope.context(),
-                },
-                KMS_TIMEOUT,
-            )
-            .await?;
-        if opened.key_id != wrapped.key_arn || opened.plaintext.as_slice().len() != 32 {
-            return Err(KmsInternalError::InvalidCiphertext);
-        }
-        Ok(opened.plaintext)
+        Ok(wrapped)
     }
 }

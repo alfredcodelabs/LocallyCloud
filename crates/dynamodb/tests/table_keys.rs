@@ -302,6 +302,157 @@ async fn physical_files(
     }
 }
 
+async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) {
+    use locallycloud_dynamodb::encryption::catalog::{FilePhase, TableCatalog};
+    use locallycloud_dynamodb::error::DdbError;
+    let keys = Arc::new(TableKeys::new(
+        dispatcher(registry),
+        Arc::new(StateCipher::with_key(&[13; 32])),
+    ));
+    let catalog = TableCatalog::new(state.clone(), keys.clone())
+        .await
+        .unwrap();
+    let scope = TableKeyScope::new(ACCOUNT, REGION, "catalog-orders", Uuid::new_v4()).unwrap();
+    let key = keys.generate(&scope, caller(), None).await.unwrap();
+    let competitor = TableKeyScope::new(ACCOUNT, REGION, "catalog-orders", Uuid::new_v4()).unwrap();
+    let competitor_key = keys.generate(&competitor, caller(), None).await.unwrap();
+    // Competing creates with different files and keys must elect exactly one owner.
+    let (a, b) = tokio::join!(
+        catalog.reserve(scope.clone(), key.envelope.clone()),
+        catalog.reserve(competitor, competitor_key.envelope.clone())
+    );
+    let (creating, expected_key) = match (a, b) {
+        (Ok(record), Err(DdbError::ResourceInUse(_))) => (record, &key.plaintext),
+        (Err(DdbError::ResourceInUse(_)), Ok(record)) => (record, &competitor_key.plaintext),
+        other => panic!("unexpected reservation results: {other:?}"),
+    };
+    assert_eq!(creating.phase(), FilePhase::Creating);
+    let mut invalid_scope = serde_json::to_value(creating.scope()).unwrap();
+    invalid_scope["storage_id"] = json!(Uuid::nil().to_string());
+    assert!(serde_json::from_value::<TableKeyScope>(invalid_scope).is_err());
+    assert!(catalog.forget_deleted(&creating).await.is_err());
+    let path = state.path().to_owned();
+    let reopened = Arc::new(
+        tokio::task::spawn_blocking(move || StateDb::open(path).unwrap())
+            .await
+            .unwrap(),
+    );
+    let catalog = TableCatalog::new(reopened, keys.clone()).await.unwrap();
+    let loaded = catalog
+        .load(ACCOUNT, REGION, "catalog-orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.phase(), FilePhase::Creating);
+    assert_eq!(
+        keys.open(loaded.scope(), caller(), loaded.envelope())
+            .await
+            .unwrap()
+            .as_slice(),
+        expected_key.as_slice()
+    );
+    let active = catalog
+        .transition(&loaded, FilePhase::Active)
+        .await
+        .unwrap();
+    assert!(matches!(
+        catalog.transition(&creating, FilePhase::Deleting).await,
+        Err(DdbError::ResourceInUse(_))
+    ));
+    assert!(matches!(
+        catalog.transition(&active, FilePhase::Creating).await,
+        Err(DdbError::Validation(_))
+    ));
+    assert!(catalog
+        .load(ACCOUNT, "us-east-2", "catalog-orders")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(catalog
+        .load("111111111111", REGION, "catalog-orders")
+        .await
+        .unwrap()
+        .is_none());
+    // Authenticated metadata cannot be moved to a different revision or corrupted.
+    let db = state.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        let conn = db.connection().unwrap();
+        let saved: Vec<u8> = conn
+            .query_row(
+                "SELECT metadata FROM lc_dynamodb_table_files WHERE name='catalog-orders'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE lc_dynamodb_table_files SET revision=revision+1 WHERE name='catalog-orders'",
+            [],
+        )
+        .unwrap();
+        saved
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        catalog.load(ACCOUNT, REGION, "catalog-orders").await,
+        Err(DdbError::Internal(_))
+    ));
+    let db = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn=db.connection().unwrap();
+        conn.execute("UPDATE lc_dynamodb_table_files SET revision=revision-1,metadata=?1 WHERE name='catalog-orders'",[vec![0u8;32]]).unwrap();
+    }).await.unwrap();
+    assert!(matches!(
+        catalog.load(ACCOUNT, REGION, "catalog-orders").await,
+        Err(DdbError::Internal(_))
+    ));
+    let db = state.clone();
+    tokio::task::spawn_blocking(move || {
+        db.connection()
+            .unwrap()
+            .execute(
+                "UPDATE lc_dynamodb_table_files SET metadata=?1 WHERE name='catalog-orders'",
+                [saved],
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let deleting = catalog
+        .transition(&active, FilePhase::Deleting)
+        .await
+        .unwrap();
+    catalog.forget_deleted(&deleting).await.unwrap();
+    assert!(catalog
+        .load(ACCOUNT, REGION, "catalog-orders")
+        .await
+        .unwrap()
+        .is_none());
+    let replacement =
+        TableKeyScope::new(ACCOUNT, REGION, "catalog-orders", Uuid::new_v4()).unwrap();
+    let replacement_key = keys.generate(&replacement, caller(), None).await.unwrap();
+    let fresh = catalog
+        .reserve(replacement.clone(), replacement_key.envelope)
+        .await
+        .unwrap();
+    assert_ne!(fresh.file_name(), creating.file_name());
+    assert!(matches!(
+        catalog.forget_deleted(&deleting).await,
+        Err(DdbError::ResourceInUse(_))
+    ));
+    assert_eq!(
+        catalog
+            .load(ACCOUNT, REGION, "catalog-orders")
+            .await
+            .unwrap()
+            .unwrap()
+            .file_name(),
+        fresh.file_name()
+    );
+    let other = TableKeyScope::new(ACCOUNT, REGION, "wrong-catalog-table", Uuid::new_v4()).unwrap();
+    assert!(catalog.reserve(other, key.envelope).await.is_err());
+}
+
 #[tokio::test]
 async fn real_kms_table_keys_are_unique_scope_bound_persistent_and_revocable() {
     // This integration binary has one test and owns its complete throwaway environment.
@@ -513,6 +664,7 @@ async fn real_kms_table_keys_are_unique_scope_bound_persistent_and_revocable() {
         .await;
         eprintln!("Real SQLCipher worker: two independent KMS keys; wrong key and physical scope rejected; restart preserved data");
     }
+    catalog_recovery(&registry, state.clone()).await;
     drop(broker);
     drop(registry);
     drop(state);
