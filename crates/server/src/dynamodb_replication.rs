@@ -17,7 +17,6 @@ use tokio::sync::{mpsc, oneshot, watch, Notify};
 use crate::dynamodb_engine::WorkerPool;
 
 const PAGE: usize = 32;
-const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 type Scope = (String, String);
 type Key = (String, String);
 type Reply = Result<(u16, Value), String>;
@@ -80,12 +79,18 @@ struct Global {
     revision: i64,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    ttl_attribute: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum Phase {
     Active,
+    UpdatingTtl {
+        specification: TtlSpecification,
+        next: usize,
+    },
     Creating {
         source: String,
         target: String,
@@ -316,6 +321,7 @@ pub struct Coordinator {
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     started: AtomicBool,
+    relay_polling: AtomicBool,
 }
 
 impl Coordinator {
@@ -344,6 +350,7 @@ impl Coordinator {
             stop,
             tasks: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
+            relay_polling: AtomicBool::new(false),
         }))
     }
 
@@ -450,11 +457,28 @@ impl Coordinator {
             )
             .await;
         let result = match result {
-            Ok((status, mut output)) if status == 200 && op == "DescribeTable" => {
+            Ok((status, mut output))
+                if status == 200
+                    && matches!(op.as_str(), "DescribeTable" | "DescribeTimeToLive") =>
+            {
                 if let Some(name) = table_name(&body) {
                     match self.metadata.get(&request.account_id, &name).await {
                         Ok(Some(global)) if global.regions.contains(&request.region) => {
-                            overlay(&mut output, "Table", &global, &request.region)
+                            match op.as_str() {
+                                "DescribeTable" => {
+                                    overlay(&mut output, "Table", &global, &request.region)
+                                }
+                                "DescribeTimeToLive" => {
+                                    if let Phase::UpdatingTtl { specification, .. } = &global.phase
+                                    {
+                                        output["TimeToLiveDescription"] = json!({
+                                            "TimeToLiveStatus": if specification.enabled { "ENABLING" } else { "DISABLING" },
+                                            "AttributeName": specification.attribute_name,
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                         Ok(Some(_)) => {}
                         Ok(None) => {}
@@ -563,10 +587,7 @@ impl Coordinator {
                     .as_ref()
                     .is_some_and(|global| global.regions.contains(&request.region)) =>
             {
-                Err(DdbError::Validation(
-                    "TTL setting synchronization is not yet supported for ExtendDB global tables"
-                        .into(),
-                ))
+                self.begin_ttl(request, &body, global).await
             }
             "UpdateTable"
                 if global
@@ -614,12 +635,7 @@ impl Coordinator {
     }
 
     async fn rpc(&self, account: &str, region: &str, op: &str, body: Value) -> Reply {
-        tokio::time::timeout(
-            RPC_TIMEOUT,
-            self.pool.query(account, region, op.into(), body),
-        )
-        .await
-        .map_err(|_| "replication peer request timed out".to_owned())?
+        self.pool.query(account, region, op.into(), body).await
     }
 
     async fn private(
@@ -637,6 +653,114 @@ impl Coordinator {
                 "replication control operation failed with status {status}"
             ))
         }
+    }
+
+    async fn begin_ttl(
+        &self,
+        request: &ServiceRequest,
+        body: &Value,
+        global: Option<Global>,
+    ) -> Result<Value, DdbError> {
+        let mut global =
+            global.ok_or_else(|| DdbError::Internal("global metadata is missing".into()))?;
+        if matches!(global.phase, Phase::UpdatingTtl { .. }) {
+            return Err(DdbError::Validation(
+                "Time to live is being updated for this table; retry when it completes".into(),
+            ));
+        }
+        if !matches!(global.phase, Phase::Active) {
+            return Err(DdbError::ResourceInUse(
+                "a global table update is already in progress".into(),
+            ));
+        }
+        let specification = ttl_specification(body)?;
+        let desired = specification.attribute();
+        for region in &global.regions {
+            let description = self.describe(&global.account, region, &global.name).await?;
+            if description.get("TableStatus").and_then(Value::as_str) != Some("ACTIVE") {
+                return Err(DdbError::ResourceInUse("a replica is not ACTIVE".into()));
+            }
+            let (status, current) = self
+                .rpc(
+                    &global.account,
+                    region,
+                    "DescribeTimeToLive",
+                    json!({"TableName":global.name}),
+                )
+                .await
+                .map_err(DdbError::Internal)?;
+            if status != 200 {
+                return Err(DdbError::ResourceInUse(
+                    "a replica TTL configuration is unavailable".into(),
+                ));
+            }
+            let current = ttl_attribute(&current)?;
+            if region == &request.region && current == desired {
+                return Err(DdbError::Validation(
+                    "TimeToLive is already in the requested state".into(),
+                ));
+            }
+            if current
+                .as_ref()
+                .is_some_and(|attribute| attribute != &specification.attribute_name)
+            {
+                return Err(DdbError::Validation(
+                    "Disable the current TTL attribute before changing its name".into(),
+                ));
+            }
+        }
+        global.ttl_attribute = desired;
+        global.phase = Phase::UpdatingTtl {
+            specification: specification.clone(),
+            next: 0,
+        };
+        // Persist before touching any replica; a crash or failed worker resumes this intent.
+        self.metadata
+            .save(&global)
+            .await
+            .map_err(DdbError::Internal)?;
+        self.notifier.activate();
+        Ok(json!({"TimeToLiveSpecification":specification}))
+    }
+
+    async fn synchronize_ttl(
+        &self,
+        global: &Global,
+        region: &str,
+        specification: &TtlSpecification,
+    ) -> Result<(), String> {
+        let current = self
+            .private(
+                global,
+                region,
+                "DescribeTimeToLive",
+                json!({"TableName":global.name}),
+            )
+            .await?;
+        let current = ttl_attribute(&current).map_err(|error| error.to_string())?;
+        let desired = specification.attribute();
+        if current == desired {
+            return Ok(());
+        }
+        self.private(
+            global,
+            region,
+            "UpdateTimeToLive",
+            json!({"TableName":global.name,"TimeToLiveSpecification":specification}),
+        )
+        .await?;
+        let verified = self
+            .private(
+                global,
+                region,
+                "DescribeTimeToLive",
+                json!({"TableName":global.name}),
+            )
+            .await?;
+        if ttl_attribute(&verified).map_err(|error| error.to_string())? != desired {
+            return Err("replica TTL setting has not converged".into());
+        }
+        Ok(())
     }
 
     async fn begin_update(
@@ -741,14 +865,7 @@ impl Coordinator {
                 "could not verify the source TTL configuration".into(),
             ));
         }
-        if ttl
-            .get("TimeToLiveDescription")
-            .and_then(|description| description.get("TimeToLiveStatus"))
-            .and_then(Value::as_str)
-            != Some("DISABLED")
-        {
-            return Err(DdbError::Validation("TTL-enabled sources require synchronized replica settings; this integration is not yet supported".into()));
-        }
+        let ttl_attribute = ttl_attribute(&ttl)?;
         let mut global = match global {
             Some(global) => global,
             None => Global {
@@ -759,6 +876,7 @@ impl Coordinator {
                 phase: Phase::Active,
                 revision: 0,
                 error: None,
+                ttl_attribute: None,
             },
         };
         if !matches!(global.phase, Phase::Active) {
@@ -766,6 +884,7 @@ impl Coordinator {
                 "a global table update is already in progress".into(),
             ));
         }
+        global.ttl_attribute = ttl_attribute;
         match action.as_str() {
             "Create" => {
                 if global.regions.contains(&target) {
@@ -913,7 +1032,13 @@ impl Coordinator {
         let mut stop = self.stop.subscribe();
         let mut retry = 1;
         loop {
-            tokio::select! {biased;_=stop.changed()=>break,_=self.notifier.signal.notified()=>{}}
+            tokio::select! {
+                biased;
+                _=stop.changed()=>break,
+                _=self.notifier.signal.notified()=>{},
+                // TTL deletions originate inside workers, without a client request to notify us.
+                _=tokio::time::sleep(Duration::from_secs(5)), if self.relay_polling.load(Ordering::Acquire)=>{},
+            }
             self.notifier.take();
             if *stop.borrow() {
                 break;
@@ -944,6 +1069,7 @@ impl Coordinator {
         let mut after = (String::new(), String::new());
         let mut progress = false;
         let mut failed = false;
+        let mut relay_polling = false;
         loop {
             let keys = self.metadata.keys(&after).await?;
             if keys.is_empty() {
@@ -958,6 +1084,7 @@ impl Coordinator {
                 let Some(global) = self.metadata.get(&key.0, &key.1).await? else {
                     continue;
                 };
+                relay_polling |= global.regions.len() > 1;
                 if !matches!(global.phase, Phase::Active) {
                     while jobs.len() >= 4 {
                         if let Some(result) = jobs.join_next().await {
@@ -1013,6 +1140,7 @@ impl Coordinator {
         }
         // Keep activation sticky so an older empty scan cannot disable a new
         // topology's notifications. Failed lanes retain their own retry timers.
+        self.relay_polling.store(relay_polling, Ordering::Release);
         if failed && !progress {
             Err("some replication work remains unavailable".into())
         } else {
@@ -1157,6 +1285,21 @@ impl Coordinator {
     async fn advance_inner(&self, mut global: Global) -> Result<bool, String> {
         match global.phase.clone() {
             Phase::Active => return Ok(false),
+            Phase::UpdatingTtl {
+                specification,
+                next,
+            } => {
+                if let Some(region) = global.regions.get(next) {
+                    self.synchronize_ttl(&global, region, &specification)
+                        .await?;
+                    global.phase = Phase::UpdatingTtl {
+                        specification,
+                        next: next + 1,
+                    };
+                } else {
+                    global.phase = Phase::Active;
+                }
+            }
             Phase::Creating {
                 source,
                 target,
@@ -1289,6 +1432,17 @@ impl Coordinator {
                                 return Ok(false);
                             }
                         }
+                        if let Some(attribute) = &global.ttl_attribute {
+                            self.synchronize_ttl(
+                                &global,
+                                &target,
+                                &TtlSpecification {
+                                    enabled: true,
+                                    attribute_name: attribute.clone(),
+                                },
+                            )
+                            .await?;
+                        }
                         self.private(
                             &global,
                             &target,
@@ -1410,6 +1564,64 @@ fn operation(request: &ServiceRequest) -> Option<String> {
         .split_once('.')
         .map(|(_, op)| op.to_owned())
 }
+
+fn ttl_attribute(body: &Value) -> Result<Option<String>, DdbError> {
+    let description = body
+        .get("TimeToLiveDescription")
+        .ok_or_else(|| DdbError::Internal("TTL description is missing".into()))?;
+    match description.get("TimeToLiveStatus").and_then(Value::as_str) {
+        Some("DISABLED") => Ok(None),
+        Some("ENABLED") => description
+            .get("AttributeName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty() && name.len() <= 255)
+            .map(|name| Some(name.to_owned()))
+            .ok_or_else(|| DdbError::Internal("TTL attribute is invalid".into())),
+        Some("ENABLING" | "DISABLING") => Err(DdbError::ResourceInUse(
+            "TTL is being updated; retry when it completes".into(),
+        )),
+        _ => Err(DdbError::Internal("TTL status is invalid".into())),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct TtlSpecification {
+    enabled: bool,
+    attribute_name: String,
+}
+
+impl TtlSpecification {
+    fn attribute(&self) -> Option<String> {
+        self.enabled.then(|| self.attribute_name.clone())
+    }
+}
+
+fn ttl_specification(body: &Value) -> Result<TtlSpecification, DdbError> {
+    let invalid = || {
+        DdbError::Validation(
+            "A boolean Enabled and an AttributeName of 1..255 bytes are required".into(),
+        )
+    };
+    if body.as_object().is_none_or(|fields| {
+        fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "TableName" | "TimeToLiveSpecification"))
+    }) {
+        return Err(invalid());
+    }
+    let specification: TtlSpecification = serde_json::from_value(
+        body.get("TimeToLiveSpecification")
+            .cloned()
+            .ok_or_else(invalid)?,
+    )
+    .map_err(|_| invalid())?;
+    if specification.attribute_name.is_empty() || specification.attribute_name.len() > 255 {
+        return Err(invalid());
+    }
+    Ok(specification)
+}
+
 fn replica_transitioning(global: &Global, region: &str) -> bool {
     matches!(&global.phase, Phase::Creating { target, .. } | Phase::Deleting { target, .. } if target == region)
 }
@@ -1632,7 +1844,70 @@ mod tests {
             },
             revision: 0,
             error: None,
+            ttl_attribute: None,
         }
+    }
+
+    #[test]
+    fn ttl_settings_require_valid_wire_types_and_stable_status() {
+        let valid = json!({"TableName":"orders","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expires"}});
+        assert_eq!(
+            serde_json::to_value(ttl_specification(&valid).unwrap()).unwrap(),
+            valid["TimeToLiveSpecification"]
+        );
+        for specification in [
+            json!({"Enabled":"true","AttributeName":"expires"}),
+            json!({"Enabled":true,"AttributeName":""}),
+            json!({"Enabled":true,"AttributeName":"x".repeat(256)}),
+            json!({"Enabled":true,"AttributeName":"expires","extra":1}),
+        ] {
+            assert!(ttl_specification(&json!({"TimeToLiveSpecification":specification})).is_err());
+        }
+        assert_eq!(
+            ttl_attribute(&json!({"TimeToLiveDescription":{"TimeToLiveStatus":"DISABLED"}}))
+                .unwrap(),
+            None
+        );
+        assert_eq!(ttl_attribute(&json!({"TimeToLiveDescription":{"TimeToLiveStatus":"ENABLED","AttributeName":"expires"}})).unwrap().as_deref(), Some("expires"));
+        for status in ["ENABLING", "DISABLING", "OTHER"] {
+            assert!(
+                ttl_attribute(&json!({"TimeToLiveDescription":{"TimeToLiveStatus":status}}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ttl_intent_and_progress_survive_metadata_restart() {
+        let root =
+            std::env::temp_dir().join(format!("dynamodb-ttl-intent-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.db")).unwrap());
+        let cipher = Arc::new(StateCipher::with_key(&[42; 32]));
+        let mut value = global("orders");
+        value.ttl_attribute = Some("expires".into());
+        value.phase = Phase::UpdatingTtl {
+            specification: TtlSpecification {
+                enabled: true,
+                attribute_name: "expires".into(),
+            },
+            next: 1,
+        };
+        let metadata = Metadata::with_cipher(state.clone(), cipher.clone())
+            .await
+            .unwrap();
+        metadata.save(&value).await.unwrap();
+        drop(metadata);
+        let reopened = Metadata::with_cipher(state.clone(), cipher).await.unwrap();
+        let saved = reopened
+            .get(&value.account, &value.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.ttl_attribute.as_deref(), Some("expires"));
+        assert!(matches!(saved.phase, Phase::UpdatingTtl { next: 1, .. }));
+        drop(reopened);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
