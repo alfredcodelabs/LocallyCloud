@@ -496,8 +496,8 @@ fn test_db() -> Arc<StateDb> {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
     });
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.kiro/localcloud-tmp/kms-tests")
+    let path = std::env::temp_dir()
+        .join("locallycloud-kms-tests")
         .join(uuid::Uuid::new_v4().to_string())
         .join("state.sqlite3");
     Arc::new(StateDb::open(path).expect("temporary KMS state"))

@@ -4,6 +4,7 @@
 //! `ServiceRegistry`. Operations are selected from the `X-Amz-Target` header.
 
 mod capacity;
+pub mod encryption;
 mod engine;
 pub mod error;
 pub mod expression;

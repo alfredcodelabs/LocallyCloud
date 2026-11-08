@@ -27,3 +27,6 @@ rusqlite.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+locallycloud-kms.workspace = true
+locallycloud-iam-sts.workspace = true
+zeroize.workspace = true

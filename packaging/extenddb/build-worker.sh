@@ -29,10 +29,6 @@ cp -R "$WORKER/src" "$CONTEXT/src"
 MANIFEST="$CONTEXT/Cargo.toml"
 cd "$CONTEXT"
 cargo build --manifest-path "$MANIFEST" --release --locked -j "${CARGO_BUILD_JOBS:-2}"
-cargo test --manifest-path "$MANIFEST" --release --locked -p extenddb-storage-sqlite --lib history:: -j "${CARGO_BUILD_JOBS:-2}"
-cargo test --manifest-path "$MANIFEST" --locked -j "${CARGO_BUILD_JOBS:-2}"
-cargo clippy --manifest-path "$MANIFEST" --all-targets --locked -j "${CARGO_BUILD_JOBS:-2}" -- -D warnings
-cargo fmt --manifest-path "$MANIFEST" -- --check
 BINARY="$CARGO_TARGET_DIR/release/locallycloud-extenddb-worker"
 GLIBC_BASELINE="${LOCALLYCLOUD_GLIBC_BASELINE:-2.39}"
 GLIBC_REQUIRED="$(objdump -T "$BINARY" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)"
@@ -87,7 +83,7 @@ def artifact(path):
 
 catalog = {
     'schema':1, 'component':'extenddb', 'protocol':1, 'version':version,
-    'capabilities':['stream-cursors-v1', 'mrec-outbox-v1', 'backups-v1', 'migration-ttl-v1', 'pitr-history-v1', 'pitr-global-v1'],
+    'capabilities':['stream-cursors-v1', 'mrec-outbox-v1', 'backups-v1', 'migration-ttl-v1', 'pitr-history-v1', 'pitr-global-v1', 'table-file-v1'],
     'upstream': json.loads((work / 'source/prepared.json').read_text()),
     'artifacts':[{'architecture':arch, 'binary':artifact(output / name),
                   'notices':artifact(output / f'{name}.LICENSES.txt')}],

@@ -3,6 +3,7 @@ mod cipher;
 mod pitr;
 mod replication;
 mod streams;
+mod table_file;
 
 use std::collections::HashMap;
 use std::io;
@@ -33,6 +34,7 @@ const FEATURES: &[&str] = &[
     "migration-ttl-v1",
     "pitr-history-v1",
     "pitr-global-v1",
+    "table-file-v1",
 ];
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -88,6 +90,8 @@ struct Initialize {
     region: String,
     #[serde(default)]
     mode: WorkerMode,
+    #[serde(default)]
+    table_file: Option<table_file::TableFile>,
 }
 
 impl Drop for Initialize {
@@ -151,6 +155,9 @@ fn validate_initialize(init: &Initialize) -> Result<Zeroizing<[u8; 32]>, &'stati
     if init.version != 1 {
         return Err("unsupported protocol version");
     }
+    if let Some(table) = &init.table_file {
+        table.validate()?;
+    }
     if init.account_id.len() != 12 || !init.account_id.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("invalid account");
     }
@@ -211,7 +218,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut init: Initialize = serde_json::from_slice(&first)?;
     first.zeroize();
-    cipher::install(validate_initialize(&init)?)?;
+    let encoding = match &init.table_file {
+        Some(_) => cipher::KeyEncoding::Raw,
+        None => cipher::KeyEncoding::LegacyPassphrase,
+    };
+    cipher::install(validate_initialize(&init)?, encoding)?;
     init.key.zeroize();
 
     // Bootstrap explicitly: the upstream serve-time dev bootstrap prints a
@@ -243,7 +254,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await,
         )?;
     }
-    let scope = format!("{}:{}", init.account_id, init.region);
+    let scope = match &init.table_file {
+        Some(table) => table.scope(&init.account_id, &init.region)?,
+        None => format!("{}:{}", init.account_id, init.region),
+    };
     let settings = (extenddb_storage_sqlite::backend().settings_store)(&init.database).await?;
     match storage(settings.get_setting("locallycloud_scope").await)? {
         Some(stored) if stored != scope => return Err("database belongs to another scope".into()),
@@ -314,7 +328,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
     };
-    write_frame(&mut writer, &ready(init.mode)).await?;
+    let mut hello = ready(init.mode);
+    hello["table_file"] = serde_json::to_value(&init.table_file)?;
+    write_frame(&mut writer, &hello).await?;
     let result: Result<(), Box<dyn std::error::Error>> = async {
         loop {
             let frame = tokio::select! {
@@ -325,6 +341,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             };
             let request: Request = serde_json::from_slice(&frame)?;
+            if let Some(table) = &init.table_file {
+                if let Err(error) = table.authorize(&request.operation, &request.body, &init.account_id, &init.region) {
+                    write_frame(&mut writer, &json!({"id":request.id,"status":error.status_code(),"body":aws_error(&error)})).await?;
+                    continue;
+                }
+            }
             let result = match request.operation.as_str() {
                 "__locallycloud_resolve_stream_iterator" => streams::resolve(&request.body),
                 "GetRecords" => streams::get_records(request.body, &context).await,
@@ -488,6 +510,7 @@ mod tests {
             account_id: "000000000000".to_owned(),
             region: "us-east-1".to_owned(),
             mode: WorkerMode::Normal,
+            table_file: None,
         };
         assert!(validate_initialize(&init).is_ok());
         init.database = "/tmp/test.sqlite?mode=memory".to_owned();

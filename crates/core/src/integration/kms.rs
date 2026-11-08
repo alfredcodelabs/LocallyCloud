@@ -48,6 +48,7 @@ pub enum KmsServiceKey {
     SecretsManager,
     Ssm,
     S3,
+    DynamoDb,
 }
 
 impl KmsServiceKey {
@@ -56,6 +57,7 @@ impl KmsServiceKey {
             Self::SecretsManager => "secretsmanager",
             Self::Ssm => "ssm",
             Self::S3 => "s3",
+            Self::DynamoDb => "dynamodb",
         }
     }
 }

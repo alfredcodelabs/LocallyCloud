@@ -1048,7 +1048,11 @@ mod pitr_tests {
     #[tokio::test]
     async fn remote_commit_history_is_atomic_replay_safe_and_survives_reopen() {
         // This is the worker suite's only database test and owns its normal one-time VFS setup.
-        crate::cipher::install(zeroize::Zeroizing::new([73; 32])).unwrap();
+        crate::cipher::install(
+            zeroize::Zeroizing::new([73; 32]),
+            crate::cipher::KeyEncoding::LegacyPassphrase,
+        )
+        .unwrap();
         let directory = tokio::task::spawn_blocking(Directory::new).await.unwrap();
         let a_path = directory.0.join("a.sqlite3");
         let b_path = directory.0.join("b.sqlite3");

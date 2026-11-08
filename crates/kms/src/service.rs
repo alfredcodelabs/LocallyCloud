@@ -344,7 +344,7 @@ impl KmsService {
         scope: &Scope,
         service: &str,
     ) -> Result<String, KmsError> {
-        if !matches!(service, "ssm" | "secretsmanager" | "s3") {
+        if !matches!(service, "ssm" | "secretsmanager" | "s3" | "dynamodb") {
             return Err(KmsError::AccessDenied);
         }
         self.store.service_default_key(scope, service, || {
@@ -353,12 +353,12 @@ impl KmsService {
             record.owner_service = Some(service.to_owned());
             record.rotation.enabled = true;
             record.rotation.next_date = Some((self.clock)()? + 365.0 * 86400.0);
-            if service == "s3" {
+            if matches!(service, "s3" | "dynamodb") {
                 record.policy = KeyPolicy::parse(json!({"Statement": {
                     "Effect":"Allow", "Principal":"*", "Action":["kms:GenerateDataKey","kms:Decrypt","kms:Encrypt"],
                     "Resource":"*", "Condition":{"StringEquals":{
                         "kms:CallerAccount":scope.account_id,
-                        "kms:ViaService":format!("s3.{}.amazonaws.com", scope.region)
+                        "kms:ViaService":format!("{service}.{}.amazonaws.com", scope.region)
                     }}
                 }}).to_string())?;
                 record.explicit_policy = true;
@@ -368,7 +368,7 @@ impl KmsService {
     }
 
     fn is_own_managed_alias(&self, key_id: &str, scope: &Scope, service: &str) -> bool {
-        if !matches!(service, "ssm" | "secretsmanager" | "s3") {
+        if !matches!(service, "ssm" | "secretsmanager" | "s3" | "dynamodb") {
             return false;
         }
         let alias = format!("alias/aws/{service}");
@@ -623,7 +623,9 @@ fn internal_policy_allows(
     if call.iam_policy_denied {
         return false;
     }
-    if !key.explicit_policy && (call.source_service != "s3" || call.caller_arn.is_none()) {
+    if !key.explicit_policy
+        && (!matches!(call.source_service.as_str(), "s3" | "dynamodb") || call.caller_arn.is_none())
+    {
         // Unknown development identities retain permissive-mode behavior. The strict IAM
         // capability sets iam_policy_denied for unresolved identities before reaching here.
         return true;

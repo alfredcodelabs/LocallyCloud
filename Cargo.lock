@@ -2581,6 +2581,8 @@ dependencies = [
  "dashmap",
  "http",
  "locallycloud-core",
+ "locallycloud-iam-sts",
+ "locallycloud-kms",
  "locallycloud-state",
  "proptest",
  "rusqlite",
@@ -2590,6 +2592,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
