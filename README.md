@@ -145,9 +145,8 @@ cargo clippy -j 4 --workspace --all-targets --locked -- -D warnings
 cargo test -j 4 --workspace --locked
 ```
 
-See [versioning and packages](packaging/VERSIONING.md) for releases,
-[brand assets](packaging/assets/README.md) for logo exports and
-[agent context](docs/AGENT_CONTEXT.md) for optional persistent project context.
+See [versioning and packages](packaging/VERSIONING.md) for releases and
+[brand assets](packaging/assets/README.md) for logo exports.
 
 ## Project and license
 

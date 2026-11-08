@@ -1,6 +1,6 @@
 # Frequently asked questions
 
-[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [Agent context](AGENT_CONTEXT.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md)
 
 Practical answers for using LocallyCloud during the beta. Start with the [installation and quick-start guide](../README.md#installation) if this is your first visit.
 

@@ -1,6 +1,6 @@
 # Supported platforms
 
-[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
 
 LocallyCloud is a Linux program. It is developed natively on Arch Linux and distributed as an
 Arch package and as one `.deb` for Debian, Ubuntu LTS, and their derivatives, including WSL 2.

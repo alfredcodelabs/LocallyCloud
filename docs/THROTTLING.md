@@ -1,6 +1,6 @@
 # Throttling
 
-[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [FAQ](FAQ.md) · [Agent context](AGENT_CONTEXT.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [FAQ](FAQ.md)
 
 Compare burst handling at workstation scale. Each service has independent limits;
 there is no shared throttle across Lambda, DynamoDB and Kinesis.
