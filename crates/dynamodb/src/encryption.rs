@@ -6,11 +6,13 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::kms::{
-    KmsCallContext, KmsDecryptRequest, KmsGenerateDataKeyRequest, KmsInternalError, KmsServiceKey,
-    SensitiveBytes,
+    KmsAuthorizeCachedKeyRequest, KmsCallContext, KmsDataKeyAction, KmsDecryptRequest,
+    KmsGenerateDataKeyRequest, KmsInternalError, KmsServiceKey, SensitiveBytes,
 };
-use locallycloud_core::integration::InternalDispatcher;
+use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
 use locallycloud_state::StateCipher;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -168,6 +170,110 @@ impl TableKeys {
             dispatcher,
             metadata_cipher,
         }
+    }
+
+    /// Rebuild IAM decisions for the current caller, including warm-worker requests.
+    pub fn decryption_context(
+        &self,
+        scope: &TableKeyScope,
+        envelope: &TableKeyEnvelope,
+        request_id: &str,
+        identity: RequestIdentity,
+        delegated: Option<CallerIdentity>,
+    ) -> Result<KmsCallContext, KmsInternalError> {
+        let wrapped = self.wrapped_key(scope, envelope)?;
+        let caller = match &delegated {
+            Some(CallerIdentity::AssumedRole { role_arn, .. }) => Some(role_arn.clone()),
+            Some(CallerIdentity::ServicePrincipal { .. }) => {
+                return Err(KmsInternalError::AccessDenied)
+            }
+            Some(CallerIdentity::Default) | None => self
+                .dispatcher
+                .resolve_caller_arn(&identity)
+                .map_err(|_| KmsInternalError::AccessDenied)?,
+        };
+        // Match KMS/STS: unregistered development credentials are root only in permissive mode.
+        let caller = match caller {
+            None if self.dispatcher.strict_sigv4_required() => {
+                return Err(KmsInternalError::AccessDenied)
+            }
+            None => Some(format!("arn:aws:iam::{}:root", scope.account)),
+            caller => caller,
+        };
+        let encryption = scope.context();
+        let mut context: BTreeMap<String, Vec<String>> = encryption
+            .iter()
+            .map(|(key, value)| {
+                (
+                    format!("kms:encryptioncontext:{}", key.to_ascii_lowercase()),
+                    vec![value.clone()],
+                )
+            })
+            .collect();
+        context.insert(
+            "kms:encryptioncontextkeys".into(),
+            encryption.keys().cloned().collect(),
+        );
+        context.insert(
+            "kms:viaservice".into(),
+            vec![format!("dynamodb.{}.amazonaws.com", scope.region)],
+        );
+        context.insert(
+            "kms:calleraccount".into(),
+            vec![caller
+                .as_deref()
+                .and_then(|arn| arn.split(':').nth(4))
+                .unwrap_or(&scope.account)
+                .into()],
+        );
+        context.insert("aws:requestedregion".into(), vec![scope.region.clone()]);
+        if let Some(caller) = &caller {
+            context.insert("aws:principalarn".into(), vec![caller.clone()]);
+        }
+        let authorization = AuthorizationRequest {
+            request_identity: identity,
+            delegated_identity: delegated,
+            source_service: "dynamodb".into(),
+            action: "kms:Decrypt".into(),
+            resource: wrapped.key_arn,
+            context,
+        };
+        let denied = (caller.is_some() || self.dispatcher.strict_sigv4_required())
+            && self
+                .dispatcher
+                .identity_policy_denies(authorization.clone());
+        Ok(KmsCallContext {
+            source_service: "dynamodb".into(),
+            account_id: scope.account.clone(),
+            region: scope.region.clone(),
+            request_id: request_id.into(),
+            caller_arn: caller,
+            iam_policy_allowed: self.dispatcher.identity_policy_allows(authorization),
+            iam_policy_denied: denied,
+        })
+    }
+
+    /// Recheck permissions and key state without decrypting a cached data key again.
+    pub async fn authorize(
+        &self,
+        scope: &TableKeyScope,
+        call: KmsCallContext,
+        envelope: &TableKeyEnvelope,
+    ) -> Result<(), KmsInternalError> {
+        scope.validate_call(&call)?;
+        let wrapped = self.wrapped_key(scope, envelope)?;
+        self.dispatcher
+            .kms_authorize_cached_key_bounded(
+                KmsAuthorizeCachedKeyRequest {
+                    call,
+                    key_id: wrapped.key_arn,
+                    ciphertext: SensitiveBytes::new(wrapped.ciphertext),
+                    encryption_context: scope.context(),
+                    action: KmsDataKeyAction::Decrypt,
+                },
+                KMS_TIMEOUT,
+            )
+            .await
     }
 
     pub async fn generate(

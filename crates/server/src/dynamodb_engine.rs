@@ -1,4 +1,5 @@
 //! Lazy, private ExtendDB workers. Only the LocalCloud front door authorizes clients.
+mod table_storage;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
@@ -6,16 +7,18 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use table_storage::{TableCall, TableStorage};
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::response::Response;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_dynamodb::error::DdbError;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 use crate::{component_catalog, component_manager};
@@ -25,6 +28,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WORKERS: usize = 4;
 type Reply = Result<(u16, Value), String>;
+type WorkerScope = (String, String, Option<uuid::Uuid>);
 
 pub fn bind_store(state: &locallycloud_state::StateDb, engine: &str) -> io::Result<()> {
     crate::dynamodb_migration::ensure_no_pending(state.path())?;
@@ -71,11 +75,47 @@ pub fn bind_store(state: &locallycloud_state::StateDb, engine: &str) -> io::Resu
     Ok(())
 }
 
+struct WorkerBudget {
+    slots: Arc<Semaphore>,
+    waiting: watch::Sender<usize>,
+}
+
+struct WaitingWorker<'a>(&'a watch::Sender<usize>);
+
+impl Drop for WaitingWorker<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count = count.saturating_sub(1));
+    }
+}
+
+impl WorkerBudget {
+    fn new(limit: usize) -> Arc<Self> {
+        let (waiting, _) = watch::channel(0);
+        Arc::new(Self {
+            slots: Arc::new(Semaphore::new(limit)),
+            waiting,
+        })
+    }
+
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        if let Ok(slot) = self.slots.clone().try_acquire_owned() {
+            return Ok(slot);
+        }
+        self.waiting
+            .send_modify(|count| *count = count.saturating_add(1));
+        let waiting = WaitingWorker(&self.waiting);
+        let slot = self.slots.clone().acquire_owned().await;
+        drop(waiting);
+        slot
+    }
+}
+
 struct Request {
     operation: String,
     body: Value,
     reply: oneshot::Sender<Reply>,
     deadline: tokio::time::Instant,
+    table: Option<TableCall>,
 }
 
 pub struct ExtendDb {
@@ -84,9 +124,14 @@ pub struct ExtendDb {
 }
 
 impl ExtendDb {
-    pub async fn new(state: Arc<locallycloud_state::StateDb>) -> io::Result<Self> {
+    pub async fn new(
+        state: Arc<locallycloud_state::StateDb>,
+        registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
+    ) -> io::Result<Self> {
         let notifier = crate::dynamodb_replication::RelayNotifier::new();
-        let pool = Arc::new(WorkerPool::new(&state, notifier.clone())?);
+        let mut pool = WorkerPool::new(&state, notifier.clone())?;
+        pool.table_storage = Some(TableStorage::new(state.clone(), registry));
+        let pool = Arc::new(pool);
         let coordinator =
             crate::dynamodb_replication::Coordinator::new(pool.clone(), state, notifier).await?;
         Ok(Self { pool, coordinator })
@@ -135,10 +180,11 @@ pub(crate) struct WorkerPool {
     launch: WorkerLaunch,
     data: PathBuf,
     key: Arc<Zeroizing<String>>,
-    workers: Mutex<HashMap<(String, String), WorkerTask>>,
+    workers: Mutex<HashMap<WorkerScope, WorkerTask>>,
+    table_storage: Option<Arc<TableStorage>>,
     closing: AtomicBool,
     notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
-    slots: Arc<Semaphore>,
+    budget: Arc<WorkerBudget>,
 }
 
 struct WorkerTask {
@@ -217,6 +263,96 @@ impl WorkerPool {
         operation: String,
         body: Value,
     ) -> Reply {
+        self.query_for(account, region, operation, body, None).await
+    }
+
+    pub(crate) async fn query_external(
+        &self,
+        request: &ServiceRequest,
+        operation: String,
+        body: Value,
+    ) -> Reply {
+        self.query_for(
+            &request.account_id,
+            &request.region,
+            operation,
+            body,
+            Some(request),
+        )
+        .await
+    }
+
+    async fn query_for(
+        &self,
+        account: &str,
+        region: &str,
+        operation: String,
+        body: Value,
+        request: Option<&ServiceRequest>,
+    ) -> Reply {
+        let table = match &self.table_storage {
+            Some(storage) => match storage
+                .resolve(account, region, &operation, &body, request)
+                .await
+            {
+                Ok(table) => table,
+                Err(error) => return error_reply(error).await,
+            },
+            None => None,
+        };
+        let Some(table) = table else {
+            return self.query_regional(account, region, operation, body).await;
+        };
+        let sender = match self.worker(account, region, Some(&table)) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return error_reply(DdbError::Throttling(error.to_string())).await
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        self.enqueue(sender, operation, body, Some(table)).await
+    }
+
+    async fn enqueue(
+        &self,
+        sender: mpsc::Sender<Request>,
+        operation: String,
+        body: Value,
+        table: Option<TableCall>,
+    ) -> Reply {
+        let (reply, response) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        match sender.try_send(Request {
+            operation,
+            body,
+            reply,
+            deadline,
+            table,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return error_reply(DdbError::Throttling(
+                    "ExtendDB worker is busy; retry later".into(),
+                ))
+                .await
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err("ExtendDB worker stopped".into())
+            }
+        }
+        tokio::time::timeout_at(deadline + Duration::from_secs(5), response)
+            .await
+            .map_err(|_| "ExtendDB queue wait timed out")?
+            .map_err(|_| "ExtendDB worker stopped")?
+    }
+
+    async fn query_regional(
+        &self,
+        account: &str,
+        region: &str,
+        operation: String,
+        body: Value,
+    ) -> Reply {
         if operation == "UpdateTable" && body.get("SSESpecification").is_some() {
             let (status, description) = self
                 .query_raw(
@@ -247,21 +383,10 @@ impl WorkerPool {
         operation: String,
         body: Value,
     ) -> Reply {
-        let sender = self.worker(account, region).map_err(|e| e.to_string())?;
-        let (reply, response) = oneshot::channel();
-        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
-        sender
-            .try_send(Request {
-                operation,
-                body,
-                reply,
-                deadline,
-            })
-            .map_err(|_| "ExtendDB worker busy or stopped")?;
-        tokio::time::timeout_at(deadline + Duration::from_secs(5), response)
-            .await
-            .map_err(|_| "ExtendDB queue wait timed out")?
-            .map_err(|_| "ExtendDB worker stopped")?
+        let sender = self
+            .worker(account, region, None)
+            .map_err(|e| e.to_string())?;
+        self.enqueue(sender, operation, body, None).await
     }
 
     pub fn new(
@@ -304,14 +429,24 @@ impl WorkerPool {
             data,
             key: Arc::new(Zeroizing::new(key)),
             workers: Mutex::new(HashMap::new()),
+            table_storage: None,
             closing: AtomicBool::new(false),
             notifier,
-            slots: Arc::new(Semaphore::new(MAX_WORKERS)),
+            budget: WorkerBudget::new(MAX_WORKERS),
         })
     }
 
-    fn worker(&self, account: &str, region: &str) -> io::Result<mpsc::Sender<Request>> {
-        let scope = (account.to_string(), region.to_string());
+    fn worker(
+        &self,
+        account: &str,
+        region: &str,
+        table: Option<&TableCall>,
+    ) -> io::Result<mpsc::Sender<Request>> {
+        let scope = (
+            account.to_string(),
+            region.to_string(),
+            table.map(|t| t.record.scope().storage_id()),
+        );
         let mut workers = self
             .workers
             .lock()
@@ -324,18 +459,26 @@ impl WorkerPool {
             return Ok(worker.sender.clone());
         }
         if workers.len() >= MAX_WORKERS * 2 {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
                 "ExtendDB worker capacity reached; retry after idle workers stop",
             ));
         }
         let (sender, receiver) = mpsc::channel(8);
-        let database = self.data.join(account).join(format!("{region}.sqlite3"));
+        let database = match table {
+            Some(table) => self
+                .data
+                .join(account)
+                .join(region)
+                .join(table.record.file_name()),
+            None => self.data.join(account).join(format!("{region}.sqlite3")),
+        };
         let task = tokio::spawn(serve_worker(
             self.launch.clone(),
             database,
-            scope.clone(),
+            (scope.0.clone(), scope.1.clone()),
             self.key.clone(),
-            self.slots.clone(),
+            self.budget.clone(),
             self.notifier.clone(),
             receiver,
         ));
@@ -443,23 +586,57 @@ fn ready_for_mode(ready: &Value, mode: WorkerMode) -> bool {
                 .any(|feature| feature.as_str() == Some("migration-ttl-v1")))
 }
 
+#[derive(Serialize)]
+struct TableBinding<'a> {
+    table_name: &'a str,
+    storage_id: String,
+}
+
+#[derive(Serialize)]
+struct WorkerInitialize<'a> {
+    version: u32,
+    key: &'a str,
+    database: &'a std::path::Path,
+    account_id: &'a str,
+    region: &'a str,
+    mode: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table_file: Option<&'a TableBinding<'a>>,
+}
+
+fn ready_for_table(ready: &Value, table: Option<&TableBinding<'_>>) -> bool {
+    match table {
+        None => ready.get("table_file").is_none_or(Value::is_null),
+        Some(table) => {
+            ready
+                .get("features")
+                .and_then(Value::as_array)
+                .is_some_and(|features| features.iter().any(|v| v == "table-file-v1"))
+                && ready["table_file"]["table_name"] == table.table_name
+                && ready["table_file"]["storage_id"] == table.storage_id
+        }
+    }
+}
+
 impl Worker {
     async fn start(
         launch: WorkerLaunch,
         database: PathBuf,
         scope: &(String, String),
         key: &str,
-        slots: Arc<Semaphore>,
+        slot: OwnedSemaphorePermit,
+        table: Option<&locallycloud_dynamodb::encryption::catalog::TableFileRecord>,
     ) -> io::Result<Self> {
         let WorkerLaunch { components, mode } = launch;
-        let slot = slots
-            .acquire_owned()
-            .await
-            .map_err(|_| io::Error::other("ExtendDB is shutting down"))?;
         let (_, executable, lease) =
             tokio::task::spawn_blocking(move || component_manager::verified(&components))
                 .await
                 .map_err(io::Error::other)??;
+        let table_file = table.is_some();
+        let existing_table = table.is_some_and(|t| {
+            t.phase() == locallycloud_dynamodb::encryption::catalog::FilePhase::Active
+        });
+        let expected_database = database.clone();
         let parent = database
             .parent()
             .ok_or_else(|| io::Error::other("invalid database directory"))?
@@ -468,6 +645,21 @@ impl Worker {
             let data_root = parent
                 .parent()
                 .ok_or_else(|| io::Error::other("invalid data directory"))?;
+            if table_file {
+                if let Some(root) = data_root.parent() {
+                    component_manager::private_directory(root)?;
+                }
+            }
+            if existing_table {
+                let metadata = std::fs::symlink_metadata(&expected_database).map_err(|_| {
+                    io::Error::other("Encrypted table data file is missing or unsafe")
+                })?;
+                if !metadata.is_file() || metadata.len() == 0 {
+                    return Err(io::Error::other(
+                        "Encrypted table data file is missing or unsafe",
+                    ));
+                }
+            }
             component_manager::private_directory(data_root)
                 .and_then(|()| component_manager::private_directory(&parent))
                 .map_err(|_| {
@@ -502,13 +694,29 @@ impl Worker {
             _lease: lease,
             _slot: slot,
         };
-        let mut init = Zeroizing::new(serde_json::to_vec(&json!({"version":1,"key":key,"database":database,"account_id":scope.0,"region":scope.1,"mode":mode.as_str()})).map_err(io::Error::other)?);
+        // Borrow key material: a temporary serde_json::Value would leave an unzeroized copy.
+        let binding = table.map(|record| TableBinding {
+            table_name: record.scope().table_name(),
+            storage_id: record.scope().storage_id().to_string(),
+        });
+        let mut init = Zeroizing::new(
+            serde_json::to_vec(&WorkerInitialize {
+                version: 1,
+                key,
+                database: &database,
+                account_id: &scope.0,
+                region: &scope.1,
+                mode: mode.as_str(),
+                table_file: binding.as_ref(),
+            })
+            .map_err(io::Error::other)?,
+        );
         init.push(b'\n');
         worker.input.write_all(&init).await?;
         worker.input.flush().await?;
         let ready = frame(&mut worker.output).await?;
-        if !ready_for_mode(&ready, mode) {
-            return Err(io::Error::other("ExtendDB worker handshake or mode is incompatible; reinstall a current worker with migration TTL support"));
+        if !ready_for_mode(&ready, mode) || !ready_for_table(&ready, binding.as_ref()) {
+            return Err(io::Error::other("ExtendDB worker handshake, mode, or table binding is incompatible; install a current worker"));
         }
         drop(executable);
         Ok(worker)
@@ -557,12 +765,31 @@ async fn serve_worker(
     database: PathBuf,
     scope: (String, String),
     key: Arc<Zeroizing<String>>,
-    slots: Arc<Semaphore>,
+    budget: Arc<WorkerBudget>,
     notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
     mut requests: mpsc::Receiver<Request>,
 ) {
-    let mut worker = None;
-    while let Ok(Some(request)) = tokio::time::timeout(IDLE_TIMEOUT, requests.recv()).await {
+    let mut worker: Option<Worker> = None;
+    let mut waiting = budget.waiting.subscribe();
+    let mut idle_until = tokio::time::Instant::now() + IDLE_TIMEOUT;
+    loop {
+        let request = tokio::select! {
+            // Yield cached capacity before more work when another actor needs a process.
+            biased;
+            changed=waiting.changed()=> {
+                if changed.is_err() { break; }
+                let release=*waiting.borrow_and_update()>0;
+                if release {
+                    if let Some(worker)=worker.take() { worker.stop().await; }
+                }
+                continue;
+            }
+            received=tokio::time::timeout_at(idle_until,requests.recv())=>match received {
+                Ok(Some(request))=>request,
+                _=>break,
+            },
+        };
+        idle_until = tokio::time::Instant::now() + IDLE_TIMEOUT;
         if request.reply.is_closed() || tokio::time::Instant::now() >= request.deadline {
             let _ = request
                 .reply
@@ -571,26 +798,46 @@ async fn serve_worker(
         }
         let result = tokio::time::timeout_at(request.deadline, async {
             if worker.is_none() {
+                let slot = budget
+                    .acquire()
+                    .await
+                    .map_err(|_| DdbError::Internal("ExtendDB is shutting down".into()))?;
+                let table_key = match &request.table {
+                    Some(table) => Some(table.unlock().await?),
+                    None => None,
+                };
+                let key = table_key
+                    .as_ref()
+                    .map(|v| v.as_str())
+                    .unwrap_or(key.as_str());
                 worker = Some(
                     Worker::start(
                         launch.clone(),
                         database.clone(),
                         &scope,
-                        key.as_str(),
-                        slots.clone(),
+                        key,
+                        slot,
+                        request.table.as_ref().map(|t| &t.record),
                     )
-                    .await?,
+                    .await
+                    .map_err(|e| DdbError::Internal(e.to_string()))?,
                 );
             }
+            if let Some(table) = &request.table {
+                table.authorize().await?;
+            }
             match worker.as_mut() {
-                Some(worker) => worker.request(&request).await,
-                None => Err(io::Error::other("ExtendDB worker unavailable")),
+                Some(worker) => worker
+                    .request(&request)
+                    .await
+                    .map_err(|e| DdbError::Internal(e.to_string())),
+                None => Err(DdbError::Internal("ExtendDB worker unavailable".into())),
             }
         })
         .await
         .unwrap_or_else(|_| {
-            Err(io::Error::other(
-                "ExtendDB worker request timed out; outcome may be unknown",
+            Err(DdbError::Internal(
+                "ExtendDB worker request timed out; outcome may be unknown".into(),
             ))
         });
         if result.is_err() {
@@ -604,7 +851,12 @@ async fn serve_worker(
         ) {
             notifier.notify(&scope.0, &scope.1);
         }
-        let _ = request.reply.send(result.map_err(|e| e.to_string()));
+        let result = match result {
+            Ok(value) => Ok(value),
+            Err(error) => error_reply(error).await,
+        };
+        let _ = request.reply.send(result);
+        idle_until = tokio::time::Instant::now() + IDLE_TIMEOUT;
     }
     if let Some(worker) = worker {
         worker.stop().await;
@@ -750,12 +1002,13 @@ mod tests {
             data: PathBuf::from("/never-opened"),
             key: Arc::new(Zeroizing::new(String::new())),
             workers: Mutex::new(HashMap::from([(
-                ("000000000000".into(), "us-east-1".into()),
+                ("000000000000".into(), "us-east-1".into(), None),
                 WorkerTask { sender, task },
             )])),
+            table_storage: None,
             closing: AtomicBool::new(false),
             notifier: crate::dynamodb_replication::RelayNotifier::new(),
-            slots: Arc::new(Semaphore::new(1)),
+            budget: WorkerBudget::new(1),
         };
         (pool, calls)
     }
@@ -864,6 +1117,7 @@ mod tests {
                 body: json!({}),
                 reply,
                 deadline: tokio::time::Instant::now() - Duration::from_secs(1),
+                table: None,
             })
             .await
             .unwrap();
@@ -876,7 +1130,7 @@ mod tests {
             PathBuf::from("/missing-database"),
             ("000000000000".into(), "us-east-1".into()),
             Arc::new(Zeroizing::new(String::new())),
-            Arc::new(Semaphore::new(1)),
+            WorkerBudget::new(1),
             crate::dynamodb_replication::RelayNotifier::new(),
             receiver,
         )
@@ -885,6 +1139,69 @@ mod tests {
             result.await.unwrap().unwrap_err(),
             "ExtendDB request expired before execution"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_slot_waiters_remove_cache_pressure() {
+        let budget = WorkerBudget::new(1);
+        let cached = budget.acquire().await.unwrap();
+        let mut changed = budget.waiting.subscribe();
+        let waiting = budget.clone();
+        let task = tokio::spawn(async move { waiting.acquire().await });
+        tokio::time::timeout(Duration::from_secs(1), changed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*changed.borrow_and_update(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(*budget.waiting.borrow(), 0);
+        drop(cached);
+        assert_eq!(budget.slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_full_worker_queue_returns_aws_throttling_without_executing() {
+        let (pool, _) = scripted_pool(vec![]);
+        let (sender, receiver) = mpsc::channel(1);
+        let (reply, _) = oneshot::channel();
+        sender
+            .try_send(Request {
+                operation: "GetItem".into(),
+                body: json!({}),
+                reply,
+                deadline: tokio::time::Instant::now() + REQUEST_TIMEOUT,
+                table: None,
+            })
+            .unwrap_or_else(|_| panic!("fixture queue unexpectedly full"));
+        let (status, body) = pool
+            .enqueue(sender, "PutItem".into(), json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(status, 400);
+        assert!(body["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("#ThrottlingException"));
+        drop(receiver);
+        pool.shutdown().await;
+    }
+
+    #[test]
+    fn table_handshake_rejects_missing_capability_and_wrong_generation() {
+        let table = TableBinding {
+            table_name: "orders",
+            storage_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut ready = json!({"features":["table-file-v1"],"table_file":{"table_name":table.table_name,"storage_id":table.storage_id}});
+        assert!(ready_for_table(&ready, Some(&table)));
+        assert!(!ready_for_table(&ready, None));
+        ready["table_file"]["storage_id"] = json!(uuid::Uuid::new_v4().to_string());
+        assert!(!ready_for_table(&ready, Some(&table)));
+        ready["table_file"]["storage_id"] = json!(table.storage_id);
+        ready["features"] = json!([]);
+        assert!(!ready_for_table(&ready, Some(&table)));
+        assert!(ready_for_table(&json!({}), None));
     }
 
     #[test]

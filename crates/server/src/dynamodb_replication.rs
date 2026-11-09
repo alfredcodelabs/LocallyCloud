@@ -449,12 +449,7 @@ impl Coordinator {
         }
         let result = self
             .pool
-            .query(
-                &request.account_id,
-                &request.region,
-                op.clone(),
-                body.clone(),
-            )
+            .query_external(&request, op.clone(), body.clone())
             .await;
         let result = match result {
             Ok((status, mut output))

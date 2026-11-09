@@ -38,6 +38,10 @@ impl TableFileRecord {
         &self.0.envelope
     }
 
+    pub fn revision(&self) -> i64 {
+        self.0.revision
+    }
+
     pub fn phase(&self) -> FilePhase {
         self.0.phase
     }
@@ -109,6 +113,18 @@ impl TableCatalog {
             if n != 1 { return Err(conflict()); }
             Ok(TableFileRecord(record))
         }).await.map_err(|_| unavailable())?
+    }
+
+    pub async fn has_scope(&self, account: &str, region: &str) -> Result<bool, DdbError> {
+        crate::streams::validate_scope_values(account, region)?;
+        let (account, region) = (account.to_owned(), region.to_owned());
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            state.connection().map_err(|_|unavailable())?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lc_dynamodb_table_files WHERE account=?1 AND region=?2)",
+                (&account,&region),|row|row.get(0),
+            ).map_err(|_|unavailable())
+        }).await.map_err(|_|unavailable())?
     }
 
     pub async fn load(

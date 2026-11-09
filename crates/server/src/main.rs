@@ -482,7 +482,7 @@ async fn main() {
     }
     let mut managed_dynamodb = None;
     let dynamodb_registration = match dynamodb_engine.as_str() {
-        "extenddb" => dynamodb_engine::ExtendDb::new(state.clone())
+        "extenddb" => dynamodb_engine::ExtendDb::new(state.clone(), Arc::downgrade(&registry))
             .await
             .map(|engine| {
                 let engine = Arc::new(engine);
