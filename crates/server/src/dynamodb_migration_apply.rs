@@ -263,7 +263,7 @@ fn source_guard() -> Result<SourceGuard, String> {
     })
 }
 
-fn supports_migration_ttl(bytes: &[u8]) -> bool {
+fn supports_migration(bytes: &[u8]) -> bool {
     if bytes.len() > 4096 {
         return false;
     }
@@ -274,9 +274,13 @@ fn supports_migration_ttl(bytes: &[u8]) -> bool {
         return false;
     };
     value.get("version").and_then(Value::as_u64) == Some(1)
-        && features
+        && ["migration-ttl-v1", "migration-history-v1"]
             .iter()
-            .any(|feature| feature.as_str() == Some("migration-ttl-v1"))
+            .all(|required| {
+                features
+                    .iter()
+                    .any(|feature| feature.as_str() == Some(*required))
+            })
         && crate::component_catalog::REQUIRED_CAPABILITIES
             .iter()
             .all(|required| {
@@ -286,7 +290,7 @@ fn supports_migration_ttl(bytes: &[u8]) -> bool {
             })
 }
 
-async fn require_migration_ttl(component: &(PathBuf, File, File)) -> Result<(), String> {
+async fn require_migration_support(component: &(PathBuf, File, File)) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     // Execute the checksum-verified inode while its shared installation lease remains held.
     let executable = format!(
@@ -312,8 +316,8 @@ async fn require_migration_ttl(component: &(PathBuf, File, File)) -> Result<(), 
             return Err("ExtendDB capability output exceeds its limit");
         }
         let status = child.wait().await.map_err(|_| "Cannot reap ExtendDB capability probe")?;
-        if !status.success() || !supports_migration_ttl(&bytes) {
-            return Err("Installed ExtendDB worker lacks migration TTL support; install a current worker before retrying");
+        if !status.success() || !supports_migration(&bytes) {
+            return Err("Installed ExtendDB worker lacks safe offline history migration support; install a current worker before retrying");
         }
         Ok(())
     }).await;
@@ -543,6 +547,16 @@ struct Table {
     region: String,
     name: String,
     count: u64,
+    history: Option<Value>,
+}
+
+fn history_matches(expected: &Value, actual: &Value) -> bool {
+    ["Enabled", "Days"]
+        .iter()
+        .all(|field| expected.get(field) == actual.get(field))
+        && ["Started", "Latest"].iter().all(|field| {
+            expected.get(field).and_then(Value::as_f64) == actual.get(field).and_then(Value::as_f64)
+        })
 }
 
 async fn verify_count(pool: &WorkerPool, table: &Table) -> Result<(), String> {
@@ -580,6 +594,25 @@ async fn verify_count(pool: &WorkerPool, table: &Table) -> Result<(), String> {
     }
     if count != table.count {
         return Err(format!("Migration item count differs for {}", table.name));
+    }
+    if let Some(expected) = &table.history {
+        let actual = query(
+            pool,
+            &table.account,
+            &table.region,
+            "__locallycloud_migration_history_describe",
+            json!({"TableName":table.name}),
+        )
+        .await?;
+        if !history_matches(expected, &actual)
+            || expected.get("VersionCount").and_then(Value::as_u64)
+                != actual.get("VersionCount").and_then(Value::as_u64)
+        {
+            return Err(format!(
+                "Migration recovery history differs for {}",
+                table.name
+            ));
+        }
     }
     Ok(())
 }
@@ -741,6 +774,7 @@ async fn transfer(
                         region,
                         name: table,
                         count: item_count,
+                        history: None,
                     };
                     if import {
                         if tags.as_array().is_some_and(|tags| !tags.is_empty()) {
@@ -800,6 +834,47 @@ async fn transfer(
                         .map_err(|_| "Invalid destination migration item")?;
                     if actual != expected {
                         return Err(format!("Migration item differs for {table}"));
+                    }
+                }
+                NativeRecord::HistoryWindow {
+                    account, region, table, enabled, started, latest, days, version_count,
+                } => {
+                    let active = current.as_mut().filter(|current| {
+                        current.account == account && current.region == region && current.name == table && current.history.is_none()
+                    }).ok_or("Migration history has no matching table")?;
+                    let expected = json!({"Enabled":enabled,"Started":started,"Latest":latest,"Days":days,"VersionCount":version_count});
+                    if import {
+                        query(&pool, &account, &region, "__locallycloud_migration_history_begin",
+                            json!({"TableName":table,"Enabled":enabled,"Started":started,"Latest":latest,"Days":days})).await?;
+                    }
+                    let actual = query(&pool, &account, &region, "__locallycloud_migration_history_describe",json!({"TableName":table})).await?;
+                    if !history_matches(&expected, &actual) {
+                        return Err(format!("Migration recovery window differs for {table}"));
+                    }
+                    active.history = Some(expected);
+                }
+                NativeRecord::HistoryVersion { account, region, table, at, item, key } => {
+                    if current.as_ref().is_none_or(|current| {
+                        current.account != account || current.region != region || current.name != table || current.history.is_none()
+                    }) {
+                        return Err("Migration version has no matching history window".into());
+                    }
+                    if import {
+                        query(&pool, &account, &region, "__locallycloud_migration_history_put",
+                            json!({"TableName":table,"Key":key,"At":at,"Item":item})).await?;
+                    }
+                    let actual = query(&pool, &account, &region, "__locallycloud_migration_history_get",
+                        json!({"TableName":table,"Key":key,"At":at})).await?;
+                    let actual = actual.get("Item").ok_or("Missing migrated history record")?;
+                    let matches = match item {
+                        None => actual.is_null(),
+                        Some(expected) => {
+                            locallycloud_dynamodb::value::item_from_json(&expected).map_err(|_| "Invalid source history item")?
+                                == locallycloud_dynamodb::value::item_from_json(actual).map_err(|_| "Invalid destination history item")?
+                        }
+                    };
+                    if !matches {
+                        return Err(format!("Migration history item differs for {table}"));
                     }
                 }
             }
@@ -874,7 +949,7 @@ pub(crate) async fn apply(policy: MigrationPolicy) -> Result<(), String> {
     let guard = tokio::task::spawn_blocking(source_guard)
         .await
         .map_err(|_| "Migration source preflight task failed".to_owned())??;
-    require_migration_ttl(&guard.component).await?;
+    require_migration_support(&guard.component).await?;
     let mut prepared = tokio::task::spawn_blocking(move || prepare(guard, policy))
         .await
         .map_err(|_| "Migration destination preflight task failed".to_owned())??;
@@ -914,7 +989,7 @@ pub(crate) async fn apply(policy: MigrationPolicy) -> Result<(), String> {
     println!(
         "{}",
         json!({"kind":"migration-complete","engine":"extenddb","nativeRowsRetained":true,
-        "preserved":["logicalSchema","billingAndCapacity","indexes","tags","ttl","items"],
+        "preserved":["logicalSchema","billingAndCapacity","indexes","tags","ttl","items","pitrHistory"],
         "physicalTableIdentity":"regenerated",
         "legacyAes256Normalization":{"tables":normalized_tables,"sourceSseType":"AES256",
         "destinationStorage":"SQLCipher","destinationSseDescriptor":"default-owned","kmsMigrated":false}})
@@ -1130,21 +1205,29 @@ mod tests {
         let features = crate::component_catalog::REQUIRED_CAPABILITIES
             .iter()
             .map(|feature| json!(feature))
-            .chain(std::iter::once(json!("migration-ttl-v1")))
+            .chain([json!("migration-ttl-v1"), json!("migration-history-v1")])
             .collect::<Vec<_>>();
         let valid = json!({"version":1,"features":features});
-        assert!(supports_migration_ttl(&serde_json::to_vec(&valid).unwrap()));
+        assert!(supports_migration(&serde_json::to_vec(&valid).unwrap()));
+        let old_features = valid["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|feature| feature.as_str() != Some("migration-history-v1"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!supports_migration(
+            &serde_json::to_vec(&json!({"version":1,"features":old_features})).unwrap()
+        ));
         for invalid in [
             json!({"version":1,"features":["stream-cursors-v1"]}),
             json!({"version":2,"features":valid["features"]}),
             json!({"version":1,"features":"migration-ttl-v1"}),
         ] {
-            assert!(!supports_migration_ttl(
-                &serde_json::to_vec(&invalid).unwrap()
-            ));
+            assert!(!supports_migration(&serde_json::to_vec(&invalid).unwrap()));
         }
-        assert!(!supports_migration_ttl(&vec![b' '; 4097]));
-        assert!(!supports_migration_ttl(b"not json"));
+        assert!(!supports_migration(&vec![b' '; 4097]));
+        assert!(!supports_migration(b"not json"));
     }
 
     #[test]

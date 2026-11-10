@@ -1,5 +1,6 @@
 mod backups;
 mod cipher;
+mod migration;
 mod pitr;
 mod replication;
 mod streams;
@@ -32,6 +33,7 @@ const FEATURES: &[&str] = &[
     "mrec-outbox-v1",
     "backups-v1",
     "migration-ttl-v1",
+    "migration-history-v1",
     "pitr-history-v1",
     "pitr-global-v1",
     "table-file-v1",
@@ -57,6 +59,10 @@ fn runtime_options(mode: WorkerMode) -> ServerComponentsOptions {
     let mut options = ServerComponentsOptions::default();
     options.suspend_ttl_expiration = mode == WorkerMode::Migration;
     options
+}
+
+fn scope_matches(stored: &str, expected: &str) -> bool {
+    stored == expected || stored.strip_suffix(":migration-history-v1") == Some(expected)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -260,7 +266,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let settings = (extenddb_storage_sqlite::backend().settings_store)(&init.database).await?;
     match storage(settings.get_setting("locallycloud_scope").await)? {
-        Some(stored) if stored != scope => return Err("database belongs to another scope".into()),
+        Some(stored) if !scope_matches(&stored, &scope) => {
+            return Err("database belongs to another scope".into());
+        }
         Some(_) => {}
         None if initialized => return Err("database has no LocalCloud scope binding".into()),
         None => storage(settings.set_setting("locallycloud_scope", &scope).await)?,
@@ -348,6 +356,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let result = match request.operation.as_str() {
+                op if op.starts_with("__locallycloud_migration_history_") => {
+                    migration::dispatch(op, request.body, init.mode, &context, &sqlite).await
+                }
                 "__locallycloud_resolve_stream_iterator" => streams::resolve(&request.body),
                 "GetRecords" => streams::get_records(request.body, &context).await,
                 op @ ("DescribeContinuousBackups"
@@ -481,6 +492,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_scope_is_exact_and_legacy_scope_stays_readable() {
+        let scope = "000000000000:us-east-1";
+        assert!(scope_matches(scope, scope));
+        assert!(scope_matches(
+            &format!("{scope}:migration-history-v1"),
+            scope
+        ));
+        for other in [
+            "000000000001:us-east-1:migration-history-v1",
+            "000000000000:us-east-2:migration-history-v1",
+            "000000000000:us-east-1:migration-history-v2",
+            "000000000000:us-east-1:migration-history-v1:extra",
+        ] {
+            assert!(!scope_matches(other, scope));
+        }
+    }
 
     #[tokio::test]
     async fn framing_rejects_partial_requests() {

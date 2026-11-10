@@ -147,6 +147,8 @@ jobs:
           LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud-dynamodb --test table_keys --locked -- --nocapture
           LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud --test dynamodb_sse --locked -- --nocapture 2>&1 | tee /tmp/public-sse-test.log
           grep -Fq 'Real public SSE lifecycle:' /tmp/public-sse-test.log
+          LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud --test dynamodb_migration --locked -- --nocapture 2>&1 | tee /tmp/native-pitr-migration-test.log
+          grep -Fq 'Real native PITR migration: passed' /tmp/native-pitr-migration-test.log
       - uses: actions/upload-artifact@v7
         with:
           name: package-debian-${{ matrix.arch }}

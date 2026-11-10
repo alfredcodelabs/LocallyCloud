@@ -2,7 +2,7 @@
 use std::path::Path;
 
 use locallycloud_state::StateCipher;
-use rusqlite::params;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use super::{
@@ -10,8 +10,10 @@ use super::{
     source_schema_with_binding, BlockingFeature, InspectionSummary, SourceBinding, MAX_RECORD,
 };
 use crate::error::DdbError;
-use crate::store::{KeySchemaElement, KeyType, ProjectionType, TableData, WarmThroughput};
-use crate::value::{item_from_json, item_size, item_to_json, Item, MAX_ITEM_SIZE};
+use crate::store::{
+    KeyScalar, KeySchemaElement, KeyType, ProjectionType, StoredKey, TableData, WarmThroughput,
+};
+use crate::value::{item_from_json, item_size, item_to_json, AttributeValue, Item, MAX_ITEM_SIZE};
 
 /// Metadata preservation is the default; normalization always requires explicit consent.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,24 @@ pub enum NativeRecord {
         region: String,
         table: String,
         item: Value,
+        key: Value,
+    },
+    HistoryWindow {
+        account: String,
+        region: String,
+        table: String,
+        enabled: bool,
+        started: f64,
+        latest: f64,
+        days: u32,
+        version_count: u64,
+    },
+    HistoryVersion {
+        account: String,
+        region: String,
+        table: String,
+        at: f64,
+        item: Option<Value>,
         key: Value,
     },
 }
@@ -293,10 +313,19 @@ fn export_with_binding(
     mut visit: impl FnMut(NativeRecord) -> Result<(), DdbError>,
 ) -> Result<InspectionSummary, DdbError> {
     let connection = open_snapshot(path)?;
+    let (schema, _) = source_schema_with_binding(&connection, binding)?;
     let summary = inspect_snapshot_with_binding(&connection, cipher, binding, |table| {
-        if table.blocking_features.iter().any(|feature| {
-            !matches!(feature, BlockingFeature::ServerSideEncryption)
-                || !policy.normalizes(table.sse_type.as_deref())
+        let has_history = schema.contains("dynamodb_recovery")
+            && scoped_count(
+                &connection,
+                &schema,
+                "dynamodb_recovery",
+                [&table.account, &table.region, &table.table],
+            )? == 1;
+        if table.blocking_features.iter().any(|feature| match feature {
+            BlockingFeature::ServerSideEncryption => !policy.normalizes(table.sse_type.as_deref()),
+            BlockingFeature::PointInTimeRecovery => !has_history,
+            _ => true,
         }) {
             return Err(unsupported(
                 "the table features reported by migrate-dynamodb --dry-run",
@@ -310,7 +339,6 @@ fn export_with_binding(
     if summary.active_transaction_tokens > 0 {
         return Err(unsupported("unexpired transaction idempotency tokens"));
     }
-    let (schema, _) = source_schema_with_binding(&connection, binding)?;
     if !schema.contains("dynamodb_tables") {
         return Ok(summary);
     }
@@ -346,29 +374,122 @@ fn export_with_binding(
                     item_count: count,
                 })?;
             }
-            if !schema.contains("dynamodb_items") {
-                continue;
-            }
-            let mut items=connection.prepare("SELECT CASE WHEN length(CAST(item_key AS BLOB))<=?4 THEN item_key END,CASE WHEN length(CAST(item AS BLOB))<=?4 THEN item END FROM dynamodb_items WHERE account=?1 AND region=?2 AND name=?3 ORDER BY item_key").map_err(|_|invalid())?;
-            let mut items = items
-                .query(params![account, region, table, MAX_RECORD])
-                .map_err(|_| invalid())?;
-            while let Some(row) = items.next().map_err(|_| invalid())? {
-                let key: String = row.get(0).map_err(|_| invalid())?;
-                let encoded: String = row.get(1).map_err(|_| invalid())?;
-                let item = crate::recovery::decode_item(Some(cipher), &scope, &key, &encoded)?;
-                let (item, key) = wire_item(&item, &data)?;
-                if emit {
-                    visit(NativeRecord::Item {
-                        account: account.clone(),
-                        region: region.clone(),
-                        table: table.clone(),
-                        item,
-                        key,
-                    })?;
+            if schema.contains("dynamodb_items") {
+                let mut items=connection.prepare("SELECT CASE WHEN length(CAST(item_key AS BLOB))<=?4 THEN item_key END,CASE WHEN length(CAST(item AS BLOB))<=?4 THEN item END FROM dynamodb_items WHERE account=?1 AND region=?2 AND name=?3 ORDER BY item_key").map_err(|_|invalid())?;
+                let mut items = items
+                    .query(params![account, region, table, MAX_RECORD])
+                    .map_err(|_| invalid())?;
+                while let Some(row) = items.next().map_err(|_| invalid())? {
+                    let key: String = row.get(0).map_err(|_| invalid())?;
+                    let encoded: String = row.get(1).map_err(|_| invalid())?;
+                    let item = crate::recovery::decode_item(Some(cipher), &scope, &key, &encoded)?;
+                    let (item, key) = wire_item(&item, &data)?;
+                    if emit {
+                        visit(NativeRecord::Item {
+                            account: account.clone(),
+                            region: region.clone(),
+                            table: table.clone(),
+                            item,
+                            key,
+                        })?;
+                    }
                 }
+            }
+            if schema.contains("dynamodb_recovery") {
+                export_history(&connection, cipher, &schema, scope, &data, emit, &mut visit)?;
             }
         }
     }
     Ok(summary)
+}
+
+fn history_key(saved: &StoredKey, data: &TableData) -> Result<Value, DdbError> {
+    fn scalar(value: &KeyScalar) -> AttributeValue {
+        match value {
+            KeyScalar::S(value) => AttributeValue::S(value.clone()),
+            KeyScalar::N(value) => AttributeValue::N(value.clone()),
+            KeyScalar::B(value) => AttributeValue::B(value.clone()),
+        }
+    }
+    let mut item = Item::new();
+    for key in &data.def.key_schema {
+        let value = match key.key_type {
+            KeyType::Hash => &saved.partition,
+            KeyType::Range => saved.sort.as_ref().ok_or_else(invalid)?,
+        };
+        item.insert(key.name.clone(), scalar(value));
+    }
+    let (wire, _) = wire_item(&item, data)?;
+    Ok(wire)
+}
+
+fn export_history(
+    connection: &Connection,
+    cipher: &StateCipher,
+    schema: &std::collections::BTreeSet<String>,
+    scope: [&str; 3],
+    data: &TableData,
+    emit: bool,
+    visit: &mut impl FnMut(NativeRecord) -> Result<(), DdbError>,
+) -> Result<(), DdbError> {
+    let window: Option<(bool, f64, f64, u32)> = connection.query_row(
+        "SELECT enabled,started,latest,days FROM dynamodb_recovery WHERE account=?1 AND region=?2 AND name=?3",
+        scope, |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional().map_err(|_| invalid())?;
+    let Some((enabled, started, latest, days)) = window else {
+        return Ok(());
+    };
+    if emit {
+        visit(NativeRecord::HistoryWindow {
+            account: scope[0].into(),
+            region: scope[1].into(),
+            table: scope[2].into(),
+            enabled,
+            started,
+            latest,
+            days,
+            version_count: scoped_count(connection, schema, "dynamodb_recovery_items", scope)?,
+        })?;
+    }
+    if !schema.contains("dynamodb_recovery_items") {
+        return Ok(());
+    }
+    let mut records = connection.prepare(
+        "SELECT CASE WHEN length(CAST(item_key AS BLOB))<=?4 THEN item_key END,at,item IS NULL,CASE WHEN length(CAST(item AS BLOB))<=?4 THEN item END FROM dynamodb_recovery_items WHERE account=?1 AND region=?2 AND name=?3 ORDER BY item_key,at",
+    ).map_err(|_| invalid())?;
+    let mut records = records
+        .query(params![scope[0], scope[1], scope[2], MAX_RECORD])
+        .map_err(|_| invalid())?;
+    while let Some(row) = records.next().map_err(|_| invalid())? {
+        let encoded_key: String = row.get(0).map_err(|_| invalid())?;
+        let at: f64 = row.get(1).map_err(|_| invalid())?;
+        let tombstone: bool = row.get(2).map_err(|_| invalid())?;
+        let encoded: Option<String> = row.get(3).map_err(|_| invalid())?;
+        let saved: StoredKey = serde_json::from_str(&encoded_key).map_err(|_| invalid())?;
+        let key = history_key(&saved, data)?;
+        let item = match (tombstone, encoded) {
+            (true, None) => None,
+            (false, Some(encoded)) => {
+                let item =
+                    crate::recovery::decode_item(Some(cipher), &scope, &encoded_key, &encoded)?;
+                let (item, actual_key) = wire_item(&item, data)?;
+                if actual_key != key {
+                    return Err(invalid());
+                }
+                Some(item)
+            }
+            _ => return Err(invalid()),
+        };
+        if emit {
+            visit(NativeRecord::HistoryVersion {
+                account: scope[0].into(),
+                region: scope[1].into(),
+                table: scope[2].into(),
+                at,
+                item,
+                key,
+            })?;
+        }
+    }
+    Ok(())
 }

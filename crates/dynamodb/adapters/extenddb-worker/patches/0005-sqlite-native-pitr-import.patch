@@ -1,0 +1,478 @@
+diff --git a/crates/storage-sqlite/src/lib.rs b/crates/storage-sqlite/src/lib.rs
+--- a/crates/storage-sqlite/src/lib.rs
++++ b/crates/storage-sqlite/src/lib.rs
+@@ -35,6 +35,7 @@
+ mod management_store;
+ mod metadata;
+ pub mod mutation_hook;
++mod native_history;
+ mod number_key;
+ mod operations;
+ mod schema;
+diff --git a/crates/storage-sqlite/src/history.rs b/crates/storage-sqlite/src/history.rs
+--- a/crates/storage-sqlite/src/history.rs
++++ b/crates/storage-sqlite/src/history.rs
+@@ -18,6 +18,10 @@
+ type Result<T> = std::result::Result<T, StorageError>;
+ const DAY: i64 = 86_400_000_000;
+ const SCHEMA: &str = "
++CREATE TABLE IF NOT EXISTS lc_pitr_native_windows(table_id TEXT PRIMARY KEY REFERENCES lc_pitr_windows(table_id) ON DELETE CASCADE,enabled INTEGER NOT NULL,started REAL NOT NULL,latest REAL NOT NULL,days INTEGER NOT NULL);
++CREATE TABLE IF NOT EXISTS lc_pitr_native_versions(table_id TEXT NOT NULL REFERENCES lc_pitr_windows(table_id) ON DELETE CASCADE,pk TEXT NOT NULL,sk TEXT NOT NULL,at REAL NOT NULL,item_data TEXT,PRIMARY KEY(table_id,pk,sk,at));
++CREATE TABLE IF NOT EXISTS lc_pitr_exact_restore_requests(backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn) ON DELETE CASCADE,at REAL NOT NULL);
++CREATE TABLE IF NOT EXISTS lc_pitr_exact_restores(table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE,at REAL NOT NULL);
+ CREATE TABLE IF NOT EXISTS lc_pitr_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_us INTEGER NOT NULL);
+ INSERT OR IGNORE INTO lc_pitr_clock VALUES(1,0);
+ CREATE TABLE IF NOT EXISTS lc_pitr_windows(table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE,
+@@ -167,7 +171,7 @@
+         Ok(description)
+     }
+ 
+-    async fn history_user_source(
++    pub(crate) async fn history_user_source(
+         &self,
+         tx: &mut Transaction<'_, Sqlite>,
+         account: &str,
+@@ -262,8 +266,9 @@
+         .execute(&mut **tx)
+         .await
+         .map_err(storage)?;
+-        sqlx::query("DELETE FROM lc_pitr_versions WHERE rowid IN (SELECT old.rowid FROM lc_pitr_versions old JOIN lc_pitr_windows w USING(table_id) WHERE (w.table_id=? OR (? IS NULL AND w.table_id IN (SELECT table_id FROM lc_pitr_pending))) AND old.at_us<w.floor_us AND (EXISTS(SELECT 1 FROM lc_pitr_versions newer WHERE newer.table_id=old.table_id AND newer.pk=old.pk AND newer.sk=old.sk AND newer.at_us>old.at_us AND newer.at_us<=w.floor_us) OR (old.item_data IS NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_versions older WHERE older.table_id=old.table_id AND older.pk=old.pk AND older.sk=old.sk AND older.at_us<old.at_us))) LIMIT 128)")
++        sqlx::query("DELETE FROM lc_pitr_versions WHERE rowid IN (SELECT old.rowid FROM lc_pitr_versions old JOIN lc_pitr_windows w USING(table_id) WHERE (w.table_id=? OR (? IS NULL AND w.table_id IN (SELECT table_id FROM lc_pitr_pending))) AND old.at_us<w.floor_us AND (EXISTS(SELECT 1 FROM lc_pitr_versions newer WHERE newer.table_id=old.table_id AND newer.pk=old.pk AND newer.sk=old.sk AND newer.at_us>old.at_us AND newer.at_us<=w.floor_us) OR (old.item_data IS NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_versions older WHERE older.table_id=old.table_id AND older.pk=old.pk AND older.sk=old.sk AND older.at_us<old.at_us) AND NOT EXISTS(SELECT 1 FROM lc_pitr_native_versions older WHERE older.table_id=old.table_id AND older.pk=old.pk AND older.sk=old.sk AND older.at<old.at_us/1000000.0))) LIMIT 128)")
+             .bind(table).bind(table).execute(&mut **tx).await.map_err(storage)?;
++        sqlx::query("DELETE FROM lc_pitr_native_versions WHERE rowid IN (SELECT old.rowid FROM lc_pitr_native_versions old JOIN lc_pitr_windows w USING(table_id) WHERE (w.table_id=? OR (? IS NULL AND w.table_id IN (SELECT table_id FROM lc_pitr_pending))) AND old.at<w.floor_us/1000000.0 AND (EXISTS(SELECT 1 FROM lc_pitr_native_versions newer WHERE newer.table_id=old.table_id AND newer.pk=old.pk AND newer.sk=old.sk AND newer.at>old.at AND newer.at<=w.floor_us/1000000.0) OR EXISTS(SELECT 1 FROM lc_pitr_versions newer WHERE newer.table_id=old.table_id AND newer.pk=old.pk AND newer.sk=old.sk AND newer.at_us/1000000.0>old.at AND newer.at_us<=w.floor_us) OR (old.item_data IS NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_native_versions older WHERE older.table_id=old.table_id AND older.pk=old.pk AND older.sk=old.sk AND older.at<old.at))) LIMIT 128)").bind(table).bind(table).execute(&mut **tx).await.map_err(storage)?;
+         sqlx::query("DELETE FROM backup_items WHERE rowid IN (SELECT i.rowid FROM backup_items i JOIN lc_backup_retention r USING(backup_arn) WHERE r.expires_us<=? LIMIT 128)").bind(now).execute(&mut **tx).await.map_err(storage)?;
+         sqlx::query("DELETE FROM backups WHERE backup_arn IN (SELECT r.backup_arn FROM lc_backup_retention r WHERE r.expires_us<=? AND NOT EXISTS(SELECT 1 FROM backup_items i WHERE i.backup_arn=r.backup_arn) LIMIT 1)").bind(now).execute(&mut **tx).await.map_err(storage)?;
+         Ok(())
+@@ -282,7 +287,7 @@
+         let recovery = match window(&mut tx, &id).await?.filter(|w| w.enabled) {
+             Some(window) => {
+                 let now = checked_now(&mut tx).await?;
+-                json!({"PointInTimeRecoveryStatus":"ENABLED","RecoveryPeriodInDays":window.days,"EarliestRestorableDateTime":seconds(floor(&window,now)),"LatestRestorableDateTime":seconds(now)})
++                json!({"PointInTimeRecoveryStatus":"ENABLED","RecoveryPeriodInDays":window.days,"EarliestRestorableDateTime":crate::native_history::earliest(&mut tx,&id,seconds(floor(&window,now))).await?,"LatestRestorableDateTime":seconds(now)})
+             }
+             None => json!({"PointInTimeRecoveryStatus":"DISABLED"}),
+         };
+@@ -359,6 +364,16 @@
+                     .bind(&description.table_id).bind(account).bind(table).bind(enabled).bind(started).bind(floor).bind(days).execute(&mut *tx).await.map_err(storage)?;
+             }
+             if !enabled {
++                sqlx::query("DELETE FROM lc_pitr_native_windows WHERE table_id=?")
++                    .bind(&description.table_id)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(storage)?;
++                sqlx::query("DELETE FROM lc_pitr_native_versions WHERE table_id=?")
++                    .bind(&description.table_id)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(storage)?;
+                 sqlx::query("DELETE FROM lc_pitr_versions WHERE table_id=?")
+                     .bind(&description.table_id)
+                     .execute(&mut *tx)
+@@ -409,13 +424,23 @@
+                 .ok_or_else(unavailable)?;
+             let now = checked_now(&mut tx).await?;
+             let requested = restore_time(at, now, floor(&window, now))?;
++            let exact = at.unwrap_or_else(|| seconds(now));
++            let earliest = crate::native_history::earliest(
++                &mut tx,
++                &description.table_id,
++                seconds(floor(&window, now)),
++            )
++            .await?;
++            if exact < earliest || exact > seconds(now) {
++                return Err(invalid_time());
++            }
+             let backup = self
+                 .snapshot_on(
+                     &mut tx,
+                     account,
+                     source,
+                     "__pitr_restore__",
+-                    SnapshotData::Historical(requested),
++                    SnapshotData::Historical(exact),
+                     "INTERNAL",
+                     Some(now + DAY),
+                 )
+@@ -424,6 +449,12 @@
+                 .bind(&backup.backup_arn)
+                 .bind(&description.table_arn)
+                 .bind(requested)
++                .execute(&mut *tx)
++                .await
++                .map_err(storage)?;
++            sqlx::query("INSERT INTO lc_pitr_exact_restore_requests VALUES(?,?)")
++                .bind(&backup.backup_arn)
++                .bind(exact)
+                 .execute(&mut *tx)
+                 .await
+                 .map_err(storage)?;
+diff --git a/crates/storage-sqlite/src/backup.rs b/crates/storage-sqlite/src/backup.rs
+--- a/crates/storage-sqlite/src/backup.rs
++++ b/crates/storage-sqlite/src/backup.rs
+@@ -87,7 +87,7 @@
+ 
+ pub(crate) enum SnapshotData {
+     Current,
+-    Historical(i64),
++    Historical(f64),
+ }
+ 
+ impl SqliteEngine {
+@@ -144,8 +144,8 @@
+                     .bind(&arn).execute(&mut **tx).await.map_err(crate::history::storage)?;
+             }
+             SnapshotData::Historical(at) => {
+-                sqlx::query("INSERT INTO backup_items(backup_arn,pk,sk,item_data) SELECT ?,h.pk,h.sk,h.item_data FROM lc_pitr_versions h WHERE h.table_id=? AND h.at_us<=? AND h.item_data IS NOT NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_versions n WHERE n.table_id=h.table_id AND n.pk=h.pk AND n.sk=h.sk AND n.at_us>h.at_us AND n.at_us<=?)")
+-                    .bind(&arn).bind(&description.table_id).bind(at).bind(at).execute(&mut **tx).await.map_err(crate::history::storage)?;
++                sqlx::query("INSERT INTO backup_items(backup_arn,pk,sk,item_data) SELECT ?1,h.pk,h.sk,h.item_data FROM lc_pitr_versions h WHERE h.table_id=?2 AND h.at_us/1000000.0<=?3 AND h.item_data IS NOT NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_versions n WHERE n.table_id=h.table_id AND n.pk=h.pk AND n.sk=h.sk AND n.at_us>h.at_us AND n.at_us/1000000.0<=?3) AND NOT EXISTS(SELECT 1 FROM lc_pitr_native_versions n WHERE n.table_id=h.table_id AND n.pk=h.pk AND n.sk=h.sk AND n.at>h.at_us/1000000.0 AND n.at<=?3) UNION ALL SELECT ?1,h.pk,h.sk,h.item_data FROM lc_pitr_native_versions h WHERE h.table_id=?2 AND h.at<=?3 AND h.item_data IS NOT NULL AND NOT EXISTS(SELECT 1 FROM lc_pitr_native_versions n WHERE n.table_id=h.table_id AND n.pk=h.pk AND n.sk=h.sk AND n.at>h.at AND n.at<=?3) AND NOT EXISTS(SELECT 1 FROM lc_pitr_versions n WHERE n.table_id=h.table_id AND n.pk=h.pk AND n.sk=h.sk AND n.at_us/1000000.0>h.at AND n.at_us/1000000.0<=?3)")
++                    .bind(&arn).bind(&description.table_id).bind(at).execute(&mut **tx).await.map_err(crate::history::storage)?;
+             }
+         }
+         let (count,size):(i64,i64)=sqlx::query_as("SELECT COUNT(*),COALESCE(SUM(length(CAST(item_data AS BLOB))),0) FROM backup_items WHERE backup_arn=?")
+@@ -581,14 +581,14 @@
+                 .execute(&mut *tx)
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+-            let historical: Option<(String, i64)> = sqlx::query_as(
+-                "SELECT source_arn,at_us FROM lc_pitr_restore_requests WHERE backup_arn=?",
++            let historical: Option<(String, i64, Option<f64>)> = sqlx::query_as(
++                "SELECT r.source_arn,r.at_us,e.at FROM lc_pitr_restore_requests r LEFT JOIN lc_pitr_exact_restore_requests e USING(backup_arn) WHERE r.backup_arn=?",
+             )
+             .bind(&backup_arn)
+             .fetch_optional(&mut *tx)
+             .await
+             .map_err(crate::history::storage)?;
+-            if let Some((source, at)) = historical {
++            if let Some((source, at, exact)) = historical {
+                 sqlx::query("INSERT INTO lc_pitr_restores VALUES(?,?,?)")
+                     .bind(&desc.table_id)
+                     .bind(source)
+@@ -596,6 +596,14 @@
+                     .execute(&mut *tx)
+                     .await
+                     .map_err(crate::history::storage)?;
++                if let Some(exact) = exact {
++                    sqlx::query("INSERT INTO lc_pitr_exact_restores VALUES(?,?)")
++                        .bind(&desc.table_id)
++                        .bind(exact)
++                        .execute(&mut *tx)
++                        .await
++                        .map_err(crate::history::storage)?;
++                }
+                 sqlx::query("DELETE FROM backups WHERE backup_arn=?")
+                     .bind(&backup_arn)
+                     .execute(&mut *tx)
+diff --git a/crates/storage-sqlite/src/table_helpers.rs b/crates/storage-sqlite/src/table_helpers.rs
+--- a/crates/storage-sqlite/src/table_helpers.rs
++++ b/crates/storage-sqlite/src/table_helpers.rs
+@@ -172,17 +172,17 @@
+             .collect::<Result<Vec<_>, _>>()?;
+         desc.vector_indexes =
+             vector_index_descriptions(&self.region, account_id, &table_name_owned, catalog_rows)?;
+-        let recovery: Option<(String, i64)> =
+-            sqlx::query_as("SELECT source_arn,at_us FROM lc_pitr_restores WHERE table_id=?")
++        let recovery: Option<(String, i64, Option<f64>)> =
++            sqlx::query_as("SELECT r.source_arn,r.at_us,e.at FROM lc_pitr_restores r LEFT JOIN lc_pitr_exact_restores e USING(table_id) WHERE r.table_id=?")
+                 .bind(&desc.table_id)
+                 .fetch_optional(&mut *connection)
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+-        if let Some((source, at)) = recovery {
++        if let Some((source, at, exact)) = recovery {
+             desc.restore_summary = Some(extenddb_core::types::RestoreSummary {
+                 source_table_arn: Some(source),
+                 source_backup_arn: None,
+-                restore_date_time: crate::history::seconds(at),
++                restore_date_time: exact.unwrap_or_else(|| crate::history::seconds(at)),
+                 restore_in_progress: false,
+             });
+         }
+diff --git a/crates/storage-sqlite/src/native_history.rs b/crates/storage-sqlite/src/native_history.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/storage-sqlite/src/native_history.rs
+@@ -0,0 +1,283 @@
++// Copyright 2026 LocalCloud contributors
++// SPDX-License-Identifier: Apache-2.0
++
++//! Offline import preserves native timestamp bits; ordinary PITR still owns restore/indexing.
++use extenddb_core::types::{
++    AttributeValue, Item, KeyType, ScalarAttributeType, TableDescription, item_size_bytes,
++};
++use extenddb_storage::error::StorageError;
++use extenddb_storage::util::{parse_sk, pk_to_text, sk_info};
++use serde_json::{Value, json};
++use sqlx::{Sqlite, Transaction};
++
++use crate::data::{BoundValue, sk_bound};
++use crate::history::{now_us, seconds, storage};
++use crate::store::SqliteEngine;
++
++type Result<T> = std::result::Result<T, StorageError>;
++fn invalid() -> StorageError {
++    StorageError::Validation("Invalid native recovery history or conflicting import".into())
++}
++
++pub(crate) async fn earliest(
++    tx: &mut Transaction<'_, Sqlite>,
++    id: &str,
++    floor: f64,
++) -> Result<f64> {
++    let start: Option<f64> =
++        sqlx::query_scalar("SELECT started FROM lc_pitr_native_windows WHERE table_id=?")
++            .bind(id)
++            .fetch_optional(&mut **tx)
++            .await
++            .map_err(storage)?;
++    Ok(start.map_or(floor, |start| floor.max(start)))
++}
++
++async fn key(
++    tx: &mut Transaction<'_, Sqlite>,
++    desc: &TableDescription,
++    key: &Item,
++) -> Result<(String, String)> {
++    if key.len() != desc.key_schema.len() {
++        return Err(invalid());
++    }
++    for field in &desc.key_schema {
++        let value = key.get(&field.attribute_name).ok_or_else(invalid)?;
++        let kind = desc
++            .attribute_definitions
++            .iter()
++            .find(|d| d.attribute_name == field.attribute_name)
++            .map(|d| d.attribute_type)
++            .ok_or_else(invalid)?;
++        if !matches!(
++            (kind, value),
++            (ScalarAttributeType::S, AttributeValue::S(_))
++                | (ScalarAttributeType::N, AttributeValue::N(_))
++                | (ScalarAttributeType::B, AttributeValue::B(_))
++        ) {
++            return Err(invalid());
++        }
++    }
++    let partition = desc
++        .key_schema
++        .iter()
++        .find(|k| k.key_type == KeyType::Hash)
++        .ok_or_else(invalid)?;
++    let pk = pk_to_text(key.get(&partition.attribute_name).ok_or_else(invalid)?)?.into_owned();
++    let bytes = if let Some((name, kind)) = sk_info(&desc.key_schema, &desc.attribute_definitions) {
++        match sk_bound(&parse_sk(key.get(name).ok_or_else(invalid)?, kind)?) {
++            BoundValue::Text(text) => text.into_bytes(),
++            BoundValue::Blob(bytes) => bytes,
++        }
++    } else {
++        Vec::new()
++    };
++    let sk: String = sqlx::query_scalar("SELECT hex(?)")
++        .bind(bytes)
++        .fetch_one(&mut **tx)
++        .await
++        .map_err(storage)?;
++    Ok((pk, sk))
++}
++
++impl SqliteEngine {
++    pub async fn native_history_begin(
++        &self,
++        account: &str,
++        table: &str,
++        enabled: bool,
++        started: f64,
++        latest: f64,
++        days: u32,
++    ) -> Result<Value> {
++        let now = seconds(now_us()?);
++        if !started.is_finite()
++            || !latest.is_finite()
++            || started < 0.0
++            || latest < started
++            || latest > now
++            || !(1..=35).contains(&days)
++        {
++            return Err(invalid());
++        }
++        let _writer = self.write_lock.lock().await;
++        let mut tx = self
++            .pool
++            .begin_with("BEGIN IMMEDIATE")
++            .await
++            .map_err(storage)?;
++        let desc = self.history_user_source(&mut tx, account, table).await?;
++        let exists: bool =
++            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM lc_pitr_windows WHERE table_id=?)")
++                .bind(&desc.table_id)
++                .fetch_one(&mut *tx)
++                .await
++                .map_err(storage)?;
++        if exists {
++            return Err(invalid());
++        }
++        // Existing workers validate this scope exactly and must not ignore imported history.
++        let scope = format!("{account}:{}", self.region);
++        let upgraded = format!("{scope}:migration-history-v1");
++        let stored: Option<String> =
++            sqlx::query_scalar("SELECT value FROM settings WHERE key='locallycloud_scope'")
++                .fetch_optional(&mut *tx)
++                .await
++                .map_err(storage)?;
++        match stored.as_deref() {
++            Some(value) if value == scope => {
++                sqlx::query("UPDATE settings SET value=? WHERE key='locallycloud_scope'")
++                    .bind(upgraded)
++                    .execute(&mut *tx)
++                    .await
++                    .map_err(storage)?;
++            }
++            Some(value) if value == upgraded => {}
++            _ => return Err(invalid()),
++        }
++        // Only the ordinary clock/window is rounded outward; source versions retain f64 seconds.
++        #[allow(clippy::cast_possible_truncation)]
++        let floor = (started * 1_000_000.0).floor() as i64;
++        #[allow(clippy::cast_possible_truncation)]
++        let clock = (latest * 1_000_000.0).ceil() as i64;
++        sqlx::query("INSERT INTO lc_pitr_windows VALUES(?,?,?,?,?,?,?)")
++            .bind(&desc.table_id)
++            .bind(account)
++            .bind(table)
++            .bind(enabled)
++            .bind(floor)
++            .bind(floor)
++            .bind(i64::from(days))
++            .execute(&mut *tx)
++            .await
++            .map_err(storage)?;
++        sqlx::query("INSERT INTO lc_pitr_native_windows VALUES(?,?,?,?,?)")
++            .bind(&desc.table_id)
++            .bind(enabled)
++            .bind(started)
++            .bind(latest)
++            .bind(i64::from(days))
++            .execute(&mut *tx)
++            .await
++            .map_err(storage)?;
++        sqlx::query("UPDATE lc_pitr_clock SET last_us=MAX(last_us,?) WHERE singleton=1")
++            .bind(clock)
++            .execute(&mut *tx)
++            .await
++            .map_err(storage)?;
++        tx.commit().await.map_err(storage)?;
++        self.native_history_describe(account, table).await
++    }
++
++    pub async fn native_history_put(
++        &self,
++        account: &str,
++        table: &str,
++        at: f64,
++        source_key: &Item,
++        item: Option<&Item>,
++    ) -> Result<Value> {
++        if !at.is_finite() || at < 0.0 || item.is_some_and(|item| item_size_bytes(item) > 409_600) {
++            return Err(invalid());
++        }
++        let _writer = self.write_lock.lock().await;
++        let mut tx = self
++            .pool
++            .begin_with("BEGIN IMMEDIATE")
++            .await
++            .map_err(storage)?;
++        let desc = self.history_user_source(&mut tx, account, table).await?;
++        let latest: f64 =
++            sqlx::query_scalar("SELECT latest FROM lc_pitr_native_windows WHERE table_id=?")
++                .bind(&desc.table_id)
++                .fetch_optional(&mut *tx)
++                .await
++                .map_err(storage)?
++                .ok_or_else(invalid)?;
++        if at > latest {
++            return Err(invalid());
++        }
++        let (pk, sk) = key(&mut tx, &desc, source_key).await?;
++        if let Some(item) = item {
++            let item_key = desc
++                .key_schema
++                .iter()
++                .map(|field| {
++                    item.get(&field.attribute_name)
++                        .map(|value| (field.attribute_name.clone(), value.clone()))
++                        .ok_or_else(invalid)
++                })
++                .collect::<Result<Item>>()?;
++            if key(&mut tx, &desc, &item_key).await? != (pk.clone(), sk.clone()) {
++                return Err(invalid());
++            }
++        }
++        let encoded = item
++            .map(serde_json::to_string)
++            .transpose()
++            .map_err(|_| invalid())?;
++        let previous: Option<(Option<String>,)> = sqlx::query_as("SELECT item_data FROM lc_pitr_native_versions WHERE table_id=? AND pk=? AND sk=? AND at=?")
++            .bind(&desc.table_id).bind(&pk).bind(&sk).bind(at).fetch_optional(&mut *tx).await.map_err(storage)?;
++        if let Some((old,)) = previous {
++            if old != encoded {
++                return Err(invalid());
++            }
++        } else {
++            sqlx::query("INSERT INTO lc_pitr_native_versions VALUES(?,?,?,?,?)")
++                .bind(&desc.table_id)
++                .bind(pk)
++                .bind(sk)
++                .bind(at)
++                .bind(encoded)
++                .execute(&mut *tx)
++                .await
++                .map_err(storage)?;
++        }
++        tx.commit().await.map_err(storage)?;
++        Ok(json!({}))
++    }
++
++    pub async fn native_history_get(
++        &self,
++        account: &str,
++        table: &str,
++        at: f64,
++        source_key: &Item,
++    ) -> Result<Value> {
++        if !at.is_finite() || at < 0.0 {
++            return Err(invalid());
++        }
++        let mut tx = self.pool.begin().await.map_err(storage)?;
++        let desc = self.history_user_source(&mut tx, account, table).await?;
++        let (pk, sk) = key(&mut tx, &desc, source_key).await?;
++        let (item,): (Option<String>,) = sqlx::query_as("SELECT item_data FROM lc_pitr_native_versions WHERE table_id=? AND pk=? AND sk=? AND at=?")
++            .bind(&desc.table_id).bind(pk).bind(sk).bind(at).fetch_optional(&mut *tx).await.map_err(storage)?
++            .ok_or_else(|| StorageError::TableNotFound("Native history record does not exist".into()))?;
++        let item = item
++            .map(|item| serde_json::from_str::<Value>(&item).map_err(|_| invalid()))
++            .transpose()?;
++        Ok(json!({"Item":item}))
++    }
++
++    pub async fn native_history_describe(&self, account: &str, table: &str) -> Result<Value> {
++        let mut tx = self.pool.begin().await.map_err(storage)?;
++        let desc = self.history_user_source(&mut tx, account, table).await?;
++        let (enabled, started, latest, days): (bool, f64, f64, i64) = sqlx::query_as(
++            "SELECT enabled,started,latest,days FROM lc_pitr_native_windows WHERE table_id=?",
++        )
++        .bind(&desc.table_id)
++        .fetch_optional(&mut *tx)
++        .await
++        .map_err(storage)?
++        .ok_or_else(invalid)?;
++        let count: i64 =
++            sqlx::query_scalar("SELECT COUNT(*) FROM lc_pitr_native_versions WHERE table_id=?")
++                .bind(&desc.table_id)
++                .fetch_one(&mut *tx)
++                .await
++                .map_err(storage)?;
++        Ok(
++            json!({"Enabled":enabled,"Started":started,"Latest":latest,"Days":days,"VersionCount":count}),
++        )
++    }
++}

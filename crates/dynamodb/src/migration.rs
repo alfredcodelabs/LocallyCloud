@@ -425,7 +425,8 @@ fn inspect_snapshot_with_binding(
                 BlockingFeature::StreamIdentityAndHistory,
             ),
             (
-                data.pitr_enabled || recovery_versions > 0 || recovery_windows > 0,
+                (data.pitr_enabled || recovery_versions > 0 || recovery_windows > 0)
+                    && recovery_windows != 1,
                 BlockingFeature::PointInTimeRecovery,
             ),
             (
@@ -697,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_history_stays_blocked_without_losing_versions_or_tombstones() {
+    fn export_preserves_history_without_losing_versions_or_tombstones() {
         for (encrypted, enabled) in [(false, true), (true, true), (true, false)] {
             let fixture = history_fixture(encrypted, enabled);
             let before = std::fs::read(fixture.state.path()).unwrap();
@@ -709,7 +710,7 @@ mod tests {
                     if table.table == "zzz-history" {
                         histories += 1;
                         assert_eq!(table.recovery_versions, 2);
-                        assert!(table.blocking_features.iter().any(|feature| matches!(
+                        assert!(!table.blocking_features.iter().any(|feature| matches!(
                             feature,
                             BlockingFeature::PointInTimeRecovery
                         )));
@@ -723,19 +724,121 @@ mod tests {
                 summary.encrypted_records_authenticated,
                 if encrypted { 3 } else { 0 }
             );
-            let mut emitted = 0;
-            assert!(export_native(
+            let mut windows = 0;
+            let mut versions = 0;
+            let mut tombstones = 0;
+            let mut table_seen = false;
+            export_native_with_policy(
                 fixture.state.path(),
                 &StateCipher::with_key(&[7; 32]),
-                |_| {
-                    emitted += 1;
+                MigrationPolicy::NormalizeLegacyAes256,
+                |record| {
+                    match record {
+                        NativeRecord::Table { table, .. } => {
+                            table_seen = table == "zzz-history";
+                        }
+                        NativeRecord::Item { .. } => {}
+                        NativeRecord::HistoryWindow {
+                            enabled: actual,
+                            started,
+                            latest,
+                            days,
+                            version_count,
+                            ..
+                        } => {
+                            assert!(table_seen);
+                            assert_eq!(actual, enabled);
+                            assert_eq!(
+                                (started, latest, days, version_count),
+                                (10.25, 12.75, 7, 2)
+                            );
+                            windows += 1;
+                        }
+                        NativeRecord::HistoryVersion { at, item, key, .. } => {
+                            assert!(table_seen && windows == 1);
+                            assert_eq!(key, json!({"pk":{"S":"row"}}));
+                            if let Some(item) = item {
+                                assert_eq!(at, 10.25);
+                                assert_eq!(item["pk"], json!({"S":"row"}));
+                            } else {
+                                assert_eq!(at, 12.75);
+                                tombstones += 1;
+                            }
+                            versions += 1;
+                        }
+                    }
                     Ok(())
-                }
+                },
             )
-            .is_err());
-            assert_eq!(emitted, 0);
+            .unwrap();
+            assert_eq!((windows, versions, tombstones), (1, 2, 1));
             assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn history_export_preserves_submicrosecond_timestamps_and_retention_baselines() {
+        let fixture = history_fixture(false, true);
+        let started = 1_700_000_000.25_f64;
+        let next = f64::from_bits(started.to_bits() + 1);
+        let connection = fixture.state.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE dynamodb_recovery SET started=?1,latest=?2",
+                params![next, next],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE dynamodb_recovery_items SET at=CASE WHEN item IS NULL THEN ?2 ELSE ?1 END",
+                params![started, next],
+            )
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        let mut versions = Vec::new();
+        export_native(
+            fixture.state.path(),
+            &StateCipher::with_key(&[7; 32]),
+            |record| {
+                if let NativeRecord::HistoryVersion { at, .. } = record {
+                    versions.push(at.to_bits());
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(versions, vec![started.to_bits(), next.to_bits()]);
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn history_wire_validation_finishes_before_any_export_callback() {
+        let fixture = history_fixture(false, true);
+        let oversized =
+            json!({"pk":{"S":"row"},"payload":{"S":"x".repeat(crate::value::MAX_ITEM_SIZE)}});
+        fixture
+            .state
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE dynamodb_recovery_items SET item=?1 WHERE item IS NOT NULL",
+                [oversized.to_string()],
+            )
+            .unwrap();
+        let before = std::fs::read(fixture.state.path()).unwrap();
+        let mut calls = 0;
+        assert!(export_native(
+            fixture.state.path(),
+            &StateCipher::with_key(&[7; 32]),
+            |_| {
+                calls += 1;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(calls, 0);
+        assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
     }
 
     #[test]
@@ -1080,6 +1183,9 @@ mod tests {
                     fixture.item("orders", "later", false, &cipher);
                 }
                 NativeRecord::Item { .. } => emitted += 1,
+                NativeRecord::HistoryWindow { .. } | NativeRecord::HistoryVersion { .. } => {
+                    panic!("Unexpected history for a table without PITR")
+                }
             }
             Ok(())
         })
@@ -1269,6 +1375,10 @@ mod tests {
                             assert_eq!(item["expires"], json!({"N":"1"}));
                             expired_seen = true;
                         }
+                        NativeRecord::HistoryWindow { .. }
+                        | NativeRecord::HistoryVersion { .. } => {
+                            panic!("Unexpected history for a table without PITR")
+                        }
                     }
                     Ok(())
                 },
@@ -1326,6 +1436,9 @@ mod tests {
                         assert!(create.get("SSESpecification").is_none());
                     }
                     NativeRecord::Item { .. } => items += 1,
+                    NativeRecord::HistoryWindow { .. } | NativeRecord::HistoryVersion { .. } => {
+                        panic!("Unexpected history for a table without PITR")
+                    }
                 }
                 Ok(())
             },

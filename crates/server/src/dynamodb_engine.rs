@@ -690,9 +690,13 @@ fn ready_for_mode(ready: &Value, mode: WorkerMode) -> bool {
                     .any(|feature| feature.as_str() == Some(*required))
             })
         && (mode == WorkerMode::Normal
-            || features
+            || ["migration-ttl-v1", "migration-history-v1"]
                 .iter()
-                .any(|feature| feature.as_str() == Some("migration-ttl-v1")))
+                .all(|required| {
+                    features
+                        .iter()
+                        .any(|feature| feature.as_str() == Some(*required))
+                }))
 }
 
 #[derive(Serialize)]
@@ -1542,7 +1546,20 @@ mod tests {
         let features = component_catalog::REQUIRED_CAPABILITIES
             .iter()
             .map(|feature| json!(feature))
+            .chain(std::iter::once(json!("migration-history-v1")))
             .collect::<Vec<_>>();
+        let previous = component_catalog::REQUIRED_CAPABILITIES
+            .iter()
+            .map(|feature| json!(feature))
+            .collect::<Vec<_>>();
+        assert!(ready_for_mode(
+            &json!({"ready":true,"version":1,"mode":"normal","features":previous}),
+            WorkerMode::Normal
+        ));
+        assert!(!ready_for_mode(
+            &json!({"ready":true,"version":1,"mode":"migration","features":previous}),
+            WorkerMode::Migration
+        ));
         for mode in [WorkerMode::Normal, WorkerMode::Migration] {
             let mut ready =
                 json!({"ready":true,"version":1,"mode":mode.as_str(),"features":features});
