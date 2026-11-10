@@ -312,6 +312,13 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
     let catalog = TableCatalog::new(state.clone(), keys.clone())
         .await
         .unwrap();
+    assert!(catalog.page(None, 1).await.unwrap().is_empty());
+    for limit in [0, 101, usize::MAX] {
+        assert!(matches!(
+            catalog.page(None, limit).await,
+            Err(DdbError::Validation(_))
+        ));
+    }
     let scope = TableKeyScope::new(ACCOUNT, REGION, "catalog-orders", Uuid::new_v4()).unwrap();
     let key = keys.generate(&scope, caller(), None).await.unwrap();
     let competitor = TableKeyScope::new(ACCOUNT, REGION, "catalog-orders", Uuid::new_v4()).unwrap();
@@ -397,6 +404,10 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
         catalog.load(ACCOUNT, REGION, "catalog-orders").await,
         Err(DdbError::Internal(_))
     ));
+    assert!(matches!(
+        catalog.page(None, 100).await,
+        Err(DdbError::Internal(_))
+    ));
     let db = state.clone();
     tokio::task::spawn_blocking(move || {
         let conn=db.connection().unwrap();
@@ -451,6 +462,95 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
     );
     let other = TableKeyScope::new(ACCOUNT, REGION, "wrong-catalog-table", Uuid::new_v4()).unwrap();
     assert!(catalog.reserve(other, key.envelope).await.is_err());
+
+    for (account, region, name) in [
+        (ACCOUNT, REGION, "aaa-orders"),
+        (ACCOUNT, "us-east-2", "aaa-orders"),
+        ("111111111111", REGION, "aaa-orders"),
+    ] {
+        let scope = TableKeyScope::new(account, region, name, Uuid::new_v4()).unwrap();
+        let mut call = caller();
+        call.account_id = account.into();
+        call.region = region.into();
+        call.caller_arn = Some(format!("arn:aws:iam::{account}:root"));
+        let key = keys.generate(&scope, call, None).await.unwrap();
+        let record = catalog.reserve(scope, key.envelope).await.unwrap();
+        let active = catalog
+            .transition(&record, FilePhase::Active)
+            .await
+            .unwrap();
+        if account != ACCOUNT {
+            catalog
+                .transition(&active, FilePhase::Deleting)
+                .await
+                .unwrap();
+        }
+    }
+    let mut cursor = None;
+    let mut inventory = Vec::new();
+    loop {
+        let page = catalog.page(cursor.as_ref(), 1).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert_eq!(page.len(), 1);
+        cursor = page.last().cloned();
+        inventory.extend(page);
+    }
+    let scopes: Vec<_> = inventory
+        .iter()
+        .map(|record| {
+            let scope = record.scope();
+            (scope.account(), scope.region(), scope.table_name())
+        })
+        .collect();
+    assert_eq!(
+        scopes,
+        vec![
+            (ACCOUNT, REGION, "aaa-orders"),
+            (ACCOUNT, REGION, "catalog-orders"),
+            (ACCOUNT, "us-east-2", "aaa-orders"),
+            ("111111111111", REGION, "aaa-orders"),
+        ]
+    );
+    assert_eq!(inventory[1].phase(), FilePhase::Creating);
+    assert_eq!(inventory[3].phase(), FilePhase::Deleting);
+    let all = catalog.page(None, 100).await.unwrap();
+    assert_eq!(all.len(), inventory.len());
+    // A deleted cursor still advances by its logical key without requiring the row.
+    let deleting = catalog
+        .transition(&fresh, FilePhase::Deleting)
+        .await
+        .unwrap();
+    catalog.forget_deleted(&deleting).await.unwrap();
+    assert_eq!(catalog.page(Some(&fresh), 100).await.unwrap().len(), 2);
+    let db = state.clone();
+    tokio::task::spawn_blocking(move || {
+        db.connection()
+            .unwrap()
+            .execute(
+                "UPDATE lc_dynamodb_table_files SET name=?1 WHERE account=?2 AND region=?3",
+                ("x".repeat(256), "111111111111", REGION),
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        catalog.page(None, 100).await,
+        Err(DdbError::Internal(_))
+    ));
+    let db = state.clone();
+    tokio::task::spawn_blocking(move || {
+        db.connection().unwrap().execute(
+            "UPDATE lc_dynamodb_table_files SET account='',region='',name='' WHERE account='111111111111'",
+            [],
+        ).unwrap();
+    }).await.unwrap();
+    assert!(matches!(
+        catalog.page(None, 100).await,
+        Err(DdbError::Internal(_))
+    ));
 }
 
 #[tokio::test]

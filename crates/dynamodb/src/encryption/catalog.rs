@@ -127,6 +127,71 @@ impl TableCatalog {
         }).await.map_err(|_|unavailable())?
     }
 
+    /// Bounded recovery inventory, ordered by account, region and table name.
+    /// Continue after the last record until a page is empty. Pages are not a snapshot.
+    pub async fn page(
+        &self,
+        after: Option<&TableFileRecord>,
+        limit: usize,
+    ) -> Result<Vec<TableFileRecord>, DdbError> {
+        if !(1..=100).contains(&limit) {
+            return Err(DdbError::Validation(
+                "Catalog page size must be between 1 and 100".into(),
+            ));
+        }
+        let after_is_none = after.is_none();
+        let cursor = match after {
+            Some(record) => {
+                let scope = record.scope();
+                Self::validate_scope(scope.account(), scope.region(), scope.table_name())?;
+                (
+                    scope.account().to_owned(),
+                    scope.region().to_owned(),
+                    scope.table_name().to_owned(),
+                )
+            }
+            None => (String::new(), String::new(), String::new()),
+        };
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = this.state.connection().map_err(|_| unavailable())?;
+            let comparison = if after_is_none { ">=" } else { ">" };
+            let sql = format!(
+                "SELECT
+                 CASE WHEN length(CAST(account AS BLOB))=12 THEN account ELSE NULL END,
+                 CASE WHEN length(CAST(region AS BLOB)) BETWEEN 3 AND 64 THEN region ELSE NULL END,
+                 CASE WHEN length(CAST(name AS BLOB)) BETWEEN 3 AND 255 THEN name ELSE NULL END,
+                 CASE WHEN length(CAST(storage_id AS BLOB))=36 THEN storage_id ELSE NULL END,
+                 revision, CASE WHEN length(metadata)<=?4 THEN metadata ELSE NULL END
+                 FROM lc_dynamodb_table_files WHERE (account,region,name){comparison}(?1,?2,?3)
+                 ORDER BY account,region,name LIMIT ?5"
+            );
+            let mut statement = db.prepare(&sql).map_err(|_| unavailable())?;
+            let mut rows = statement
+                .query((
+                    &cursor.0,
+                    &cursor.1,
+                    &cursor.2,
+                    i64::try_from(MAX_RECORD + 1024).map_err(|_| unavailable())?,
+                    i64::try_from(limit).map_err(|_| unavailable())?,
+                ))
+                .map_err(|_| unavailable())?;
+            let mut records = Vec::with_capacity(limit);
+            while let Some(row) = rows.next().map_err(|_| unavailable())? {
+                let account: String = row.get(0).map_err(|_| unavailable())?;
+                let region: String = row.get(1).map_err(|_| unavailable())?;
+                let name: String = row.get(2).map_err(|_| unavailable())?;
+                let id: String = row.get(3).map_err(|_| unavailable())?;
+                let revision: i64 = row.get(4).map_err(|_| unavailable())?;
+                let sealed: Vec<u8> = row.get(5).map_err(|_| unavailable())?;
+                records.push(this.decode(&account, &region, &name, &id, revision, &sealed)?);
+            }
+            Ok(records)
+        })
+        .await
+        .map_err(|_| unavailable())?
+    }
+
     pub async fn load(
         &self,
         account: &str,
