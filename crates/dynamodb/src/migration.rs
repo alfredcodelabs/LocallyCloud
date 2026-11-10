@@ -12,6 +12,8 @@ use crate::store::{StoredKey, StreamRecord, TableData};
 
 #[path = "migration_export.rs"]
 mod export;
+#[path = "migration_history.rs"]
+mod history;
 pub use export::{
     export_native, export_native_recovery, export_native_recovery_with_policy,
     export_native_with_policy, MigrationPolicy, NativeRecord,
@@ -78,18 +80,16 @@ enum RecordKind {
     Metadata,
     Item,
     Stream,
-    RecoveryItem,
 }
 
 impl RecordKind {
-    const ALL: [Self; 4] = [Self::Metadata, Self::Item, Self::Stream, Self::RecoveryItem];
+    const ALL: [Self; 3] = [Self::Metadata, Self::Item, Self::Stream];
 
     fn table(self) -> &'static str {
         match self {
             Self::Metadata => "dynamodb_tables",
             Self::Item => "dynamodb_items",
             Self::Stream => "dynamodb_stream_records",
-            Self::RecoveryItem => "dynamodb_recovery_items",
         }
     }
 
@@ -98,7 +98,6 @@ impl RecordKind {
             Self::Metadata => "SELECT substr(account,1,13),substr(region,1,65),substr(name,1,256),'',CASE WHEN length(CAST(metadata AS BLOB))<=?1 THEN metadata END FROM dynamodb_tables",
             Self::Item => "SELECT substr(account,1,13),substr(region,1,65),substr(name,1,256),CASE WHEN length(CAST(item_key AS BLOB))<=?1 THEN item_key END,CASE WHEN length(CAST(item AS BLOB))<=?1 THEN item END FROM dynamodb_items",
             Self::Stream => "SELECT substr(account,1,13),substr(region,1,65),substr(name,1,256),CAST(sequence AS TEXT),CASE WHEN length(CAST(record AS BLOB))<=?1 THEN record END FROM dynamodb_stream_records",
-            Self::RecoveryItem => "SELECT substr(account,1,13),substr(region,1,65),substr(name,1,256),CASE WHEN length(CAST(item_key AS BLOB))<=?1 THEN item_key END,CASE WHEN length(CAST(item AS BLOB))<=?1 THEN item END FROM dynamodb_recovery_items WHERE item IS NOT NULL",
         }
     }
 }
@@ -219,7 +218,7 @@ fn authenticate(
                 RecordKind::Metadata => {
                     crate::store::migration_table(cipher, &account, &region, &name, &encoded)?;
                 }
-                RecordKind::Item | RecordKind::RecoveryItem => {
+                RecordKind::Item => {
                     let _: StoredKey = serde_json::from_str(&key).map_err(|_| invalid())?;
                     crate::recovery::decode_item(
                         Some(cipher),
@@ -242,7 +241,9 @@ fn authenticate(
             }
         }
     }
-    Ok(encrypted)
+    encrypted
+        .checked_add(history::validate(connection, cipher, schema)?)
+        .ok_or_else(invalid)
 }
 
 fn scoped_count(
@@ -637,6 +638,137 @@ mod tests {
         )
         .is_err());
         assert_eq!(emitted, 0);
+    }
+
+    fn history_fixture(encrypted: bool, enabled: bool) -> Fixture {
+        let fixture = Fixture::new();
+        fixture.table("aaa-orders", false, |_| {});
+        fixture.table("zzz-history", encrypted, |metadata| {
+            metadata["pitr_enabled"] = json!(enabled);
+        });
+        let connection = fixture.state.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO dynamodb_recovery VALUES(?1,?2,'zzz-history',?3,10.25,12.75,7)",
+                params![ACCOUNT, REGION, i64::from(enabled)],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO dynamodb_recovery_items SELECT account,region,name,item_key,10.25,item FROM dynamodb_items WHERE name='zzz-history'", []).unwrap();
+        let key = serde_json::to_string(&StoredKey {
+            partition: KeyScalar::S("row".into()),
+            sort: None,
+        })
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO dynamodb_recovery_items VALUES(?1,?2,'zzz-history',?3,12.75,NULL)",
+                params![ACCOUNT, REGION, key],
+            )
+            .unwrap();
+        drop(connection);
+        fixture
+    }
+
+    #[test]
+    fn malformed_history_is_rejected_before_any_inspection_output() {
+        for mutation in [
+            "UPDATE dynamodb_recovery_items SET item_key='invalid' WHERE item IS NULL",
+            "UPDATE dynamodb_recovery_items SET at=-1 WHERE item IS NULL",
+            "UPDATE dynamodb_recovery_items SET at=13 WHERE item IS NULL",
+            "UPDATE dynamodb_recovery_items SET at=1e999 WHERE item IS NULL",
+            "UPDATE dynamodb_recovery SET started=13",
+            "UPDATE dynamodb_recovery SET latest=1e999",
+            "UPDATE dynamodb_recovery SET days=36",
+            "UPDATE dynamodb_recovery SET enabled=2",
+            "UPDATE dynamodb_recovery SET enabled=0",
+            "UPDATE dynamodb_recovery_items SET item_key='{\"partition\":{\"S\":\"wrong\"},\"sort\":null}' WHERE item IS NOT NULL",
+        ] {
+            let fixture = history_fixture(true, true);
+            fixture.state.connection().unwrap().execute_batch(mutation).unwrap();
+            let before = std::fs::read(fixture.state.path()).unwrap();
+            let mut emitted = 0;
+            assert!(inspect_native(fixture.state.path(), &StateCipher::with_key(&[7;32]), |_| {
+                emitted += 1;
+                Ok(())
+            }).is_err(), "{mutation}");
+            assert_eq!(emitted, 0, "{mutation}");
+            assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn valid_history_stays_blocked_without_losing_versions_or_tombstones() {
+        for (encrypted, enabled) in [(false, true), (true, true), (true, false)] {
+            let fixture = history_fixture(encrypted, enabled);
+            let before = std::fs::read(fixture.state.path()).unwrap();
+            let mut histories = 0;
+            let summary = inspect_native(
+                fixture.state.path(),
+                &StateCipher::with_key(&[7; 32]),
+                |table| {
+                    if table.table == "zzz-history" {
+                        histories += 1;
+                        assert_eq!(table.recovery_versions, 2);
+                        assert!(table.blocking_features.iter().any(|feature| matches!(
+                            feature,
+                            BlockingFeature::PointInTimeRecovery
+                        )));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(histories, 1);
+            assert_eq!(
+                summary.encrypted_records_authenticated,
+                if encrypted { 3 } else { 0 }
+            );
+            let mut emitted = 0;
+            assert!(export_native(
+                fixture.state.path(),
+                &StateCipher::with_key(&[7; 32]),
+                |_| {
+                    emitted += 1;
+                    Ok(())
+                }
+            )
+            .is_err());
+            assert_eq!(emitted, 0);
+            assert_eq!(std::fs::read(fixture.state.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn history_keeps_retention_baselines_and_rejects_orphans_or_oversized_bodies() {
+        let fixture = history_fixture(false, true);
+        fixture
+            .state
+            .connection()
+            .unwrap()
+            .execute("UPDATE dynamodb_recovery SET started=11", [])
+            .unwrap();
+        inspect_native(
+            fixture.state.path(),
+            &StateCipher::with_key(&[7; 32]),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        for mutation in [
+            "PRAGMA foreign_keys=OFF; DELETE FROM dynamodb_recovery",
+            "UPDATE dynamodb_recovery_items SET item_key='{\"partition\":{\"S\":\"wrong\"},\"sort\":null}' WHERE item IS NOT NULL",
+            "UPDATE dynamodb_recovery_items SET item=zeroblob(8388609) WHERE item IS NOT NULL",
+            "UPDATE dynamodb_recovery_items SET item_key='{\"partition\":{\"S\":\"row\"},\"sort\":{\"S\":\"unexpected\"}}' WHERE item IS NULL",
+        ] {
+            let fixture = history_fixture(false, true);
+            fixture.state.connection().unwrap().execute_batch(mutation).unwrap();
+            let mut emitted = 0;
+            assert!(inspect_native(fixture.state.path(), &StateCipher::with_key(&[7;32]), |_| {
+                emitted += 1;
+                Ok(())
+            }).is_err(), "{mutation}");
+            assert_eq!(emitted, 0, "{mutation}");
+        }
     }
 
     #[test]
