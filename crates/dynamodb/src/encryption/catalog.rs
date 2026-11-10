@@ -8,14 +8,15 @@ use serde::{Deserialize, Serialize};
 use super::{TableKeyEnvelope, TableKeyScope, TableKeys};
 use crate::error::DdbError;
 
-// Keep the previous envelope allowance plus a bounded, complete normalized schema.
+// Envelope allowance plus bounded normalized schema and provider description.
 const MAX_CREATE_INTENT: usize = 1024 * 1024;
-const MAX_RECORD: usize = 128 * 1024 + MAX_CREATE_INTENT;
+const MAX_RECORD: usize = 128 * 1024 + 2 * MAX_CREATE_INTENT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilePhase {
     Creating,
     Active,
+    Updating,
     Deleting,
 }
 
@@ -28,6 +29,10 @@ struct FileMetadata {
     revision: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     create_intent: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_update: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +58,16 @@ impl TableFileRecord {
     /// Complete normalized CreateTable parameters, absent for legacy reservations.
     pub fn create_intent(&self) -> Option<&serde_json::Value> {
         self.0.create_intent.as_ref()
+    }
+
+    /// Last validated ACTIVE description returned by the provider.
+    pub fn description(&self) -> Option<&serde_json::Value> {
+        self.0.description.as_ref()
+    }
+
+    /// Authorized update parameters persisted before the provider mutation.
+    pub fn pending_update(&self) -> Option<&serde_json::Value> {
+        self.0.pending_update.as_ref()
     }
 
     /// File names never contain AWS names or client-provided path segments.
@@ -103,8 +118,8 @@ impl TableCatalog {
         self.reserve_inner(scope, envelope, None).await
     }
 
-    /// Persist the complete, provider-validated normalized CreateTable parameters before
-    /// mutating the provider. Pass parameters only, never a request or credentials.
+    /// Persist complete normalized CreateTable parameters before provider mutation.
+    /// The provider validates the schema. Never pass a request or credentials.
     pub async fn reserve_with_intent(
         &self,
         scope: TableKeyScope,
@@ -131,6 +146,8 @@ impl TableCatalog {
             phase: FilePhase::Creating,
             revision: 1,
             create_intent,
+            description: None,
+            pending_update: None,
         };
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -184,10 +201,55 @@ impl TableCatalog {
             }
             None => (String::new(), String::new(), String::new()),
         };
+        self.read_page(cursor, after_is_none, limit, false).await
+    }
+
+    /// Bounded inventory within one account and region, ordered by table name.
+    pub async fn page_scope(
+        &self,
+        account: &str,
+        region: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TableFileRecord>, DdbError> {
+        crate::streams::validate_scope_values(account, region)?;
+        if let Some(name) = after {
+            crate::store::validate_table_name(name)?;
+        }
+        if !(1..=100).contains(&limit) {
+            return Err(DdbError::Validation(
+                "Catalog page size must be between 1 and 100".into(),
+            ));
+        }
+        self.read_page(
+            (
+                account.to_owned(),
+                region.to_owned(),
+                after.unwrap_or_default().to_owned(),
+            ),
+            after.is_none(),
+            limit,
+            true,
+        )
+        .await
+    }
+
+    async fn read_page(
+        &self,
+        cursor: (String, String, String),
+        initial: bool,
+        limit: usize,
+        scoped: bool,
+    ) -> Result<Vec<TableFileRecord>, DdbError> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             let db = this.state.connection().map_err(|_| unavailable())?;
-            let comparison = if after_is_none { ">=" } else { ">" };
+            let comparison = if initial { ">=" } else { ">" };
+            let filter = if scoped {
+                format!("account=?1 AND region=?2 AND name{comparison}?3")
+            } else {
+                format!("(account,region,name){comparison}(?1,?2,?3)")
+            };
             let sql = format!(
                 "SELECT
                  CASE WHEN length(CAST(account AS BLOB))=12 THEN account ELSE NULL END,
@@ -196,7 +258,7 @@ impl TableCatalog {
                  CASE WHEN length(CAST(storage_id AS BLOB))=36 THEN storage_id ELSE NULL END,
                  revision, CASE WHEN length(metadata)<=?4 THEN metadata ELSE NULL END,
                  length(metadata)
-                 FROM lc_dynamodb_table_files WHERE (account,region,name){comparison}(?1,?2,?3)
+                 FROM lc_dynamodb_table_files WHERE {filter}
                  ORDER BY account,region,name LIMIT ?5"
             );
             let mut statement = db.prepare(&sql).map_err(|_| unavailable())?;
@@ -281,11 +343,90 @@ impl TableCatalog {
                 ))
             }
         }
-        let this = self.clone();
         let mut record = previous.0.clone();
-        let revision = record.revision;
-        record.revision = revision.checked_add(1).ok_or_else(unavailable)?;
         record.phase = phase;
+        self.save(previous, record).await
+    }
+
+    /// Persist the actual ACTIVE provider description when creation completes.
+    pub async fn activate(
+        &self,
+        previous: &TableFileRecord,
+        description: serde_json::Value,
+    ) -> Result<TableFileRecord, DdbError> {
+        if previous.phase() != FilePhase::Creating {
+            return Err(DdbError::Validation("Table storage is not creating".into()));
+        }
+        Self::validate_description(previous.scope(), &description)?;
+        let mut record = previous.0.clone();
+        record.phase = FilePhase::Active;
+        record.description = Some(description);
+        self.save(previous, record).await
+    }
+
+    /// Refresh an ACTIVE description without changing its immutable storage identity.
+    pub async fn refresh_description(
+        &self,
+        previous: &TableFileRecord,
+        description: serde_json::Value,
+    ) -> Result<TableFileRecord, DdbError> {
+        if previous.phase() != FilePhase::Active {
+            return Err(DdbError::Validation("Table storage is not active".into()));
+        }
+        Self::validate_description(previous.scope(), &description)?;
+        let mut record = previous.0.clone();
+        record.description = Some(description);
+        self.save(previous, record).await
+    }
+
+    /// Fence deletion before changing the provider's deletion protection.
+    pub async fn begin_update(
+        &self,
+        previous: &TableFileRecord,
+        intent: serde_json::Value,
+    ) -> Result<TableFileRecord, DdbError> {
+        if previous.phase() != FilePhase::Active {
+            return Err(DdbError::Validation("Table storage is not active".into()));
+        }
+        Self::validate_update(previous.scope(), &intent)?;
+        let mut record = previous.0.clone();
+        record.phase = FilePhase::Updating;
+        record.pending_update = Some(intent);
+        self.save(previous, record).await
+    }
+
+    /// Clear the fence only after observing the intended provider state.
+    pub async fn complete_update(
+        &self,
+        previous: &TableFileRecord,
+        description: serde_json::Value,
+    ) -> Result<TableFileRecord, DdbError> {
+        if previous.phase() != FilePhase::Updating {
+            return Err(DdbError::Validation("Table storage is not updating".into()));
+        }
+        Self::validate_description(previous.scope(), &description)?;
+        let intent = previous.pending_update().ok_or_else(unavailable)?;
+        Self::validate_update(previous.scope(), intent)?;
+        if description.get("DeletionProtectionEnabled") != intent.get("DeletionProtectionEnabled") {
+            return Err(DdbError::Validation(
+                "Provider table update has not completed".into(),
+            ));
+        }
+        let mut record = previous.0.clone();
+        record.phase = FilePhase::Active;
+        record.description = Some(description);
+        record.pending_update = None;
+        self.save(previous, record).await
+    }
+
+    async fn save(
+        &self,
+        previous: &TableFileRecord,
+        mut record: FileMetadata,
+    ) -> Result<TableFileRecord, DdbError> {
+        let this = self.clone();
+        let revision = previous.revision();
+        record.revision = revision.checked_add(1).ok_or_else(unavailable)?;
         tokio::task::spawn_blocking(move || {
             let sealed = this.encode(&record)?;
             let n = this
@@ -389,6 +530,57 @@ impl TableCatalog {
                 "CreateTable intent must match the table storage scope".into(),
             ));
         }
+        Self::validate_value(intent)
+    }
+
+    fn validate_update(scope: &TableKeyScope, intent: &serde_json::Value) -> Result<(), DdbError> {
+        if intent.as_object().is_none_or(|object| object.len() != 2)
+            || intent.get("TableName").and_then(serde_json::Value::as_str)
+                != Some(scope.table_name())
+            || intent
+                .get("DeletionProtectionEnabled")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+        {
+            return Err(DdbError::Validation(
+                "Table update intent must contain only its scoped name and deletion protection"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_description(
+        scope: &TableKeyScope,
+        description: &serde_json::Value,
+    ) -> Result<(), DdbError> {
+        let arn = format!(
+            "arn:aws:dynamodb:{}:{}:table/{}",
+            scope.region(),
+            scope.account(),
+            scope.table_name()
+        );
+        if description
+            .get("TableName")
+            .and_then(serde_json::Value::as_str)
+            != Some(scope.table_name())
+            || description
+                .get("TableArn")
+                .and_then(serde_json::Value::as_str)
+                != Some(arn.as_str())
+            || description
+                .get("TableStatus")
+                .and_then(serde_json::Value::as_str)
+                != Some("ACTIVE")
+        {
+            return Err(DdbError::Validation(
+                "ACTIVE table description must match the table storage scope".into(),
+            ));
+        }
+        Self::validate_value(description)
+    }
+
+    fn validate_value(value: &serde_json::Value) -> Result<(), DdbError> {
         fn bounded_depth(value: &serde_json::Value, depth: usize) -> bool {
             if depth > 32 {
                 return false;
@@ -407,9 +599,7 @@ impl TableCatalog {
         impl std::io::Write for SizeLimit {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if bytes.len() > MAX_CREATE_INTENT - self.0 {
-                    return Err(std::io::Error::other(
-                        "CreateTable intent exceeds size limit",
-                    ));
+                    return Err(std::io::Error::other("Catalog value exceeds size limit"));
                 }
                 self.0 += bytes.len();
                 Ok(bytes.len())
@@ -419,9 +609,9 @@ impl TableCatalog {
                 Ok(())
             }
         }
-        if !bounded_depth(intent, 0) || serde_json::to_writer(SizeLimit(0), intent).is_err() {
+        if !bounded_depth(value, 0) || serde_json::to_writer(SizeLimit(0), value).is_err() {
             return Err(DdbError::Validation(
-                "CreateTable intent exceeds catalog size or nesting limits".into(),
+                "Catalog value exceeds size or nesting limits".into(),
             ));
         }
         Ok(())
@@ -487,6 +677,16 @@ impl TableCatalog {
         }
         if let Some(intent) = &record.create_intent {
             Self::validate_intent(&record.scope, intent).map_err(|_| unavailable())?;
+        }
+        if let Some(description) = &record.description {
+            Self::validate_description(&record.scope, description).map_err(|_| unavailable())?;
+        }
+        match (record.phase, &record.pending_update) {
+            (FilePhase::Updating, Some(intent)) => {
+                Self::validate_update(&record.scope, intent).map_err(|_| unavailable())?;
+            }
+            (FilePhase::Updating, None) | (_, Some(_)) => return Err(unavailable()),
+            (_, None) => {}
         }
         self.keys
             .wrapped_key(&record.scope, &record.envelope)

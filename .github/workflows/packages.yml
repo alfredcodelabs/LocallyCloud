@@ -145,6 +145,8 @@ jobs:
           LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud --locked dynamodb_engine::table_storage::tests::actual_table_worker_reauthorizes_warm_access_and_rejects_stale_generations -- --exact --nocapture 2>&1 | tee /tmp/table-storage-test.log
           grep -Fq 'Real table worker:' /tmp/table-storage-test.log
           LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud-dynamodb --test table_keys --locked -- --nocapture
+          LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud --test dynamodb_sse --locked -- --nocapture 2>&1 | tee /tmp/public-sse-test.log
+          grep -Fq 'Real public SSE lifecycle:' /tmp/public-sse-test.log
       - uses: actions/upload-artifact@v7
         with:
           name: package-debian-${{ matrix.arch }}

@@ -330,6 +330,17 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
             .await
             .unwrap();
         assert_eq!(record.create_intent(), Some(&intent));
+        let description = json!({
+            "TableName":name,
+            "TableArn":format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{name}"),
+            "TableStatus":"ACTIVE",
+            "ProviderField":"y".repeat(600 * 1024)
+        });
+        let record = catalog
+            .activate(&record, description.clone())
+            .await
+            .unwrap();
+        assert_eq!(record.description(), Some(&description));
         large_records.push(record);
     }
     let first = catalog.page(None, 100).await.unwrap();
@@ -338,6 +349,7 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
     let second = catalog.page(first.last(), 100).await.unwrap();
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].create_intent(), large_records[1].create_intent());
+    assert_eq!(second[0].description(), large_records[1].description());
     assert!(catalog.page(second.last(), 100).await.unwrap().is_empty());
     let db = state.clone();
     let saved = tokio::task::spawn_blocking(move || {
@@ -468,11 +480,162 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
             .as_slice(),
         expected_key.as_slice()
     );
+    let description = json!({
+        "TableName":"catalog-orders",
+        "TableArn":format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/catalog-orders"),
+        "TableStatus":"ACTIVE",
+        "ItemCount":7,
+        "ProviderField":{"preserved":true}
+    });
+    let mut wrong_name = description.clone();
+    wrong_name["TableName"] = json!("another-table");
+    let mut wrong_arn = description.clone();
+    wrong_arn["TableArn"] = json!(format!(
+        "arn:aws:dynamodb:us-east-2:{ACCOUNT}:table/catalog-orders"
+    ));
+    let mut pending = description.clone();
+    pending["TableStatus"] = json!("CREATING");
+    let mut oversized = description.clone();
+    oversized["ProviderField"] = json!("x".repeat(1024 * 1024));
+    let mut nested = json!(null);
+    for _ in 0..34 {
+        nested = json!([nested]);
+    }
+    let mut too_deep = description.clone();
+    too_deep["ProviderField"] = nested;
+    for invalid in [
+        json!(null),
+        wrong_name,
+        wrong_arn,
+        pending,
+        oversized,
+        too_deep,
+    ] {
+        assert!(matches!(
+            catalog.activate(&loaded, invalid).await,
+            Err(DdbError::Validation(_))
+        ));
+        let unchanged = catalog
+            .load(ACCOUNT, REGION, "catalog-orders")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision(), loaded.revision());
+        assert_eq!(unchanged.phase(), FilePhase::Creating);
+        assert!(unchanged.description().is_none());
+    }
     let active = catalog
-        .transition(&loaded, FilePhase::Active)
+        .activate(&loaded, description.clone())
         .await
         .unwrap();
     assert_eq!(active.create_intent(), Some(&intent));
+    assert_eq!(active.description(), Some(&description));
+    let mut updated = description.clone();
+    updated["ItemCount"] = json!(8);
+    let refreshed = catalog
+        .refresh_description(&active, updated.clone())
+        .await
+        .unwrap();
+    assert_eq!(refreshed.revision(), active.revision() + 1);
+    assert!(matches!(
+        catalog
+            .refresh_description(&active, description.clone())
+            .await,
+        Err(DdbError::ResourceInUse(_))
+    ));
+    assert!(matches!(
+        catalog.activate(&active, description).await,
+        Err(DdbError::Validation(_))
+    ));
+    let path = state.path().to_owned();
+    let reopened = Arc::new(
+        tokio::task::spawn_blocking(move || StateDb::open(path).unwrap())
+            .await
+            .unwrap(),
+    );
+    let catalog = TableCatalog::new(reopened, keys.clone()).await.unwrap();
+    let active = catalog
+        .load(ACCOUNT, REGION, "catalog-orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.description(), Some(&updated));
+    assert_eq!(
+        catalog.page(None, 1).await.unwrap()[0].description(),
+        Some(&updated)
+    );
+    let update_intent = json!({"TableName":"catalog-orders","DeletionProtectionEnabled":true});
+    for invalid in [
+        json!({"TableName":"another-table","DeletionProtectionEnabled":true}),
+        json!({"TableName":"catalog-orders","DeletionProtectionEnabled":"true"}),
+        json!({"TableName":"catalog-orders","DeletionProtectionEnabled":true,"Extra":0}),
+    ] {
+        assert!(matches!(
+            catalog.begin_update(&active, invalid).await,
+            Err(DdbError::Validation(_))
+        ));
+    }
+    let updating = catalog
+        .begin_update(&active, update_intent.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        catalog.begin_update(&active, update_intent.clone()).await,
+        Err(DdbError::ResourceInUse(_))
+    ));
+    assert!(matches!(
+        catalog.transition(&updating, FilePhase::Deleting).await,
+        Err(DdbError::Validation(_))
+    ));
+    let path = state.path().to_owned();
+    let reopened = Arc::new(
+        tokio::task::spawn_blocking(move || StateDb::open(path).unwrap())
+            .await
+            .unwrap(),
+    );
+    let catalog = TableCatalog::new(reopened, keys.clone()).await.unwrap();
+    let updating = catalog
+        .load(ACCOUNT, REGION, "catalog-orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updating.phase(), FilePhase::Updating);
+    assert_eq!(updating.pending_update(), Some(&update_intent));
+    assert_eq!(updating.description(), Some(&updated));
+    let mut actual = updated.clone();
+    actual["DeletionProtectionEnabled"] = json!(true);
+    let mut wrong_flag = actual.clone();
+    wrong_flag["DeletionProtectionEnabled"] = json!(false);
+    let mut wrong_scope = actual.clone();
+    wrong_scope["TableArn"] = json!(format!(
+        "arn:aws:dynamodb:us-east-2:{ACCOUNT}:table/catalog-orders"
+    ));
+    for invalid in [wrong_flag, wrong_scope] {
+        assert!(matches!(
+            catalog.complete_update(&updating, invalid).await,
+            Err(DdbError::Validation(_))
+        ));
+        let unchanged = catalog
+            .load(ACCOUNT, REGION, "catalog-orders")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision(), updating.revision());
+        assert_eq!(unchanged.phase(), FilePhase::Updating);
+    }
+    let active = catalog
+        .complete_update(&updating, actual.clone())
+        .await
+        .unwrap();
+    assert_eq!(active.phase(), FilePhase::Active);
+    assert!(active.pending_update().is_none());
+    assert_eq!(active.description(), Some(&actual));
+    assert_eq!(active.create_intent(), Some(&intent));
+    assert_eq!(active.scope().storage_id(), updating.scope().storage_id());
+    assert!(matches!(
+        catalog.complete_update(&updating, actual).await,
+        Err(DdbError::ResourceInUse(_))
+    ));
     assert!(matches!(
         catalog.transition(&creating, FilePhase::Deleting).await,
         Err(DdbError::ResourceInUse(_))
@@ -561,6 +724,7 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
         .unwrap();
     assert_ne!(fresh.file_name(), creating.file_name());
     assert!(fresh.create_intent().is_none());
+    assert!(fresh.description().is_none());
     assert!(catalog
         .load(ACCOUNT, REGION, "catalog-orders")
         .await
@@ -600,6 +764,7 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
             .transition(&record, FilePhase::Active)
             .await
             .unwrap();
+        assert!(active.description().is_none());
         if account != ACCOUNT {
             catalog
                 .transition(&active, FilePhase::Deleting)
@@ -638,6 +803,44 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
     assert_eq!(inventory[3].phase(), FilePhase::Deleting);
     let all = catalog.page(None, 100).await.unwrap();
     assert_eq!(all.len(), inventory.len());
+    for (account, region, expected) in [
+        (ACCOUNT, REGION, vec!["aaa-orders", "catalog-orders"]),
+        (ACCOUNT, "us-east-2", vec!["aaa-orders"]),
+        ("111111111111", REGION, vec!["aaa-orders"]),
+    ] {
+        let page = catalog
+            .page_scope(account, region, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|record| record.scope().table_name())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            page.iter()
+                .all(|record| record.scope().account() == account
+                    && record.scope().region() == region)
+        );
+    }
+    let after_missing = catalog
+        .page_scope(ACCOUNT, REGION, Some("bbb-missing"), 100)
+        .await
+        .unwrap();
+    assert_eq!(after_missing.len(), 1);
+    assert_eq!(after_missing[0].scope().table_name(), "catalog-orders");
+    assert!(matches!(
+        catalog.page_scope(ACCOUNT, REGION, Some("../bad"), 1).await,
+        Err(DdbError::Validation(_))
+    ));
+    for limit in [0, 101] {
+        assert!(matches!(
+            catalog.page_scope(ACCOUNT, REGION, None, limit).await,
+            Err(DdbError::Validation(_))
+        ));
+    }
+
     // A deleted cursor still advances by its logical key without requiring the row.
     let deleting = catalog
         .transition(&fresh, FilePhase::Deleting)
@@ -671,6 +874,157 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
     assert!(matches!(
         catalog.page(None, 100).await,
         Err(DdbError::Internal(_))
+    ));
+}
+
+async fn action_specific_authorization(registry: &Arc<ServiceRegistry>, broker: &TableKeys) {
+    use locallycloud_core::integration::identity::CallerIdentity;
+    use locallycloud_core::integration::RequestIdentity;
+    use locallycloud_iam_sts::enforcement::EnforcementMode;
+    use locallycloud_iam_sts::model::IamRole;
+    use locallycloud_iam_sts::store::IamStore;
+    use locallycloud_iam_sts::sts::SessionStore;
+    use std::collections::BTreeMap;
+
+    let scope = TableKeyScope::new(ACCOUNT, REGION, "iam-orders", Uuid::new_v4()).unwrap();
+    let created = kms(registry, "CreateKey", json!({})).await;
+    let arn = created["KeyMetadata"]["Arn"].as_str().unwrap();
+    let key_id = created["KeyMetadata"]["KeyId"].as_str().unwrap();
+    kms(
+        registry,
+        "CreateAlias",
+        json!({"AliasName":"alias/iam-table","TargetKeyId":arn}),
+    )
+    .await;
+    let material = broker.generate(&scope, caller(), Some(arn)).await.unwrap();
+    let denied = kms(registry, "CreateKey", json!({})).await;
+    let denied_arn = denied["KeyMetadata"]["Arn"].as_str().unwrap();
+    let root = json!({"Effect":"Allow","Principal":{"AWS":format!("arn:aws:iam::{ACCOUNT}:root")},"Action":"kms:*","Resource":"*"});
+    kms(registry,"PutKeyPolicy",json!({"KeyId":denied_arn,"PolicyName":"default","Policy":json!({"Version":"2012-10-17","Statement":[root,{"Effect":"Deny","Principal":"*","Action":"kms:GenerateDataKey","Resource":"*"}]}).to_string()})).await;
+
+    let store = Arc::new(IamStore::new());
+    for (name, allow, deny) in [
+        ("generator", "kms:GenerateDataKey", "kms:Decrypt"),
+        ("reader", "kms:Decrypt", "kms:GenerateDataKey"),
+    ] {
+        let policy = json!({"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":allow,"Resource":[arn,denied_arn],"Condition":{"StringEquals":{"kms:ViaService":format!("dynamodb.{REGION}.amazonaws.com"),"kms:EncryptionContext:aws:dynamodb:tableName":"iam-orders"}}},
+            {"Effect":"Deny","Action":deny,"Resource":"*"}
+        ]}).to_string();
+        store.create_role(
+            ACCOUNT,
+            IamRole {
+                role_name: name.into(),
+                role_id: format!("role-{name}"),
+                arn: format!("arn:aws:iam::{ACCOUNT}:role/{name}"),
+                path: "/".into(),
+                create_date: "2026-01-01T00:00:00Z".into(),
+                assume_role_policy_document: "{}".into(),
+                description: None,
+                max_session_duration: 3600,
+                tags: BTreeMap::new(),
+                attached_policies: Vec::new(),
+                inline_policies: BTreeMap::from([("key".into(), policy)]),
+                permission_boundary: None,
+            },
+        );
+    }
+    locallycloud_iam_sts::register_with_store_and_mode(
+        registry,
+        store,
+        Arc::new(SessionStore::new()),
+        EnforcementMode::Strict,
+    );
+    let identity = RequestIdentity {
+        account_id: ACCOUNT.into(),
+        ..Default::default()
+    };
+    let role = |name: &str| {
+        Some(CallerIdentity::AssumedRole {
+            role_arn: format!("arn:aws:iam::{ACCOUNT}:role/{name}"),
+            session_name: "table".into(),
+        })
+    };
+    // All selectors authorize against the resolved key ARN, including aliases and bare IDs.
+    for selector in [arn, key_id, "alias/iam-table"] {
+        let (call, canonical) = broker
+            .generation_context(
+                &scope,
+                Some(selector),
+                "generate",
+                identity.clone(),
+                role("generator"),
+            )
+            .await
+            .unwrap();
+        assert!(call.iam_policy_allowed);
+        assert!(!call.iam_policy_denied);
+        assert_eq!(canonical, arn);
+        broker
+            .generate(&scope, call, Some(&canonical))
+            .await
+            .unwrap();
+    }
+    let call = broker
+        .decryption_context(
+            &scope,
+            &material.envelope,
+            "read",
+            identity.clone(),
+            role("generator"),
+        )
+        .unwrap();
+    assert!(call.iam_policy_denied);
+    assert!(matches!(
+        broker.open(&scope, call, &material.envelope).await,
+        Err(KmsInternalError::AccessDenied)
+    ));
+    let call = broker
+        .decryption_context(
+            &scope,
+            &material.envelope,
+            "read",
+            identity.clone(),
+            role("reader"),
+        )
+        .unwrap();
+    assert!(call.iam_policy_allowed);
+    broker.open(&scope, call, &material.envelope).await.unwrap();
+    let (call, canonical) = broker
+        .generation_context(
+            &scope,
+            Some("alias/iam-table"),
+            "generate",
+            identity.clone(),
+            role("reader"),
+        )
+        .await
+        .unwrap();
+    assert!(call.iam_policy_denied);
+    assert!(matches!(
+        broker.generate(&scope, call, Some(&canonical)).await,
+        Err(KmsInternalError::AccessDenied)
+    ));
+    assert!(matches!(
+        broker
+            .generation_context(&scope, None, "unknown", identity.clone(), None)
+            .await,
+        Err(KmsInternalError::AccessDenied)
+    ));
+    let (call, canonical) = broker
+        .generation_context(
+            &scope,
+            Some(denied_arn),
+            "generate",
+            identity,
+            role("generator"),
+        )
+        .await
+        .unwrap();
+    assert!(call.iam_policy_allowed);
+    assert!(matches!(
+        broker.generate(&scope, call, Some(&canonical)).await,
+        Err(KmsInternalError::AccessDenied)
     ));
 }
 
@@ -886,6 +1240,7 @@ async fn real_kms_table_keys_are_unique_scope_bound_persistent_and_revocable() {
         eprintln!("Real SQLCipher worker: two independent KMS keys; wrong key and physical scope rejected; restart preserved data");
     }
     catalog_recovery(&registry, state.clone()).await;
+    action_specific_authorization(&registry, &broker).await;
     drop(broker);
     drop(registry);
     drop(state);

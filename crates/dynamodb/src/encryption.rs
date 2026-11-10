@@ -10,7 +10,8 @@ use locallycloud_core::integration::authorization::AuthorizationRequest;
 use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::kms::{
     KmsAuthorizeCachedKeyRequest, KmsCallContext, KmsDataKeyAction, KmsDecryptRequest,
-    KmsGenerateDataKeyRequest, KmsInternalError, KmsServiceKey, SensitiveBytes,
+    KmsGenerateDataKeyRequest, KmsInternalError, KmsServiceKey, KmsValidateKeyRequest,
+    SensitiveBytes,
 };
 use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
 use locallycloud_state::StateCipher;
@@ -182,24 +183,66 @@ impl TableKeys {
         delegated: Option<CallerIdentity>,
     ) -> Result<KmsCallContext, KmsInternalError> {
         let wrapped = self.wrapped_key(scope, envelope)?;
-        let caller = match &delegated {
-            Some(CallerIdentity::AssumedRole { role_arn, .. }) => Some(role_arn.clone()),
-            Some(CallerIdentity::ServicePrincipal { .. }) => {
-                return Err(KmsInternalError::AccessDenied)
-            }
-            Some(CallerIdentity::Default) | None => self
-                .dispatcher
-                .resolve_caller_arn(&identity)
-                .map_err(|_| KmsInternalError::AccessDenied)?,
+        self.call_context(
+            scope,
+            &wrapped.key_arn,
+            KmsDataKeyAction::Decrypt,
+            request_id,
+            identity,
+            delegated,
+        )
+    }
+
+    /// Resolve aliases before IAM evaluation and generate against the same canonical key.
+    pub async fn generation_context(
+        &self,
+        scope: &TableKeyScope,
+        key_id: Option<&str>,
+        request_id: &str,
+        identity: RequestIdentity,
+        delegated: Option<CallerIdentity>,
+    ) -> Result<(KmsCallContext, String), KmsInternalError> {
+        // Resolve the caller first: strict unknown callers cannot create a service default key.
+        let call = KmsCallContext {
+            source_service: "dynamodb".into(),
+            account_id: scope.account.clone(),
+            region: scope.region.clone(),
+            request_id: request_id.into(),
+            caller_arn: self.caller(scope, &identity, &delegated)?,
+            iam_policy_allowed: false,
+            iam_policy_denied: false,
         };
-        // Match KMS/STS: unregistered development credentials are root only in permissive mode.
-        let caller = match caller {
-            None if self.dispatcher.strict_sigv4_required() => {
-                return Err(KmsInternalError::AccessDenied)
-            }
-            None => Some(format!("arn:aws:iam::{}:root", scope.account)),
-            caller => caller,
+        scope.validate_call(&call)?;
+        let request = KmsValidateKeyRequest {
+            call,
+            key_id: Self::key_selector(key_id)?,
         };
+        let resolved = self
+            .dispatcher
+            .kms_validate_key_bounded(request, KMS_TIMEOUT)
+            .await?;
+        scope.validate_key_arn(&resolved.key_arn)?;
+        let call = self.call_context(
+            scope,
+            &resolved.key_arn,
+            KmsDataKeyAction::Generate,
+            request_id,
+            identity,
+            delegated,
+        )?;
+        Ok((call, resolved.key_arn))
+    }
+
+    fn call_context(
+        &self,
+        scope: &TableKeyScope,
+        key_arn: &str,
+        action: KmsDataKeyAction,
+        request_id: &str,
+        identity: RequestIdentity,
+        delegated: Option<CallerIdentity>,
+    ) -> Result<KmsCallContext, KmsInternalError> {
+        let caller = self.caller(scope, &identity, &delegated)?;
         let encryption = scope.context();
         let mut context: BTreeMap<String, Vec<String>> = encryption
             .iter()
@@ -234,8 +277,8 @@ impl TableKeys {
             request_identity: identity,
             delegated_identity: delegated,
             source_service: "dynamodb".into(),
-            action: "kms:Decrypt".into(),
-            resource: wrapped.key_arn,
+            action: action.as_str().into(),
+            resource: key_arn.into(),
             context,
         };
         let denied = (caller.is_some() || self.dispatcher.strict_sigv4_required())
@@ -253,12 +296,50 @@ impl TableKeys {
         })
     }
 
+    fn caller(
+        &self,
+        scope: &TableKeyScope,
+        identity: &RequestIdentity,
+        delegated: &Option<CallerIdentity>,
+    ) -> Result<Option<String>, KmsInternalError> {
+        let caller = match delegated {
+            Some(CallerIdentity::AssumedRole { role_arn, .. }) => Some(role_arn.clone()),
+            Some(CallerIdentity::ServicePrincipal { .. }) => {
+                return Err(KmsInternalError::AccessDenied)
+            }
+            Some(CallerIdentity::Default) | None => self
+                .dispatcher
+                .resolve_caller_arn(identity)
+                .map_err(|_| KmsInternalError::AccessDenied)?,
+        };
+        // Match KMS/STS: unregistered development credentials are root only in permissive mode.
+        let caller = match caller {
+            None if self.dispatcher.strict_sigv4_required() => {
+                return Err(KmsInternalError::AccessDenied)
+            }
+            None => Some(format!("arn:aws:iam::{}:root", scope.account)),
+            caller => caller,
+        };
+        Ok(caller)
+    }
+
     /// Recheck permissions and key state without decrypting a cached data key again.
     pub async fn authorize(
         &self,
         scope: &TableKeyScope,
         call: KmsCallContext,
         envelope: &TableKeyEnvelope,
+    ) -> Result<(), KmsInternalError> {
+        self.authorize_action(scope, call, envelope, KmsDataKeyAction::Decrypt)
+            .await
+    }
+
+    pub async fn authorize_action(
+        &self,
+        scope: &TableKeyScope,
+        call: KmsCallContext,
+        envelope: &TableKeyEnvelope,
+        action: KmsDataKeyAction,
     ) -> Result<(), KmsInternalError> {
         scope.validate_call(&call)?;
         let wrapped = self.wrapped_key(scope, envelope)?;
@@ -269,7 +350,7 @@ impl TableKeys {
                     key_id: wrapped.key_arn,
                     ciphertext: SensitiveBytes::new(wrapped.ciphertext),
                     encryption_context: scope.context(),
-                    action: KmsDataKeyAction::Decrypt,
+                    action,
                 },
                 KMS_TIMEOUT,
             )
@@ -283,11 +364,7 @@ impl TableKeys {
         key_id: Option<&str>,
     ) -> Result<TableKeyMaterial, KmsInternalError> {
         scope.validate_call(&call)?;
-        let key_id = match key_id {
-            Some(id) if !id.is_empty() && id.len() <= 2048 => id.to_owned(),
-            Some(_) => return Err(KmsInternalError::InvalidRequest),
-            None => format!("alias/aws/{}", KmsServiceKey::DynamoDb.service_name()),
-        };
+        let key_id = Self::key_selector(key_id)?;
         let generated = self
             .dispatcher
             .kms_generate_data_key_bounded(
@@ -362,6 +439,25 @@ impl TableKeys {
         }
         Ok(opened.plaintext)
     }
+    pub fn key_arn(
+        &self,
+        scope: &TableKeyScope,
+        envelope: &TableKeyEnvelope,
+    ) -> Result<String, KmsInternalError> {
+        Ok(self.wrapped_key(scope, envelope)?.key_arn)
+    }
+
+    fn key_selector(key_id: Option<&str>) -> Result<String, KmsInternalError> {
+        match key_id {
+            Some(id) if !id.is_empty() && id.len() <= 2048 => Ok(id.to_owned()),
+            Some(_) => Err(KmsInternalError::InvalidRequest),
+            None => Ok(format!(
+                "alias/aws/{}",
+                KmsServiceKey::DynamoDb.service_name()
+            )),
+        }
+    }
+
     fn wrapped_key(
         &self,
         scope: &TableKeyScope,

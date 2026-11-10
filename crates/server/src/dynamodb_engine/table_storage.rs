@@ -1,10 +1,13 @@
-//! KMS authorization for private table workers. Public SSE creation remains gated.
+//! Caller authorization and lifecycle integration for encrypted table workers.
+#[path = "table_lifecycle.rs"]
+mod lifecycle;
+use super::FileAccess;
 use std::sync::{Arc, Weak};
 
 use base64::Engine;
 use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::identity::{trusted_role, CallerIdentity};
-use locallycloud_core::integration::kms::{KmsCallContext, KmsInternalError};
+use locallycloud_core::integration::kms::{KmsCallContext, KmsDataKeyAction, KmsInternalError};
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::ServiceRegistry;
 use locallycloud_dynamodb::encryption::catalog::{FilePhase, TableCatalog, TableFileRecord};
@@ -32,6 +35,15 @@ pub(super) struct TableCall {
     identity: RequestIdentity,
     delegated: Option<CallerIdentity>,
     request_id: String,
+    access: TableAccess,
+}
+
+enum TableAccess {
+    Data,
+    Creation(Option<Zeroizing<String>>),
+    InspectCreating,
+    Control,
+    Updating,
 }
 
 fn unavailable() -> DdbError {
@@ -55,6 +67,98 @@ fn kms_error(error: KmsInternalError) -> DdbError {
 }
 
 impl TableStorage {
+    fn target_name<'a>(
+        account: &str,
+        region: &str,
+        target: &'a str,
+    ) -> Result<Option<&'a str>, DdbError> {
+        if target == "*" {
+            return Ok(None);
+        }
+        let name = if target.starts_with("arn:") {
+            let prefix = format!("arn:aws:dynamodb:{region}:{account}:table/");
+            target
+                .strip_prefix(&prefix)
+                .and_then(|value| value.split('/').next())
+                .ok_or_else(|| {
+                    DdbError::Validation("Resource ARN must match the request scope".into())
+                })?
+        } else {
+            target
+        };
+        locallycloud_dynamodb::encryption::TableKeyScope::new(
+            account,
+            region,
+            name,
+            uuid::Uuid::from_u128(1),
+        )?;
+        Ok(Some(name))
+    }
+    fn identity(request: &ServiceRequest) -> (RequestIdentity, Option<CallerIdentity>) {
+        (
+            RequestIdentity {
+                account_id: request.account_id.clone(),
+                access_key_id: request
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(RequestIdentity::access_key_from_authorization),
+                arn: None,
+            },
+            trusted_role(request),
+        )
+    }
+
+    fn for_access(
+        self: &Arc<Self>,
+        record: TableFileRecord,
+        request: &ServiceRequest,
+        access: TableAccess,
+    ) -> TableCall {
+        let (identity, delegated) = Self::identity(request);
+        TableCall {
+            record,
+            storage: self.clone(),
+            identity,
+            delegated,
+            request_id: request.request_id.clone(),
+            access,
+        }
+    }
+
+    fn call(self: &Arc<Self>, record: TableFileRecord, request: &ServiceRequest) -> TableCall {
+        self.for_access(record, request, TableAccess::Data)
+    }
+
+    fn creation_call(
+        self: &Arc<Self>,
+        record: TableFileRecord,
+        request: &ServiceRequest,
+        key: Option<Zeroizing<String>>,
+    ) -> TableCall {
+        self.for_access(record, request, TableAccess::Creation(key))
+    }
+
+    fn inspection_call(
+        self: &Arc<Self>,
+        record: TableFileRecord,
+        request: &ServiceRequest,
+    ) -> TableCall {
+        self.for_access(record, request, TableAccess::InspectCreating)
+    }
+
+    fn control_call(
+        self: &Arc<Self>,
+        record: TableFileRecord,
+        request: &ServiceRequest,
+    ) -> TableCall {
+        let access = if record.phase() == FilePhase::Updating {
+            TableAccess::Updating
+        } else {
+            TableAccess::Control
+        };
+        self.for_access(record, request, access)
+    }
     pub fn new(state: Arc<StateDb>, registry: Weak<ServiceRegistry>) -> Arc<Self> {
         Arc::new(Self {
             state,
@@ -94,9 +198,23 @@ impl TableStorage {
                 "DescribeLimits" | "__locallycloud_resolve_stream_iterator"
             ) && services.catalog.has_scope(account, region).await?
             {
-                return Err(DdbError::Validation(
-                    "This operation is not yet supported for encrypted tables".into(),
-                ));
+                let targets =
+                    locallycloud_dynamodb::service::authorization_targets(operation, body)?;
+                for (_, target) in targets {
+                    let Some(name) = Self::target_name(account, region, &target)? else {
+                        continue;
+                    };
+                    if services
+                        .catalog
+                        .load(account, region, name)
+                        .await?
+                        .is_some()
+                    {
+                        return Err(DdbError::Validation(
+                            "This operation is not yet supported for encrypted tables".into(),
+                        ));
+                    }
+                }
             }
             return Ok(None);
         };
@@ -129,25 +247,39 @@ impl TableStorage {
         let request = request.ok_or_else(|| {
             DdbError::AccessDenied("Encrypted table access requires a caller identity".into())
         })?;
-        Ok(Some(TableCall {
-            record,
-            storage: self.clone(),
-            identity: RequestIdentity {
-                account_id: account.into(),
-                access_key_id: request
-                    .headers
-                    .get(http::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(RequestIdentity::access_key_from_authorization),
-                arn: None,
-            },
-            delegated: trusted_role(request),
-            request_id: request.request_id.clone(),
-        }))
+        Ok(Some(self.call(record, request)))
     }
 }
 
 impl TableCall {
+    pub fn file_access(&self) -> FileAccess {
+        match &self.access {
+            TableAccess::Creation(_) => FileAccess::Create,
+            TableAccess::Data
+            | TableAccess::Control
+            | TableAccess::Updating
+            | TableAccess::InspectCreating => FileAccess::Existing,
+        }
+    }
+    pub fn check_operation(&self, operation: &str) -> Result<(), DdbError> {
+        let allowed = match &self.access {
+            TableAccess::Data => matches!(
+                operation,
+                "GetItem" | "PutItem" | "UpdateItem" | "DeleteItem" | "Query" | "Scan"
+            ),
+            TableAccess::Creation(_) => matches!(operation, "CreateTable" | "DescribeTable"),
+            TableAccess::InspectCreating => operation == "DescribeTable",
+            TableAccess::Control | TableAccess::Updating => {
+                matches!(operation, "DescribeTable" | "UpdateTable")
+            }
+        };
+        if !allowed {
+            return Err(DdbError::Validation(
+                "Operation does not match table authorization".into(),
+            ));
+        }
+        Ok(())
+    }
     pub async fn authorize(&self) -> Result<KmsCallContext, DdbError> {
         let services = self.storage.services().await?;
         let scope = self.record.scope();
@@ -158,7 +290,12 @@ impl TableCall {
             .ok_or_else(|| {
                 DdbError::ResourceNotFound("Encrypted table storage no longer exists".into())
             })?;
-        if current.phase() != FilePhase::Active
+        let phase = match &self.access {
+            TableAccess::Data | TableAccess::Control => FilePhase::Active,
+            TableAccess::Updating => FilePhase::Updating,
+            TableAccess::Creation(_) | TableAccess::InspectCreating => FilePhase::Creating,
+        };
+        if current.phase() != phase
             || current.scope().storage_id() != scope.storage_id()
             || current.revision() != self.record.revision()
         {
@@ -166,19 +303,45 @@ impl TableCall {
                 "Encrypted table storage changed before execution".into(),
             ));
         }
-        let call = services
-            .keys
-            .decryption_context(
-                scope,
-                self.record.envelope(),
-                &self.request_id,
-                self.identity.clone(),
-                self.delegated.clone(),
-            )
-            .map_err(kms_error)?;
+        let (call, action) = match &self.access {
+            TableAccess::Creation(_) => {
+                let key_arn = services
+                    .keys
+                    .key_arn(scope, self.record.envelope())
+                    .map_err(kms_error)?;
+                let (call, _) = services
+                    .keys
+                    .generation_context(
+                        scope,
+                        Some(&key_arn),
+                        &self.request_id,
+                        self.identity.clone(),
+                        self.delegated.clone(),
+                    )
+                    .await
+                    .map_err(kms_error)?;
+                (call, KmsDataKeyAction::Generate)
+            }
+            TableAccess::Data
+            | TableAccess::Control
+            | TableAccess::Updating
+            | TableAccess::InspectCreating => (
+                services
+                    .keys
+                    .decryption_context(
+                        scope,
+                        self.record.envelope(),
+                        &self.request_id,
+                        self.identity.clone(),
+                        self.delegated.clone(),
+                    )
+                    .map_err(kms_error)?,
+                KmsDataKeyAction::Decrypt,
+            ),
+        };
         services
             .keys
-            .authorize(scope, call.clone(), self.record.envelope())
+            .authorize_action(scope, call.clone(), self.record.envelope(), action)
             .await
             .map_err(kms_error)?;
         Ok(call)
@@ -187,6 +350,23 @@ impl TableCall {
     pub async fn unlock(&self) -> Result<Zeroizing<String>, DdbError> {
         let call = self.authorize().await?;
         let services = self.storage.services().await?;
+        let call = match &self.access {
+            TableAccess::Creation(None) => services
+                .keys
+                .decryption_context(
+                    self.record.scope(),
+                    self.record.envelope(),
+                    &self.request_id,
+                    self.identity.clone(),
+                    self.delegated.clone(),
+                )
+                .map_err(kms_error)?,
+            TableAccess::Data
+            | TableAccess::Control
+            | TableAccess::Updating
+            | TableAccess::InspectCreating => call,
+            TableAccess::Creation(Some(key)) => return Ok(Zeroizing::new(key.to_string())),
+        };
         let key = services
             .keys
             .open(self.record.scope(), call, self.record.envelope())
@@ -402,9 +582,15 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(material.plaintext.as_slice()),
         );
         let slot = pool.budget.acquire().await.unwrap();
-        let mut seed = Worker::spawn(pool.launch.clone(), database.clone(), slot, Some(&creating))
-            .await
-            .unwrap();
+        let mut seed = Worker::spawn(
+            pool.launch.clone(),
+            database.clone(),
+            slot,
+            Some(&creating),
+            FileAccess::Create,
+        )
+        .await
+        .unwrap();
         seed.initialize(
             pool.launch.mode,
             &database,
@@ -431,7 +617,7 @@ mod tests {
         worker_call(&mut seed,"PutItem",json!({"TableName":"encrypted-orders","Item":{"id":{"S":"one"},"value":{"S":"preserved"}}})).await;
         seed.stop().await.unwrap();
         drop(seed);
-        let active = services
+        services
             .catalog
             .transition(&creating, FilePhase::Active)
             .await
@@ -528,11 +714,12 @@ mod tests {
             ("ListTables", json!({})),
         ] {
             let (status, body) = pool.query_external(&req, op.into(), body).await.unwrap();
-            assert_eq!(status, 400);
-            assert!(body["__type"]
-                .as_str()
-                .unwrap()
-                .ends_with("#ValidationException"));
+            assert_eq!(status, 200, "{op}: {body}");
+            if op == "DescribeTable" {
+                assert_eq!(body["Table"]["SSEDescription"]["KMSMasterKeyArn"], key_arn);
+            } else {
+                assert_eq!(body["TableNames"], json!(["encrypted-orders"]));
+            }
         }
         let (status, body) = pool
             .query(ACCOUNT, REGION, "GetItem".into(), get.clone())
@@ -612,6 +799,12 @@ mod tests {
             .unwrap();
         assert_eq!(status, 200);
         assert_eq!(body["Item"]["value"]["S"], "preserved");
+        let active = services
+            .catalog
+            .load(ACCOUNT, REGION, "encrypted-orders")
+            .await
+            .unwrap()
+            .unwrap();
         let stale = storage
             .resolve(ACCOUNT, REGION, "GetItem", &get, Some(&req))
             .await

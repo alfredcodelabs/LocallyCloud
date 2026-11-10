@@ -250,10 +250,8 @@ const RESTORE_DATA_ACTIONS: &[&str] = &[
     "UpdateItem",
 ];
 
-pub(crate) fn authorization_targets(
-    op: &str,
-    body: &Value,
-) -> Result<Vec<(String, String)>, DdbError> {
+/// Resource targets shared by authorization and optional storage routing.
+pub fn authorization_targets(op: &str, body: &Value) -> Result<Vec<(String, String)>, DdbError> {
     let mut targets = Vec::new();
     match op {
         "ListBackups" => targets.push((op.into(), "*".into())),

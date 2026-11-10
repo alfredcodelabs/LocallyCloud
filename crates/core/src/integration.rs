@@ -282,6 +282,34 @@ impl InternalDispatcher {
         }
     }
 
+    /// Resolve a key selector with the same concurrency and timeout limits as key operations.
+    pub async fn kms_validate_key_bounded(
+        &self,
+        request: kms::KmsValidateKeyRequest,
+        limit: Duration,
+    ) -> Result<kms::KmsValidateKeyOutput, kms::KmsInternalError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or(kms::KmsInternalError::Unavailable)?;
+        let api = registry
+            .kms_api(&ServiceName::new("kms"))
+            .ok_or(kms::KmsInternalError::Unavailable)?;
+        let permit = self
+            .kms_blocking_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| kms::KmsInternalError::Unavailable)?;
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            api.validate_key(request)
+        });
+        match tokio::time::timeout(limit, worker).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(kms::KmsInternalError::Internal),
+        }
+    }
+
     pub async fn kms_authorize_cached_key_bounded(
         &self,
         request: kms::KmsAuthorizeCachedKeyRequest,

@@ -161,6 +161,12 @@ pub(crate) enum WorkerMode {
     Migration,
 }
 
+#[derive(Clone, Copy)]
+enum FileAccess {
+    Create,
+    Existing,
+}
+
 impl WorkerMode {
     fn as_str(self) -> &'static str {
         match self {
@@ -325,6 +331,20 @@ impl WorkerPool {
         Ok(())
     }
 
+    fn retire_stopped_generation(&self, scope: &WorkerScope) -> io::Result<()> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| io::Error::other("worker registry unavailable"))?;
+        if let Some(worker) = workers.get(scope) {
+            if !*worker.stop.borrow() || *worker.completion.borrow() != Some(Ok(())) {
+                return Err(io::Error::other("worker exit was not confirmed"));
+            }
+        }
+        workers.remove(scope);
+        Ok(())
+    }
+
     pub(crate) async fn query(
         &self,
         account: &str,
@@ -359,6 +379,16 @@ impl WorkerPool {
         body: Value,
         request: Option<&ServiceRequest>,
     ) -> Reply {
+        if let Some(storage) = &self.table_storage {
+            match storage
+                .lifecycle(self, account, region, &operation, &body, request)
+                .await
+            {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => {}
+                Err(error) => return error_reply(error).await,
+            }
+        }
         let table = match &self.table_storage {
             Some(storage) => match storage
                 .resolve(account, region, &operation, &body, request)
@@ -372,7 +402,15 @@ impl WorkerPool {
         let Some(table) = table else {
             return self.query_regional(account, region, operation, body).await;
         };
-        let sender = match self.worker(account, region, Some(&table)) {
+        self.query_table(table, operation, body).await
+    }
+
+    async fn query_table(&self, table: TableCall, operation: String, mut body: Value) -> Reply {
+        let scope = table.record.scope();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("TableName".into(), Value::String(scope.table_name().into()));
+        }
+        let sender = match self.worker(scope.account(), scope.region(), Some(&table)) {
             Ok(sender) => sender,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 return error_reply(DdbError::Throttling(error.to_string())).await
@@ -564,6 +602,9 @@ impl WorkerPool {
 
 #[async_trait]
 impl locallycloud_dynamodb::DynamoEngine for ExtendDb {
+    fn supports_customer_encryption(&self) -> bool {
+        true
+    }
     fn supports_pitr(&self) -> bool {
         true
     }
@@ -692,6 +733,7 @@ impl Worker {
         database: PathBuf,
         slot: OwnedSemaphorePermit,
         table: Option<&locallycloud_dynamodb::encryption::catalog::TableFileRecord>,
+        access: FileAccess,
     ) -> io::Result<Self> {
         let WorkerLaunch { components, .. } = launch;
         let (_, executable, lease) =
@@ -699,9 +741,7 @@ impl Worker {
                 .await
                 .map_err(io::Error::other)??;
         let table_file = table.is_some();
-        let existing_table = table.is_some_and(|t| {
-            t.phase() == locallycloud_dynamodb::encryption::catalog::FilePhase::Active
-        });
+        let existing_table = table.is_some() && matches!(access, FileAccess::Existing);
         let expected_database = database.clone();
         let parent = database
             .parent()
@@ -889,6 +929,9 @@ async fn serve_worker(
             continue;
         }
         let result = tokio::time::timeout_at(request.deadline, async {
+            if let Some(table) = &request.table {
+                table.check_operation(&request.operation)?;
+            }
             if worker.is_none() {
                 let slot = budget
                     .acquire()
@@ -908,6 +951,10 @@ async fn serve_worker(
                         database.clone(),
                         slot,
                         request.table.as_ref().map(|t| &t.record),
+                        request
+                            .table
+                            .as_ref()
+                            .map_or(FileAccess::Create, TableCall::file_access),
                     )
                     .await
                     .map_err(|e| DdbError::Internal(e.to_string()))?,

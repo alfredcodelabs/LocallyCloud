@@ -22,6 +22,9 @@ struct EngineHandler {
 /// The backend resolves its own token format; the wrapper owns authorization.
 #[async_trait]
 pub trait DynamoEngine: NativeHandler {
+    fn supports_customer_encryption(&self) -> bool {
+        false
+    }
     fn supports_owned_encryption(&self) -> bool {
         false
     }
@@ -294,6 +297,40 @@ fn validate_owned_encryption(op: &str, body: &Value, supported: bool) -> Result<
     Ok(())
 }
 
+fn validate_encryption(op: &str, body: &Value, engine: &dyn DynamoEngine) -> Result<(), DdbError> {
+    if !engine.supports_customer_encryption() || !matches!(op, "CreateTable" | "UpdateTable") {
+        return validate_owned_encryption(op, body, engine.supports_owned_encryption());
+    }
+    let Some(specification) = body.get("SSESpecification") else {
+        return Ok(());
+    };
+    let Some(specification) = specification.as_object() else {
+        return Err(DdbError::Validation(
+            "SSESpecification must be an object".into(),
+        ));
+    };
+    if specification
+        .keys()
+        .any(|key| !matches!(key.as_str(), "Enabled" | "SSEType" | "KMSMasterKeyId"))
+        || specification
+            .get("Enabled")
+            .is_some_and(|v| !v.is_boolean())
+        || specification
+            .get("SSEType")
+            .is_some_and(|v| v.as_str() != Some("KMS"))
+        || specification.get("KMSMasterKeyId").is_some_and(|v| {
+            v.as_str()
+                .is_none_or(|key| key.is_empty() || key.len() > 2048)
+        })
+    {
+        return Err(DdbError::Validation("Invalid SSESpecification".into()));
+    }
+    if specification.get("Enabled").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    validate_owned_encryption(op, body, engine.supports_owned_encryption())
+}
+
 fn pitr_table(request: &ServiceRequest, value: &Value, field: &str) -> Result<(), DdbError> {
     let raw = value
         .as_str()
@@ -510,13 +547,7 @@ impl NativeHandler for EngineHandler {
             self.engine.supports_mrec(),
         )
         .and_then(|()| validate_pitr(&request, &op, &authorization_body))
-        .and_then(|()| {
-            validate_owned_encryption(
-                &op,
-                &authorization_body,
-                self.engine.supports_owned_encryption(),
-            )
-        })
+        .and_then(|()| validate_encryption(&op, &authorization_body, self.engine.as_ref()))
         .and_then(|()| service::authorize(&self.registry, &request, &op, &authorization_body))
         {
             return error.into_response(&request.request_id);

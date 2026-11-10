@@ -395,6 +395,7 @@ impl Coordinator {
         if matches!(
             op.as_str(),
             "CreateTable"
+                | "DescribeTable"
                 | "DeleteTable"
                 | "UpdateTable"
                 | "UpdateTimeToLive"
@@ -452,27 +453,15 @@ impl Coordinator {
             .query_external(&request, op.clone(), body.clone())
             .await;
         let result = match result {
-            Ok((status, mut output))
-                if status == 200
-                    && matches!(op.as_str(), "DescribeTable" | "DescribeTimeToLive") =>
-            {
+            Ok((status, mut output)) if status == 200 && op == "DescribeTimeToLive" => {
                 if let Some(name) = table_name(&body) {
                     match self.metadata.get(&request.account_id, &name).await {
                         Ok(Some(global)) if global.regions.contains(&request.region) => {
-                            match op.as_str() {
-                                "DescribeTable" => {
-                                    overlay(&mut output, "Table", &global, &request.region)
-                                }
-                                "DescribeTimeToLive" => {
-                                    if let Phase::UpdatingTtl { specification, .. } = &global.phase
-                                    {
-                                        output["TimeToLiveDescription"] = json!({
-                                            "TimeToLiveStatus": if specification.enabled { "ENABLING" } else { "DISABLING" },
-                                            "AttributeName": specification.attribute_name,
-                                        });
-                                    }
-                                }
-                                _ => {}
+                            if let Phase::UpdatingTtl { specification, .. } = &global.phase {
+                                output["TimeToLiveDescription"] = json!({
+                                    "TimeToLiveStatus": if specification.enabled { "ENABLING" } else { "DISABLING" },
+                                    "AttributeName": specification.attribute_name,
+                                });
                             }
                         }
                         Ok(Some(_)) => {}
@@ -549,6 +538,22 @@ impl Coordinator {
             }
         }
         let result = match op.as_str() {
+            "DescribeTable" => {
+                let result = self.pool.query_external(request, op, body).await;
+                let result = match result {
+                    Ok((200, mut output)) => {
+                        if let Some(global) = global
+                            .as_ref()
+                            .filter(|global| global.regions.contains(&request.region))
+                        {
+                            overlay(&mut output, "Table", global, &request.region);
+                        }
+                        Ok((200, output))
+                    }
+                    other => other,
+                };
+                return encode(result, &request.request_id);
+            }
             "CreateTable" | "RestoreTableFromBackup" | "RestoreTableToPointInTime"
                 if global
                     .as_ref()
@@ -607,18 +612,14 @@ impl Coordinator {
                     Err(DdbError::Validation("this schema or security update is not supported for ExtendDB global tables".into()))
                 } else {
                     return encode(
-                        self.pool
-                            .query(&request.account_id, &request.region, op, body)
-                            .await,
+                        self.pool.query_external(request, op, body).await,
                         &request.request_id,
                     );
                 }
             }
             _ => {
                 return encode(
-                    self.pool
-                        .query(&request.account_id, &request.region, op, body)
-                        .await,
+                    self.pool.query_external(request, op, body).await,
                     &request.request_id,
                 )
             }
