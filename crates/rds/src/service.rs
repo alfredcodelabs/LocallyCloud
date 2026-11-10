@@ -932,7 +932,7 @@ impl RdsHandler {
                 Ok(()) => {
                     completed.status = "available".to_owned();
                     if let Err(reason) = persist(&directory, &completed).await {
-                        stop_instance(&runtime, &directory).await;
+                        let _ = stop_instance(&runtime, &directory).await;
                         completed.status = "failed".to_owned();
                         completed.error =
                             Some(format!("Unable to persist instance metadata: {reason}"));
@@ -942,7 +942,7 @@ impl RdsHandler {
                     }
                 }
                 Err(reason) => {
-                    stop_instance(&runtime, &directory).await;
+                    let _ = stop_instance(&runtime, &directory).await;
                     completed.status = "failed".to_owned();
                     completed.error = Some(reason);
                     let _ = persist(&directory, &completed).await;
@@ -1156,14 +1156,14 @@ impl RdsHandler {
                         true
                     };
                     if !published {
-                        stop_instance(&runtime, &directory).await;
+                        let _ = stop_instance(&runtime, &directory).await;
                         completed.status = "failed".to_owned();
                         completed.error = Some("Unable to publish private RDS endpoint".to_owned());
                         let _ = persist(&directory, &completed).await;
                     } else {
                         completed.status = "available".to_owned();
                         if let Err(reason) = persist(&directory, &completed).await {
-                            stop_instance(&runtime, &directory).await;
+                            let _ = stop_instance(&runtime, &directory).await;
                             completed.status = "failed".to_owned();
                             completed.error =
                                 Some(format!("Unable to persist instance metadata: {reason}"));
@@ -1172,7 +1172,7 @@ impl RdsHandler {
                     }
                 }
                 Err(reason) => {
-                    stop_instance(&runtime, &directory).await;
+                    let _ = stop_instance(&runtime, &directory).await;
                     completed.status = "failed".to_owned();
                     completed.error = Some(reason);
                     let _ = persist(&directory, &completed).await;
@@ -1272,7 +1272,7 @@ impl RdsHandler {
                 Ok(()) => {
                     completed.status = "available".to_owned();
                     if let Err(reason) = persist(&directory, &completed).await {
-                        stop_instance(&runtime, &directory).await;
+                        let _ = stop_instance(&runtime, &directory).await;
                         completed.status = "failed".to_owned();
                         completed.error =
                             Some(format!("Unable to persist replica metadata: {reason}"));
@@ -1280,7 +1280,7 @@ impl RdsHandler {
                     }
                 }
                 Err(reason) => {
-                    stop_instance(&runtime, &directory).await;
+                    let _ = stop_instance(&runtime, &directory).await;
                     completed.status = "failed".to_owned();
                     completed.error = Some(reason);
                     let _ = persist(&directory, &completed).await;
@@ -1506,34 +1506,11 @@ impl RdsHandler {
         };
         let directory = self.directory(&instance);
         let data = directory.join("data");
-        if command(
-            &runtime,
-            "pg_ctl",
-            &["-D", &data.to_string_lossy(), "status"],
-        )
-        .await
-        .is_ok()
-        {
-            if let Err(reason) = command(
-                &runtime,
-                "pg_ctl",
-                &[
-                    "-D",
-                    &data.to_string_lossy(),
-                    "stop",
-                    "-m",
-                    "immediate",
-                    "-w",
-                ],
-            )
-            .await
-            {
-                let mut failed = instance.clone();
-                failed.status = "failed".to_owned();
-                failed.error = Some(format!("Unable to stop PostgreSQL: {reason}"));
-                self.instances.lock().await.insert(key.clone(), failed);
-                return Err(Error::internal(reason));
-            }
+        if let Err(reason) = stop_instance(&runtime, &directory).await {
+            self.instances.lock().await.insert(key.clone(), instance);
+            return Err(Error::internal(format!(
+                "Unable to stop PostgreSQL safely: {reason}"
+            )));
         }
         if let Some(cluster_id) = &instance.cluster_id {
             let result: Result<(), String> = async {
@@ -1904,26 +1881,28 @@ impl RdsHandler {
         self.spawn_job(async move {
             let result = restore(&runtime, &snapshot_dir, &directory, &instance).await;
             let mut completed = instance;
-            match result {
+            let failure = match result {
                 Ok(()) => {
                     completed.status = "available".to_owned();
-                    if let Err(reason) = persist(&directory, &completed).await {
-                        stop_instance(&runtime, &directory).await;
-                        let _ = tokio::fs::remove_dir_all(directory.join("data")).await;
-                        completed.status = "failed".to_owned();
-                        completed.error =
-                            Some(format!("Unable to persist restored instance: {reason}"));
-                        let _ = persist(&directory, &completed).await;
+                    persist(&directory, &completed)
+                        .await
+                        .err()
+                        .map(|reason| format!("Unable to persist restored instance: {reason}"))
+                }
+                Err(reason) => Some(reason),
+            };
+            if let Some(mut reason) = failure {
+                match remove_stopped_data(&runtime, &directory).await {
+                    Ok(()) => {
+                        let _ = cleanup_socket_dir(&completed).await;
+                    }
+                    Err(error) => {
+                        reason.push_str(&format!("; PostgreSQL data retained: {error}"));
                     }
                 }
-                Err(reason) => {
-                    stop_instance(&runtime, &directory).await;
-                    let _ = tokio::fs::remove_dir_all(directory.join("data")).await;
-                    let _ = cleanup_socket_dir(&completed).await;
-                    completed.status = "failed".to_owned();
-                    completed.error = Some(reason);
-                    let _ = persist(&directory, &completed).await;
-                }
+                completed.status = "failed".to_owned();
+                completed.error = Some(reason);
+                let _ = persist(&directory, &completed).await;
             }
             instances.lock().await.insert(key, completed);
             if let Some(current) = snapshots.lock().await.get_mut(&snapshot_key) {
@@ -2534,10 +2513,7 @@ async fn start_and_probe(
     prepare_socket_dir(instance).await?;
     let data = directory.join("data");
     let data_arg = data.to_string_lossy();
-    if command(runtime, "pg_ctl", &["-D", &data_arg, "status"])
-        .await
-        .is_err()
-    {
+    if !postgres_running(runtime, directory).await? {
         command(
             runtime,
             "pg_ctl",
@@ -2583,9 +2559,33 @@ async fn probe(
     .await
 }
 
-async fn stop_instance(runtime: &PostgresRuntime, directory: &Path) {
+async fn postgres_running(runtime: &PostgresRuntime, directory: &Path) -> Result<bool, String> {
     let data = directory.join("data");
-    let _ = command(
+    match tokio::fs::symlink_metadata(&data).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err("PostgreSQL data path is not a directory".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err("Unable to inspect PostgreSQL data directory".to_owned()),
+    }
+    let mut cmd = Command::new(runtime.bin_dir.join("pg_ctl"));
+    cmd.args(["-D", &data.to_string_lossy(), "status"]);
+    let output = execute_output(cmd).await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(3) => Ok(false),
+        _ => Err(format!(
+            "Unable to inspect PostgreSQL status: {}",
+            output.status
+        )),
+    }
+}
+
+async fn stop_instance(runtime: &PostgresRuntime, directory: &Path) -> Result<(), String> {
+    if !postgres_running(runtime, directory).await? {
+        return Ok(());
+    }
+    let data = directory.join("data");
+    command(
         runtime,
         "pg_ctl",
         &[
@@ -2597,7 +2597,17 @@ async fn stop_instance(runtime: &PostgresRuntime, directory: &Path) {
             "-w",
         ],
     )
-    .await;
+    .await
+    .map(|_| ())
+}
+
+async fn remove_stopped_data(runtime: &PostgresRuntime, directory: &Path) -> Result<(), String> {
+    stop_instance(runtime, directory).await?;
+    match tokio::fs::remove_dir_all(directory.join("data")).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 async fn sql_command(
@@ -2647,13 +2657,26 @@ async fn command(runtime: &PostgresRuntime, tool: &str, args: &[&str]) -> Result
     execute(cmd).await
 }
 
-async fn execute(mut cmd: Command) -> Result<String, String> {
-    let output = tokio::time::timeout(Duration::from_secs(60), cmd.kill_on_drop(true).output())
+async fn execute_output(mut cmd: Command) -> Result<std::process::Output, String> {
+    tokio::time::timeout(Duration::from_secs(60), cmd.kill_on_drop(true).output())
         .await
         .map_err(|_| "PostgreSQL command timed out".to_owned())?
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())
+}
+
+fn command_failure(output: &std::process::Output) -> String {
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if message.is_empty() {
+        format!("PostgreSQL command exited with {}", output.status)
+    } else {
+        message
+    }
+}
+
+async fn execute(cmd: Command) -> Result<String, String> {
+    let output = execute_output(cmd).await?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        return Err(command_failure(&output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -3038,6 +3061,172 @@ impl Error {
             .with_xml_namespace(XMLNS)
             .render(AwsProtocol::Query)
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod process_status_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn failed_restore_cleanup_requires_a_confirmed_stop() {
+        let root = std::env::temp_dir().join(format!("rds-stop-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        tokio::fs::create_dir_all(&bin).await.unwrap();
+        let runtime = PostgresRuntime {
+            bin_dir: bin.clone(),
+            version: "16.4".into(),
+        };
+        let directory = root.join("instance");
+        let marker = directory.join("data/important");
+        for (status, stop, permitted, stop_called) in [
+            ("exit 4", "exit 0", false, false),
+            ("exit 1", "exit 0", false, false),
+            ("kill -TERM $$", "exit 0", false, false),
+            ("exit 0", "exit 1", false, true),
+            ("exit 3", "exit 1", true, false),
+            ("exit 0", "exit 0", true, true),
+        ] {
+            tokio::fs::create_dir_all(marker.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&marker, b"database bytes").await.unwrap();
+            let script = format!("#!/bin/sh\ncase \"$3\" in\n status) {status};;\n stop) : > \"$2/../stop-called\"; {stop};;\n *) exit 1;;\nesac\n");
+            tokio::fs::write(bin.join("pg_ctl"), script).await.unwrap();
+            tokio::fs::set_permissions(bin.join("pg_ctl"), std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let result = remove_stopped_data(&runtime, &directory).await;
+            assert_eq!(
+                result.is_ok(),
+                permitted,
+                "status={status}, stop={stop}: {result:?}"
+            );
+            assert_eq!(tokio::fs::try_exists(&marker).await.unwrap(), !permitted);
+            if !permitted {
+                assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"database bytes");
+            }
+            let stopped = directory.join("stop-called");
+            assert_eq!(tokio::fs::try_exists(&stopped).await.unwrap(), stop_called);
+            if stop_called {
+                tokio::fs::remove_file(stopped).await.unwrap();
+            }
+        }
+        tokio::fs::create_dir_all(marker.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&marker, b"database bytes").await.unwrap();
+        tokio::fs::remove_file(bin.join("pg_ctl")).await.unwrap();
+        assert!(remove_stopped_data(&runtime, &directory).await.is_err());
+        assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"database bytes");
+        tokio::fs::remove_dir_all(directory.join("data"))
+            .await
+            .unwrap();
+        // A failed initialization with no data does not require a working pg_ctl.
+        assert!(remove_stopped_data(&runtime, &directory).await.is_ok());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_preserves_data_when_postgres_status_is_unknown() {
+        const CHILD: &str = "LOCALLYCLOUD_RDS_STATUS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!("rds-status-{}", uuid::Uuid::new_v4()));
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "service::process_status_tests::delete_preserves_data_when_postgres_status_is_unknown", "--nocapture"])
+                .env(CHILD, &root)
+                .env("LOCALLYCLOUD_PG_BIN_DIR", root.join("bin"))
+                .kill_on_drop(true)
+                .output().await.unwrap();
+            tokio::fs::remove_dir_all(root).await.unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let bin = root.join("bin");
+        tokio::fs::create_dir_all(&bin).await.unwrap();
+        for tool in ["initdb", "pg_ctl", "postgres", "psql", "pg_basebackup"] {
+            let script = if tool == "pg_ctl" {
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'pg_ctl (PostgreSQL) 16.4'; exit 0; fi\nexit 4\n".to_owned()
+            } else {
+                format!("#!/bin/sh\necho '{tool} (PostgreSQL) 16.4'\n")
+            };
+            tokio::fs::write(bin.join(tool), script).await.unwrap();
+            tokio::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+        }
+        let opening = root.join("rds");
+        let handler = tokio::task::spawn_blocking(move || RdsHandler::new(opening))
+            .await
+            .unwrap()
+            .unwrap();
+        let instance = Instance {
+            id: "protected".into(),
+            account: "000000000000".into(),
+            region: "us-east-1".into(),
+            username: "app".into(),
+            db_name: "app".into(),
+            class: "db.t3.micro".into(),
+            storage: 20,
+            port: 12345,
+            status: "available".into(),
+            error: None,
+            replica_source: None,
+            cluster_id: None,
+            vpc: None,
+            socket_token: new_socket_token(),
+            dbi_resource_id: new_dbi_resource_id(),
+        };
+        let key = (
+            instance.account.clone(),
+            instance.region.clone(),
+            instance.id.clone(),
+        );
+        let directory = handler.directory(&instance);
+        tokio::fs::create_dir_all(directory.join("data"))
+            .await
+            .unwrap();
+        let marker = directory.join("data/important");
+        tokio::fs::write(&marker, b"database bytes").await.unwrap();
+        persist(&directory, &instance).await.unwrap();
+        handler.instances.lock().await.insert(key.clone(), instance);
+        let response = handler
+            .handle(ServiceRequest {
+                method: axum::http::Method::POST,
+                uri: "/".parse().unwrap(),
+                headers: Default::default(),
+                body:
+                    "Action=DeleteDBInstance&DBInstanceIdentifier=protected&SkipFinalSnapshot=true"
+                        .into(),
+                account_id: key.0.clone(),
+                region: key.1.clone(),
+                request_id: "status-failure".into(),
+            })
+            .await;
+        let status = response.status();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            tokio::fs::try_exists(&marker).await.unwrap(),
+            "status inspection failure deleted database bytes: {status}: {body}"
+        );
+        assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"database bytes");
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("<Code>InternalFailure</Code>"), "{body}");
+        assert!(handler.instances.lock().await.contains_key(&key));
     }
 }
 
