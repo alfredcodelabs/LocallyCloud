@@ -17,7 +17,7 @@ use locallycloud_dynamodb::error::DdbError;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
@@ -189,7 +189,42 @@ pub(crate) struct WorkerPool {
 
 struct WorkerTask {
     sender: mpsc::Sender<Request>,
-    task: tokio::task::JoinHandle<()>,
+    stop: watch::Sender<bool>,
+    completion: watch::Receiver<Option<Result<(), ()>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl WorkerTask {
+    fn spawn(
+        sender: mpsc::Sender<Request>,
+        stop: watch::Sender<bool>,
+        future: impl std::future::Future<Output = io::Result<()>> + Send + 'static,
+    ) -> Self {
+        let (completed, completion) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            let result = future.await.map_err(|_| ());
+            completed.send_replace(Some(result));
+        });
+        Self {
+            sender,
+            stop,
+            completion,
+            task: Some(task),
+        }
+    }
+
+    fn stopped() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (stop, _) = watch::channel(true);
+        let (_, completion) = watch::channel(Some(Ok(())));
+        Self {
+            sender,
+            stop,
+            completion,
+            task: None,
+        }
+    }
 }
 
 impl WorkerPool {
@@ -237,23 +272,57 @@ impl WorkerPool {
 
     pub async fn shutdown(&self) {
         self.closing.store(true, Ordering::Release);
-        let workers = match self.workers.lock() {
-            Ok(mut workers) => workers
-                .drain()
-                .map(|(_, worker)| worker)
-                .collect::<Vec<_>>(),
+        let scopes = match self.workers.lock() {
+            Ok(workers) => workers.keys().cloned().collect::<Vec<_>>(),
             Err(_) => return,
         };
-        for WorkerTask { sender, mut task } in workers {
-            drop(sender);
-            if tokio::time::timeout(REQUEST_TIMEOUT + Duration::from_secs(5), &mut task)
-                .await
-                .is_err()
-            {
-                task.abort();
-                let _ = task.await;
+        for scope in scopes {
+            if self.stop_worker(&scope).await.is_err() {
+                tracing::warn!("ExtendDB worker shutdown did not confirm process exit");
             }
         }
+    }
+
+    async fn stop_worker(&self, scope: &WorkerScope) -> io::Result<()> {
+        let mut completion = {
+            let mut workers = self
+                .workers
+                .lock()
+                .map_err(|_| io::Error::other("worker registry unavailable"))?;
+            let at_capacity = workers.len() >= MAX_WORKERS * 2;
+            let worker = match workers.entry(scope.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    if at_capacity {
+                        return Err(io::Error::other("worker stop fence capacity reached"));
+                    }
+                    entry.insert(WorkerTask::stopped())
+                }
+            };
+            worker.stop.send_replace(true);
+            worker.completion.clone()
+        };
+        let result = tokio::time::timeout(REQUEST_TIMEOUT + Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = *completion.borrow_and_update() {
+                    return result.map_err(|_| io::Error::other("worker exit was not confirmed"));
+                }
+                completion.changed().await.map_err(|_| {
+                    io::Error::other("worker exited without cleanup acknowledgement")
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("worker stop timed out"))?;
+        result?;
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| io::Error::other("worker registry unavailable"))?;
+        if let Some(worker) = workers.get_mut(scope) {
+            worker.task.take();
+        }
+        Ok(())
     }
 
     pub(crate) async fn query(
@@ -454,8 +523,13 @@ impl WorkerPool {
         if self.closing.load(Ordering::Acquire) {
             return Err(io::Error::other("ExtendDB is shutting down"));
         }
-        workers.retain(|_, worker| !worker.sender.is_closed());
+        workers.retain(|_, worker| {
+            *worker.stop.borrow() || *worker.completion.borrow() != Some(Ok(()))
+        });
         if let Some(worker) = workers.get(&scope) {
+            if *worker.stop.borrow() || worker.sender.is_closed() {
+                return Err(io::Error::other("ExtendDB worker generation is stopped"));
+            }
             return Ok(worker.sender.clone());
         }
         if workers.len() >= MAX_WORKERS * 2 {
@@ -473,22 +547,17 @@ impl WorkerPool {
                 .join(table.record.file_name()),
             None => self.data.join(account).join(format!("{region}.sqlite3")),
         };
-        let task = tokio::spawn(serve_worker(
+        let (stop, stopped) = watch::channel(false);
+        let future = serve_worker(
             self.launch.clone(),
             database,
             (scope.0.clone(), scope.1.clone()),
             self.key.clone(),
             self.budget.clone(),
             self.notifier.clone(),
-            receiver,
-        ));
-        workers.insert(
-            scope,
-            WorkerTask {
-                sender: sender.clone(),
-                task,
-            },
+            (receiver, stopped),
         );
+        workers.insert(scope, WorkerTask::spawn(sender.clone(), stop, future));
         Ok(sender)
     }
 }
@@ -540,8 +609,7 @@ impl locallycloud_dynamodb::DynamoEngine for ExtendDb {
 
 struct Worker {
     child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    output: Option<BufReader<ChildStdout>>,
     _lease: std::fs::File,
     _slot: OwnedSemaphorePermit,
 }
@@ -619,15 +687,13 @@ fn ready_for_table(ready: &Value, table: Option<&TableBinding<'_>>) -> bool {
 }
 
 impl Worker {
-    async fn start(
+    async fn spawn(
         launch: WorkerLaunch,
         database: PathBuf,
-        scope: &(String, String),
-        key: &str,
         slot: OwnedSemaphorePermit,
         table: Option<&locallycloud_dynamodb::encryption::catalog::TableFileRecord>,
     ) -> io::Result<Self> {
-        let WorkerLaunch { components, mode } = launch;
+        let WorkerLaunch { components, .. } = launch;
         let (_, executable, lease) =
             tokio::task::spawn_blocking(move || component_manager::verified(&components))
                 .await
@@ -672,28 +738,40 @@ impl Worker {
         .map_err(io::Error::other)??;
         use std::os::fd::AsRawFd;
         let executable_path = format!("/proc/{}/fd/{}", std::process::id(), executable.as_raw_fd());
-        let mut child = Command::new(executable_path)
+        let child = Command::new(executable_path)
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("worker stdin unavailable"))?;
-        let output = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("worker stdout unavailable"))?;
-        let mut worker = Self {
+        // No await after spawn: the actor owns the child before initialization can time out.
+        Ok(Self {
             child,
-            input,
-            output: BufReader::new(output),
+            output: None,
             _lease: lease,
             _slot: slot,
-        };
+        })
+    }
+
+    async fn initialize(
+        &mut self,
+        mode: WorkerMode,
+        database: &std::path::Path,
+        scope: &(String, String),
+        key: &str,
+        table: Option<&locallycloud_dynamodb::encryption::catalog::TableFileRecord>,
+    ) -> io::Result<()> {
+        self.output = self.child.stdout.take().map(BufReader::new);
+        let input = self
+            .child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::other("worker stdin unavailable"))?;
+        let output = self
+            .output
+            .as_mut()
+            .ok_or_else(|| io::Error::other("worker stdout unavailable"))?;
         // Borrow key material: a temporary serde_json::Value would leave an unzeroized copy.
         let binding = table.map(|record| TableBinding {
             table_name: record.scope().table_name(),
@@ -703,7 +781,7 @@ impl Worker {
             serde_json::to_vec(&WorkerInitialize {
                 version: 1,
                 key,
-                database: &database,
+                database,
                 account_id: &scope.0,
                 region: &scope.1,
                 mode: mode.as_str(),
@@ -712,14 +790,13 @@ impl Worker {
             .map_err(io::Error::other)?,
         );
         init.push(b'\n');
-        worker.input.write_all(&init).await?;
-        worker.input.flush().await?;
-        let ready = frame(&mut worker.output).await?;
+        input.write_all(&init).await?;
+        input.flush().await?;
+        let ready = frame(output).await?;
         if !ready_for_mode(&ready, mode) || !ready_for_table(&ready, binding.as_ref()) {
             return Err(io::Error::other("ExtendDB worker handshake, mode, or table binding is incompatible; install a current worker"));
         }
-        drop(executable);
-        Ok(worker)
+        Ok(())
     }
 
     async fn request(&mut self, request: &Request) -> io::Result<(u16, Value)> {
@@ -730,9 +807,18 @@ impl Worker {
             return Err(io::Error::other("ExtendDB request exceeds frame limit"));
         }
         bytes.push(b'\n');
-        self.input.write_all(&bytes).await?;
-        self.input.flush().await?;
-        let mut result = frame(&mut self.output).await?;
+        let input = self
+            .child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::other("worker stdin unavailable"))?;
+        let output = self
+            .output
+            .as_mut()
+            .ok_or_else(|| io::Error::other("worker stdout unavailable"))?;
+        input.write_all(&bytes).await?;
+        input.flush().await?;
+        let mut result = frame(output).await?;
         let status = result
             .get("status")
             .and_then(Value::as_u64)
@@ -748,15 +834,16 @@ impl Worker {
         Ok((status, body))
     }
 
-    async fn stop(mut self) {
-        drop(self.input);
-        if tokio::time::timeout(Duration::from_secs(3), self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
-            let _ = self.child.wait().await;
+    async fn stop(&mut self) -> io::Result<()> {
+        drop(self.child.stdin.take());
+        let result = match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) | Err(_) => self.child.kill().await,
+        };
+        if result.is_err() {
+            tracing::error!("ExtendDB worker process exit could not be confirmed");
         }
+        result
     }
 }
 
@@ -767,20 +854,25 @@ async fn serve_worker(
     key: Arc<Zeroizing<String>>,
     budget: Arc<WorkerBudget>,
     notifier: Arc<crate::dynamodb_replication::RelayNotifier>,
-    mut requests: mpsc::Receiver<Request>,
-) {
+    inbox: (mpsc::Receiver<Request>, watch::Receiver<bool>),
+) -> io::Result<()> {
+    let (mut requests, mut stopped) = inbox;
     let mut worker: Option<Worker> = None;
     let mut waiting = budget.waiting.subscribe();
     let mut idle_until = tokio::time::Instant::now() + IDLE_TIMEOUT;
     loop {
+        if *stopped.borrow() {
+            break;
+        }
         let request = tokio::select! {
             // Yield cached capacity before more work when another actor needs a process.
             biased;
+            _=stopped.changed()=>break,
             changed=waiting.changed()=> {
                 if changed.is_err() { break; }
                 let release=*waiting.borrow_and_update()>0;
                 if release {
-                    if let Some(worker)=worker.take() { worker.stop().await; }
+                    if let Some(mut worker)=worker.take() { worker.stop().await?; }
                 }
                 continue;
             }
@@ -811,17 +903,27 @@ async fn serve_worker(
                     .map(|v| v.as_str())
                     .unwrap_or(key.as_str());
                 worker = Some(
-                    Worker::start(
+                    Worker::spawn(
                         launch.clone(),
                         database.clone(),
-                        &scope,
-                        key,
                         slot,
                         request.table.as_ref().map(|t| &t.record),
                     )
                     .await
                     .map_err(|e| DdbError::Internal(e.to_string()))?,
                 );
+                if let Some(worker) = worker.as_mut() {
+                    worker
+                        .initialize(
+                            launch.mode,
+                            &database,
+                            &scope,
+                            key,
+                            request.table.as_ref().map(|t| &t.record),
+                        )
+                        .await
+                        .map_err(|error| DdbError::Internal(error.to_string()))?;
+                }
             }
             if let Some(table) = &request.table {
                 table.authorize().await?;
@@ -841,8 +943,8 @@ async fn serve_worker(
             ))
         });
         if result.is_err() {
-            if let Some(worker) = worker.take() {
-                worker.stop().await;
+            if let Some(mut worker) = worker.take() {
+                worker.stop().await?;
             }
         }
         if matches!(
@@ -858,9 +960,16 @@ async fn serve_worker(
         let _ = request.reply.send(result);
         idle_until = tokio::time::Instant::now() + IDLE_TIMEOUT;
     }
-    if let Some(worker) = worker {
-        worker.stop().await;
+    requests.close();
+    while let Some(request) = requests.recv().await {
+        let _ = request
+            .reply
+            .send(Err("ExtendDB worker generation is stopped".into()));
     }
+    if let Some(mut worker) = worker {
+        worker.stop().await?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -986,14 +1095,16 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel::<Request>(8);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed = calls.clone();
-        let task = tokio::spawn(async move {
+        let (stop, _) = watch::channel(false);
+        let future = async move {
             for (expected, reply) in replies {
                 let request = receiver.recv().await.unwrap();
                 assert_eq!(request.operation, expected);
                 observed.lock().unwrap().push(request.operation);
                 request.reply.send(Ok(reply)).unwrap();
             }
-        });
+            Ok(())
+        };
         let pool = WorkerPool {
             launch: WorkerLaunch {
                 components: PathBuf::from("/never-executed"),
@@ -1003,7 +1114,7 @@ mod tests {
             key: Arc::new(Zeroizing::new(String::new())),
             workers: Mutex::new(HashMap::from([(
                 ("000000000000".into(), "us-east-1".into(), None),
-                WorkerTask { sender, task },
+                WorkerTask::spawn(sender, stop, future),
             )])),
             table_storage: None,
             closing: AtomicBool::new(false),
@@ -1122,6 +1233,7 @@ mod tests {
             .await
             .unwrap();
         drop(sender);
+        let (_stop, stopped) = watch::channel(false);
         serve_worker(
             WorkerLaunch {
                 components: PathBuf::from("/missing-component"),
@@ -1132,9 +1244,10 @@ mod tests {
             Arc::new(Zeroizing::new(String::new())),
             WorkerBudget::new(1),
             crate::dynamodb_replication::RelayNotifier::new(),
-            receiver,
+            (receiver, stopped),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             result.await.unwrap().unwrap_err(),
             "ExtendDB request expired before execution"
@@ -1184,6 +1297,179 @@ mod tests {
             .unwrap()
             .ends_with("#ThrottlingException"));
         drop(receiver);
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_initialization_keeps_the_child_until_confirmed_exit() {
+        for (program, args, times_out) in [("cat", &[][..], false), ("sleep", &["60"][..], true)] {
+            let budget = WorkerBudget::new(1);
+            let child = Command::new(program)
+                .args(args)
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let lease = tokio::fs::File::open("/dev/null")
+                .await
+                .unwrap()
+                .into_std()
+                .await;
+            let mut worker = Worker {
+                child,
+                output: None,
+                _lease: lease,
+                _slot: budget.acquire().await.unwrap(),
+            };
+            let timeout = if times_out {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(5)
+            };
+            let result = tokio::time::timeout(
+                timeout,
+                worker.initialize(
+                    WorkerMode::Normal,
+                    std::path::Path::new("unused.sqlite3"),
+                    &("000000000000".into(), "us-east-1".into()),
+                    "test-key",
+                    None,
+                ),
+            )
+            .await;
+            if times_out {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert!(worker.child.try_wait().unwrap().is_none());
+            assert_eq!(budget.slots.available_permits(), 0);
+            worker.stop().await.unwrap();
+            assert!(worker.child.try_wait().unwrap().is_some());
+            drop(worker);
+            assert_eq!(budget.slots.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_drains_queued_requests_and_rejects_cloned_senders() {
+        let (mut pool, _) = scripted_pool(vec![]);
+        pool.workers.get_mut().unwrap().clear();
+        let scope: WorkerScope = ("000000000000".into(), "us-east-1".into(), None);
+        let (sender, receiver) = mpsc::channel(8);
+        let clone = sender.clone();
+        let (reply, response) = oneshot::channel();
+        sender
+            .try_send(Request {
+                operation: "PutItem".into(),
+                body: json!({}),
+                reply,
+                deadline: tokio::time::Instant::now() + REQUEST_TIMEOUT,
+                table: None,
+            })
+            .unwrap_or_else(|_| panic!("fixture queue full"));
+        let (stop, stopped) = watch::channel(true);
+        let future = serve_worker(
+            pool.launch.clone(),
+            pool.data.clone(),
+            (scope.0.clone(), scope.1.clone()),
+            pool.key.clone(),
+            pool.budget.clone(),
+            pool.notifier.clone(),
+            (receiver, stopped),
+        );
+        pool.workers
+            .get_mut()
+            .unwrap()
+            .insert(scope.clone(), WorkerTask::spawn(sender, stop, future));
+        pool.stop_worker(&scope).await.unwrap();
+        assert!(response.await.unwrap().unwrap_err().contains("stopped"));
+        assert!(clone.is_closed());
+        let (reply, _) = oneshot::channel();
+        assert!(matches!(
+            clone.try_send(Request {
+                operation: "PutItem".into(),
+                body: json!({}),
+                reply,
+                deadline: tokio::time::Instant::now() + REQUEST_TIMEOUT,
+                table: None,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(pool.worker(&scope.0, &scope.1, None).is_err());
+        assert_eq!(pool.budget.slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_retries_the_same_cleanup_acknowledgement() {
+        let (mut pool, _) = scripted_pool(vec![]);
+        pool.workers.get_mut().unwrap().clear();
+        let scope: WorkerScope = ("000000000000".into(), "us-east-1".into(), None);
+        let (sender, mut requests) = mpsc::channel(8);
+        let (stop, mut stopped) = watch::channel(false);
+        let (release, released) = oneshot::channel();
+        let task = WorkerTask::spawn(sender, stop, async move {
+            stopped.changed().await.map_err(io::Error::other)?;
+            requests.close();
+            released.await.map_err(io::Error::other)?;
+            Ok(())
+        });
+        pool.workers.get_mut().unwrap().insert(scope.clone(), task);
+        let pool = Arc::new(pool);
+        let pending = pool.clone();
+        let pending_scope = scope.clone();
+        let first = tokio::spawn(async move { pending.stop_worker(&pending_scope).await });
+        loop {
+            let stopping = *pool
+                .workers
+                .lock()
+                .unwrap()
+                .get(&scope)
+                .unwrap()
+                .stop
+                .borrow();
+            if stopping {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(pool.worker(&scope.0, &scope.1, None).is_err());
+        let retry_pool = pool.clone();
+        let retry_scope = scope.clone();
+        let retry = tokio::spawn(async move { retry_pool.stop_worker(&retry_scope).await });
+        tokio::task::yield_now().await;
+        assert!(!retry.is_finished());
+        release.send(()).unwrap();
+        retry.await.unwrap().unwrap();
+        assert!(pool
+            .workers
+            .lock()
+            .unwrap()
+            .get(&scope)
+            .unwrap()
+            .task
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_worker_stop_fences_acquisition_without_stopping_another_scope() {
+        let (pool, _) = scripted_pool(vec![("ListTables", (200, json!({"TableNames":[]})))]);
+        let stopped_scope: WorkerScope = ("000000000000".into(), "us-west-2".into(), None);
+        pool.stop_worker(&stopped_scope).await.unwrap();
+        assert!(pool
+            .worker(&stopped_scope.0, &stopped_scope.1, None)
+            .is_err());
+        let (status, _) = pool
+            .query("000000000000", "us-east-1", "ListTables".into(), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        pool.stop_worker(&stopped_scope).await.unwrap();
         pool.shutdown().await;
     }
 

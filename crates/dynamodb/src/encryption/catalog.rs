@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use super::{TableKeyEnvelope, TableKeyScope, TableKeys};
 use crate::error::DdbError;
 
-const MAX_RECORD: usize = 128 * 1024;
+// Keep the previous envelope allowance plus a bounded, complete normalized schema.
+const MAX_CREATE_INTENT: usize = 1024 * 1024;
+const MAX_RECORD: usize = 128 * 1024 + MAX_CREATE_INTENT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilePhase {
@@ -24,6 +26,8 @@ struct FileMetadata {
     envelope: TableKeyEnvelope,
     phase: FilePhase,
     revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    create_intent: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +48,11 @@ impl TableFileRecord {
 
     pub fn phase(&self) -> FilePhase {
         self.0.phase
+    }
+
+    /// Complete normalized CreateTable parameters, absent for legacy reservations.
+    pub fn create_intent(&self) -> Option<&serde_json::Value> {
+        self.0.create_intent.as_ref()
     }
 
     /// File names never contain AWS names or client-provided path segments.
@@ -91,6 +100,27 @@ impl TableCatalog {
         scope: TableKeyScope,
         envelope: TableKeyEnvelope,
     ) -> Result<TableFileRecord, DdbError> {
+        self.reserve_inner(scope, envelope, None).await
+    }
+
+    /// Persist the complete, provider-validated normalized CreateTable parameters before
+    /// mutating the provider. Pass parameters only, never a request or credentials.
+    pub async fn reserve_with_intent(
+        &self,
+        scope: TableKeyScope,
+        envelope: TableKeyEnvelope,
+        intent: serde_json::Value,
+    ) -> Result<TableFileRecord, DdbError> {
+        Self::validate_intent(&scope, &intent)?;
+        self.reserve_inner(scope, envelope, Some(intent)).await
+    }
+
+    async fn reserve_inner(
+        &self,
+        scope: TableKeyScope,
+        envelope: TableKeyEnvelope,
+        create_intent: Option<serde_json::Value>,
+    ) -> Result<TableFileRecord, DdbError> {
         Self::validate_scope(scope.account(), scope.region(), scope.table_name())?;
         self.keys
             .wrapped_key(&scope, &envelope)
@@ -100,6 +130,7 @@ impl TableCatalog {
             envelope,
             phase: FilePhase::Creating,
             revision: 1,
+            create_intent,
         };
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -129,6 +160,7 @@ impl TableCatalog {
 
     /// Bounded recovery inventory, ordered by account, region and table name.
     /// Continue after the last record until a page is empty. Pages are not a snapshot.
+    /// A serialized-byte budget may return fewer rows than the requested limit.
     pub async fn page(
         &self,
         after: Option<&TableFileRecord>,
@@ -162,7 +194,8 @@ impl TableCatalog {
                  CASE WHEN length(CAST(region AS BLOB)) BETWEEN 3 AND 64 THEN region ELSE NULL END,
                  CASE WHEN length(CAST(name AS BLOB)) BETWEEN 3 AND 255 THEN name ELSE NULL END,
                  CASE WHEN length(CAST(storage_id AS BLOB))=36 THEN storage_id ELSE NULL END,
-                 revision, CASE WHEN length(metadata)<=?4 THEN metadata ELSE NULL END
+                 revision, CASE WHEN length(metadata)<=?4 THEN metadata ELSE NULL END,
+                 length(metadata)
                  FROM lc_dynamodb_table_files WHERE (account,region,name){comparison}(?1,?2,?3)
                  ORDER BY account,region,name LIMIT ?5"
             );
@@ -177,13 +210,20 @@ impl TableCatalog {
                 ))
                 .map_err(|_| unavailable())?;
             let mut records = Vec::with_capacity(limit);
+            let mut page_bytes = 0usize;
             while let Some(row) = rows.next().map_err(|_| unavailable())? {
                 let account: String = row.get(0).map_err(|_| unavailable())?;
                 let region: String = row.get(1).map_err(|_| unavailable())?;
                 let name: String = row.get(2).map_err(|_| unavailable())?;
                 let id: String = row.get(3).map_err(|_| unavailable())?;
                 let revision: i64 = row.get(4).map_err(|_| unavailable())?;
+                let sealed_len: i64 = row.get(6).map_err(|_| unavailable())?;
+                let sealed_len = usize::try_from(sealed_len).map_err(|_| unavailable())?;
+                if !records.is_empty() && sealed_len > MAX_RECORD + 1024 - page_bytes {
+                    break;
+                }
                 let sealed: Vec<u8> = row.get(5).map_err(|_| unavailable())?;
+                page_bytes += sealed.len();
                 records.push(this.decode(&account, &region, &name, &id, revision, &sealed)?);
             }
             Ok(records)
@@ -313,6 +353,80 @@ impl TableCatalog {
         crate::store::validate_table_name(name)
     }
 
+    fn validate_intent(scope: &TableKeyScope, intent: &serde_json::Value) -> Result<(), DdbError> {
+        const MEMBERS: &[&str] = &[
+            "AttributeDefinitions",
+            "BillingMode",
+            "DeletionProtectionEnabled",
+            "GlobalSecondaryIndexes",
+            "GlobalTableSettingsReplicationMode",
+            "GlobalTableSourceArn",
+            "KeySchema",
+            "LocalSecondaryIndexes",
+            "OnDemandThroughput",
+            "ProvisionedThroughput",
+            "ResourcePolicy",
+            "StreamSpecification",
+            "TableClass",
+            "TableName",
+            "Tags",
+            "VectorIndexes",
+            "WarmThroughput",
+        ];
+        let object = intent.as_object().ok_or_else(|| {
+            DdbError::Validation("CreateTable intent must be normalized parameters".into())
+        })?;
+        if object
+            .keys()
+            .any(|member| !MEMBERS.contains(&member.as_str()))
+        {
+            return Err(DdbError::Validation(
+                "CreateTable intent contains unsupported parameters".into(),
+            ));
+        }
+        if intent.get("TableName").and_then(serde_json::Value::as_str) != Some(scope.table_name()) {
+            return Err(DdbError::Validation(
+                "CreateTable intent must match the table storage scope".into(),
+            ));
+        }
+        fn bounded_depth(value: &serde_json::Value, depth: usize) -> bool {
+            if depth > 32 {
+                return false;
+            }
+            match value {
+                serde_json::Value::Array(values) => {
+                    values.iter().all(|value| bounded_depth(value, depth + 1))
+                }
+                serde_json::Value::Object(values) => {
+                    values.values().all(|value| bounded_depth(value, depth + 1))
+                }
+                _ => true,
+            }
+        }
+        struct SizeLimit(usize);
+        impl std::io::Write for SizeLimit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > MAX_CREATE_INTENT - self.0 {
+                    return Err(std::io::Error::other(
+                        "CreateTable intent exceeds size limit",
+                    ));
+                }
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        if !bounded_depth(intent, 0) || serde_json::to_writer(SizeLimit(0), intent).is_err() {
+            return Err(DdbError::Validation(
+                "CreateTable intent exceeds catalog size or nesting limits".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn encode(&self, record: &FileMetadata) -> Result<Vec<u8>, DdbError> {
         let bytes = serde_json::to_vec(record).map_err(|_| unavailable())?;
         if bytes.len() > MAX_RECORD {
@@ -370,6 +484,9 @@ impl TableCatalog {
             || record.revision != revision
         {
             return Err(unavailable());
+        }
+        if let Some(intent) = &record.create_intent {
+            Self::validate_intent(&record.scope, intent).map_err(|_| unavailable())?;
         }
         self.keys
             .wrapped_key(&record.scope, &record.envelope)

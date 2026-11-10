@@ -402,12 +402,14 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(material.plaintext.as_slice()),
         );
         let slot = pool.budget.acquire().await.unwrap();
-        let mut seed = Worker::start(
-            pool.launch.clone(),
-            database.clone(),
+        let mut seed = Worker::spawn(pool.launch.clone(), database.clone(), slot, Some(&creating))
+            .await
+            .unwrap();
+        seed.initialize(
+            pool.launch.mode,
+            &database,
             &(ACCOUNT.into(), REGION.into()),
             &encoded,
-            slot,
             Some(&creating),
         )
         .await
@@ -427,7 +429,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         worker_call(&mut seed,"PutItem",json!({"TableName":"encrypted-orders","Item":{"id":{"S":"one"},"value":{"S":"preserved"}}})).await;
-        seed.stop().await;
+        seed.stop().await.unwrap();
+        drop(seed);
         let active = services
             .catalog
             .transition(&creating, FilePhase::Active)
@@ -615,23 +618,44 @@ mod tests {
             .unwrap()
             .unwrap();
         let sender = pool.worker(ACCOUNT, REGION, Some(&stale)).unwrap();
-        services
+        let deleting = services
             .catalog
             .transition(&active, FilePhase::Deleting)
             .await
             .unwrap();
-        let (status, body) = pool
-            .enqueue(sender, "GetItem".into(), get, Some(stale))
+        assert!(matches!(
+            stale.authorize().await,
+            Err(DdbError::ResourceInUse(_))
+        ));
+        let scope = (
+            ACCOUNT.into(),
+            REGION.into(),
+            Some(active.scope().storage_id()),
+        );
+        pool.stop_worker(&scope).await.unwrap();
+        assert!(sender.is_closed());
+        assert!(pool.worker(ACCOUNT, REGION, Some(&stale)).is_err());
+        assert_eq!(pool.budget.slots.available_permits(), 1);
+        // Only after the real child acknowledged exit may its file and catalog identity go.
+        tokio::fs::remove_file(&database).await.unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = database.as_os_str().to_owned();
+            sidecar.push(suffix);
+            match tokio::fs::remove_file(std::path::PathBuf::from(sidecar)).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("fixture sidecar cleanup failed: {error}"),
+            }
+        }
+        services.catalog.forget_deleted(&deleting).await.unwrap();
+        let (status, _) = pool
+            .query(ACCOUNT, REGION, "ListTables".into(), json!({}))
             .await
             .unwrap();
-        assert_eq!(status, 400);
-        assert!(body["__type"]
-            .as_str()
-            .unwrap()
-            .ends_with("#ResourceInUseException"));
+        assert_eq!(status, 200);
         pool.shutdown().await;
         assert_eq!(pool.budget.slots.available_permits(), 1);
         tokio::fs::remove_dir_all(root).await.unwrap();
-        eprintln!("Real table worker: scoped file, warm IAM denial, KMS revocation/recovery, stale queued request rejection and full worker cleanup passed");
+        eprintln!("Real table worker: scoped file, warm IAM denial, KMS revocation/recovery, stale generation rejection and confirmed per-generation cleanup passed");
     }
 }

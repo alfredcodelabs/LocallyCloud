@@ -69,7 +69,7 @@ jobs:
           node tools/architecture-review-mcp/test.mjs
 
   debian:
-    needs: version
+    needs: [version, extenddb]
     strategy:
       fail-fast: false
       matrix:
@@ -130,6 +130,21 @@ jobs:
           export SQLITE3_STATIC=1
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-extenddb-${{ matrix.arch == 'amd64' && 'x86_64' || 'arm64' }}
+          path: components
+      - name: Test the real table worker with packaged SQLite
+        run: |
+          set -o pipefail
+          export SQLITE3_LIB_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4-${{ matrix.arch }}/lib"
+          export SQLITE3_INCLUDE_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4-${{ matrix.arch }}/include"
+          export SQLITE3_STATIC=1
+          worker="$GITHUB_WORKSPACE/components/locallycloud-extenddb-worker-linux-${{ matrix.arch == 'amd64' && 'x86_64' || 'arm64' }}"
+          chmod u+x "$worker"
+          LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud --locked dynamodb_engine::table_storage::tests::actual_table_worker_reauthorizes_warm_access_and_rejects_stale_generations -- --exact --nocapture 2>&1 | tee /tmp/table-storage-test.log
+          grep -Fq 'Real table worker:' /tmp/table-storage-test.log
+          LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud-dynamodb --test table_keys --locked -- --nocapture
       - uses: actions/upload-artifact@v7
         with:
           name: package-debian-${{ matrix.arch }}

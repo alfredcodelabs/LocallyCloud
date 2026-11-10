@@ -319,14 +319,118 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
             Err(DdbError::Validation(_))
         ));
     }
+    // Synthetic payload sizes exercise the catalog's bound independently of provider validation.
+    let mut large_records = Vec::new();
+    for name in ["catalog-large-a", "catalog-large-b"] {
+        let scope = TableKeyScope::new(ACCOUNT, REGION, name, Uuid::new_v4()).unwrap();
+        let key = keys.generate(&scope, caller(), None).await.unwrap();
+        let intent = json!({"TableName":name,"ResourcePolicy":"x".repeat(600 * 1024)});
+        let record = catalog
+            .reserve_with_intent(scope, key.envelope, intent.clone())
+            .await
+            .unwrap();
+        assert_eq!(record.create_intent(), Some(&intent));
+        large_records.push(record);
+    }
+    let first = catalog.page(None, 100).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].scope().table_name(), "catalog-large-a");
+    let second = catalog.page(first.last(), 100).await.unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].create_intent(), large_records[1].create_intent());
+    assert!(catalog.page(second.last(), 100).await.unwrap().is_empty());
+    let db = state.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        let conn = db.connection().unwrap();
+        let saved: Vec<u8> = conn
+            .query_row(
+                "SELECT metadata FROM lc_dynamodb_table_files WHERE name='catalog-large-b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut corrupt = saved.clone();
+        corrupt[0] ^= 1;
+        conn.execute(
+            "UPDATE lc_dynamodb_table_files SET metadata=?1 WHERE name='catalog-large-b'",
+            [corrupt],
+        )
+        .unwrap();
+        saved
+    })
+    .await
+    .unwrap();
+    let first = catalog.page(None, 100).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(matches!(
+        catalog.page(first.last(), 100).await,
+        Err(DdbError::Internal(_))
+    ));
+    let db = state.clone();
+    tokio::task::spawn_blocking(move || {
+        db.connection()
+            .unwrap()
+            .execute(
+                "UPDATE lc_dynamodb_table_files SET metadata=?1 WHERE name='catalog-large-b'",
+                [saved],
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    for record in large_records {
+        let deleting = catalog
+            .transition(&record, FilePhase::Deleting)
+            .await
+            .unwrap();
+        catalog.forget_deleted(&deleting).await.unwrap();
+    }
     let scope = TableKeyScope::new(ACCOUNT, REGION, "catalog-orders", Uuid::new_v4()).unwrap();
     let key = keys.generate(&scope, caller(), None).await.unwrap();
     let competitor = TableKeyScope::new(ACCOUNT, REGION, "catalog-orders", Uuid::new_v4()).unwrap();
     let competitor_key = keys.generate(&competitor, caller(), None).await.unwrap();
+    let intent = json!({
+        "TableName":"catalog-orders",
+        "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        "BillingMode":"PAY_PER_REQUEST",
+        "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"},
+        "Tags":[{"Key":"owner","Value":"durable-create-intent-marker"}],
+        "DeletionProtectionEnabled":true
+    });
+    // Rejected intent must leave no reservation, even with an otherwise valid envelope.
+    let mut wrong = intent.clone();
+    wrong["TableName"] = json!("another-table");
+    let mut oversized = intent.clone();
+    oversized["Tags"][0]["Value"] = json!("x".repeat(1024 * 1024));
+    let mut nested = json!(null);
+    for _ in 0..34 {
+        nested = json!([nested]);
+    }
+    let mut too_deep = intent.clone();
+    too_deep["Tags"] = nested;
+    let mut raw_request = intent.clone();
+    raw_request["headers"] = json!({"authorization":"must-not-be-persisted"});
+    let mut sse = intent.clone();
+    sse["SSESpecification"] = json!({"Enabled":true});
+    for invalid in [json!(null), wrong, oversized, too_deep, raw_request, sse] {
+        assert!(matches!(
+            catalog
+                .reserve_with_intent(scope.clone(), key.envelope.clone(), invalid)
+                .await,
+            Err(DdbError::Validation(_))
+        ));
+        assert!(catalog
+            .load(ACCOUNT, REGION, "catalog-orders")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(catalog.page(None, 1).await.unwrap().is_empty());
+    }
     // Competing creates with different files and keys must elect exactly one owner.
     let (a, b) = tokio::join!(
-        catalog.reserve(scope.clone(), key.envelope.clone()),
-        catalog.reserve(competitor, competitor_key.envelope.clone())
+        catalog.reserve_with_intent(scope.clone(), key.envelope.clone(), intent.clone()),
+        catalog.reserve_with_intent(competitor, competitor_key.envelope.clone(), intent.clone())
     );
     let (creating, expected_key) = match (a, b) {
         (Ok(record), Err(DdbError::ResourceInUse(_))) => (record, &key.plaintext),
@@ -334,6 +438,7 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
         other => panic!("unexpected reservation results: {other:?}"),
     };
     assert_eq!(creating.phase(), FilePhase::Creating);
+    assert_eq!(creating.create_intent(), Some(&intent));
     let mut invalid_scope = serde_json::to_value(creating.scope()).unwrap();
     invalid_scope["storage_id"] = json!(Uuid::nil().to_string());
     assert!(serde_json::from_value::<TableKeyScope>(invalid_scope).is_err());
@@ -351,6 +456,11 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
         .unwrap()
         .unwrap();
     assert_eq!(loaded.phase(), FilePhase::Creating);
+    assert_eq!(loaded.create_intent(), Some(&intent));
+    assert_eq!(
+        catalog.page(None, 1).await.unwrap()[0].create_intent(),
+        Some(&intent)
+    );
     assert_eq!(
         keys.open(loaded.scope(), caller(), loaded.envelope())
             .await
@@ -362,6 +472,7 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
         .transition(&loaded, FilePhase::Active)
         .await
         .unwrap();
+    assert_eq!(active.create_intent(), Some(&intent));
     assert!(matches!(
         catalog.transition(&creating, FilePhase::Deleting).await,
         Err(DdbError::ResourceInUse(_))
@@ -391,6 +502,8 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
                 |r| r.get(0),
             )
             .unwrap();
+        let marker = b"durable-create-intent-marker";
+        assert!(!saved.windows(marker.len()).any(|bytes| bytes == marker));
         conn.execute(
             "UPDATE lc_dynamodb_table_files SET revision=revision+1 WHERE name='catalog-orders'",
             [],
@@ -447,6 +560,14 @@ async fn catalog_recovery(registry: &Arc<ServiceRegistry>, state: Arc<StateDb>) 
         .await
         .unwrap();
     assert_ne!(fresh.file_name(), creating.file_name());
+    assert!(fresh.create_intent().is_none());
+    assert!(catalog
+        .load(ACCOUNT, REGION, "catalog-orders")
+        .await
+        .unwrap()
+        .unwrap()
+        .create_intent()
+        .is_none());
     assert!(matches!(
         catalog.forget_deleted(&deleting).await,
         Err(DdbError::ResourceInUse(_))
