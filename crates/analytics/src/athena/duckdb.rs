@@ -200,14 +200,7 @@ impl DuckDbEngine {
         ensure_running(record)?;
         let mut command = tokio::process::Command::new(&self.executable);
         command
-            .args([
-                "-no-init",
-                "-no-agent",
-                "-bail",
-                "-batch",
-                "-json",
-                ":memory:",
-            ])
+            .args(["-no-init", "-bail", "-batch", "-json", ":memory:"])
             .env_clear()
             .current_dir(work)
             .stdin(Stdio::piped())
@@ -698,6 +691,55 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn real_cli_keeps_explicit_json_compatible_with_duckdb_1_5() {
+        let Some(executable) = std::env::var_os("LOCALLYCLOUD_TEST_DUCKDB_BIN") else {
+            eprintln!("Set LOCALLYCLOUD_TEST_DUCKDB_BIN to validate the real DuckDB CLI");
+            return;
+        };
+        let work = std::env::temp_dir().join(format!("duckdb-cli-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&work).await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let record = Arc::new(Mutex::new(QueryRecord {
+            id: "cli-compatibility".into(),
+            spec: QuerySpec {
+                query_string: "SELECT 1 AS ok".into(),
+                context: None,
+                result_configuration: ResultConfiguration {
+                    output_location: "s3://results/cli/".into(),
+                },
+                work_group: None,
+            },
+            effective_output_location: S3Location {
+                bucket: "results".into(),
+                key: "cli/result.csv".into(),
+            },
+            state: QueryState::Running,
+            submission_time: 0.0,
+            completion_time: None,
+            reason: None,
+            scanned_bytes: 0,
+            result: None,
+            result_token: "cli-result".into(),
+            caller: None,
+        }));
+        let engine = DuckDbEngine::new(executable.into(), work.join("extensions"), work.clone());
+        let result = engine
+            .execute(&work, "SET threads=2; SELECT 1 AS ok;\n", &record, 0)
+            .await;
+        tokio::fs::remove_dir_all(&work).await.unwrap();
+        let result = match result {
+            Ok(value) => value,
+            Err(WorkerFailure::Failed { reason, .. }) => panic!("DuckDB CLI failed: {reason}"),
+            Err(WorkerFailure::Cancelled) => panic!("DuckDB CLI fixture was cancelled"),
+        };
+        assert_eq!(result, serde_json::json!([{"ok": 1}]));
+        eprintln!("Real DuckDB CLI: JSON compatibility passed");
+    }
 
     #[test]
     fn trusted_ast_rendering_preserves_values_and_rejects_client_commands() {

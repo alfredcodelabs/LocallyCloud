@@ -158,6 +158,29 @@ impl StateDb {
         Ok(file)
     }
 
+    /// Keep the lease until every task accessing the service directory has finished.
+    /// Locking the directory inode also covers aliases without a removable lockfile.
+    pub fn lock_directory(path: &Path) -> Result<std::fs::File, StateError> {
+        Self::private_dir(path)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = directory.metadata()?;
+        // SAFETY: geteuid has no arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != uid
+        {
+            return Err(StateError::InsecureDirectory(path.to_path_buf()));
+        }
+        directory.try_lock().map_err(|error| {
+            std::io::Error::other(format!(
+                "cannot acquire exclusive data directory lock; stop the other instance or configure a different data directory: {error}"
+            ))
+        })?;
+        Ok(directory)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -166,6 +189,49 @@ impl StateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_lease_is_exclusive_across_aliases_and_released_on_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "state-dir-lease-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = StateDb::lock_directory(&root).unwrap();
+        assert!(StateDb::lock_directory(&root).is_err());
+        assert!(StateDb::lock_directory(&root.join(".")).is_err());
+        let other = root.join("independent");
+        let separate = StateDb::lock_directory(&other).unwrap();
+        drop(first);
+        let reopened = StateDb::lock_directory(&root).unwrap();
+        drop(reopened);
+        drop(separate);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_lease_rejects_symlinks_and_shared_permissions() {
+        let root = std::env::temp_dir().join(format!(
+            "state-dir-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        StateDb::private_dir(&root).unwrap();
+        let target = root.join("target");
+        StateDb::private_dir(&target).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(StateDb::lock_directory(&link).is_err());
+        fs::set_permissions(&target, Permissions::from_mode(0o755)).unwrap();
+        assert!(StateDb::lock_directory(&target).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn runtime_lock_excludes_another_owner_and_releases_on_drop() {

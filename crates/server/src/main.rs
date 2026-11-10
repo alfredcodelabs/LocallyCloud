@@ -766,7 +766,13 @@ async fn main() {
         tracing::error!(error = %error, "failed to register CloudWatch Logs");
         std::process::exit(4);
     }
-    let rds = match locallycloud_rds::register(&registry) {
+    let rds_registry = registry.clone();
+    let rds_registration =
+        tokio::task::spawn_blocking(move || locallycloud_rds::register(&rds_registry))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+    let rds = match rds_registration {
         Ok(rds) => rds,
         Err(error) => {
             tracing::error!(%error, "failed to register RDS");

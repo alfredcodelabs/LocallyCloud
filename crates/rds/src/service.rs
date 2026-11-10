@@ -116,6 +116,7 @@ struct Snapshot {
 
 pub struct RdsHandler {
     root: PathBuf,
+    root_lease: Arc<std::fs::File>,
     instances: Arc<Mutex<HashMap<Key, Instance>>>,
     snapshots: Arc<Mutex<HashMap<Key, Snapshot>>>,
     clusters: Arc<Mutex<HashMap<Key, Cluster>>>,
@@ -157,7 +158,8 @@ impl RdsHandler {
         })
     }
 
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf) -> Result<Self, locallycloud_state::StateError> {
+        let root_lease = Arc::new(locallycloud_state::StateDb::lock_directory(&root)?);
         let mut instances = HashMap::new();
         let mut snapshots = HashMap::new();
         let mut clusters = HashMap::new();
@@ -326,8 +328,9 @@ impl RdsHandler {
             }
         }
         let subnet_groups = load_subnet_groups(&root);
-        Self {
+        Ok(Self {
             root,
+            root_lease,
             instances: Arc::new(Mutex::new(instances)),
             snapshots: Arc::new(Mutex::new(snapshots)),
             clusters: Arc::new(Mutex::new(clusters)),
@@ -335,7 +338,17 @@ impl RdsHandler {
             network_leases: Arc::new(Mutex::new(HashMap::new())),
             ec2: RwLock::new(None),
             jobs: Mutex::new(Vec::new()),
-        }
+        })
+    }
+
+    async fn spawn_job(&self, job: impl std::future::Future<Output = ()> + Send + 'static) {
+        let root_lease = self.root_lease.clone();
+        let mut jobs = self.jobs.lock().await;
+        jobs.retain(|job| !job.is_finished());
+        jobs.push(tokio::spawn(async move {
+            let _root_lease = root_lease;
+            job.await;
+        }));
     }
 
     pub async fn attach_ec2(&self, ec2: Arc<Ec2Handler>) {
@@ -902,9 +915,7 @@ impl RdsHandler {
         drop(clusters);
         let response = format!("<DBInstance>{}</DBInstance>", instance_xml(&instance));
         let state = self.instances.clone();
-        let mut jobs = self.jobs.lock().await;
-        jobs.retain(|job| !job.is_finished());
-        jobs.push(tokio::spawn(async move {
+        self.spawn_job(async move {
             let result = if retained_data {
                 reopen_cluster_writer(&runtime, &cluster_dir, &directory, &instance).await
             } else {
@@ -938,7 +949,8 @@ impl RdsHandler {
                 }
             }
             state.lock().await.insert(key, completed);
-        }));
+        })
+        .await;
         Ok(response)
     }
 
@@ -1128,9 +1140,7 @@ impl RdsHandler {
         let state = self.instances.clone();
         let response = format!("<DBInstance>{}</DBInstance>", instance_xml(&instance));
         let password = password.to_owned();
-        let mut jobs = self.jobs.lock().await;
-        jobs.retain(|job| !job.is_finished());
-        jobs.push(tokio::spawn(async move {
+        self.spawn_job(async move {
             let result = provision(&runtime, &directory, &instance, &password).await;
             let mut completed = instance;
             match result {
@@ -1172,7 +1182,8 @@ impl RdsHandler {
                 network_leases.lock().await.remove(&key);
             }
             state.lock().await.insert(key, completed);
-        }));
+        })
+        .await;
         Ok(response)
     }
 
@@ -1254,9 +1265,7 @@ impl RdsHandler {
         }
         let state = self.instances.clone();
         let response = format!("<DBInstance>{}</DBInstance>", instance_xml(&instance));
-        let mut jobs = self.jobs.lock().await;
-        jobs.retain(|job| !job.is_finished());
-        jobs.push(tokio::spawn(async move {
+        self.spawn_job(async move {
             let result = provision_replica(&runtime, &source, &directory, &instance).await;
             let mut completed = instance;
             match result {
@@ -1278,7 +1287,8 @@ impl RdsHandler {
                 }
             }
             state.lock().await.insert(key, completed);
-        }));
+        })
+        .await;
         Ok(response)
     }
 
@@ -1682,9 +1692,7 @@ impl RdsHandler {
         let response = format!("<DBSnapshot>{}</DBSnapshot>", snapshot_xml(&snapshot));
         let instances = self.instances.clone();
         let snapshots = self.snapshots.clone();
-        let mut jobs = self.jobs.lock().await;
-        jobs.retain(|job| !job.is_finished());
-        jobs.push(tokio::spawn(async move {
+        self.spawn_job(async move {
             let result = backup_snapshot(&runtime, &source, &source_dir, &target_dir).await;
             let mut completed = snapshot;
             match result {
@@ -1714,7 +1722,8 @@ impl RdsHandler {
             .to_owned();
             let _ = persist(&source_dir, &source_status).await;
             instances.lock().await.insert(source_key, source_status);
-        }));
+        })
+        .await;
         Ok(response)
     }
 
@@ -1892,9 +1901,7 @@ impl RdsHandler {
         let instances = self.instances.clone();
         let snapshots = self.snapshots.clone();
         let snapshot_dir = self.snapshot_directory(&snapshot);
-        let mut jobs = self.jobs.lock().await;
-        jobs.retain(|job| !job.is_finished());
-        jobs.push(tokio::spawn(async move {
+        self.spawn_job(async move {
             let result = restore(&runtime, &snapshot_dir, &directory, &instance).await;
             let mut completed = instance;
             match result {
@@ -1922,7 +1929,8 @@ impl RdsHandler {
             if let Some(current) = snapshots.lock().await.get_mut(&snapshot_key) {
                 current.status = "available".to_owned();
             }
-        }));
+        })
+        .await;
         Ok(response)
     }
 
@@ -2180,8 +2188,7 @@ pub fn register(
         }
         None => locallycloud_state::StateDb::data_dir()?.join("rds"),
     };
-    locallycloud_state::StateDb::private_dir(&root)?;
-    let handler = Arc::new(RdsHandler::new(root));
+    let handler = Arc::new(RdsHandler::new(root)?);
     let mut metadata = ServiceMetadata::new(AwsProtocol::Query, None);
     metadata.known_actions = [
         "CreateDBCluster",
@@ -3035,6 +3042,100 @@ impl Error {
 }
 
 #[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_job_keeps_ownership_after_handler_is_dropped() {
+        let root = std::env::temp_dir().join(format!("rds-job-lease-{}", uuid::Uuid::new_v4()));
+        let opening = root.clone();
+        let owner = tokio::task::spawn_blocking(move || RdsHandler::new(opening))
+            .await
+            .unwrap()
+            .unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        owner
+            .spawn_job(async move {
+                wait.await.unwrap();
+            })
+            .await;
+        let job = owner.jobs.lock().await.pop().unwrap();
+        drop(owner);
+        let opening = root.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || RdsHandler::new(opening))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        release.send(()).unwrap();
+        job.await.unwrap();
+        let opening = root.clone();
+        let reopened = tokio::task::spawn_blocking(move || RdsHandler::new(opening))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(reopened);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn second_owner_cannot_discard_an_active_snapshot() {
+        let root = std::env::temp_dir().join(format!("rds-ownership-{}", uuid::Uuid::new_v4()));
+        let owner = RdsHandler::new(root.clone()).unwrap();
+        let snapshot = Snapshot {
+            id: "active-snapshot".into(),
+            source: Instance {
+                id: "source".into(),
+                account: "000000000000".into(),
+                region: "us-east-1".into(),
+                username: "app".into(),
+                db_name: "app".into(),
+                class: "db.t3.micro".into(),
+                storage: 20,
+                port: 12345,
+                status: "available".into(),
+                error: None,
+                replica_source: None,
+                cluster_id: None,
+                vpc: None,
+                socket_token: new_socket_token(),
+                dbi_resource_id: new_dbi_resource_id(),
+            },
+            status: "creating".into(),
+            error: None,
+        };
+        let directory = owner.snapshot_directory(&snapshot);
+        let partial = directory.join("data.tmp-live").join("chunk");
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        std::fs::write(&partial, b"live snapshot bytes").unwrap();
+        let metadata = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(directory.join("snapshot.json"), &metadata).unwrap();
+
+        let second = RdsHandler::new(root.clone());
+        assert!(second.is_err());
+        assert!(
+            partial.exists(),
+            "second startup deleted another owner's active snapshot"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("snapshot.json")).unwrap(),
+            metadata
+        );
+        drop(second);
+        drop(owner);
+        let recovered = RdsHandler::new(root.clone()).unwrap();
+        assert!(!partial.exists());
+        let saved: Snapshot =
+            serde_json::from_slice(&std::fs::read(directory.join("snapshot.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.status, "failed");
+        drop(recovered);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod aurora_class_tests {
     use super::*;
     use axum::body::to_bytes;
@@ -3057,7 +3158,7 @@ mod aurora_class_tests {
     async fn rejected_aurora_classes_return_query_errors_without_resources() {
         let root =
             std::env::temp_dir().join(format!("locallycloud-rds-class-{}", uuid::Uuid::new_v4()));
-        let handler = RdsHandler::new(root.clone());
+        let handler = RdsHandler::new(root.clone()).unwrap();
         for (class, code, message) in [
             ("", "MissingParameter", "Missing DBInstanceClass"),
             (
@@ -3094,8 +3195,11 @@ mod aurora_class_tests {
             assert!(body.contains("aurora-class-contract"), "{body}");
             assert!(handler.instances.lock().await.is_empty());
             assert!(handler.clusters.lock().await.is_empty());
-            assert!(!tokio::fs::try_exists(&root).await.unwrap());
+            let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+            assert!(entries.next_entry().await.unwrap().is_none());
         }
+        drop(handler);
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]
@@ -3105,7 +3209,7 @@ mod aurora_class_tests {
         }
         let root =
             std::env::temp_dir().join(format!("locallycloud-rds-medium-{}", uuid::Uuid::new_v4()));
-        let handler = RdsHandler::new(root.clone());
+        let handler = RdsHandler::new(root.clone()).unwrap();
         let response = handler
             .handle(request("&DBInstanceClass=db.t3.medium"))
             .await;
@@ -3171,7 +3275,7 @@ mod replica_tests {
         };
         let root =
             std::env::temp_dir().join(format!("locallycloud-rds-restart-{}", uuid::Uuid::new_v4()));
-        let handler = RdsHandler::new(root.clone());
+        let handler = RdsHandler::new(root.clone()).unwrap();
         let req = ServiceRequest {
             method: Method::POST,
             uri: Uri::from_static("/"),
@@ -3221,7 +3325,7 @@ mod replica_tests {
         assert!(!tokio::fs::try_exists(socket_dir(&writer)).await.unwrap());
         drop(handler);
 
-        let restored = RdsHandler::new(root.clone());
+        let restored = RdsHandler::new(root.clone()).unwrap();
         let endpoint = restored
             .resolve_cluster(
                 &req.account_id,
@@ -3266,7 +3370,7 @@ mod replica_tests {
             "lcr-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let handler = RdsHandler::new(root.clone());
+        let handler = RdsHandler::new(root.clone()).unwrap();
         let req = ServiceRequest {
             method: Method::POST,
             uri: Uri::from_static("/"),
@@ -3419,7 +3523,7 @@ mod vpc_tests {
             .join(format!("lcr-deep-{}", uuid::Uuid::new_v4()))
             .join("x".repeat(90))
             .join("y".repeat(90));
-        let handler = RdsHandler::new(root.clone());
+        let handler = RdsHandler::new(root.clone()).unwrap();
         let instance = Instance {
             id: "orders-db".to_owned(),
             account: "000000000000".to_owned(),
@@ -3498,7 +3602,7 @@ mod vpc_tests {
         let subnet_b = call_ec2(&ec2, format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.42.2.0%2F24&AvailabilityZone=us-east-1b")).await;
         let a = xml_value(&subnet_a, "subnetId");
         let b = xml_value(&subnet_b, "subnetId");
-        let handler = RdsHandler::new(root.clone());
+        let handler = RdsHandler::new(root.clone()).unwrap();
         handler.attach_ec2(ec2.clone()).await;
         let invalid = handler.handle(request(format!("Action=CreateDBSubnetGroup&DBSubnetGroupName=orders&DBSubnetGroupDescription=orders&SubnetIds.member.1={a}"))).await;
         assert_eq!(invalid.status(), 400);
@@ -3530,7 +3634,8 @@ mod vpc_tests {
         assert!(body.contains("<TagList/>") && body.contains("<ListTagsForResourceResult>"));
         let foreign = handler.handle(request("Action=ListTagsForResource&ResourceName=arn:aws:rds:us-west-2:000000000000:subgrp:orders".to_owned())).await;
         assert_eq!(foreign.status(), 400);
-        let restarted = RdsHandler::new(root.clone());
+        drop(handler);
+        let restarted = RdsHandler::new(root.clone()).unwrap();
         let described = restarted
             .handle(request(
                 "Action=DescribeDBSubnetGroups&DBSubnetGroupName=orders".to_owned(),
@@ -3564,7 +3669,7 @@ mod inventory_tests {
             "locallycloud-rds-inventory-{}",
             uuid::Uuid::new_v4()
         ));
-        let handler = RdsHandler::new(root.clone());
+        let handler = RdsHandler::new(root.clone()).unwrap();
         let request = ServiceRequest {
             method: axum::http::Method::POST,
             uri: "/".parse().unwrap(),
