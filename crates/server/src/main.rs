@@ -779,6 +779,10 @@ async fn main() {
             std::process::exit(4);
         }
     };
+    if let Err(error) = rds.recover_runtime().await {
+        tracing::error!(%error,"RDS runtime recovery failed; data retained");
+        std::process::exit(4);
+    }
     rds.attach_ec2(ec2.clone()).await;
     let cluster_resolver = {
         let rds = rds.clone();

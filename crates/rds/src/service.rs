@@ -3,6 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+#[cfg(test)]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,10 +14,14 @@ use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use locallycloud_ec2::{Ec2Handler, TaskNetworkLease};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::runtime::{self, PostgresRuntime};
+#[path = "oci.rs"]
+mod oci;
+use oci::{Command as DatabaseCommand, Engine as OciEngine, Runtime as DatabaseRuntime};
 
 const XMLNS: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
 type Key = (String, String, String);
@@ -117,6 +122,8 @@ struct Snapshot {
 pub struct RdsHandler {
     root: PathBuf,
     root_lease: Arc<std::fs::File>,
+    engine: Arc<OciEngine>,
+    host_override: Option<PostgresRuntime>,
     instances: Arc<Mutex<HashMap<Key, Instance>>>,
     snapshots: Arc<Mutex<HashMap<Key, Snapshot>>>,
     clusters: Arc<Mutex<HashMap<Key, Cluster>>>,
@@ -160,6 +167,7 @@ impl RdsHandler {
 
     pub fn new(root: PathBuf) -> Result<Self, locallycloud_state::StateError> {
         let root_lease = Arc::new(locallycloud_state::StateDb::lock_directory(&root)?);
+        let pending_oci = oci::pending(&root);
         let mut instances = HashMap::new();
         let mut snapshots = HashMap::new();
         let mut clusters = HashMap::new();
@@ -271,15 +279,20 @@ impl RdsHandler {
                                                     serialized,
                                                 );
                                             }
-                                            if let Ok(partials) = std::fs::read_dir(entry.path()) {
-                                                for partial in partials.flatten() {
-                                                    if partial
-                                                        .file_name()
-                                                        .to_string_lossy()
-                                                        .starts_with("data.tmp-")
-                                                    {
-                                                        let _ =
-                                                            std::fs::remove_dir_all(partial.path());
+                                            if !pending_oci {
+                                                if let Ok(partials) =
+                                                    std::fs::read_dir(entry.path())
+                                                {
+                                                    for partial in partials.flatten() {
+                                                        if partial
+                                                            .file_name()
+                                                            .to_string_lossy()
+                                                            .starts_with("data.tmp-")
+                                                        {
+                                                            let _ = std::fs::remove_dir_all(
+                                                                partial.path(),
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -328,8 +341,11 @@ impl RdsHandler {
             }
         }
         let subnet_groups = load_subnet_groups(&root);
+        let engine = Arc::new(OciEngine::new(root.clone(), root_lease.clone()));
         Ok(Self {
             root,
+            engine,
+            host_override: None,
             root_lease,
             instances: Arc::new(Mutex::new(instances)),
             snapshots: Arc::new(Mutex::new(snapshots)),
@@ -339,6 +355,32 @@ impl RdsHandler {
             ec2: RwLock::new(None),
             jobs: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn with_postgres(
+        root: PathBuf,
+        runtime: PostgresRuntime,
+    ) -> Result<Self, locallycloud_state::StateError> {
+        let mut handler = Self::new(root)?;
+        handler.host_override = Some(runtime);
+        Ok(handler)
+    }
+
+    pub async fn recover_runtime(&self) -> Result<(), String> {
+        self.engine.ensure_recovered().await
+    }
+
+    async fn resolve_runtime(&self) -> Result<DatabaseRuntime, String> {
+        if let Some(runtime) = &self.host_override {
+            return Ok(DatabaseRuntime::Host(runtime.clone()));
+        }
+        if std::env::var_os("LOCALLYCLOUD_PG_BIN_DIR").is_some() {
+            return runtime::resolve_from_env()
+                .await
+                .map(DatabaseRuntime::Host)
+                .map_err(|e| e.to_string());
+        }
+        Ok(DatabaseRuntime::Oci(self.engine.clone()))
     }
 
     async fn spawn_job(&self, job: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -822,9 +864,11 @@ impl RdsHandler {
             cluster_id.to_owned(),
         );
         let key = (req.account_id.clone(), req.region.clone(), id.to_owned());
-        let runtime = runtime::resolve_from_env()
+        let runtime = self
+            .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
+        runtime.prepare().await.map_err(Error::internal)?;
         let mut clusters = self.clusters.lock().await;
         let cluster = clusters
             .get_mut(&cluster_key)
@@ -1084,9 +1128,11 @@ impl RdsHandler {
                 "VpcSecurityGroupIds requires DBSubnetGroupName",
             ));
         }
-        let runtime = runtime::resolve_from_env()
+        let runtime = self
+            .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
+        runtime.prepare().await.map_err(Error::internal)?;
         validate_scope(&req.account_id, &req.region)?;
         let key = (req.account_id.clone(), req.region.clone(), id.to_owned());
         let port = free_port().await.map_err(Error::internal)?;
@@ -1214,9 +1260,11 @@ impl RdsHandler {
             source_id.to_owned(),
         );
         let key = (req.account_id.clone(), req.region.clone(), id.to_owned());
-        let runtime = runtime::resolve_from_env()
+        let runtime = self
+            .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
+        runtime.prepare().await.map_err(Error::internal)?;
         let port = free_port().await.map_err(Error::internal)?;
         let (instance, source) = {
             let mut state = self.instances.lock().await;
@@ -1309,7 +1357,8 @@ impl RdsHandler {
                 400,
             ));
         }
-        let runtime = runtime::resolve_from_env()
+        let runtime = self
+            .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
         let directory = self.directory(&instance);
@@ -1352,7 +1401,7 @@ impl RdsHandler {
             return Some(instance.clone());
         }
         let directory = self.directory(instance);
-        let result = match runtime::resolve_from_env().await {
+        let result = match self.resolve_runtime().await {
             Ok(runtime) if instance.status == "restarting" => {
                 start_and_probe(&runtime, &directory, instance, None)
                     .await
@@ -1497,7 +1546,7 @@ impl RdsHandler {
             current.status = "deleting".to_owned();
             original
         };
-        let runtime = match runtime::resolve_from_env().await {
+        let runtime = match self.resolve_runtime().await {
             Ok(runtime) => runtime,
             Err(error) => {
                 self.instances.lock().await.insert(key.clone(), instance);
@@ -1510,6 +1559,12 @@ impl RdsHandler {
             self.instances.lock().await.insert(key.clone(), instance);
             return Err(Error::internal(format!(
                 "Unable to stop PostgreSQL safely: {reason}"
+            )));
+        }
+        if let Err(reason) = runtime.quiesce(&directory).await {
+            self.instances.lock().await.insert(key.clone(), instance);
+            return Err(Error::internal(format!(
+                "RDS tool cleanup is not confirmed; data retained: {reason}"
             )));
         }
         if let Some(cluster_id) = &instance.cluster_id {
@@ -1601,7 +1656,8 @@ impl RdsHandler {
             source_id.to_owned(),
         );
         let snapshot_key = (req.account_id.clone(), req.region.clone(), id.to_owned());
-        let runtime = runtime::resolve_from_env()
+        let runtime = self
+            .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
         let source = {
@@ -1761,7 +1817,14 @@ impl RdsHandler {
             current.status = "deleting".to_owned();
             snapshot
         };
-        if let Err(error) = tokio::fs::remove_dir_all(self.snapshot_directory(&snapshot)).await {
+        let directory = self.snapshot_directory(&snapshot);
+        if let Err(error) = self.engine.recover(Some(&directory)).await {
+            self.snapshots.lock().await.insert(key, snapshot);
+            return Err(Error::internal(format!(
+                "RDS snapshot cleanup is not confirmed; data retained: {error}"
+            )));
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(directory).await {
             self.snapshots.lock().await.insert(key, snapshot);
             return Err(Error::internal(error.to_string()));
         }
@@ -1815,9 +1878,11 @@ impl RdsHandler {
         if class != "db.t3.micro" {
             return Err(Error::invalid("Only db.t3.micro is supported"));
         }
-        let runtime = runtime::resolve_from_env()
+        let runtime = self
+            .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
+        runtime.prepare().await.map_err(Error::internal)?;
         let key = (req.account_id.clone(), req.region.clone(), id.to_owned());
         let mut instance = snapshot.source.clone();
         instance.id = id.to_owned();
@@ -2025,7 +2090,7 @@ impl RdsHandler {
         for instance in &instances {
             let _ = tokio::fs::remove_file(self.directory(instance).join("password")).await;
         }
-        if let Ok(runtime) = runtime::resolve_from_env().await {
+        if let Ok(runtime) = self.resolve_runtime().await {
             for instance in &instances {
                 let data = self.directory(instance).join("data");
                 let _ = command(
@@ -2035,6 +2100,10 @@ impl RdsHandler {
                 )
                 .await;
             }
+        }
+        if let Err(error) = self.engine.recover(None).await {
+            eprintln!("RDS OCI cleanup is not confirmed; data retained: {error}");
+            return;
         }
         for instance in &instances {
             let _ = cleanup_socket_dir(instance).await;
@@ -2111,6 +2180,12 @@ impl NativeHandler for RdsHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
+        if let Err(error) = self.recover_runtime().await {
+            return Error::internal(format!(
+                "RDS runtime recovery failed; data retained: {error}"
+            ))
+            .response(&request.request_id);
+        }
         let input = Input::parse(&request);
         let action = input.get("Action").unwrap_or("Unknown");
         let result = match action {
@@ -2196,14 +2271,14 @@ pub fn register(
 }
 
 async fn backup_snapshot(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     source: &Instance,
     source_dir: &Path,
     target_dir: &Path,
 ) -> Result<(), String> {
     probe(runtime, source_dir, source).await?;
     let temporary = target_dir.join(format!("data.tmp-{}", uuid::Uuid::new_v4()));
-    let mut cmd = Command::new(runtime.bin_dir.join("pg_basebackup"));
+    let mut cmd = runtime.command("pg_basebackup");
     cmd.args([
         "-h",
         &socket_dir(source).to_string_lossy(),
@@ -2218,6 +2293,10 @@ async fn backup_snapshot(
         "--checkpoint=fast",
     ]);
     if let Err(reason) = execute(cmd).await {
+        runtime
+            .quiesce(target_dir)
+            .await
+            .map_err(|error| format!("{reason}; backup data retained: {error}"))?;
         let _ = tokio::fs::remove_dir_all(&temporary).await;
         return Err(reason);
     }
@@ -2238,7 +2317,7 @@ async fn persist_snapshot(directory: &Path, snapshot: &Snapshot) -> Result<(), S
 }
 
 async fn restore(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     snapshot: &Path,
     directory: &Path,
     instance: &Instance,
@@ -2316,7 +2395,7 @@ fn snapshot_xml(snapshot: &Snapshot) -> String {
 }
 
 async fn reopen_cluster_writer(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     cluster_dir: &Path,
     directory: &Path,
     instance: &Instance,
@@ -2344,7 +2423,7 @@ async fn reopen_cluster_writer(
 }
 
 async fn provision(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     directory: &Path,
     instance: &Instance,
     password: &str,
@@ -2429,14 +2508,14 @@ async fn provision(
 }
 
 async fn provision_replica(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     source: &Instance,
     directory: &Path,
     instance: &Instance,
 ) -> Result<(), String> {
     let socket = prepare_socket_dir(instance).await?;
     let data = directory.join("data");
-    let mut cmd = Command::new(runtime.bin_dir.join("pg_basebackup"));
+    let mut cmd = runtime.command("pg_basebackup");
     cmd.args([
         "-h",
         &socket_dir(source).to_string_lossy(),
@@ -2478,12 +2557,12 @@ async fn provision_replica(
 }
 
 async fn sql_query(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     instance: &Instance,
     sql: &str,
     _directory: &Path,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(runtime.bin_dir.join("psql"));
+    let mut cmd = runtime.command("psql");
     cmd.args([
         "-X",
         "-A",
@@ -2505,7 +2584,7 @@ async fn sql_query(
 }
 
 async fn start_and_probe(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     directory: &Path,
     instance: &Instance,
     password: Option<&str>,
@@ -2537,7 +2616,7 @@ async fn start_and_probe(
 }
 
 async fn probe(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     directory: &Path,
     instance: &Instance,
 ) -> Result<(), String> {
@@ -2559,7 +2638,7 @@ async fn probe(
     .await
 }
 
-async fn postgres_running(runtime: &PostgresRuntime, directory: &Path) -> Result<bool, String> {
+async fn postgres_running(runtime: &DatabaseRuntime, directory: &Path) -> Result<bool, String> {
     let data = directory.join("data");
     match tokio::fs::symlink_metadata(&data).await {
         Ok(metadata) if metadata.is_dir() => {}
@@ -2567,7 +2646,7 @@ async fn postgres_running(runtime: &PostgresRuntime, directory: &Path) -> Result
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => return Err("Unable to inspect PostgreSQL data directory".to_owned()),
     }
-    let mut cmd = Command::new(runtime.bin_dir.join("pg_ctl"));
+    let mut cmd = runtime.command("pg_ctl");
     cmd.args(["-D", &data.to_string_lossy(), "status"]);
     let output = execute_output(cmd).await?;
     match output.status.code() {
@@ -2580,7 +2659,7 @@ async fn postgres_running(runtime: &PostgresRuntime, directory: &Path) -> Result
     }
 }
 
-async fn stop_instance(runtime: &PostgresRuntime, directory: &Path) -> Result<(), String> {
+async fn stop_instance(runtime: &DatabaseRuntime, directory: &Path) -> Result<(), String> {
     if !postgres_running(runtime, directory).await? {
         return Ok(());
     }
@@ -2601,8 +2680,9 @@ async fn stop_instance(runtime: &PostgresRuntime, directory: &Path) -> Result<()
     .map(|_| ())
 }
 
-async fn remove_stopped_data(runtime: &PostgresRuntime, directory: &Path) -> Result<(), String> {
+async fn remove_stopped_data(runtime: &DatabaseRuntime, directory: &Path) -> Result<(), String> {
     stop_instance(runtime, directory).await?;
+    runtime.quiesce(directory).await?;
     match tokio::fs::remove_dir_all(directory.join("data")).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2611,7 +2691,7 @@ async fn remove_stopped_data(runtime: &PostgresRuntime, directory: &Path) -> Res
 }
 
 async fn sql_command(
-    runtime: &PostgresRuntime,
+    runtime: &DatabaseRuntime,
     instance: &Instance,
     db: &str,
     password: Option<&str>,
@@ -2627,7 +2707,7 @@ async fn sql_command(
             .to_str()
             .ok_or_else(|| "Invalid socket path".to_owned())?
     };
-    let mut cmd = Command::new(runtime.bin_dir.join("psql"));
+    let mut cmd = runtime.command("psql");
     cmd.args([
         "-X",
         "-A",
@@ -2651,17 +2731,14 @@ async fn sql_command(
     execute(cmd).await.map(|_| ())
 }
 
-async fn command(runtime: &PostgresRuntime, tool: &str, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new(runtime.bin_dir.join(tool));
+async fn command(runtime: &DatabaseRuntime, tool: &str, args: &[&str]) -> Result<String, String> {
+    let mut cmd = runtime.command(tool);
     cmd.args(args);
     execute(cmd).await
 }
 
-async fn execute_output(mut cmd: Command) -> Result<std::process::Output, String> {
-    tokio::time::timeout(Duration::from_secs(60), cmd.kill_on_drop(true).output())
-        .await
-        .map_err(|_| "PostgreSQL command timed out".to_owned())?
-        .map_err(|error| error.to_string())
+async fn execute_output(cmd: DatabaseCommand) -> Result<std::process::Output, String> {
+    cmd.output().await
 }
 
 fn command_failure(output: &std::process::Output) -> String {
@@ -2673,7 +2750,7 @@ fn command_failure(output: &std::process::Output) -> String {
     }
 }
 
-async fn execute(cmd: Command) -> Result<String, String> {
+async fn execute(cmd: DatabaseCommand) -> Result<String, String> {
     let output = execute_output(cmd).await?;
     if !output.status.success() {
         return Err(command_failure(&output));
@@ -3074,10 +3151,10 @@ mod process_status_tests {
         let root = std::env::temp_dir().join(format!("rds-stop-{}", uuid::Uuid::new_v4()));
         let bin = root.join("bin");
         tokio::fs::create_dir_all(&bin).await.unwrap();
-        let runtime = PostgresRuntime {
+        let runtime = DatabaseRuntime::Host(PostgresRuntime {
             bin_dir: bin.clone(),
             version: "16.4".into(),
-        };
+        });
         let directory = root.join("instance");
         let marker = directory.join("data/important");
         for (status, stop, permitted, stop_called) in [
@@ -3393,12 +3470,12 @@ mod aurora_class_tests {
 
     #[tokio::test]
     async fn medium_aurora_class_reaches_cluster_lookup_when_runtime_is_available() {
-        if runtime::resolve_from_env().await.is_err() {
+        let Ok(host_runtime) = runtime::resolve_from_env().await else {
             return;
-        }
+        };
         let root =
             std::env::temp_dir().join(format!("locallycloud-rds-medium-{}", uuid::Uuid::new_v4()));
-        let handler = RdsHandler::new(root.clone()).unwrap();
+        let handler = RdsHandler::with_postgres(root.clone(), host_runtime).unwrap();
         let response = handler
             .handle(request("&DBInstanceClass=db.t3.medium"))
             .await;
@@ -3459,12 +3536,13 @@ mod replica_tests {
 
     #[tokio::test]
     async fn aurora_restart_recreates_private_socket_and_preserves_rows() {
-        let Ok(runtime) = runtime::resolve_from_env().await else {
+        let Ok(host_runtime) = runtime::resolve_from_env().await else {
             return;
         };
+        let runtime = DatabaseRuntime::Host(host_runtime.clone());
         let root =
             std::env::temp_dir().join(format!("locallycloud-rds-restart-{}", uuid::Uuid::new_v4()));
-        let handler = RdsHandler::new(root.clone()).unwrap();
+        let handler = RdsHandler::with_postgres(root.clone(), host_runtime.clone()).unwrap();
         let req = ServiceRequest {
             method: Method::POST,
             uri: Uri::from_static("/"),
@@ -3514,7 +3592,7 @@ mod replica_tests {
         assert!(!tokio::fs::try_exists(socket_dir(&writer)).await.unwrap());
         drop(handler);
 
-        let restored = RdsHandler::new(root.clone()).unwrap();
+        let restored = RdsHandler::with_postgres(root.clone(), host_runtime.clone()).unwrap();
         let endpoint = restored
             .resolve_cluster(
                 &req.account_id,
@@ -3552,14 +3630,15 @@ mod replica_tests {
 
     #[tokio::test]
     async fn streaming_replica_is_read_only_until_promoted() {
-        let Ok(runtime) = runtime::resolve_from_env().await else {
+        let Ok(host_runtime) = runtime::resolve_from_env().await else {
             return;
         };
+        let runtime = DatabaseRuntime::Host(host_runtime.clone());
         let root = std::env::temp_dir().join(format!(
             "lcr-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let handler = RdsHandler::new(root.clone()).unwrap();
+        let handler = RdsHandler::with_postgres(root.clone(), host_runtime.clone()).unwrap();
         let req = ServiceRequest {
             method: Method::POST,
             uri: Uri::from_static("/"),
@@ -3851,6 +3930,78 @@ mod inventory_tests {
     use super::*;
     use std::future::{poll_fn, Future};
     use std::task::Poll;
+
+    #[tokio::test]
+    async fn failed_snapshot_delete_preserves_data_when_tool_cleanup_is_unknown() {
+        let root = std::env::temp_dir().join(format!("rds-journal-{}", uuid::Uuid::new_v4()));
+        let handler = RdsHandler::new(root.clone()).unwrap();
+        let request = ServiceRequest {
+            method: axum::http::Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: Default::default(),
+            body: "Action=DeleteDBSnapshot&DBSnapshotIdentifier=protected".into(),
+            account_id: "000000000000".into(),
+            region: "us-east-1".into(),
+            request_id: "tool-cleanup-regression".into(),
+        };
+        let snapshot = Snapshot {
+            id: "protected".into(),
+            source: Instance {
+                id: "source".into(),
+                account: request.account_id.clone(),
+                region: request.region.clone(),
+                username: "app".into(),
+                db_name: "app".into(),
+                class: "db.t3.medium".into(),
+                storage: 20,
+                port: 12345,
+                status: "available".into(),
+                error: None,
+                replica_source: None,
+                cluster_id: None,
+                vpc: None,
+                socket_token: new_socket_token(),
+                dbi_resource_id: new_dbi_resource_id(),
+            },
+            status: "failed".into(),
+            error: Some("backup interrupted".into()),
+        };
+        let key = (
+            request.account_id.clone(),
+            request.region.clone(),
+            snapshot.id.clone(),
+        );
+        let directory = handler.snapshot_directory(&snapshot);
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let marker = directory.join("important");
+        tokio::fs::write(&marker, b"unfinished backup bytes")
+            .await
+            .unwrap();
+        handler.snapshots.lock().await.insert(key.clone(), snapshot);
+        tokio::fs::create_dir_all(root.join(".oci-tasks"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".oci-tasks/interrupted.json"),
+            b"incomplete journal",
+        )
+        .await
+        .unwrap();
+        assert!(handler
+            .delete_snapshot(&request, &Input::parse(&request))
+            .await
+            .is_err());
+        assert_eq!(
+            tokio::fs::read(&marker).await.unwrap(),
+            b"unfinished backup bytes"
+        );
+        assert_eq!(
+            handler.snapshots.lock().await.get(&key).unwrap().status,
+            "failed"
+        );
+        drop(handler);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[tokio::test]
     async fn inventory_waiting_on_snapshots_does_not_block_cluster_deletion() {

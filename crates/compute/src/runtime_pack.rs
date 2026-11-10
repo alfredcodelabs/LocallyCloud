@@ -345,6 +345,30 @@ impl RuntimePack {
         })
     }
 
+    /// Preserve verified image files and metadata for a durable service-owned guest.
+    /// Call from spawn_blocking; the canonical pack lease remains held during capture.
+    pub fn snapshot(&self, directory: &Path) -> io::Result<()> {
+        fs::create_dir_all(directory)?;
+        self.install(&directory.join("rootfs"))?;
+        let source = self
+            .root
+            .parent()
+            .ok_or_else(|| invalid("pack root has no parent"))?;
+        for name in ["manifest.json", "inventory.json"] {
+            fs::copy(source.join(name), directory.join(name))?;
+        }
+        Ok(())
+    }
+
+    /// Re-open an owned snapshot without requiring an active catalog pointer or network.
+    pub fn load_snapshot(directory: &Path, runtime: &str, architecture: &str) -> io::Result<Self> {
+        repository(runtime)?;
+        if !matches!(architecture, "x86_64" | "arm64") {
+            return Err(invalid("unsupported pack architecture"));
+        }
+        Self::load(directory, runtime, architecture)
+    }
+
     /// The compute backend mounts the guest root read-only. Per-environment directories
     /// remain writable on the host for overlays and deletion; runtime files are shared.
     pub fn install(&self, destination: &Path) -> io::Result<()> {

@@ -2245,6 +2245,7 @@ impl Executor {
             command.splice(0..0, ["/bin/bash".into(), "/var/runtime/vpc-wait".into()]);
         }
         let spec = TaskSpec {
+            mounts: Vec::new(),
             user: None,
             name: func.function_name.clone(),
             image: rootfs.path.display().to_string(),
@@ -6416,6 +6417,7 @@ mod tests {
         let task_id = format!("public-deny-{}", Uuid::new_v4().simple());
         let port = 39000;
         let spec = TaskSpec {
+            mounts: Vec::new(),
             user: None,
             name: task_id.clone(),
             image: rootfs.display().to_string(),

@@ -338,7 +338,11 @@ impl PgHandler {
             }
             transaction.clone()
         };
-        let guard = transaction.operation_lock.clone().lock_owned().await;
+        let guard = transaction
+            .operation_lock
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| RdsDataError::Database("Transaction is still running a query"))?;
         if transaction.closed.load(Ordering::Acquire)
             || self.state.expired(&transaction, Instant::now())
         {

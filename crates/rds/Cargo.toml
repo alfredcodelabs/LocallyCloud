@@ -19,3 +19,5 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 form_urlencoded = "1"
+locallycloud-compute.workspace = true
+tokio-postgres = "=0.7.18"

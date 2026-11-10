@@ -72,6 +72,7 @@ async fn postgres_pack_persists_sql_across_isolated_guest_restarts() {
     .unwrap()
     .unwrap();
     let mut spec = TaskSpec {
+        mounts: Vec::new(),
         user: Some(identity),
         name: "postgres-validation".into(),
         image: root.display().to_string(),

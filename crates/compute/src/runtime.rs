@@ -13,9 +13,19 @@ pub struct TaskUser {
     pub gid: u32,
 }
 
+/// Service-owned bind mount. Sources must be absolute, real paths owned by this user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskMount {
+    pub source: std::path::PathBuf,
+    pub destination: std::path::PathBuf,
+    pub read_only: bool,
+}
+
 /// Specification for a task to be executed by a [`ComputeRuntime`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
+    /// Explicit service-owned data mounts; images cannot request host paths.
+    pub mounts: Vec<TaskMount>,
     /// Optional non-root guest identity. None preserves the runtime default.
     pub user: Option<TaskUser>,
     /// Human-readable task name.
@@ -155,6 +165,13 @@ pub trait ComputeRuntime: Send + Sync {
     /// was never started and [`RuntimeError::TaskAlreadyCompleted`] for one that already
     /// finished naturally (Req 13.4, 13.5).
     async fn stop_task(&self, task_id: &str) -> Result<TaskHandle, RuntimeError>;
+
+    /// Ask a service to stop through its shutdown handler, retaining ownership on failure.
+    async fn interrupt_task(&self, _task_id: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "graceful task shutdown unavailable for this backend".into(),
+        })
+    }
 
     /// Observe a task after launch. A service can use this with its own readiness
     /// probe to avoid advertising a workload that has already exited.

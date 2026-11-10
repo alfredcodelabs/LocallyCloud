@@ -60,6 +60,7 @@ async fn oci_runtime_runs_hello_task_and_captures_output() {
     }
 
     let spec = TaskSpec {
+        mounts: Vec::new(),
         user: None,
         name: "hello".into(),
         image: rootfs.display().to_string(),
@@ -116,6 +117,7 @@ async fn oci_runtime_reports_failed_guest_process() {
         return;
     }
     let spec = TaskSpec {
+        mounts: Vec::new(),
         user: None,
         name: "failed".into(),
         image: rootfs.display().to_string(),

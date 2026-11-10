@@ -430,6 +430,7 @@ impl TaskRuntime for EcsOciRuntime {
                 .await);
         }
         let spec = TaskSpec {
+            mounts: Vec::new(),
             user: None,
             name: task_id.clone(),
             image: root.display().to_string(),

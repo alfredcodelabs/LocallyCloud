@@ -13,6 +13,7 @@
 //! [`YoukiRuntime::discover`] on `PATH`); nothing is installed eagerly.
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -255,6 +256,79 @@ impl YoukiRuntime {
                 "source": guest_tmp.display().to_string(),
                 "options": ["rbind", "rw", "nosuid", "nodev"]
             }));
+        }
+
+        if spec.mounts.len() > 8 {
+            return Err(exec_failed("too many service data mounts"));
+        }
+        let mut destinations = std::collections::HashSet::new();
+        for mount in &spec.mounts {
+            let safe = |path: &Path| {
+                path.is_absolute()
+                    && path.components().all(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    })
+            };
+            if !safe(&mount.source)
+                || !safe(&mount.destination)
+                || mount.destination == Path::new("/")
+                || !destinations.insert(mount.destination.clone())
+            {
+                return Err(exec_failed("unsafe service data mount path"));
+            }
+            for path in mount.source.ancestors() {
+                let metadata = tokio::fs::symlink_metadata(path)
+                    .await
+                    .map_err(|e| exec_failed(format!("service mount source unavailable: {e}")))?;
+                if metadata.file_type().is_symlink() {
+                    return Err(exec_failed("service mount source contains a symlink"));
+                }
+            }
+            let metadata = tokio::fs::symlink_metadata(&mount.source)
+                .await
+                .map_err(|e| exec_failed(e.to_string()))?;
+            // SAFETY: geteuid has no arguments or preconditions.
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || !(metadata.is_dir() || metadata.is_file())
+            {
+                return Err(exec_failed(
+                    "service mount source must be an owned file or directory",
+                ));
+            }
+            let relative = mount
+                .destination
+                .strip_prefix("/")
+                .map_err(|_| exec_failed("invalid service mount destination"))?;
+            let mut target = rootfs.to_path_buf();
+            let parts: Vec<_> = relative.components().collect();
+            for (index, part) in parts.iter().enumerate() {
+                target.push(part.as_os_str());
+                match tokio::fs::symlink_metadata(&target).await {
+                    Ok(entry) if entry.file_type().is_symlink() => {
+                        return Err(exec_failed("service mount destination contains a symlink"))
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if index + 1 == parts.len() && metadata.is_file() {
+                            tokio::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&target)
+                                .await
+                                .map_err(|e| exec_failed(e.to_string()))?;
+                        } else {
+                            tokio::fs::create_dir(&target)
+                                .await
+                                .map_err(|e| exec_failed(e.to_string()))?;
+                        }
+                    }
+                    Err(error) => return Err(exec_failed(error.to_string())),
+                }
+            }
+            config["mounts"].as_array_mut().ok_or_else(||exec_failed("OCI spec has no mounts array"))?.push(serde_json::json!({"destination":mount.destination,"type":"bind","source":mount.source,"options":["rbind",if mount.read_only {"ro"} else {"rw"},"nosuid","nodev","noexec"]}));
         }
 
         // Share the host network namespace so the guest reaches the Runtime API and the
@@ -1113,6 +1187,18 @@ impl ComputeRuntime for YoukiRuntime {
         })
     }
 
+    async fn interrupt_task(&self, task_id: &str) -> Result<(), RuntimeError> {
+        if self.task_state(task_id).await? != TaskState::Running {
+            return Ok(());
+        }
+        let output = self.oci_command(&["kill", task_id, "INT"]).await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(exec_failed("OCI service shutdown signal failed"))
+        }
+    }
+
     async fn reconcile_orphaned_task(&self, task_id: &str) -> Result<bool, RuntimeError> {
         self.ensure_runtime_available()?;
         let state = self.oci_command(&["state", task_id]).await?;
@@ -1374,6 +1460,7 @@ mod tests {
 
     fn spec() -> TaskSpec {
         TaskSpec {
+            mounts: Vec::new(),
             user: None,
             name: "hello".into(),
             image: "busybox".into(),
@@ -1484,6 +1571,43 @@ mod tests {
             .await
             .is_err());
         task.user = None;
+        let data = root.join("owned-data");
+        tokio::fs::create_dir(&data).await.unwrap();
+        task.mounts = vec![crate::runtime::TaskMount {
+            source: data.clone(),
+            destination: PathBuf::from("/service-data"),
+            read_only: false,
+        }];
+        rt.write_bundle_config(&root, &task, &root, true, 1024, None)
+            .await
+            .unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(root.join("config.json")).await.unwrap())
+                .unwrap();
+        let mount = config["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["destination"] == "/service-data")
+            .unwrap();
+        assert_eq!(
+            mount["options"],
+            serde_json::json!(["rbind", "rw", "nosuid", "nodev", "noexec"])
+        );
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&data, &alias).unwrap();
+        task.mounts[0].source = alias;
+        assert!(rt
+            .write_bundle_config(&root, &task, &root, true, 1024, None)
+            .await
+            .is_err());
+        task.mounts[0].source = data;
+        task.mounts[0].destination = PathBuf::from("/alias");
+        assert!(rt
+            .write_bundle_config(&root, &task, &root, true, 1024, None)
+            .await
+            .is_err());
+        task.mounts.clear();
         let gate = SetupGate::for_test();
         rt.write_bundle_config(&root, &task, &root, true, 256, Some(&gate))
             .await

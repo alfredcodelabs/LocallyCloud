@@ -48,6 +48,7 @@ impl InstanceRuntime for Ec2OciRuntime {
         }
         let runtime = self.runtime()?;
         let task = TaskSpec {
+            mounts: Vec::new(),
             user: None,
             name: spec.instance_id.clone(),
             image: rootfs.display().to_string(),
