@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 const IMPORTER: &str = include_str!("../../../scripts/import-lambda-runtime.py");
 pub const USAGE: &str = "Usage: locallycloud runtime <COMMAND>\n\n\
 Commands:\n\
-  install RUNTIME       Prepare one official AWS runtime for this machine\n\
+  install RUNTIME       Prepare one verified upstream runtime for this machine\n\
   list                  List installed runtimes\n\
   check-updates [NAME]  Check installed runtimes without changing them\n\
   update RUNTIME        Verify and activate the current upstream version\n\
@@ -24,7 +24,7 @@ Options:\n\
   --arch x86_64|arm64    Override automatic host architecture selection\n\
   --digest sha256:HEX    Pin install/update to an immutable image digest\n\
   -h, --help            Print this help\n\n\
-Examples: nodejs24.x, python3.14, ruby4.0, dotnet10, provided.al2023 (Go bootstrap).\n\
+Examples: nodejs24.x, python3.14, ruby4.0, dotnet10, provided.al2023, postgres16.\n\
 Preparation requires Python 3. Listing, rollback and removal do not.\n\
 No server, state database or KMS master key is required.";
 
@@ -61,10 +61,11 @@ fn failure(message: impl Into<String>) -> io::Error {
 }
 
 fn runtime(name: &str) -> Result<Runtime, String> {
-    let (repository, reference) = locallycloud_lambda::runtime_pack::official_image(name)
+    let (repository, reference) = locallycloud_compute::runtime_pack::official_image(name)
         .map_err(|error| error.to_string())?;
     let repository = repository
-        .strip_prefix("lambda/")
+        .rsplit('/')
+        .next()
         .ok_or("invalid official repository")?;
     Ok(Runtime {
         name: name.to_owned(),
@@ -305,7 +306,7 @@ fn confirm_current(root: &Path, spec: &Runtime, arch: &str, digest: &Value) -> i
     if metadata(&path)?["source"]["imageDigest"] != *digest {
         return Ok(false);
     }
-    locallycloud_lambda::runtime_pack::validate(&path, &spec.name, arch)?;
+    locallycloud_compute::runtime_pack::validate(&path, &spec.name, arch)?;
     Ok(true)
 }
 
@@ -774,7 +775,7 @@ fn publish(
     private(&versions)?;
     let destination = versions.join(version_id(&manifest)?);
     if existing.as_ref() == Some(&destination) {
-        locallycloud_lambda::runtime_pack::validate(&destination, &runtime.name, arch)?;
+        locallycloud_compute::runtime_pack::validate(&destination, &runtime.name, arch)?;
         return Ok(
             json!({"operation":"update","runtime":runtime.name,"architecture":arch,"status":"up-to-date","digest":manifest["source"]["imageDigest"]}),
         );
@@ -785,7 +786,7 @@ fn publish(
                 "existing runtime version does not match the requested image digest",
             ));
         }
-        locallycloud_lambda::runtime_pack::validate(&destination, &runtime.name, arch)?;
+        locallycloud_compute::runtime_pack::validate(&destination, &runtime.name, arch)?;
     } else {
         fs::rename(stage, &destination)?;
     }
@@ -871,7 +872,7 @@ async fn install(
         }
         backend(&["import".into(),"--runtime".into(),spec.name.clone(),"--work".into(),stage.display().to_string(),"--blobs".into(),root.join(".blobs").display().to_string(),"--max-compressed".into(),(512u64*1024*1024).to_string(),"--max-expanded".into(),(2u64*1024*1024*1024).to_string(),"--max-entries".into(),"100000".into()]).await?;
         let validate_stage=stage.clone(); let name=spec.name.clone();let validate_arch=arch.clone();
-        blocking(move || locallycloud_lambda::runtime_pack::validate(&validate_stage,&name,&validate_arch)).await?;
+        blocking(move || locallycloud_compute::runtime_pack::validate(&validate_stage,&name,&validate_arch)).await?;
         let publish_root=root.clone();let publish_stage=stage.clone();
         blocking(move || publish(&publish_root,&spec,&arch,&publish_stage,update)).await
     }.await;
@@ -894,7 +895,7 @@ fn rollback(root: &Path, spec: &Runtime, arch: &str) -> io::Result<Value> {
     let current = resolve_version(&root, &active, spec, arch)?;
     let old = resolve_version(&root, &prior, spec, arch)
         .map_err(|_| failure("no previous version is available for rollback"))?;
-    locallycloud_lambda::runtime_pack::validate(&old, &spec.name, arch)?;
+    locallycloud_compute::runtime_pack::validate(&old, &spec.name, arch)?;
     publish_pointers(&root, spec, arch, &old, Some(&current))?;
     let manifest = metadata(&old)?;
     Ok(

@@ -430,6 +430,7 @@ impl TaskRuntime for EcsOciRuntime {
                 .await);
         }
         let spec = TaskSpec {
+            user: None,
             name: task_id.clone(),
             image: root.display().to_string(),
             command,

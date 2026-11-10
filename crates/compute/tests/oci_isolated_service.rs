@@ -48,6 +48,7 @@ async fn isolated_http_service_is_reachable_only_through_runtime_connector() {
     let task_id = format!("isolated-test-{}", std::process::id());
     let port = 18000 + (std::process::id() % 10000) as u16;
     let spec = TaskSpec {
+        user: None,
         name: task_id.clone(),
         image: rootfs.display().to_string(),
         command: vec!["/bin/httpd".into(), port.to_string()],
@@ -120,6 +121,7 @@ async fn readiness_timeout_stops_the_isolated_guest() {
     let task_id = format!("timeout-test-{}", std::process::id());
     let actual_port = 28000 + (std::process::id() % 10000) as u16;
     let spec = TaskSpec {
+        user: None,
         name: task_id.clone(),
         image: rootfs.display().to_string(),
         command: vec!["/bin/httpd".into(), actual_port.to_string()],
@@ -173,6 +175,7 @@ async fn isolated_guest_reaches_host_listener_only_through_its_own_loopback() {
     let task_id = format!("isolated-client-{}", std::process::id());
     let port = 38000 + (std::process::id() % 10000) as u16;
     let spec = TaskSpec {
+        user: None,
         name: task_id.clone(),
         image: rootfs.display().to_string(),
         command: vec!["/bin/client".into(), port.to_string()],
@@ -244,6 +247,7 @@ async fn isolated_guest_connects_to_private_ip_without_host_route() {
     let address: std::net::Ipv4Addr = "10.123.45.67".parse().unwrap();
     let second: std::net::Ipv4Addr = "10.123.45.68".parse().unwrap();
     let spec = TaskSpec {
+        user: None,
         name: task_id.clone(),
         image: rootfs.display().to_string(),
         command: vec![
@@ -345,6 +349,7 @@ async fn isolated_guest_public_tcp_keeps_original_destination() {
     let task_id = format!("public-client-{}", std::process::id());
     let port = 36000 + (std::process::id() % 10000) as u16;
     let spec = TaskSpec {
+        user: None,
         name: task_id.clone(),
         image: rootfs.display().to_string(),
         command: vec!["/bin/client".into(), port.to_string(), "8.8.8.8".into()],
@@ -433,6 +438,7 @@ async fn isolated_guest_sends_udp_to_a_link_local_endpoint_bound_in_its_netns() 
     let task_id = format!("isolated-udp-{}", std::process::id());
     let address = std::net::Ipv4Addr::new(169, 254, 169, 253);
     let spec = TaskSpec {
+        user: None,
         name: task_id.clone(),
         image: rootfs.display().to_string(),
         command: vec!["/bin/udp-client".into(), address.to_string(), "2000".into()],

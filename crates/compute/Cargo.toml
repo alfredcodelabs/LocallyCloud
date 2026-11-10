@@ -18,3 +18,8 @@ thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 libc = "0.2"
+serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tokio-postgres = "=0.7.18"

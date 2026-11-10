@@ -197,6 +197,22 @@ impl YoukiRuntime {
             .map(|a| serde_json::Value::from(a.as_str()))
             .collect();
 
+        if let Some(user) = spec.user {
+            if user.uid == 0 || user.gid == 0 || user.uid == u32::MAX || user.gid == u32::MAX {
+                return Err(exec_failed(
+                    "guest identity must use valid non-root UID and GID",
+                ));
+            }
+            // SAFETY: geteuid/getegid have no arguments or preconditions.
+            let (host_uid, host_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            config["process"]["user"] = serde_json::json!({"uid":user.uid,"gid":user.gid});
+            config["linux"]["uidMappings"] =
+                serde_json::json!([{"containerID":user.uid,"hostID":host_uid,"size":1}]);
+            config["linux"]["gidMappings"] =
+                serde_json::json!([{"containerID":user.gid,"hostID":host_gid,"size":1}]);
+            config["process"]["noNewPrivileges"] = serde_json::json!(true);
+            config["process"]["capabilities"] = serde_json::json!({"bounding":[],"effective":[],"inheritable":[],"permitted":[],"ambient":[]});
+        }
         config["process"]["terminal"] = serde_json::Value::Bool(false);
         config["process"]["args"] = serde_json::Value::Array(args);
         config["process"]["env"] = serde_json::Value::Array(env);
@@ -960,6 +976,14 @@ impl ComputeRuntime for YoukiRuntime {
         self.start_task_with_network(task_id, spec, false).await
     }
 
+    async fn start_task_isolated(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+    ) -> Result<TaskHandle, RuntimeError> {
+        self.start_task_with_network(task_id, spec, true).await
+    }
+
     async fn start_task_isolated_with_loopback(
         &self,
         task_id: &str,
@@ -1350,6 +1374,7 @@ mod tests {
 
     fn spec() -> TaskSpec {
         TaskSpec {
+            user: None,
             name: "hello".into(),
             image: "busybox".into(),
             command: vec!["echo".into(), "hi".into()],
@@ -1436,6 +1461,29 @@ mod tests {
                 .iter()
                 .any(|value| value["type"] == "network"));
         }
+        task.user = Some(crate::runtime::TaskUser { uid: 999, gid: 999 });
+        rt.write_bundle_config(&root, &task, &root, true, 1024, None)
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            value["process"]["user"],
+            serde_json::json!({"uid":999,"gid":999})
+        );
+        assert_eq!(value["linux"]["uidMappings"][0]["containerID"], 999);
+        assert_eq!(value["linux"]["uidMappings"][0]["size"], 1);
+        assert_eq!(value["process"]["noNewPrivileges"], true);
+        assert_eq!(
+            value["process"]["capabilities"]["effective"],
+            serde_json::json!([])
+        );
+        task.user = Some(crate::runtime::TaskUser { uid: 0, gid: 999 });
+        assert!(rt
+            .write_bundle_config(&root, &task, &root, true, 1024, None)
+            .await
+            .is_err());
+        task.user = None;
         let gate = SetupGate::for_test();
         rt.write_bundle_config(&root, &task, &root, true, 256, Some(&gate))
             .await

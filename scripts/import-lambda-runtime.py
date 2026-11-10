@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect and import a pinned public AWS Lambda image without a container daemon."""
+"""Inspect and import pinned upstream Lambda and PostgreSQL images without a container daemon."""
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -30,6 +30,7 @@ RUNTIME_PATTERNS = {
     "lambda/ruby": r"ruby([1-9][0-9]?\.[0-9]{1,2})",
     "lambda/dotnet": r"dotnet([1-9][0-9]?)",
     "lambda/provided": r"provided\.(al2|al2023)",
+    "docker/library/postgres": r"postgres(16|17|18)",
 }
 ACCEPT = ", ".join((
     "application/vnd.oci.image.index.v1+json",
@@ -294,7 +295,7 @@ def download_and_extract(max_compressed, max_expanded, max_entries):
     info = json.loads((WORK / "inspection.json").read_text())
     REPOSITORY = info.get("repository", "lambda/nodejs")
     if REPOSITORY not in RUNTIME_PATTERNS:
-        raise ValueError("Only official Lambda runtime repositories are supported")
+        raise ValueError("Only supported upstream runtime repositories are supported")
     registry = Registry()
     manifest, digest = registry.manifest(info["imageDigest"])
     if digest != info["imageDigest"] or manifest["layers"] != info["layers"]:
@@ -385,7 +386,8 @@ def check_updates():
     architecture = {"x86_64": "amd64", "arm64": "arm64"}.get(manifest["architecture"])
     if not match or not architecture:
         raise ValueError("Installed pack has an invalid official runtime identity")
-    current, _, _ = resolve_image(match.group(1), architecture, manifest["runtime"])
+    reference = match.group(1) + ("-bookworm" if REPOSITORY == "docker/library/postgres" else "")
+    current, _, _ = resolve_image(reference, architecture, manifest["runtime"])
     return {"runtime": manifest["runtime"], "architecture": manifest["architecture"],
             "installedDigest": manifest["source"]["imageDigest"],
             "availableDigest": current["imageDigest"],
@@ -438,7 +440,7 @@ def pack(runtime):
                    "indexDigest": info["topDigest"], "imageDigest": info["imageDigest"],
                    "configDigest": info["configDigest"]},
         "entrypoint": config.get("Entrypoint", []), "environment": environment,
-        "workingDirectory": config.get("WorkingDir", "/var/task"),
+        "workingDirectory": config.get("WorkingDir") or ("/" if repository == "docker/library/postgres" else "/var/task"),
     }
     write_json(WORK / "manifest.json", result)
     print(json.dumps({"packManifest": str(WORK / "manifest.json"), "entries": len(entries),
@@ -452,8 +454,8 @@ def main():
         "Use --work <packs>/<runtime>/<x86_64|arm64> and --runtime to publish a local pack. "
         "No downloads occur inside the server. The pack command inventories an existing rootfs."))
     parser.add_argument("command", choices=["inspect", "import", "pack", "check"])
-    parser.add_argument("--runtime", help="AWS runtime name, e.g. nodejs22.x, python3.13, provided.al2023")
-    parser.add_argument("--repository", choices=[repository.split("/")[1] for repository in RUNTIME_PATTERNS], default="nodejs")
+    parser.add_argument("--runtime", help="Runtime name, e.g. nodejs22.x, python3.13, provided.al2023, postgres16")
+    parser.add_argument("--repository", choices=[repository.rsplit("/", 1)[1] for repository in RUNTIME_PATTERNS], default="nodejs")
     parser.add_argument("--reference", default="22")
     parser.add_argument("--blobs", type=Path, help="Shared content-addressed layer cache")
     parser.add_argument("--architecture", choices=["amd64", "arm64"],
@@ -464,7 +466,7 @@ def main():
     parser.add_argument("--work", type=Path, default=WORK)
     args = parser.parse_args()
     WORK = args.work.resolve()
-    REPOSITORY = "lambda/" + args.repository
+    REPOSITORY = next(repository for repository in RUNTIME_PATTERNS if repository.rsplit("/", 1)[1] == args.repository)
     BLOBS = args.blobs.resolve() if args.blobs else None
     for location in [args.work.absolute(), args.blobs.absolute() if args.blobs else None]:
         if location and any(part.is_symlink() for part in [location, *location.parents]):

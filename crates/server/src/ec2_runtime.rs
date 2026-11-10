@@ -48,6 +48,7 @@ impl InstanceRuntime for Ec2OciRuntime {
         }
         let runtime = self.runtime()?;
         let task = TaskSpec {
+            user: None,
             name: spec.instance_id.clone(),
             image: rootfs.display().to_string(),
             command: vec!["/bin/httpd".into(), spec.guest_port.to_string()],

@@ -60,6 +60,7 @@ async fn oci_runtime_runs_hello_task_and_captures_output() {
     }
 
     let spec = TaskSpec {
+        user: None,
         name: "hello".into(),
         image: rootfs.display().to_string(),
         command: vec!["/bin/echo".into(), "hello-locallycloud".into()],
@@ -115,6 +116,7 @@ async fn oci_runtime_reports_failed_guest_process() {
         return;
     }
     let spec = TaskSpec {
+        user: None,
         name: "failed".into(),
         image: rootfs.display().to_string(),
         command: vec!["/bin/does-not-exist".into()],

@@ -25,6 +25,7 @@ class ArtifactTest(unittest.TestCase):
     def test_official_runtime_identity_and_update_tag(self):
         import re
         for repository, runtime, tag in [
+            ("docker/library/postgres", "postgres16", "16-bookworm"),
             ("lambda/nodejs", "nodejs24.x", "24"),
             ("lambda/python", "python3.14", "3.14"),
             ("lambda/ruby", "ruby4.0", "4.0"),
@@ -33,7 +34,7 @@ class ArtifactTest(unittest.TestCase):
             ("lambda/provided", "provided.al2023", "al2023"),
         ]:
             with self.subTest(runtime=runtime):
-                self.assertEqual(re.fullmatch(artifact.RUNTIME_PATTERNS[repository], runtime).group(1), tag)
+                self.assertEqual(re.fullmatch(artifact.RUNTIME_PATTERNS[repository], runtime).group(1) + ("-bookworm" if repository == "docker/library/postgres" else ""), tag)
                 manifest = {"runtime": runtime, "architecture": "x86_64",
                             "source": {"repository": repository, "imageDigest": "old"}}
                 (self.work / "manifest.json").write_text(json.dumps(manifest))

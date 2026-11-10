@@ -6,9 +6,18 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 
+/// Non-root guest identity mapped to the current host user, without subordinate IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskUser {
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// Specification for a task to be executed by a [`ComputeRuntime`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
+    /// Optional non-root guest identity. None preserves the runtime default.
+    pub user: Option<TaskUser>,
     /// Human-readable task name.
     pub name: String,
     /// Container image reference or rootfs path.
@@ -69,6 +78,17 @@ pub struct TaskOutput {
 pub trait ComputeRuntime: Send + Sync {
     /// Start a task. On success the returned handle is in [`TaskState::Running`].
     async fn start_task(&self, task_id: &str, spec: &TaskSpec) -> Result<TaskHandle, RuntimeError>;
+
+    /// Start an isolated task that needs no guest-to-host listeners (for example initdb).
+    async fn start_task_isolated(
+        &self,
+        _task_id: &str,
+        _spec: &TaskSpec,
+    ) -> Result<TaskHandle, RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "isolated tasks are unavailable for this backend".into(),
+        })
+    }
 
     /// Start a network-isolated task after binding guest-loopback listeners.
     /// Unsupported backends fail closed; callers operate the returned listeners

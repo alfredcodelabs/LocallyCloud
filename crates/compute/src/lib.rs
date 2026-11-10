@@ -11,6 +11,7 @@ mod netns_socket;
 mod output;
 pub mod private_dir;
 pub mod runtime;
+pub mod runtime_pack;
 pub mod youki;
 
 mod youki_setup;
