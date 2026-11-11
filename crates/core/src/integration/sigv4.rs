@@ -240,9 +240,9 @@ fn verify_at(
                         .split(',')
                         .any(|encoding| encoding.trim().eq_ignore_ascii_case("aws-chunked"))
                 })
-                || !header(headers, "x-amz-decoded-content-length")
-                    .is_some_and(|value| value.parse::<usize>().is_ok())
-                || !header(headers, "x-amz-trailer").is_some_and(|value| !value.is_empty())
+                || header(headers, "x-amz-decoded-content-length")
+                    .is_none_or(|value| value.parse::<usize>().is_err())
+                || header(headers, "x-amz-trailer").is_none_or(|value| value.is_empty())
             {
                 return false;
             }
