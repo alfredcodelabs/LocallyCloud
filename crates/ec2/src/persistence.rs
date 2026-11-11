@@ -182,10 +182,10 @@ impl Persistence {
                 if !scope.vpcs.contains_key(&spec.vpc_id)
                     || spec.security_group_ids.is_empty()
                     || spec.security_group_ids.iter().any(|id| {
-                        !scope
+                        scope
                             .security_groups
                             .get(id)
-                            .is_some_and(|group| group.vpc_id == spec.vpc_id)
+                            .is_none_or(|group| group.vpc_id != spec.vpc_id)
                     })
                     || !subnet.cidr.contains(&spec.private_ip)
                     || scope.network_interfaces.values().any(|eni| {
@@ -224,8 +224,8 @@ impl Persistence {
             if scope.subnets.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))
                 || scope.security_groups.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))
                 || scope.route_tables.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))
-                || scope.network_interfaces.values().any(|eni| !scope.subnets.get(&eni.subnet_id).is_some_and(|subnet|subnet.vpc_id==eni.vpc_id) || eni.group_ids.iter().any(|id|!scope.security_groups.get(id).is_some_and(|group|group.vpc_id==eni.vpc_id)))
-                || scope.security_groups.values().any(|group|group.ingress.iter().chain(&group.egress).any(|rule|matches!(&rule.peer,RulePeer::Group(id) if !scope.security_groups.get(id).is_some_and(|peer|peer.vpc_id==group.vpc_id)))) {return Err(invalid());}
+                || scope.network_interfaces.values().any(|eni| scope.subnets.get(&eni.subnet_id).is_none_or(|subnet|subnet.vpc_id!=eni.vpc_id) || eni.group_ids.iter().any(|id|scope.security_groups.get(id).is_none_or(|group|group.vpc_id!=eni.vpc_id)))
+                || scope.security_groups.values().any(|group|group.ingress.iter().chain(&group.egress).any(|rule|matches!(&rule.peer,RulePeer::Group(id) if scope.security_groups.get(id).is_none_or(|peer|peer.vpc_id!=group.vpc_id)))) {return Err(invalid());}
         }
         Ok(())
     }
