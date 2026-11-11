@@ -2360,6 +2360,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recreate_global_bucket_in_virginia_preserves_objects_and_private_acl() {
+        let handler = S3Handler::new();
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, "/recreated-bucket", "", &[]))
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, "/recreated-bucket/key", "retained", &[]))
+                .await
+                .status(),
+            200
+        );
+        let response = handler
+            .handle(req(Method::PUT, "/recreated-bucket", "", &[]))
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers().get("Location").unwrap(),
+            "/recreated-bucket"
+        );
+        let (status, body) = body_string(
+            handler
+                .handle(req(Method::GET, "/recreated-bucket/key", "", &[]))
+                .await,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "retained");
+        let (status, body) = body_string(
+            handler
+                .handle(req(Method::GET, "/recreated-bucket?acl", "", &[]))
+                .await,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.contains("<Permission>FULL_CONTROL</Permission>"));
+        assert!(!body.contains("AllUsers"));
+        let name = "/bucket-000000000000-us-east-1-an";
+        let headers = [("x-amz-bucket-namespace", "account-regional")];
+        assert_eq!(
+            handler
+                .handle(req(Method::PUT, name, "", &headers))
+                .await
+                .status(),
+            200
+        );
+        let (status, body) =
+            body_string(handler.handle(req(Method::PUT, name, "", &headers)).await).await;
+        assert_eq!(status, 409);
+        assert!(body.contains("<Code>BucketAlreadyOwnedByYou</Code>"));
+    }
+
     struct WritePolicyStub {
         allow: std::sync::atomic::AtomicBool,
         requests: Mutex<Vec<AuthorizationRequest>>,

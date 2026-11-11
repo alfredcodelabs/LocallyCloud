@@ -1371,6 +1371,43 @@ mod tests {
     }
 
     #[test]
+    fn reserved_region_environment_is_rejected_on_create_and_update() {
+        let store = FunctionStore::new();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("valid"),
+            None,
+        )
+        .unwrap();
+        for key in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+            let environment = serde_json::json!({"Variables": {key: "eu-west-1"}});
+            let mut input = create_input("invalid");
+            input["Environment"] = environment.clone();
+            let error =
+                create_function(&store, "us-east-1", "000000000000", &input, None).unwrap_err();
+            assert_eq!(error.code(), "InvalidParameterValueException");
+            assert_eq!(error.http_status(), 400);
+            assert!(get_function(&store, "us-east-1", "000000000000", "invalid").is_err());
+            let error = update_function_configuration(
+                &store,
+                "us-east-1",
+                "000000000000",
+                "valid",
+                &serde_json::json!({"Environment": environment}),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "InvalidParameterValueException");
+            let (_, config) = get_function(&store, "us-east-1", "000000000000", "valid").unwrap();
+            assert!(config.unwrap()["Configuration"]["Environment"]["Variables"]
+                .get(key)
+                .is_none());
+        }
+    }
+
+    #[test]
     fn create_then_get_round_trips() {
         let store = FunctionStore::new();
         let (status, body) = create_function(

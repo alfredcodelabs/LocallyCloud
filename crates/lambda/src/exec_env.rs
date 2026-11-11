@@ -17,6 +17,8 @@ pub const RESERVED_ENV_KEYS: &[&str] = &[
     "_HANDLER",
     "_X_AMZN_TRACE_ID",
     "AWS_EXECUTION_ENV",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
     "AWS_LAMBDA_FUNCTION_NAME",
     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
     "AWS_LAMBDA_FUNCTION_VERSION",
@@ -169,10 +171,21 @@ mod tests {
 
     #[test]
     fn rejects_reserved_keys() {
-        let env = user(&[("AWS_LAMBDA_FUNCTION_NAME", "other")]);
-        assert!(validate_environment(&env).is_err());
-        let env = user(&[("_HANDLER", "x")]);
-        assert!(validate_environment(&env).is_err());
+        for key in [
+            "AWS_LAMBDA_FUNCTION_NAME",
+            "_HANDLER",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+        ] {
+            let env = user(&[(key, "other")]);
+            assert!(
+                matches!(
+                    validate_environment(&env),
+                    Err(LambdaError::InvalidParameterValue(_))
+                ),
+                "{key}"
+            );
+        }
     }
 
     #[test]

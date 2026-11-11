@@ -483,8 +483,9 @@ pub struct BucketState {
     pub uploads: DirtyMap<String, MultipartUpload>,
 }
 
-// Gate identity is immutable and can be looked up without taking bucket metadata locks.
+// Region and gate identity are immutable and readable without bucket metadata locks.
 struct StoredBucket {
+    region: String,
     state: Arc<RwLock<BucketState>>,
     transaction_gate: Arc<RwLock<()>>,
 }
@@ -492,6 +493,7 @@ struct StoredBucket {
 impl StoredBucket {
     fn new(bucket: BucketState) -> Self {
         Self {
+            region: bucket.region.clone(),
             transaction_gate: bucket.transaction_gate.clone(),
             state: Arc::new(RwLock::new(bucket)),
         }
@@ -566,7 +568,14 @@ impl AccountStore {
         use dashmap::mapref::entry::Entry;
         match self.buckets.entry(name.to_string()) {
             Entry::Occupied(slot) if slot.get().0 == account => {
-                Err(S3Error::BucketAlreadyOwnedByYou)
+                if region == "us-east-1"
+                    && slot.get().1.region == "us-east-1"
+                    && !name.ends_with("-an")
+                {
+                    Ok(())
+                } else {
+                    Err(S3Error::BucketAlreadyOwnedByYou)
+                }
             }
             Entry::Occupied(_) => Err(S3Error::BucketAlreadyExists),
             Entry::Vacant(slot) => {
@@ -669,11 +678,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_is_exclusive_per_account() {
+    fn recreate_owned_bucket_is_only_idempotent_in_us_east_1_global_namespace() {
         let store = AccountStore::new();
-        assert!(store.create("acc", "b", "us-east-1", false).is_ok());
+        for (name, existing_region, request_region, success) in [
+            ("east", "us-east-1", "us-east-1", true),
+            ("west", "us-west-2", "us-west-2", false),
+            ("east-to-west", "us-east-1", "us-west-2", false),
+            ("west-to-east", "us-west-2", "us-east-1", false),
+            (
+                "bucket-000000000000-us-east-1-an",
+                "us-east-1",
+                "us-east-1",
+                false,
+            ),
+        ] {
+            store.create("acc", name, existing_region, false).unwrap();
+            let result = store.create("acc", name, request_region, false);
+            if success {
+                assert!(result.is_ok(), "{name}");
+            } else {
+                assert!(
+                    matches!(result, Err(S3Error::BucketAlreadyOwnedByYou)),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recreate_owned_bucket_preserves_existing_state_and_restored_region() {
+        let store = AccountStore::new();
+        store.create("acc", "bucket", "us-east-1", false).unwrap();
+        let bucket = store.get("acc", "bucket").unwrap();
+        bucket.write().await.bucket_tags = Some(BTreeMap::from([("key".into(), "value".into())]));
+        let creation_date = bucket.read().await.creation_date;
+        store.create("acc", "bucket", "us-east-1", true).unwrap();
+        assert!(Arc::ptr_eq(&bucket, &store.get("acc", "bucket").unwrap()));
+        let state = bucket.read().await;
+        assert_eq!(state.creation_date, creation_date);
+        assert_eq!(
+            state.bucket_tags.as_ref().unwrap().get("key").unwrap(),
+            "value"
+        );
+        assert!(state.object_lock.is_none());
+        drop(state);
+        let restored = AccountStore::new();
+        let blobs = tempfile::tempdir().unwrap();
+        restored
+            .restore_snapshot(&store.durable_snapshot(blobs.path()).unwrap())
+            .unwrap();
+        assert!(restored.create("acc", "bucket", "us-east-1", false).is_ok());
         assert!(matches!(
-            store.create("acc", "b", "us-east-1", false),
+            restored.create("acc", "bucket", "us-west-2", false),
             Err(S3Error::BucketAlreadyOwnedByYou)
         ));
     }
