@@ -47,7 +47,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta.4"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.95.0"
 authors = ["Alfred Rodriguez G"]

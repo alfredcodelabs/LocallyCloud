@@ -14,7 +14,7 @@ from the dashboard.
 [Quick start](#quick-start) · [Services](docs/SERVICES.md) · [Documentation](#documentation)
 
 > [!NOTE]
-> Beta for local development and testing. Services implement subsets of AWS
+> For local development and testing. Services implement subsets of AWS
 > operations; validate your application on AWS before deploying it.
 
 ## Installation
@@ -24,10 +24,10 @@ for your architecture, then install it with your package manager:
 
 ```sh
 # Debian 13 / Ubuntu 24.04 or 26.04 (example: amd64)
-sudo apt install ./locallycloud_0.1.0.beta.4-1_amd64.deb
+sudo apt install ./locallycloud_0.1.0-1_amd64.deb
 
 # Arch Linux (example: x86_64)
-sudo pacman -U ./locallycloud-0.1.0beta.4-1-x86_64.pkg.tar.zst
+sudo pacman -U ./locallycloud-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 Use the filename you downloaded. **Run LocallyCloud as your regular user, without

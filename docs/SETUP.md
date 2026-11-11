@@ -32,7 +32,7 @@ The executable is `target/release/locallycloud`. Continue with [Quick start](../
 The `.deb` supports Debian 13, Ubuntu 24.04 LTS and 26.04 LTS, distributions based on them (such as Linux Mint or Pop!_OS), and WSL 2 distributions based on them. Releases provide one package per architecture: `amd64` for Intel and AMD processors, and `arm64` for ARM processors. The package requires glibc 2.39 or later; older releases such as Ubuntu 22.04 are not supported, and `apt` refuses to install the package there. When a tagged release is available, download the `.deb` for your architecture (`dpkg --print-architecture` shows it). From the download directory:
 
 ```sh
-sudo apt install ./locallycloud_0.1.0.beta.4-1_amd64.deb
+sudo apt install ./locallycloud_0.1.0-1_amd64.deb
 ```
 
 Use the filename for the version and architecture you downloaded. The package includes SQLite and installs its required system libraries through `apt`; Rust and a separate SQLite installation are not needed. It recommends `dbus-user-session`, but APT can leave recommendations uninstalled. Install it explicitly when using OCI compute. The installed command is `locallycloud`.
@@ -42,7 +42,7 @@ Use the filename for the version and architecture you downloaded. The package in
 When a tagged release is available, download its `.pkg.tar.zst` for Arch Linux `x86_64`:
 
 ```sh
-sudo pacman -U ./locallycloud-0.1.0beta.4-1-x86_64.pkg.tar.zst
+sudo pacman -U ./locallycloud-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 Use the filename for the version you downloaded. The package requires SQLite 3.53.4 or later from the Arch repositories. The installed command is `locallycloud`. On Arch Linux ARM (`aarch64`), build the package from a source checkout with `makepkg` in `packaging/arch`; that platform is supported on a best-effort basis.
@@ -63,7 +63,7 @@ Alternatively, on a supported Debian or Ubuntu host with the required system lib
 
 ```sh
 mkdir -p "$HOME/.local/opt/locallycloud" "$HOME/.local/bin"
-dpkg-deb --extract ./locallycloud_0.1.0.beta.4-1_amd64.deb "$HOME/.local/opt/locallycloud"
+dpkg-deb --extract ./locallycloud_0.1.0-1_amd64.deb "$HOME/.local/opt/locallycloud"
 ln -s "$HOME/.local/opt/locallycloud/usr/bin/locallycloud" "$HOME/.local/bin/locallycloud"
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -84,10 +84,10 @@ The server can start without a compute runtime. Install these dependencies only 
 | Route Firehose Iceberg records with `MetadataExtraction` | `jq` available in `PATH`. |
 | Run broader Athena SQL on Iceberg tables | DuckDB, with `LOCALLYCLOUD_DUCKDB_BIN` set to its executable. Without it, Athena uses a built-in reader for a smaller SQL subset. |
 | Run EC2 instances | The OCI prerequisites above and `LOCALLYCLOUD_EC2_IMAGE_ROOTFS` pointing to the image's root filesystem. |
-| Run RDS PostgreSQL or Aurora PostgreSQL, including RDS Data API access | PostgreSQL 16 or later; use the newest version your distribution provides. `initdb`, `pg_ctl`, `postgres`, `psql`, and `pg_basebackup` must have matching versions. LocallyCloud starts its own databases. |
+| Run RDS PostgreSQL or Aurora PostgreSQL, including RDS Data API access | The OCI prerequisites above and an explicitly installed PostgreSQL pack: `locallycloud runtime install postgres18`. PostgreSQL 16, 17 and 18 are supported; the default is 18. No host PostgreSQL installation is required. |
 | Open the dashboard from the applications menu | `xdg-utils`. Opening the URL directly in a browser does not require it. |
 
-On Debian and Ubuntu, install the components you need with `sudo apt install crun dbus-user-session`, `sudo apt install postgresql`, or `sudo apt install xdg-utils`; add `python3` for runtime preparation or `jq` for metadata extraction. On Arch, the equivalent packages are `crun`, `postgresql`, `xdg-utils`, `python` and `jq`. RDS finds PostgreSQL on `PATH` (Arch) or the newest version under `/usr/lib/postgresql/<version>/bin` (Debian and Ubuntu). Set `LOCALLYCLOUD_PG_BIN_DIR` only to use a different installation.
+On Debian and Ubuntu, install only the host tools you need with `sudo apt install crun dbus-user-session` or `sudo apt install xdg-utils`; add `python3` for runtime preparation or `jq` for metadata extraction. On Arch, the equivalent packages are `crun`, `dbus`, `xdg-utils`, `python` and `jq`. Runtime packs are downloaded only by explicit `locallycloud runtime install/update` commands. To use a host PostgreSQL toolchain instead of OCI, set `LOCALLYCLOUD_PG_BIN_DIR` to its `bin` directory; all five tools (`initdb`, `pg_ctl`, `postgres`, `psql`, `pg_basebackup`) must have matching versions, 16 or later.
 
 ### Official Lambda runtime packs
 
@@ -154,7 +154,7 @@ See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com
 | `LOCALLYCLOUD_KMS_MASTER_KEY` | Base64-encoded 32-byte master key | Required; no default |
 | `LOCALLYCLOUD_IAM_ENFORCEMENT` | IAM mode; `strict` evaluates policies | Permissive |
 | `LOCALLYCLOUD_WORK_DIR` | Lambda work files | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/lambda` |
-| `LOCALLYCLOUD_RUNTIME_PACKS_DIR` | Installed Lambda runtime packs; relative paths resolve from the server working directory | `<Lambda work directory>/runtime-packs` |
+| `LOCALLYCLOUD_RUNTIME_PACKS_DIR` | Installed Lambda and PostgreSQL runtime packs; relative paths resolve from the server working directory | `<Lambda work directory>/runtime-packs` |
 | `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | Shared Lambda environment budget in MiB; see [memory accounting](LAMBDA.md#memory-budget) | `4096` |
 | `LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY` | Independent Lambda execution quota for each account/region; integer from 1 to 2147483647 | `1000` |
 | `LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE` | Classic EventBridge rules: multiply retry delays and maximum event age by this factor; finite number from 0.000001 to 1 | `1` (real time) |
@@ -163,7 +163,7 @@ See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com
 | `LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate controlled table write limits; reads and hot partitions are not modeled | Disabled |
 | `LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate provisioned shard write limits | Disabled |
 | `LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY` | Minimum slots left unreserved when assigning function RC; integer from 0 to the account quota. Set explicitly for quotas below 100 | `100` |
-| `LOCALLYCLOUD_PG_BIN_DIR` | PostgreSQL binaries for RDS | Found on `PATH`, then the newest under `/usr/lib/postgresql` |
+| `LOCALLYCLOUD_PG_BIN_DIR` | Explicit host PostgreSQL toolchain override for RDS, instead of OCI runtime packs | Unset; use an installed PostgreSQL runtime pack |
 | `LOCALLYCLOUD_COGNITO_MAILBOX_DIR` | Directory that receives Cognito confirmation codes | Disabled |
 | `LOCALLYCLOUD_UI` | Dashboard: `on` or `off`. `off` returns 404 for the dashboard and its read endpoints, which sign reads with your local AWS profiles; health and status stay available | `on` |
 | `LOCALLYCLOUD_ENDPOINT_URL` | Endpoint that Lambda, ECS and EC2 guests use to call back into the emulator. `AWS_ENDPOINT_URL` takes priority when set | Derived from the listen address; a wildcard bind becomes `127.0.0.1` |

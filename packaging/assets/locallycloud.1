@@ -58,12 +58,12 @@ Lambda work files. Default:
 .IR ${XDG_CACHE_HOME:\-~/.cache}/locallycloud/lambda .
 .TP
 .B LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB
-Memory budget for Lambda environments, in MiB. Default: 1024.
+Shared memory budget for Lambda environments, in MiB. Default: 4096.
 .TP
 .B LOCALLYCLOUD_PG_BIN_DIR
-Directory with the PostgreSQL 16 or later binaries used by RDS. By default
-RDS uses PATH, then the newest version under
-.IR /usr/lib/postgresql/ <version> /bin .
+Explicit directory with matching PostgreSQL 16 or later host binaries,
+overriding the default OCI runtime packs. Install a pack with
+.BR "locallycloud runtime install postgres18" .
 .TP
 .B LOCALLYCLOUD_COGNITO_MAILBOX_DIR
 Private directory that receives Cognito confirmation codes as JSON files.

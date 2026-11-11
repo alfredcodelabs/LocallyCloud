@@ -1,5 +1,5 @@
 # Maintainer: Alfred Rodriguez G <alfredcode.dev@gmail.com>
-# Local checkout package for validating Arch before the first tagged release.
+# Local checkout package; version is derived from Cargo.toml.
 pkgname=locallycloud
 pkgver=$(bash "$startdir/../../scripts/package-version.sh" arch)
 pkgrel=1
@@ -12,7 +12,7 @@ makedepends=('cargo' 'cargo-about' 'git')
 optdepends=('crun: daemonless compute runtime'
             'jq: inline metadata extraction for Firehose Iceberg delivery'
             'python: prepare and check official Lambda runtimes with locallycloud runtime'
-            'postgresql: local RDS runtime'
+            'postgresql: optional host RDS override via LOCALLYCLOUD_PG_BIN_DIR'
             'xdg-utils: open the dashboard from the application menu')
 # GCC LTO objects from aws-lc-sys do not link with Rust's lld invocation.
 options=('!lto' '!debug')

@@ -34,26 +34,21 @@ bash scripts/check-package-version.sh
 
 For a new version, edit Cargo.toml and update Cargo.lock with `cargo update --workspace --offline`. Run the checks before creating the tag. GitHub Actions requires the tag to match the output of `package-version.sh tag` and builds all artifacts from that commit. The local scripts do not publish releases or packages.
 
-## 0.1.0-beta.4 candidate
+## 0.1.0 release
 
-The next prerelease is `v0.1.0-beta.4`, with packaging revision 1. Changes since beta.3:
+The release tag is `v0.1.0`, with packaging revision 1. It has no prerelease suffix and becomes the GitHub `latest` release only after the publishing workflow succeeds. Version `0.x` still permits API changes; this is not a declaration of `1.0` API stability.
 
-- Package installation checks explicitly install `dbus-user-session` and independently verify the package's recommendation metadata. This handles Ubuntu 26.04 images where APT skips the recommendation.
-- Setup and troubleshooting clarify that recommended packages may need explicit installation for OCI compute.
+Changes since beta.4 include:
 
-### Beta.3 feature baseline
+- Official AWS Lambda runtime packs installed and updated explicitly through `locallycloud runtime`, without startup or invocation downloads.
+- ExtendDB integration with durable global replication, Streams to Lambda, TTL, per-table KMS encryption, backups and native PITR history migration.
+- Rootless OCI PostgreSQL packs for RDS and RDS Data API, supporting majors 16, 17 and 18 (default 18), with no required host PostgreSQL installation.
+- Lambda-backed CloudFormation custom resource lifecycles, provisioning/cleanup fixes, API Gateway to Step Functions mappings, and Firehose/Iceberg routing.
+- Dashboard architecture review and OWASP Threat Dragon import/export.
 
-Beta.3 introduced these changes since beta.2:
+The functional candidate at `b780845` passed package installation and SDK/CLI smoke checks in QEMU on Debian 13 and Ubuntu 24.04/26.04, on both architectures: Lambda Node/Python/Go, S3/SQS, PostgreSQL 18 with UUIDv7, and SQL/S3 persistence after restart. Those checks do not replace CI or certify every service integration. Publishing still waits for the workflow gates below.
 
-- Firehose/Iceberg delivery and maintenance, encrypted recovery checks, and persisted Glue catalog state.
-- Durable ECS services integrated with local ECR images, scoped runtime identity and internal HTTP ALB lifecycle.
-- Bounded ECS IPv4 VPC networking, DNS/NAT policy enforcement and explicit EC2 recovery through `StartInstances`.
-- Lambda lifecycle and X-Ray integration, API Gateway tracing, and CloudFormation IAM/SAM fixes.
-- A shorter README with dedicated setup and service references and consistent documentation navigation.
-
-Before tagging, commit the reviewed candidate, pass the repository checks, and validate Lambda/OCI on a supported Debian or Ubuntu VM or WSL installation as required by `AGENTS.md`. Restore the missing external ECS/ALB/network fixtures before relying on their historical results as a current release gate. The packaging workflow builds and installs both Debian architectures and the Arch package before publishing the prerelease.
-
-Updating AUR checksums requires the published beta.4 archive; do not update its pinned source version or invent checksums before that archive exists.
+The AUR recipe remains pinned to its published archive until `v0.1.0` is available. After publication, run `packaging/aur/update.sh v0.1.0` to download the real archive, update its checksum and regenerate `.SRCINFO`; do not invent checksums or use `SKIP`.
 
 ## Packaging revisions
 
@@ -73,7 +68,7 @@ There are two Arch recipes. `packaging/arch/PKGBUILD` builds the local checkout 
 After the release tag is published, on an Arch machine:
 
 ```sh
-bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0-beta.4
+bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0
 cd packaging/aur && makepkg --cleanbuild && namcap PKGBUILD ./*.pkg.tar.zst
 ```
 
@@ -107,7 +102,7 @@ References: [SemVer](https://semver.org/), [Debian](https://www.debian.org/doc/d
 
 The `.github/workflows/packages.yml` workflow runs on pull requests, pushes to `main`, `master`, `develop`, and `stage`, and `v*` tags. It can also be run manually to check a branch without publishing.
 
-It validates version formats, tag matching, and the versions of all crates. It checks `cargo fmt`, builds and installs both packages, and runs library tests for `locallycloud-core` and `locallycloud-state`. It does not yet cover all service integrations, PostgreSQL, or OCI runtimes.
+It validates version formats, tag matching and workspace versions; runs formatting, workspace tests and Clippy with packaged SQLite; and checks the real ExtendDB worker. Debian installation checks cover both architectures on all supported Debian/Ubuntu releases. Separate jobs check the Arch package and architecture review UI/MCP. Containers do not validate rootless OCI: retain the VM/WSL gate required by `AGENTS.md`.
 
 Debian is built natively on Debian 13 for `amd64` and `arm64` (GitHub `ubuntu-24.04` and `ubuntu-24.04-arm` runners) using the Rust version declared in Cargo.toml. SQLite 3.53.4 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. The `libc6` dependency is computed from the binary and must not exceed glibc 2.39, the oldest supported LTS. A follow-up job installs each `.deb` with `apt` on Debian 13, Ubuntu 24.04, and Ubuntu 26.04 and starts the server; releases wait for it. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories; the PKGBUILD also declares `aarch64` for Arch Linux ARM, which CI does not build yet.
 
@@ -115,11 +110,11 @@ After saving and pushing the version and Cargo.lock changes:
 
 ```sh
 bash scripts/check-package-version.sh
-git tag -a v0.1.0-beta.4 -m "LocallyCloud 0.1.0-beta.4"
-git push origin v0.1.0-beta.4
+git tag -a v0.1.0 -m "LocallyCloud 0.1.0"
+git push origin v0.1.0
 ```
 
-Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, and `SHA256SUMS`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
+Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, the ExtendDB workers and notices, `components.json`, and `SHA256SUMS`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
 
 No personal token or additional secrets are required: the workflow uses `GITHUB_TOKEN`, with write access only in the publishing job. Actions must be enabled in the repository. The workflow does not publish an APT repository or submit the recipe to AUR; those channels need their own configuration.
 

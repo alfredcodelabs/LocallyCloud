@@ -2,7 +2,7 @@
 
 [← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md)
 
-Practical answers for using LocallyCloud during the beta. Start with the [installation and quick-start guide](../README.md#installation) if this is your first visit.
+Practical answers for using LocallyCloud. Start with the [installation and quick-start guide](../README.md#installation) if this is your first visit.
 
 [🚀 Getting started](#getting-started) · [🔌 Profiles](#aws-profiles-and-connections) · [📦 Compatibility](#compatibility-and-services) · [🔧 Troubleshooting](#troubleshooting) · [💬 Feedback](#feedback-and-releases)
 
@@ -170,13 +170,13 @@ an empty request body; LocallyCloud does not replace it with `{}`.
 
 ### RDS cannot start a PostgreSQL database. What is missing?
 
-Install PostgreSQL 16 or later from your distribution, preferably the newest version it provides: `sudo apt install postgresql` on Debian and Ubuntu, or `sudo pacman -S postgresql` on Arch. `initdb`, `pg_ctl`, `postgres`, `psql`, and `pg_basebackup` must belong to the same version. LocallyCloud finds them on `PATH` or, on Debian and Ubuntu, under `/usr/lib/postgresql/<version>/bin`, choosing the newest supported version. To use another installation, set `LOCALLYCLOUD_PG_BIN_DIR` to its `bin` directory before starting LocallyCloud.
+Install the runtime with `locallycloud runtime install postgres18` and check the [rootless OCI prerequisites](SETUP.md#optional-runtime-dependencies). PostgreSQL 18 is the default; packs for 16 and 17 are also supported. A host PostgreSQL installation is not required. To use one explicitly, set `LOCALLYCLOUD_PG_BIN_DIR` to a `bin` directory containing matching versions of `initdb`, `pg_ctl`, `postgres`, `psql` and `pg_basebackup` (16 or later).
 
-LocallyCloud starts its own local databases. RDS Data API workflows that access those databases need the same PostgreSQL setup.
+LocallyCloud starts its own databases; RDS Data API uses the same runtime and data.
 
 ### Will my resources survive a restart?
 
-Persistence varies by service and operation. Preserve the state directory and the KMS master key, and test restart behavior for your specific workflow. This beta is intended for test data.
+Persistence varies by service and operation. Preserve the state directory and the KMS master key, and test restart behavior for your specific workflow. LocallyCloud is intended for test data.
 
 These survive a restart with the same database and master key:
 
