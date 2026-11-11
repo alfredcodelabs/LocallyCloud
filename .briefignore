@@ -1,0 +1,4 @@
+# findbrief index scope (gitignore syntax). Git-ignored paths are already out.
+# Kiro specs and steering are ignored by git but describe intended behavior.
+!.kiro/specs/**/*.md
+!.kiro/steering/**/*.md

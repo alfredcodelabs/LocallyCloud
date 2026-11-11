@@ -313,12 +313,12 @@ routing name never implies runtime support.
 
 ## Agent skills
 
-Start each session with `node .agents/skills/context/scripts/context.mjs brief`, and use its
+Start each session with `node .agents/skills/findbrief/scripts/findbrief.mjs brief`, and use its
 `find`, `why` and `when` commands before searching files by hand.
 
 Project skills live in `.agents/skills/`:
 
-- `context` — exact files, history and reasons from a local index of git and the source tree.
+- `findbrief` — exact files, history and reasons from a local index of git and the source tree.
 - `conditional-dispatch` — when writing or reviewing dispatch, mappings, validations, state
   transitions, or growing `if`/`else` chains.
 - `whitebox-review` — for code reviews, security audits, and before closing relevant changes
