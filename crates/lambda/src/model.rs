@@ -886,8 +886,8 @@ impl FunctionStore {
     ) -> Option<Vec<(String, EventInvokeConfig)>> {
         let record = self.records.get(&Self::key(account, region, name))?;
         if marker.is_some_and(|q| {
-            !record.event_invoke_configs.contains_key(q)
-                && !(q == "$LATEST" && record.event_invoke_config.is_some())
+            !(record.event_invoke_configs.contains_key(q)
+                || q == "$LATEST" && record.event_invoke_config.is_some())
         }) {
             return None;
         }

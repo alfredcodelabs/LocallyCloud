@@ -245,13 +245,13 @@ pub(crate) fn handle(
                 let old = store
                     .get_event_invoke_config(account, region, &key)
                     .ok_or_else(missing)?;
-                if !input.as_object().is_some_and(|v| !v.is_empty()) {
+                if input.as_object().is_none_or(|v| v.is_empty()) {
                     return Err(invalid("Update must contain a configuration field"));
                 }
-                if !input.get("MaximumRetryAttempts").is_some() {
+                if input.get("MaximumRetryAttempts").is_none() {
                     next.maximum_retry_attempts = old.maximum_retry_attempts;
                 }
-                if !input.get("MaximumEventAgeInSeconds").is_some() {
+                if input.get("MaximumEventAgeInSeconds").is_none() {
                     next.maximum_event_age_in_seconds = old.maximum_event_age_in_seconds;
                 }
                 if let Some(old_destination) = old.destination_config {

@@ -129,7 +129,7 @@ jobs:
           export SQLITE3_INCLUDE_DIR="$GITHUB_WORKSPACE/target/debian-package/sqlite-3.53.4-${{ matrix.arch }}/include"
           export SQLITE3_STATIC=1
           cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
       - uses: actions/download-artifact@v8
         with:
           name: package-extenddb-${{ matrix.arch == 'amd64' && 'x86_64' || 'arm64' }}
