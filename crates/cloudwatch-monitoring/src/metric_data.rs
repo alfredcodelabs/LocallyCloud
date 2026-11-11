@@ -208,9 +208,9 @@ fn parse_query(
         Some(Value::Bool(flag)) => *flag,
         Some(_) => return Err(invalid(format!("{member}.ReturnData must be a boolean"))),
     };
-    if json_field(value, "Period").is_some_and(|period| {
-        !period.is_null() && !period.as_u64().is_some_and(|period| period > 0)
-    }) {
+    if json_field(value, "Period")
+        .is_some_and(|period| !period.is_null() && period.as_u64().is_none_or(|period| period == 0))
+    {
         return Err(invalid(format!(
             "{member}.Period must be a positive integer"
         )));

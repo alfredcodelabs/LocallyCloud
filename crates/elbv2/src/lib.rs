@@ -1726,10 +1726,9 @@ impl Elbv2Handler {
             .get_mut(&(req.account_id.clone(), req.region.clone()))
             .and_then(|g| g.values_mut().find(|g| g.arn == arn))
             .ok_or_else(Error::not_found)?;
-        group.targets.retain(|_, t| {
-            !t.draining_until
-                .is_some_and(|until| until <= Instant::now())
-        });
+        group
+            .targets
+            .retain(|_, t| t.draining_until.is_none_or(|until| until > Instant::now()));
         let keys = if targets.is_empty() {
             group.targets.keys().copied().collect::<Vec<_>>()
         } else {
@@ -2193,7 +2192,7 @@ async fn run_listener(listener: TcpListener, context: ListenerContext) {
                 let due = {
                     let Ok(mut state) = groups.lock() else { break; };
                     let Some(group) = state.get_mut(&(account.clone(),region.clone())).and_then(|gs|gs.values_mut().find(|g|g.arn == target_group_arn)) else { break; };
-                    group.targets.retain(|_,t| !t.draining_until.is_some_and(|until|until <= Instant::now()));
+                    group.targets.retain(|_,t| t.draining_until.is_none_or(|until|until > Instant::now()));
                     let mut due = Vec::new();
                     for target in group.targets.values_mut() {
                         if tasks.len() + due.len() >= 64 { break; }

@@ -35,9 +35,9 @@ pub fn create(
             || fields[3].is_empty()
             || fields[4].len() != 12
             || !fields[4].bytes().all(|byte| byte.is_ascii_digit())
-            || !fields[5]
+            || fields[5]
                 .strip_prefix("key/")
-                .is_some_and(|key| !key.is_empty())
+                .is_none_or(|key| key.is_empty())
         {
             return Err(LogsError::InvalidParameter(
                 "kmsKeyId must be a KMS key ARN".into(),

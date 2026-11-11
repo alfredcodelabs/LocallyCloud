@@ -287,7 +287,7 @@ impl Plan {
             }
             if value
                 .get("Label")
-                .is_some_and(|v| !v.as_str().is_some_and(|v| v.len() <= 1024))
+                .is_some_and(|v| v.as_str().is_none_or(|v| v.len() > 1024))
             {
                 return Err(invalid(
                     "Metric query Label must be a string of at most 1024 characters",
