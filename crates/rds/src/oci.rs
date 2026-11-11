@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use locallycloud_compute::runtime::{
     ComputeRuntime, RuntimeError, TaskMount, TaskSpec, TaskState, TaskUser,
@@ -21,7 +21,7 @@ use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 use super::{Instance, PostgresRuntime};
 
-const RUNTIME: &str = "postgres16";
+use crate::version::EngineVersion;
 const MEMORY_MB: u32 = 512;
 
 #[derive(Clone)]
@@ -44,12 +44,17 @@ impl Runtime {
             Self::Oci(engine) => engine.recover(Some(directory)).await,
         }
     }
-    pub async fn prepare(&self) -> Result<(), String> {
+    pub async fn prepare(&self, requested: EngineVersion) -> Result<EngineVersion, String> {
         match self {
-            Self::Host(_) => Ok(()),
+            Self::Host(runtime) => {
+                let actual: EngineVersion = runtime.version.parse()?;
+                check_version(requested, actual)?;
+                Ok(actual)
+            }
             Self::Oci(engine) => {
                 engine.available().await?;
-                engine.source().await.map(drop)
+                let image = engine.source(requested).await?;
+                image_version(&image)
             }
         }
     }
@@ -298,8 +303,12 @@ impl Engine {
         }
         Ok(())
     }
-    async fn source(&self) -> Result<Arc<RuntimePack>, String> {
-        self.packs.load(RUNTIME,Self::architecture()?).await.map_err(|_|"PostgreSQL runtime pack unavailable or invalid; run locallycloud runtime install postgres16".into())
+    async fn source(&self, requested: EngineVersion) -> Result<Arc<RuntimePack>, String> {
+        let runtime = requested.runtime();
+        let loaded = self.packs.load(runtime, Self::architecture()?).await;
+        let image = loaded.map_err(|_| format!("PostgreSQL runtime pack unavailable or invalid; run locallycloud runtime install {runtime}"))?;
+        check_version(requested, image_version(&image)?)?;
+        Ok(image)
     }
     fn slot(&self, directory: &Path) -> Result<Arc<Slot>, String> {
         let mut slots = self
@@ -346,6 +355,8 @@ impl Engine {
         &self,
         directory: &Path,
     ) -> Result<(Arc<RuntimePack>, Option<Arc<RuntimePack>>), String> {
+        let instance = Self::instance(directory).await?;
+        let requested = instance_version(directory, &instance).await?;
         let snapshot = directory.join("oci-image");
         if tokio::fs::try_exists(snapshot.join("manifest.json"))
             .await
@@ -355,8 +366,15 @@ impl Engine {
             let root_lease = self.root_lease.clone();
             return tokio::task::spawn_blocking(move || {
                 let _root_lease = root_lease;
-                RuntimePack::load_snapshot(&snapshot, RUNTIME, arch)
-                    .map(|image| (Arc::new(image), None))
+                RuntimePack::load_snapshot(&snapshot, requested.runtime(), arch)
+                    .and_then(|image| {
+                        check_version(
+                            requested,
+                            image_version(&image).map_err(std::io::Error::other)?,
+                        )
+                        .map_err(std::io::Error::other)?;
+                        Ok((Arc::new(image), None))
+                    })
                     .map_err(|_| {
                         "RDS owned runtime image invalid; preserve the instance for recovery"
                             .to_owned()
@@ -374,14 +392,14 @@ impl Engine {
                     .into(),
             );
         }
-        let source = self.source().await?;
+        let source = self.source(requested).await?;
         let copying = source.clone();
         let arch = Self::architecture()?;
         let root_lease = self.root_lease.clone();
         let image = tokio::task::spawn_blocking(move || {
             let _root_lease = root_lease;
             copying.snapshot(&snapshot).map_err(|e| e.to_string())?;
-            RuntimePack::load_snapshot(&snapshot, RUNTIME, arch)
+            RuntimePack::load_snapshot(&snapshot, requested.runtime(), arch)
                 .map(Arc::new)
                 .map_err(|e| e.to_string())
         })
@@ -463,7 +481,7 @@ impl Engine {
     ) -> Result<Output, String> {
         let runtime = self.compute().await?;
         let id = format!("rds-tool-{}", uuid::Uuid::new_v4());
-        let mut command = vec![format!("/usr/lib/postgresql/16/bin/{tool}")];
+        let mut command = vec![image_version(&image)?.binary(tool)];
         command.extend(args);
         let spec = Self::spec(&image, rootfs.clone(), command, mounts).await?;
         let resource = if rootfs
@@ -682,12 +700,18 @@ impl Engine {
         {
             return Err("RDS previous guest termination is not confirmed".into());
         }
+        let data_version = data_version(directory).await?;
+        if instance
+            .engine_version
+            .is_some_and(|version| version.major() != data_version.major())
+        {
+            return Err(
+                "PostgreSQL data major differs from instance metadata; data retained".into(),
+            );
+        }
         let (image, source) = self.image(directory).await?;
-        let version = tokio::fs::read_to_string(directory.join("data/PG_VERSION"))
-            .await
-            .map_err(|_| "PostgreSQL data version unavailable")?;
-        if version.trim() != "16" {
-            return Err("RDS OCI currently requires PostgreSQL16 data; preserve this instance for migration".into());
+        if image_version(&image)?.major() != data_version.major() {
+            return Err("PostgreSQL data major differs from runtime image; data retained".into());
         }
         let socket = super::prepare_socket_dir(&instance).await?;
         let mut mounts = vec![
@@ -705,7 +729,7 @@ impl Engine {
             &image,
             directory.join("oci-image/rootfs"),
             vec![
-                "/usr/lib/postgresql/16/bin/postgres".into(),
+                image_version(&image)?.binary("postgres"),
                 "-D".into(),
                 "/data".into(),
                 "-p".into(),
@@ -890,7 +914,11 @@ impl Engine {
         }
         let source = match source {
             Some(image) => image,
-            None => self.source().await?,
+            None => {
+                return Err(
+                    "RDS source guest is unavailable for a version-safe physical backup".into(),
+                )
+            }
         };
         let temporary = parent.join(format!("backup-guest-{}", uuid::Uuid::new_v4()));
         let creating = temporary.clone();
@@ -936,6 +964,58 @@ impl Engine {
         result
     }
 }
+pub(super) async fn instance_version(
+    directory: &Path,
+    instance: &Instance,
+) -> Result<EngineVersion, String> {
+    if let Some(version) = instance.engine_version {
+        return Ok(version);
+    }
+    data_version(directory).await
+}
+pub(super) async fn data_version(directory: &Path) -> Result<EngineVersion, String> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(directory.join("data/PG_VERSION"))
+        .await
+        .map_err(|_| "Existing PostgreSQL data version unavailable; data retained")?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| "PostgreSQL data version unreadable")?;
+    if !metadata.is_file() || metadata.len() > 32 {
+        return Err("PostgreSQL data version must be a bounded regular file; data retained".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(33)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| "PostgreSQL data version unreadable")?;
+    if bytes.len() > 32 {
+        return Err("PostgreSQL data version exceeds limit; data retained".into());
+    }
+    std::str::from_utf8(&bytes)
+        .map_err(|_| "PostgreSQL data version is invalid")?
+        .trim()
+        .parse()
+}
+
+fn image_version(image: &RuntimePack) -> Result<EngineVersion, String> {
+    image
+        .environment
+        .get("PG_VERSION")
+        .and_then(|version| version.split('-').next())
+        .ok_or_else(|| "PostgreSQL runtime image version unavailable".to_owned())?
+        .parse()
+}
+fn check_version(requested: EngineVersion, actual: EngineVersion) -> Result<(), String> {
+    if !requested.matches(actual) {
+        return Err(format!("Requested PostgreSQL {requested}, installed image is {actual}; install a matching {} pack", requested.runtime()));
+    }
+    Ok(())
+}
+
 fn required<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
     args.iter()
         .position(|arg| arg == flag)
@@ -1059,4 +1139,52 @@ async fn remove_intent(path: &Path) -> Result<(), String> {
         .sync_all()
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_metadata_uses_physical_major_instead_of_new_default() {
+        let root =
+            std::env::temp_dir().join(format!("rds-legacy-version-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(root.join("data")).await.unwrap();
+        let instance: Instance = serde_json::from_value(serde_json::json!({
+            "id":"legacy", "account":"000000000000", "region":"us-east-1",
+            "username":"app", "db_name":"app", "class":"db.t3.micro", "storage":20,
+            "port":5432, "status":"available", "error":null
+        }))
+        .unwrap();
+        assert_eq!(instance.engine_version, None);
+        for (major, pack) in [
+            ("16", "postgres16"),
+            ("17", "postgres17"),
+            ("18", "postgres18"),
+        ] {
+            tokio::fs::write(root.join("data/PG_VERSION"), major)
+                .await
+                .unwrap();
+            assert_eq!(
+                instance_version(&root, &instance).await.unwrap().runtime(),
+                pack
+            );
+        }
+        tokio::fs::write(root.join("data/PG_VERSION"), "19")
+            .await
+            .unwrap();
+        assert!(instance_version(&root, &instance).await.is_err());
+        tokio::fs::write(root.join("data/PG_VERSION"), "1".repeat(33))
+            .await
+            .unwrap();
+        assert!(instance_version(&root, &instance).await.is_err());
+        tokio::fs::remove_file(root.join("data/PG_VERSION"))
+            .await
+            .unwrap();
+        tokio::fs::symlink("/dev/zero", root.join("data/PG_VERSION"))
+            .await
+            .unwrap();
+        assert!(instance_version(&root, &instance).await.is_err());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 }

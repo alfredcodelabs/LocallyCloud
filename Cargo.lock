@@ -2842,6 +2842,7 @@ dependencies = [
  "async-trait",
  "axum",
  "form_urlencoded",
+ "libc",
  "locallycloud-compute",
  "locallycloud-core",
  "locallycloud-ec2",

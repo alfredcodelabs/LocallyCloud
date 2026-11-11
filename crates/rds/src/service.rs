@@ -19,6 +19,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::runtime::{self, PostgresRuntime};
+use crate::version::EngineVersion;
 #[path = "oci.rs"]
 mod oci;
 use oci::{Command as DatabaseCommand, Engine as OciEngine, Runtime as DatabaseRuntime};
@@ -36,6 +37,8 @@ impl Drop for PasswordFile {
 #[derive(Clone, Serialize, Deserialize)]
 struct Instance {
     id: String,
+    #[serde(default)]
+    engine_version: Option<EngineVersion>,
     account: String,
     region: String,
     username: String,
@@ -90,6 +93,8 @@ pub struct RdsInstanceEndpoint {
 #[derive(Clone, Serialize, Deserialize)]
 struct Cluster {
     id: String,
+    #[serde(default)]
+    engine_version: Option<EngineVersion>,
     account: String,
     region: String,
     username: String,
@@ -669,7 +674,6 @@ impl RdsHandler {
             "GlobalClusterIdentifier",
             "ReplicationSourceIdentifier",
             "ServerlessV2ScalingConfiguration.MinCapacity",
-            "EngineVersion",
             "ManageMasterUserPassword",
         ] {
             if input.get(field).is_some() {
@@ -688,8 +692,10 @@ impl RdsHandler {
         }
         let db_name = input.get("DatabaseName").unwrap_or("postgres");
         validate_user(db_name)?;
+        let engine_version = requested_version(input)?;
         let cluster = Cluster {
             id: id.to_owned(),
+            engine_version: Some(engine_version),
             account: req.account_id.clone(),
             region: req.region.clone(),
             username: username.to_owned(),
@@ -868,11 +874,46 @@ impl RdsHandler {
             .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
-        runtime.prepare().await.map_err(Error::internal)?;
+        let preparing_cluster = self
+            .clusters
+            .lock()
+            .await
+            .get(&cluster_key)
+            .cloned()
+            .ok_or_else(|| Error::new("DBClusterNotFoundFault", "DB cluster not found", 404))?;
+        let preparing_dir = self.cluster_directory(&preparing_cluster);
+        let preparing_data = tokio::fs::try_exists(preparing_dir.join("data"))
+            .await
+            .map_err(|error| Error::internal(error.to_string()))?;
+        let requested = match preparing_cluster.engine_version {
+            Some(version) => version,
+            None if preparing_data => oci::data_version(&preparing_dir)
+                .await
+                .map_err(Error::internal)?,
+            None => EngineVersion::default(),
+        };
+        let writer_version = input
+            .get("EngineVersion")
+            .map(str::parse::<EngineVersion>)
+            .transpose()
+            .map_err(Error::invalid)?;
+        let engine_version = runtime.prepare(requested).await.map_err(Error::internal)?;
+        if writer_version.is_some_and(|version| !version.matches(engine_version)) {
+            return Err(Error::invalid(
+                "Writer EngineVersion must match its DB cluster",
+            ));
+        }
         let mut clusters = self.clusters.lock().await;
         let cluster = clusters
             .get_mut(&cluster_key)
             .ok_or_else(|| Error::new("DBClusterNotFoundFault", "DB cluster not found", 404))?;
+        if cluster.engine_version != preparing_cluster.engine_version {
+            return Err(Error::new(
+                "InvalidDBClusterStateFault",
+                "Cluster changed during runtime preparation; retry",
+                400,
+            ));
+        }
         if cluster.writer_id.is_some() {
             return Err(Error::new(
                 "InvalidDBClusterStateFault",
@@ -907,6 +948,7 @@ impl RdsHandler {
         };
         let instance = Instance {
             id: id.to_owned(),
+            engine_version: Some(engine_version),
             account: req.account_id.clone(),
             region: req.region.clone(),
             username: cluster.username.clone(),
@@ -946,11 +988,14 @@ impl RdsHandler {
             let _ = tokio::fs::remove_dir_all(&directory).await;
             return Err(Error::internal(error));
         }
+        let previous_version = cluster.engine_version;
+        cluster.engine_version = Some(engine_version);
         cluster.writer_id = Some(id.to_owned());
         let previous_port = cluster.last_writer_port;
         cluster.last_writer_port = Some(port);
         if let Err(error) = persist_cluster(&cluster_dir, cluster).await {
             cluster.writer_id = None;
+            cluster.engine_version = previous_version;
             cluster.last_writer_port = previous_port;
             self.instances.lock().await.remove(&key);
             let _ = tokio::fs::remove_dir_all(&directory).await;
@@ -1008,6 +1053,7 @@ impl RdsHandler {
         if engine != "postgres" {
             return Err(Error::invalid("Only Engine=postgres is supported"));
         }
+        let requested = requested_version(input)?;
         for field in ["KmsKeyId", "DBClusterIdentifier"] {
             if input.get(field).is_some() {
                 return Err(Error::invalid(format!("{field} is unsupported")));
@@ -1132,12 +1178,13 @@ impl RdsHandler {
             .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
-        runtime.prepare().await.map_err(Error::internal)?;
+        let engine_version = runtime.prepare(requested).await.map_err(Error::internal)?;
         validate_scope(&req.account_id, &req.region)?;
         let key = (req.account_id.clone(), req.region.clone(), id.to_owned());
         let port = free_port().await.map_err(Error::internal)?;
         let instance = Instance {
             id: id.to_owned(),
+            engine_version: Some(engine_version),
             account: req.account_id.clone(),
             region: req.region.clone(),
             username: username.to_owned(),
@@ -1264,26 +1311,47 @@ impl RdsHandler {
             .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
-        runtime.prepare().await.map_err(Error::internal)?;
+        let preparing_source = self
+            .instances
+            .lock()
+            .await
+            .get(&source_key)
+            .cloned()
+            .ok_or_else(|| Error::new("DBInstanceNotFound", "Source DB instance not found", 404))?;
+        if preparing_source.cluster_id.is_some() || preparing_source.vpc.is_some() {
+            return Err(Error::invalid(
+                "VPC and Aurora read replicas require dedicated network provisioning",
+            ));
+        }
+        if preparing_source.status != "available" || preparing_source.replica_source.is_some() {
+            return Err(Error::new(
+                "InvalidDBInstanceState",
+                "Source must be an available writer",
+                400,
+            ));
+        }
+        let requested =
+            oci::instance_version(&self.directory(&preparing_source), &preparing_source)
+                .await
+                .map_err(Error::internal)?;
+        let engine_version = runtime.prepare(requested).await.map_err(Error::internal)?;
         let port = free_port().await.map_err(Error::internal)?;
         let (instance, source) = {
             let mut state = self.instances.lock().await;
             let source = state.get(&source_key).cloned().ok_or_else(|| {
                 Error::new("DBInstanceNotFound", "Source DB instance not found", 404)
             })?;
-            if source.cluster_id.is_some() || source.vpc.is_some() {
-                return Err(Error::invalid(
-                    "VPC and Aurora read replicas require dedicated network provisioning",
-                ));
-            }
-            if source.status != "available" || source.replica_source.is_some() {
+            if source.dbi_resource_id != preparing_source.dbi_resource_id
+                || source.status != "available"
+            {
                 return Err(Error::new(
                     "InvalidDBInstanceState",
-                    "Source must be an available writer",
+                    "Source changed during runtime preparation; retry",
                     400,
                 ));
             }
             let mut replica = source.clone();
+            replica.engine_version = Some(engine_version);
             replica.id = id.to_owned();
             replica.port = port;
             replica.socket_token = new_socket_token();
@@ -1411,7 +1479,12 @@ impl RdsHandler {
             Err(error) => Err(error.to_string()),
         };
         let result = match result {
-            Ok(runtime) => probe(&runtime, &directory, instance).await,
+            Ok(runtime) => match probe(&runtime, &directory, instance).await {
+                Ok(()) if instance.engine_version.is_none() => server_version(&runtime, instance)
+                    .await
+                    .map(|version| instance.engine_version = Some(version)),
+                other => other,
+            },
             Err(error) => Err(error),
         };
         instance.status = if result.is_ok() {
@@ -1882,9 +1955,14 @@ impl RdsHandler {
             .resolve_runtime()
             .await
             .map_err(|error| Error::internal(error.to_string()))?;
-        runtime.prepare().await.map_err(Error::internal)?;
+        let requested =
+            oci::instance_version(&self.snapshot_directory(&snapshot), &snapshot.source)
+                .await
+                .map_err(Error::internal)?;
+        let engine_version = runtime.prepare(requested).await.map_err(Error::internal)?;
         let key = (req.account_id.clone(), req.region.clone(), id.to_owned());
         let mut instance = snapshot.source.clone();
+        instance.engine_version = Some(engine_version);
         instance.id = id.to_owned();
         instance.class = class.to_owned();
         instance.socket_token = new_socket_token();
@@ -2391,7 +2469,11 @@ async fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
 }
 
 fn snapshot_xml(snapshot: &Snapshot) -> String {
-    format!("<DBSnapshotIdentifier>{}</DBSnapshotIdentifier><DBInstanceIdentifier>{}</DBInstanceIdentifier><Status>{}</Status><Engine>postgres</Engine><AllocatedStorage>{}</AllocatedStorage><SnapshotType>manual</SnapshotType><Port>{}</Port>", escape(&snapshot.id), escape(&snapshot.source.id), escape(&snapshot.status), snapshot.source.storage, snapshot.source.port)
+    let mut xml = format!("<DBSnapshotIdentifier>{}</DBSnapshotIdentifier><DBInstanceIdentifier>{}</DBInstanceIdentifier><Status>{}</Status><Engine>postgres</Engine><AllocatedStorage>{}</AllocatedStorage><SnapshotType>manual</SnapshotType><Port>{}</Port>", escape(&snapshot.id), escape(&snapshot.source.id), escape(&snapshot.status), snapshot.source.storage, snapshot.source.port);
+    if let Some(version) = snapshot.source.engine_version {
+        xml.push_str(&format!("<EngineVersion>{version}</EngineVersion>"));
+    }
+    xml
 }
 
 async fn reopen_cluster_writer(
@@ -2790,6 +2872,42 @@ async fn persist_cluster(directory: &Path, cluster: &Cluster) -> Result<(), Stri
         .map_err(|e| e.to_string())
 }
 
+fn requested_version(input: &Input) -> Result<EngineVersion, Error> {
+    input
+        .get("EngineVersion")
+        .map(str::parse)
+        .transpose()
+        .map_err(Error::invalid)
+        .map(|version| version.unwrap_or_default())
+}
+async fn server_version(
+    runtime: &DatabaseRuntime,
+    instance: &Instance,
+) -> Result<EngineVersion, String> {
+    let socket = socket_dir(instance);
+    let version = command(
+        runtime,
+        "psql",
+        &[
+            "-X",
+            "-A",
+            "-t",
+            "-h",
+            &socket.to_string_lossy(),
+            "-p",
+            &instance.port.to_string(),
+            "-U",
+            &instance.username,
+            "-d",
+            "postgres",
+            "-c",
+            "SHOW server_version_num",
+        ],
+    )
+    .await?;
+    EngineVersion::from_server_number(&version)
+}
+
 fn cluster_xml(cluster: &Cluster, writer: Option<&Instance>) -> String {
     let available = writer.is_some_and(|instance| instance.status == "available");
     let status = if available {
@@ -2805,6 +2923,12 @@ fn cluster_xml(cluster: &Cluster, writer: Option<&Instance>) -> String {
         escape(&cluster.id), status, escape(&cluster.username), escape(&cluster.db_name),
         writer.map_or(5432, |instance| instance.port), cluster.http_endpoint_enabled
     );
+    if let Some(version) = writer
+        .and_then(|writer| writer.engine_version)
+        .or(cluster.engine_version)
+    {
+        xml.push_str(&format!("<EngineVersion>{version}</EngineVersion>"));
+    }
     if let Some(writer) = writer {
         xml.push_str(&format!("<DBClusterMembers><DBClusterMember><DBInstanceIdentifier>{}</DBInstanceIdentifier><IsClusterWriter>true</IsClusterWriter></DBClusterMember></DBClusterMembers>", escape(&writer.id)));
         if available {
@@ -2967,6 +3091,9 @@ fn instance_xml(instance: &Instance) -> String {
         .as_ref()
         .map_or(instance.port, |vpc| vpc.client_port);
     let mut xml = format!("<DBInstanceIdentifier>{}</DBInstanceIdentifier><DBInstanceClass>{}</DBInstanceClass><Engine>{}</Engine><DBInstanceStatus>{}</DBInstanceStatus><MasterUsername>{}</MasterUsername><AllocatedStorage>{}</AllocatedStorage><DBName>{}</DBName><Port>{}</Port>", escape(&instance.id), escape(&instance.class), engine, escape(visible_status), escape(&instance.username), instance.storage, escape(&instance.db_name), visible_port);
+    if let Some(version) = instance.engine_version {
+        xml.push_str(&format!("<EngineVersion>{version}</EngineVersion>"));
+    }
     if let Some(vpc) = &instance.vpc {
         xml.push_str(&format!("<DBSubnetGroup><DBSubnetGroupName>{}</DBSubnetGroupName><SubnetGroupStatus>Complete</SubnetGroupStatus></DBSubnetGroup><VpcSecurityGroups>", escape(&vpc.subnet_group)));
         for id in &vpc.security_group_ids {
@@ -3246,6 +3373,7 @@ mod process_status_tests {
             .unwrap()
             .unwrap();
         let instance = Instance {
+            engine_version: None,
             id: "protected".into(),
             account: "000000000000".into(),
             region: "us-east-1".into(),
@@ -3352,6 +3480,7 @@ mod ownership_tests {
         let snapshot = Snapshot {
             id: "active-snapshot".into(),
             source: Instance {
+                engine_version: None,
                 id: "source".into(),
                 account: "000000000000".into(),
                 region: "us-east-1".into(),
@@ -3492,7 +3621,11 @@ mod aurora_class_tests {
             "{body}"
         );
         assert!(handler.instances.lock().await.is_empty());
-        assert!(!tokio::fs::try_exists(&root).await.unwrap());
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+        drop(entries);
+        drop(handler);
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }
 
@@ -3558,6 +3691,7 @@ mod replica_tests {
                 &input(&[
                     ("DBClusterIdentifier", "restart-cluster"),
                     ("Engine", "aurora-postgresql"),
+                    ("EngineVersion", &host_runtime.version),
                     ("MasterUsername", "releaseuser"),
                     ("MasterUserPassword", "ReleaseFixture9!"),
                     ("EnableHttpEndpoint", "true"),
@@ -3654,6 +3788,7 @@ mod replica_tests {
                 &input(&[
                     ("DBInstanceIdentifier", "source"),
                     ("Engine", "postgres"),
+                    ("EngineVersion", &host_runtime.version),
                     ("MasterUsername", "localuser"),
                     ("MasterUserPassword", "localpassword"),
                 ]),
@@ -3793,6 +3928,7 @@ mod vpc_tests {
             .join("y".repeat(90));
         let handler = RdsHandler::new(root.clone()).unwrap();
         let instance = Instance {
+            engine_version: None,
             id: "orders-db".to_owned(),
             account: "000000000000".to_owned(),
             region: "us-east-1".to_owned(),
@@ -3947,6 +4083,7 @@ mod inventory_tests {
         let snapshot = Snapshot {
             id: "protected".into(),
             source: Instance {
+                engine_version: None,
                 id: "source".into(),
                 account: request.account_id.clone(),
                 region: request.region.clone(),
