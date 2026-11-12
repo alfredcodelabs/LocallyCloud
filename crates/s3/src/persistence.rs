@@ -3,10 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use locallycloud_state::StateDb;
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 
 use super::service::{StoredDelivery, MAX_PENDING_NOTIFICATIONS};
@@ -28,6 +28,7 @@ pub(crate) struct StateRow {
 #[derive(Clone)]
 pub(super) struct S3Persistence {
     state: Arc<StateDb>,
+    connection: Arc<Mutex<Connection>>,
     pub(super) blobs: PathBuf,
 }
 
@@ -299,11 +300,21 @@ impl S3Persistence {
                 .map_err(sql)?;
         }
         transaction.commit().map_err(sql)?;
-        Ok(Self { state, blobs })
+        Ok(Self {
+            state,
+            connection: Arc::new(Mutex::new(connection)),
+            blobs,
+        })
+    }
+
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>, String> {
+        self.connection
+            .lock()
+            .map_err(|_| "S3 persistent connection lock poisoned".to_string())
     }
 
     pub(super) fn restore(&self, store: &AccountStore) -> Result<(), String> {
-        let connection = self.state.connection().map_err(|error| error.to_string())?;
+        let connection = self.connection()?;
         let mut buckets: BTreeMap<(String, String), BucketState> = BTreeMap::new();
         let mut blocks: Vec<(String, PublicAccessBlock)> = Vec::new();
         // Bucket/upload metadata precede their children; no aggregate JSON tree or body copies.
@@ -381,7 +392,7 @@ impl S3Persistence {
 
     #[cfg(test)]
     pub(super) fn load(&self) -> Result<Option<Vec<u8>>, String> {
-        let connection = self.state.connection().map_err(|error| error.to_string())?;
+        let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT account,bucket,kind,key,subkey,payload FROM s3_entries ORDER BY account,bucket,kind,key,subkey").map_err(sql)?;
         let rows = statement
             .query_map([], |row| {
@@ -557,7 +568,7 @@ impl S3Persistence {
         notifications: &[StoredDelivery],
         next_id: u64,
     ) -> Result<(), String> {
-        let mut connection = self.state.connection().map_err(|error| error.to_string())?;
+        let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
@@ -573,6 +584,7 @@ impl S3Persistence {
             .map_err(sql)?;
         Self::append_notifications(&transaction, notifications)?;
         transaction.commit().map_err(sql)?;
+        drop(connection);
         if let Err(error) = self.remove_candidates(&candidates) {
             tracing::warn!(%error,"S3 obsolete blob cleanup deferred until startup");
         }
@@ -587,7 +599,7 @@ impl S3Persistence {
         notifications: &[StoredDelivery],
     ) -> Result<(), String> {
         let (rows, next_id) = snapshot_rows(payload)?;
-        let mut connection = self.state.connection().map_err(|error| error.to_string())?;
+        let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
@@ -620,6 +632,7 @@ impl S3Persistence {
             .map_err(sql)?;
         Self::append_notifications(&transaction, notifications)?;
         transaction.commit().map_err(sql)?;
+        drop(connection);
         if let Err(error) = self.remove_candidates(&candidates) {
             tracing::warn!(%error,"S3 obsolete blob cleanup deferred until startup");
         }
@@ -630,7 +643,7 @@ impl S3Persistence {
         if candidates.is_empty() {
             return Ok(());
         }
-        let mut connection = self.state.connection().map_err(|error| error.to_string())?;
+        let mut connection = self.connection()?;
         // Hold the SQLite writer lock while checking references and unlinking, so an added
         // reference cannot race between the last-reference check and file removal.
         let transaction = connection
@@ -680,9 +693,7 @@ impl S3Persistence {
             return Ok(true);
         }
         let pending: i64 = self
-            .state
-            .connection()
-            .map_err(|error| error.to_string())?
+            .connection()?
             .query_row("SELECT count(*) FROM s3_notification_outbox", [], |row| {
                 row.get(0)
             })
@@ -692,9 +703,7 @@ impl S3Persistence {
 
     pub(super) fn has_pending(&self) -> Result<bool, String> {
         let exists: i64 = self
-            .state
-            .connection()
-            .map_err(|error| error.to_string())?
+            .connection()?
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM s3_notification_outbox)",
                 [],
@@ -705,9 +714,7 @@ impl S3Persistence {
     }
 
     pub(super) fn max_outbox_id(&self) -> Result<i64, String> {
-        self.state
-            .connection()
-            .map_err(|error| error.to_string())?
+        self.connection()?
             .query_row(
                 "SELECT coalesce(max(id), 0) FROM s3_notification_outbox",
                 [],
@@ -721,7 +728,7 @@ impl S3Persistence {
         after: i64,
         through: i64,
     ) -> Result<Vec<(i64, StoredDelivery)>, String> {
-        let connection = self.state.connection().map_err(|error| error.to_string())?;
+        let connection = self.connection()?;
         let mut statement = connection
             .prepare(
                 "SELECT id,payload FROM s3_notification_outbox WHERE id>?1 AND id<=?2 ORDER BY id LIMIT 64",
@@ -744,9 +751,7 @@ impl S3Persistence {
     }
 
     pub(super) fn delete_outbox(&self, id: i64) -> Result<(), String> {
-        self.state
-            .connection()
-            .map_err(|error| error.to_string())?
+        self.connection()?
             .execute("DELETE FROM s3_notification_outbox WHERE id=?1", [id])
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -1028,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_failure_rolls_back_metadata_counter_and_blob_references() {
+    fn outbox_failure_rolls_back_and_connection_reuses_commit_gc_and_outbox() {
         let (root, db) = fixture();
         let persistence = S3Persistence::new(db.clone()).unwrap();
         persistence
@@ -1046,7 +1051,7 @@ mod tests {
         assert!(persistence
             .save_delta(
                 &[row("object", "k", Some(json!({"body":{"File":blob}})))],
-                &[notification],
+                std::slice::from_ref(&notification),
                 2
             )
             .is_err());
@@ -1062,8 +1067,53 @@ mod tests {
             .query_row("SELECT count(*) FROM s3_blob_refs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(refs, 0);
+        conn.execute_batch("DROP TRIGGER reject_s3_outbox").unwrap();
+        let worker = persistence.clone();
+        worker
+            .save_delta(
+                &[row("object", "k", Some(json!({"body":{"File":blob}})))],
+                &[notification],
+                2,
+            )
+            .unwrap();
+        assert!(persistence.has_pending().unwrap());
+        let through = persistence.max_outbox_id().unwrap();
+        let deliveries = worker.load_outbox(0, through).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&deliveries[0].1).unwrap()["request_id"],
+            "r"
+        );
+        worker
+            .save_delta(&[row("object", "k", None)], &[], 3)
+            .unwrap();
+        assert!(!blob.exists());
+        assert!(persistence.has_pending().unwrap());
+        persistence.delete_outbox(deliveries[0].0).unwrap();
+        assert!(!worker.has_pending().unwrap());
+        {
+            let connection = worker.connection().unwrap();
+            let synchronous: i64 = connection
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            let journal: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(synchronous, 2);
+            assert_eq!(journal, "wal");
+        }
         drop(conn);
+        drop(worker);
         drop(persistence);
+        let reopened = S3Persistence::new(db.clone()).unwrap();
+        assert!(!reopened.has_pending().unwrap());
+        let loaded: Value = serde_json::from_slice(&reopened.load().unwrap().unwrap()).unwrap();
+        assert_eq!(loaded["next_id"], 3);
+        assert!(loaded["buckets"][0][2]["objects"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        drop(reopened);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }

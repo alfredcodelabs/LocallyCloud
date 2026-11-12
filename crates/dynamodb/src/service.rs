@@ -408,10 +408,12 @@ impl NativeHandler for DynamoHandler {
         let result = self
             .dispatch(&op, &context(&self.store, &request), &body)
             .await;
-        if may_mutate || self.store.has_dirty_items().await {
+        if !read_only || self.store.has_dirty_items().await {
             if let Err(err) = self.store.persist().await {
                 return err.into_response(&request.request_id);
             }
+        } else if may_mutate {
+            self.store.clear_uncommitted();
         }
         match result {
             Ok(value) => json_response(value),
@@ -650,6 +652,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_reads_do_not_require_the_sqlite_writer() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compatibility-tests/.work")
+            .join(format!("ddb-unchanged-reads-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state.clone()).unwrap()),
+            Weak::new(),
+        );
+        h.reaper_started.store(true, Ordering::Release);
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        assert_eq!(call(&h, "CreateTable", create).await.status(), 200);
+        assert_eq!(
+            call(
+                &h,
+                "PutItem",
+                r#"{"TableName":"tbl","Item":{"id":{"S":"a"}}}"#
+            )
+            .await
+            .status(),
+            200
+        );
+
+        let mut competing_writer = state.connection().unwrap();
+        let transaction = competing_writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        for (operation, body) in [
+            ("GetItem", r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#),
+            (
+                "Query",
+                r#"{"TableName":"tbl","KeyConditionExpression":"id = :id","ExpressionAttributeValues":{":id":{"S":"a"}}}"#,
+            ),
+            ("Scan", r#"{"TableName":"tbl"}"#),
+        ] {
+            let (status, body) = call_json(&h, operation, body).await;
+            assert_eq!(status, 200, "{operation}: {body}");
+            let item = if operation == "GetItem" {
+                &body["Item"]
+            } else {
+                &body["Items"][0]
+            };
+            assert_eq!(item["id"]["S"], "a", "{operation}: {body}");
+            assert!(!h.store.has_uncommitted(), "{operation}");
+        }
+        transaction.rollback().unwrap();
+        drop(competing_writer);
+        drop(h);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_metadata_commit_is_flushed_before_read() {
         let root = std::env::temp_dir().join(format!(
             "locallycloud-ddb-poison-{}-{}",
@@ -674,6 +728,16 @@ mod tests {
             .await
             .def
             .billing_mode = "PROVISIONED".into();
+        assert_eq!(
+            call(
+                &h,
+                "GetItem",
+                r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#
+            )
+            .await
+            .status(),
+            200
+        );
         let (status, body) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
         assert_eq!(status, 200);
         assert_eq!(
@@ -1462,7 +1526,15 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_reaps_expired_items_on_read() {
-        let h = DynamoHandler::new();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compatibility-tests/.work")
+            .join(format!("ddb-read-expiry-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state.clone()).unwrap()),
+            Weak::new(),
+        );
+        h.reaper_started.store(true, Ordering::Release);
         let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"OLD_IMAGE"}}"#;
         call(&h, "CreateTable", create).await;
         let (s, _) = call_json(
@@ -1486,6 +1558,13 @@ mod tests {
         )
         .await;
 
+        let (status, backup) = call_json(&h, "UpdateContinuousBackups", r#"{"TableName":"tbl","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#).await;
+        assert_eq!(status, 200, "{backup}");
+        let before_expiry = backup["ContinuousBackupsDescription"]
+            ["PointInTimeRecoveryDescription"]["LatestRestorableDateTime"]
+            .as_f64()
+            .unwrap();
+
         // GetItem on the expired item reaps it → no Item.
         let (_, v) = call_json(
             &h,
@@ -1494,6 +1573,23 @@ mod tests {
         )
         .await;
         assert!(v.get("Item").is_none());
+        assert!(!h.store.has_uncommitted());
+        drop(h);
+        let h = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(state.clone()).unwrap()),
+            Weak::new(),
+        );
+        h.reaper_started.store(true, Ordering::Release);
+        assert_eq!(
+            h.store
+                .get("000000000000", "us-east-1", "tbl")
+                .unwrap()
+                .read()
+                .await
+                .items
+                .len(),
+            1
+        );
         // The live item remains.
         let (_, v) = call_json(
             &h,
@@ -1532,7 +1628,31 @@ mod tests {
             .iter()
             .map(|r| r["eventName"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"REMOVE"));
+        assert_eq!(names.iter().filter(|name| **name == "REMOVE").count(), 1);
+
+        for (target, timestamp, present) in [
+            ("prior", Some(before_expiry), true),
+            ("latest", None, false),
+        ] {
+            let mut restore = serde_json::json!({"SourceTableName":"tbl","TargetTableName":target});
+            if let Some(timestamp) = timestamp {
+                restore["RestoreDateTime"] = serde_json::json!(timestamp);
+            } else {
+                restore["UseLatestRestorableTime"] = serde_json::json!(true);
+            }
+            let (status, restored) =
+                call_json(&h, "RestoreTableToPointInTime", &restore.to_string()).await;
+            assert_eq!(status, 200, "{restored}");
+            let (_, item) = call_json(
+                &h,
+                "GetItem",
+                &serde_json::json!({"TableName":target,"Key":{"id":{"S":"old"}}}).to_string(),
+            )
+            .await;
+            assert_eq!(item.get("Item").is_some(), present, "{target}: {item}");
+        }
+        drop(h);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
