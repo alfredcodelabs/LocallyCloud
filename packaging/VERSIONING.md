@@ -34,6 +34,16 @@ bash scripts/check-package-version.sh
 
 For a new version, edit Cargo.toml and update Cargo.lock with `cargo update --workspace --offline`. Run the checks before creating the tag. GitHub Actions requires the tag to match the output of `package-version.sh tag` and builds all artifacts from that commit. The local scripts do not publish releases or packages.
 
+## 0.1.1 release
+
+The next release tag is `v0.1.1`, with packaging revision 1. It includes the
+Lambda reserved-region environment validation and S3 bucket recreation fixes,
+plus Clippy 1.95 compatibility fixes. It publishes only after the workflow gates
+below succeed; the existing `v0.1.0` tag is preserved.
+
+The AUR recipe stays pinned to its verified archive until publication. Then run
+`packaging/aur/update.sh v0.1.1` to refresh the real source checksum and `.SRCINFO`.
+
 ## 0.1.0 release
 
 The release tag is `v0.1.0`, with packaging revision 1. It has no prerelease suffix and becomes the GitHub `latest` release only after the publishing workflow succeeds. Version `0.x` still permits API changes; this is not a declaration of `1.0` API stability.
@@ -68,7 +78,7 @@ There are two Arch recipes. `packaging/arch/PKGBUILD` builds the local checkout 
 After the release tag is published, on an Arch machine:
 
 ```sh
-bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.0
+bash packaging/aur/update.sh            # tag derived from Cargo.toml, or pass one: v0.1.1
 cd packaging/aur && makepkg --cleanbuild && namcap PKGBUILD ./*.pkg.tar.zst
 ```
 
@@ -110,8 +120,8 @@ After saving and pushing the version and Cargo.lock changes:
 
 ```sh
 bash scripts/check-package-version.sh
-git tag -a v0.1.0 -m "LocallyCloud 0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "LocallyCloud 0.1.1"
+git push origin v0.1.1
 ```
 
 Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, the ExtendDB workers and notices, `components.json`, and `SHA256SUMS`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
