@@ -11,6 +11,7 @@ pub mod execute;
 pub mod logging;
 pub mod proxy_event;
 pub mod service;
+mod stage_path;
 pub mod store;
 mod tags;
 pub mod v1;

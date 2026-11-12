@@ -4,6 +4,9 @@ use serde_json::{json, Map, Value};
 
 use crate::error::CfnError;
 
+#[path = "sam/policies.rs"]
+mod policies;
+
 fn http_api_domain(
     generated: &mut Map<String, Value>,
     api: &str,
@@ -456,6 +459,7 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
                         "Handler",
                         "Runtime",
                         "Role",
+                        "Policies",
                         "Environment",
                         "VpcConfig",
                         "Timeout",
@@ -500,15 +504,22 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
                         managed_policies
                             .push(json!("arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"));
                     }
-                    add_generated(
-                        &mut generated,
-                        role_id,
-                        json!({"Type":"AWS::IAM::Role","Properties":{
-                            "AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[{
-                                "Effect":"Allow","Action":["sts:AssumeRole"],
-                                "Principal":{"Service":["lambda.amazonaws.com"]}}]},
-                            "ManagedPolicyArns":managed_policies}}),
-                    )?;
+                    let (extra_managed, inline) =
+                        policies::role_policies(&role_id, p.get("Policies"))?;
+                    for policy in extra_managed {
+                        if !managed_policies.contains(&policy) {
+                            managed_policies.push(policy);
+                        }
+                    }
+                    let mut role = json!({"Type":"AWS::IAM::Role","Properties":{
+                        "AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[{
+                            "Effect":"Allow","Action":["sts:AssumeRole"],
+                            "Principal":{"Service":["lambda.amazonaws.com"]}}]},
+                        "ManagedPolicyArns":managed_policies}});
+                    if !inline.is_empty() {
+                        role["Properties"]["Policies"] = Value::Array(inline);
+                    }
+                    add_generated(&mut generated, role_id, role)?;
                 }
                 let uri = p
                     .get("CodeUri")
@@ -657,6 +668,7 @@ fn transform_inner(raw: &mut Value) -> Result<(), CfnError> {
 
 #[cfg(test)]
 mod tests {
+    use super::globals_tests::template;
     use super::*;
 
     #[test]
@@ -691,6 +703,72 @@ mod tests {
         let unchanged = invalid.clone();
         assert!(transform(&mut invalid).is_err());
         assert_eq!(invalid, unchanged);
+    }
+
+    #[test]
+    fn function_policies_generate_scoped_dynamodb_permissions_and_preserve_inline_deny() {
+        let deny = json!({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:DeleteItem","Resource":"*"}]});
+        let arn = "arn:aws:iam::000000000000:policy/ExistingPolicy";
+        let mut raw = template(
+            json!({}),
+            json!({"CodeUri":"s3://artifacts/fn.zip","Policies":[
+                {"DynamoDBCrudPolicy":{"TableName":{"Ref":"Items"}}}, deny, arn
+            ]}),
+        );
+        transform(&mut raw).unwrap();
+        let role = &raw["Resources"]["WorkerRole"]["Properties"];
+        let policy = &role["Policies"][0];
+        assert_eq!(policy["PolicyName"], "WorkerRolePolicy0");
+        let statement = &policy["PolicyDocument"]["Statement"][0];
+        assert_eq!(statement["Effect"], "Allow");
+        assert!(statement["Action"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dynamodb:PutItem")));
+        assert!(!statement["Action"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dynamodb:*")));
+        assert_eq!(
+            statement["Resource"],
+            json!([
+                {"Fn::Sub":["arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${tableName}",{"tableName":{"Ref":"Items"}}]},
+                {"Fn::Sub":["arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${tableName}/index/*",{"tableName":{"Ref":"Items"}}]}
+            ])
+        );
+        assert_eq!(role["Policies"][1]["PolicyDocument"], deny);
+        assert!(role["ManagedPolicyArns"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(arn)));
+        assert!(raw["Resources"]["Worker"]["Properties"]
+            .get("Policies")
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_function_policies_fail_without_mutating_the_template() {
+        for policy in [
+            json!(false),
+            json!({"UnknownPolicy":{}}),
+            json!({"DynamoDBCrudPolicy":{}}),
+            json!({"DynamoDBCrudPolicy":{"TableName":true}}),
+            json!({"DynamoDBCrudPolicy":{"TableName":"table","Extra":"ignored"}}),
+        ] {
+            let mut raw = template(
+                json!({}),
+                json!({"CodeUri":"s3://artifacts/fn.zip","Policies":[policy]}),
+            );
+            let original = raw.clone();
+            assert!(transform(&mut raw).is_err());
+            assert_eq!(raw, original);
+        }
+        let mut raw = template(
+            json!({}),
+            json!({"CodeUri":"s3://artifacts/fn.zip","Role":"arn:aws:iam::000000000000:role/Provided","Policies":[{"UnknownPolicy":{}}]}),
+        );
+        transform(&mut raw).unwrap();
+        assert!(raw["Resources"].get("WorkerRole").is_none());
     }
 
     #[test]
@@ -827,7 +905,7 @@ mod tests {
 mod globals_tests {
     use super::*;
 
-    fn template(globals: Value, properties: Value) -> Value {
+    pub(super) fn template(globals: Value, properties: Value) -> Value {
         json!({"Transform":"AWS::Serverless-2016-10-31", "Globals":globals,
             "Resources":{"Worker":{"Type":"AWS::Serverless::Function", "Properties":properties}}})
     }

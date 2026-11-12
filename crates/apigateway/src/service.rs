@@ -22,6 +22,7 @@ use crate::auth::JwtValidator;
 use crate::domains::DomainBindings;
 use crate::error::ApiGwError;
 use crate::execute::{self, ExecuteCtx};
+use crate::stage_path::control_stage_path;
 use crate::store::ApiGwStore;
 use crate::v1::Ctx;
 use crate::{v1, v2, websocket};
@@ -870,7 +871,10 @@ impl NativeHandler for ApiGwHandler {
             .await;
         }
 
-        let path = request.uri.path().to_string();
+        let path = match control_stage_path(request.uri.path()) {
+            Ok(path) => path,
+            Err(error) => return error.into_response(&request.request_id),
+        };
         if path.starts_with("/tags/") && path.contains("//") {
             return ApiGwError::BadRequest("Invalid tagging resource path".into())
                 .into_response(&request.request_id);
@@ -891,11 +895,7 @@ impl NativeHandler for ApiGwHandler {
             return error.into_response(&request.request_id);
         }
         if request.method == Method::GET || segs.first() == Some(&"tags") {
-            let resource = format!(
-                "arn:aws:apigateway:{}::{}",
-                request.region,
-                request.uri.path()
-            );
+            let resource = format!("arn:aws:apigateway:{}::{}", request.region, path);
             if locallycloud_core::integration::authorization::authorize_native_read(
                 &self.registry,
                 &request,
@@ -1141,6 +1141,95 @@ mod tests {
         let mut handler = ApiGwHandler::new(registry);
         handler.domains = crate::domains::fixture_bindings();
         handler
+    }
+
+    #[tokio::test]
+    async fn encoded_default_stage_round_trips_and_authorizes_the_decoded_resource() {
+        use locallycloud_core::integration::authorization::{
+            AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
+        };
+        struct StageAuthorization(String);
+        impl AuthorizationEvaluator for StageAuthorization {
+            fn strict_sigv4_required(&self) -> bool {
+                true
+            }
+            fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError> {
+                if request.resource == self.0 {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::Denied)
+                }
+            }
+        }
+        let registry = ServiceRegistry::with_known_services();
+        let handler = test_handler(Arc::downgrade(&registry));
+        let (_, api) = call(
+            &handler,
+            Method::POST,
+            "/v2/apis",
+            json!({"name":"encoded-stage","protocolType":"HTTP"}),
+        )
+        .await;
+        let id = api["apiId"].as_str().unwrap();
+        let stages = format!("/v2/apis/{id}/stages");
+        assert_eq!(
+            call(
+                &handler,
+                Method::POST,
+                &stages,
+                json!({"stageName":"$default","autoDeploy":true})
+            )
+            .await
+            .0,
+            201
+        );
+        let encoded = format!("{stages}/%24default");
+        assert_eq!(
+            call(&handler, Method::GET, &encoded, Value::Null).await.1["stageName"],
+            "$default"
+        );
+        assert_eq!(
+            call(
+                &handler,
+                Method::PATCH,
+                &encoded,
+                json!({"description":"updated"})
+            )
+            .await
+            .0,
+            200
+        );
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(test_handler(Weak::new())),
+            Arc::new(StageAuthorization(format!(
+                "arn:aws:apigateway:us-east-1::{stages}/$default"
+            ))),
+        );
+        for (name, expected) in [("%24default", 200), ("other", 403)] {
+            let mut request = req(Method::GET, &format!("{stages}/{name}"), Value::Null);
+            request.headers.insert(
+                "x-locallycloud-verified-external-sigv4",
+                "1".parse().unwrap(),
+            );
+            request.headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20261112/us-east-1/apigateway/aws4_request, SignedHeaders=host, Signature=test".parse().unwrap());
+            assert_eq!(handler.handle(request).await.status(), expected);
+        }
+        assert_eq!(
+            call(&handler, Method::DELETE, &encoded, Value::Null)
+                .await
+                .0,
+            204
+        );
+        assert!(!handler
+            .store
+            .v2("000000000000", "us-east-1", id)
+            .unwrap()
+            .read()
+            .await
+            .stages
+            .contains_key("$default"));
     }
 
     #[tokio::test]
