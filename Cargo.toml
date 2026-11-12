@@ -150,3 +150,6 @@ opt-level = 3
 
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

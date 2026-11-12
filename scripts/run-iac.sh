@@ -21,7 +21,7 @@ log="$work/run.log"
 failed=0
 declare -A recorded=()
 
-for v in $(env | grep -oE '^AWS_[A-Z_]+'); do unset "$v"; done
+for v in "${!AWS_@}"; do unset "$v"; done
 export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true AWS_PROFILE=default
 export SAM_CLI_TELEMETRY=0 SLS_TELEMETRY_DISABLED=1 SLS_NOTIFICATIONS_MODE=off CHECKPOINT_DISABLE=1
 export TF_PLUGIN_CACHE_DIR="$here/.tfcache"; mkdir -p "$TF_PLUGIN_CACHE_DIR"
