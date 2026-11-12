@@ -24,6 +24,15 @@ use crate::streams;
 pub(crate) const TARGET_PREFIX: &str = "DynamoDB_20120810";
 pub(crate) const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810";
 
+// Notify after mutations finish or are cancelled, including error paths.
+struct MaintenanceWake<'a>(&'a tokio::sync::Notify);
+
+impl Drop for MaintenanceWake<'_> {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 /// The natively-implemented DynamoDB service.
 pub struct DynamoHandler {
     store: Arc<TableStore>,
@@ -73,15 +82,37 @@ impl DynamoHandler {
             return;
         }
         let store = Arc::downgrade(&self.store);
+        let changed = self.store.maintenance_changed.clone();
         let registry = self.registry.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut last_run = tokio::time::Instant::now();
             loop {
-                interval.tick().await;
-                let Some(store) = store.upgrade() else {
+                let notified = changed.notified();
+                tokio::pin!(notified);
+                // Register before checking the weak store so shutdown cannot lose its wakeup.
+                notified.as_mut().enable();
+                let Some(current) = store.upgrade() else {
                     break;
                 };
-                ops::run_maintenance(&store, &registry).await;
+                let deadline = current.maintenance_deadline(last_run);
+                drop(current);
+                match deadline {
+                    Some(deadline) => {
+                        tokio::select! {
+                            _ = &mut notified => continue,
+                            _ = tokio::time::sleep_until(deadline) => {}
+                        }
+                    }
+                    None => {
+                        notified.await;
+                        continue;
+                    }
+                }
+                let Some(current) = store.upgrade() else {
+                    break;
+                };
+                ops::run_maintenance(&current, &registry).await;
+                last_run = tokio::time::Instant::now();
             }
         });
     }
@@ -401,6 +432,11 @@ impl NativeHandler for DynamoHandler {
                 | "DescribeExport"
                 | "ListExports"
         );
+        let _maintenance_wake = if read_only {
+            None
+        } else {
+            Some(MaintenanceWake(&self.store.maintenance_changed))
+        };
         let may_mutate = !read_only || matches!(op.as_str(), "GetItem" | "Query" | "Scan");
         if may_mutate {
             self.store.mark_uncommitted();
@@ -2042,6 +2078,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_does_not_write_lock_unrelated_tables() {
+        let h = DynamoHandler::new();
+        h.reaper_started.store(true, Ordering::Release);
+        for name in ["plain", "expires"] {
+            let create = serde_json::json!({"TableName":name,"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"});
+            assert_eq!(
+                call(&h, "CreateTable", &create.to_string()).await.status(),
+                200
+            );
+        }
+        call(&h, "UpdateTimeToLive", r#"{"TableName":"expires","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"exp"}}"#).await;
+        call(
+            &h,
+            "PutItem",
+            r#"{"TableName":"expires","Item":{"id":{"S":"old"},"exp":{"N":"1"}}}"#,
+        )
+        .await;
+        let unrelated = h.store.get("000000000000", "us-east-1", "plain").unwrap();
+        let _reader = unrelated.read().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            ops::run_maintenance(&h.store, &Weak::new()),
+        )
+        .await
+        .unwrap();
+        assert!(h
+            .store
+            .get("000000000000", "us-east-1", "expires")
+            .unwrap()
+            .read()
+            .await
+            .items
+            .is_empty());
+        assert!(h
+            .store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn ttl_reaper_runs_without_a_read_trigger() {
         let h = DynamoHandler::new();
         let create = r#"{"TableName":"ttl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"OLD_IMAGE"}}"#;
@@ -2052,6 +2128,14 @@ mod tests {
             r#"{"TableName":"ttl","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"exp"}}"#,
         )
         .await;
+        // Give the empty TTL table's worker a chance to enter its idle wait.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(h
+            .store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .is_none());
         call(
             &h,
             "PutItem",
@@ -2071,6 +2155,20 @@ mod tests {
                 .count(),
             1
         );
+        drop(guard);
+        assert!(h
+            .store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .is_none());
+        let changed = h.store.maintenance_changed.clone();
+        drop(h);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&changed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

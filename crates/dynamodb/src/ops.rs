@@ -1576,6 +1576,9 @@ fn reap_expired(data: &mut TableData, now_secs: f64) {
 pub async fn sweep_expired(store: &TableStore) {
     let now = now_epoch_secs();
     for (_, _, table) in store.all_tables() {
+        if table.read().await.ttl_attribute.is_none() {
+            continue;
+        }
         let mut guard = table.write().await;
         reap_expired(&mut guard, now);
     }
@@ -1596,6 +1599,9 @@ pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry
     sweep_expired(store).await;
     let mut changed = replicate_pending(store).await;
     for (_, region, table) in store.all_tables() {
+        if table.read().await.kinesis_pending.is_empty() {
+            continue;
+        }
         let pending = {
             let mut guard = table.write().await;
             std::mem::take(&mut guard.kinesis_pending)
@@ -1611,14 +1617,7 @@ pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry
             }
         }
     }
-    if !changed {
-        for (_, _, table) in store.all_tables() {
-            if !table.read().await.dirty_keys.is_empty() {
-                changed = true;
-                break;
-            }
-        }
-    }
+    changed |= store.has_dirty_items().await;
     if changed {
         if let Err(error) = store.persist().await {
             tracing::error!(%error, "DynamoDB maintenance persistence failed");
@@ -1636,6 +1635,9 @@ pub async fn replicate_pending(store: &TableStore) -> bool {
     // multi-table replication throughput becomes a bottleneck.
     let _topology = store.replica_topology.lock().await;
     for (account, source_region, table) in store.all_tables() {
+        if table.read().await.replica_pending.is_empty() {
+            continue;
+        }
         let (name, targets, pending) = {
             let mut guard = table.write().await;
             (

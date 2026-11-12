@@ -15,7 +15,7 @@ use locallycloud_state::{StateCipher, StateDb};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::error::DdbError;
 use crate::value::{number_cmp, AttributeValue, Item};
@@ -466,13 +466,21 @@ impl StoredTable {
 pub struct TableStore {
     tables: DashMap<ScopedKey, Arc<StoredTable>>,
     pending_tables: Arc<DashSet<ScopedKey>>,
+    maintenance_tables: DashSet<ScopedKey>,
     txn_tokens: DashMap<TxnTokenKey, Arc<Mutex<Option<TxnOutcome>>>>,
     pub replica_topology: Mutex<()>,
     pub operation_gate: Mutex<()>,
+    pub(crate) maintenance_changed: Arc<Notify>,
     pub(crate) capacity: crate::capacity::CapacityModel,
     uncommitted: AtomicBool,
     pub(crate) state: Option<Arc<StateDb>>,
     pub(crate) cipher: Option<Arc<StateCipher>>,
+}
+
+impl Drop for TableStore {
+    fn drop(&mut self) {
+        self.maintenance_changed.notify_waiters();
+    }
 }
 
 pub(crate) fn validate_table_name(name: &str) -> Result<(), DdbError> {
@@ -547,11 +555,9 @@ impl TableStore {
         connection
             .execute_batch(crate::recovery::SCHEMA)
             .map_err(persist_error)?;
-        let store = Self {
-            state: Some(state),
-            cipher,
-            ..Self::default()
-        };
+        let mut store = Self::new();
+        store.state = Some(state);
+        store.cipher = cipher;
         {
             let mut query = connection
                 .prepare("SELECT account, region, name, metadata FROM dynamodb_tables")
@@ -718,14 +724,16 @@ impl TableStore {
                 );
             }
         }
+        for entry in &store.tables {
+            let data = entry.value().data.try_read().map_err(persist_error)?;
+            store.track_maintenance(entry.key(), &data);
+        }
         Ok(store)
     }
 
     /// A cancelled or failed request must commit its in-memory changes before another read.
     pub fn mark_uncommitted(&self) {
-        if self.state.is_some() {
-            self.uncommitted.store(true, AtomicOrdering::Release);
-        }
+        self.uncommitted.store(true, AtomicOrdering::Release);
     }
 
     pub fn has_uncommitted(&self) -> bool {
@@ -753,10 +761,6 @@ impl TableStore {
     /// Commit changed items and metadata before the service acknowledges a write.
     /// Callers serialize mutations with operation_gate, including cancellation recovery.
     pub async fn persist(&self) -> Result<(), DdbError> {
-        let Some(state) = &self.state else {
-            self.clear_uncommitted();
-            return Ok(());
-        };
         let pending = self.pending_keys();
         let entries: Vec<_> = pending
             .iter()
@@ -770,6 +774,25 @@ impl TableStore {
         for ((account, region, _), table) in &entries {
             locked.push((account, region, table.data.write().await));
         }
+        let Some(state) = &self.state else {
+            for (account, region, table) in &locked {
+                self.track_maintenance(
+                    &(
+                        account.to_string(),
+                        region.to_string(),
+                        table.def.name.clone(),
+                    ),
+                    table,
+                );
+            }
+            for key in &pending {
+                if !self.tables.contains_key(key) {
+                    self.maintenance_tables.remove(key);
+                }
+            }
+            self.clear_uncommitted();
+            return Ok(());
+        };
         let mut connection = state.connection().map_err(persist_error)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -898,6 +921,21 @@ impl TableStore {
         }
         crate::recovery::prune(&transaction)?;
         transaction.commit().map_err(persist_error)?;
+        for (account, region, table) in &locked {
+            self.track_maintenance(
+                &(
+                    account.to_string(),
+                    region.to_string(),
+                    table.def.name.clone(),
+                ),
+                table,
+            );
+        }
+        for key in &pending {
+            if !self.tables.contains_key(key) {
+                self.maintenance_tables.remove(key);
+            }
+        }
         self.clear_uncommitted();
         for (_, _, mut table) in locked {
             table.dirty_keys.clear();
@@ -982,6 +1020,47 @@ impl TableStore {
             .entry((account.to_string(), region.to_string(), token.to_string()))
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
+    }
+
+    fn track_maintenance(&self, key: &ScopedKey, data: &TableData) {
+        if (data.ttl_attribute.is_some() && !data.items.is_empty())
+            || !data.replica_pending.is_empty()
+            || !data.kinesis_pending.is_empty()
+        {
+            self.maintenance_tables.insert(key.clone());
+        } else {
+            self.maintenance_tables.remove(key);
+        }
+    }
+
+    pub(crate) fn maintenance_deadline(
+        &self,
+        last_run: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        let retry = last_run + Duration::from_millis(100);
+        if self.has_uncommitted() {
+            return Some(retry);
+        }
+        if !self.maintenance_tables.is_empty() {
+            return Some(retry);
+        }
+        self.txn_tokens
+            .iter()
+            .map(|entry| {
+                let outcome = match entry.value().try_lock() {
+                    Ok(outcome) => outcome,
+                    Err(_) => return retry,
+                };
+                match outcome.as_ref() {
+                    Some(outcome) if outcome.created_at.elapsed() < Duration::from_secs(600) => {
+                        tokio::time::Instant::from_std(
+                            outcome.created_at + Duration::from_secs(600),
+                        )
+                    }
+                    _ => retry,
+                }
+            })
+            .min()
     }
 
     pub fn purge_expired_txn_tokens(&self) {
@@ -1283,6 +1362,92 @@ mod tests {
         }
         assert!(reopened.get("0", "us-east-1", "removed").is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_deadlines_follow_commits_restore_and_token_expiry() {
+        let root = std::env::temp_dir().join(format!("ddb-maintenance-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let store = TableStore::with_state(state.clone()).unwrap();
+        store
+            .create("0", "us-east-1", data(simple_def("plain")))
+            .unwrap();
+        store.persist().await.unwrap();
+        let last = tokio::time::Instant::now();
+        assert!(store.maintenance_deadline(last).is_none());
+        let mut ttl = data(simple_def("expires"));
+        ttl.ttl_attribute = Some("exp".into());
+        let mut item = Item::new();
+        item.insert("pk".into(), AttributeValue::S("one".into()));
+        item.insert("exp".into(), AttributeValue::N("1".into()));
+        let key = ttl.key_of(&item).unwrap();
+        ttl.emit_stream(None, Some(&item));
+        ttl.items.insert(key, item);
+        store.create("0", "us-east-1", ttl).unwrap();
+        store.persist().await.unwrap();
+        assert_eq!(
+            store.maintenance_deadline(last),
+            Some(last + Duration::from_millis(100))
+        );
+        drop(store);
+        let store = TableStore::with_state(state).unwrap();
+        assert!(store.maintenance_deadline(last).is_some());
+        store
+            .get("0", "us-east-1", "expires")
+            .unwrap()
+            .write()
+            .await
+            .ttl_attribute = None;
+        store.persist().await.unwrap();
+        assert!(store.maintenance_deadline(last).is_none());
+        let created_at = Instant::now();
+        let slot = store.txn_slot("0", "us-east-1", "token");
+        *slot.lock().await = Some(TxnOutcome {
+            fingerprint: "request".into(),
+            result: Ok(serde_json::json!({})),
+            created_at,
+        });
+        assert_eq!(
+            store.maintenance_deadline(last),
+            Some(tokio::time::Instant::from_std(
+                created_at + Duration::from_secs(600)
+            ))
+        );
+        slot.lock().await.as_mut().unwrap().created_at = created_at - Duration::from_secs(601);
+        drop(slot);
+        store.purge_expired_txn_tokens();
+        assert!(store.maintenance_deadline(last).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_memory_mutation_keeps_maintenance_scheduled() {
+        let store = TableStore::new();
+        let mut ttl = data(simple_def("expires"));
+        ttl.ttl_attribute = Some("exp".into());
+        let mut item = Item::new();
+        item.insert("pk".into(), AttributeValue::S("one".into()));
+        item.insert("exp".into(), AttributeValue::N("1".into()));
+        ttl.items.insert(ttl.key_of(&item).unwrap(), item);
+        store.mark_uncommitted();
+        store.create("0", "us-east-1", ttl).unwrap();
+        // Simulate cancellation after mutation but before persist refreshes the index.
+        assert!(store.maintenance_tables.is_empty());
+        assert!(store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .is_some());
+        crate::ops::run_maintenance(&store, &std::sync::Weak::new()).await;
+        assert!(!store.has_uncommitted());
+        assert!(store
+            .get("0", "us-east-1", "expires")
+            .unwrap()
+            .read()
+            .await
+            .items
+            .is_empty());
+        assert!(store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .is_none());
     }
 
     #[test]
