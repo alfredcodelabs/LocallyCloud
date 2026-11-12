@@ -58,7 +58,7 @@ step() {  # step <tool> <name> <command...>
   echo "### $tool/$name: $*" >> "$log"
   if detail="$("$@" 2>&1)"; then status=PASS; else status=FAIL; fi
   echo "$detail" >> "$log"
-  detail="$(echo "$detail" | grep -iE 'error|fail|exception|denied|unsupported|not ' | head -2 | tr '\t\n' '  ' | cut -c1-240)"
+  detail="$(echo "$detail" | grep -iE -A 1 'error|fail|exception|denied|unsupported|not ' | head -4 | tr '\t\n' '  ' | cut -c1-240)"
   record "$tool" "$name" "$status" "$((SECONDS - t0))" "$detail"
   [ "$status" = PASS ]
 }
@@ -135,12 +135,25 @@ sam_flow() {
 }
 
 serverless_flow() {
-  local d="$work/serverless"
-  [ -d "$here/serverless/node_modules" ] || { record serverless setup FAIL 0 'Missing Serverless dependencies'; return 1; }
+  local d="$work/serverless" fixture="${IAC_SERVERLESS_FIXTURE:-$here/serverless-osls}"
+  [ -x "$fixture/node_modules/.bin/osls" ] || { record serverless setup FAIL 0 'Missing Open Serverless dependencies: install the pinned osls fixture'; return 1; }
+  step serverless toolchain node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const root = process.argv[1];
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json")));
+    const installed = JSON.parse(fs.readFileSync(path.join(root, "node_modules/osls/package.json")));
+    const expected = manifest.devDependencies?.osls;
+    if (installed.name !== "osls" || !/^4\.[0-9]+\.[0-9]+$/.test(expected ?? "") || installed.version !== expected) {
+      console.error("Expected pinned osls v4; installed version differs from fixture");
+      process.exit(1);
+    }
+    console.log(JSON.stringify({cli: installed.name, version: installed.version}));
+  ' "$fixture" || return 1
   mkdir -p "$d" || return 1
-  find "$here/serverless" -mindepth 1 -maxdepth 1 ! -name node_modules ! -name .serverless ! -name .git -exec cp -r -t "$d" -- {} + || return 1
-  ln -s "$here/serverless/node_modules" "$d/node_modules" || return 1
-  local sls=(sh -c "cd '$d' && npx --no-install serverless \"\$@\"" sls)
+  find "$fixture" -mindepth 1 -maxdepth 1 ! -name node_modules ! -name .serverless ! -name .git -exec cp -r -t "$d" -- {} + || return 1
+  ln -s "$fixture/node_modules" "$d/node_modules" || return 1
+  local sls=(env -C "$d" "$d/node_modules/.bin/osls")
   step serverless deploy "${sls[@]}" deploy --stage local || { step serverless remove "${sls[@]}" remove --stage local; return; }
   local api; api="$(aws apigatewayv2 get-apis --query "Items[?Name=='local-lcbench'].ApiId | [0]" --output text)"
   local url; url="$(api_url "$api")"
