@@ -9,7 +9,6 @@ use base64::Engine;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Uri};
 use serde_json::{json, Map, Value};
-use tokio::sync::RwLock;
 
 use locallycloud_core::registry::ServiceRegistry;
 
@@ -70,7 +69,7 @@ fn now_epoch_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-async fn get_table(ctx: &Ctx<'_>, name: &str) -> Result<Arc<RwLock<TableData>>, DdbError> {
+async fn get_table(ctx: &Ctx<'_>, name: &str) -> Result<Arc<crate::store::StoredTable>, DdbError> {
     ctx.store.get(ctx.account, ctx.region, name).ok_or_else(|| {
         DdbError::ResourceNotFound(format!(
             "Requested resource not found: Table: {name} not found"
@@ -1013,7 +1012,7 @@ pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
 async fn update_replicas(
     ctx: &Ctx<'_>,
     req: &Value,
-    table: &Arc<RwLock<TableData>>,
+    table: &Arc<crate::store::StoredTable>,
 ) -> Result<Value, DdbError> {
     let updates = req
         .get("ReplicaUpdates")

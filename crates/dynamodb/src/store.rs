@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use locallycloud_state::{StateCipher, StateDb};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -428,10 +428,44 @@ pub struct TxnOutcome {
     pub created_at: Instant,
 }
 
+/// Table access registers persistence candidates at the mutation boundary.
+pub struct StoredTable {
+    data: Arc<RwLock<TableData>>,
+    key: ScopedKey,
+    pending: Arc<DashSet<ScopedKey>>,
+}
+
+impl StoredTable {
+    fn new(data: TableData, key: ScopedKey, pending: Arc<DashSet<ScopedKey>>) -> Self {
+        Self {
+            data: Arc::new(RwLock::new(data)),
+            key,
+            pending,
+        }
+    }
+
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, TableData> {
+        self.data.read().await
+    }
+
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, TableData> {
+        let guard = self.data.write().await;
+        self.pending.insert(self.key.clone());
+        guard
+    }
+
+    pub async fn write_owned(self: Arc<Self>) -> tokio::sync::OwnedRwLockWriteGuard<TableData> {
+        let guard = self.data.clone().write_owned().await;
+        self.pending.insert(self.key.clone());
+        guard
+    }
+}
+
 /// Region/account-scoped table store.
 #[derive(Default)]
 pub struct TableStore {
-    tables: DashMap<ScopedKey, Arc<RwLock<TableData>>>,
+    tables: DashMap<ScopedKey, Arc<StoredTable>>,
+    pending_tables: Arc<DashSet<ScopedKey>>,
     txn_tokens: DashMap<TxnTokenKey, Arc<Mutex<Option<TxnOutcome>>>>,
     pub replica_topology: Mutex<()>,
     pub operation_gate: Mutex<()>,
@@ -541,9 +575,14 @@ impl TableStore {
                 )?;
                 let saved: PersistedTable =
                     serde_json::from_str(&metadata).map_err(persist_error)?;
+                let key = (account, region, name);
                 store.tables.insert(
-                    (account, region, name),
-                    Arc::new(RwLock::new(saved.into_data())),
+                    key.clone(),
+                    Arc::new(StoredTable::new(
+                        saved.into_data(),
+                        key,
+                        store.pending_tables.clone(),
+                    )),
                 );
             }
         }
@@ -572,6 +611,7 @@ impl TableStore {
             let key: StoredKey = serde_json::from_str(&key).map_err(persist_error)?;
             if let Some(table) = store.get(&account, &region, &name) {
                 table
+                    .data
                     .try_write()
                     .expect("newly loaded table has no readers")
                     .items
@@ -608,6 +648,7 @@ impl TableStore {
                 let record = serde_json::from_str(&record).map_err(persist_error)?;
                 if let Some(table) = store.get(&account, &region, &name) {
                     let mut guard = table
+                        .data
                         .try_write()
                         .expect("newly loaded table has no readers");
                     guard.stream_records.push(record);
@@ -638,6 +679,7 @@ impl TableStore {
                 let version = serde_json::from_str(&version).map_err(persist_error)?;
                 if let Some(table) = store.get(&account, &region, &name) {
                     table
+                        .data
                         .try_write()
                         .expect("newly loaded table has no readers")
                         .replica_versions
@@ -690,12 +732,17 @@ impl TableStore {
         self.uncommitted.load(AtomicOrdering::Acquire)
     }
 
+    // Callers hold operation_gate and have either committed or ruled out mutations.
     pub fn clear_uncommitted(&self) {
+        self.pending_tables.clear();
         self.uncommitted.store(false, AtomicOrdering::Release);
     }
 
     pub async fn has_dirty_items(&self) -> bool {
-        for (_, _, table) in self.all_tables() {
+        for key in self.pending_keys() {
+            let Some(table) = self.tables.get(&key).map(|entry| entry.value().clone()) else {
+                continue;
+            };
             if !table.read().await.dirty_keys.is_empty() {
                 return true;
             }
@@ -704,23 +751,31 @@ impl TableStore {
     }
 
     /// Commit changed items and metadata before the service acknowledges a write.
+    /// Callers serialize mutations with operation_gate, including cancellation recovery.
     pub async fn persist(&self) -> Result<(), DdbError> {
         let Some(state) = &self.state else {
+            self.clear_uncommitted();
             return Ok(());
         };
-        let entries = self.all_tables();
+        let pending = self.pending_keys();
+        let entries: Vec<_> = pending
+            .iter()
+            .filter_map(|key| {
+                self.tables
+                    .get(key)
+                    .map(|entry| (key, entry.value().clone()))
+            })
+            .collect();
         let mut locked = Vec::with_capacity(entries.len());
-        for (account, region, table) in &entries {
-            locked.push((account, region, table.write().await));
+        for ((account, region, _), table) in &entries {
+            locked.push((account, region, table.data.write().await));
         }
         let mut connection = state.connection().map_err(persist_error)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persist_error)?;
-        let mut present = std::collections::BTreeSet::new();
         for (account, region, table) in &locked {
             let name = &table.def.name;
-            present.insert(((*account).clone(), (*region).clone(), name.clone()));
             let old_metadata: Option<String> = transaction
                 .query_row(
                     "SELECT metadata FROM dynamodb_tables WHERE account=?1 AND region=?2 AND name=?3",
@@ -804,25 +859,17 @@ impl TableStore {
                 }
             }
         }
-        {
-            let mut query = transaction
-                .prepare("SELECT account,region,name FROM dynamodb_tables")
-                .map_err(persist_error)?;
-            let rows = query
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(persist_error)?;
-            for row in rows {
-                let key = row.map_err(persist_error)?;
-                if !present.contains(&key) {
-                    transaction.execute("DELETE FROM dynamodb_tables WHERE account=?1 AND region=?2 AND name=?3",
-                        params![key.0,key.1,key.2]).map_err(persist_error)?;
-                }
+        for (account, region, name) in &pending {
+            if !self
+                .tables
+                .contains_key(&(account.clone(), region.clone(), name.clone()))
+            {
+                transaction
+                    .execute(
+                        "DELETE FROM dynamodb_tables WHERE account=?1 AND region=?2 AND name=?3",
+                        params![account, region, name],
+                    )
+                    .map_err(persist_error)?;
             }
         }
         let now = unix_secs();
@@ -868,37 +915,50 @@ impl TableStore {
         validate_table_name(&data.def.name)?;
         let key = Self::key(account, region, &data.def.name);
         use dashmap::mapref::entry::Entry;
-        match self.tables.entry(key) {
+        match self.tables.entry(key.clone()) {
             Entry::Occupied(_) => Err(DdbError::ResourceInUse(format!(
                 "Table already exists: {}",
                 data.def.name
             ))),
             Entry::Vacant(slot) => {
-                slot.insert(Arc::new(RwLock::new(data)));
+                self.pending_tables.insert(key.clone());
+                slot.insert(Arc::new(StoredTable::new(
+                    data,
+                    key,
+                    self.pending_tables.clone(),
+                )));
                 Ok(())
             }
         }
     }
 
-    pub fn get(&self, account: &str, region: &str, name: &str) -> Option<Arc<RwLock<TableData>>> {
+    pub fn get(&self, account: &str, region: &str, name: &str) -> Option<Arc<StoredTable>> {
         self.tables
             .get(&Self::key(account, region, name))
             .map(|e| e.clone())
     }
 
-    pub fn remove(
-        &self,
-        account: &str,
-        region: &str,
-        name: &str,
-    ) -> Option<Arc<RwLock<TableData>>> {
-        self.tables
-            .remove(&Self::key(account, region, name))
-            .map(|(_, v)| v)
+    pub fn remove(&self, account: &str, region: &str, name: &str) -> Option<Arc<StoredTable>> {
+        let key = Self::key(account, region, name);
+        let removed = self.tables.remove(&key).map(|(_, value)| value);
+        if removed.is_some() {
+            self.pending_tables.insert(key);
+        }
+        removed
+    }
+
+    fn pending_keys(&self) -> Vec<ScopedKey> {
+        let mut keys: Vec<_> = self
+            .pending_tables
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        keys.sort_unstable();
+        keys
     }
 
     /// Snapshot every table with its scope. Arcs keep entries alive only for the current sweep.
-    pub fn all_tables(&self) -> Vec<(String, String, Arc<RwLock<TableData>>)> {
+    pub fn all_tables(&self) -> Vec<(String, String, Arc<StoredTable>)> {
         self.tables
             .iter()
             .map(|entry| {
@@ -1117,6 +1177,111 @@ mod tests {
             .await
             .items
             .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistence_does_not_lock_or_update_unrelated_tables() {
+        let root = std::env::temp_dir().join(format!("ddb-incremental-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let store = TableStore::with_state(state.clone()).unwrap();
+        for name in ["alpha", "bravo"] {
+            store
+                .create("0", "us-east-1", data(simple_def(name)))
+                .unwrap();
+        }
+        store.persist().await.unwrap();
+        let connection = state.connection().unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_unrelated BEFORE UPDATE ON dynamodb_tables WHEN OLD.name='bravo' BEGIN SELECT RAISE(ABORT, 'unrelated table updated'); END;").unwrap();
+        let unrelated = store.get("0", "us-east-1", "bravo").unwrap();
+        let _reader = unrelated.read().await;
+        store
+            .get("0", "us-east-1", "alpha")
+            .unwrap()
+            .write()
+            .await
+            .tags
+            .insert("owner".into(), "changed".into());
+        tokio::time::timeout(Duration::from_secs(1), store.persist())
+            .await
+            .unwrap()
+            .unwrap();
+        let reopened = TableStore::with_state(state).unwrap();
+        assert_eq!(
+            reopened
+                .get("0", "us-east-1", "alpha")
+                .unwrap()
+                .read()
+                .await
+                .tags
+                .get("owner")
+                .map(String::as_str),
+            Some("changed")
+        );
+        assert!(store.pending_keys().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_multitable_commit_preserves_candidates_for_retry_and_delete() {
+        let root = std::env::temp_dir().join(format!("ddb-delta-retry-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let store = TableStore::with_state(state.clone()).unwrap();
+        for name in ["alpha", "bravo", "removed"] {
+            store
+                .create("0", "us-east-1", data(simple_def(name)))
+                .unwrap();
+        }
+        store.persist().await.unwrap();
+        store.mark_uncommitted();
+        for name in ["alpha", "bravo"] {
+            // TransactWriteItems uses owned guards; they must register changes too.
+            let mut guard = store
+                .get("0", "us-east-1", name)
+                .unwrap()
+                .write_owned()
+                .await;
+            guard.tags.insert("owner".into(), "changed".into());
+        }
+        store.remove("0", "us-east-1", "removed");
+        let connection = state.connection().unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_second BEFORE UPDATE ON dynamodb_tables WHEN OLD.name='bravo' BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END;").unwrap();
+        assert!(store.persist().await.is_err());
+        assert!(store.has_uncommitted());
+        assert_eq!(store.pending_keys().len(), 3);
+        let reopened = TableStore::with_state(state.clone()).unwrap();
+        for name in ["alpha", "bravo"] {
+            assert!(reopened
+                .get("0", "us-east-1", name)
+                .unwrap()
+                .read()
+                .await
+                .tags
+                .is_empty());
+        }
+        assert!(reopened.get("0", "us-east-1", "removed").is_some());
+        drop(reopened);
+        connection
+            .execute_batch("DROP TRIGGER reject_second")
+            .unwrap();
+        store.persist().await.unwrap();
+        assert!(!store.has_uncommitted());
+        assert!(store.pending_keys().is_empty());
+        let reopened = TableStore::with_state(state).unwrap();
+        for name in ["alpha", "bravo"] {
+            assert_eq!(
+                reopened
+                    .get("0", "us-east-1", name)
+                    .unwrap()
+                    .read()
+                    .await
+                    .tags
+                    .get("owner")
+                    .map(String::as_str),
+                Some("changed")
+            );
+        }
+        assert!(reopened.get("0", "us-east-1", "removed").is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

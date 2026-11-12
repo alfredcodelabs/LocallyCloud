@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 use crate::error::DdbError;
 use crate::ops::Ctx;
 use crate::store::TableStore;
-use crate::store::{KeyType, StreamRecord, TableData};
+use crate::store::{KeyType, StreamRecord};
 use crate::value::item_to_json;
 
 /// The single shard id exposed per stream.
@@ -46,7 +46,7 @@ fn table_name_from_stream_arn(arn: &str) -> Result<&str, DdbError> {
 pub(crate) async fn resolve_stream_table(
     ctx: &Ctx<'_>,
     stream_arn: &str,
-) -> Result<std::sync::Arc<tokio::sync::RwLock<TableData>>, DdbError> {
+) -> Result<std::sync::Arc<crate::store::StoredTable>, DdbError> {
     let name = table_name_from_stream_arn(stream_arn)?;
     let table = ctx
         .store
