@@ -145,6 +145,9 @@ locallycloud-acm = { path = "crates/acm" }
 locallycloud-cloudfront = { path = "crates/cloudfront" }
 locallycloud-architecture = { path = "crates/architecture" }
 
+[profile.release]
+strip = "symbols"
+
 [profile.dev.package.rsa]
 opt-level = 3
 
