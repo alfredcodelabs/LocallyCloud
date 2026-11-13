@@ -252,6 +252,9 @@ mod tests {
         }
     }
     impl KmsInternalApi for CountingKms {
+        fn resource_aliases(&self, _key_arn: &str) -> Result<Vec<String>, KmsInternalError> {
+            Ok(Vec::new())
+        }
         fn encrypt(&self, _: KmsEncryptRequest) -> Result<KmsEncryptOutput, KmsInternalError> {
             Err(KmsInternalError::Unavailable)
         }

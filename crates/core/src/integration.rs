@@ -140,7 +140,7 @@ impl InternalDispatcher {
         let evaluator = registry
             .authorization_evaluator(&ServiceName::new("iam"))
             .ok_or(authorization::AuthorizationError::Unavailable)?;
-        evaluator.authorize(request)
+        evaluator.authorize(self.kms_identity_context(request)?)
     }
 
     /// Validate a service role through the registered IAM capability.
@@ -181,7 +181,41 @@ impl InternalDispatcher {
         evaluator.resolve_caller_arn(identity)
     }
 
+    /// KMS aliases are resource attributes: resolve current authoritative names, never caller context.
+    fn kms_identity_context(
+        &self,
+        mut request: authorization::AuthorizationRequest,
+    ) -> Result<authorization::AuthorizationRequest, authorization::AuthorizationError> {
+        if !request.action.starts_with("kms:") {
+            return Ok(request);
+        }
+        request
+            .context
+            .retain(|key, _| !key.eq_ignore_ascii_case("kms:resourcealiases"));
+        let parts: Vec<_> = request.resource.splitn(6, ':').collect();
+        if !matches!(parts.as_slice(), ["arn", _, "kms", _, _, resource] if resource.starts_with("key/"))
+        {
+            return Ok(request);
+        }
+        let aliases = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.kms_api(&ServiceName::new("kms")))
+            .ok_or(authorization::AuthorizationError::Unavailable)?
+            .resource_aliases(&request.resource)
+            .map_err(|_| authorization::AuthorizationError::Unavailable)?;
+        if !aliases.is_empty() {
+            request
+                .context
+                .insert("kms:resourcealiases".into(), aliases);
+        }
+        Ok(request)
+    }
+
     pub fn identity_policy_denies(&self, request: authorization::AuthorizationRequest) -> bool {
+        let Ok(request) = self.kms_identity_context(request) else {
+            return true;
+        };
         self.registry
             .upgrade()
             .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
@@ -189,6 +223,9 @@ impl InternalDispatcher {
     }
 
     pub fn identity_policy_allows(&self, request: authorization::AuthorizationRequest) -> bool {
+        let Ok(request) = self.kms_identity_context(request) else {
+            return false;
+        };
         self.registry
             .upgrade()
             .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
@@ -2572,5 +2609,96 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod kms_alias_context_tests {
+    use super::kms::*;
+    use super::*;
+    use std::sync::RwLock;
+
+    struct Metadata(RwLock<Option<Vec<String>>>);
+    impl KmsInternalApi for Metadata {
+        fn resource_aliases(&self, _: &str) -> Result<Vec<String>, KmsInternalError> {
+            self.0
+                .read()
+                .unwrap()
+                .clone()
+                .ok_or(KmsInternalError::Unavailable)
+        }
+        fn encrypt(&self, _: KmsEncryptRequest) -> Result<KmsEncryptOutput, KmsInternalError> {
+            Err(KmsInternalError::Unavailable)
+        }
+        fn generate_data_key(
+            &self,
+            _: KmsGenerateDataKeyRequest,
+        ) -> Result<KmsGenerateDataKeyOutput, KmsInternalError> {
+            Err(KmsInternalError::Unavailable)
+        }
+        fn decrypt(&self, _: KmsDecryptRequest) -> Result<KmsDecryptOutput, KmsInternalError> {
+            Err(KmsInternalError::Unavailable)
+        }
+        fn validate_key(
+            &self,
+            _: KmsValidateKeyRequest,
+        ) -> Result<KmsValidateKeyOutput, KmsInternalError> {
+            Err(KmsInternalError::Unavailable)
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::handler::NativeHandler for Metadata {
+        async fn handle(&self, _: ServiceRequest) -> Response {
+            Response::new(axum::body::Body::empty())
+        }
+    }
+    #[test]
+    fn aliases_are_authoritative_live_absent_when_empty_and_fail_closed() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let metadata = Arc::new(Metadata(RwLock::new(Some(vec!["alias/current".into()]))));
+        registry.register_native_with_kms_api(
+            ServiceName::new("kms"),
+            crate::registry::ServiceMetadata::new(AwsProtocol::Json11, None),
+            metadata.clone(),
+            metadata.clone(),
+        );
+        let dispatcher = InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:9".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let request = || authorization::AuthorizationRequest {
+            request_identity: RequestIdentity {
+                account_id: "000000000000".into(),
+                access_key_id: None,
+                arn: None,
+            },
+            delegated_identity: None,
+            source_service: "s3".into(),
+            action: "kms:Decrypt".into(),
+            resource: "arn:aws:kms:us-east-1:000000000000:key/example".into(),
+            context: std::collections::BTreeMap::from([(
+                "kms:ResourceAliases".into(),
+                vec!["alias/spoofed".into()],
+            )]),
+        };
+        let context = dispatcher.kms_identity_context(request()).unwrap().context;
+        assert_eq!(context.len(), 1);
+        assert_eq!(context["kms:resourcealiases"], vec!["alias/current"]);
+        *metadata.0.write().unwrap() = Some(vec![]);
+        assert!(dispatcher
+            .kms_identity_context(request())
+            .unwrap()
+            .context
+            .is_empty());
+        *metadata.0.write().unwrap() = None;
+        assert!(dispatcher.kms_identity_context(request()).is_err());
+        assert!(!dispatcher.identity_policy_allows(request()));
+        assert!(dispatcher.identity_policy_denies(request()));
     }
 }

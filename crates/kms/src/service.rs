@@ -72,6 +72,29 @@ impl KmsService {
             })
             .ok_or(KmsError::NotFound)?
     }
+    pub(crate) fn resource_aliases(&self, arn: &str) -> Result<Vec<String>, KmsError> {
+        let parts: Vec<_> = arn.splitn(6, ':').collect();
+        let ["arn", "aws", "kms", region, account, resource] = parts.as_slice() else {
+            return Err(KmsError::Validation);
+        };
+        let key_id = resource
+            .strip_prefix("key/")
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+            .ok_or(KmsError::Validation)?;
+        if region.is_empty() || account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(KmsError::Validation);
+        }
+        let aliases = self
+            .store
+            .resource_aliases(&Scope::new(account, region), key_id);
+        if aliases.len() > 50 {
+            // Do not authorize from a truncated alias set when the default AWS quota is exceeded.
+            return Err(KmsError::AccessDenied);
+        }
+        Ok(aliases)
+    }
+
     pub(crate) fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
         self.store.resource_regions(account)
     }

@@ -49,7 +49,7 @@ async fn rotation_period_conditions_use_requested_and_default_period_with_native
         "us-east-1".into(),
         account.into(),
     )));
-    let handler = KmsHandler::with_registry(&registry, test_db()).unwrap();
+    let handler = test_handler(&registry, test_db());
     let created = handler
         .service
         .dispatch(

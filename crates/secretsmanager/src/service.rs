@@ -547,6 +547,9 @@ mod kms_boundary_tests {
     }
 
     impl KmsInternalApi for FaultKms {
+        fn resource_aliases(&self, _key_arn: &str) -> Result<Vec<String>, KmsInternalError> {
+            Ok(Vec::new())
+        }
         fn encrypt(
             &self,
             request: KmsEncryptRequest,

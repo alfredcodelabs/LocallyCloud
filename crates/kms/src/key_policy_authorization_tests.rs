@@ -15,7 +15,7 @@ const ACCESS_KEY: &str = "AKIAPOLICYADMIN000001";
 struct Fixture {
     _registry: Arc<ServiceRegistry>,
     store: Arc<IamStore>,
-    handler: KmsHandler,
+    handler: Arc<KmsHandler>,
 }
 
 impl Fixture {
@@ -63,7 +63,7 @@ impl Fixture {
             "us-east-1".into(),
             ACCOUNT.into(),
         )));
-        let handler = KmsHandler::with_registry(&registry, test_db()).unwrap();
+        let handler = test_handler(&registry, test_db());
         Self {
             _registry: registry,
             store,

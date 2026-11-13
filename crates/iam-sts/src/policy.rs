@@ -264,6 +264,11 @@ fn parse_conditions(
         IamStsError::MalformedPolicyDocument("Condition must be an object".into())
     })?;
     for (operator, keys) in map {
+        if !supports_condition_operator(operator) {
+            return Err(IamStsError::MalformedPolicyDocument(
+                "Unsupported condition operator".into(),
+            ));
+        }
         let keys = keys.as_object().ok_or_else(|| {
             IamStsError::MalformedPolicyDocument("condition operator must map keys".into())
         })?;
@@ -417,15 +422,43 @@ impl Statement {
 
 /// Evaluate one condition `operator`/`key`/`values` against the request context.
 /// AND across operator blocks/keys (caller), OR across candidate values (here).
+#[derive(Clone, Copy)]
+enum ConditionSet {
+    Default,
+    Any,
+    All,
+}
+
+pub(crate) fn supports_condition_operator(operator: &str) -> bool {
+    condition_operator(operator).is_some()
+}
+
+fn condition_operator(operator: &str) -> Option<(ConditionSet, &str, bool)> {
+    let (set, operator) = match operator.split_once(':') {
+        Some(("ForAnyValue", base)) => (ConditionSet::Any, base),
+        Some(("ForAllValues", base)) => (ConditionSet::All, base),
+        Some(_) => return None,
+        None => (ConditionSet::Default, operator),
+    };
+    let (base, if_exists) = match operator.strip_suffix("IfExists") {
+        Some(b) => (b, true),
+        None => (operator, false),
+    };
+    let supported = match base {
+        "Null" => matches!(set, ConditionSet::Default) && !if_exists,
+        _ => apply_operator(base, "", "").is_some(),
+    };
+    supported.then_some((set, base, if_exists))
+}
+
 fn eval_condition(
     operator: &str,
     key: &str,
     values: &[String],
     context: &BTreeMap<String, Vec<String>>,
 ) -> bool {
-    let (base, if_exists) = match operator.strip_suffix("IfExists") {
-        Some(b) => (b, true),
-        None => (operator, false),
+    let Some((set, base, if_exists)) = condition_operator(operator) else {
+        return false;
     };
     if base == "Null" {
         // {"Null": {"key": "true"}} ⇒ matches iff the key is absent.
@@ -445,24 +478,37 @@ fn eval_condition(
     );
     let ctx_values = match context.get(key) {
         Some(v) if !v.is_empty() => v,
-        _ => return if_exists || negated,
+        _ => {
+            return match set {
+                ConditionSet::Any => false,
+                ConditionSet::All => true,
+                ConditionSet::Default => if_exists || negated,
+            }
+        }
     };
-    if negated {
-        ctx_values
-            .iter()
-            .all(|cv| values.iter().all(|pv| apply_operator(base, pv, cv)))
-    } else {
-        ctx_values
-            .iter()
-            .any(|cv| values.iter().any(|pv| apply_operator(base, pv, cv)))
+    let matches_value = |cv: &String| {
+        if negated {
+            values
+                .iter()
+                .all(|pv| apply_operator(base, pv, cv) == Some(true))
+        } else {
+            values
+                .iter()
+                .any(|pv| apply_operator(base, pv, cv) == Some(true))
+        }
+    };
+    match (set, negated) {
+        (ConditionSet::All, _) | (ConditionSet::Default, true) => {
+            ctx_values.iter().all(matches_value)
+        }
+        (ConditionSet::Any, _) | (ConditionSet::Default, false) => {
+            ctx_values.iter().any(matches_value)
+        }
     }
 }
 
-fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> bool {
-    if op.starts_with("Numeric") && (num(policy_value).is_none() || num(ctx_value).is_none()) {
-        return false;
-    }
-    match op {
+fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> Option<bool> {
+    let result = match op {
         "StringEquals" => policy_value == ctx_value,
         "StringNotEquals" => policy_value != ctx_value,
         "StringEqualsIgnoreCase" => policy_value.eq_ignore_ascii_case(ctx_value),
@@ -489,8 +535,13 @@ fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> bool {
         "DateGreaterThanEquals" => ctx_value >= policy_value,
         "IpAddress" => ip_in_cidr(ctx_value, policy_value),
         "NotIpAddress" => !ip_in_cidr(ctx_value, policy_value),
-        _ => false, // unsupported operator never matches
-    }
+        _ => return None,
+    };
+    Some(
+        result
+            && (!op.starts_with("Numeric")
+                || (num(policy_value).is_some() && num(ctx_value).is_some())),
+    )
 }
 
 fn num(s: &str) -> Option<f64> {
@@ -823,7 +874,68 @@ mod tests {
 
     #[test]
     fn numeric_operator() {
-        assert!(apply_operator("NumericLessThan", "100", "50"));
-        assert!(!apply_operator("NumericLessThan", "100", "150"));
+        assert_eq!(apply_operator("NumericLessThan", "100", "50"), Some(true));
+        assert_eq!(apply_operator("NumericLessThan", "100", "150"), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod set_operator_tests {
+    use super::*;
+    #[test]
+    fn condition_sets_preserve_any_all_negation_absence_and_unknown_fail_closed() {
+        let values = vec!["alias/finance".into()];
+        let context = BTreeMap::from([(
+            "kms:resourcealiases".into(),
+            vec!["alias/finance".into(), "alias/other".into()],
+        )]);
+        for (operator, expected) in [
+            ("ForAnyValue:StringEquals", true),
+            ("ForAllValues:StringEquals", false),
+            ("ForAnyValue:StringNotEquals", true),
+            ("ForAllValues:StringNotEquals", false),
+            ("ForAnyValue:StringLike", true),
+        ] {
+            assert_eq!(
+                eval_condition(operator, "kms:resourcealiases", &values, &context),
+                expected,
+                "{operator}"
+            );
+        }
+        for (operator, expected) in [
+            ("ForAnyValue:StringEquals", false),
+            ("ForAllValues:StringEquals", true),
+            ("ForAnyValue:StringEqualsIfExists", false),
+            ("UnsupportedIfExists", false),
+            ("NumericUnsupportedIfExists", false),
+            ("ForSomeValue:StringEquals", false),
+        ] {
+            assert_eq!(
+                eval_condition(operator, "absent", &values, &BTreeMap::new()),
+                expected,
+                "{operator}"
+            );
+        }
+        for effect in ["Allow", "Deny"] {
+            let doc = serde_json::json!({"Statement":{"Effect":effect,"Action":"kms:Decrypt","Resource":"*","Condition":{"UnsupportedIfExists":{"absent":"value"}}}});
+            assert!(
+                PolicyDocument::parse(&doc.to_string()).is_err(),
+                "unsupported conditional {effect} must not be silently ignored"
+            );
+        }
+        let allow = PolicyDocument::parse(
+            r#"{"Statement":{"Effect":"Allow","Action":"kms:Decrypt","Resource":"*"}}"#,
+        )
+        .unwrap();
+        let deny = PolicyDocument::parse(r#"{"Statement":{"Effect":"Deny","Action":"kms:Decrypt","Resource":"*","Condition":{"ForAnyValue:StringEquals":{"kms:ResourceAliases":"alias/finance"}}}}"#).unwrap();
+        let request = EvalRequest {
+            action: "kms:Decrypt".into(),
+            resource: "arn:aws:kms:us-east-1:000000000000:key/example".into(),
+            context,
+        };
+        assert_eq!(
+            evaluate(&[allow, deny], None, None, &request),
+            Decision::ExplicitDeny
+        );
     }
 }

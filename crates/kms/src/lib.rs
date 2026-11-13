@@ -267,6 +267,11 @@ impl InternalFault {
 }
 
 impl KmsInternalApi for KmsHandler {
+    fn resource_aliases(&self, key_arn: &str) -> Result<Vec<String>, KmsInternalError> {
+        self.service
+            .resource_aliases(key_arn)
+            .map_err(map_internal_error)
+    }
     fn authorize_cached_key(
         &self,
         request: locallycloud_core::integration::kms::KmsAuthorizeCachedKeyRequest,
@@ -488,6 +493,18 @@ pub fn register_with_state(
 }
 
 #[cfg(test)]
+fn test_handler(registry: &Arc<ServiceRegistry>, db: Arc<StateDb>) -> Arc<KmsHandler> {
+    let handler = Arc::new(KmsHandler::with_registry(registry, db).unwrap());
+    registry.register_native_with_kms_api(
+        ServiceName::new("kms"),
+        ServiceMetadata::new(AwsProtocol::Json11, Some(TARGET_PREFIX)),
+        handler.clone(),
+        handler.clone(),
+    );
+    handler
+}
+
+#[cfg(test)]
 fn test_db() -> Arc<StateDb> {
     static MASTER: std::sync::Once = std::sync::Once::new();
     MASTER.call_once(|| {
@@ -575,7 +592,7 @@ mod tests {
             "us-east-1".into(),
             "000000000000".into(),
         )));
-        let handler = KmsHandler::with_registry(&registry, test_db()).unwrap();
+        let handler = test_handler(&registry, test_db());
         let create = handler
             .service
             .dispatch(
@@ -739,7 +756,7 @@ mod tests {
             KmsAuthorizeCachedKeyRequest, KmsCallContext, KmsDataKeyAction, SensitiveBytes,
         };
         let registry = ServiceRegistry::with_known_services();
-        let handler = KmsHandler::with_registry(&registry, test_db()).unwrap();
+        let handler = test_handler(&registry, test_db());
         let account = "000000000000";
         let region = "us-east-1";
         let created = handler

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Contract version understood by the registry and internal callers.
-pub const KMS_INTERNAL_API_VERSION: u16 = 6;
+pub const KMS_INTERNAL_API_VERSION: u16 = 7;
 
 #[derive(Clone, Copy)]
 pub enum KmsDataKeyAction {
@@ -194,6 +194,11 @@ pub enum KmsInternalError {
 }
 
 pub trait KmsInternalApi: Send + Sync {
+    /// Current resource aliases for a canonical key ARN, without key material or authorization recursion.
+    /// An absent/planned key has no aliases. Unavailable metadata must fail authorization closed.
+    fn resource_aliases(&self, _key_arn: &str) -> Result<Vec<String>, KmsInternalError> {
+        Err(KmsInternalError::Unavailable)
+    }
     fn authorize_cached_key(
         &self,
         _request: KmsAuthorizeCachedKeyRequest,

@@ -861,3 +861,57 @@ fn customer_key_disable_survives_reopen_and_blocks_crypto_until_enabled() {
         Err(KmsError::InvalidState)
     ));
 }
+
+#[test]
+fn resource_alias_metadata_tracks_scope_reassignment_and_deletion() {
+    let service = test_service();
+    let one = call_ok(&service, "CreateKey", json!({}))["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let two = call_ok(&service, "CreateKey", json!({}))["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call_ok(
+        &service,
+        "CreateAlias",
+        json!({"AliasName":"alias/ledger","TargetKeyId":one}),
+    );
+    assert_eq!(
+        service.resource_aliases(&one).unwrap(),
+        vec!["alias/ledger"]
+    );
+    assert!(service
+        .resource_aliases(&one.replace(REGION, "us-east-2"))
+        .unwrap()
+        .is_empty());
+    assert!(service
+        .resource_aliases(&one.replace(ACCOUNT, "111111111111"))
+        .unwrap()
+        .is_empty());
+    call_ok(
+        &service,
+        "UpdateAlias",
+        json!({"AliasName":"alias/ledger","TargetKeyId":two}),
+    );
+    assert!(service.resource_aliases(&one).unwrap().is_empty());
+    assert_eq!(
+        service.resource_aliases(&two).unwrap(),
+        vec!["alias/ledger"]
+    );
+    call_ok(&service, "DeleteAlias", json!({"AliasName":"alias/ledger"}));
+    assert!(service.resource_aliases(&two).unwrap().is_empty());
+    assert!(service.resource_aliases("alias/ledger").is_err());
+    for index in 0..51 {
+        call_ok(
+            &service,
+            "CreateAlias",
+            json!({"AliasName":format!("alias/limit-{index}"),"TargetKeyId":two}),
+        );
+    }
+    assert!(
+        matches!(service.resource_aliases(&two), Err(KmsError::AccessDenied)),
+        "an over-quota alias set must not grant access from a truncated prefix"
+    );
+}

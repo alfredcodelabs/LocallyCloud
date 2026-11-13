@@ -240,6 +240,18 @@ impl KmsStore {
         }
     }
 
+    pub(crate) fn resource_aliases(&self, scope: &Scope, key_id: &str) -> Vec<String> {
+        let mut aliases: Vec<_> = self
+            .aliases
+            .iter()
+            .filter(|entry| entry.key().scope == *scope && entry.target_key_id == key_id)
+            .map(|entry| entry.alias_name.clone())
+            .take(51)
+            .collect();
+        aliases.sort();
+        aliases
+    }
+
     pub(crate) fn list_aliases(&self, scope: &Scope) -> Vec<AliasRecord> {
         let mut aliases: Vec<AliasRecord> = self
             .aliases

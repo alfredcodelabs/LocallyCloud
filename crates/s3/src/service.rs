@@ -2125,6 +2125,9 @@ mod tests {
     }
 
     impl KmsInternalApi for FakeKmsApi {
+        fn resource_aliases(&self, _key_arn: &str) -> Result<Vec<String>, KmsInternalError> {
+            Ok(Vec::new())
+        }
         fn generate_data_key(
             &self,
             request: KmsGenerateDataKeyRequest,

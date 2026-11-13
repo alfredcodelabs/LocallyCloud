@@ -39,11 +39,21 @@ pub(crate) fn parse(document: &str) -> Result<Vec<ResourceStatement>, ResourcePo
     if document.contains("${") {
         return Err(ResourcePolicyError::Unsupported("policy variables".into()));
     }
-    let parsed = PolicyDocument::parse(document).map_err(|e| malformed(e.to_string()))?;
     let raw = match &root["Statement"] {
         Value::Array(items) => items.iter().collect::<Vec<_>>(),
         item => vec![item],
     };
+    if raw
+        .iter()
+        .filter_map(|statement| statement.get("Condition").and_then(Value::as_object))
+        .flat_map(|condition| condition.keys())
+        .any(|operator| !crate::policy::supports_condition_operator(operator))
+    {
+        return Err(ResourcePolicyError::Unsupported(
+            "condition operator".into(),
+        ));
+    }
+    let parsed = PolicyDocument::parse(document).map_err(|e| malformed(e.to_string()))?;
     raw.into_iter()
         .zip(parsed.statements)
         .map(|(raw, statement)| {
