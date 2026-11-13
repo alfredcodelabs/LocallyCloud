@@ -6,12 +6,13 @@
 
 use locallycloud_core::views::architecture::TopologyError;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 
 use super::{deployed, reason, Context};
 use crate::acl::identity::{types, Accept};
 use crate::acl::reads::{self, Reply};
 use crate::acl::stack::StackResource;
-use crate::domain::Finding;
+use crate::domain::{Fact, FactId, FactValue, Finding};
 
 const DEFINITION_REASON: &str = "Definition unavailable or unsupported intrinsic";
 
@@ -85,7 +86,166 @@ pub(super) async fn extract(
     let Some(definition) = definition else {
         return Ok(vec![Finding::gap(id, "Definition", DEFINITION_REASON)]);
     };
-    Ok(tasks(ctx, id, &definition))
+    let mut findings = tasks(ctx, id, &definition);
+    for (state, path) in failure_tasks(&definition) {
+        let Some(resource) = state.get("Resource").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(
+            INTEGRATIONS
+                .iter()
+                .find(|(admits, _)| admits(resource))
+                .map(|(_, integration)| integration),
+            Some(Integration::Sqs)
+        ) || resource
+            .rsplit(':')
+            .next()
+            .and_then(|operation| operation.split('.').next())
+            != Some("sendMessage")
+        {
+            continue;
+        }
+        let Some((argument_field, args)) = ["Parameters", "Arguments"].iter().find_map(|key| {
+            state
+                .get(*key)
+                .and_then(Value::as_object)
+                .map(|args| (*key, args))
+        }) else {
+            continue;
+        };
+        let Field::Value(queue) = field(args, "QueueUrl") else {
+            continue;
+        };
+        if let Some(target) = ctx
+            .identities
+            .resolve(queue, Accept::Types(&[types::SQS_QUEUE]))
+        {
+            findings.push(Finding::Fact {
+                target: target.to_owned(),
+                fact: Fact {
+                    id: FactId::DeadLetter,
+                    value: FactValue::DeadLetterTarget,
+                    evidence: deployed(
+                        id,
+                        "DescribeStateMachine",
+                        &format!("{path}.{argument_field}.QueueUrl (Catch path)"),
+                    ),
+                },
+            });
+        }
+    }
+    Ok(findings)
+}
+
+/// Error-only control-flow paths, keeping nested state-machine names in their own scope.
+fn failure_tasks(definition: &Value) -> Vec<(&Map<String, Value>, String)> {
+    let mut pending = vec![(definition, false, "Definition".to_owned())];
+    let mut tasks = Vec::new();
+    while let Some((scope, inherited_failure, path)) = pending.pop() {
+        let Some(states) = scope.get("States").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(start) = scope.get("StartAt").and_then(Value::as_str) else {
+            continue;
+        };
+        let all = reachable(states, std::iter::once(start), true);
+        let normal = if inherited_failure {
+            BTreeSet::new()
+        } else {
+            reachable(states, std::iter::once(start), false)
+        };
+        let seeds = all.iter().flat_map(|name| catches(&states[*name]));
+        let mut failures = reachable(states, seeds, true);
+        if inherited_failure {
+            failures.extend(all.iter().copied());
+        }
+        for name in all {
+            let state = &states[name];
+            let failed = failures.contains(name) && !normal.contains(name);
+            let path = format!("{path}.States.{name}");
+            match state.get("Type").and_then(Value::as_str) {
+                Some("Task") if failed => {
+                    if let Some(state) = state.as_object() {
+                        tasks.push((state, path));
+                    }
+                }
+                Some("Map") => {
+                    for field in ["ItemProcessor", "Iterator"] {
+                        if let Some(child) = state.get(field) {
+                            pending.push((child, failed, format!("{path}.{field}")));
+                        }
+                    }
+                }
+                Some("Parallel") => {
+                    if let Some(branches) = state.get("Branches").and_then(Value::as_array) {
+                        for (index, branch) in branches.iter().enumerate() {
+                            pending.push((branch, failed, format!("{path}.Branches[{index}]")));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    tasks
+}
+
+fn catches(state: &Value) -> impl Iterator<Item = &str> {
+    let can_catch = matches!(
+        state.get("Type").and_then(Value::as_str),
+        Some("Task" | "Map" | "Parallel")
+    );
+    state
+        .get("Catch")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(move |catch| {
+            can_catch
+                && catch
+                    .get("ErrorEquals")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| !errors.is_empty() && errors.iter().all(Value::is_string))
+        })
+        .filter_map(|catch| catch.get("Next").and_then(Value::as_str))
+}
+
+fn reachable<'a>(
+    states: &'a Map<String, Value>,
+    seeds: impl Iterator<Item = &'a str>,
+    include_catches: bool,
+) -> BTreeSet<&'a str> {
+    let mut pending: Vec<_> = seeds.collect();
+    let mut seen = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        let Some(state) = states.get(name) else {
+            continue;
+        };
+        if !seen.insert(name) {
+            continue;
+        }
+        match state.get("Type").and_then(Value::as_str) {
+            Some("Choice") => {
+                pending.extend(state.get("Default").and_then(Value::as_str));
+                pending.extend(
+                    state
+                        .get("Choices")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|choice| choice.get("Next").and_then(Value::as_str)),
+                );
+            }
+            Some("Task" | "Pass" | "Wait" | "Map" | "Parallel") => {
+                pending.extend(state.get("Next").and_then(Value::as_str))
+            }
+            _ => {}
+        }
+        if include_catches {
+            pending.extend(catches(state));
+        }
+    }
+    seen
 }
 
 /// Walks every nested object, as nested Map/Parallel states hold their own `States`.
@@ -240,6 +400,38 @@ fn dynamodb_label(resource: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catch_paths_follow_control_flow_without_marking_normal_or_unreachable_tasks() {
+        let definition = json!({"StartAt":"Work","States":{
+            "Work":{"Type":"Task","Next":"Shared","Catch":[{"ErrorEquals":["States.ALL"],"Next":"Prepare"}]},
+            "Prepare":{"Type":"Pass","Next":"Choose"},
+            "Choose":{"Type":"Choice","Choices":[{"Next":"Send"}],"Default":"Shared"},
+            "Send":{"Type":"Task","Next":"Prepare"},
+            "Shared":{"Type":"Task","End":true},
+            "Unreachable":{"Type":"Task","Catch":[{"ErrorEquals":["States.ALL"],"Next":"Ghost"}]},
+            "Ghost":{"Type":"Task","End":true}
+        }});
+        let names: Vec<_> = failure_tasks(&definition)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(names, vec!["Definition.States.Send"]);
+        let nested = json!({"StartAt":"Map","States":{
+            "Map":{"Type":"Map","ItemProcessor":{"StartAt":"Work","States":{
+                "Work":{"Type":"Task","Catch":[{"ErrorEquals":["States.ALL"],"Next":"Send"}],"End":true},
+                "Send":{"Type":"Task","End":true}}},"Next":"Send"},
+            "Send":{"Type":"Task","End":true}
+        }});
+        let names: Vec<_> = failure_tasks(&nested)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Definition.States.Map.ItemProcessor.States.Send"]
+        );
+    }
 
     #[test]
     fn classifies_task_resources_in_order() {

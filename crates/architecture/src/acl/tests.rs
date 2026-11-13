@@ -637,3 +637,71 @@ async fn concurrent_reads_stay_within_the_in_flight_bound() {
     assert!(fake.peak.load(Ordering::SeqCst) <= 3);
     assert_eq!(fake.calls.lock().unwrap().len(), 43);
 }
+
+#[tokio::test]
+async fn catch_send_message_is_a_dead_letter_target_with_deployed_evidence() {
+    for (integration, args) in [
+        ("arn:aws:states:::sqs:sendMessage", "Parameters"),
+        ("arn:aws:states:::aws-sdk:sqs:sendMessage", "Arguments"),
+    ] {
+        for mode in ["caught", "shared", "dynamic", "redrive", "receive"] {
+            let queue = match mode {
+                "dynamic" => json!({"QueueUrl.$":"$.queue"}),
+                _ => json!({"QueueUrl":QUEUE_URL,"MessageBody":"must-not-export-error-payload"}),
+            };
+            let mut definition = json!({"StartAt":"Work","States":{
+                "Work":{"Type":"Task","Resource":WORKER_ARN,"Catch":[{"ErrorEquals":["States.ALL"],"Next":"Prepare"}],"Next":"Done"},
+                "Done":{"Type":"Succeed"},"Prepare":{"Type":"Pass","Next":"Send"},
+                "Send":{"Type":"Task","Resource":integration,"End":true}
+            }});
+            definition["States"]["Send"][args] = queue;
+            if mode == "shared" {
+                definition["States"]["Work"]["Next"] = json!("Send");
+            }
+            if mode == "receive" {
+                definition["States"]["Send"]["Resource"] =
+                    json!("arn:aws:states:::aws-sdk:sqs:receiveMessage");
+            }
+            let mut template = json!({"Resources":{
+                "Machine":{"Type":"AWS::StepFunctions::StateMachine"},
+                "Queue":{"Type":"AWS::SQS::Queue"},"Worker":{"Type":"AWS::Lambda::Function"}
+            }});
+            if mode == "redrive" {
+                template["Resources"]["Queue"]["Properties"] = json!({"RedrivePolicy":{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:other"}});
+            }
+            let fake = FakeAws::new(
+                template,
+                &[
+                    ("Queue", "AWS::SQS::Queue", QUEUE_URL),
+                    ("Worker", "AWS::Lambda::Function", WORKER_ARN),
+                    ("Machine", "AWS::StepFunctions::StateMachine", "machine"),
+                ],
+            )
+            .with(move |seen| match seen.op.as_str() {
+                "DescribeStateMachine" => ok(json!({"definition":definition.to_string()})),
+                _ => None,
+            });
+            let model = topology(&fake).await.unwrap();
+            let facts = node(&model, "Queue")["facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|f| f["id"] == "dead-letter")
+                .collect::<Vec<_>>();
+            assert_eq!(facts.len(), 1);
+            let expected = match mode {
+                "caught" => "dead-letter-target",
+                "redrive" => "configured",
+                _ => "not-declared",
+            };
+            assert_eq!(facts[0]["value"], expected, "{integration} {mode}");
+            if mode == "caught" {
+                assert!(facts[0]["evidence"].as_str().unwrap().contains(&format!(
+                    "DescribeStateMachine Definition.States.Send.{args}.QueueUrl (Catch path)"
+                )));
+                assert!(has_edge(&model, "configured", "Machine", "Queue"));
+            }
+            assert!(!model.to_string().contains("must-not-export-error-payload"));
+        }
+    }
+}

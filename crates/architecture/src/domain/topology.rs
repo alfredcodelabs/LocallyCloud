@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::fmt;
 
 use super::model::{
-    bounded_text, Edge, EdgeKind, EmptyList, Fact, Node, Origin, Snapshot, SnapshotMeta,
-    SnapshotScope, Unresolved, INFERRED,
+    bounded_text, Edge, EdgeKind, EmptyList, Fact, FactId, FactValue, Node, Origin, Snapshot,
+    SnapshotMeta, SnapshotScope, Unresolved, INFERRED,
 };
 
 /// Same bounds the browser model enforces.
@@ -192,7 +192,20 @@ impl Topology {
         let Some(node) = self.nodes.iter_mut().find(|n| n.id == target) else {
             return;
         };
-        if node.facts.len() < MAX_FACTS && !node.facts.iter().any(|f| f.id == fact.id) {
+        if let Some(existing) = node.facts.iter_mut().find(|f| f.id == fact.id) {
+            // Being a failure destination does not require a queue's own RedrivePolicy.
+            if fact.id == FactId::DeadLetter
+                && existing.value == FactValue::NotDeclared
+                && fact.value == FactValue::DeadLetterTarget
+            {
+                *existing = Fact {
+                    evidence: bounded_text(&fact.evidence, EVIDENCE),
+                    ..fact
+                };
+            }
+            return;
+        }
+        if node.facts.len() < MAX_FACTS {
             node.facts.push(Fact {
                 evidence: bounded_text(&fact.evidence, EVIDENCE),
                 ..fact
