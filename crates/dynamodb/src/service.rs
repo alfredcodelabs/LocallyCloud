@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -571,6 +570,7 @@ mod tests {
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct KinesisRecorder {
