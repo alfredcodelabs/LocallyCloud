@@ -67,8 +67,23 @@ pub struct ChangeSet {
     pub status: String,
     pub reason: Option<String>,
     pub executed: bool,
+    #[serde(default)]
+    pub creation_time: Option<String>,
     pub request: Query,
     pub changes: Vec<ChangeSetChange>,
+}
+
+/// Read projection: listing never clones templates or full resource-change vectors.
+pub(crate) struct ChangeSetSummary {
+    pub id: String,
+    pub name: String,
+    pub stack_name: String,
+    pub stack_id: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub executed: bool,
+    pub creation_time: Option<String>,
+    pub description: Option<String>,
 }
 
 impl CfnStore {
@@ -440,6 +455,30 @@ impl CfnStore {
         Ok(true)
     }
 
+    pub(crate) fn change_set_summaries<'a>(
+        &'a self,
+        account: &str,
+        region: &str,
+        stack_id: &str,
+    ) -> impl Iterator<Item = ChangeSetSummary> + 'a {
+        let prefix = format!("{account}:{region}:");
+        let stack_id = stack_id.to_owned();
+        self.change_sets
+            .iter()
+            .filter(move |entry| entry.key().starts_with(&prefix) && entry.stack_id == stack_id)
+            .map(|entry| ChangeSetSummary {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                stack_name: entry.stack_name.clone(),
+                stack_id: entry.stack_id.clone(),
+                status: entry.status.clone(),
+                reason: entry.reason.clone(),
+                executed: entry.executed,
+                creation_time: entry.creation_time.clone(),
+                description: entry.request.get("Description"),
+            })
+    }
+
     pub fn find_change_set(
         &self,
         account: &str,
@@ -790,6 +829,7 @@ mod tests {
             status: "CREATE_COMPLETE".into(),
             reason: None,
             executed: false,
+            creation_time: None,
             request: Query {
                 params: [("TemplateBody".into(), "private-change-template".into())].into(),
             },
@@ -1030,6 +1070,7 @@ mod tests {
             status: "CREATE_COMPLETE".into(),
             reason: None,
             executed: false,
+            creation_time: None,
             request: Query {
                 params: Default::default(),
             },

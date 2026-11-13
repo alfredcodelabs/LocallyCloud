@@ -1,6 +1,8 @@
 //! CloudFormation service handler: Query-protocol dispatch, stack lifecycle orchestration,
 //! and XML responses. Registered `Native` in the Core registry.
 
+mod change_sets;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
@@ -102,6 +104,7 @@ impl CfnHandler {
             "CreateStack" => self.create_stack(q, region, account, None).await,
             "CreateChangeSet" => self.create_change_set(q, region, account).await,
             "DescribeChangeSet" => self.describe_change_set(q, region, account),
+            "ListChangeSets" => self.list_change_sets(q, region, account),
             "ExecuteChangeSet" => self.execute_change_set(q, region, account).await,
             "DeleteChangeSet" => self.delete_change_set(q, region, account),
             "UpdateStack" => self.update_stack(q, region, account).await,
@@ -382,6 +385,24 @@ impl CfnHandler {
         let stack = q
             .get("StackName")
             .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
+        if name.len() > 128
+            || !name
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic())
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(CfnError::Validation("ChangeSetName must start with a letter and contain up to 128 letters, digits or hyphens".into()));
+        }
+        if q.get("Description")
+            .is_some_and(|description| description.chars().take(1025).count() > 1024)
+        {
+            return Err(CfnError::Validation(
+                "Description must contain at most 1024 characters".into(),
+            ));
+        }
         let change_type = q.get("ChangeSetType").unwrap_or_else(|| "UPDATE".into());
         if !matches!(change_type.as_str(), "CREATE" | "UPDATE") {
             return Err(CfnError::Validation(
@@ -398,6 +419,24 @@ impl CfnHandler {
             )));
         }
         let existing = self.store.find(account, region, &stack);
+        let review = self.store.review_change_set(account, region, &stack);
+        let stack = existing
+            .as_ref()
+            .map(|existing| existing.stack_name.clone())
+            .or_else(|| review.as_ref().map(|change| change.stack_name.clone()))
+            .unwrap_or(stack);
+        if existing.is_none()
+            && (stack.len() > 128
+                || !stack
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic())
+                || !stack
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+        {
+            return Err(CfnError::Validation("StackName must start with a letter and contain up to 128 letters, digits or hyphens".into()));
+        }
         if (change_type == "CREATE") == existing.is_some() {
             return Err(CfnError::Validation(format!(
                 "ChangeSetType {change_type} is invalid for stack {stack}"
@@ -428,8 +467,14 @@ impl CfnHandler {
         let stack_id = existing
             .as_ref()
             .map(|old| old.stack_id.clone())
+            .or_else(|| {
+                self.store
+                    .review_change_set(account, region, &stack)
+                    .map(|change| change.stack_id)
+            })
             .unwrap_or_else(|| make_stack_id(region, account, &stack));
         let mut request = q.clone();
+        request.params.insert("StackName".into(), stack.clone());
         request.params.insert("TemplateBody".into(), body);
         request.params.remove("TemplateURL");
         request
@@ -463,6 +508,7 @@ impl CfnHandler {
                 reason: unchanged
                     .then(|| "The submitted information didn't contain changes.".into()),
                 executed: false,
+                creation_time: Some(now_iso()),
                 request,
                 changes,
             },
@@ -522,40 +568,14 @@ impl CfnHandler {
             text_el("Status", &cs.status),
             text_el(
                 "ExecutionStatus",
-                if cs.executed {
-                    match self
-                        .store
-                        .find(account, region, &cs.stack_id)
-                        .map(|stack| stack.status)
-                    {
-                        Some(
-                            StackStatus::CreateInProgress
-                            | StackStatus::UpdateInProgress
-                            | StackStatus::DeleteInProgress
-                            | StackStatus::RollbackInProgress
-                            | StackStatus::UpdateRollbackInProgress,
-                        ) => "EXECUTE_IN_PROGRESS",
-                        Some(
-                            StackStatus::CreateFailed
-                            | StackStatus::UpdateFailed
-                            | StackStatus::DeleteFailed
-                            | StackStatus::RollbackComplete
-                            | StackStatus::RollbackFailed
-                            | StackStatus::UpdateRollbackComplete
-                            | StackStatus::UpdateRollbackFailed,
-                        )
-                        | None => "EXECUTE_FAILED",
-                        _ => "EXECUTE_COMPLETE",
-                    }
-                } else if cs.status == "FAILED" {
-                    "UNAVAILABLE"
-                } else {
-                    "AVAILABLE"
-                }
+                self.change_set_execution_status(&cs, region, account)
             ),
             text_el("ChangeSetType", &cs.change_type),
             reason,
-            text_el("CreationTime", &now_iso())
+            cs.creation_time
+                .as_deref()
+                .map(|time| text_el("CreationTime", time))
+                .unwrap_or_default()
         ))
     }
 
@@ -1368,10 +1388,10 @@ impl CfnHandler {
         let mut reconciliation_actions = Vec::new();
         let mut metadata_changes = Vec::new();
 
-        let (in_progress, complete, failed_status) = if creating {
-            ("CREATE_IN_PROGRESS", "CREATE_COMPLETE", "CREATE_FAILED")
+        let (in_progress, failed_status) = if creating {
+            ("CREATE_IN_PROGRESS", "CREATE_FAILED")
         } else {
-            ("UPDATE_IN_PROGRESS", "UPDATE_COMPLETE", "UPDATE_FAILED")
+            ("UPDATE_IN_PROGRESS", "UPDATE_FAILED")
         };
 
         // Stack-level start event (deployment tools monitor these to detect completion).
@@ -1415,6 +1435,12 @@ impl CfnHandler {
         }
 
         for decl in active {
+            let (resource_in_progress, resource_complete, resource_failed) =
+                if resolved.contains_key(&decl.logical_id) {
+                    ("UPDATE_IN_PROGRESS", "UPDATE_COMPLETE", "UPDATE_FAILED")
+                } else {
+                    ("CREATE_IN_PROGRESS", "CREATE_COMPLETE", "CREATE_FAILED")
+                };
             let ctx = ResolveCtx {
                 region,
                 account,
@@ -1430,7 +1456,7 @@ impl CfnHandler {
                     events.push(event(
                         &decl.logical_id,
                         &decl.resource_type,
-                        failed_status,
+                        resource_failed,
                         Some(error.to_string()),
                     ));
                     failure_reason = Some(error.to_string());
@@ -1466,7 +1492,7 @@ impl CfnHandler {
                 events.push(event(
                     &decl.logical_id,
                     &decl.resource_type,
-                    in_progress,
+                    resource_in_progress,
                     None,
                 ));
                 record("", None, &events).await?;
@@ -1503,7 +1529,7 @@ impl CfnHandler {
                         {
                             resource.physical_id = updated.ref_value.clone();
                             resource.attributes = updated.attributes.clone();
-                            resource.status = complete.to_string();
+                            resource.status = resource_complete.to_string();
                             resource.lifecycle = Some(lifecycle);
                             if deferred && decl.update_replace_policy != ResourcePolicy::Retain {
                                 resource
@@ -1521,7 +1547,12 @@ impl CfnHandler {
                             *deferred_previous = deferred.then_some(current);
                         }
                         resolved.insert(decl.logical_id.clone(), updated);
-                        events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
+                        events.push(event(
+                            &decl.logical_id,
+                            &decl.resource_type,
+                            resource_complete,
+                            None,
+                        ));
                         record(
                             &decl.logical_id,
                             resources.iter().find(|r| r.logical_id == decl.logical_id),
@@ -1535,12 +1566,12 @@ impl CfnHandler {
                             .iter_mut()
                             .find(|r| r.logical_id == decl.logical_id)
                         {
-                            resource.status = failed_status.into();
+                            resource.status = resource_failed.into();
                         }
                         events.push(event(
                             &decl.logical_id,
                             &decl.resource_type,
-                            failed_status,
+                            resource_failed,
                             Some(reason.clone()),
                         ));
                         record(
@@ -1626,7 +1657,7 @@ impl CfnHandler {
             events.push(event(
                 &decl.logical_id,
                 &decl.resource_type,
-                in_progress,
+                resource_in_progress,
                 None,
             ));
             record("", None, &events).await?;
@@ -1639,12 +1670,17 @@ impl CfnHandler {
                         logical_id: decl.logical_id.clone(),
                         physical_id: rr.ref_value.clone(),
                         resource_type: decl.resource_type.clone(),
-                        status: complete.to_string(),
+                        status: resource_complete.to_string(),
                         attributes: rr.attributes.clone(),
                         pending_cleanup: Vec::new(),
                         lifecycle: Some(lifecycle),
                     });
-                    events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
+                    events.push(event(
+                        &decl.logical_id,
+                        &decl.resource_type,
+                        resource_complete,
+                        None,
+                    ));
                     record(&decl.logical_id, resources.last(), &events).await?;
                     reconciliation_actions.push(ReconcileAction::Created {
                         logical_id: decl.logical_id.clone(),
@@ -1658,7 +1694,7 @@ impl CfnHandler {
                     events.push(event(
                         &decl.logical_id,
                         &decl.resource_type,
-                        failed_status,
+                        resource_failed,
                         Some(reason.clone()),
                     ));
                     failure_reason = Some(reason);
@@ -2077,6 +2113,7 @@ impl CfnHandler {
             .store
             .find(account, region, &name)
             .ok_or_else(|| CfnError::Validation(format!("Stack with id {name} does not exist")))?;
+        let stack = resource_view(stack);
         let members: String = stack
             .resources
             .iter()
@@ -2101,6 +2138,7 @@ impl CfnHandler {
             .store
             .find(account, region, &name)
             .ok_or_else(|| CfnError::Validation(format!("Stack with id {name} does not exist")))?;
+        let stack = resource_view(stack);
         let resource = stack.resource(&logical).ok_or_else(|| {
             CfnError::Validation(format!(
                 "Resource {logical} does not exist for stack {name}"
@@ -2125,6 +2163,7 @@ impl CfnHandler {
             .store
             .find(account, region, &name)
             .ok_or_else(|| CfnError::Validation(format!("Stack with id {name} does not exist")))?;
+        let stack = resource_view(stack);
         let members: String = stack
             .resources
             .iter()
@@ -2132,7 +2171,7 @@ impl CfnHandler {
                 format!(
                     "<member>{}{}{}{}{}<LastUpdatedTimestamp>{}</LastUpdatedTimestamp></member>",
                     text_el("LogicalResourceId", &r.logical_id),
-                    text_el("PhysicalResourceId", &r.physical_id),
+                    physical_resource_id(r),
                     text_el("ResourceType", &r.resource_type),
                     text_el("ResourceStatus", &r.status),
                     resource_status_reason(&stack, r),
@@ -2248,6 +2287,7 @@ impl NativeHandler for CfnHandler {
                 | "GetTemplate"
                 | "GetTemplateSummary"
                 | "DescribeChangeSet"
+                | "ListChangeSets"
         ) {
             let stack_name = q.get("StackName");
             let resource = if op == "DescribeChangeSet" {
@@ -2257,7 +2297,15 @@ impl NativeHandler for CfnHandler {
             } else {
                 stack_name
                     .as_deref()
-                    .and_then(|name| self.store.find(&request.account_id, &request.region, name))
+                    .and_then(|name| {
+                        self.store
+                            .find(&request.account_id, &request.region, name)
+                            .or_else(|| {
+                                self.store
+                                    .review_change_set(&request.account_id, &request.region, name)
+                                    .map(|change| review_stack(&change))
+                            })
+                    })
                     .map(|stack| stack.stack_id)
             }
             .unwrap_or_else(|| "*".into());
@@ -2762,12 +2810,11 @@ fn render_event(stack: &Stack, e: &StackEvent) -> String {
         .map(|r| text_el("ResourceStatusReason", r))
         .unwrap_or_default();
     let physical_id = if e.resource_type == STACK_TYPE {
-        stack.stack_id.as_str()
+        Some(stack.stack_id.as_str())
     } else {
         stack
             .resource(&e.logical_id)
             .map(|r| r.physical_id.as_str())
-            .unwrap_or(e.logical_id.as_str())
     };
     format!(
         "<member>{}{}{}{}{}{}{}<Timestamp>{}</Timestamp>{}</member>",
@@ -2775,12 +2822,95 @@ fn render_event(stack: &Stack, e: &StackEvent) -> String {
         text_el("StackName", &stack.stack_name),
         text_el("EventId", &e.event_id),
         text_el("LogicalResourceId", &e.logical_id),
-        text_el("PhysicalResourceId", physical_id),
+        physical_id
+            .map(|id| text_el("PhysicalResourceId", id))
+            .unwrap_or_default(),
         text_el("ResourceType", &e.resource_type),
         text_el("ResourceStatus", &e.status),
         xml_escape(&e.timestamp),
         reason,
     )
+}
+
+/// Project current operation events for readers without inventing provider ownership.
+fn resource_view(mut stack: Stack) -> Stack {
+    let start = stack
+        .events
+        .iter()
+        .rposition(|event| {
+            event.resource_type == STACK_TYPE
+                && event.logical_id == stack.stack_name
+                && matches!(
+                    event.status.as_str(),
+                    "CREATE_IN_PROGRESS" | "UPDATE_IN_PROGRESS" | "DELETE_IN_PROGRESS"
+                )
+        })
+        .unwrap_or(0);
+    let active = stack.status.is_in_progress();
+    let latest: BTreeMap<_, _> = stack.events[start..]
+        .iter()
+        .rev()
+        .filter(|event| event.resource_type != STACK_TYPE)
+        .fold(BTreeMap::new(), |mut latest, event| {
+            latest.entry(event.logical_id.as_str()).or_insert(event);
+            latest
+        });
+    let mut known: BTreeSet<String> = stack
+        .resources
+        .iter()
+        .map(|r| r.logical_id.clone())
+        .collect();
+    if active {
+        for resource in &mut stack.resources {
+            if let Some(event) = latest.get(resource.logical_id.as_str()).filter(|event| {
+                event.resource_type == resource.resource_type
+                    && matches!(
+                        event.status.as_str(),
+                        "CREATE_IN_PROGRESS"
+                            | "UPDATE_IN_PROGRESS"
+                            | "UPDATE_ROLLBACK_IN_PROGRESS"
+                            | "DELETE_IN_PROGRESS"
+                    )
+            }) {
+                resource.status = event.status.clone();
+            }
+        }
+    }
+    let pending = stack.events[start..]
+        .iter()
+        .filter(|event| {
+            let latest_event = latest
+                .get(event.logical_id.as_str())
+                .is_some_and(|last| last.event_id == event.event_id);
+            latest_event
+                && (matches!(event.status.as_str(), "CREATE_FAILED" | "UPDATE_FAILED")
+                    || active
+                        && matches!(
+                            event.status.as_str(),
+                            "CREATE_IN_PROGRESS" | "UPDATE_IN_PROGRESS"
+                        ))
+        })
+        .filter(|event| event.resource_type != STACK_TYPE && known.insert(event.logical_id.clone()))
+        .map(|event| StackResource {
+            logical_id: event.logical_id.clone(),
+            physical_id: String::new(),
+            resource_type: event.resource_type.clone(),
+            status: event.status.clone(),
+            attributes: BTreeMap::new(),
+            pending_cleanup: Vec::new(),
+            lifecycle: None,
+        })
+        .collect::<Vec<_>>();
+    stack.resources.extend(pending);
+    stack
+}
+
+fn physical_resource_id(resource: &StackResource) -> String {
+    if resource.physical_id.is_empty() {
+        String::new()
+    } else {
+        text_el("PhysicalResourceId", &resource.physical_id)
+    }
 }
 
 fn render_resource_detail(stack: &Stack, r: &StackResource) -> String {
@@ -2805,7 +2935,7 @@ fn resource_detail_inner(stack: &Stack, r: &StackResource) -> String {
         text_el("StackId", &stack.stack_id),
         text_el("StackName", &stack.stack_name),
         text_el("LogicalResourceId", &r.logical_id),
-        text_el("PhysicalResourceId", &r.physical_id),
+        physical_resource_id(r),
         text_el("ResourceType", &r.resource_type),
         text_el("ResourceStatus", &r.status),
         reason,
@@ -3037,6 +3167,97 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn pending_resources_are_read_views_without_physical_ownership_or_stale_epochs() {
+        let mut stack = Stack {
+            stack_id: "arn:stack:view".into(),
+            stack_name: "view".into(),
+            status: StackStatus::CreateInProgress,
+            template_body: String::new(),
+            parameters: BTreeMap::new(),
+            resources: Vec::new(),
+            outputs: Vec::new(),
+            events: vec![
+                event("view", STACK_TYPE, "CREATE_IN_PROGRESS", None),
+                event("Custom", "Custom::Probe", "CREATE_IN_PROGRESS", None),
+            ],
+            tags: Vec::new(),
+            creation_time: now_iso(),
+            last_updated_time: None,
+            disable_rollback: false,
+        };
+        let view = resource_view(stack.clone());
+        let pending = view.resource("Custom").unwrap();
+        assert_eq!(pending.status, "CREATE_IN_PROGRESS");
+        assert!(pending.physical_id.is_empty());
+        assert!(!resource_detail_inner(&view, pending).contains("<PhysicalResourceId>"));
+        assert!(
+            stack.resources.is_empty(),
+            "reading must not create provider ownership"
+        );
+        stack.status = StackStatus::CreateFailed;
+        assert!(
+            resource_view(stack.clone()).resources.is_empty(),
+            "restart must not resurrect a running provider"
+        );
+        stack.events.push(event(
+            "Custom",
+            "Custom::Probe",
+            "CREATE_FAILED",
+            Some("provider failed".into()),
+        ));
+        assert_eq!(
+            resource_view(stack.clone())
+                .resource("Custom")
+                .unwrap()
+                .status,
+            "CREATE_FAILED"
+        );
+        stack.status = StackStatus::UpdateInProgress;
+        stack
+            .events
+            .push(event("view", STACK_TYPE, "UPDATE_IN_PROGRESS", None));
+        assert!(
+            resource_view(stack.clone()).resources.is_empty(),
+            "old operation events are not current resources"
+        );
+        stack.resources.push(StackResource {
+            logical_id: "Function".into(),
+            physical_id: "real-function".into(),
+            resource_type: "AWS::Lambda::Function".into(),
+            status: "UPDATE_COMPLETE".into(),
+            attributes: BTreeMap::new(),
+            pending_cleanup: Vec::new(),
+            lifecycle: None,
+        });
+        stack.events.push(event(
+            "Function",
+            "AWS::Lambda::Function",
+            "UPDATE_IN_PROGRESS",
+            None,
+        ));
+        let view = resource_view(stack.clone());
+        assert_eq!(
+            view.resource("Function").unwrap().status,
+            "UPDATE_IN_PROGRESS"
+        );
+        assert_eq!(
+            stack.resource("Function").unwrap().status,
+            "UPDATE_COMPLETE"
+        );
+        stack.events.push(event(
+            "Function",
+            "AWS::Lambda::Function",
+            "DELETE_COMPLETE",
+            Some("Retired resource old-function".into()),
+        ));
+        assert_eq!(
+            resource_view(stack).resource("Function").unwrap().status,
+            "UPDATE_COMPLETE",
+            "retired replacement events do not delete the live resource view"
+        );
+    }
 
     #[test]
     fn recorded_dependencies_order_cleanup_after_interrupted_update() {
@@ -4373,7 +4594,7 @@ mod tests {
             assert_eq!(restored[0].lifecycle, original[0].lifecycle);
             assert!(events.iter().any(|event| event.logical_id == "Shared"
                 && event.resource_type == "AWS::SQS::Queue"
-                && event.status == "UPDATE_COMPLETE"));
+                && event.status == "CREATE_COMPLETE"));
             assert!(events.iter().any(|event| event.logical_id == "Shared"
                 && event.resource_type == "AWS::SQS::Queue"
                 && event.status == "DELETE_COMPLETE"));
@@ -4947,7 +5168,7 @@ mod tests {
             "Subnet":{"Type":"AWS::EC2::Subnet","Properties":{"VpcId":{"Ref":"Vpc"},"CidrBlock":"10.55.1.0/24"}},
             "Preferred":{"Type":"AWS::EC2::SecurityGroup","Properties":{"VpcId":{"Ref":"Vpc"},"GroupDescription":"preferred"}},
             "Retired":{"Type":"AWS::EC2::SecurityGroup","Properties":{"VpcId":{"Ref":"Vpc"},"GroupDescription":"retired"}},
-            "Function":{"Type":"AWS::Lambda::Function","Properties":{"FunctionName":"cfn-sg-switch","Runtime":"nodejs22.x","Handler":"index.handler","Role":"arn:aws:iam::000000000000:role/test","Code":{"ZipFile":"UEsDBBQAAAAAAMeaQ100F2L+HQAAAB0AAAAIAAAAaW5kZXguanNleHBvcnRzLmhhbmRsZXI9YXN5bmMoKT0+KHt9KVBLAQIUAxQAAAAAAMeaQ100F2L+HQAAAB0AAAAIAAAAAAAAAAAAAACAAQAAAABpbmRleC5qc1BLBQYAAAAAAQABADYAAABDAAAAAAA="},"VpcConfig":{"SubnetIds":[{"Ref":"Subnet"}],"SecurityGroupIds":[{"Ref":"Retired"}]}}}
+            "Function":{"Type":"AWS::Lambda::Function","Properties":{"FunctionName":"cfn-sg-switch","Runtime":"nodejs22.x","Handler":"index.handler","Role":"arn:aws:iam::000000000000:role/test","Code":{"ZipFile":"exports.handler=async()=>({})"},"VpcConfig":{"SubnetIds":[{"Ref":"Subnet"}],"SecurityGroupIds":[{"Ref":"Retired"}]}}}
         }});
         let initial = Template::parse(&topology.to_string()).unwrap();
         let (status, original, _, events) =

@@ -4121,7 +4121,7 @@ impl Provisioner {
             .unwrap_or_else(|| generate_name(stack_name, logical_id, 64));
 
         // Resolve the code package into an inline base64 zip the Lambda service accepts.
-        let code = self.resolve_code(props.get("Code")).await?;
+        let code = self.resolve_code(props).await?;
 
         let mut body = json!({
             "FunctionName": name,
@@ -4225,8 +4225,13 @@ impl Provisioner {
             .unwrap_or_else(|| json!(["x86_64"]));
         let code = if previous_props.get("Code") != props.get("Code")
             || architectures != previous_architectures
+            || (props
+                .get("Code")
+                .and_then(|code| code.get("ZipFile"))
+                .is_some()
+                && props.get("Runtime") != previous_props.get("Runtime"))
         {
-            let mut code = self.resolve_code(props.get("Code")).await?;
+            let mut code = self.resolve_code(props).await?;
             code["Architectures"] = architectures;
             Some(code)
         } else {
@@ -5272,17 +5277,71 @@ impl Provisioner {
         Ok(())
     }
 
-    /// Resolve `Code` into `{ "ZipFile": <base64> }`. Supports inline `ZipFile` and an
-    /// `S3Bucket`/`S3Key` reference (fetched from the S3 service and re-inlined, since the
-    /// Lambda data plane consumes inline zips).
-    async fn resolve_code(&self, code: Option<&Value>) -> Result<Value, CfnError> {
-        let Some(code) = code else {
+    /// Convert CFN inline source or an S3 deployment package into Lambda API ZIP bytes.
+    async fn resolve_code(&self, props: &Value) -> Result<Value, CfnError> {
+        let Some(code) = props.get("Code") else {
             return Err(CfnError::Validation(
                 "Lambda function is missing Code".into(),
             ));
         };
-        if let Some(zip) = code.get("ZipFile").and_then(Value::as_str) {
-            return Ok(json!({ "ZipFile": zip }));
+        if let Some(source) = code.get("ZipFile") {
+            const MAX_INLINE_BYTES: usize = 4 * 1024 * 1024;
+            let source = source.as_str().ok_or_else(|| {
+                CfnError::Validation("Lambda Code.ZipFile must be a source-code string".into())
+            })?;
+            if source.len() > MAX_INLINE_BYTES {
+                return Err(CfnError::Validation(
+                    "Lambda inline code exceeds 4 MiB".into(),
+                ));
+            }
+            let filename =
+                match props.get("Runtime").and_then(Value::as_str) {
+                    Some(runtime) if runtime.starts_with("nodejs") => "index.js",
+                    Some(runtime) if runtime.starts_with("python") => "index.py",
+                    _ => return Err(CfnError::Validation(
+                        "Lambda Code.ZipFile inline source requires a Node.js or Python runtime"
+                            .into(),
+                    )),
+                };
+            if props
+                .get("Handler")
+                .and_then(Value::as_str)
+                .is_some_and(|handler| !handler.starts_with("index."))
+            {
+                return Err(CfnError::Validation(
+                    "Lambda Code.ZipFile requires a handler in the index module".into(),
+                ));
+            }
+            let source = source.to_owned();
+            let archive = tokio::task::spawn_blocking(move || {
+                use std::io::{Cursor, Write};
+                let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .last_modified_time(zip::DateTime::default())
+                    .unix_permissions(0o644);
+                archive
+                    .start_file(filename, options)
+                    .map_err(|_| CfnError::Internal)?;
+                archive
+                    .write_all(source.as_bytes())
+                    .map_err(|_| CfnError::Internal)?;
+                let bytes = archive
+                    .finish()
+                    .map_err(|_| CfnError::Internal)?
+                    .into_inner();
+                if bytes.len() > MAX_INLINE_BYTES {
+                    return Err(CfnError::Validation(
+                        "Lambda inline ZIP exceeds 4 MiB".into(),
+                    ));
+                }
+                Ok(bytes)
+            })
+            .await
+            .map_err(|_| CfnError::Internal)??;
+            return Ok(
+                json!({"ZipFile": base64::engine::general_purpose::STANDARD.encode(archive)}),
+            );
         }
         let bucket = code.get("S3Bucket").and_then(Value::as_str);
         let key = code.get("S3Key").and_then(Value::as_str);
@@ -9085,8 +9144,8 @@ mod tests {
             "us-west-2".into(),
             "123456789012".into(),
         );
-        let mut props = json!({"FunctionName":"reserved-native","Runtime":"python3.12","Handler":"ledger.post",
-            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},"ReservedConcurrentExecutions":"4"});
+        let mut props = json!({"FunctionName":"reserved-native","Runtime":"python3.12","Handler":"index.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"def post(event, context):\n    return event\n"},"ReservedConcurrentExecutions":"4"});
         let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
         // The same deployed template must not republish versions or write other services.
         faults.requests.lock().unwrap().clear();
@@ -9341,6 +9400,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_lambda_source_is_packaged_for_native_create_and_update() {
+        use std::io::{Cursor, Read};
+
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_lambda::register(&registry);
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        for (suffix, runtime, filename, source, changed) in [
+            (
+                "node",
+                "nodejs22.x",
+                "index.js",
+                "exports.handler=async()=> 'héllo';\n",
+                "exports.handler=async()=> 'updated';\n",
+            ),
+            (
+                "python",
+                "python3.13",
+                "index.py",
+                "def handler(event, context):\n    return 'héllo'\n",
+                "def handler(event, context):\n    return 'updated'\n",
+            ),
+        ] {
+            let name = format!("inline-native-{suffix}");
+            let mut props = json!({"FunctionName":name,"Runtime":runtime,"Handler":"index.handler",
+                "Role":"arn:aws:iam::123456789012:role/workflow", "Code":{"ZipFile":source}});
+            let package = p.resolve_code(&props).await.unwrap();
+            assert_eq!(
+                p.resolve_code(&props).await.unwrap(),
+                package,
+                "inline ZIP must be deterministic"
+            );
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(package["ZipFile"].as_str().unwrap())
+                .unwrap();
+            let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            assert_eq!(archive.len(), 1);
+            let mut entry = archive.by_index(0).unwrap();
+            assert_eq!(entry.name(), filename);
+            let mut extracted = String::new();
+            entry.read_to_string(&mut extracted).unwrap();
+            assert_eq!(extracted, source);
+            let resource = p.lambda_function("Inline", "stack", &props).await.unwrap();
+            let path = format!("/2015-03-31/functions/{name}/configuration");
+            let original = p
+                .call_json("lambda", Method::GET, &path, json!({}), "Inline")
+                .await
+                .unwrap();
+            assert_eq!(original["CodeSize"], bytes.len());
+            let previous = props.clone();
+            props["Code"]["ZipFile"] = json!(changed);
+            p.update_lambda_function("Inline", &resource.ref_value, &previous, &props)
+                .await
+                .unwrap();
+            let updated = p
+                .call_json("lambda", Method::GET, &path, json!({}), "Inline")
+                .await
+                .unwrap();
+            assert_ne!(original["CodeSha256"], updated["CodeSha256"]);
+            assert_eq!(original["FunctionArn"], updated["FunctionArn"]);
+            p.delete_function(&resource.ref_value).await.unwrap();
+        }
+
+        let mut props = json!({"Runtime":"nodejs22.x","Handler":"index.handler","Code":{"ZipFile":"UEsDBAoAAAA="}});
+        let package = p.resolve_code(&props).await.unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(package["ZipFile"].as_str().unwrap())
+            .unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut literal = String::new();
+        archive
+            .by_name("index.js")
+            .unwrap()
+            .read_to_string(&mut literal)
+            .unwrap();
+        assert_eq!(
+            literal, "UEsDBAoAAAA=",
+            "base64-looking source must not be decoded"
+        );
+        props["Runtime"] = json!("python3.13");
+        let package = p.resolve_code(&props).await.unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(package["ZipFile"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            zip::ZipArchive::new(Cursor::new(bytes))
+                .unwrap()
+                .by_index(0)
+                .unwrap()
+                .name(),
+            "index.py"
+        );
+        for runtime in ["provided.al2023", "ruby3.4", "dotnet8"] {
+            props["Runtime"] = json!(runtime);
+            assert!(p.resolve_code(&props).await.is_err());
+        }
+        props["Runtime"] = json!("nodejs22.x");
+        props["Handler"] = json!("other.handler");
+        assert!(p.resolve_code(&props).await.is_err());
+        props["Handler"] = json!("index.handler");
+        props["Code"]["ZipFile"] = json!(42);
+        assert!(p.resolve_code(&props).await.is_err());
+        props["Code"]["ZipFile"] = json!("x".repeat(4 * 1024 * 1024 + 1));
+        assert!(p.resolve_code(&props).await.is_err());
+    }
+
+    #[tokio::test]
     async fn lambda_architectures_reach_native_create_and_code_updates() {
         let registry = Arc::new(ServiceRegistry::new());
         locallycloud_lambda::register(&registry);
@@ -9349,8 +9518,8 @@ mod tests {
             "us-west-2".into(),
             "123456789012".into(),
         );
-        let mut props = json!({"FunctionName":"architecture-native","Runtime":"python3.12","Handler":"ledger.post",
-            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},
+        let mut props = json!({"FunctionName":"architecture-native","Runtime":"python3.12","Handler":"index.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"def post(event, context):\n    return event\n"},
             "Architectures":["arm64"]});
         let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
         let configuration = || async {
@@ -9437,8 +9606,8 @@ mod tests {
             "us-west-2".into(),
             "123456789012".into(),
         );
-        let mut props = json!({"FunctionName":"logging-native","Runtime":"python3.12","Handler":"ledger.post",
-            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},
+        let mut props = json!({"FunctionName":"logging-native","Runtime":"python3.12","Handler":"index.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"def post(event, context):\n    return event\n"},
             "LoggingConfig":{"LogGroup":"accounting/custom-logs","LogFormat":"Text"}});
         let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
         let configuration = || async {
@@ -9511,8 +9680,8 @@ mod tests {
             "us-west-2".into(),
             "123456789012".into(),
         );
-        let mut props = json!({"FunctionName":"traced-native","Runtime":"python3.12","Handler":"ledger.post",
-            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},
+        let mut props = json!({"FunctionName":"traced-native","Runtime":"python3.12","Handler":"index.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"def post(event, context):\n    return event\n"},
             "TracingConfig":{"Mode":"Active"}});
         let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
         let mode = || async {
