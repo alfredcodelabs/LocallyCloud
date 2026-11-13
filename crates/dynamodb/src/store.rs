@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
 use locallycloud_state::{StateCipher, StateDb};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -223,6 +223,8 @@ pub struct TableData {
     pub def: TableDefinition,
     pub(crate) write_window: crate::capacity::WriteWindow,
     persist_id: String,
+    /// Whether this incarnation has completed its first SQLite commit.
+    persisted: bool,
     pub items: BTreeMap<StoredKey, Item>,
     pub tags: BTreeMap<String, String>,
     pub ttl_attribute: Option<String>,
@@ -254,6 +256,7 @@ impl TableData {
         TableData {
             def,
             persist_id: uuid::Uuid::new_v4().to_string(),
+            persisted: false,
             items: BTreeMap::new(),
             tags,
             ttl_attribute,
@@ -804,29 +807,14 @@ impl TableStore {
             .map_err(persist_error)?;
         for (account, region, table) in &locked {
             let name = &table.def.name;
-            let old_metadata: Option<String> = transaction
-                .query_row(
-                    "SELECT metadata FROM dynamodb_tables WHERE account=?1 AND region=?2 AND name=?3",
-                    params![account, region, name],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(persist_error)?;
-            if let Some(old_metadata) = old_metadata {
-                let old_metadata = crate::recovery::decode(
-                    self.cipher.as_deref(),
-                    &["dynamodb-metadata", account, region, name],
-                    &old_metadata,
-                )?;
-                let old: PersistedTable =
-                    serde_json::from_str(&old_metadata).map_err(persist_error)?;
-                if old.identity() != table.persist_id {
-                    // A newly created table must not inherit rows from an older table with its name.
-                    transaction.execute(
+            if !table.persisted {
+                // A new incarnation must not inherit the previous table's child rows.
+                transaction
+                    .execute(
                         "DELETE FROM dynamodb_tables WHERE account=?1 AND region=?2 AND name=?3",
                         params![account, region, name],
-                    ).map_err(persist_error)?;
-                }
+                    )
+                    .map_err(persist_error)?;
             }
             let metadata =
                 serde_json::to_string(&PersistedTable::from_data(table)).map_err(persist_error)?;
@@ -943,6 +931,7 @@ impl TableStore {
         }
         self.clear_uncommitted();
         for (_, _, mut table) in locked {
+            table.persisted = true;
             table.dirty_keys.clear();
             table.stream_persisted = table.stream_records.len();
         }
@@ -954,7 +943,7 @@ impl TableStore {
     }
 
     /// Atomically create a table; `ResourceInUseException` if the name already exists.
-    pub fn create(&self, account: &str, region: &str, data: TableData) -> Result<(), DdbError> {
+    pub fn create(&self, account: &str, region: &str, mut data: TableData) -> Result<(), DdbError> {
         validate_table_name(&data.def.name)?;
         let key = Self::key(account, region, &data.def.name);
         use dashmap::mapref::entry::Entry;
@@ -964,6 +953,7 @@ impl TableStore {
                 data.def.name
             ))),
             Entry::Vacant(slot) => {
+                data.persisted = false;
                 self.pending_tables.insert(key.clone());
                 slot.insert(Arc::new(StoredTable::new(
                     data,
@@ -1251,9 +1241,30 @@ mod tests {
         store
             .create("0", "us-east-1", data(simple_def("tbl")))
             .unwrap();
+        let connection = state.connection().unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_recreation BEFORE INSERT ON dynamodb_tables BEGIN SELECT RAISE(ABORT, 'injected first commit failure'); END;").unwrap();
+        assert!(store.persist().await.is_err());
+        assert!(
+            !store
+                .get("0", "us-east-1", "tbl")
+                .unwrap()
+                .read()
+                .await
+                .persisted
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM dynamodb_items", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        connection
+            .execute_batch("DROP TRIGGER reject_recreation")
+            .unwrap();
         store.persist().await.unwrap();
         drop(store);
-        let reopened = TableStore::with_state(state).unwrap();
+        let reopened = TableStore::with_state(state.clone()).unwrap();
         assert!(reopened
             .get("0", "us-east-1", "tbl")
             .unwrap()
@@ -1261,6 +1272,31 @@ mod tests {
             .await
             .items
             .is_empty());
+        let table = reopened.get("0", "us-east-1", "tbl").unwrap();
+        assert!(table.read().await.persisted);
+        for pk in ["first", "second"] {
+            let mut item = Item::new();
+            item.insert("pk".into(), AttributeValue::S(pk.into()));
+            {
+                let mut guard = table.write().await;
+                let key = guard.key_of(&item).unwrap();
+                guard.emit_stream(None, Some(&item));
+                guard.items.insert(key, item);
+            }
+            reopened.persist().await.unwrap();
+        }
+        drop(reopened);
+        let restored = TableStore::with_state(state).unwrap();
+        assert_eq!(
+            restored
+                .get("0", "us-east-1", "tbl")
+                .unwrap()
+                .read()
+                .await
+                .items
+                .len(),
+            2
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1541,6 +1577,7 @@ impl PersistedTable {
         TableData {
             def: self.def,
             persist_id,
+            persisted: true,
             items: BTreeMap::new(),
             tags: self.tags,
             ttl_attribute: self.ttl_attribute,
