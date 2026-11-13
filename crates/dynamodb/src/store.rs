@@ -474,6 +474,7 @@ pub struct TableStore {
     pub(crate) capacity: crate::capacity::CapacityModel,
     uncommitted: AtomicBool,
     pub(crate) state: Option<Arc<StateDb>>,
+    connection: Option<std::sync::Mutex<rusqlite::Connection>>,
     pub(crate) cipher: Option<Arc<StateCipher>>,
 }
 
@@ -728,6 +729,8 @@ impl TableStore {
             let data = entry.value().data.try_read().map_err(persist_error)?;
             store.track_maintenance(entry.key(), &data);
         }
+        drop(query);
+        store.connection = Some(std::sync::Mutex::new(connection));
         Ok(store)
     }
 
@@ -774,7 +777,7 @@ impl TableStore {
         for ((account, region, _), table) in &entries {
             locked.push((account, region, table.data.write().await));
         }
-        let Some(state) = &self.state else {
+        let Some(connection) = &self.connection else {
             for (account, region, table) in &locked {
                 self.track_maintenance(
                     &(
@@ -793,7 +796,9 @@ impl TableStore {
             self.clear_uncommitted();
             return Ok(());
         };
-        let mut connection = state.connection().map_err(persist_error)?;
+        let mut connection = connection.lock().map_err(|_| {
+            DdbError::Internal("DynamoDB persistence connection is poisoned".into())
+        })?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persist_error)?;
@@ -1326,6 +1331,25 @@ mod tests {
         let connection = state.connection().unwrap();
         connection.execute_batch("CREATE TRIGGER reject_second BEFORE UPDATE ON dynamodb_tables WHEN OLD.name='bravo' BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END;").unwrap();
         assert!(store.persist().await.is_err());
+        {
+            let connection = store.connection.as_ref().unwrap().lock().unwrap();
+            assert!(
+                connection.is_autocommit(),
+                "failed transaction must roll back before reuse"
+            );
+            assert_eq!(
+                connection
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                connection
+                    .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "wal"
+            );
+        }
         assert!(store.has_uncommitted());
         assert_eq!(store.pending_keys().len(), 3);
         let reopened = TableStore::with_state(state.clone()).unwrap();
