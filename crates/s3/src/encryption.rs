@@ -16,6 +16,7 @@ use crate::store::StoredBody;
 
 pub(crate) const CHUNK: usize = 64 * 1024;
 const OVERHEAD: usize = 12 + 16;
+pub(crate) const INLINE_PLAINTEXT_LIMIT: usize = CHUNK - OVERHEAD;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,7 +134,7 @@ impl EncryptedBody {
             context,
             ciphertext: Box::new(StoredBody::Inline(Bytes::new())),
         };
-        let mut file = if body.len() > CHUNK - OVERHEAD {
+        let mut file = if body.len() > INLINE_PLAINTEXT_LIMIT {
             Some(tempfile::tempfile().map_err(|_| S3Error::InternalError)?)
         } else {
             None

@@ -328,6 +328,15 @@ impl StoredBody {
         if start.checked_add(len).is_none_or(|end| end > self.len()) {
             return Err(S3Error::InternalError);
         }
+        match self {
+            Self::Opened(body, _)
+                if len <= CHUNK && matches!(body.ciphertext.as_ref(), Self::Inline(_)) =>
+            {
+                // One bounded in-memory chunk: authenticate before constructing success headers.
+                return Ok(Body::from(self.read_range(start, start + len)?));
+            }
+            _ => {}
+        }
         let pinned = self.pin_readers()?;
         match &pinned {
             Self::Inline(body) => Ok(Body::from(body.slice(start..start + len))),
@@ -342,6 +351,9 @@ impl StoredBody {
                 })
                 .await
                 .map_err(|_| S3Error::InternalError)??;
+                if first.len() == len {
+                    return Ok(Body::from(first));
+                }
                 let stream = futures_util::stream::try_unfold(
                     (body, start, end, Some(first)),
                     |(body, cursor, end, first)| async move {
@@ -864,6 +876,68 @@ mod body_tests {
         expected.extend_from_slice(&inputs[1][3..]);
         assert_eq!(received, Bytes::from(expected));
         assert_eq!(small.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn encrypted_response_boundaries_ranges_and_corruption() {
+        let store = AccountStore::new();
+        let ctx = crate::ops::Ctx {
+            store: &store,
+            account: "test",
+            storage_account: "test",
+            copy_source_account: None,
+            region: "us-east-1",
+            request_id: "test",
+            dispatcher: None,
+            identity: None,
+            delegated_identity: None,
+            strict_external: false,
+        };
+        let encryption = ServerSideEncryption::default();
+        for len in [
+            0,
+            1,
+            4096,
+            crate::encryption::INLINE_PLAINTEXT_LIMIT,
+            crate::encryption::INLINE_PLAINTEXT_LIMIT + 1,
+            CHUNK * 2 + 7,
+        ] {
+            let input = Bytes::from(vec![b'x'; len]);
+            let encrypted = crate::ops::encrypt_body(
+                &ctx,
+                "bucket",
+                "key",
+                &StoredBody::Inline(input.clone()),
+                &encryption,
+            )
+            .await
+            .unwrap();
+            let opened = crate::ops::open_body(&ctx, "bucket", "key", &encrypted, &encryption)
+                .await
+                .unwrap();
+            let response = opened.response_body(0, len).await.unwrap();
+            assert_eq!(axum::body::to_bytes(response, len).await.unwrap(), input);
+            if len > 0 {
+                let start = len / 2;
+                let size = (len - start).min(23);
+                let response = opened.response_body(start, size).await.unwrap();
+                assert_eq!(
+                    axum::body::to_bytes(response, size).await.unwrap(),
+                    input.slice(start..start + size)
+                );
+            }
+            let StoredBody::Opened(body, key) = opened else {
+                panic!("opened encrypted body required");
+            };
+            let mut corrupt = (*body).clone();
+            let mut ciphertext = corrupt.ciphertext.read_all().unwrap().to_vec();
+            ciphertext[12] ^= 1;
+            corrupt.ciphertext = Box::new(StoredBody::Inline(Bytes::from(ciphertext)));
+            assert!(StoredBody::Opened(Arc::new(corrupt), key)
+                .response_body(0, len)
+                .await
+                .is_err());
+        }
     }
 
     #[test]

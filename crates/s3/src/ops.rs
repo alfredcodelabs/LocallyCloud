@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::encryption::EncryptedBody;
+use crate::encryption::{EncryptedBody, INLINE_PLAINTEXT_LIMIT};
 use axum::body::Body;
 use axum::response::Response;
 use bytes::Bytes;
@@ -386,12 +386,19 @@ pub(crate) async fn encrypt_body(
             )
         }
     };
-    let source = body.clone();
-    let encrypted = tokio::task::spawn_blocking(move || {
-        EncryptedBody::encrypt(&source, &plain, wrapped, kms_key, context)
-    })
-    .await
-    .map_err(|_| S3Error::InternalError)??;
+    let encrypted = match body {
+        StoredBody::Inline(bytes) if bytes.len() <= INLINE_PLAINTEXT_LIMIT => {
+            EncryptedBody::encrypt(body, &plain, wrapped, kms_key, context)?
+        }
+        _ => {
+            let source = body.clone();
+            tokio::task::spawn_blocking(move || {
+                EncryptedBody::encrypt(&source, &plain, wrapped, kms_key, context)
+            })
+            .await
+            .map_err(|_| S3Error::InternalError)??
+        }
+    };
     Ok(StoredBody::Encrypted(Arc::new(encrypted)))
 }
 
