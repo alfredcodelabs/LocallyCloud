@@ -19,23 +19,35 @@ struct ActivitySnapshot {
 
 pub(crate) struct Persistence {
     state: Arc<StateDb>,
+    connection: std::sync::Mutex<rusqlite::Connection>,
     cipher: StateCipher,
 }
 impl Persistence {
     pub(crate) fn new(state: Arc<StateDb>, cipher: StateCipher) -> Result<Self, String> {
-        state.connection().map_err(|e|e.to_string())?.execute_batch(
+        let connection = state.connection().map_err(|e| e.to_string())?;
+        connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS sfn_scopes(account TEXT NOT NULL,region TEXT NOT NULL,version INTEGER NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(account,region));
              CREATE TABLE IF NOT EXISTS sfn_executions(arn TEXT PRIMARY KEY,version INTEGER NOT NULL,payload BLOB NOT NULL);"
         ).map_err(|e|e.to_string())?;
-        Ok(Self { state, cipher })
+        Ok(Self {
+            state,
+            connection: std::sync::Mutex::new(connection),
+            cipher,
+        })
     }
+    fn connection(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, String> {
+        self.connection
+            .lock()
+            .map_err(|_| "Step Functions persistence connection is poisoned".into())
+    }
+
     fn seal<T: Serialize>(&self, context: &[&str], value: &T) -> Result<Vec<u8>, String> {
         let clear = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         self.cipher.seal(context, &clear).map_err(|e| e.to_string())
     }
     pub(crate) fn save_execution(&self, execution: &Execution) -> Result<(), String> {
         let payload = self.seal(&["stepfunctions", "execution", &execution.arn], execution)?;
-        self.state.connection().map_err(|e|e.to_string())?.execute(
+        self.connection()?.execute(
             "INSERT INTO sfn_executions(arn,version,payload) VALUES(?1,1,?2) ON CONFLICT(arn) DO UPDATE SET version=excluded.version,payload=excluded.payload",
             params![execution.arn,payload],
         ).map_err(|e|e.to_string())?;
@@ -48,13 +60,14 @@ impl Persistence {
         snapshot: &ScopeSnapshot,
     ) -> Result<(), String> {
         let payload = self.seal(&["stepfunctions", "scope", account, region], snapshot)?;
-        self.state.connection().map_err(|e|e.to_string())?.execute(
+        self.connection()?.execute(
             "INSERT INTO sfn_scopes(account,region,version,payload) VALUES(?1,?2,1,?3) ON CONFLICT(account,region) DO UPDATE SET version=excluded.version,payload=excluded.payload",
             params![account,region,payload],
         ).map_err(|e|e.to_string())?;
         Ok(())
     }
     pub(crate) fn restore(&self, store: &SfnStore) -> Result<(), String> {
+        // Restore may save interrupted executions; its read cursor must not hold the writer mutex.
         let connection = self.state.connection().map_err(|e| e.to_string())?;
         let mut statement = connection
             .prepare("SELECT account,region,version,payload FROM sfn_scopes")
@@ -269,5 +282,122 @@ impl Drop for ExecutionWriteGuard<'_> {
             }
             self.failed.store(true, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(account: &str, value: &str) -> ScopeSnapshot {
+        ScopeSnapshot {
+            machines: Vec::new(),
+            activities: vec![ActivitySnapshot {
+                arn: format!("arn:aws:states:us-east-1:{account}:activity:work"),
+                name: "work".into(),
+                creation_date: 1.0,
+                tags: BTreeMap::from([("private".into(), value.into())]),
+            }],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reused_writer_recovers_from_sql_failure_and_preserves_encrypted_scopes() {
+        let root = std::env::temp_dir().join(format!("sfn-writer-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let persistence =
+            Arc::new(Persistence::new(state.clone(), StateCipher::with_key(&[7; 32])).unwrap());
+        let account = "000000000000";
+        persistence
+            .save_scope(account, "us-east-1", &snapshot(account, "original"))
+            .unwrap();
+        let connection = state.connection().unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_scope BEFORE UPDATE ON sfn_scopes BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        assert!(persistence
+            .save_scope(account, "us-east-1", &snapshot(account, "changed"))
+            .is_err());
+        {
+            let writer = persistence.connection().unwrap();
+            assert!(writer.is_autocommit());
+            assert_eq!(
+                writer
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                writer
+                    .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "wal"
+            );
+        }
+        let payload: Vec<u8> = connection
+            .query_row(
+                "SELECT payload FROM sfn_scopes WHERE account=?1",
+                [account],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let clear = persistence
+            .cipher
+            .open(&["stepfunctions", "scope", account, "us-east-1"], &payload)
+            .unwrap();
+        let restored: ScopeSnapshot = serde_json::from_slice(&clear).unwrap();
+        assert_eq!(restored.activities[0].tags["private"], "original");
+        assert!(persistence
+            .cipher
+            .open(
+                &["stepfunctions", "scope", "111111111111", "us-east-1"],
+                &payload
+            )
+            .is_err());
+        connection
+            .execute_batch("DROP TRIGGER reject_scope")
+            .unwrap();
+        persistence
+            .save_scope(
+                account,
+                "us-east-1",
+                &snapshot(account, "sensitive_scope_snapshot"),
+            )
+            .unwrap();
+        let mut writers = Vec::new();
+        for index in 1..=4 {
+            let persistence = persistence.clone();
+            writers.push(tokio::task::spawn_blocking(move || {
+                let account = format!("{index:012}");
+                persistence.save_scope(&account, "us-east-1", &snapshot(&account, &account))
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap().unwrap();
+        }
+        let payloads: Vec<Vec<u8>> = connection
+            .prepare("SELECT payload FROM sfn_scopes")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(payloads.iter().all(|payload| !payload
+            .windows(b"sensitive_scope_snapshot".len())
+            .any(|part| part == b"sensitive_scope_snapshot")));
+        drop(persistence);
+        assert!(SfnStore::with_state(state.clone(), StateCipher::with_key(&[8; 32])).is_err());
+        let reopened = SfnStore::with_state(state, StateCipher::with_key(&[7; 32])).unwrap();
+        for index in 0..=4 {
+            let account = format!("{index:012}");
+            let activity = reopened
+                .get_activity(&account, "us-east-1", "work")
+                .unwrap();
+            let expected = if index == 0 {
+                "sensitive_scope_snapshot"
+            } else {
+                &account
+            };
+            assert_eq!(activity.tags.read().await["private"], expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
