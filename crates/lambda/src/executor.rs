@@ -471,10 +471,30 @@ pub struct InvokeResult {
     pub init: Option<InitReport>,
     /// Output a managed runtime produced during Init, emitted before `START`.
     pub init_logs: String,
+    /// Tail of the exact formatted lines delivered to CloudWatch (at most 4 KiB).
+    pub(crate) formatted_log_tail: Option<Vec<u8>>,
 }
 
 /// `X-Amz-Log-Result` carries at most the last 4 KB of the invocation's log.
 const LOG_TAIL_BYTES: usize = 4096;
+
+/// Copy only the final 4 KiB without joining the entire captured log again.
+pub(crate) fn log_tail_from_lines(lines: &[String]) -> Vec<u8> {
+    if lines.is_empty() {
+        return vec![b'\n'];
+    }
+    let mut tail = Vec::with_capacity(LOG_TAIL_BYTES);
+    for line in lines.iter().rev() {
+        if tail.len() == LOG_TAIL_BYTES {
+            break;
+        }
+        tail.push(b'\n');
+        let remaining = LOG_TAIL_BYTES - tail.len();
+        tail.extend(line.as_bytes().iter().rev().take(remaining).copied());
+    }
+    tail.reverse();
+    tail
+}
 
 impl InvokeResult {
     /// The CloudWatch Logs lines of this invocation, in order: Init output, `INIT_REPORT`
@@ -618,7 +638,9 @@ struct ExecutionLogState {
     output_bytes: u64,
     account: String,
     region: String,
-    function_name: String,
+    log_group_name: String,
+    logging_config: crate::model::LoggingConfig,
+    runtime: Option<String>,
     role: String,
 }
 
@@ -971,7 +993,7 @@ impl Executor {
                 Err(ColdStartError::Failed(e)) => {
                     self.publish_invocation_metrics(account, region, func, true, None);
                     let request_id = Uuid::new_v4().to_string();
-                    let result = InvokeResult {
+                    let mut result = InvokeResult {
                         outcome: Outcome::Error {
                             error_type: FunctionErrorType::Unhandled,
                             payload: serde_json::json!({"errorMessage": e.to_string()})
@@ -985,15 +1007,16 @@ impl Executor {
                         billed_duration_ms: 0,
                         init: None,
                         init_logs: String::new(),
+                        formatted_log_tail: None,
                     };
-                    self.publish_invocation_logs(account, region, func, &result)
+                    self.publish_invocation_logs(account, region, func, &mut result)
                         .await?;
                     return Ok(result);
                 }
                 Err(ColdStartError::Init(failure)) => {
                     // Errors=1 and no Duration: the invocation never reached the handler.
                     self.publish_invocation_metrics(account, region, func, true, None);
-                    let result = InvokeResult {
+                    let mut result = InvokeResult {
                         outcome: Outcome::Error {
                             error_type: FunctionErrorType::Unhandled,
                             payload: failure.payload,
@@ -1005,8 +1028,9 @@ impl Executor {
                         billed_duration_ms: billed_ms(0, Some(&failure.report)),
                         init: Some(failure.report),
                         init_logs: failure.logs,
+                        formatted_log_tail: None,
                     };
-                    self.publish_invocation_logs(account, region, func, &result)
+                    self.publish_invocation_logs(account, region, func, &mut result)
                         .await?;
                     return Ok(result);
                 }
@@ -1155,6 +1179,7 @@ impl Executor {
             billed_duration_ms: billed_ms(duration_us, init.as_ref()),
             init,
             init_logs,
+            formatted_log_tail: None,
         };
         if func.tracing_mode == TracingMode::Active && trace.sampled {
             self.emit_lambda_segments(
@@ -1180,7 +1205,7 @@ impl Executor {
                 }
         );
         if !reusable || !has_extensions {
-            self.publish_invocation_logs(account, region, func, &result)
+            self.publish_invocation_logs(account, region, func, &mut result)
                 .await?;
         }
 
@@ -1205,7 +1230,7 @@ impl Executor {
                     complete.billed_duration_ms =
                         billed_ms(complete.duration_us, complete.init.as_ref());
                     if let Err(error) = executor
-                        .publish_invocation_logs(&account, &region, &function, &complete)
+                        .publish_invocation_logs(&account, &region, &function, &mut complete)
                         .await
                     {
                         tracing::warn!(%error, "extension invocation logs not published");
@@ -1231,7 +1256,7 @@ impl Executor {
                 .await;
             let (tail, _) = self.read_environment_logs(&env_key).await;
             result.logs.push_str(&tail);
-            self.publish_invocation_logs(account, region, func, &result)
+            self.publish_invocation_logs(account, region, func, &mut result)
                 .await?;
             if phase.is_ok() {
                 self.return_warm(&pool_key, &env_key, generation).await;
@@ -1342,7 +1367,7 @@ impl Executor {
         account: &str,
         region: &str,
         func: &LambdaFunction,
-        result: &InvokeResult,
+        result: &mut InvokeResult,
     ) -> Result<(), LambdaError> {
         let Some(registry) = self.registry.upgrade() else {
             return Ok(());
@@ -1374,7 +1399,10 @@ impl Executor {
             .ensure_group(
                 scope.clone(),
                 ProducerGroupSpec {
-                    name: format!("/aws/lambda/{}", func.function_name),
+                    name: func
+                        .logging_config
+                        .log_group_name(&func.function_name)
+                        .into_owned(),
                 },
                 context.clone(),
             )
@@ -1396,8 +1424,13 @@ impl Executor {
                 LambdaError::InternalError("CloudWatch Logs stream publication failed".into())
             })?;
         let timestamp_ms = now_ms();
-        let events = result
-            .log_lines(&func.version, func.memory_size)
+        let lines = crate::logging::invocation_lines(result, func);
+        if lines.is_empty() {
+            result.formatted_log_tail = Some(Vec::new());
+            return Ok(());
+        }
+        result.formatted_log_tail = Some(log_tail_from_lines(&lines));
+        let events = lines
             .into_iter()
             .map(|message| ProducerLogEvent {
                 timestamp_ms,
@@ -1771,15 +1804,22 @@ impl Executor {
         let Some(state) = self.log_state.get(env_key) else {
             return Ok(());
         };
-        let (account, region, name, role) = (
+        let (account, region, group_name, logging_config, runtime, role) = (
             state.account.clone(),
             state.region.clone(),
-            state.function_name.clone(),
+            state.log_group_name.clone(),
+            state.logging_config.clone(),
+            state.runtime.clone(),
             state.role.clone(),
         );
         drop(state);
         let (logs, stream) = self.read_environment_logs(env_key).await;
         if logs.is_empty() {
+            return Ok(());
+        }
+        let messages =
+            crate::logging::application_lines(&logs, &logging_config, runtime.as_deref());
+        if messages.is_empty() {
             return Ok(());
         }
         let Some(registry) = self.registry.upgrade() else {
@@ -1805,9 +1845,7 @@ impl Executor {
         };
         // Final delivery must not recreate a group deleted by its stack, or require
         // DescribeLogGroups on a standard write-only Lambda execution role.
-        let group = GroupRef {
-            name: format!("/aws/lambda/{name}"),
-        };
+        let group = GroupRef { name: group_name };
         let target = sink
             .ensure_stream(
                 scope.clone(),
@@ -1825,10 +1863,11 @@ impl Executor {
         sink.append(
             scope,
             target,
-            logs.lines()
-                .map(|line| ProducerLogEvent {
+            messages
+                .into_iter()
+                .map(|message| ProducerLogEvent {
                     timestamp_ms,
-                    message: line.to_owned(),
+                    message,
                 })
                 .collect(),
             context,
@@ -2146,6 +2185,7 @@ impl Executor {
             memory_size: func.memory_size,
             region,
             log_stream: &log_stream,
+            logging_config: &func.logging_config,
             runtime_api: &runtime_api,
             aws_endpoint_url: &self.aws_endpoint_url,
             access_key_id: role_credentials
@@ -2521,7 +2561,12 @@ impl Executor {
                 output_bytes: 0,
                 account: account.to_owned(),
                 region: region.to_owned(),
-                function_name: func.function_name.clone(),
+                log_group_name: func
+                    .logging_config
+                    .log_group_name(&func.function_name)
+                    .into_owned(),
+                logging_config: func.logging_config.clone(),
+                runtime: func.runtime.clone(),
                 role: func.role.clone(),
             },
         );
@@ -3460,6 +3505,7 @@ mod tests {
             code_zip: Some(code.into()),
             dead_letter_arn: None,
             vpc_config: None,
+            logging_config: Default::default(),
             tracing_mode: crate::model::TracingMode::PassThrough,
         }
     }
@@ -4538,7 +4584,7 @@ mod tests {
                 events: Vec<ProducerLogEvent>,
                 _: ProducerContext,
             ) -> Result<AppendOutcome, SinkError> {
-                assert_eq!(target.group_name, "/aws/lambda/function");
+                assert_eq!(target.group_name, "/custom/final-group");
                 assert_eq!(target.stream_name, "warm-stream");
                 let count = events.len();
                 self.events
@@ -4580,7 +4626,9 @@ mod tests {
                 output_bytes: 0,
                 account: "000000000000".into(),
                 region: "us-east-1".into(),
-                function_name: "function".into(),
+                log_group_name: "/custom/final-group".into(),
+                logging_config: Default::default(),
+                runtime: None,
                 role: "arn:aws:iam::000000000000:role/basic".into(),
             },
         );
@@ -4974,6 +5022,23 @@ mod tests {
         assert_lambda_metric_shape(&observations);
     }
 
+    #[test]
+    fn formatted_tail_is_the_bounded_byte_suffix_of_published_lines() {
+        for lines in [
+            vec![],
+            vec![String::new()],
+            vec!["hello".into(), "world".into()],
+            vec!["á".repeat(3000), "suffix".into()],
+        ] {
+            let mut full = lines.join("\n");
+            full.push('\n');
+            let bytes = full.into_bytes();
+            let tail = log_tail_from_lines(&lines);
+            assert_eq!(tail, bytes[bytes.len().saturating_sub(LOG_TAIL_BYTES)..]);
+            assert!(tail.len() <= LOG_TAIL_BYTES);
+        }
+    }
+
     fn stream_messages(logs: &RecordingLogs, stream: &str) -> Vec<String> {
         logs.events
             .lock()
@@ -4982,6 +5047,68 @@ mod tests {
             .filter(|(group, name, _)| group == "/aws/lambda/fn" && name == stream)
             .map(|(_, _, message)| message.clone())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn invocation_logs_use_configured_group_without_default_group_delivery() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let logs = Arc::new(RecordingLogs::default());
+        let registry = observability_registry_with_logs(metrics, logs.clone());
+        let exec = build_executor(
+            Arc::new(InvocationBroker::new()),
+            GuestBehavior::EchoUppercaseLen,
+        )
+        .await
+        .with_service_registry(Arc::downgrade(&registry));
+        let mut function = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        function.logging_config.log_group = Some("/custom/accounting".into());
+        function.logging_config.log_format = crate::model::LogFormat::Json;
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &function, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(result.outcome, Outcome::Success(_)));
+        let events = logs.events.lock().unwrap();
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|(group, _, _)| group == "/custom/accounting"));
+        let mut published = events
+            .iter()
+            .map(|(_, _, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        published.push('\n');
+        let published = published.into_bytes();
+        assert_eq!(
+            result.formatted_log_tail.as_deref().unwrap(),
+            &published[published.len().saturating_sub(LOG_TAIL_BYTES)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn filtering_all_logs_keeps_invocation_successful_with_an_empty_tail() {
+        let logs = Arc::new(RecordingLogs::default());
+        let registry =
+            observability_registry_with_logs(Arc::new(RecordingMetrics::default()), logs.clone());
+        let exec = build_executor(
+            Arc::new(InvocationBroker::new()),
+            GuestBehavior::EchoUppercaseLen,
+        )
+        .await
+        .with_service_registry(Arc::downgrade(&registry));
+        let mut function = func("nodejs22.x", 10, zip_with(&[("index.js", b"x")]));
+        function.logging_config.log_format = crate::model::LogFormat::Json;
+        function.logging_config.application_log_level =
+            Some(crate::model::ApplicationLogLevel::Fatal);
+        function.logging_config.system_log_level = Some(crate::model::SystemLogLevel::Warn);
+        let result = exec
+            .invoke_sync("000000000000", "us-east-1", &function, b"{}".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(result.outcome, Outcome::Success(_)));
+        assert_eq!(result.formatted_log_tail.as_deref(), Some(&[][..]));
+        assert!(logs.events.lock().unwrap().is_empty());
     }
 
     /// Init (a 300 ms import) is measured once, reported only on the cold-start `REPORT`,

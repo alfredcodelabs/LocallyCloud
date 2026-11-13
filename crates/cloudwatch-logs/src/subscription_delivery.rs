@@ -116,6 +116,7 @@ async fn deliver(registry: &Weak<ServiceRegistry>, delivery: &PendingSubscriptio
     for payload in payloads {
         let call = match lambda_call(
             &delivery.group_key.scope,
+            &delivery.group_key.name,
             &delivery.function_name,
             payload,
             "Event",
@@ -192,6 +193,7 @@ fn encode_payload(
 
 pub(crate) fn lambda_call(
     scope: &ScopeKey,
+    log_group: &str,
     function_name: &str,
     payload: Vec<u8>,
     invocation_type: &'static str,
@@ -203,6 +205,20 @@ pub(crate) fn lambda_call(
     headers.insert(
         "x-amz-invocation-type",
         HeaderValue::from_static(invocation_type),
+    );
+    headers.insert(
+        "x-locallycloud-source-arn",
+        HeaderValue::from_str(&format!(
+            "arn:aws:logs:{}:{}:log-group:{log_group}",
+            scope.region, scope.account_id,
+        ))
+        .map_err(|_| LogsError::ServiceUnavailable("invalid subscription source ARN".into()))?,
+    );
+    headers.insert(
+        "x-locallycloud-source-account",
+        HeaderValue::from_str(&scope.account_id).map_err(|_| {
+            LogsError::ServiceUnavailable("invalid subscription source account".into())
+        })?,
     );
     headers.insert(
         "authorization",
@@ -221,7 +237,7 @@ pub(crate) fn lambda_call(
         headers,
         body: payload.into(),
         identity: CallerIdentity::ServicePrincipal {
-            service: "logs.amazonaws.com".into(),
+            service: "logs".into(),
         },
         correlation: CorrelationContext::root(),
         pattern: Some(IntegrationPatternId("logs->lambda")),
@@ -244,4 +260,85 @@ struct SubscriptionLogEvent<'a> {
     id: &'a str,
     timestamp: i64,
     message: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use locallycloud_core::handler::{NativeHandler, ServiceRequest};
+    use locallycloud_core::integration::identity::PRINCIPAL_HEADER;
+    use locallycloud_core::integration::InternalDispatcher;
+    use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+    use locallycloud_core::registry::{AwsProtocol, ServiceMetadata};
+
+    #[tokio::test]
+    async fn subscription_calls_attest_the_actual_log_group_and_service_principal() {
+        struct Destination;
+        #[async_trait]
+        impl NativeHandler for Destination {
+            async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+                assert_eq!(request.account_id, "000000000000");
+                assert_eq!(request.region, "us-east-2");
+                assert_eq!(
+                    request.headers["x-locallycloud-verified-internal-scope"],
+                    "1"
+                );
+                assert_eq!(request.headers[PRINCIPAL_HEADER], "logs.amazonaws.com");
+                assert_eq!(
+                    request.headers["x-locallycloud-source-account"],
+                    "000000000000"
+                );
+                assert_eq!(
+                    request.headers["x-locallycloud-source-arn"],
+                    "arn:aws:logs:us-east-2:000000000000:log-group:accounting/custom-logs"
+                );
+                let status = if request.headers["x-amz-invocation-type"] == "DryRun" {
+                    204
+                } else {
+                    202
+                };
+                http::Response::builder()
+                    .status(status)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        }
+        let registry = Arc::new(ServiceRegistry::new());
+        registry.register_native(
+            ServiceName::new("lambda"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            Arc::new(Destination),
+        );
+        let dispatcher = Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: std::time::Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-2".into(),
+            "000000000000".into(),
+        ));
+        let scope = ScopeKey {
+            account_id: "000000000000".into(),
+            region: "us-east-2".into(),
+        };
+        let engine = DeliveryEngine::new(dispatcher);
+        for (invocation, expected) in [("DryRun", 204), ("Event", 202)] {
+            let response = engine
+                .deliver_sync(
+                    lambda_call(
+                        &scope,
+                        "accounting/custom-logs",
+                        "worker",
+                        b"{}".to_vec(),
+                        invocation,
+                    )
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(response.status(), expected);
+        }
+    }
 }

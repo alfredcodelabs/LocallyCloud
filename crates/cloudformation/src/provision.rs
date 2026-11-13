@@ -4133,6 +4133,7 @@ impl Provisioner {
             ("Runtime", "Runtime"),
             ("Role", "Role"),
             ("Description", "Description"),
+            ("LoggingConfig", "LoggingConfig"),
         ] {
             if let Some(v) = props.get(cfn) {
                 obj.insert(api.to_string(), v.clone());
@@ -4265,6 +4266,7 @@ impl Provisioner {
                 }
                 // Removing TracingConfig resets the function to the Lambda default, as in AWS.
                 configuration["TracingConfig"] = json!({"Mode": tracing.unwrap_or("PassThrough")});
+                configuration["LoggingConfig"] = lambda_logging_configuration(function, properties);
                 configuration
             };
             let next = configuration(props, tracing);
@@ -5617,9 +5619,22 @@ impl Provisioner {
         &self,
         function: &str,
     ) -> Result<Option<String>, CfnError> {
-        // The native executor and guest environment use this exact configured default.
         // This is an association, never proof that CloudFormation owns the log group.
-        let group = format!("/aws/lambda/{function}");
+        let configuration = self
+            .call_json(
+                "lambda",
+                Method::GET,
+                &format!("/2015-03-31/functions/{function}/configuration"),
+                json!({}),
+                function,
+            )
+            .await?;
+        let group = configuration
+            .get("LoggingConfig")
+            .and_then(|config| config.get("LogGroup"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("/aws/lambda/{function}"));
         let result = self
             .call_logs(
                 "DescribeLogGroups",
@@ -8641,6 +8656,29 @@ fn ensure_delete_succeeded(
     )))
 }
 
+// Lambda configuration updates merge fields; CFN property removal must restore defaults.
+fn lambda_logging_configuration(function: &str, properties: &Value) -> Value {
+    let mut configuration = properties
+        .get("LoggingConfig")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = configuration.as_object_mut() {
+        object.entry("LogFormat").or_insert_with(|| json!("Text"));
+        object
+            .entry("LogGroup")
+            .or_insert_with(|| json!(format!("/aws/lambda/{function}")));
+        if object.get("LogFormat").and_then(Value::as_str) == Some("JSON") {
+            object
+                .entry("ApplicationLogLevel")
+                .or_insert_with(|| json!("INFO"));
+            object
+                .entry("SystemLogLevel")
+                .or_insert_with(|| json!("INFO"));
+        }
+    }
+    configuration
+}
+
 /// `TracingConfig.Mode` when declared; `Mode` is optional and AWS allows `Active|PassThrough`.
 fn lambda_tracing_mode<'a>(
     logical_id: &str,
@@ -9287,6 +9325,100 @@ mod tests {
             .0,
             404
         );
+    }
+
+    #[tokio::test]
+    async fn lambda_logging_config_reaches_native_lambda_and_resets_removed_properties() {
+        struct ExistingLogs;
+        #[async_trait]
+        impl NativeHandler for ExistingLogs {
+            async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["logGroupNamePrefix"], "accounting/custom-logs");
+                http::Response::builder()
+                    .status(200)
+                    .body(Body::from(
+                        json!({"logGroups":[{"logGroupName":"accounting/custom-logs"}]})
+                            .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_lambda::register(&registry);
+        registry.register_native(
+            ServiceName::new("logs"),
+            ServiceMetadata::new(AwsProtocol::Json11, None),
+            Arc::new(ExistingLogs),
+        );
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        let mut props = json!({"FunctionName":"logging-native","Runtime":"python3.12","Handler":"ledger.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},
+            "LoggingConfig":{"LogGroup":"accounting/custom-logs","LogFormat":"Text"}});
+        let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
+        let configuration = || async {
+            p.call_json(
+                "lambda",
+                Method::GET,
+                "/2015-03-31/functions/logging-native/configuration",
+                json!({}),
+                "Worker",
+            )
+            .await
+            .unwrap()["LoggingConfig"]
+                .clone()
+        };
+        assert_eq!(configuration().await["LogGroup"], "accounting/custom-logs");
+        assert_eq!(
+            p.associated_lambda_log_group(&resource.ref_value)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("accounting/custom-logs")
+        );
+        let previous = props.clone();
+        props["LoggingConfig"] = json!({"LogFormat":"JSON","LogGroup":"accounting/updated-logs","ApplicationLogLevel":"ERROR","SystemLogLevel":"WARN"});
+        p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+            .await
+            .unwrap();
+        let updated = configuration().await;
+        assert_eq!(updated["LogGroup"], "accounting/updated-logs");
+        assert_eq!(updated["ApplicationLogLevel"], "ERROR");
+        assert_eq!(updated["SystemLogLevel"], "WARN");
+        let previous = props.clone();
+        props["LoggingConfig"] = json!({"LogFormat":"JSON"});
+        p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+            .await
+            .unwrap();
+        let updated = configuration().await;
+        assert_eq!(updated["LogGroup"], "/aws/lambda/logging-native");
+        assert_eq!(updated["ApplicationLogLevel"], "INFO");
+        assert_eq!(updated["SystemLogLevel"], "INFO");
+        let previous = props.clone();
+        props.as_object_mut().unwrap().remove("LoggingConfig");
+        p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+            .await
+            .unwrap();
+        let updated = configuration().await;
+        assert_eq!(updated["LogGroup"], "/aws/lambda/logging-native");
+        assert_eq!(updated["LogFormat"], "Text");
+        for invalid in [
+            json!(null),
+            json!({"LogGroup":""}),
+            json!({"LogFormat":"xml"}),
+        ] {
+            let mut next = props.clone();
+            next["LoggingConfig"] = invalid;
+            assert!(p
+                .update_lambda_function("Worker", &resource.ref_value, &props, &next)
+                .await
+                .is_err());
+        }
+        assert_eq!(configuration().await, updated);
     }
 
     #[tokio::test]

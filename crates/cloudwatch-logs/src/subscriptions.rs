@@ -53,11 +53,6 @@ pub async fn put(
         ));
     }
     let function_name = lambda_function_name(&request.destination_arn, &scope)?;
-    if request.log_group_name == format!("/aws/lambda/{function_name}") {
-        return Err(LogsError::InvalidParameter(
-            "a Lambda function cannot subscribe its own conventional log group".into(),
-        ));
-    }
     let pattern = Arc::new(FilterPattern::compile(Some(&request.filter_pattern))?);
 
     let lambda = ServiceName::new("lambda");
@@ -72,6 +67,7 @@ pub async fn put(
     let response = DeliveryEngine::new(dispatcher)
         .deliver_sync(lambda_call(
             &scope,
+            &request.log_group_name,
             &function_name,
             b"{}".to_vec(),
             "DryRun",

@@ -57,6 +57,7 @@ pub struct ExecEnvInputs<'a> {
     pub memory_size: u32,
     pub region: &'a str,
     pub log_stream: &'a str,
+    pub logging_config: &'a crate::model::LoggingConfig,
     /// Host endpoint the guest reaches the Runtime API on, e.g. `127.0.0.1:9001` (no scheme).
     pub runtime_api: &'a str,
     /// locallycloud endpoint URL for in-guest AWS SDK calls, e.g. `http://127.0.0.1:4566`.
@@ -100,12 +101,25 @@ pub fn build_execution_env(input: &ExecEnvInputs) -> BTreeMap<String, String> {
     env.insert("LAMBDA_TASK_ROOT".into(), LAMBDA_TASK_ROOT.to_string());
     env.insert(
         "AWS_LAMBDA_LOG_GROUP_NAME".into(),
-        format!("/aws/lambda/{}", input.function_name),
+        input
+            .logging_config
+            .log_group_name(input.function_name)
+            .into_owned(),
     );
     env.insert(
         "AWS_LAMBDA_LOG_STREAM_NAME".into(),
         input.log_stream.to_string(),
     );
+    env.insert(
+        "AWS_LAMBDA_LOG_FORMAT".into(),
+        input.logging_config.log_format.as_str().into(),
+    );
+    if input.logging_config.log_format == crate::model::LogFormat::Json {
+        env.insert(
+            "AWS_LAMBDA_LOG_LEVEL".into(),
+            input.logging_config.application_log_level().as_str().into(),
+        );
+    }
     env.insert("AWS_LAMBDA_INITIALIZATION_TYPE".into(), "on-demand".into());
     if let Some(runtime) = input.runtime {
         env.insert("AWS_EXECUTION_ENV".into(), format!("AWS_Lambda_{runtime}"));
@@ -205,6 +219,7 @@ mod tests {
             memory_size: 256,
             region: "us-east-1",
             log_stream: "2024/01/01/[$LATEST]abc",
+            logging_config: &Default::default(),
             runtime_api: "127.0.0.1:9001",
             aws_endpoint_url: "http://127.0.0.1:4566",
             access_key_id: "test",
@@ -238,6 +253,12 @@ mod tests {
             memory_size: 128,
             region: "us-east-1",
             log_stream: "s",
+            logging_config: &crate::model::LoggingConfig {
+                log_group: Some("/custom/accounting".into()),
+                log_format: crate::model::LogFormat::Json,
+                application_log_level: Some(crate::model::ApplicationLogLevel::Warn),
+                ..Default::default()
+            },
             runtime_api: "127.0.0.1:9001",
             aws_endpoint_url: "http://127.0.0.1:4566",
             access_key_id: "test",
@@ -246,6 +267,9 @@ mod tests {
             user_env: &user_env,
         });
         assert_eq!(env["AWS_REGION"], "us-east-1");
+        assert_eq!(env["AWS_LAMBDA_LOG_GROUP_NAME"], "/custom/accounting");
+        assert_eq!(env["AWS_LAMBDA_LOG_FORMAT"], "JSON");
+        assert_eq!(env["AWS_LAMBDA_LOG_LEVEL"], "WARN");
         // Custom-runtime function: no _HANDLER injected.
         assert!(!env.contains_key("_HANDLER"));
     }

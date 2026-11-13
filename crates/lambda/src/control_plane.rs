@@ -10,10 +10,11 @@ use uuid::Uuid;
 use crate::error::LambdaError;
 use crate::model::{
     compute_zip_code, function_arn, function_url_id, is_supported_runtime, layer_arn,
-    resolve_function_name, Alias, FunctionStore, FunctionUrlConfig, LambdaFunction, LayerStore,
-    LayerVersion, TracingMode, VpcConfig, DEFAULT_EPHEMERAL_MB, DEFAULT_MEMORY_MB,
-    DEFAULT_TIMEOUT_SECS, MAX_EPHEMERAL_MB, MAX_MEMORY_MB, MAX_TIMEOUT_SECS, MIN_EPHEMERAL_MB,
-    MIN_MEMORY_MB, MIN_TIMEOUT_SECS,
+    resolve_function_name, Alias, ApplicationLogLevel, FunctionStore, FunctionUrlConfig,
+    LambdaFunction, LayerStore, LayerVersion, LogFormat, LoggingConfig, SystemLogLevel,
+    TracingMode, VpcConfig, DEFAULT_EPHEMERAL_MB, DEFAULT_MEMORY_MB, DEFAULT_TIMEOUT_SECS,
+    MAX_EPHEMERAL_MB, MAX_MEMORY_MB, MAX_TIMEOUT_SECS, MIN_EPHEMERAL_MB, MIN_MEMORY_MB,
+    MIN_TIMEOUT_SECS,
 };
 
 type OpResult = Result<(u16, Option<Value>), LambdaError>;
@@ -50,6 +51,10 @@ pub fn create_function(
     validate_env(input)?;
     let environment = environment_variables(input);
     let tracing_mode = tracing_mode(input)?.unwrap_or_default();
+    let mut logging_config = LoggingConfig::default();
+    if let Some(patch) = logging_config_patch(input)? {
+        patch.apply(&mut logging_config);
+    }
 
     // Image requests are shape-validated and rejected before any state is created. Zip carries
     // the only executable package supported by this module.
@@ -153,9 +158,81 @@ pub fn create_function(
         dead_letter_arn,
         vpc_config: vpc_config.flatten(),
         tracing_mode,
+        logging_config,
     };
     store.create(account, region, func.clone())?;
     Ok((201, Some(func.to_configuration_json())))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LoggingConfigPatch {
+    log_format: Option<LogFormat>,
+    application_log_level: Option<ApplicationLogLevel>,
+    system_log_level: Option<SystemLogLevel>,
+    log_group: Option<String>,
+}
+
+impl LoggingConfigPatch {
+    fn apply(self, config: &mut LoggingConfig) {
+        if let Some(format) = self.log_format {
+            config.log_format = format;
+            if format == LogFormat::Text {
+                config.application_log_level = None;
+                config.system_log_level = None;
+            }
+        }
+        if let Some(level) = self.application_log_level {
+            config.application_log_level = Some(level);
+        }
+        if let Some(level) = self.system_log_level {
+            config.system_log_level = Some(level);
+        }
+        if let Some(group) = self.log_group {
+            config.log_group = Some(group);
+        }
+    }
+}
+
+fn logging_config_patch(input: &Value) -> Result<Option<LoggingConfigPatch>, LambdaError> {
+    let Some(value) = input.get("LoggingConfig") else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(LambdaError::InvalidParameterValue(
+            "LoggingConfig must be an object".into(),
+        ));
+    }
+    if [
+        "LogFormat",
+        "ApplicationLogLevel",
+        "SystemLogLevel",
+        "LogGroup",
+    ]
+    .iter()
+    .any(|field| value.get(field).is_some_and(Value::is_null))
+    {
+        return Err(LambdaError::InvalidParameterValue(
+            "LoggingConfig fields cannot be null".into(),
+        ));
+    }
+    let patch: LoggingConfigPatch = serde_json::from_value(value.clone()).map_err(|error| {
+        LambdaError::InvalidParameterValue(format!("Invalid LoggingConfig: {error}"))
+    })?;
+    if let Some(group) = &patch.log_group {
+        if group.is_empty()
+            || group.len() > 512
+            || !group.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'/' | b'#')
+            })
+        {
+            return Err(LambdaError::InvalidParameterValue(
+                "LoggingConfig.LogGroup must contain 1 to 512 characters from [._/#A-Za-z0-9-]"
+                    .into(),
+            ));
+        }
+    }
+    Ok(Some(patch))
 }
 
 /// `TracingConfig.Mode` when supplied; `Mode` is optional within `TracingConfig`.
@@ -456,6 +533,7 @@ pub fn update_function_configuration(
     let name = resolve_function_name(name, region)?;
     validate_env(input)?;
     let tracing_mode = tracing_mode(input)?;
+    let logging_config = logging_config_patch(input)?;
 
     // Validate supplied fields before mutating anything.
     if let Some(runtime) = input.get("Runtime").and_then(Value::as_str) {
@@ -537,6 +615,9 @@ pub fn update_function_configuration(
             }
             if let Some(v) = tracing_mode {
                 f.tracing_mode = v;
+            }
+            if let Some(patch) = logging_config {
+                patch.apply(&mut f.logging_config);
             }
             f.last_modified = now_iso8601();
             f.revision_id = Uuid::new_v4().to_string();
@@ -1624,6 +1705,144 @@ mod tests {
         // unchanged fields preserved, revision rotated
         assert_eq!(cfg["Runtime"], "nodejs22.x");
         assert_ne!(cfg["RevisionId"].as_str().unwrap(), rev0);
+    }
+
+    #[test]
+    fn logging_configuration_merges_updates_and_preserves_versions_and_legacy_state() {
+        let store = FunctionStore::new();
+        let mut input = create_input("logging");
+        input["LoggingConfig"] = serde_json::json!({
+            "LogFormat": "JSON", "LogGroup": "custom/group", "ApplicationLogLevel": "DEBUG", "SystemLogLevel": "WARN"
+        });
+        let (_, created) =
+            create_function(&store, "us-east-1", "000000000000", &input, None).unwrap();
+        assert_eq!(created.unwrap()["LoggingConfig"], input["LoggingConfig"]);
+        publish_version(&store, "us-east-1", "000000000000", "logging").unwrap();
+        let (_, updated) = update_function_configuration(
+            &store,
+            "us-east-1",
+            "000000000000",
+            "logging",
+            &serde_json::json!({
+                "LoggingConfig": {"LogGroup": "next-group"}
+            }),
+            None,
+        )
+        .unwrap();
+        let updated = updated.unwrap();
+        assert_eq!(updated["LoggingConfig"]["LogFormat"], "JSON");
+        assert_eq!(updated["LoggingConfig"]["LogGroup"], "next-group");
+        assert_eq!(updated["LoggingConfig"]["ApplicationLogLevel"], "DEBUG");
+        assert_eq!(updated["LoggingConfig"]["SystemLogLevel"], "WARN");
+        let old = store
+            .get_version("000000000000", "us-east-1", "logging", 1)
+            .unwrap();
+        assert_eq!(
+            old.to_configuration_json()["LoggingConfig"]["LogGroup"],
+            "custom/group"
+        );
+        let (_, text) = update_function_configuration(
+            &store,
+            "us-east-1",
+            "000000000000",
+            "logging",
+            &serde_json::json!({
+                "LoggingConfig": {"LogFormat": "Text"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            text.unwrap()["LoggingConfig"],
+            serde_json::json!({"LogFormat":"Text","LogGroup":"next-group"})
+        );
+        let (_, json) = update_function_configuration(
+            &store,
+            "us-east-1",
+            "000000000000",
+            "logging",
+            &serde_json::json!({
+                "LoggingConfig": {"LogFormat": "JSON"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            json.unwrap()["LoggingConfig"],
+            serde_json::json!({
+                "LogFormat":"JSON", "LogGroup":"next-group", "ApplicationLogLevel":"INFO", "SystemLogLevel":"INFO"
+            })
+        );
+        let function = store.get("000000000000", "us-east-1", "logging").unwrap();
+        let mut persisted = serde_json::to_value(&function).unwrap();
+        let restored: LambdaFunction = serde_json::from_value(persisted.clone()).unwrap();
+        assert_eq!(restored.logging_config, function.logging_config);
+        persisted.as_object_mut().unwrap().remove("logging_config");
+        let legacy: LambdaFunction = serde_json::from_value(persisted).unwrap();
+        assert_eq!(
+            legacy.to_configuration_json()["LoggingConfig"],
+            serde_json::json!({
+                "LogFormat":"Text", "LogGroup":"/aws/lambda/logging"
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_logging_configuration_cannot_create_or_change_functions() {
+        let store = FunctionStore::new();
+        create_function(
+            &store,
+            "us-east-1",
+            "000000000000",
+            &create_input("logging"),
+            None,
+        )
+        .unwrap();
+        let before = store
+            .get("000000000000", "us-east-1", "logging")
+            .unwrap()
+            .to_configuration_json();
+        for logging in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"LogFormat":"xml"}),
+            serde_json::json!({"LogFormat":17}),
+            serde_json::json!({"ApplicationLogLevel":"VERBOSE"}),
+            serde_json::json!({"SystemLogLevel":"ERROR"}),
+            serde_json::json!({"LogGroup":null}),
+            serde_json::json!({"LogGroup":false}),
+            serde_json::json!({"LogGroup":""}),
+            serde_json::json!({"LogGroup":"a".repeat(513)}),
+            serde_json::json!({"LogGroup":"name with space"}),
+            serde_json::json!({"LogGroup":"invalid\nname"}),
+        ] {
+            let patch = serde_json::json!({"LoggingConfig":logging});
+            assert!(matches!(
+                update_function_configuration(
+                    &store,
+                    "us-east-1",
+                    "000000000000",
+                    "logging",
+                    &patch,
+                    None
+                ),
+                Err(LambdaError::InvalidParameterValue(_))
+            ));
+            let mut input = create_input("invalid");
+            input["LoggingConfig"] = patch["LoggingConfig"].clone();
+            assert!(matches!(
+                create_function(&store, "us-east-1", "000000000000", &input, None),
+                Err(LambdaError::InvalidParameterValue(_))
+            ));
+            assert!(store.get("000000000000", "us-east-1", "invalid").is_none());
+            assert_eq!(
+                store
+                    .get("000000000000", "us-east-1", "logging")
+                    .unwrap()
+                    .to_configuration_json(),
+                before
+            );
+        }
     }
 
     #[test]

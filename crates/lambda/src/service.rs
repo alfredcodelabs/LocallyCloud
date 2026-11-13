@@ -1294,6 +1294,27 @@ fn invoke_payload(body: &[u8]) -> Vec<u8> {
     }
 }
 
+fn is_self_log_subscription(req: &ServiceRequest, log_group: &str) -> bool {
+    req.headers
+        .get("x-locallycloud-verified-internal-scope")
+        .is_some_and(|value| value == "1")
+        && req
+            .headers
+            .get(locallycloud_core::integration::identity::PRINCIPAL_HEADER)
+            .is_some_and(|value| value == "logs.amazonaws.com")
+        && req
+            .headers
+            .get("x-locallycloud-source-arn")
+            .is_some_and(|value| {
+                value
+                    == format!(
+                        "arn:aws:logs:{}:{}:log-group:{log_group}",
+                        req.region, req.account_id
+                    )
+                    .as_str()
+            })
+}
+
 impl LambdaHandler {
     /// Handle `POST /2015-03-31/functions/{name}/invocations`.
     async fn invoke(&self, req: &ServiceRequest) -> Response {
@@ -1326,6 +1347,15 @@ impl LambdaHandler {
             Ok(f) => f,
             Err(e) => return e.into_response(&req.request_id),
         };
+        if is_self_log_subscription(
+            req,
+            &func.logging_config.log_group_name(&func.function_name),
+        ) {
+            return LambdaError::InvalidParameterValue(
+                "A Lambda function cannot receive a subscription from its own log group".into(),
+            )
+            .into_response(&req.request_id);
+        }
         // A function must be Active to be invoked (task 14 state gate).
         if func.state != "Active" {
             return LambdaError::ResourceConflict(format!(
@@ -1674,8 +1704,18 @@ fn invoke_response(
         .header("x-amzn-requestid", request_id);
     if tail_logs {
         // The last 4 KB of the log as written to CloudWatch, base64-encoded.
-        let tail = result.log_tail(&func.version, func.memory_size);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(tail);
+        let encoded = match &result.formatted_log_tail {
+            Some(tail) => base64::engine::general_purpose::STANDARD.encode(tail),
+            None => {
+                let lines = crate::logging::invocation_lines(&result, func);
+                let tail = if lines.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::executor::log_tail_from_lines(&lines)
+                };
+                base64::engine::general_purpose::STANDARD.encode(tail)
+            }
+        };
         if let Ok(value) = http::HeaderValue::from_str(&encoded) {
             builder = builder.header("x-amz-log-result", value);
         }
@@ -2153,6 +2193,30 @@ mod tests {
     fn empty_invoke_payload_is_delivered_as_empty_object() {
         assert_eq!(invoke_payload(b""), b"{}");
         assert_eq!(invoke_payload(b"\"x\""), b"\"x\"");
+    }
+
+    #[test]
+    fn self_subscription_guard_requires_attested_matching_source_group() {
+        let mut req = request(Method::POST, "/2015-03-31/functions/fn/invocations", "{}");
+        req.headers.insert(
+            "x-locallycloud-source-arn",
+            "arn:aws:logs:us-east-1:000000000000:log-group:/custom/logs"
+                .parse()
+                .unwrap(),
+        );
+        req.headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            "logs.amazonaws.com".parse().unwrap(),
+        );
+        assert!(!is_self_log_subscription(&req, "/custom/logs"));
+        req.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        assert!(is_self_log_subscription(&req, "/custom/logs"));
+        assert!(!is_self_log_subscription(&req, "/aws/lambda/fn"));
+        req.region = "us-east-2".into();
+        assert!(!is_self_log_subscription(&req, "/custom/logs"));
     }
     use std::io::{Cursor, Write};
 

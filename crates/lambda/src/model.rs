@@ -91,6 +91,104 @@ impl TracingMode {
     }
 }
 
+/// Lambda advanced logging controls shared by configuration and invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    #[serde(rename = "JSON")]
+    Json,
+}
+
+impl LogFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            Self::Json => "JSON",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ApplicationLogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+}
+
+impl ApplicationLogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+            Self::Fatal => "FATAL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SystemLogLevel {
+    Debug,
+    Info,
+    Warn,
+}
+
+impl SystemLogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub log_format: LogFormat,
+    pub application_log_level: Option<ApplicationLogLevel>,
+    pub system_log_level: Option<SystemLogLevel>,
+    pub log_group: Option<String>,
+}
+
+impl LoggingConfig {
+    pub fn log_group_name<'a>(&'a self, function_name: &str) -> std::borrow::Cow<'a, str> {
+        match &self.log_group {
+            Some(name) => std::borrow::Cow::Borrowed(name),
+            None => std::borrow::Cow::Owned(format!("/aws/lambda/{function_name}")),
+        }
+    }
+
+    pub fn application_log_level(&self) -> ApplicationLogLevel {
+        self.application_log_level
+            .unwrap_or(ApplicationLogLevel::Info)
+    }
+
+    pub fn system_log_level(&self) -> SystemLogLevel {
+        self.system_log_level.unwrap_or(SystemLogLevel::Info)
+    }
+
+    pub fn to_json(&self, function_name: &str) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "LogFormat": self.log_format.as_str(),
+            "LogGroup": self.log_group_name(function_name),
+        });
+        if self.log_format == LogFormat::Json {
+            value["ApplicationLogLevel"] = self.application_log_level().as_str().into();
+            value["SystemLogLevel"] = self.system_log_level().as_str().into();
+        }
+        value
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LambdaFunction {
     pub function_name: String,
@@ -123,6 +221,8 @@ pub struct LambdaFunction {
     /// Records persisted before tracing support restore as `PassThrough`.
     #[serde(default)]
     pub tracing_mode: TracingMode,
+    #[serde(default)]
+    pub logging_config: LoggingConfig,
 }
 
 impl LambdaFunction {
@@ -150,6 +250,7 @@ impl LambdaFunction {
             // Creation and supported updates finish synchronously before returning.
             "LastUpdateStatus": "Successful",
             "TracingConfig": { "Mode": self.tracing_mode.as_str() },
+            "LoggingConfig": self.logging_config.to_json(&self.function_name),
         });
         if !self.environment.is_empty() {
             json["Environment"] = serde_json::json!({ "Variables": self.environment });
@@ -1371,6 +1472,7 @@ mod tests {
             dead_letter_arn: None,
             vpc_config: None,
             tracing_mode: TracingMode::PassThrough,
+            logging_config: LoggingConfig::default(),
         };
         let mut configured = f("a");
         assert!(configured

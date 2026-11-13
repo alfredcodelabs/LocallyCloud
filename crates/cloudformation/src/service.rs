@@ -926,6 +926,7 @@ impl CfnHandler {
                         None
                     } else {
                         match provisioner.associated_lambda_log_group(&resource.physical_id).await {
+                            Ok(Some(group)) if stack.resources.iter().any(|candidate| candidate.resource_type == "AWS::Logs::LogGroup" && candidate.physical_id == group) => None,
                             Ok(Some(group)) => Some(format!("Associated log group {group} is not managed by this stack and remains after Lambda deletion")),
                             Ok(None) => None,
                             Err(error) => Some(format!("Could not verify associated log group {group}: {error}")),

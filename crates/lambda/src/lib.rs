@@ -13,6 +13,7 @@ mod event_invoke;
 pub mod exec_env;
 pub mod executor;
 pub mod function_url;
+mod logging;
 mod metrics;
 pub mod model;
 mod persistence;
