@@ -6,12 +6,20 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod select;
+
 const MAX_MIRROR_OBJECTS: usize = 4096;
 const MAX_MIRROR_MANIFESTS: usize = 256;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub(super) trait IcebergQueryEngine: Send + Sync {
+    async fn query_sql(
+        &self,
+        access: QueryAccess<'_>,
+        sql: &str,
+        database: Option<&str>,
+    ) -> Result<(QueryResult, u64), WorkerFailure>;
     async fn query(
         &self,
         access: QueryAccess<'_>,
@@ -22,14 +30,27 @@ pub(super) trait IcebergQueryEngine: Send + Sync {
 
 #[async_trait]
 impl IcebergQueryEngine for DuckDbEngine {
+    async fn query_sql(
+        &self,
+        access: QueryAccess<'_>,
+        sql: &str,
+        database: Option<&str>,
+    ) -> Result<(QueryResult, u64), WorkerFailure> {
+        self.run(access, QueryInput::Sql(sql, database)).await
+    }
     async fn query(
         &self,
         access: QueryAccess<'_>,
         table: &GlueTableOutput,
         parsed: &sql::ParsedQuery,
     ) -> Result<(QueryResult, u64), WorkerFailure> {
-        DuckDbEngine::query(self, access, table, parsed).await
+        self.run(access, QueryInput::Simple(table, parsed)).await
     }
+}
+
+enum QueryInput<'a> {
+    Simple(&'a GlueTableOutput, &'a sql::ParsedQuery),
+    Sql(&'a str, Option<&'a str>),
 }
 
 #[derive(Clone)]
@@ -59,12 +80,17 @@ impl DuckDbEngine {
         }
     }
 
-    pub(super) async fn query(
+    async fn run(
         &self,
         access: QueryAccess<'_>,
-        table: &GlueTableOutput,
-        parsed: &sql::ParsedQuery,
+        input: QueryInput<'_>,
     ) -> Result<(QueryResult, u64), WorkerFailure> {
+        for name in ["avro", "iceberg"] {
+            let path = self.extensions.join(format!("{name}.duckdb_extension"));
+            if tokio::fs::metadata(path).await.is_err() {
+                return Err(failure(format!("DuckDB extension {name} is missing; prepare official avro and iceberg extensions matching the CLI version and architecture in LOCALLYCLOUD_DUCKDB_EXTENSIONS_DIR"), 0));
+            }
+        }
         ensure_running(access.record)?;
         let cancelled = async {
             loop {
@@ -89,7 +115,10 @@ impl DuckDbEngine {
         tokio::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))
             .await
             .map_err(|_| failure("Cannot secure DuckDB query directory", 0))?;
-        let result = self.query_in(&work, access, table, parsed).await;
+        let result = match input {
+            QueryInput::Simple(table, parsed) => self.query_in(&work, access, table, parsed).await,
+            QueryInput::Sql(sql, database) => self.select_in(&work, access, sql, database).await,
+        };
         let cleanup = tokio::fs::remove_dir_all(&work).await;
         match (result, cleanup) {
             (Ok(_), Err(_)) => Err(failure("Cannot clean DuckDB query directory", 0)),
@@ -110,6 +139,7 @@ impl DuckDbEngine {
             access.caller,
             access.record,
             table,
+            0,
         )
         .await?;
         let mut fields = match &parsed.projection {
@@ -277,7 +307,19 @@ impl DuckDbEngine {
                     .map_err(|_| failure("DuckDB process failed", scanned))?
                     .success()
                 {
-                    return Err(failure("DuckDB Iceberg execution failed; verify the prepared engine, extension and snapshot compatibility", scanned));
+                    let diagnostic = String::from_utf8_lossy(&err);
+                    let reason = if diagnostic.contains("extension")
+                        || diagnostic.contains("Extension")
+                    {
+                        "DuckDB could not load an extension; prepare official avro and iceberg extensions matching the CLI version and architecture in LOCALLYCLOUD_DUCKDB_EXTENSIONS_DIR"
+                    } else if diagnostic.contains("Binder Error")
+                        || diagnostic.contains("Parser Error")
+                    {
+                        "DuckDB could not bind or parse the SELECT; verify table names, columns, functions and SQL dialect"
+                    } else {
+                        "DuckDB Iceberg execution failed; verify snapshot and result type compatibility"
+                    };
+                    return Err(failure(reason, scanned));
                 }
                 serde_json::from_slice(&out)
                     .map_err(|_| failure("DuckDB returned invalid JSON", scanned))
@@ -317,6 +359,9 @@ struct SnapshotMirror<'a> {
     scanned: u64,
     paths: HashMap<String, PathBuf>,
     allowed_paths: Vec<PathBuf>,
+    object_limit: usize,
+    manifest_limit: usize,
+    manifests: usize,
 }
 
 impl<'a> SnapshotMirror<'a> {
@@ -334,6 +379,9 @@ impl<'a> SnapshotMirror<'a> {
             scanned,
             paths: HashMap::new(),
             allowed_paths: Vec::new(),
+            object_limit: MAX_MIRROR_OBJECTS,
+            manifest_limit: MAX_MIRROR_MANIFESTS,
+            manifests: 0,
         })
     }
 
@@ -379,7 +427,7 @@ impl<'a> SnapshotMirror<'a> {
         if let Some(path) = self.paths.get(uri) {
             return Ok(path.clone());
         }
-        if self.paths.len() >= MAX_MIRROR_OBJECTS {
+        if self.paths.len() >= self.object_limit {
             return Err(failure(
                 "Iceberg snapshot exceeds the object limit",
                 self.scanned,
@@ -453,12 +501,13 @@ impl<'a> SnapshotMirror<'a> {
             .map_err(|_| failure("Iceberg manifest list Avro is invalid", self.scanned))?;
         let mut objects = HashSet::new();
         for (index, descriptor) in list.enumerate() {
-            if index >= MAX_MIRROR_MANIFESTS {
+            if index >= self.manifest_limit {
                 return Err(failure(
                     "Iceberg snapshot exceeds the manifest limit",
                     self.scanned,
                 ));
             }
+            self.manifests += 1;
             let descriptor = descriptor
                 .map_err(|_| failure("Iceberg manifest descriptor is invalid", self.scanned))?;
             let content = avro_integer(
@@ -568,6 +617,34 @@ fn decode_value(kind: &str, value: &Value) -> Result<Option<String>, &'static st
     }
 }
 
+fn snapshot_scan(path: &Path) -> Result<String, WorkerFailure> {
+    let metadata_directory = path
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "metadata"))
+        .ok_or_else(|| {
+            failure(
+                "DuckDB snapshot metadata must be in the table metadata directory",
+                0,
+            )
+        })?;
+    let table_root = metadata_directory
+        .parent()
+        .ok_or_else(|| failure("DuckDB snapshot table root is missing", 0))?;
+    let version = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".metadata.json"))
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| {
+            failure(
+                "DuckDB snapshot metadata must have a .metadata.json suffix",
+                0,
+            )
+        })?;
+    Ok(format!("iceberg_scan({},version={},version_name_format='%s%s.metadata.json',allow_moved_paths=true)",
+        sql_path(table_root)?, sql_literal(version)))
+}
+
 fn render(
     parsed: &sql::ParsedQuery,
     columns: &[ResultColumn],
@@ -631,33 +708,7 @@ fn render(
                 .collect(),
         ),
     };
-    let metadata_directory = path
-        .parent()
-        .filter(|parent| parent.file_name().is_some_and(|name| name == "metadata"))
-        .ok_or_else(|| {
-            failure(
-                "DuckDB snapshot metadata must be in the table metadata directory",
-                0,
-            )
-        })?;
-    let table_root = metadata_directory
-        .parent()
-        .ok_or_else(|| failure("DuckDB snapshot table root is missing", 0))?;
-    let version = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".metadata.json"))
-        .filter(|version| !version.is_empty())
-        .ok_or_else(|| {
-            failure(
-                "DuckDB snapshot metadata must have a .metadata.json suffix",
-                0,
-            )
-        })?;
-    let mut query = format!(
-        "SELECT {select} FROM iceberg_scan({},version={},version_name_format='%s%s.metadata.json',allow_moved_paths=true)",
-        sql_path(table_root)?, sql_literal(version)
-    );
+    let mut query = format!("SELECT {select} FROM {}", snapshot_scan(path)?);
     if !parsed.predicates.is_empty() {
         let predicates = parsed
             .predicates

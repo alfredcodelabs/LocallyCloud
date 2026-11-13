@@ -43,7 +43,7 @@ impl LambdaError {
             LambdaError::RequestTooLarge(_) => "RequestTooLargeException",
             LambdaError::TooManyRequests(_) => "TooManyRequestsException",
             LambdaError::InternalError(_) => "InternalServerError",
-            LambdaError::LocalCapacityExceeded(_) => "LocalCapacityExceededException",
+            LambdaError::LocalCapacityExceeded(_) => "TooManyRequestsException",
             LambdaError::NotImplemented(_) => "NotImplementedException",
         }
     }
@@ -59,17 +59,27 @@ impl LambdaError {
             LambdaError::RequestTooLarge(_) => 413,
             LambdaError::TooManyRequests(_) => 429,
             LambdaError::InternalError(_) => 500,
-            LambdaError::LocalCapacityExceeded(_) => 503,
+            LambdaError::LocalCapacityExceeded(_) => 429,
             LambdaError::NotImplemented(_) => 501,
         }
     }
 
     /// Render to an Axum response in the REST-JSON shape.
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
-        AwsError::new(self.code(), self.to_string(), self.http_status())
+        let throttled = matches!(
+            self,
+            Self::TooManyRequests(_) | Self::LocalCapacityExceeded(_)
+        );
+        let mut response = AwsError::new(self.code(), self.to_string(), self.http_status())
             .with_request_id(request_id.to_string())
             .with_rest_json_message_key("Message")
             .render(AwsProtocol::RestJson)
-            .into_response()
+            .into_response();
+        if throttled {
+            response
+                .headers_mut()
+                .insert("retry-after", http::HeaderValue::from_static("1"));
+        }
+        response
     }
 }

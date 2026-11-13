@@ -641,6 +641,11 @@ struct GetQueryResultsRequest {
 }
 
 fn validate_start(input: &StartQueryExecutionRequest) -> Result<(), AthenaError> {
+    if input.query_string.is_empty() || input.query_string.len() > 262_144 {
+        return Err(AthenaError::InvalidRequest(
+            "QueryString must contain 1 to 262144 UTF-8 bytes".into(),
+        ));
+    }
     if input
         .client_request_token
         .as_ref()
@@ -869,12 +874,81 @@ async fn execute_query(
     effective_output_location: &S3Location,
     engine: Option<&dyn IcebergQueryEngine>,
 ) -> Result<(), WorkerFailure> {
-    let parsed = SqlParser::new(&spec.query_string).parse().map_err(|reason| {
-        WorkerFailure::failed(
-            format!("Unsupported SQL: {reason}; expected SELECT COUNT(*), SUM(column), or column[, column] FROM identifier[.identifier] [WHERE column operator literal [AND ...]] [;]"),
-            0,
+    let (result, scanned) = read_query(registry, scope, caller, record, spec, engine).await?;
+    ensure_running(record)?;
+    let csv = result.csv();
+    if csv.len() > MAX_RESULT_BYTES {
+        return Err(WorkerFailure::failed(
+            "Query exceeded the 64 MiB result limit",
+            scanned,
+        ));
+    }
+    put_object(
+        registry,
+        scope,
+        caller,
+        &effective_output_location.bucket,
+        &effective_output_location.key,
+        Bytes::from(csv.into_bytes()),
+        scanned,
+    )
+    .await?;
+
+    let cancelled = {
+        let mut query = record
+            .lock()
+            .map_err(|_| WorkerFailure::failed("Athena query state is unavailable", scanned))?;
+        match query.state {
+            QueryState::Running => {
+                query.state = QueryState::Succeeded;
+                query.completion_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs_f64());
+                query.scanned_bytes = scanned;
+                query.result = Some(result);
+                false
+            }
+            QueryState::Cancelled => true,
+            _ => return Err(WorkerFailure::Cancelled),
+        }
+    };
+    if cancelled {
+        let _ = delete_object(
+            registry,
+            scope,
+            caller,
+            &effective_output_location.bucket,
+            &effective_output_location.key,
+            scanned,
         )
-    })?;
+        .await;
+        return Err(WorkerFailure::Cancelled);
+    }
+    Ok(())
+}
+
+async fn read_query(
+    registry: &Weak<ServiceRegistry>,
+    scope: &Scope,
+    caller: Option<&AthenaCaller>,
+    record: &Arc<Mutex<QueryRecord>>,
+    spec: &QuerySpec,
+    engine: Option<&dyn IcebergQueryEngine>,
+) -> Result<(QueryResult, u64), WorkerFailure> {
+    let parsed = match SqlParser::new(&spec.query_string).parse() {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            return match engine {
+                Some(engine) => engine.query_sql(
+                    duckdb::QueryAccess { registry, scope, caller, record },
+                    &spec.query_string,
+                    spec.context.as_ref().and_then(|c| c.database.as_deref()),
+                ).await,
+                None => Err(WorkerFailure::failed(format!("Unsupported SQL: {reason}; built-in Athena supports single-table SELECT with simple predicates"), 0)),
+            };
+        }
+    };
     let database = parsed
         .database
         .clone()
@@ -890,7 +964,7 @@ async fn execute_query(
             )
         })?;
     let table = glue_table_snapshot(registry, scope, caller, &database, &parsed.table).await?;
-    let (result, scanned) = if let Some(engine) = engine.filter(|_| is_iceberg_table(&table)) {
+    let result = if let Some(engine) = engine.filter(|_| is_iceberg_table(&table)) {
         engine
             .query(
                 duckdb::QueryAccess {
@@ -973,57 +1047,7 @@ async fn execute_query(
             }
         }
     };
-    ensure_running(record)?;
-    let csv = result.csv();
-    if csv.len() > MAX_RESULT_BYTES {
-        return Err(WorkerFailure::failed(
-            "Query exceeded the 64 MiB result limit",
-            scanned,
-        ));
-    }
-    put_object(
-        registry,
-        scope,
-        caller,
-        &effective_output_location.bucket,
-        &effective_output_location.key,
-        Bytes::from(csv.into_bytes()),
-        scanned,
-    )
-    .await?;
-
-    let cancelled = {
-        let mut query = record
-            .lock()
-            .map_err(|_| WorkerFailure::failed("Athena query state is unavailable", scanned))?;
-        match query.state {
-            QueryState::Running => {
-                query.state = QueryState::Succeeded;
-                query.completion_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .map(|duration| duration.as_secs_f64());
-                query.scanned_bytes = scanned;
-                query.result = Some(result);
-                false
-            }
-            QueryState::Cancelled => true,
-            _ => return Err(WorkerFailure::Cancelled),
-        }
-    };
-    if cancelled {
-        let _ = delete_object(
-            registry,
-            scope,
-            caller,
-            &effective_output_location.bucket,
-            &effective_output_location.key,
-            scanned,
-        )
-        .await;
-        return Err(WorkerFailure::Cancelled);
-    }
-    Ok(())
+    Ok(result)
 }
 
 fn is_iceberg_table(table: &GlueTableOutput) -> bool {
@@ -1060,7 +1084,7 @@ async fn iceberg_manifest_list(
     table: &GlueTableOutput,
 ) -> Result<(Value, Bytes, u64), WorkerFailure> {
     let (metadata, _, manifest_list, scanned) =
-        iceberg_snapshot_objects(registry, scope, caller, record, table).await?;
+        iceberg_snapshot_objects(registry, scope, caller, record, table, 0).await?;
     Ok((metadata, manifest_list, scanned))
 }
 
@@ -1070,6 +1094,7 @@ async fn iceberg_snapshot_objects(
     caller: Option<&AthenaCaller>,
     record: &Arc<Mutex<QueryRecord>>,
     table: &GlueTableOutput,
+    initial_scanned: u64,
 ) -> Result<(Value, Bytes, Bytes, u64), WorkerFailure> {
     // Iceberg's current snapshot is the only source of truth. Listing all objects
     // under the table prefix would count old snapshots and uncommitted writes.
@@ -1094,17 +1119,10 @@ async fn iceberg_snapshot_objects(
         caller,
         &metadata_location.bucket,
         &metadata_location.key,
-        0,
+        initial_scanned,
     )
     .await?;
-    let mut scanned = metadata_body.len() as u64;
-    if scanned > SCAN_LIMIT {
-        return Err(WorkerFailure::failed(
-            "Query exceeded the 64 MiB scan limit",
-            scanned,
-        ));
-    }
-    update_scanned(record, scanned)?;
+    let mut scanned = add_scan(record, initial_scanned, metadata_body.len())?;
     let metadata: Value = serde_json::from_slice(&metadata_body)
         .map_err(|_| WorkerFailure::failed("Iceberg metadata JSON is invalid", scanned))?;
     if metadata.get("format-version").and_then(Value::as_u64) != Some(2) {
@@ -2791,6 +2809,20 @@ mod tests {
                 format!("AWS4-HMAC-SHA256 Credential=AKIAREADER/19700101/us-east-1/{service}/aws4_request")
             );
         }
+    }
+
+    #[test]
+    fn query_length_is_bounded_before_engine_admission() {
+        let mut request: StartQueryExecutionRequest = serde_json::from_value(json!({
+            "QueryString":"é".repeat(131_072),
+            "ResultConfiguration":{"OutputLocation":"s3://results/"}
+        }))
+        .unwrap();
+        assert!(validate_start(&request).is_ok());
+        request.query_string.push('é');
+        assert!(validate_start(&request).is_err());
+        request.query_string.clear();
+        assert!(validate_start(&request).is_err());
     }
 
     #[tokio::test]

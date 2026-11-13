@@ -3707,10 +3707,11 @@ mod tests {
         }
         while let Some(response) = pending.join_next().await {
             let response = response.unwrap();
-            assert_eq!(response.status(), 503);
+            assert_eq!(response.status(), 429);
+            assert_eq!(response.headers()["retry-after"], "1");
             assert_eq!(
                 response.headers()["x-amzn-errortype"],
-                "LocalCapacityExceededException"
+                "TooManyRequestsException"
             );
             let body = axum::body::to_bytes(response.into_body(), 4096)
                 .await
@@ -4904,10 +4905,11 @@ mod tests {
             matches!(&error, LambdaError::LocalCapacityExceeded(message) if message.contains("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB"))
         );
         let response = error.into_response("capacity-test");
-        assert_eq!(response.status(), 503);
+        assert_eq!(response.status(), 429);
+        assert_eq!(response.headers()["retry-after"], "1");
         assert_eq!(
             response.headers()["x-amzn-errortype"],
-            "LocalCapacityExceededException"
+            "TooManyRequestsException"
         );
         flush_metrics(&exec);
         let observations = metrics.observations.lock().unwrap();
