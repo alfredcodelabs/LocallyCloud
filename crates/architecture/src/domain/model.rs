@@ -70,6 +70,7 @@ pub enum FactValue {
     Partial,
     Enforced,
     Configured,
+    DeadLetterTarget,
     Limited,
     Public,
     Restricted,

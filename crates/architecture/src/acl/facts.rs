@@ -24,6 +24,7 @@ const USAGE_PLAN: &str = "AWS::ApiGateway::UsagePlan";
 const HTTP_API: &str = "AWS::ApiGatewayV2::Api";
 const HTTP_ROUTE: &str = "AWS::ApiGatewayV2::Route";
 const HTTP_STAGE: &str = "AWS::ApiGatewayV2::Stage";
+const SNS_SUBSCRIPTION: &str = "AWS::SNS::Subscription";
 /// Environment variable names that usually hold credentials.
 const SECRET_NAMES: &[&str] = &[
     "SECRET",
@@ -35,6 +36,33 @@ const SECRET_NAMES: &[&str] = &[
     "APIKEY",
     "ACCESS_KEY",
     "CREDENTIAL",
+];
+/// Name suffixes of variables that point to a secret instead of holding it.
+const SECRET_REFERENCE_SUFFIXES: &[&str] = &["_ARN", "_ID", "_NAME", "_PATH"];
+/// Write actions that only accept `Resource: "*"`, so a wildcard resource is not a gap.
+const WILDCARD_ONLY_WRITES: &[&str] = &[
+    "logs:CreateLogDelivery",
+    "logs:UpdateLogDelivery",
+    "logs:DeleteLogDelivery",
+    "logs:PutResourcePolicy",
+    "logs:DeleteResourcePolicy",
+    "xray:PutTraceSegments",
+    "xray:PutTelemetryRecords",
+];
+/// Properties through which a resource sends its failures to a queue.
+const DEAD_LETTER_SOURCES: &[(&str, &[&str])] = &[
+    (types::SQS_QUEUE, &["RedrivePolicy", "deadLetterTargetArn"]),
+    (types::LAMBDA_FUNCTION, &["DeadLetterConfig", "TargetArn"]),
+    (
+        EVENT_INVOKE_CONFIG,
+        &["DestinationConfig", "OnFailure", "Destination"],
+    ),
+    (
+        types::EVENT_SOURCE_MAPPING,
+        &["DestinationConfig", "OnFailure", "Destination"],
+    ),
+    (types::EVENT_RULE, &["Targets", "DeadLetterConfig", "Arn"]),
+    (SNS_SUBSCRIPTION, &["RedrivePolicy", "deadLetterTargetArn"]),
 ];
 
 struct Facts<'a, 't> {
@@ -305,13 +333,50 @@ fn queue(facts: &mut Facts<'_, '_>) {
         }
         other => other,
     };
-    let dead_letter = if redrive.is_some_and(|r| r.get("deadLetterTargetArn").is_some()) {
-        FactValue::Configured
+    let (dead_letter, evidence) = if redrive.is_some_and(|r| r.get("deadLetterTargetArn").is_some())
+    {
+        (FactValue::Configured, facts.own("RedrivePolicy"))
     } else {
-        FactValue::NotDeclared
+        dead_letter_source(facts).map_or_else(
+            || (FactValue::NotDeclared, facts.own("RedrivePolicy")),
+            |evidence| (FactValue::DeadLetterTarget, evidence),
+        )
     };
-    facts.add(FactId::DeadLetter, dead_letter, facts.own("RedrivePolicy"));
+    facts.add(FactId::DeadLetter, dead_letter, evidence);
     resource_policies(facts, QUEUE_POLICY, "Queues");
+}
+
+/// The first property that sends another resource's failures to this queue.
+fn dead_letter_source(facts: &Facts<'_, '_>) -> Option<String> {
+    DEAD_LETTER_SOURCES
+        .iter()
+        .find_map(|(resource_type, path)| {
+            facts
+                .view
+                .of_type(resource_type)
+                .filter(|(id, _)| *id != facts.logical_id)
+                .find(|(_, properties)| {
+                    values_at(properties, path)
+                        .into_iter()
+                        .any(|value| facts.view.mentions(value, facts.logical_id))
+                })
+                .map(|(id, _)| format!("{id}.Properties.{} (template)", path.join(".")))
+        })
+}
+
+/// Values at `path`; a list on the way is read element by element, one level deep.
+fn values_at<'v>(value: &'v Value, path: &[&str]) -> Vec<&'v Value> {
+    let Some((key, rest)) = path.split_first() else {
+        return vec![value];
+    };
+    let children: Vec<&Value> = match value {
+        Value::Array(elements) => elements.iter().filter_map(|e| e.get(*key)).collect(),
+        other => other.get(*key).into_iter().collect(),
+    };
+    children
+        .into_iter()
+        .flat_map(|child| values_at(child, rest))
+        .collect()
 }
 
 fn topic(facts: &mut Facts<'_, '_>) {
@@ -329,16 +394,23 @@ fn topic(facts: &mut Facts<'_, '_>) {
 }
 
 fn function(facts: &mut Facts<'_, '_>) {
-    let concurrency = if facts.prop(&["ReservedConcurrentExecutions"]).is_some() {
-        FactValue::Limited
+    let (concurrency, evidence) = if facts.prop(&["ReservedConcurrentExecutions"]).is_some() {
+        (
+            FactValue::Limited,
+            facts.own("ReservedConcurrentExecutions"),
+        )
     } else {
-        FactValue::NotDeclared
+        source_limited_concurrency(facts).map_or_else(
+            || {
+                (
+                    FactValue::NotDeclared,
+                    facts.own("ReservedConcurrentExecutions"),
+                )
+            },
+            |evidence| (FactValue::Partial, evidence),
+        )
     };
-    facts.add(
-        FactId::ReservedConcurrency,
-        concurrency,
-        facts.own("ReservedConcurrentExecutions"),
-    );
+    facts.add(FactId::ReservedConcurrency, concurrency, evidence);
 
     let on_failure = facts
         .referrers(EVENT_INVOKE_CONFIG, "FunctionName")
@@ -362,6 +434,27 @@ fn function(facts: &mut Facts<'_, '_>) {
     log_retention(facts);
 }
 
+/// Evidence when every event source mapping of the function caps its concurrency.
+/// That bounds only those sources, so it is partial, never a reserved limit.
+fn source_limited_concurrency(facts: &Facts<'_, '_>) -> Option<String> {
+    let mappings = facts.referrers(types::EVENT_SOURCE_MAPPING, "FunctionName");
+    let capped = |properties: &Value| {
+        properties
+            .get("ScalingConfig")
+            .and_then(|scaling| scaling.get("MaximumConcurrency"))
+            .is_some()
+    };
+    if mappings.is_empty() || !mappings.iter().all(|(_, p)| capped(p)) {
+        return None;
+    }
+    let ids: Vec<&str> = mappings.iter().map(|(id, _)| *id).collect();
+    Some(format!(
+        "{}.Properties.ScalingConfig.MaximumConcurrency bounds only those sources; {} declares no ReservedConcurrentExecutions (template)",
+        ids.join(", "),
+        facts.logical_id
+    ))
+}
+
 /// Classifies environment variables without emitting their values.
 fn environment_secrets(facts: &mut Facts<'_, '_>) {
     let variables = facts
@@ -375,9 +468,12 @@ fn environment_secrets(facts: &mut Facts<'_, '_>) {
         };
         if text.contains("{{resolve:secretsmanager:") || text.contains("{{resolve:ssm-secure:") {
             resolved.push(name.as_str());
-        } else if !text.is_empty() {
+        } else if !text.is_empty() && !text.starts_with("arn:") {
             let upper = name.to_ascii_uppercase();
-            if SECRET_NAMES.iter().any(|marker| upper.contains(marker)) {
+            let reference = SECRET_REFERENCE_SUFFIXES
+                .iter()
+                .any(|suffix| upper.ends_with(suffix));
+            if !reference && SECRET_NAMES.iter().any(|marker| upper.contains(marker)) {
                 suspected.push(name.as_str());
             }
         }
@@ -460,20 +556,40 @@ fn role_privilege(facts: &mut Facts<'_, '_>, property: &str) {
                 .iter()
                 .any(|a| *a == "*" || a.ends_with(":*"))
         });
-    let wildcard_resource = allows.iter().any(|s| {
-        texts(s.get("Resource")).contains(&"*")
-            && texts(s.get("Action")).iter().any(|a| !is_read_action(a))
-    });
+    let on_any_resource: Vec<&str> = allows
+        .iter()
+        .filter(|s| texts(s.get("Resource")).contains(&"*"))
+        .flat_map(|s| texts(s.get("Action")))
+        .filter(|a| !is_read_action(a))
+        .collect();
+    let wildcard_resource = on_any_resource.iter().any(|a| !is_wildcard_only(a));
     let value = match (wildcard_action, wildcard_resource) {
         (true, _) => FactValue::WildcardAction,
         (false, true) => FactValue::WildcardResource,
         (false, false) => FactValue::Scoped,
     };
-    facts.add(
-        FactId::RolePrivilege,
-        value,
-        format!("{role} policies (template; statements not exported)"),
-    );
+    let mut wildcard_only: Vec<&str> = on_any_resource
+        .into_iter()
+        .filter(|a| is_wildcard_only(a))
+        .collect();
+    wildcard_only.sort_unstable();
+    wildcard_only.dedup();
+    let evidence = if wildcard_only.is_empty() {
+        format!("{role} policies (template; statements not exported)")
+    } else {
+        format!(
+            "{role} policies (template; statements not exported); actions that only accept Resource \"*\": {}",
+            wildcard_only.join(", ")
+        )
+    };
+    facts.add(FactId::RolePrivilege, value, evidence);
+}
+
+/// IAM action names are case-insensitive.
+fn is_wildcard_only(action: &str) -> bool {
+    WILDCARD_ONLY_WRITES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(action))
 }
 
 fn is_read_action(action: &str) -> bool {
@@ -488,14 +604,21 @@ fn log_retention(facts: &mut Facts<'_, '_>) {
         .prop(&["LoggingConfig", "LogGroup"])
         .map(|value| facts.view.referenced(value))
         .unwrap_or_default();
+    // Lambda writes to LoggingConfig.LogGroup, or to /aws/lambda/<FunctionName> by default.
+    let target_name = facts.text(&["LoggingConfig", "LogGroup"]).or_else(|| {
+        facts
+            .text(&["FunctionName"])
+            .map(|name| format!("/aws/lambda/{name}"))
+    });
     let group = facts
         .view
         .of_type(types::LOG_GROUP)
         .find(|(id, properties)| {
             configured.contains(id)
-                || properties
-                    .get("LogGroupName")
-                    .is_some_and(|name| facts.view.mentions(name, facts.logical_id))
+                || properties.get("LogGroupName").is_some_and(|name| {
+                    facts.view.mentions(name, facts.logical_id)
+                        || target_name.is_some() && facts.resolver.literal(name) == target_name
+                })
         });
     let (value, evidence) = match group {
         Some((id, properties)) if properties.get("RetentionInDays").is_some() => (
@@ -1010,5 +1133,144 @@ mod tests {
             FactValue::Disabled
         );
         assert!(!facts.contains_key(&("Process".to_owned(), FactId::RolePrivilege)));
+    }
+
+    #[test]
+    fn resolves_literal_log_groups_dead_letter_targets_and_source_limits() {
+        let facts = facts_of(json!({"Resources": {
+            "Ledger": {"Type": "AWS::Lambda::Function", "Properties": {
+                "LoggingConfig": {"LogGroup": "cwl-grp-ledger-dev"}}},
+            "LedgerLogs": {"Type": "AWS::Logs::LogGroup", "Properties": {
+                "LogGroupName": "cwl-grp-ledger-dev", "RetentionInDays": 365}},
+            "Named": {"Type": "AWS::Lambda::Function", "Properties": {"FunctionName": "named-fn"}},
+            "NamedLogs": {"Type": "AWS::Logs::LogGroup", "Properties": {
+                "LogGroupName": "/aws/lambda/named-fn"}},
+            "Other": {"Type": "AWS::Lambda::Function", "Properties": {
+                "LoggingConfig": {"LogGroup": "someone-else"}}},
+            "Ingest": {"Type": "AWS::Lambda::Function"},
+            "IngestMapping": {"Type": "AWS::Lambda::EventSourceMapping", "Properties": {
+                "FunctionName": {"Ref": "Ingest"}, "EventSourceArn": {"Fn::GetAtt": ["Inbox", "Arn"]},
+                "ScalingConfig": {"MaximumConcurrency": 2}}},
+            "Mixed": {"Type": "AWS::Lambda::Function"},
+            "MixedCapped": {"Type": "AWS::Lambda::EventSourceMapping", "Properties": {
+                "FunctionName": {"Ref": "Mixed"}, "ScalingConfig": {"MaximumConcurrency": 2}}},
+            "MixedOpen": {"Type": "AWS::Lambda::EventSourceMapping", "Properties": {
+                "FunctionName": {"Ref": "Mixed"}}},
+            "Inbox": {"Type": "AWS::SQS::Queue", "Properties": {
+                "RedrivePolicy": {"deadLetterTargetArn": {"Fn::GetAtt": ["InboxDlq", "Arn"]}}}},
+            "InboxDlq": {"Type": "AWS::SQS::Queue"},
+            "Rule": {"Type": "AWS::Events::Rule", "Properties": {"Targets": [
+                {"Id": "t", "Arn": {"Fn::GetAtt": ["Target", "Arn"]},
+                 "DeadLetterConfig": {"Arn": {"Fn::GetAtt": ["RuleDlq", "Arn"]}}}]}},
+            "Target": {"Type": "AWS::SQS::Queue"},
+            "RuleDlq": {"Type": "AWS::SQS::Queue"}
+        }}));
+        assert_eq!(
+            get(&facts, "Ledger", FactId::LogRetention),
+            FactValue::Retained
+        );
+        assert_eq!(
+            get(&facts, "Named", FactId::LogRetention),
+            FactValue::NeverExpires
+        );
+        assert_eq!(
+            get(&facts, "Other", FactId::LogRetention),
+            FactValue::NotDeclared
+        );
+        assert_eq!(
+            get(&facts, "Ingest", FactId::ReservedConcurrency),
+            FactValue::Partial
+        );
+        assert_eq!(
+            get(&facts, "Mixed", FactId::ReservedConcurrency),
+            FactValue::NotDeclared
+        );
+        assert_eq!(
+            get(&facts, "InboxDlq", FactId::DeadLetter),
+            FactValue::DeadLetterTarget
+        );
+        assert_eq!(
+            get(&facts, "RuleDlq", FactId::DeadLetter),
+            FactValue::DeadLetterTarget
+        );
+        assert_eq!(
+            get(&facts, "Inbox", FactId::DeadLetter),
+            FactValue::Configured
+        );
+        assert_eq!(
+            get(&facts, "Target", FactId::DeadLetter),
+            FactValue::NotDeclared
+        );
+    }
+
+    #[test]
+    fn ignores_wildcard_only_actions_and_secret_references() {
+        let facts = facts_of(json!({"Resources": {
+            "Flow": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "RoleArn": {"Fn::GetAtt": ["FlowRole", "Arn"]}}},
+            "FlowRole": {"Type": "AWS::IAM::Role", "Properties": {"Policies": [{"PolicyDocument": {
+                "Statement": [
+                    {"Effect": "Allow", "Resource": "*", "Action": [
+                        "logs:CreateLogDelivery", "logs:putresourcepolicy", "xray:PutTraceSegments",
+                        "xray:GetSamplingRules", "lakeformation:GetDataAccess"]},
+                    {"Effect": "Allow", "Resource": "arn:aws:s3:::raw/*", "Action": "s3:PutObject"}]}}]}},
+            "Loose": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "RoleArn": {"Fn::GetAtt": ["LooseRole", "Arn"]}}},
+            "LooseRole": {"Type": "AWS::IAM::Role", "Properties": {"Policies": [{"PolicyDocument": {
+                "Statement": {"Effect": "Allow", "Resource": "*",
+                    "Action": ["logs:CreateLogDelivery", "s3:PutObject"]}}}]}},
+            "Sftp": {"Type": "AWS::Lambda::Function", "Properties": {"Environment": {"Variables": {
+                "SFTP_VAULT_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:1:secret:x",
+                "SFTP_CONNECTION_SECRET_ID": "sftp/connection",
+                "VAULT_SECRETS_PATH": "kv/sftp",
+                "SECRET_LOOKUP": "arn:aws:ssm:us-east-1:1:parameter/x"}}}},
+            "Leaky": {"Type": "AWS::Lambda::Function", "Properties": {"Environment": {"Variables": {
+                "SFTP_VAULT_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:1:secret:x",
+                "CLIENT_SECRET": "plain"}}}}
+        }}));
+        assert_eq!(
+            get(&facts, "Flow", FactId::RolePrivilege),
+            FactValue::Scoped
+        );
+        assert_eq!(
+            get(&facts, "Loose", FactId::RolePrivilege),
+            FactValue::WildcardResource
+        );
+        assert_eq!(
+            get(&facts, "Sftp", FactId::SecretsInEnvironment),
+            FactValue::NoneDetected
+        );
+        assert_eq!(
+            get(&facts, "Leaky", FactId::SecretsInEnvironment),
+            FactValue::Suspected
+        );
+    }
+
+    #[test]
+    fn names_wildcard_only_actions_in_the_evidence() {
+        let template = json!({"Resources": {
+            "Flow": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "RoleArn": {"Fn::GetAtt": ["FlowRole", "Arn"]}}},
+            "FlowRole": {"Type": "AWS::IAM::Role", "Properties": {"Policies": [{"PolicyDocument": {
+                "Statement": {"Effect": "Allow", "Resource": "*",
+                    "Action": ["logs:PutResourcePolicy", "logs:CreateLogDelivery"]}}}]}}
+        }});
+        let parameters = HashMap::new();
+        let resolver = Resolver {
+            pseudo: HashMap::new(),
+            parameters: &parameters,
+            physical: HashMap::new(),
+        };
+        let view = TemplateView::new(&template).unwrap();
+        let evidence = findings(&view, &resolver)
+            .into_iter()
+            .find_map(|finding| match finding {
+                Finding::Fact { fact, .. } if fact.id == FactId::RolePrivilege => {
+                    Some(fact.evidence)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(evidence.ends_with("logs:CreateLogDelivery, logs:PutResourcePolicy"));
     }
 }

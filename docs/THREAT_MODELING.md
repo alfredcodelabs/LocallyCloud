@@ -189,9 +189,21 @@ treated as untrusted data.
   on the default or an external event bus, and Step Functions tasks beyond Lambda,
   DynamoDB, SQS and EventBridge. They appear as unresolved references or are absent.
 - "Not declared" means absent from the template, not absent from the deployment.
-  Known false gaps: settings applied after deployment outside the template (for
-  example access logs that the Serverless Framework sets with `UpdateStage`), queues
-  that are themselves dead-letter queues, and IAM actions that only accept
-  `Resource: "*"` (log delivery and X-Ray). Record a finding with that rationale.
+  Known false gaps: settings applied after deployment outside the template, for
+  example access logs that the Serverless Framework sets with `UpdateStage`. Record
+  a finding with that rationale.
+- A queue that another resource in the template uses as its dead-letter queue or
+  failure destination counts as covered. Write actions that only accept
+  `Resource: "*"` (log delivery, log resource policies and X-Ray) do not make a role
+  a wildcard-resource gap; the evidence lists them so they can still be reviewed.
+- A function without reserved concurrency whose event source mappings all set
+  `ScalingConfig.MaximumConcurrency` stays "to review" (`partial`): the cap bounds
+  only those sources, not other callers.
+- A function's log group is found through `LoggingConfig.LogGroup` (a reference
+  or a literal name) or the default `/aws/lambda/<FunctionName>`. A name built at
+  deploy time from values the template does not resolve is not matched.
+- Secrets in environment variables are suspected by name only. Names ending in
+  `_ARN`, `_ID`, `_NAME` or `_PATH`, and values that are ARNs, are treated as
+  references to a secret, not as the secret itself.
 - The catalog covers serverless resource types and STRIDE. A control without a
   matching fact always stays "to review".
