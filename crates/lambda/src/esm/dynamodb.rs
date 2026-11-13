@@ -692,6 +692,29 @@ mod tests {
         restored.attach_state(state.clone()).unwrap();
         assert!(restored.get(&mapping.uuid).is_none());
         assert!(restored.checkpoints.is_empty());
+        // Reuse the same connection after rollback; failed frontiers must not advance it.
+        store
+            .insert_with_stream_frontiers(mapping.clone(), vec![("shard".into(), "10".into())])
+            .unwrap();
+        store
+            .save_checkpoint(&mapping.uuid, "shard", 0.0, Some("20".into()))
+            .unwrap();
+        let recovered = EsmStore::new();
+        recovered.attach_state(state.clone()).unwrap();
+        assert!(recovered.get(&mapping.uuid).is_some());
+        assert_eq!(
+            recovered
+                .prepare_shard(&mapping.uuid, "shard", 0.0)
+                .unwrap()
+                .as_deref(),
+            Some("20")
+        );
+        recovered.remove(&mapping.uuid).unwrap();
+        let cleared = EsmStore::new();
+        cleared.attach_state(state.clone()).unwrap();
+        assert!(cleared.get(&mapping.uuid).is_none());
+        assert!(cleared.checkpoints.is_empty());
+        drop((recovered, cleared));
         drop(restored);
         drop(store);
         drop(state);

@@ -175,7 +175,7 @@ impl EsmStore {
                 "event source mapping already exists for this function and source".into(),
             ));
         }
-        if let Some(state) = self.persistence.lock().map_err(|_| state_error())?.as_ref() {
+        if let Some(state) = self.persistence.lock().map_err(|_| state_error())?.as_mut() {
             state.save_with_frontiers(&esm, &frontiers)?;
         }
         for (shard, sequence) in frontiers {
