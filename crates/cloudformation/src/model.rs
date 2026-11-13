@@ -16,9 +16,53 @@ pub enum StackStatus {
     CreateFailed,
     UpdateFailed,
     DeleteFailed,
+    RollbackInProgress,
+    RollbackComplete,
+    RollbackFailed,
+    UpdateRollbackInProgress,
+    UpdateRollbackComplete,
+    UpdateRollbackFailed,
 }
 
 impl StackStatus {
+    pub fn is_in_progress(self) -> bool {
+        self.interrupted_failure().is_some()
+    }
+
+    pub(crate) fn interrupted_failure(self) -> Option<Self> {
+        match self {
+            Self::CreateInProgress => Some(Self::CreateFailed),
+            Self::UpdateInProgress => Some(Self::UpdateFailed),
+            Self::DeleteInProgress => Some(Self::DeleteFailed),
+            Self::RollbackInProgress => Some(Self::RollbackFailed),
+            Self::UpdateRollbackInProgress => Some(Self::UpdateRollbackFailed),
+            Self::ReviewInProgress
+            | Self::CreateComplete
+            | Self::UpdateComplete
+            | Self::UpdateCompleteCleanupInProgress
+            | Self::DeleteComplete
+            | Self::CreateFailed
+            | Self::UpdateFailed
+            | Self::DeleteFailed
+            | Self::RollbackComplete
+            | Self::RollbackFailed
+            | Self::UpdateRollbackComplete
+            | Self::UpdateRollbackFailed => None,
+        }
+    }
+
+    pub(crate) fn can_update(self) -> bool {
+        matches!(
+            self,
+            Self::CreateComplete
+                | Self::UpdateComplete
+                | Self::UpdateCompleteCleanupInProgress
+                | Self::UpdateRollbackComplete
+                | Self::CreateFailed
+                | Self::UpdateFailed
+        )
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             StackStatus::ReviewInProgress => "REVIEW_IN_PROGRESS",
@@ -32,6 +76,12 @@ impl StackStatus {
             StackStatus::CreateFailed => "CREATE_FAILED",
             StackStatus::UpdateFailed => "UPDATE_FAILED",
             StackStatus::DeleteFailed => "DELETE_FAILED",
+            StackStatus::RollbackInProgress => "ROLLBACK_IN_PROGRESS",
+            StackStatus::RollbackComplete => "ROLLBACK_COMPLETE",
+            StackStatus::RollbackFailed => "ROLLBACK_FAILED",
+            StackStatus::UpdateRollbackInProgress => "UPDATE_ROLLBACK_IN_PROGRESS",
+            StackStatus::UpdateRollbackComplete => "UPDATE_ROLLBACK_COMPLETE",
+            StackStatus::UpdateRollbackFailed => "UPDATE_ROLLBACK_FAILED",
         }
     }
 }
@@ -98,6 +148,8 @@ pub struct Stack {
     pub tags: Vec<(String, String)>,
     pub creation_time: String,
     pub last_updated_time: Option<String>,
+    #[serde(default)]
+    pub disable_rollback: bool,
 }
 
 impl Stack {

@@ -199,7 +199,7 @@ async fn failed_missing_and_mismatched_provider_callbacks_fail_stack() {
             .store
             .get("000000000000", "us-east-1", "custom-stack")
             .unwrap();
-        assert_eq!(stack.status, StackStatus::CreateFailed, "{mode}");
+        assert_eq!(stack.status, StackStatus::RollbackComplete, "{mode}");
         assert!(stack
             .events
             .iter()
@@ -252,7 +252,7 @@ async fn provider_update_and_delete_failures_are_visible_and_delete_can_retry() 
             .store
             .get("000000000000", "us-east-1", "custom-stack")
             .unwrap();
-        assert_eq!(stack.status, StackStatus::UpdateFailed);
+        assert_eq!(stack.status, StackStatus::UpdateRollbackFailed);
         assert_eq!(stack.resources[0].physical_id, "original");
         operation(&handler, "DeleteStack", None).await;
         let stack = handler
@@ -289,7 +289,7 @@ async fn rollback_delete_failure_preserves_provider_dependencies_for_retry() {
         .store
         .get("000000000000", "us-east-1", "custom-stack")
         .unwrap();
-    assert_eq!(stack.status, StackStatus::CreateFailed);
+    assert_eq!(stack.status, StackStatus::RollbackFailed);
     for logical in ["Role", "Bucket"] {
         assert_eq!(
             stack

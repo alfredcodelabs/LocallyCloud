@@ -147,26 +147,14 @@ impl CfnStore {
         let interrupted = store
             .stacks
             .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.status,
-                    crate::model::StackStatus::CreateInProgress
-                        | crate::model::StackStatus::UpdateInProgress
-                        | crate::model::StackStatus::DeleteInProgress
-                )
-            })
+            .filter(|entry| entry.status.is_in_progress())
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
         for (key, mut stack) in interrupted {
-            stack.status = match stack.status {
-                crate::model::StackStatus::CreateInProgress => {
-                    crate::model::StackStatus::CreateFailed
-                }
-                crate::model::StackStatus::UpdateInProgress => {
-                    crate::model::StackStatus::UpdateFailed
-                }
-                _ => crate::model::StackStatus::DeleteFailed,
-            };
+            stack.status = stack
+                .status
+                .interrupted_failure()
+                .ok_or(CfnError::Internal)?;
             stack.events.push(crate::model::StackEvent { event_id: uuid::Uuid::new_v4().to_string(), logical_id: stack.stack_name.clone(), resource_type: "AWS::CloudFormation::Stack".into(), status: stack.status.as_str().into(), reason: Some("LocallyCloud stopped during this operation; only recorded resource ownership is available".into()), timestamp: time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(|_| CfnError::Internal)? });
             store
                 .persistence
@@ -524,6 +512,22 @@ fn apply_progress(
             (None, None) => {}
         }
     }
+    for event in events {
+        if event.logical_id == stack.stack_name
+            && event.resource_type == "AWS::CloudFormation::Stack"
+        {
+            match event.status.as_str() {
+                "ROLLBACK_IN_PROGRESS" => {
+                    stack.status = crate::model::StackStatus::RollbackInProgress
+                }
+                "UPDATE_ROLLBACK_IN_PROGRESS" => {
+                    stack.status = crate::model::StackStatus::UpdateRollbackInProgress
+                }
+                "DELETE_IN_PROGRESS" => stack.status = crate::model::StackStatus::DeleteInProgress,
+                _ => {}
+            }
+        }
+    }
     stack.events.extend_from_slice(events);
 }
 
@@ -551,6 +555,7 @@ mod tests {
             tags: Vec::new(),
             creation_time: String::new(),
             last_updated_time: None,
+            disable_rollback: false,
         };
         store.put("owner", "us-east-1", stack.clone()).unwrap();
         let sql = db.connection().unwrap();
@@ -677,6 +682,44 @@ mod tests {
                 .len(),
             recovered.events.len()
         );
+        for (phase, failure) in [
+            (
+                crate::model::StackStatus::RollbackInProgress,
+                crate::model::StackStatus::RollbackFailed,
+            ),
+            (
+                crate::model::StackStatus::UpdateRollbackInProgress,
+                crate::model::StackStatus::UpdateRollbackFailed,
+            ),
+        ] {
+            let store = reopen();
+            let mut live = store.get("owner", "us-east-1", "progress").unwrap();
+            live.status = crate::model::StackStatus::CreateInProgress;
+            store.put("owner", "us-east-1", live).unwrap();
+            let phase_event = StackEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                logical_id: "progress".into(),
+                resource_type: "AWS::CloudFormation::Stack".into(),
+                status: phase.as_str().into(),
+                reason: None,
+                timestamp: String::new(),
+            };
+            store
+                .progress("owner", "us-east-1", "progress", "", None, &[phase_event])
+                .unwrap();
+            assert_eq!(
+                store.get("owner", "us-east-1", "progress").unwrap().status,
+                phase
+            );
+            drop(store);
+            assert_eq!(
+                reopen()
+                    .get("owner", "us-east-1", "progress")
+                    .unwrap()
+                    .status,
+                failure
+            );
+        }
         drop(sql);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
@@ -724,6 +767,7 @@ mod tests {
             tags: vec![("application".into(), "orders".into())],
             creation_time: "2026-10-06T00:00:00Z".into(),
             last_updated_time: None,
+            disable_rollback: false,
         };
         store.put("owner", "us-east-1", stack.clone()).unwrap();
         let mut other = stack.clone();
@@ -950,6 +994,7 @@ mod tests {
             tags: Vec::new(),
             creation_time: String::new(),
             last_updated_time: None,
+            disable_rollback: false,
         };
         store.archive("account", "region", stack.clone()).unwrap();
         assert!(store.find("account", "region", "stack").is_none());

@@ -24,6 +24,47 @@ use crate::xml::{query_envelope, text_el, xml_escape};
 
 const STACK_TYPE: &str = "AWS::CloudFormation::Stack";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureAction {
+    Rollback,
+    DoNothing,
+    Delete,
+}
+
+fn failure_action(q: &Query, creating: bool) -> Result<FailureAction, CfnError> {
+    let disabled = match q.params.get("DisableRollback").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return Err(CfnError::Validation(
+                "DisableRollback must be true or false".into(),
+            ))
+        }
+    };
+    if creating && q.params.contains_key("DisableRollback") && q.params.contains_key("OnFailure") {
+        return Err(CfnError::Validation(
+            "DisableRollback and OnFailure cannot be specified together".into(),
+        ));
+    }
+    if creating {
+        if let Some(action) = q.params.get("OnFailure") {
+            return match action.as_str() {
+                "ROLLBACK" => Ok(FailureAction::Rollback),
+                "DO_NOTHING" => Ok(FailureAction::DoNothing),
+                "DELETE" => Ok(FailureAction::Delete),
+                _ => Err(CfnError::Validation(
+                    "OnFailure must be DO_NOTHING, ROLLBACK, or DELETE".into(),
+                )),
+            };
+        }
+    }
+    Ok(if disabled {
+        FailureAction::DoNothing
+    } else {
+        FailureAction::Rollback
+    })
+}
+
 pub struct CfnHandler {
     store: Arc<CfnStore>,
     registry: Weak<ServiceRegistry>,
@@ -102,6 +143,18 @@ impl CfnHandler {
             .as_ref()
             .map(|cs| cs.request.clone())
             .unwrap_or_else(|| q.clone());
+        if op == "ExecuteChangeSet" {
+            if let Some(value) = q.params.get("DisableRollback") {
+                request
+                    .params
+                    .insert("DisableRollback".into(), value.clone());
+            }
+        }
+        let failure_action = if operation == "DeleteStack" {
+            FailureAction::Rollback
+        } else {
+            failure_action(&request, operation == "CreateStack")?
+        };
         let requested_name = request
             .get("StackName")
             .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
@@ -125,14 +178,7 @@ impl CfnHandler {
         if operation == "DeleteStack" && existing.is_none() {
             return Ok(String::new());
         }
-        if existing.as_ref().is_some_and(|s| {
-            matches!(
-                s.status,
-                StackStatus::CreateInProgress
-                    | StackStatus::UpdateInProgress
-                    | StackStatus::DeleteInProgress
-            )
-        }) {
+        if existing.as_ref().is_some_and(|s| s.status.is_in_progress()) {
             return Err(CfnError::Validation(format!(
                 "Stack [{name}] has an operation in progress"
             )));
@@ -151,6 +197,29 @@ impl CfnHandler {
                 "Stack [{name}] does not exist"
             )));
         }
+        if let Some(stack) = existing
+            .as_ref()
+            .filter(|stack| operation == "UpdateStack" && !stack.status.can_update())
+        {
+            return Err(CfnError::Validation(format!(
+                "Stack [{name}] is in {} state and cannot be updated",
+                stack.status.as_str()
+            )));
+        }
+        if operation == "UpdateStack"
+            && existing.as_ref().is_some_and(|stack| {
+                stack.disable_rollback
+                    && matches!(
+                        stack.status,
+                        StackStatus::CreateFailed | StackStatus::UpdateFailed
+                    )
+            })
+            && failure_action != FailureAction::DoNothing
+        {
+            return Err(CfnError::Validation(
+                "A preserved failed stack must be retried with DisableRollback=true".into(),
+            ));
+        }
         let mut stack = if operation == "CreateStack" {
             Stack {
                 stack_id: change
@@ -167,6 +236,7 @@ impl CfnHandler {
                 tags: request.tags(),
                 creation_time: now_iso(),
                 last_updated_time: None,
+                disable_rollback: false,
             }
         } else {
             existing.clone().unwrap()
@@ -182,6 +252,10 @@ impl CfnHandler {
             let active = template.active_resources(&conditions)?;
             template.active_outputs(&conditions, &active)?;
             if operation == "UpdateStack"
+                && !matches!(
+                    stack.status,
+                    StackStatus::CreateFailed | StackStatus::UpdateFailed
+                )
                 && stack.template_body == body
                 && stack.parameters == parameters
                 && (request.tags().is_empty() || stack.tags == request.tags())
@@ -205,6 +279,9 @@ impl CfnHandler {
             "UpdateStack" => StackStatus::UpdateInProgress,
             _ => StackStatus::DeleteInProgress,
         };
+        if operation != "DeleteStack" {
+            stack.disable_rollback = failure_action == FailureAction::DoNothing;
+        }
         if operation == "UpdateStack" {
             stack.last_updated_time = Some(now_iso());
         }
@@ -233,11 +310,13 @@ impl CfnHandler {
             };
             if let Err(error) = result {
                 if let Some(mut stack) = self.store.get(&account, &region, &name) {
-                    stack.status = match operation.as_str() {
-                        "CreateStack" => StackStatus::CreateFailed,
-                        "UpdateStack" => StackStatus::UpdateFailed,
-                        _ => StackStatus::DeleteFailed,
-                    };
+                    stack.status = stack.status.interrupted_failure().unwrap_or({
+                        match operation.as_str() {
+                            "CreateStack" => StackStatus::CreateFailed,
+                            "UpdateStack" => StackStatus::UpdateFailed,
+                            _ => StackStatus::DeleteFailed,
+                        }
+                    });
                     stack.events.push(event(
                         &name,
                         STACK_TYPE,
@@ -323,6 +402,14 @@ impl CfnHandler {
             return Err(CfnError::Validation(format!(
                 "ChangeSetType {change_type} is invalid for stack {stack}"
             )));
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|stack| !stack.status.can_update())
+        {
+            return Err(CfnError::Validation(
+                "Stack state does not permit a change set".into(),
+            ));
         }
         let body = self.resolve_template_body(q, region, account).await?;
         let template = Template::parse(&body)?;
@@ -444,12 +531,18 @@ impl CfnHandler {
                         Some(
                             StackStatus::CreateInProgress
                             | StackStatus::UpdateInProgress
-                            | StackStatus::DeleteInProgress,
+                            | StackStatus::DeleteInProgress
+                            | StackStatus::RollbackInProgress
+                            | StackStatus::UpdateRollbackInProgress,
                         ) => "EXECUTE_IN_PROGRESS",
                         Some(
                             StackStatus::CreateFailed
                             | StackStatus::UpdateFailed
-                            | StackStatus::DeleteFailed,
+                            | StackStatus::DeleteFailed
+                            | StackStatus::RollbackComplete
+                            | StackStatus::RollbackFailed
+                            | StackStatus::UpdateRollbackComplete
+                            | StackStatus::UpdateRollbackFailed,
                         )
                         | None => "EXECUTE_FAILED",
                         _ => "EXECUTE_COMPLETE",
@@ -506,6 +599,7 @@ impl CfnHandler {
         account: &str,
         change_set_stack_id: Option<&str>,
     ) -> Result<String, CfnError> {
+        let action = failure_action(q, true)?;
         let name = q
             .get("StackName")
             .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
@@ -543,6 +637,7 @@ impl CfnHandler {
                 region,
                 account,
                 true,
+                action == FailureAction::Rollback,
                 &[],
                 None,
                 &conditions,
@@ -573,8 +668,12 @@ impl CfnHandler {
             tags: q.tags(),
             creation_time: now,
             last_updated_time: None,
+            disable_rollback: action == FailureAction::DoNothing,
         };
         self.store.put(account, region, stack)?;
+        if action == FailureAction::Delete && status == StackStatus::CreateFailed {
+            self.delete_stack(q, region, account).await?;
+        }
         Ok(format!("<StackId>{}</StackId>", xml_escape(&stack_id)))
     }
 
@@ -584,6 +683,7 @@ impl CfnHandler {
         region: &str,
         account: &str,
     ) -> Result<String, CfnError> {
+        let action = failure_action(q, false)?;
         let name = q
             .get("StackName")
             .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
@@ -632,6 +732,7 @@ impl CfnHandler {
                 region,
                 account,
                 false,
+                action == FailureAction::Rollback,
                 &existing.resources,
                 Some((&previous_template, &existing.parameters)),
                 &conditions,
@@ -659,7 +760,13 @@ impl CfnHandler {
         let mut all_events = existing.events.clone();
         all_events.append(&mut events);
 
-        let update_failed = status == StackStatus::UpdateFailed;
+        let update_failed = action == FailureAction::Rollback
+            && matches!(
+                status,
+                StackStatus::UpdateFailed
+                    | StackStatus::UpdateRollbackComplete
+                    | StackStatus::UpdateRollbackFailed
+            );
         let stack = Stack {
             stack_id: existing.stack_id.clone(),
             stack_name: name.clone(),
@@ -688,6 +795,7 @@ impl CfnHandler {
             },
             creation_time: existing.creation_time.clone(),
             last_updated_time: Some(now_iso()),
+            disable_rollback: action == FailureAction::DoNothing,
         };
         let stack_id = stack.stack_id.clone();
         self.store.put(account, region, stack)?;
@@ -742,12 +850,18 @@ impl CfnHandler {
             if !stack.events.last().is_some_and(|event| {
                 event.resource_type == STACK_TYPE && event.status == "DELETE_IN_PROGRESS"
             }) {
-                stack.events.push(event(
-                    &stack.stack_name,
-                    STACK_TYPE,
-                    "DELETE_IN_PROGRESS",
-                    None,
-                ));
+                let started = event(&stack.stack_name, STACK_TYPE, "DELETE_IN_PROGRESS", None);
+                self.store
+                    .record_progress(
+                        account,
+                        region,
+                        &stack.stack_name,
+                        "",
+                        None,
+                        std::slice::from_ref(&started),
+                    )
+                    .await?;
+                stack.events.push(started);
             }
             // Retired targets are kept in the stack until cleanup really succeeds.
             let mut replacement_events = Vec::new();
@@ -1028,6 +1142,7 @@ impl CfnHandler {
         region: &str,
         account: &str,
         creating: bool,
+        rollback_on_failure: bool,
         existing: &[StackResource],
         previous: Option<(&Template, &BTreeMap<String, String>)>,
         conditions: &BTreeMap<String, bool>,
@@ -1105,6 +1220,9 @@ impl CfnHandler {
         let prior_properties = existing
             .iter()
             .map(|resource| {
+                if let Some(lifecycle) = &resource.lifecycle {
+                    return Ok((resource.logical_id.clone(), lifecycle.properties.clone()));
+                }
                 let properties = previous_declarations
                     .get(&resource.logical_id)
                     .zip(previous_ctx.as_ref())
@@ -1159,6 +1277,8 @@ impl CfnHandler {
         // A type change reuses a logical ID, so its old resource is removed first.
         // Pure removals stay in physical inventory until dependents have been updated.
         let mut removal_failures = BTreeMap::new();
+        let mut destructive_removals = Vec::new();
+        let mut retained_previous = Vec::new();
         for resource in existing.iter().rev().filter(|resource| {
             declarations
                 .get(&resource.logical_id)
@@ -1168,6 +1288,7 @@ impl CfnHandler {
                 .get(&resource.logical_id)
                 .is_some_and(|decl| decl.deletion_policy.retains_on_delete())
             {
+                retained_previous.push(resource.clone());
                 continue;
             }
             let properties = prior_properties
@@ -1184,10 +1305,20 @@ impl CfnHandler {
                 .await
             {
                 removal_failures.insert(resource.logical_id.clone(), error.to_string());
-            } else if admitted {
-                self.store
-                    .record_progress(account, region, stack_name, &resource.logical_id, None, &[])
-                    .await?;
+            } else {
+                destructive_removals.push(resource.logical_id.clone());
+                if admitted {
+                    self.store
+                        .record_progress(
+                            account,
+                            region,
+                            stack_name,
+                            &resource.logical_id,
+                            None,
+                            &[],
+                        )
+                        .await?;
+                }
             }
         }
 
@@ -1234,7 +1365,7 @@ impl CfnHandler {
             .collect();
         let mut events: Vec<StackEvent> = Vec::new();
         let mut failure_reason = None;
-        let mut successful_actions = Vec::new();
+        let mut reconciliation_actions = Vec::new();
         let mut metadata_changes = Vec::new();
 
         let (in_progress, complete, failed_status) = if creating {
@@ -1247,6 +1378,7 @@ impl CfnHandler {
         events.push(event(stack_name, STACK_TYPE, in_progress, None));
 
         if !removal_failures.is_empty() {
+            resources.extend(retained_previous);
             for resource in &mut resources {
                 if let Some(reason) = removal_failures.get(&resource.logical_id) {
                     resource.status = failed_status.to_string();
@@ -1258,13 +1390,28 @@ impl CfnHandler {
                     ));
                 }
             }
+            let status = if rollback_on_failure {
+                events.push(event(
+                    stack_name,
+                    STACK_TYPE,
+                    "UPDATE_ROLLBACK_IN_PROGRESS",
+                    Some("resource teardown failed".into()),
+                ));
+                record("", None, &events).await?;
+                StackStatus::UpdateRollbackFailed
+            } else {
+                StackStatus::UpdateFailed
+            };
             events.push(event(
                 stack_name,
                 STACK_TYPE,
-                failed_status,
-                Some("resource teardown failed".into()),
+                status.as_str(),
+                Some(
+                    "resource teardown failed; previous resource state could not be restored"
+                        .into(),
+                ),
             ));
-            return Ok((StackStatus::UpdateFailed, resources, Vec::new(), events));
+            return Ok((status, resources, Vec::new(), events));
         }
 
         for decl in active {
@@ -1323,6 +1470,13 @@ impl CfnHandler {
                     None,
                 ));
                 record("", None, &events).await?;
+                reconciliation_actions.push(ReconcileAction::Updated {
+                    logical_id: decl.logical_id.clone(),
+                    resource_type: decl.resource_type.clone(),
+                    applied_properties: props.clone(),
+                    previous_properties: previous_properties.clone(),
+                    deferred_previous: None,
+                });
                 match provisioner
                     .update(
                         &decl.logical_id,
@@ -1360,13 +1514,12 @@ impl CfnHandler {
                                     });
                             }
                         }
-                        successful_actions.push(ReconcileAction::Updated {
-                            logical_id: decl.logical_id.clone(),
-                            resource_type: decl.resource_type.clone(),
-                            applied_properties: props.clone(),
-                            previous_properties,
-                            deferred_previous: deferred.then_some(current),
-                        });
+                        if let Some(ReconcileAction::Updated {
+                            deferred_previous, ..
+                        }) = reconciliation_actions.last_mut()
+                        {
+                            *deferred_previous = deferred.then_some(current);
+                        }
                         resolved.insert(decl.logical_id.clone(), updated);
                         events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
                         record(
@@ -1377,13 +1530,93 @@ impl CfnHandler {
                         .await?;
                     }
                     Err(error) => {
-                        let reason = error.to_string();
+                        let mut reason = error.to_string();
+                        if let Some(resource) = resources
+                            .iter_mut()
+                            .find(|r| r.logical_id == decl.logical_id)
+                        {
+                            resource.status = failed_status.into();
+                        }
                         events.push(event(
                             &decl.logical_id,
                             &decl.resource_type,
                             failed_status,
                             Some(reason.clone()),
                         ));
+                        record(
+                            &decl.logical_id,
+                            resources.iter().find(|r| r.logical_id == decl.logical_id),
+                            &events,
+                        )
+                        .await?;
+                        if !rollback_on_failure {
+                            // Preserve successful actions, but restore a partially changed failed resource.
+                            events.push(event(
+                                &decl.logical_id,
+                                &decl.resource_type,
+                                "UPDATE_ROLLBACK_IN_PROGRESS",
+                                None,
+                            ));
+                            record("", None, &events).await?;
+                            let restoration = provisioner
+                                .update(
+                                    &decl.logical_id,
+                                    &decl.resource_type,
+                                    &current,
+                                    &props,
+                                    &previous_properties,
+                                    Replacement::Rollback,
+                                )
+                                .await;
+                            let status = match restoration {
+                                Ok(restored) => {
+                                    if let Some(resource) = resources
+                                        .iter_mut()
+                                        .find(|r| r.logical_id == decl.logical_id)
+                                    {
+                                        resource.physical_id = restored.ref_value.clone();
+                                        resource.attributes = restored.attributes.clone();
+                                        resource.lifecycle = Some(existing.iter()
+                                            .find(|r| r.logical_id == decl.logical_id)
+                                            .and_then(|r| r.lifecycle.clone())
+                                            .unwrap_or_else(|| {
+                                                let previous = previous_declarations.get(&decl.logical_id);
+                                                crate::model::ResourceLifecycle {
+                                                    properties: previous_properties.clone(),
+                                                    depends_on: previous.map(|decl| decl.depends_on.iter().cloned().chain(crate::template::referenced_ids(&decl.properties)).collect()).unwrap_or_default(),
+                                                    retain_on_delete: previous.is_some_and(|decl| decl.deletion_policy.retains_on_delete()),
+                                                }
+                                            }));
+                                    }
+                                    resolved.insert(decl.logical_id.clone(), restored);
+                                    "UPDATE_ROLLBACK_COMPLETE"
+                                }
+                                Err(error) => {
+                                    reason.push_str(&format!(
+                                        "; failed resource could not be restored: {error}"
+                                    ));
+                                    "UPDATE_ROLLBACK_FAILED"
+                                }
+                            };
+                            if let Some(resource) = resources
+                                .iter_mut()
+                                .find(|r| r.logical_id == decl.logical_id)
+                            {
+                                resource.status = status.into();
+                            }
+                            events.push(event(
+                                &decl.logical_id,
+                                &decl.resource_type,
+                                status,
+                                Some(reason.clone()),
+                            ));
+                            record(
+                                &decl.logical_id,
+                                resources.iter().find(|r| r.logical_id == decl.logical_id),
+                                &events,
+                            )
+                            .await?;
+                        }
                         failure_reason = Some(reason);
                         break;
                     }
@@ -1413,7 +1646,7 @@ impl CfnHandler {
                     });
                     events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
                     record(&decl.logical_id, resources.last(), &events).await?;
-                    successful_actions.push(ReconcileAction::Created {
+                    reconciliation_actions.push(ReconcileAction::Created {
                         logical_id: decl.logical_id.clone(),
                         resource_type: decl.resource_type.clone(),
                         properties: props.clone(),
@@ -1467,21 +1700,43 @@ impl CfnHandler {
 
         record("", None, &events).await?;
         if let Some(provisioning_failure) = failure_reason {
+            let mut stack_reason = format!("resource provisioning failed: {provisioning_failure}");
+            if !rollback_on_failure {
+                let status = if creating {
+                    StackStatus::CreateFailed
+                } else {
+                    StackStatus::UpdateFailed
+                };
+                events.push(event(
+                    stack_name,
+                    STACK_TYPE,
+                    status.as_str(),
+                    Some(stack_reason),
+                ));
+                return Ok((status, resources, outputs, events));
+            }
+            let rollback_started = if creating {
+                StackStatus::RollbackInProgress
+            } else {
+                StackStatus::UpdateRollbackInProgress
+            };
+            events.push(event(
+                stack_name,
+                STACK_TYPE,
+                rollback_started.as_str(),
+                Some(stack_reason.clone()),
+            ));
+            record("", None, &events).await?;
             for (logical_id, lifecycle) in metadata_changes {
                 if let Some(resource) = resources.iter_mut().find(|r| r.logical_id == logical_id) {
                     resource.lifecycle = lifecycle;
                     record(&logical_id, Some(resource), &events).await?;
                 }
             }
-            let status = if creating {
-                StackStatus::CreateFailed
-            } else {
-                StackStatus::UpdateFailed
-            };
-            let mut stack_reason = format!("resource provisioning failed: {provisioning_failure}");
-
-            let mut cleanup_failures = Vec::new();
-            for action in successful_actions.iter().rev() {
+            let mut cleanup_failures: Vec<String> = destructive_removals.into_iter()
+                .map(|id| format!("{id}: previous resource was removed for a type change and cannot be restored automatically"))
+                .collect();
+            for action in reconciliation_actions.iter().rev() {
                 match action {
                     ReconcileAction::Created {
                         logical_id,
@@ -1495,6 +1750,21 @@ impl CfnHandler {
                         else {
                             continue;
                         };
+                        if declarations
+                            .get(logical_id)
+                            .is_some_and(|decl| decl.deletion_policy.retains_on_rollback())
+                        {
+                            resources.retain(|candidate| candidate.logical_id != *logical_id);
+                            resolved.remove(logical_id);
+                            events.push(event(
+                                logical_id,
+                                resource_type,
+                                "DELETE_SKIPPED",
+                                Some("retained by DeletionPolicy".into()),
+                            ));
+                            record(logical_id, None, &events).await?;
+                            continue;
+                        }
                         if has_failed_dependent(logical_id, &resources, &declarations) {
                             if let Some(candidate) =
                                 resources.iter_mut().find(|r| r.logical_id == *logical_id)
@@ -1655,15 +1925,39 @@ impl CfnHandler {
                     }
                 }
             }
+            for mut resource in retained_previous {
+                if resources
+                    .iter()
+                    .any(|owned| owned.logical_id == resource.logical_id)
+                {
+                    cleanup_failures.push(format!("{}: replacement cleanup must finish before restoring previous retained ownership", resource.logical_id));
+                    continue;
+                }
+                resource.status = "UPDATE_ROLLBACK_COMPLETE".into();
+                events.push(event(
+                    &resource.logical_id,
+                    &resource.resource_type,
+                    "UPDATE_ROLLBACK_COMPLETE",
+                    Some("Previous retained resource remains unchanged".into()),
+                ));
+                record(&resource.logical_id, Some(&resource), &events).await?;
+                resources.push(resource);
+            }
             if !cleanup_failures.is_empty() {
                 stack_reason.push_str("; rollback failed: ");
                 stack_reason.push_str(&cleanup_failures.join("; "));
             }
 
+            let status = match (creating, cleanup_failures.is_empty()) {
+                (true, true) => StackStatus::RollbackComplete,
+                (true, false) => StackStatus::RollbackFailed,
+                (false, true) => StackStatus::UpdateRollbackComplete,
+                (false, false) => StackStatus::UpdateRollbackFailed,
+            };
             events.push(event(
                 stack_name,
                 STACK_TYPE,
-                failed_status,
+                status.as_str(),
                 Some(stack_reason),
             ));
             return Ok((status, resources, Vec::new(), events));
@@ -2377,6 +2671,7 @@ fn review_stack(cs: &ChangeSet) -> Stack {
         tags: Vec::new(),
         creation_time: now_iso(),
         last_updated_time: None,
+        disable_rollback: false,
     }
 }
 
@@ -2446,7 +2741,7 @@ fn render_stack(stack: &Stack) -> String {
         .map(|t| text_el("LastUpdatedTime", t))
         .unwrap_or_default();
     format!(
-        "<member>{}{}{}<CreationTime>{}</CreationTime>{}{}<Outputs>{}</Outputs><Parameters>{}</Parameters><Tags>{}</Tags><DisableRollback>false</DisableRollback><EnableTerminationProtection>false</EnableTerminationProtection></member>",
+        "<member>{}{}{}<CreationTime>{}</CreationTime>{}{}<Outputs>{}</Outputs><Parameters>{}</Parameters><Tags>{}</Tags><DisableRollback>{}</DisableRollback><EnableTerminationProtection>false</EnableTerminationProtection></member>",
         text_el("StackId", &stack.stack_id),
         text_el("StackName", &stack.stack_name),
         text_el("StackStatus", stack.status.as_str()),
@@ -2456,6 +2751,7 @@ fn render_stack(stack: &Stack) -> String {
         outputs,
         params,
         tags,
+        stack.disable_rollback,
     )
 }
 
@@ -2792,12 +3088,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(stack) = store.find("000000000000", "us-east-1", name) {
-                    if !matches!(
-                        stack.status,
-                        StackStatus::CreateInProgress
-                            | StackStatus::UpdateInProgress
-                            | StackStatus::DeleteInProgress
-                    ) {
+                    if !stack.status.is_in_progress() {
                         return stack;
                     }
                 }
@@ -3341,7 +3632,7 @@ mod tests {
             assert_eq!(
                 stack.status,
                 if denied {
-                    StackStatus::UpdateFailed
+                    StackStatus::UpdateRollbackComplete
                 } else {
                     StackStatus::UpdateComplete
                 }
@@ -3621,6 +3912,184 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failure_options_validate_without_inheriting_previous_stack_flags() {
+        let q = |pairs: &[(&str, &str)]| Query {
+            params: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        assert!(failure_action(&q(&[]), true).unwrap() == FailureAction::Rollback);
+        assert!(
+            failure_action(&q(&[("DisableRollback", "true")]), false).unwrap()
+                == FailureAction::DoNothing
+        );
+        for pairs in [
+            vec![("DisableRollback", "false"), ("OnFailure", "ROLLBACK")],
+            vec![("DisableRollback", "invalid")],
+            vec![("OnFailure", "invalid")],
+        ] {
+            assert!(failure_action(&q(&pairs), true).is_err());
+        }
+        assert!(!StackStatus::RollbackComplete.can_update());
+        assert!(!StackStatus::UpdateRollbackFailed.can_update());
+        assert!(StackStatus::UpdateRollbackComplete.can_update());
+    }
+
+    #[tokio::test]
+    async fn create_failure_options_execute_real_cleanup_and_report_final_stack_state() {
+        for (option, fail_delete, expected) in [
+            (None, false, StackStatus::RollbackComplete),
+            (None, true, StackStatus::RollbackFailed),
+            (
+                Some(("DisableRollback", "true")),
+                false,
+                StackStatus::CreateFailed,
+            ),
+            (
+                Some(("OnFailure", "DO_NOTHING")),
+                false,
+                StackStatus::CreateFailed,
+            ),
+            (
+                Some(("OnFailure", "DELETE")),
+                false,
+                StackStatus::DeleteComplete,
+            ),
+        ] {
+            let s3 = Arc::new(TestS3 {
+                failed_put: Some("/second"),
+                existing: None,
+                fail_delete,
+                requests: Mutex::new(Vec::new()),
+            });
+            let (_registry, handler) = handler_with_s3(s3.clone());
+            let mut query = Query { params: [
+                ("StackName".into(), "stack".into()),
+                ("TemplateBody".into(), r#"{"Resources":{"First":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"first"}},"Second":{"Type":"AWS::S3::Bucket","DependsOn":"First","Properties":{"BucketName":"second"}}}}"#.into()),
+            ].into() };
+            if let Some((key, value)) = option {
+                query.params.insert(key.into(), value.into());
+            }
+            let response = handler
+                .create_stack(&query, "us-east-1", "000000000000", None)
+                .await
+                .unwrap();
+            let id = response
+                .strip_prefix("<StackId>")
+                .unwrap()
+                .strip_suffix("</StackId>")
+                .unwrap();
+            let stack = handler.store.find("000000000000", "us-east-1", id).unwrap();
+            assert_eq!(stack.status, expected);
+            assert_eq!(stack.events.last().unwrap().status, expected.as_str());
+            let preserved = expected == StackStatus::CreateFailed;
+            assert_eq!(stack.disable_rollback, preserved);
+            assert_eq!(
+                stack.resources.iter().any(|r| r.logical_id == "First"),
+                preserved || fail_delete || expected == StackStatus::DeleteComplete
+            );
+            assert_eq!(
+                s3.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request == "DELETE /first"),
+                !preserved
+            );
+            assert_eq!(
+                stack
+                    .events
+                    .iter()
+                    .any(|event| event.resource_type == STACK_TYPE
+                        && event.status == "ROLLBACK_IN_PROGRESS"),
+                option.is_none()
+            );
+            assert!(render_stack(&stack)
+                .contains(&format!("<DisableRollback>{preserved}</DisableRollback>")));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_failure_restores_prior_metadata_unless_rollback_is_disabled_for_this_request() {
+        for disabled in [false, true] {
+            let s3 = Arc::new(TestS3 {
+                failed_put: Some("/second"),
+                existing: None,
+                fail_delete: false,
+                requests: Mutex::new(Vec::new()),
+            });
+            let (_registry, handler) = handler_with_s3(s3);
+            let initial = serde_json::json!({"Parameters":{"Marker":{"Type":"String","Default":"old"}},"Resources":{"First":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"first"}}},"Outputs":{"Marker":{"Value":{"Ref":"Marker"}}}});
+            let mut query = Query {
+                params: [
+                    ("StackName".into(), "stack".into()),
+                    ("TemplateBody".into(), initial.to_string()),
+                    ("DisableRollback".into(), "true".into()),
+                ]
+                .into(),
+            };
+            handler
+                .create_stack(&query, "us-east-1", "000000000000", None)
+                .await
+                .unwrap();
+            let mut desired = initial.clone();
+            desired["Resources"]["Second"] = serde_json::json!({"Type":"AWS::S3::Bucket","DependsOn":"First","Properties":{"BucketName":"second"}});
+            query
+                .params
+                .insert("TemplateBody".into(), desired.to_string());
+            query.params.remove("DisableRollback");
+            if disabled {
+                query.params.insert("DisableRollback".into(), "true".into());
+            }
+            query
+                .params
+                .insert("Parameters.member.1.ParameterKey".into(), "Marker".into());
+            query
+                .params
+                .insert("Parameters.member.1.ParameterValue".into(), "new".into());
+            handler
+                .update_stack(&query, "us-east-1", "000000000000")
+                .await
+                .unwrap();
+            let stack = handler
+                .store
+                .get("000000000000", "us-east-1", "stack")
+                .unwrap();
+            assert_eq!(
+                stack.status,
+                if disabled {
+                    StackStatus::UpdateFailed
+                } else {
+                    StackStatus::UpdateRollbackComplete
+                }
+            );
+            assert_eq!(stack.disable_rollback, disabled);
+            assert_eq!(
+                stack.template_body,
+                if disabled {
+                    desired.to_string()
+                } else {
+                    initial.to_string()
+                }
+            );
+            assert_eq!(
+                stack.parameters["Marker"],
+                if disabled { "new" } else { "old" }
+            );
+            assert_eq!(stack.outputs[0].value, if disabled { "new" } else { "old" });
+            assert_eq!(
+                stack
+                    .events
+                    .iter()
+                    .any(|event| event.status == "UPDATE_ROLLBACK_IN_PROGRESS"),
+                !disabled
+            );
+            assert!(stack.resource("First").is_some());
+        }
+    }
+
     #[tokio::test]
     async fn failed_create_removes_resources_cleaned_up_successfully() {
         let s3 = Arc::new(TestS3 {
@@ -3645,6 +4114,7 @@ mod tests {
                 "us-east-1",
                 "000000000000",
                 true,
+                true,
                 &[],
                 None,
                 &conditions,
@@ -3654,7 +4124,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(status, StackStatus::CreateFailed);
+        assert_eq!(status, StackStatus::RollbackComplete);
         assert!(resources.is_empty());
         assert!(events
             .iter()
@@ -3689,6 +4159,7 @@ mod tests {
                 "us-east-1",
                 "000000000000",
                 true,
+                true,
                 &[],
                 None,
                 &conditions,
@@ -3698,7 +4169,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(status, StackStatus::CreateFailed);
+        assert_eq!(status, StackStatus::RollbackFailed);
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].status, "DELETE_FAILED");
         assert!(events.iter().any(|event| {
@@ -3753,6 +4224,7 @@ mod tests {
                     tags: Vec::new(),
                     creation_time: now_iso(),
                     last_updated_time: None,
+                    disable_rollback: false,
                 },
             )
             .unwrap();
@@ -3856,6 +4328,7 @@ mod tests {
                 "us-east-1",
                 "000000000000",
                 creating,
+                true,
                 existing,
                 previous.map(|t| (t, &previous_parameters)),
                 &conditions,
@@ -3864,6 +4337,87 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retained_type_change_restores_old_ownership_after_replacement_cleanup() {
+        for policy in ["Retain", "RetainExceptOnCreate"] {
+            let registry = Arc::new(ServiceRegistry::new());
+            locallycloud_s3::register(&registry);
+            locallycloud_sqs::register(&registry);
+            let handler = CfnHandler::new(Arc::downgrade(&registry));
+            handler
+                .provisioner("us-east-1", "111111111111")
+                .provision(
+                    "Taken",
+                    "other",
+                    "AWS::S3::Bucket",
+                    &serde_json::json!({"BucketName":"taken"}),
+                )
+                .await
+                .unwrap();
+            let initial = Template::parse(&serde_json::json!({"Resources":{"Shared":{
+                "Type":"AWS::S3::Bucket", "DeletionPolicy":policy, "Properties":{"BucketName":"retained-original"}
+            }}}).to_string()).unwrap();
+            let (_, original, _, _) = run_provision(&handler, &initial, true, &[], None).await;
+            let desired = Template::parse(&serde_json::json!({"Resources":{
+                "Shared":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":"replacement"}},
+                "ZFail":{"Type":"AWS::S3::Bucket","DependsOn":"Shared","Properties":{"BucketName":"taken"}}
+            }}).to_string()).unwrap();
+            let (status, restored, _, events) =
+                run_provision(&handler, &desired, false, &original, Some(&initial)).await;
+            assert_eq!(status, StackStatus::UpdateRollbackComplete);
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].resource_type, "AWS::S3::Bucket");
+            assert_eq!(restored[0].physical_id, original[0].physical_id);
+            assert_eq!(restored[0].lifecycle, original[0].lifecycle);
+            assert!(events.iter().any(|event| event.logical_id == "Shared"
+                && event.resource_type == "AWS::SQS::Queue"
+                && event.status == "UPDATE_COMPLETE"));
+            assert!(events.iter().any(|event| event.logical_id == "Shared"
+                && event.resource_type == "AWS::SQS::Queue"
+                && event.status == "DELETE_COMPLETE"));
+            let p = handler.provisioner("us-east-1", "000000000000");
+            let mut headers = http::HeaderMap::new();
+            headers.insert("host", "localhost:4566".parse().unwrap());
+            assert_eq!(
+                p.call(
+                    "s3",
+                    Method::HEAD,
+                    "/retained-original",
+                    headers.clone(),
+                    Bytes::new()
+                )
+                .await
+                .unwrap()
+                .0,
+                200
+            );
+            headers.insert("x-amz-target", "AmazonSQS.GetQueueUrl".parse().unwrap());
+            headers.insert(
+                "content-type",
+                "application/x-amz-json-1.0".parse().unwrap(),
+            );
+            let (status, body) = p
+                .call(
+                    "sqs",
+                    Method::POST,
+                    "/",
+                    headers,
+                    Bytes::from_static(br#"{"QueueName":"replacement"}"#),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, 400);
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                error["__type"]
+                    .as_str()
+                    .is_some_and(|code| code.ends_with("QueueDoesNotExist")
+                        || code.ends_with("NonExistentQueue")),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3883,7 +4437,7 @@ mod tests {
         }}"#).unwrap();
         let (status, resources, _, _) =
             run_provision(&handler, &changed, false, &existing, Some(&initial)).await;
-        assert_eq!(status, StackStatus::UpdateFailed);
+        assert_eq!(status, StackStatus::UpdateRollbackComplete);
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].lifecycle, existing[0].lifecycle);
         assert!(!resources[0].lifecycle.as_ref().unwrap().retain_on_delete);
@@ -3918,7 +4472,7 @@ mod tests {
         .unwrap();
         let (status, resources, outputs, events) =
             run_provision(&handler, &next, false, &existing, Some(&initial)).await;
-        assert_eq!(status, StackStatus::UpdateFailed);
+        assert_eq!(status, StackStatus::UpdateRollbackComplete);
         assert!(outputs.is_empty());
         assert_eq!(
             resources
@@ -3934,7 +4488,7 @@ mod tests {
             .is_some_and(|reason| reason.contains("Bucket.Missing"))));
         s3.requests.lock().unwrap().clear();
         let (status, resources, outputs, _) = run_provision(&handler, &next, true, &[], None).await;
-        assert_eq!(status, StackStatus::CreateFailed);
+        assert_eq!(status, StackStatus::RollbackComplete);
         assert!(resources.is_empty() && outputs.is_empty());
         assert_eq!(
             *s3.requests.lock().unwrap(),
@@ -4018,7 +4572,7 @@ mod tests {
         let (status, resources, _, events) =
             run_provision(&handler, &update, false, &resources, Some(&initial)).await;
 
-        assert_eq!(status, StackStatus::UpdateFailed);
+        assert_eq!(status, StackStatus::UpdateRollbackComplete);
         // The rolled-back resource is out of stack scope again; A and E survive the rollback.
         assert_eq!(
             resources
@@ -4031,9 +4585,9 @@ mod tests {
         // Rollback tears down the update's own creation even under RetainExceptOnCreate.
         assert!(requests.contains(&"DELETE /b".to_string()), "{requests:?}");
         assert!(!requests.contains(&"DELETE /a".to_string()), "{requests:?}");
-        assert!(events
-            .iter()
-            .any(|event| { event.logical_id == "stack" && event.status == "UPDATE_FAILED" }));
+        assert!(events.iter().any(|event| {
+            event.logical_id == "stack" && event.status == "UPDATE_ROLLBACK_COMPLETE"
+        }));
     }
 
     #[tokio::test]
@@ -4057,7 +4611,7 @@ mod tests {
         let (status, resources, _, events) =
             run_provision(&handler, &template, true, &[], None).await;
 
-        assert_eq!(status, StackStatus::CreateFailed);
+        assert_eq!(status, StackStatus::RollbackComplete);
         assert!(resources.is_empty());
         assert!(events.iter().any(|event| {
             event.logical_id == "B"
@@ -4165,6 +4719,7 @@ mod tests {
                     tags: Vec::new(),
                     creation_time: now_iso(),
                     last_updated_time: None,
+                    disable_rollback: false,
                 },
             )
             .unwrap();
@@ -4266,6 +4821,7 @@ mod tests {
                     tags: Vec::new(),
                     creation_time: now_iso(),
                     last_updated_time: None,
+                    disable_rollback: false,
                 },
             )
             .unwrap();
@@ -4415,7 +4971,7 @@ mod tests {
         let failed = Template::parse(&failed.to_string()).unwrap();
         let (status, restored, _, events) =
             run_provision(&handler, &failed, false, &original, Some(&initial)).await;
-        assert_eq!(status, StackStatus::UpdateFailed);
+        assert_eq!(status, StackStatus::UpdateRollbackComplete);
         assert!(restored
             .iter()
             .any(|resource| resource.physical_id == retired));
@@ -4652,7 +5208,7 @@ mod tests {
         let failed = Template::parse(&failed.to_string()).unwrap();
         let (status, restored, _, events) =
             run_provision(&handler, &failed, false, &original, Some(&initial)).await;
-        assert_eq!(status, StackStatus::UpdateFailed);
+        assert_eq!(status, StackStatus::UpdateRollbackComplete);
         assert!(!events
             .iter()
             .any(|event| event.status == "UPDATE_ROLLBACK_FAILED"));
@@ -4763,6 +5319,7 @@ mod tests {
                     tags: Vec::new(),
                     creation_time: now_iso(),
                     last_updated_time: None,
+                    disable_rollback: false,
                 },
             )
             .unwrap();
@@ -4947,6 +5504,7 @@ mod interrupted_progress_tests {
                     tags: Vec::new(),
                     creation_time: now_iso(),
                     last_updated_time: None,
+                    disable_rollback: false,
                 });
             admission.status = if updating {
                 StackStatus::UpdateInProgress

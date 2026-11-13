@@ -112,16 +112,7 @@ pub fn create_function(
         MAX_EPHEMERAL_MB,
     )?;
 
-    let architectures = input
-        .get("Architectures")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec!["x86_64".to_string()]);
+    let architectures = parse_architectures(input)?.unwrap_or_else(|| vec!["x86_64".to_string()]);
     let description = input
         .get("Description")
         .and_then(Value::as_str)
@@ -626,6 +617,22 @@ pub fn update_function_configuration(
     Ok((200, Some(updated.to_configuration_json())))
 }
 
+fn parse_architectures(input: &Value) -> Result<Option<Vec<String>>, LambdaError> {
+    let Some(value) = input.get("Architectures") else {
+        return Ok(None);
+    };
+    match value.as_array().map(Vec::as_slice) {
+        Some([Value::String(architecture)])
+            if matches!(architecture.as_str(), "arm64" | "x86_64") =>
+        {
+            Ok(Some(vec![architecture.clone()]))
+        }
+        _ => Err(LambdaError::InvalidParameterValue(
+            "Architectures must contain exactly one of arm64 or x86_64".into(),
+        )),
+    }
+}
+
 /// `UpdateFunctionCode` — replaces the code, recomputing `CodeSha256`/`CodeSize`.
 pub fn update_function_code(
     store: &FunctionStore,
@@ -635,6 +642,7 @@ pub fn update_function_code(
     input: &Value,
 ) -> OpResult {
     let name = resolve_function_name(name, region)?;
+    let architectures = parse_architectures(input)?;
     let (code_sha256, code_size) = resolve_update_code(input)?;
     let code_zip = input
         .get("ZipFile")
@@ -645,6 +653,9 @@ pub fn update_function_code(
         .update(account, region, &name, |f| {
             f.code_sha256 = code_sha256;
             f.code_size = code_size;
+            if let Some(architectures) = architectures {
+                f.architectures = architectures;
+            }
             if code_zip.is_some() {
                 f.code_zip = code_zip.clone();
             }
@@ -1784,6 +1795,90 @@ mod tests {
             serde_json::json!({
                 "LogFormat":"Text", "LogGroup":"/aws/lambda/logging"
             })
+        );
+    }
+
+    #[test]
+    fn architectures_validate_before_mutation_and_update_with_code_only() {
+        let store = FunctionStore::new();
+        let mut input = create_input("architecture");
+        input["Architectures"] = serde_json::json!(["arm64"]);
+        let (_, created) =
+            create_function(&store, "us-east-1", "000000000000", &input, None).unwrap();
+        assert_eq!(
+            created.unwrap()["Architectures"],
+            serde_json::json!(["arm64"])
+        );
+        let (_, unchanged) = update_function_code(
+            &store,
+            "us-east-1",
+            "000000000000",
+            "architecture",
+            &input["Code"],
+        )
+        .unwrap();
+        assert_eq!(
+            unchanged.unwrap()["Architectures"],
+            serde_json::json!(["arm64"])
+        );
+        publish_version(&store, "us-east-1", "000000000000", "architecture").unwrap();
+        let mut code = input["Code"].clone();
+        code["Architectures"] = serde_json::json!(["x86_64"]);
+        let (_, updated) =
+            update_function_code(&store, "us-east-1", "000000000000", "architecture", &code)
+                .unwrap();
+        assert_eq!(
+            updated.unwrap()["Architectures"],
+            serde_json::json!(["x86_64"])
+        );
+        assert_eq!(
+            store
+                .get_version("000000000000", "us-east-1", "architecture", 1)
+                .unwrap()
+                .architectures,
+            ["arm64"]
+        );
+        let before = store
+            .get("000000000000", "us-east-1", "architecture")
+            .unwrap()
+            .to_configuration_json();
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("arm64"),
+            serde_json::json!([]),
+            serde_json::json!(["arm64", "x86_64"]),
+            serde_json::json!(["riscv64"]),
+            serde_json::json!([42]),
+        ] {
+            input["FunctionName"] = serde_json::json!("invalid-architecture");
+            input["Architectures"] = invalid.clone();
+            assert!(matches!(
+                create_function(&store, "us-east-1", "000000000000", &input, None),
+                Err(LambdaError::InvalidParameterValue(_))
+            ));
+            assert!(store
+                .get("000000000000", "us-east-1", "invalid-architecture")
+                .is_none());
+            code["Architectures"] = invalid;
+            assert!(matches!(
+                update_function_code(&store, "us-east-1", "000000000000", "architecture", &code),
+                Err(LambdaError::InvalidParameterValue(_))
+            ));
+            assert_eq!(
+                store
+                    .get("000000000000", "us-east-1", "architecture")
+                    .unwrap()
+                    .to_configuration_json(),
+                before
+            );
+        }
+        code.as_object_mut().unwrap().remove("Architectures");
+        let (_, updated) =
+            update_function_code(&store, "us-east-1", "000000000000", "architecture", &code)
+                .unwrap();
+        assert_eq!(
+            updated.unwrap()["Architectures"],
+            serde_json::json!(["x86_64"])
         );
     }
 

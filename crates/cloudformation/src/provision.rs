@@ -4133,6 +4133,7 @@ impl Provisioner {
             ("Runtime", "Runtime"),
             ("Role", "Role"),
             ("Description", "Description"),
+            ("Architectures", "Architectures"),
             ("LoggingConfig", "LoggingConfig"),
         ] {
             if let Some(v) = props.get(cfn) {
@@ -4214,8 +4215,20 @@ impl Provisioner {
         let previous_tracing = lambda_tracing_mode(logical_id, previous_props)
             .ok()
             .flatten();
-        let code = if previous_props.get("Code") != props.get("Code") {
-            Some(self.resolve_code(props.get("Code")).await?)
+        let architectures = props
+            .get("Architectures")
+            .cloned()
+            .unwrap_or_else(|| json!(["x86_64"]));
+        let previous_architectures = previous_props
+            .get("Architectures")
+            .cloned()
+            .unwrap_or_else(|| json!(["x86_64"]));
+        let code = if previous_props.get("Code") != props.get("Code")
+            || architectures != previous_architectures
+        {
+            let mut code = self.resolve_code(props.get("Code")).await?;
+            code["Architectures"] = architectures;
+            Some(code)
         } else {
             None
         };
@@ -9325,6 +9338,74 @@ mod tests {
             .0,
             404
         );
+    }
+
+    #[tokio::test]
+    async fn lambda_architectures_reach_native_create_and_code_updates() {
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_lambda::register(&registry);
+        let p = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-west-2".into(),
+            "123456789012".into(),
+        );
+        let mut props = json!({"FunctionName":"architecture-native","Runtime":"python3.12","Handler":"ledger.post",
+            "Role":"arn:aws:iam::123456789012:role/workflow","Code":{"ZipFile":"UEsDBBQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAbGVkZ2VyLnB5ZGVmIHBvc3QoZXZlbnQsIGNvbnRleHQpOgogICAgcmV0dXJuIGV2ZW50ClBLAQIUAxQAAAAAAKUtRl03KKP8KwAAACsAAAAJAAAAAAAAAAAAAACAAQAAAABsZWRnZXIucHlQSwUGAAAAAAEAAQA3AAAAUgAAAAAA"},
+            "Architectures":["arm64"]});
+        let resource = p.lambda_function("Worker", "stack", &props).await.unwrap();
+        let configuration = || async {
+            p.call_json(
+                "lambda",
+                Method::GET,
+                "/2015-03-31/functions/architecture-native/configuration",
+                json!({}),
+                "Worker",
+            )
+            .await
+            .unwrap()
+        };
+        let original = configuration().await;
+        assert_eq!(original["Architectures"], json!(["arm64"]));
+        for next in [json!(["x86_64"]), json!(["arm64"])] {
+            let previous = props.clone();
+            props["Architectures"] = next.clone();
+            p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+                .await
+                .unwrap();
+            let current = configuration().await;
+            assert_eq!(current["Architectures"], next);
+            assert_eq!(current["CodeSha256"], original["CodeSha256"]);
+            assert_eq!(current["FunctionArn"], original["FunctionArn"]);
+        }
+        let previous = props.clone();
+        props.as_object_mut().unwrap().remove("Architectures");
+        p.update_lambda_function("Worker", &resource.ref_value, &previous, &props)
+            .await
+            .unwrap();
+        let default = configuration().await;
+        assert_eq!(default["Architectures"], json!(["x86_64"]));
+        for invalid in [
+            json!(null),
+            json!("arm64"),
+            json!([]),
+            json!(["arm64", "x86_64"]),
+            json!(["riscv64"]),
+            json!([42]),
+        ] {
+            let mut next = props.clone();
+            next["Architectures"] = invalid;
+            assert!(p
+                .update_lambda_function("Worker", &resource.ref_value, &props, &next)
+                .await
+                .is_err());
+            assert_eq!(configuration().await, default);
+            next["FunctionName"] = json!("architecture-invalid");
+            assert!(p
+                .lambda_function("InvalidWorker", "stack", &next)
+                .await
+                .is_err());
+        }
+        p.delete_function(&resource.ref_value).await.unwrap();
     }
 
     #[tokio::test]
