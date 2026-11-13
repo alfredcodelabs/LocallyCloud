@@ -43,6 +43,14 @@ pub struct ReplacementCleanup {
     pub properties: serde_json::Value,
 }
 
+/// Resolved lifecycle facts retained for cleanup after an interrupted update.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct ResourceLifecycle {
+    pub properties: serde_json::Value,
+    pub depends_on: Vec<String>,
+    pub retain_on_delete: bool,
+}
+
 /// A provisioned stack resource.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct StackResource {
@@ -53,6 +61,8 @@ pub struct StackResource {
     /// `Fn::GetAtt`-resolvable attributes (e.g. `Arn`).
     pub attributes: BTreeMap<String, String>,
     pub pending_cleanup: Vec<ReplacementCleanup>,
+    #[serde(default)]
+    pub lifecycle: Option<ResourceLifecycle>,
 }
 
 /// A recorded stack event (surfaced by `DescribeStackEvents`).

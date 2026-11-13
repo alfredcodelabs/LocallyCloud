@@ -26,6 +26,10 @@ impl Persistence {
                 kind TEXT NOT NULL CHECK(kind IN ('stack','change','deleted')),
                 scope_key TEXT NOT NULL, payload BLOB NOT NULL,
                 deleted_at INTEGER, PRIMARY KEY(kind,scope_key)
+            );
+            CREATE TABLE IF NOT EXISTS cfn_progress_v1 (
+                scope_key TEXT NOT NULL, sequence INTEGER NOT NULL, payload BLOB NOT NULL,
+                PRIMARY KEY(scope_key,sequence)
             );",
             )
             .map_err(|_| CfnError::Internal)?;
@@ -66,6 +70,57 @@ impl Persistence {
         Ok(())
     }
 
+    pub(crate) fn load_progress(
+        &self,
+        mut restore: impl FnMut(String, &[u8]) -> Result<(), CfnError>,
+    ) -> Result<(), CfnError> {
+        let connection = self.connection.lock().map_err(|_| CfnError::Internal)?;
+        let mut statement = connection
+            .prepare("SELECT scope_key,sequence,payload FROM cfn_progress_v1 ORDER BY scope_key,sequence")
+            .map_err(|_| CfnError::Internal)?;
+        let mut rows = statement.query([]).map_err(|_| CfnError::Internal)?;
+        while let Some(row) = rows.next().map_err(|_| CfnError::Internal)? {
+            let key: String = row.get(0).map_err(|_| CfnError::Internal)?;
+            let sequence: i64 = row.get(1).map_err(|_| CfnError::Internal)?;
+            let payload: Vec<u8> = row.get(2).map_err(|_| CfnError::Internal)?;
+            let plaintext = self
+                .cipher
+                .open(
+                    &["cloudformation", "progress", &key, &sequence.to_string()],
+                    &payload,
+                )
+                .map_err(|_| CfnError::Internal)?;
+            restore(key, &plaintext)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn progress<T: Serialize>(&self, key: &str, record: &T) -> Result<(), CfnError> {
+        let plaintext = serde_json::to_vec(record).map_err(|_| CfnError::Internal)?;
+        let connection = self.connection.lock().map_err(|_| CfnError::Internal)?;
+        let sequence: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM cfn_progress_v1 WHERE scope_key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .map_err(|_| CfnError::Internal)?;
+        let payload = self
+            .cipher
+            .seal(
+                &["cloudformation", "progress", key, &sequence.to_string()],
+                &plaintext,
+            )
+            .map_err(|_| CfnError::Internal)?;
+        connection
+            .execute(
+                "INSERT INTO cfn_progress_v1(scope_key,sequence,payload) VALUES(?1,?2,?3)",
+                params![key, sequence, payload],
+            )
+            .map_err(|_| CfnError::Internal)?;
+        Ok(())
+    }
+
     pub(crate) fn put<T: Serialize>(
         &self,
         kind: &str,
@@ -73,10 +128,16 @@ impl Persistence {
         record: &T,
     ) -> Result<(), CfnError> {
         let payload = self.encode(kind, key, record)?;
-        self.connection.lock().map_err(|_| CfnError::Internal)?.execute(
+        let mut connection = self.connection.lock().map_err(|_| CfnError::Internal)?;
+        let tx = connection.transaction().map_err(|_| CfnError::Internal)?;
+        tx.execute(
             "INSERT INTO cfn_metadata_v1(kind,scope_key,payload) VALUES(?1,?2,?3) ON CONFLICT(kind,scope_key) DO UPDATE SET payload=excluded.payload", params![kind,key,payload],
         ).map_err(|_| CfnError::Internal)?;
-        Ok(())
+        if kind == "stack" {
+            tx.execute("DELETE FROM cfn_progress_v1 WHERE scope_key=?1", [key])
+                .map_err(|_| CfnError::Internal)?;
+        }
+        tx.commit().map_err(|_| CfnError::Internal)
     }
 
     fn encode<T: Serialize>(&self, kind: &str, key: &str, record: &T) -> Result<Vec<u8>, CfnError> {
@@ -99,6 +160,8 @@ impl Persistence {
         let mut connection = self.connection.lock().map_err(|_| CfnError::Internal)?;
         let tx = connection.transaction().map_err(|_| CfnError::Internal)?;
         tx.execute("INSERT INTO cfn_metadata_v1(kind,scope_key,payload) VALUES('stack',?1,?2) ON CONFLICT(kind,scope_key) DO UPDATE SET payload=excluded.payload", params![key,payload]).map_err(|_| CfnError::Internal)?;
+        tx.execute("DELETE FROM cfn_progress_v1 WHERE scope_key=?1", [key])
+            .map_err(|_| CfnError::Internal)?;
         if let Some((key, payload)) = claim {
             let changed = tx
                 .execute(
@@ -138,6 +201,11 @@ impl Persistence {
         let tx = connection.transaction().map_err(|_| CfnError::Internal)?;
         tx.execute(
             "DELETE FROM cfn_metadata_v1 WHERE kind='stack' AND scope_key=?1",
+            [active_key],
+        )
+        .map_err(|_| CfnError::Internal)?;
+        tx.execute(
+            "DELETE FROM cfn_progress_v1 WHERE scope_key=?1",
             [active_key],
         )
         .map_err(|_| CfnError::Internal)?;

@@ -549,7 +549,7 @@ impl CfnHandler {
                 &active,
                 &outputs,
             )
-            .await;
+            .await?;
 
         if let Some(admission) = &admission {
             events.retain(|event| {
@@ -611,8 +611,9 @@ impl CfnHandler {
                     .with_stack(&existing.stack_id, &self.response_endpoint),
                 &mut existing.resources,
                 &mut existing.events,
+                Some((&self.store, account, region, &existing.stack_name)),
             )
-            .await;
+            .await?;
             self.store.put(account, region, existing.clone())?;
             if failed {
                 return Err(CfnError::Validation(
@@ -637,8 +638,23 @@ impl CfnHandler {
                 &active,
                 &output_exprs,
             )
-            .await;
+            .await?;
 
+        if existing
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.resource_type == STACK_TYPE)
+            .is_some_and(|event| {
+                event.resource_type == STACK_TYPE && event.status == "UPDATE_IN_PROGRESS"
+            })
+        {
+            events.retain(|event| {
+                !(event.logical_id == name
+                    && event.resource_type == STACK_TYPE
+                    && event.status == "UPDATE_IN_PROGRESS")
+            });
+        }
         // Preserve prior events, newest first is produced by describe.
         let mut all_events = existing.events.clone();
         all_events.append(&mut events);
@@ -723,53 +739,51 @@ impl CfnHandler {
                 parameters: &stack.parameters,
                 conditions: &conditions,
             };
-            stack.events.push(event(
-                &stack.stack_name,
-                STACK_TYPE,
-                "DELETE_IN_PROGRESS",
-                None,
-            ));
+            if !stack.events.last().is_some_and(|event| {
+                event.resource_type == STACK_TYPE && event.status == "DELETE_IN_PROGRESS"
+            }) {
+                stack.events.push(event(
+                    &stack.stack_name,
+                    STACK_TYPE,
+                    "DELETE_IN_PROGRESS",
+                    None,
+                ));
+            }
             // Retired targets are kept in the stack until cleanup really succeeds.
             let mut replacement_events = Vec::new();
             cleanup_network_replacements(
                 &provisioner,
                 &mut stack.resources,
                 &mut replacement_events,
+                Some((&self.store, account, region, &stack.stack_name)),
             )
-            .await;
+            .await?;
             stack.events.extend(replacement_events);
             let mut remaining = stack.resources.clone();
             let mut failures = Vec::new();
 
-            // Updates can add a new dependency after its existing dependent in storage order.
-            // Use the current template graph for teardown, then include any retained old entries.
-            let mut deletion_order: Vec<_> = template
-                .active_resources(&conditions)?
-                .into_iter()
-                .rev()
-                .filter_map(|declaration| {
-                    stack
-                        .resources
-                        .iter()
-                        .find(|resource| resource.logical_id == declaration.logical_id)
-                })
-                .collect();
-            let ordered_ids: BTreeSet<_> = deletion_order
-                .iter()
-                .map(|resource| resource.logical_id.as_str())
-                .collect();
-            deletion_order.extend(
-                stack
-                    .resources
-                    .iter()
-                    .rev()
-                    .filter(|resource| !ordered_ids.contains(resource.logical_id.as_str())),
-            );
-            // Producers can recreate a managed group while an invocation is draining.
-            // Stable sorting preserves the graph order of every other resource.
-            deletion_order.sort_by_key(|resource| resource.resource_type == "AWS::Logs::LogGroup");
+            let deletion_order = deletion_order(&stack.resources, &declarations)?;
+            let checkpoint_name = stack.stack_name.clone();
+            let mut recorded_events = stack.events.len();
+            let mut checkpoint = async |resource: &StackResource, events: &[StackEvent]| {
+                self.store
+                    .record_progress(
+                        account,
+                        region,
+                        &checkpoint_name,
+                        &resource.logical_id,
+                        Some(resource),
+                        &events[recorded_events..],
+                    )
+                    .await?;
+                recorded_events = events.len();
+                Ok::<(), CfnError>(())
+            };
             // Continue after failures so independent resources still get a cleanup attempt.
             for resource in deletion_order {
+                if resource.physical_id.is_empty() {
+                    continue;
+                }
                 if matches!(
                     resource.status.as_str(),
                     "DELETE_COMPLETE" | "DELETE_SKIPPED"
@@ -794,6 +808,14 @@ impl CfnHandler {
                         Some(reason.into()),
                     ));
                     failures.push(format!("{}: {reason}", resource.logical_id));
+                    checkpoint(
+                        remaining
+                            .iter()
+                            .find(|candidate| candidate.logical_id == resource.logical_id)
+                            .ok_or(CfnError::Internal)?,
+                        &stack.events,
+                    )
+                    .await?;
                     continue;
                 }
                 if !resource.pending_cleanup.is_empty() {
@@ -801,12 +823,24 @@ impl CfnHandler {
                         "{}: retired replacement cleanup is pending",
                         resource.logical_id
                     ));
+                    checkpoint(
+                        remaining
+                            .iter()
+                            .find(|candidate| candidate.logical_id == resource.logical_id)
+                            .ok_or(CfnError::Internal)?,
+                        &stack.events,
+                    )
+                    .await?;
                     continue;
                 }
-                if declarations
-                    .get(&resource.logical_id)
-                    .is_some_and(|decl| decl.deletion_policy.retains_on_delete())
-                {
+                if resource.lifecycle.as_ref().map_or_else(
+                    || {
+                        declarations
+                            .get(&resource.logical_id)
+                            .is_some_and(|decl| decl.deletion_policy.retains_on_delete())
+                    },
+                    |lifecycle| lifecycle.retain_on_delete,
+                ) {
                     if let Some(candidate) = remaining
                         .iter_mut()
                         .find(|candidate| candidate.logical_id == resource.logical_id)
@@ -819,6 +853,14 @@ impl CfnHandler {
                         "DELETE_SKIPPED",
                         Some("retained by DeletionPolicy".into()),
                     ));
+                    checkpoint(
+                        remaining
+                            .iter()
+                            .find(|candidate| candidate.logical_id == resource.logical_id)
+                            .ok_or(CfnError::Internal)?,
+                        &stack.events,
+                    )
+                    .await?;
                     continue;
                 }
                 if resource.resource_type == "AWS::Logs::LogGroup"
@@ -845,19 +887,36 @@ impl CfnHandler {
                         Some(reason.clone()),
                     ));
                     failures.push(format!("{}: {reason}", resource.logical_id));
+                    checkpoint(
+                        remaining
+                            .iter()
+                            .find(|candidate| candidate.logical_id == resource.logical_id)
+                            .ok_or(CfnError::Internal)?,
+                        &stack.events,
+                    )
+                    .await?;
                     continue;
                 }
-                let properties = declarations
-                    .get(&resource.logical_id)
-                    .map(|decl| resolve(&decl.properties, &ctx))
-                    .transpose()
-                    .map(|properties| properties.unwrap_or(Value::Null));
+                let properties = match &resource.lifecycle {
+                    Some(lifecycle) => Ok(lifecycle.properties.clone()),
+                    None => declarations
+                        .get(&resource.logical_id)
+                        .map(|decl| resolve(&decl.properties, &ctx))
+                        .transpose()
+                        .map(|properties| properties.unwrap_or(Value::Null)),
+                };
                 stack.events.push(event(
                     &resource.logical_id,
                     &resource.resource_type,
                     "DELETE_IN_PROGRESS",
                     None,
                 ));
+                let candidate = remaining
+                    .iter_mut()
+                    .find(|candidate| candidate.logical_id == resource.logical_id)
+                    .ok_or(CfnError::Internal)?;
+                candidate.status = "DELETE_IN_PROGRESS".into();
+                checkpoint(candidate, &stack.events).await?;
                 let log_notice = if resource.resource_type == "AWS::Lambda::Function" {
                     let group = format!("/aws/lambda/{}", resource.physical_id);
                     if stack.resources.iter().any(|candidate| {
@@ -920,6 +979,14 @@ impl CfnHandler {
                         failures.push(format!("{}: {reason}", resource.logical_id));
                     }
                 }
+                checkpoint(
+                    remaining
+                        .iter()
+                        .find(|candidate| candidate.logical_id == resource.logical_id)
+                        .ok_or(CfnError::Internal)?,
+                    &stack.events,
+                )
+                .await?;
             }
 
             if failures.is_empty() {
@@ -965,12 +1032,15 @@ impl CfnHandler {
         conditions: &BTreeMap<String, bool>,
         active: &[crate::template::ResourceDecl],
         output_exprs: &[(String, Value, Option<Value>)],
-    ) -> (
-        StackStatus,
-        Vec<StackResource>,
-        Vec<Output>,
-        Vec<StackEvent>,
-    ) {
+    ) -> Result<
+        (
+            StackStatus,
+            Vec<StackResource>,
+            Vec<Output>,
+            Vec<StackEvent>,
+        ),
+        CfnError,
+    > {
         enum ReconcileAction {
             Created {
                 logical_id: String,
@@ -983,7 +1053,6 @@ impl CfnHandler {
                 applied_properties: Value,
                 previous_properties: Value,
                 deferred_previous: Option<ResolvedResource>,
-                replacement_policy: ResourcePolicy,
             },
         }
 
@@ -1053,7 +1122,7 @@ impl CfnHandler {
         let prior_properties = match prior_properties {
             Ok(properties) => properties,
             Err(error) => {
-                return (
+                return Ok((
                     StackStatus::UpdateFailed,
                     existing.to_vec(),
                     Vec::new(),
@@ -1063,10 +1132,29 @@ impl CfnHandler {
                         "UPDATE_FAILED",
                         Some(error.to_string()),
                     )],
-                )
+                ))
             }
         };
 
+        let admitted = self.store.get(account, region, stack_name).is_some();
+        let mut recorded_events = 1; // Admission already recorded the stack start event.
+        let mut record =
+            async |logical_id: &str, resource: Option<&StackResource>, events: &[StackEvent]| {
+                if admitted {
+                    self.store
+                        .record_progress(
+                            account,
+                            region,
+                            stack_name,
+                            logical_id,
+                            resource,
+                            events.get(recorded_events..).unwrap_or_default(),
+                        )
+                        .await?;
+                }
+                recorded_events = events.len();
+                Ok::<(), CfnError>(())
+            };
         // A type change reuses a logical ID, so its old resource is removed first.
         // Pure removals stay in physical inventory until dependents have been updated.
         let mut removal_failures = BTreeMap::new();
@@ -1095,6 +1183,10 @@ impl CfnHandler {
                 .await
             {
                 removal_failures.insert(resource.logical_id.clone(), error.to_string());
+            } else if admitted {
+                self.store
+                    .record_progress(account, region, stack_name, &resource.logical_id, None, &[])
+                    .await?;
             }
         }
 
@@ -1142,6 +1234,7 @@ impl CfnHandler {
         let mut events: Vec<StackEvent> = Vec::new();
         let mut failure_reason = None;
         let mut successful_actions = Vec::new();
+        let mut metadata_changes = Vec::new();
 
         let (in_progress, complete, failed_status) = if creating {
             ("CREATE_IN_PROGRESS", "CREATE_COMPLETE", "CREATE_FAILED")
@@ -1170,7 +1263,7 @@ impl CfnHandler {
                 failed_status,
                 Some("resource teardown failed".into()),
             ));
-            return (StackStatus::UpdateFailed, resources, Vec::new(), events);
+            return Ok((StackStatus::UpdateFailed, resources, Vec::new(), events));
         }
 
         for decl in active {
@@ -1196,12 +1289,30 @@ impl CfnHandler {
                     break;
                 }
             };
+            let lifecycle = crate::model::ResourceLifecycle {
+                properties: props.clone(),
+                depends_on: decl
+                    .depends_on
+                    .iter()
+                    .cloned()
+                    .chain(crate::template::referenced_ids(&decl.properties))
+                    .collect(),
+                retain_on_delete: decl.deletion_policy.retains_on_delete(),
+            };
             if let Some(current) = resolved.get(&decl.logical_id).cloned() {
                 let previous_properties = prior_properties
                     .get(&decl.logical_id)
                     .cloned()
                     .unwrap_or(Value::Null);
                 if previous_properties == props {
+                    if let Some(resource) = resources.iter_mut().find(|r| {
+                        r.logical_id == decl.logical_id && r.lifecycle.as_ref() != Some(&lifecycle)
+                    }) {
+                        metadata_changes
+                            .push((resource.logical_id.clone(), resource.lifecycle.clone()));
+                        resource.lifecycle = Some(lifecycle);
+                        record(&decl.logical_id, Some(resource), &events).await?;
+                    }
                     continue;
                 }
                 events.push(event(
@@ -1210,6 +1321,7 @@ impl CfnHandler {
                     in_progress,
                     None,
                 ));
+                record("", None, &events).await?;
                 match provisioner
                     .update(
                         &decl.logical_id,
@@ -1222,6 +1334,14 @@ impl CfnHandler {
                     .await
                 {
                     Ok(updated) => {
+                        let deferred = (matches!(
+                            decl.resource_type.as_str(),
+                            "AWS::EC2::NatGateway"
+                                | "AWS::EC2::Route"
+                                | "AWS::EC2::VPCGatewayAttachment"
+                        ) || crate::provision::is_custom_resource(
+                            &decl.resource_type,
+                        )) && current.ref_value != updated.ref_value;
                         if let Some(resource) = resources
                             .iter_mut()
                             .find(|resource| resource.logical_id == decl.logical_id)
@@ -1229,25 +1349,31 @@ impl CfnHandler {
                             resource.physical_id = updated.ref_value.clone();
                             resource.attributes = updated.attributes.clone();
                             resource.status = complete.to_string();
+                            resource.lifecycle = Some(lifecycle);
+                            if deferred && decl.update_replace_policy != ResourcePolicy::Retain {
+                                resource
+                                    .pending_cleanup
+                                    .push(crate::model::ReplacementCleanup {
+                                        physical_id: current.ref_value.clone(),
+                                        properties: previous_properties.clone(),
+                                    });
+                            }
                         }
                         successful_actions.push(ReconcileAction::Updated {
                             logical_id: decl.logical_id.clone(),
                             resource_type: decl.resource_type.clone(),
                             applied_properties: props.clone(),
                             previous_properties,
-                            deferred_previous: ((matches!(
-                                decl.resource_type.as_str(),
-                                "AWS::EC2::NatGateway"
-                                    | "AWS::EC2::Route"
-                                    | "AWS::EC2::VPCGatewayAttachment"
-                            ) || crate::provision::is_custom_resource(
-                                &decl.resource_type,
-                            )) && current.ref_value != updated.ref_value)
-                                .then_some(current),
-                            replacement_policy: decl.update_replace_policy,
+                            deferred_previous: deferred.then_some(current),
                         });
                         resolved.insert(decl.logical_id.clone(), updated);
                         events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
+                        record(
+                            &decl.logical_id,
+                            resources.iter().find(|r| r.logical_id == decl.logical_id),
+                            &events,
+                        )
+                        .await?;
                     }
                     Err(error) => {
                         let reason = error.to_string();
@@ -1269,6 +1395,7 @@ impl CfnHandler {
                 in_progress,
                 None,
             ));
+            record("", None, &events).await?;
             match provisioner
                 .provision(&decl.logical_id, stack_name, &decl.resource_type, &props)
                 .await
@@ -1281,8 +1408,10 @@ impl CfnHandler {
                         status: complete.to_string(),
                         attributes: rr.attributes.clone(),
                         pending_cleanup: Vec::new(),
+                        lifecycle: Some(lifecycle),
                     });
                     events.push(event(&decl.logical_id, &decl.resource_type, complete, None));
+                    record(&decl.logical_id, resources.last(), &events).await?;
                     successful_actions.push(ReconcileAction::Created {
                         logical_id: decl.logical_id.clone(),
                         resource_type: decl.resource_type.clone(),
@@ -1335,7 +1464,14 @@ impl CfnHandler {
             }
         };
 
+        record("", None, &events).await?;
         if let Some(provisioning_failure) = failure_reason {
+            for (logical_id, lifecycle) in metadata_changes {
+                if let Some(resource) = resources.iter_mut().find(|r| r.logical_id == logical_id) {
+                    resource.lifecycle = lifecycle;
+                    record(&logical_id, Some(resource), &events).await?;
+                }
+            }
             let status = if creating {
                 StackStatus::CreateFailed
             } else {
@@ -1376,6 +1512,7 @@ impl CfnHandler {
                             continue;
                         }
                         events.push(event(logical_id, resource_type, "DELETE_IN_PROGRESS", None));
+                        record("", None, &events).await?;
                         match provisioner
                             .deprovision_named(
                                 logical_id,
@@ -1412,6 +1549,12 @@ impl CfnHandler {
                                 cleanup_failures.push(format!("{logical_id}: {reason}"));
                             }
                         }
+                        record(
+                            logical_id,
+                            resources.iter().find(|r| r.logical_id == *logical_id),
+                            &events,
+                        )
+                        .await?;
                     }
                     ReconcileAction::Updated {
                         logical_id,
@@ -1419,7 +1562,6 @@ impl CfnHandler {
                         applied_properties,
                         previous_properties,
                         deferred_previous,
-                        replacement_policy: _,
                     } => {
                         events.push(event(
                             logical_id,
@@ -1427,6 +1569,7 @@ impl CfnHandler {
                             "UPDATE_ROLLBACK_IN_PROGRESS",
                             None,
                         ));
+                        record("", None, &events).await?;
                         let Some(current) = resolved.get(logical_id).cloned() else {
                             let reason = "updated resource resolution is unavailable".to_string();
                             events.push(event(
@@ -1469,6 +1612,13 @@ impl CfnHandler {
                                     resource.physical_id = restored.ref_value.clone();
                                     resource.attributes = restored.attributes.clone();
                                     resource.status = "UPDATE_ROLLBACK_COMPLETE".into();
+                                    resource.pending_cleanup.retain(|retired| {
+                                        retired.physical_id != restored.ref_value
+                                    });
+                                    resource.lifecycle = existing
+                                        .iter()
+                                        .find(|r| r.logical_id == *logical_id)
+                                        .and_then(|r| r.lifecycle.clone());
                                 }
                                 resolved.insert(logical_id.clone(), restored);
                                 events.push(event(
@@ -1495,6 +1645,12 @@ impl CfnHandler {
                                 cleanup_failures.push(format!("{logical_id}: {reason}"));
                             }
                         }
+                        record(
+                            logical_id,
+                            resources.iter().find(|r| r.logical_id == *logical_id),
+                            &events,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1509,33 +1665,9 @@ impl CfnHandler {
                 failed_status,
                 Some(stack_reason),
             ));
-            return (status, resources, Vec::new(), events);
+            return Ok((status, resources, Vec::new(), events));
         }
 
-        for action in &successful_actions {
-            if let ReconcileAction::Updated {
-                logical_id,
-                previous_properties,
-                deferred_previous: Some(previous),
-                replacement_policy,
-                ..
-            } = action
-            {
-                if *replacement_policy != ResourcePolicy::Retain {
-                    if let Some(resource) = resources
-                        .iter_mut()
-                        .find(|resource| resource.logical_id == *logical_id)
-                    {
-                        resource
-                            .pending_cleanup
-                            .push(crate::model::ReplacementCleanup {
-                                physical_id: previous.ref_value.clone(),
-                                properties: previous_properties.clone(),
-                            });
-                    }
-                }
-            }
-        }
         // Cleanup is last: failed reconciliation can restore the still-live old dependencies.
         for resource in &mut resources {
             if !declarations.contains_key(&resource.logical_id) {
@@ -1560,8 +1692,19 @@ impl CfnHandler {
         resources.retain(|resource| {
             declarations.contains_key(&resource.logical_id) || !resource.pending_cleanup.is_empty()
         });
-        let cleanup_failed =
-            cleanup_network_replacements(&provisioner, &mut resources, &mut events).await;
+        // Persist cleanup intent before the first destructive request.
+        for resource in &resources {
+            if !resource.pending_cleanup.is_empty() {
+                record(&resource.logical_id, Some(resource), &events).await?;
+            }
+        }
+        let cleanup_failed = cleanup_network_replacements(
+            &provisioner,
+            &mut resources,
+            &mut events,
+            admitted.then_some((&self.store, account, region, stack_name)),
+        )
+        .await?;
 
         let status = if creating {
             StackStatus::CreateComplete
@@ -1571,7 +1714,7 @@ impl CfnHandler {
             StackStatus::UpdateComplete
         };
         events.push(event(stack_name, STACK_TYPE, status.as_str(), None));
-        (status, resources, outputs, events)
+        Ok((status, resources, outputs, events))
     }
 
     fn describe_stacks(&self, q: &Query, region: &str, account: &str) -> Result<String, CfnError> {
@@ -2423,6 +2566,76 @@ fn parse_s3_url(url: &str) -> Option<(String, String)> {
     Some((bucket.to_string(), key.to_string()))
 }
 
+fn resource_dependencies(
+    resource: &StackResource,
+    declarations: &BTreeMap<String, crate::template::ResourceDecl>,
+) -> BTreeSet<String> {
+    if let Some(lifecycle) = &resource.lifecycle {
+        return lifecycle.depends_on.iter().cloned().collect();
+    }
+    declarations
+        .get(&resource.logical_id)
+        .map_or_else(BTreeSet::new, |decl| {
+            decl.depends_on
+                .iter()
+                .cloned()
+                .chain(crate::template::referenced_ids(&decl.properties))
+                .collect()
+        })
+}
+
+fn deletion_order<'a>(
+    resources: &'a [StackResource],
+    declarations: &BTreeMap<String, crate::template::ResourceDecl>,
+) -> Result<Vec<&'a StackResource>, CfnError> {
+    let by_id: BTreeMap<_, _> = resources
+        .iter()
+        .enumerate()
+        .map(|(index, resource)| (resource.logical_id.as_str(), index))
+        .collect();
+    let dependencies: Vec<Vec<usize>> = resources
+        .iter()
+        .map(|resource| {
+            resource_dependencies(resource, declarations)
+                .into_iter()
+                .filter_map(|id| by_id.get(id.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let mut dependents = vec![0; resources.len()];
+    for dependency in dependencies.iter().flatten() {
+        dependents[*dependency] += 1;
+    }
+    let priority = |index: usize| {
+        (
+            resources[index].resource_type == "AWS::Logs::LogGroup",
+            std::cmp::Reverse(index),
+        )
+    };
+    let mut ready: BTreeSet<_> = dependents
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count == 0)
+        .map(|(index, _)| priority(index))
+        .collect();
+    let mut ordered = Vec::with_capacity(resources.len());
+    while let Some((_, std::cmp::Reverse(index))) = ready.pop_first() {
+        ordered.push(&resources[index]);
+        for dependency in &dependencies[index] {
+            dependents[*dependency] -= 1;
+            if dependents[*dependency] == 0 {
+                ready.insert(priority(*dependency));
+            }
+        }
+    }
+    if ordered.len() != resources.len() {
+        return Err(CfnError::Validation(
+            "Circular recorded resource dependency prevents safe deletion".into(),
+        ));
+    }
+    Ok(ordered)
+}
+
 fn has_failed_dependent(
     logical_id: &str,
     resources: &[StackResource],
@@ -2430,12 +2643,7 @@ fn has_failed_dependent(
 ) -> bool {
     resources.iter().any(|dependent| {
         dependent.status == "DELETE_FAILED"
-            && declarations.get(&dependent.logical_id).is_some_and(|decl| {
-                decl.depends_on.iter().any(|name| name == logical_id)
-                    || crate::template::referenced_ids(&decl.properties)
-                        .iter()
-                        .any(|name| name == logical_id)
-            })
+            && resource_dependencies(dependent, declarations).contains(logical_id)
     })
 }
 
@@ -2445,12 +2653,14 @@ async fn cleanup_network_replacements(
     provisioner: &Provisioner,
     resources: &mut Vec<StackResource>,
     events: &mut Vec<StackEvent>,
-) -> bool {
+    progress: Option<(&Arc<CfnStore>, &str, &str, &str)>,
+) -> Result<bool, CfnError> {
     let mut failed = false;
     let mut removed = BTreeSet::new();
     for resource in resources.iter_mut().rev() {
         let mut remaining = Vec::new();
-        for retired in resource.pending_cleanup.drain(..).rev() {
+        while let Some(retired) = resource.pending_cleanup.pop() {
+            let event_start = events.len();
             match provisioner
                 .deprovision_named(
                     &resource.logical_id,
@@ -2463,6 +2673,7 @@ async fn cleanup_network_replacements(
                 Ok(()) => {
                     if retired.physical_id == resource.physical_id {
                         removed.insert(resource.logical_id.clone());
+                        resource.status = "DELETE_COMPLETE".into();
                     }
                     events.push(event(
                         &resource.logical_id,
@@ -2488,6 +2699,23 @@ async fn cleanup_network_replacements(
                     failed = true;
                 }
             }
+            if let Some((store, account, region, name)) = progress {
+                // Retain earlier failed retirements while persisting only this resource.
+                let mut checkpoint = resource.clone();
+                checkpoint
+                    .pending_cleanup
+                    .extend(remaining.iter().rev().cloned());
+                store
+                    .record_progress(
+                        account,
+                        region,
+                        name,
+                        &resource.logical_id,
+                        Some(&checkpoint),
+                        &events[event_start..],
+                    )
+                    .await?;
+            }
         }
         remaining.reverse();
         resource.pending_cleanup = remaining;
@@ -2495,7 +2723,16 @@ async fn cleanup_network_replacements(
     resources.retain(|resource| {
         !removed.contains(&resource.logical_id) || !resource.pending_cleanup.is_empty()
     });
-    failed
+    if let Some((store, account, region, name)) = progress {
+        for logical_id in removed {
+            if !resources.iter().any(|r| r.logical_id == logical_id) {
+                store
+                    .record_progress(account, region, name, &logical_id, None, &[])
+                    .await?;
+            }
+        }
+    }
+    Ok(failed)
 }
 
 #[cfg(test)]
@@ -2503,6 +2740,52 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn recorded_dependencies_order_cleanup_after_interrupted_update() {
+        let old = Template::parse(r#"{"Resources":{"Provider":{"Type":"AWS::Lambda::Function"}}}"#)
+            .unwrap();
+        let declarations = old
+            .resources()
+            .into_iter()
+            .map(|decl| (decl.logical_id.clone(), decl))
+            .collect();
+        let mut resources: Vec<_> = [
+            ("Provider", "AWS::Lambda::Function"),
+            ("Added", "Custom::Review"),
+            ("Logs", "AWS::Logs::LogGroup"),
+        ]
+        .into_iter()
+        .map(|(id, kind)| StackResource {
+            logical_id: id.into(),
+            physical_id: id.into(),
+            resource_type: kind.into(),
+            status: "CREATE_COMPLETE".into(),
+            attributes: BTreeMap::new(),
+            pending_cleanup: Vec::new(),
+            lifecycle: None,
+        })
+        .collect();
+        resources[1].lifecycle = Some(crate::model::ResourceLifecycle {
+            properties: serde_json::json!({"ServiceToken":"provider-arn"}),
+            depends_on: vec!["Provider".into(), "Provider".into()],
+            retain_on_delete: false,
+        });
+        let ordered: Vec<_> = deletion_order(&resources, &declarations)
+            .unwrap()
+            .into_iter()
+            .map(|resource| resource.logical_id.as_str())
+            .collect();
+        assert_eq!(ordered, ["Added", "Provider", "Logs"]);
+        resources[1].status = "DELETE_FAILED".into();
+        assert!(has_failed_dependent("Provider", &resources, &declarations));
+        resources[0].lifecycle = Some(crate::model::ResourceLifecycle {
+            properties: Value::Null,
+            depends_on: vec!["Added".into()],
+            retain_on_delete: false,
+        });
+        assert!(deletion_order(&resources, &declarations).is_err());
+    }
 
     async fn wait_stack_terminal(store: &CfnStore, name: &str) -> Stack {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -3367,7 +3650,8 @@ mod tests {
                 &active,
                 &output_exprs,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(status, StackStatus::CreateFailed);
         assert!(resources.is_empty());
@@ -3410,7 +3694,8 @@ mod tests {
                 &active,
                 &output_exprs,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(status, StackStatus::CreateFailed);
         assert_eq!(resources.len(), 1);
@@ -3460,6 +3745,7 @@ mod tests {
                         status: "CREATE_COMPLETE".into(),
                         attributes: BTreeMap::new(),
                         pending_cleanup: Vec::new(),
+                        lifecycle: None,
                     }],
                     outputs: Vec::new(),
                     events: Vec::new(),
@@ -3576,6 +3862,30 @@ mod tests {
                 &output_exprs,
             )
             .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_update_restores_policy_only_lifecycle_changes() {
+        let s3 = Arc::new(TestS3 {
+            failed_put: Some("/second"),
+            existing: None,
+            fail_delete: false,
+            requests: Mutex::new(Vec::new()),
+        });
+        let (_registry, handler) = handler_with_s3(s3);
+        let initial = Template::parse(r#"{"Resources":{"First":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":"first"}}}}"#).unwrap();
+        let (_, existing, _, _) = run_provision(&handler, &initial, true, &[], None).await;
+        let changed = Template::parse(r#"{"Resources":{
+            "First":{"Type":"AWS::S3::Bucket","DeletionPolicy":"Retain","Properties":{"BucketName":"first"}},
+            "Second":{"Type":"AWS::S3::Bucket","DependsOn":"First","Properties":{"BucketName":"second"}}
+        }}"#).unwrap();
+        let (status, resources, _, _) =
+            run_provision(&handler, &changed, false, &existing, Some(&initial)).await;
+        assert_eq!(status, StackStatus::UpdateFailed);
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].lifecycle, existing[0].lifecycle);
+        assert!(!resources[0].lifecycle.as_ref().unwrap().retain_on_delete);
     }
 
     #[tokio::test]
@@ -3834,6 +4144,7 @@ mod tests {
             status: "CREATE_COMPLETE".into(),
             attributes: BTreeMap::new(),
             pending_cleanup: Vec::new(),
+            lifecycle: None,
         })
         .collect();
         handler
@@ -3937,6 +4248,7 @@ mod tests {
                             status: "CREATE_COMPLETE".into(),
                             attributes: BTreeMap::new(),
                             pending_cleanup: Vec::new(),
+                            lifecycle: None,
                         },
                         StackResource {
                             logical_id: "Eph".into(),
@@ -3945,6 +4257,7 @@ mod tests {
                             status: "CREATE_COMPLETE".into(),
                             attributes: BTreeMap::new(),
                             pending_cleanup: Vec::new(),
+                            lifecycle: None,
                         },
                     ],
                     outputs: Vec::new(),
@@ -4055,14 +4368,14 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
             }),
         );
-        assert!(
-            !cleanup_network_replacements(
-                &handler.provisioner("us-east-1", "000000000000"),
-                &mut pending,
-                &mut Vec::new()
-            )
-            .await
-        );
+        assert!(!cleanup_network_replacements(
+            &handler.provisioner("us-east-1", "000000000000"),
+            &mut pending,
+            &mut Vec::new(),
+            None,
+        )
+        .await
+        .unwrap());
         assert!(pending.is_empty());
     }
 
@@ -4403,14 +4716,14 @@ mod tests {
             .pending_cleanup;
         assert_eq!(cleanup.len(), 1);
         assert_eq!(cleanup[0].physical_id, original_nat);
-        assert!(
-            !cleanup_network_replacements(
-                &handler.provisioner("us-east-1", "000000000000"),
-                &mut updated,
-                &mut events
-            )
-            .await
-        );
+        assert!(!cleanup_network_replacements(
+            &handler.provisioner("us-east-1", "000000000000"),
+            &mut updated,
+            &mut events,
+            None,
+        )
+        .await
+        .unwrap());
         let updated_nat = &updated
             .iter()
             .find(|resource| resource.logical_id == "Nat")
@@ -4484,3 +4797,242 @@ mod tests {
 #[cfg(test)]
 #[path = "custom_resource_tests.rs"]
 mod custom_resource_tests;
+
+#[cfg(test)]
+mod interrupted_progress_tests {
+    use super::*;
+    use locallycloud_state::{StateCipher, StateDb};
+
+    struct BlockOneBucket {
+        inner: Arc<dyn NativeHandler>,
+        path: String,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl NativeHandler for BlockOneBucket {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            if request.method == Method::PUT && request.uri.path() == self.path {
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.inner.handle(request).await
+        }
+    }
+
+    fn handler(registry: &Arc<ServiceRegistry>, store: Arc<CfnStore>) -> CfnHandler {
+        CfnHandler {
+            store,
+            registry: Arc::downgrade(registry),
+            caller_access_key: None,
+            response_endpoint: "http://127.0.0.1:4566".into(),
+        }
+    }
+
+    async fn public_query(handler: &CfnHandler, action: &str, name: &str, logical: &str) -> String {
+        let response = handler
+            .handle(ServiceRequest {
+                method: Method::POST,
+                uri: "/".parse().unwrap(),
+                headers: Default::default(),
+                body: Bytes::from(format!(
+                    "Action={action}&StackName={name}&LogicalResourceId={logical}"
+                )),
+                region: "us-east-1".into(),
+                account_id: "000000000000".into(),
+                request_id: "progress-regression".into(),
+            })
+            .await;
+        assert_eq!(response.status(), 200);
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    async fn bucket_status(backend: &dyn NativeHandler, name: &str) -> u16 {
+        backend
+            .handle(ServiceRequest {
+                method: Method::HEAD,
+                uri: format!("/{name}").parse().unwrap(),
+                headers: Default::default(),
+                body: Bytes::new(),
+                region: "us-east-1".into(),
+                account_id: "000000000000".into(),
+                request_id: "progress-bucket".into(),
+            })
+            .await
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn interrupted_create_and_update_expose_and_recover_owned_resources() {
+        for updating in [false, true] {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../compatibility-tests/.work/cfn-progress-recovery")
+                .join(uuid::Uuid::new_v4().to_string());
+            let db = StateDb::open(root.join("state.sqlite3")).unwrap();
+            let reopen = || CfnStore::with_cipher(&db, StateCipher::with_key(&[47; 32])).unwrap();
+            let registry = Arc::new(ServiceRegistry::new());
+            locallycloud_s3::register(&registry);
+            let native = registry.native_handler(&ServiceName::new("s3")).unwrap();
+            let prefix = format!("lc-cfn-{}", uuid::Uuid::new_v4().simple());
+            let first_name = format!("{prefix}-first");
+            let held_name = format!("{prefix}-held");
+            let baseline_name = format!("{prefix}-base");
+            let backend = Arc::new(BlockOneBucket {
+                inner: native.clone(),
+                path: format!("/{held_name}"),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            registry.register_native(
+                ServiceName::new("s3"),
+                ServiceMetadata::new(AwsProtocol::RestXml, None),
+                backend.clone(),
+            );
+            let store = reopen();
+            let observer = handler(&registry, store.clone());
+            let name = "progress-stack";
+            let mut desired = serde_json::json!({"Resources": {
+                "Added":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":first_name}},
+                "Held":{"Type":"AWS::S3::Bucket","DependsOn":"Added","Properties":{"BucketName":held_name}}
+            }});
+            if updating {
+                let baseline = serde_json::json!({"Resources":{
+                    "Existing":{"Type":"AWS::S3::Bucket","Properties":{"BucketName":baseline_name}}
+                }});
+                observer
+                    .create_stack(
+                        &Query {
+                            params: [
+                                ("StackName".into(), name.into()),
+                                ("TemplateBody".into(), baseline.to_string()),
+                            ]
+                            .into(),
+                        },
+                        "us-east-1",
+                        "000000000000",
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                desired["Resources"]["Existing"] = baseline["Resources"]["Existing"].clone();
+                desired["Resources"]["Added"]["DependsOn"] = serde_json::json!("Existing");
+            }
+            let query = Query {
+                params: [
+                    ("StackName".into(), name.into()),
+                    ("TemplateBody".into(), desired.to_string()),
+                ]
+                .into(),
+            };
+            let mut admission = store
+                .get("000000000000", "us-east-1", name)
+                .unwrap_or_else(|| Stack {
+                    stack_id: make_stack_id("us-east-1", "000000000000", name),
+                    stack_name: name.into(),
+                    status: StackStatus::CreateInProgress,
+                    template_body: desired.to_string(),
+                    parameters: BTreeMap::new(),
+                    resources: Vec::new(),
+                    outputs: Vec::new(),
+                    events: Vec::new(),
+                    tags: Vec::new(),
+                    creation_time: now_iso(),
+                    last_updated_time: None,
+                });
+            admission.status = if updating {
+                StackStatus::UpdateInProgress
+            } else {
+                StackStatus::CreateInProgress
+            };
+            admission
+                .events
+                .push(event(name, STACK_TYPE, admission.status.as_str(), None));
+            let id = admission.stack_id.clone();
+            store
+                .admit("000000000000", "us-east-1", admission, None)
+                .unwrap();
+            let worker = handler(&registry, store.clone());
+            let task = tokio::spawn(async move {
+                if updating {
+                    worker
+                        .update_stack(&query, "us-east-1", "000000000000")
+                        .await
+                } else {
+                    worker
+                        .create_stack(&query, "us-east-1", "000000000000", Some(&id))
+                        .await
+                }
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                backend.entered.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(bucket_status(native.as_ref(), &first_name).await, 200);
+            assert_eq!(bucket_status(native.as_ref(), &held_name).await, 404);
+            for action in [
+                "ListStackResources",
+                "DescribeStackResources",
+                "DescribeStackResource",
+                "DescribeStackEvents",
+            ] {
+                let response = public_query(&observer, action, name, "Added").await;
+                assert!(
+                    response.contains("<LogicalResourceId>Added</LogicalResourceId>"),
+                    "{action}: {response}"
+                );
+                if action != "DescribeStackEvents" {
+                    assert!(response.contains(&first_name), "{action}: {response}");
+                }
+            }
+            let events = public_query(&observer, "DescribeStackEvents", name, "Held").await;
+            assert!(events.contains("<LogicalResourceId>Held</LogicalResourceId>"));
+            assert!(events.contains("IN_PROGRESS"));
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            drop(observer);
+            drop(store);
+            let restored = reopen();
+            let stack = restored.get("000000000000", "us-east-1", name).unwrap();
+            assert_eq!(
+                stack.status,
+                if updating {
+                    StackStatus::UpdateFailed
+                } else {
+                    StackStatus::CreateFailed
+                }
+            );
+            assert_eq!(stack.resource("Added").unwrap().physical_id, first_name);
+            assert!(stack.resource("Added").unwrap().lifecycle.is_some());
+            let recovered = handler(&registry, restored);
+            recovered
+                .delete_stack(
+                    &Query::parse(b"StackName=progress-stack"),
+                    "us-east-1",
+                    "000000000000",
+                )
+                .await
+                .unwrap();
+            assert_eq!(bucket_status(native.as_ref(), &first_name).await, 404);
+            if updating {
+                assert_eq!(bucket_status(native.as_ref(), &baseline_name).await, 404);
+            }
+            assert!(recovered
+                .store
+                .get("000000000000", "us-east-1", name)
+                .is_none());
+            drop(recovered);
+            drop(db);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}

@@ -8,7 +8,7 @@ use locallycloud_state::{StateCipher, StateDb};
 
 use dashmap::DashMap;
 
-use crate::model::Stack;
+use crate::model::{Stack, StackEvent, StackResource};
 use crate::proto::Query;
 
 /// Concurrent store of stacks keyed by `"{account}:{region}:{stack_name}"`.
@@ -128,6 +128,20 @@ impl CfnStore {
                     }
                     _ => return Err(CfnError::Internal),
                 }
+                Ok(())
+            })?;
+        store
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_progress(|key, plaintext| {
+                let (logical_id, resource, events): (
+                    String,
+                    Option<StackResource>,
+                    Vec<StackEvent>,
+                ) = serde_json::from_slice(plaintext).map_err(|_| CfnError::Internal)?;
+                let mut stack = store.stacks.get_mut(&key).ok_or(CfnError::Internal)?;
+                apply_progress(&mut stack, &logical_id, resource.as_ref(), &events);
                 Ok(())
             })?;
         let interrupted = store
@@ -274,6 +288,70 @@ impl CfnStore {
         }
         self.stacks.insert(key, stack);
         Ok(())
+    }
+
+    /// Persist only the changed ownership record and new events.
+    /// Keep known ownership in memory on failure so the worker can save its failure snapshot.
+    /// An empty logical id appends events only; `None` otherwise removes that resource.
+    pub(crate) fn progress(
+        &self,
+        account: &str,
+        region: &str,
+        name: &str,
+        logical_id: &str,
+        resource: Option<&StackResource>,
+        events: &[StackEvent],
+    ) -> Result<(), CfnError> {
+        if resource.is_some_and(|resource| resource.logical_id != logical_id) {
+            return Err(CfnError::Internal);
+        }
+        if logical_id.is_empty() && events.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.mutation.lock().map_err(|_| CfnError::Internal)?;
+        let key = Self::key(account, region, name);
+        if !self.stacks.contains_key(&key) {
+            return Err(CfnError::Internal);
+        }
+        let persisted = self.persistence.as_ref().map_or(Ok(()), |persistence| {
+            persistence.progress(&key, &(logical_id, resource, events))
+        });
+        let mut stack = self.stacks.get_mut(&key).ok_or(CfnError::Internal)?;
+        apply_progress(&mut stack, logical_id, resource, events);
+        persisted
+    }
+
+    pub(crate) async fn record_progress(
+        self: &Arc<Self>,
+        account: &str,
+        region: &str,
+        name: &str,
+        logical_id: &str,
+        resource: Option<&StackResource>,
+        events: &[StackEvent],
+    ) -> Result<(), CfnError> {
+        if self.persistence.is_none() || (logical_id.is_empty() && events.is_empty()) {
+            return self.progress(account, region, name, logical_id, resource, events);
+        }
+        let store = self.clone();
+        let account = account.to_owned();
+        let region = region.to_owned();
+        let name = name.to_owned();
+        let logical_id = logical_id.to_owned();
+        let resource = resource.cloned();
+        let events = events.to_vec();
+        tokio::task::spawn_blocking(move || {
+            store.progress(
+                &account,
+                &region,
+                &name,
+                &logical_id,
+                resource.as_ref(),
+                &events,
+            )
+        })
+        .await
+        .map_err(|_| CfnError::Internal)?
     }
 
     fn expire_deleted(&self) {
@@ -424,9 +502,185 @@ impl CfnStore {
     }
 }
 
+fn apply_progress(
+    stack: &mut Stack,
+    logical_id: &str,
+    resource: Option<&StackResource>,
+    events: &[StackEvent],
+) {
+    if !logical_id.is_empty() {
+        match (
+            stack
+                .resources
+                .iter()
+                .position(|resource| resource.logical_id == logical_id),
+            resource,
+        ) {
+            (Some(index), Some(resource)) => stack.resources[index] = resource.clone(),
+            (None, Some(resource)) => stack.resources.push(resource.clone()),
+            (Some(index), None) => {
+                stack.resources.remove(index);
+            }
+            (None, None) => {}
+        }
+    }
+    stack.events.extend_from_slice(events);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_is_incremental_visible_and_recovered_before_interruption() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compatibility-tests/.work/cfn-progress")
+            .join(uuid::Uuid::new_v4().to_string());
+        let db = StateDb::open(root.join("state.sqlite3")).unwrap();
+        let reopen = || CfnStore::with_cipher(&db, StateCipher::with_key(&[47; 32])).unwrap();
+        let store = reopen();
+        let stack = Stack {
+            stack_id: "arn:stack:progress".into(),
+            stack_name: "progress".into(),
+            status: crate::model::StackStatus::CreateInProgress,
+            template_body: "private-template".into(),
+            parameters: Default::default(),
+            resources: Vec::new(),
+            outputs: Vec::new(),
+            events: Vec::new(),
+            tags: Vec::new(),
+            creation_time: String::new(),
+            last_updated_time: None,
+        };
+        store.put("owner", "us-east-1", stack.clone()).unwrap();
+        let sql = db.connection().unwrap();
+        let snapshot = || {
+            sql.query_row(
+            "SELECT payload FROM cfn_metadata_v1 WHERE kind='stack' AND scope_key='owner:us-east-1:progress'",
+            [], |row| row.get::<_,Vec<u8>>(0),
+        ).unwrap()
+        };
+        let original_snapshot = snapshot();
+        let mut resource = StackResource {
+            logical_id: "Function".into(),
+            physical_id: "owned-function".into(),
+            resource_type: "AWS::Lambda::Function".into(),
+            status: "CREATE_COMPLETE".into(),
+            attributes: Default::default(),
+            pending_cleanup: vec![crate::model::ReplacementCleanup {
+                physical_id: "previous-owned-function".into(),
+                properties: serde_json::json!({"secret": "private-property"}),
+            }],
+            lifecycle: None,
+        };
+        let event = StackEvent {
+            event_id: "created".into(),
+            logical_id: resource.logical_id.clone(),
+            resource_type: resource.resource_type.clone(),
+            status: resource.status.clone(),
+            reason: None,
+            timestamp: String::new(),
+        };
+        store
+            .progress(
+                "owner",
+                "us-east-1",
+                "progress",
+                "Function",
+                Some(&resource),
+                std::slice::from_ref(&event),
+            )
+            .unwrap();
+        store
+            .progress(
+                "owner",
+                "us-east-1",
+                "progress",
+                "",
+                None,
+                std::slice::from_ref(&event),
+            )
+            .unwrap();
+        let live = store.get("owner", "us-east-1", "progress").unwrap();
+        assert_eq!(live.resources[0].physical_id, "owned-function");
+        assert_eq!(live.events.len(), 2);
+        assert_eq!(
+            snapshot(),
+            original_snapshot,
+            "progress must not rewrite the full stack"
+        );
+        sql.execute_batch("CREATE TRIGGER reject_progress BEFORE INSERT ON cfn_progress_v1 BEGIN SELECT RAISE(ABORT,'forced failure'); END;").unwrap();
+        resource.physical_id = "uncommitted-function".into();
+        assert!(store
+            .progress(
+                "owner",
+                "us-east-1",
+                "progress",
+                "Function",
+                Some(&resource),
+                &[]
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .get("owner", "us-east-1", "progress")
+                .unwrap()
+                .resources[0]
+                .physical_id,
+            "uncommitted-function"
+        );
+        sql.execute_batch("DROP TRIGGER reject_progress;").unwrap();
+        drop(store);
+        let store = reopen();
+        let recovered = store.get("owner", "us-east-1", "progress").unwrap();
+        assert_eq!(recovered.status, crate::model::StackStatus::CreateFailed);
+        assert_eq!(recovered.resources[0].physical_id, "owned-function");
+        assert_eq!(
+            recovered.resources[0].pending_cleanup[0].physical_id,
+            "previous-owned-function"
+        );
+        assert_eq!(recovered.events.len(), 3);
+        assert!(store.get("other", "us-east-1", "progress").is_none());
+        assert!(store.get("owner", "us-west-2", "progress").is_none());
+        assert_eq!(
+            sql.query_row("SELECT COUNT(*) FROM cfn_progress_v1", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        store
+            .put(
+                "owner",
+                "us-east-1",
+                Stack {
+                    status: crate::model::StackStatus::DeleteInProgress,
+                    ..recovered
+                },
+            )
+            .unwrap();
+        store
+            .progress("owner", "us-east-1", "progress", "Function", None, &[])
+            .unwrap();
+        drop(store);
+        let store = reopen();
+        let recovered = store.get("owner", "us-east-1", "progress").unwrap();
+        assert!(
+            recovered.resources.is_empty(),
+            "deleted ownership must not reappear after restart"
+        );
+        drop(store);
+        assert_eq!(
+            reopen()
+                .get("owner", "us-east-1", "progress")
+                .unwrap()
+                .events
+                .len(),
+            recovered.events.len()
+        );
+        drop(sql);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn durable_ownership_restart_isolation_claim_archive_and_failed_commit() {
@@ -452,6 +706,7 @@ mod tests {
                     physical_id: "old-resource".into(),
                     properties: serde_json::json!({"secret":"value"}),
                 }],
+                lifecycle: None,
             }],
             outputs: vec![crate::model::Output {
                 key: "Queue".into(),
