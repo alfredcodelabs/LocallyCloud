@@ -191,7 +191,7 @@ These survive a restart with the same database and master key:
 - Glue catalog databases and tables.
 - ECR repositories and stored images, EC2/VPC topology, ECS clusters/task definitions/services, and ALB configuration.
 
-Interrupted Step Functions executions become `ABORTED`; they are not automatically replayed. ECS desired services reconcile with new processes and rebuilt network leases; interrupted standalone tasks are not replayed. EC2 instances that were not terminated restore as stopped, retaining their configured primary ENI and private IP. Use `StartInstances` with one instance ID per request to start them explicitly. ALB listeners and target health are rebuilt. See [recovery behavior and limits](SERVICES.md#persistence-and-beta-limits).
+Interrupted Step Functions executions become `ABORTED`; they are not automatically replayed. ECS desired services reconcile with new processes and rebuilt network leases; interrupted standalone tasks are not replayed. EC2 instances that were not terminated restore as stopped, retaining their configured primary ENI and private IP. Use `StartInstances` with one instance ID per request to start them explicitly. ALB listeners and target health are rebuilt. See [recovery behavior and limits](SERVICES.md#persistence-and-limits).
 
 Cognito user pools, Route 53, CloudFront, WAF v2, CloudTrail, X-Ray, Athena, ARC, and Region Switch resources are still process-local. Recreate or reconcile them after a restart before using resources that depend on them.
 
@@ -208,11 +208,8 @@ If you configured a different address or port, update both the health-check URL 
 
 ### How is Lambda memory usage limited?
 
-Each function's `MemorySize` sets its guest limit. The separate **4096 MiB budget
-is shared across all active and warm Lambda environments**, with 32 MiB of
-estimated overhead per environment. It reserves no RAM at startup. See
-[Lambda memory accounting](LAMBDA.md#memory-budget) for configuration and rejection
-behavior.
+Each function has its own guest limit; environments share a separate host budget.
+See [memory accounting](LAMBDA.md#memory-budget).
 
 ### Does deleting a stack remove its logs and runtime files?
 

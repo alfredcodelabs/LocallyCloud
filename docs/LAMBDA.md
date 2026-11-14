@@ -58,6 +58,13 @@ host certificate trust is unchanged. Custom CA paths must be absolute guest
 paths. The isolated non-VPC path exposes the local AWS endpoint, not general
 outbound Internet access.
 
+## Logging
+
+Lambda APIs and CloudFormation accept `LoggingConfig`: `LogGroup` defaults to
+`/aws/lambda/<function-name>`; `LogFormat` defaults to `Text`. For `JSON`,
+`ApplicationLogLevel` and `SystemLogLevel` default to `INFO`.
+Execution-role permissions and the log group's KMS configuration apply.
+
 ## Memory budget
 
 Each function keeps its own `MemorySize`. Independently,
@@ -68,8 +75,8 @@ It allocates no RAM at startup and does not give each function 4096 MiB.
 Admission counts each environment's configured memory plus 32 MiB of estimated
 host overhead, rather than measured usage. Idle warm environments are evicted
 when needed; if capacity still does not fit, invocation returns
-`TooManyRequestsException`. Invalid or zero budgets disable invocation with a
-diagnostic. This budget does not cap total server RSS, ECS or EC2 memory.
+`TooManyRequestsException`; see [retry behavior](THROTTLING.md#diagnosis). Invalid
+or zero budgets disable invocation. The budget does not cap server RSS, ECS or EC2.
 
 Keep room for the server and other desktop applications. Compute work files
 should use disk-backed storage; tmpfs also consumes RAM. See

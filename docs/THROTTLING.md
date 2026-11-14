@@ -54,6 +54,9 @@ See the [configuration reference](SETUP.md#configuration) for accepted ranges.
 | `LocallyCloud/States ActiveExecutions` | Exact local active count, sampled each second; use `Maximum`. |
 | Queue/DLQ state and unique outputs | Delivery attempts, backlog, completion and loss. Inspect `ApproximateReceiveCount` when testing redrive. |
 
+Lambda concurrency and memory rejections return HTTP 429 `TooManyRequestsException`
+with `Retry-After: 1`; Step Functions can retry `Lambda.TooManyRequestsException`.
+
 Metrics are best effort. Lambda flushes minute aggregates every 60 seconds; wait before
 reading short-run results. `ExecutionsStarted` emits 1 at start and 0 at completion, so
 `SampleCount` is not the execution count. A Lambda rejection can fail a workflow without

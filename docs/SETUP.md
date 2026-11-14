@@ -82,12 +82,26 @@ The server can start without a compute runtime. Install these dependencies only 
 | Run ECS/Fargate tasks | The OCI prerequisites above, delegated cgroup v2 CPU control, `ip` and `nft` in `PATH` (`iproute2` and `nftables` packages), and kernel netfilter redirect support (`nft_redir`). Task networking is configured inside owned guest namespaces; run the emulator as your ordinary user. |
 | Run Lambda code | A matching [official runtime pack](LAMBDA.md). Python 3 is needed only to install, check or update packs. |
 | Route Firehose Iceberg records with `MetadataExtraction` | `jq` available in `PATH`. |
-| Run broader Athena SQL on Iceberg tables | DuckDB, with `LOCALLYCLOUD_DUCKDB_BIN` set to its executable. Without it, Athena uses a built-in reader for a smaller SQL subset. |
+| Run broader Athena SQL on Iceberg tables | [DuckDB CLI and matching official extensions](#duckdb). |
 | Run EC2 instances | The OCI prerequisites above and `LOCALLYCLOUD_EC2_IMAGE_ROOTFS` pointing to the image's root filesystem. |
 | Run RDS PostgreSQL or Aurora PostgreSQL, including RDS Data API access | The OCI prerequisites above and an explicitly installed PostgreSQL pack: `locallycloud runtime install postgres18`. PostgreSQL 16, 17 and 18 are supported; the default is 18. No host PostgreSQL installation is required. |
 | Open the dashboard from the applications menu | `xdg-utils`. Opening the URL directly in a browser does not require it. |
 
 On Debian and Ubuntu, install only the host tools you need with `sudo apt install crun dbus-user-session` or `sudo apt install xdg-utils`; add `python3` for runtime preparation or `jq` for metadata extraction. On Arch, the equivalent packages are `crun`, `dbus`, `xdg-utils`, `python` and `jq`. Runtime packs are downloaded only by explicit `locallycloud runtime install/update` commands. To use a host PostgreSQL toolchain instead of OCI, set `LOCALLYCLOUD_PG_BIN_DIR` to its `bin` directory; all five tools (`initdb`, `pg_ctl`, `postgres`, `psql`, `pg_basebackup`) must have matching versions, 16 or later.
+
+### DuckDB
+
+Install the DuckDB CLI and prepare its official extensions (1.5.4 was validated):
+
+```sh
+duckdb -no-init -c "INSTALL avro; INSTALL iceberg; SELECT install_path FROM duckdb_extensions() WHERE extension_name IN ('avro', 'iceberg');"
+export LOCALLYCLOUD_DUCKDB_BIN="$(command -v duckdb)"
+```
+
+Set `LOCALLYCLOUD_DUCKDB_EXTENSIONS_DIR` to the directory containing the two
+reported files. Extensions must match the CLI version and platform; recheck them
+when updating DuckDB. Startup and queries never download extensions.
+See [SQL limits](SERVICES.md#athena-and-duckdb) and [directory defaults](#configuration).
 
 ### Official Lambda runtime packs
 
@@ -142,6 +156,15 @@ The saved endpoint applies to all AWS CLI services unless a higher-priority endp
 
 See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-endpoints.html) and [configuration and credentials files](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).
 
+### SDK host prefixes
+
+If `StartSyncExecution` produces `sync-127.0.0.1`, disable host-prefix injection:
+
+- AWS CLI v2 / Boto3: `disable_host_prefix_injection = true` in the local AWS profile.
+- JavaScript SDK v3: `disableHostPrefix: true` in the client constructor.
+
+See [AWS options for other SDKs](https://docs.aws.amazon.com/sdkref/latest/guide/feature-host-prefix.html).
+
 ## Configuration
 
 | Variable | Purpose | Default |
@@ -174,7 +197,9 @@ See the AWS documentation for [configured endpoints](https://docs.aws.amazon.com
 | `LOCALLYCLOUD_ROUTE53_DNS_BIND` | Address for the Route 53 DNS server, for example `127.0.0.1:5353`. An invalid or busy address stops startup | Disabled |
 | `LOCALLYCLOUD_RDS_DATA_DIR` | Absolute directory for local RDS databases | `${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/rds` |
 | `LOCALLYCLOUD_EC2_IMAGE_ROOTFS` | Root filesystem directory for the `ami-locallycloud-http` image; required to run EC2 instances | None |
-| `LOCALLYCLOUD_DUCKDB_BIN` | DuckDB executable for Athena queries on Iceberg tables; without it, a built-in reader handles a smaller SQL subset | Disabled |
+| `LOCALLYCLOUD_DUCKDB_BIN` | DuckDB executable; see [preparation](#duckdb) | Disabled |
+| `LOCALLYCLOUD_DUCKDB_EXTENSIONS_DIR` | Directory directly containing matching `avro.duckdb_extension` and `iceberg.duckdb_extension` files | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/analytics/duckdb/extensions` |
+| `LOCALLYCLOUD_DUCKDB_WORK_DIR` | Private temporary query snapshots and results; use disk-backed storage | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/analytics/duckdb/queries` |
 | `LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL` | Maximum warm Lambda environments across all functions; integer from 0 to 1024 | `16` |
 | `LOCALLYCLOUD_KINESIS_MAX_BUFFERED_BYTES` | Maximum bytes of records Kinesis keeps in memory | `67108864` (64 MiB) |
 | `LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID`, `LOCALLYCLOUD_BOOTSTRAP_SECRET_ACCESS_KEY` | Administrator credentials for strict IAM; see [strict IAM credentials](#strict-iam-credentials) | None |
@@ -242,7 +267,7 @@ Uninstalling the program preserves resources, keys, and client settings in your 
 | Location | Contents and cleanup |
 | --- | --- |
 | `${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/` | Default persistent state, including `state.sqlite3`, local RDS databases, and RDS Data API files. Delete only if you want to discard those resources. |
-| `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/` | PostgreSQL and language runtime caches; Lambda code/root filesystems and compute bundles under `lambda/`, `oci/` and `ecs/`. Stop LocallyCloud before removing this cache. |
+| `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/` | Installed runtime packs (by default under `lambda/runtime-packs/`), Lambda code/root filesystems, compute bundles and analytics caches. Removing packs requires reinstalling them before execution. Stop LocallyCloud before removing this directory. |
 | `${TMPDIR:-/tmp}/locallycloud-lambda-<uid>/` | Legacy/fallback Lambda work directory. Inspect leftovers after stopping LocallyCloud. `<uid>` is the output of `id -u`. |
 | `${TMPDIR:-/tmp}/locallycloud-oci-<uid>/` and `locallycloud-ecs-<uid>/` | Legacy/fallback compute work directories. Remove only after their tasks have stopped. |
 | `/tmp/lc-rds-<token>/` | PostgreSQL socket directories for local RDS instances. Inspect ownership and the corresponding stopped instance before removing a leftover directory; do not delete other instances' directories. |
@@ -250,9 +275,10 @@ Uninstalling the program preserves resources, keys, and client settings in your 
 | `~/.aws/config` and `~/.aws/credentials` | Remove only `[profile locallycloud]` and `[locallycloud]`, respectively, if you no longer need that profile. Keep your other AWS profiles. |
 
 
-Lambda runtime caches contain read-only trees. If you choose to delete a stopped
-instance's cache, restore write permission first with `chmod -R u+w` on that specific
-cache directory. For custom `LOCALLYCLOUD_STATE_DB`, `LOCALLYCLOUD_RDS_DATA_DIR` or
+Lambda runtime caches contain read-only trees. Before deleting a stopped instance's
+cache, restore write permission on its directories only, for example
+`find /path/to/that/cache -type d -exec chmod u+w {} +`. Do not recursively change
+file permissions: runtime files may share hard links with installed packs. For custom `LOCALLYCLOUD_STATE_DB`, `LOCALLYCLOUD_RDS_DATA_DIR` or
 `LOCALLYCLOUD_WORK_DIR`, inspect the configured locations separately. A custom SQLite
 file may also have `-wal` and `-shm` sidecars. An EC2 root filesystem supplied through
 `LOCALLYCLOUD_EC2_IMAGE_ROOTFS` belongs to you.

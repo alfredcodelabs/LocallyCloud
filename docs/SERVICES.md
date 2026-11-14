@@ -2,7 +2,7 @@
 
 [← README](../README.md) · [Setup](SETUP.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
 
-[📦 Service catalog](#available-services) · [🔌 Compatibility](#tool-compatibility) · [⚡ Compute limits](#compute-and-networking-limits) · [💾 Persistence](#persistence-and-beta-limits)
+[📦 Service catalog](#available-services) · [🔌 Compatibility](#tool-compatibility) · [⚡ Compute limits](#compute-and-networking-limits) · [💾 Persistence](#persistence-and-limits)
 
 > [!NOTE]
 > Services implement subsets of AWS operations. Check `/_locallycloud/status` for
@@ -42,6 +42,31 @@ Some `LOCALSTACK_*` configuration aliases and `/_localstack/health` are accepted
 
 IAM defaults to permissive mode. To test permissions, enable `LOCALLYCLOUD_IAM_ENFORCEMENT=strict` with bootstrap credentials. Lambda receives a temporary session for its role. DynamoDB evaluates direct actions and each affected table in supported batch, transaction, and PartiQL operations. The workflow with and without `dynamodb:PutItem` permission has been tested; this does not establish compatibility with all AWS policies.
 
+Strict IAM supports `ForAnyValue`/`ForAllValues` for supported operators and
+`kms:ResourceAliases` in native integrations. Unsupported operators are rejected.
+
+### CloudFormation
+
+Supports Lambda `Architectures`, [logging](LAMBDA.md#logging), Lambda-backed custom
+resources, rollback, live resource progress and paginated `ListChangeSets`.
+Install custom-resource runtimes before deployment; missing callbacks wait until
+`ServiceTimeout`.
+
+`Code.ZipFile` accepts Node.js/Python source in `index.js`/`index.py`, with an
+`index.<export>` handler. Source and ZIP are each limited to 4 MiB;
+`cfn-response` is not bundled. Historical change-set execution status is inferred
+from the current stack state.
+
+### Athena and DuckDB
+
+The built-in reader supports single-table SELECTs. DuckDB adds bounded joins,
+subqueries, `IN`, `GROUP BY`, `HAVING` and `ORDER BY` over authorized Glue Iceberg
+snapshots. CTEs, UNION, table functions and non-SELECT statements are unsupported;
+functions and result types are restricted. Queries are limited to one statement
+and 256 KiB, with bounded scans, results and execution time.
+
+See [DuckDB preparation](SETUP.md#duckdb).
+
 ### API Gateway mapping templates
 
 REST API integrations support a bounded VTL subset: `#set`, `#if`/`#elseif`/`#else`,
@@ -70,7 +95,7 @@ targets. Target registration, health checks, replacement and draining are integr
 HTTPS listeners, host/path rules, multi-container tasks, IPv6 and UDP application
 traffic are outside that reference. Validate additional consumer requirements separately.
 
-## Persistence and beta limits
+## Persistence and limits
 
 Keep the state directory and KMS master key across restarts. Glue catalog entries,
 ECR images, EC2/VPC topology, ECS configuration and ALB configuration are persisted.
@@ -81,5 +106,5 @@ implemented. Live sockets and health state are rebuilt.
 Persistence varies elsewhere; see the [restart reference](FAQ.md#will-my-resources-survive-a-restart).
 Regional failover is manual. Local load results reflect your workstation rather than
 AWS scale, quotas or performance. See [throttling and backpressure](THROTTLING.md)
-for supported simulations and gaps. Use test data; the beta provides no AWS security,
+for supported simulations and gaps. Use test data; LocallyCloud provides no AWS security,
 availability or durability guarantees.

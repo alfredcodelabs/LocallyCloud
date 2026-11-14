@@ -43,6 +43,7 @@ Some features need host components:
 | Lambda, ECS/Fargate, EC2 (OCI) | `crun` or `youki`, a systemd user session with a user D-Bus, delegated cgroup v2 memory control | The `.deb` recommends `dbus-user-session`. On WSL 2, enable systemd (below). |
 | Lambda language runtimes | An [official runtime pack](LAMBDA.md) for the runtime and host CPU | Install only those you use; Python 3 is needed for preparation/checks. |
 | Firehose Iceberg metadata extraction | `jq` in `PATH` | Optional; required by `MetadataExtraction`. |
+| Athena SQL through DuckDB | DuckDB CLI and matching official `avro`/`iceberg` extensions | Optional; see [preparation and SQL limits](SERVICES.md#athena-and-duckdb). |
 | RDS and RDS Data API | OCI prerequisites above and an installed PostgreSQL runtime pack | Run `locallycloud runtime install postgres18` (default major); 16 and 17 are also supported. A host PostgreSQL installation is optional, selected explicitly with `LOCALLYCLOUD_PG_BIN_DIR`. |
 | Dashboard from the applications menu | `xdg-utils` | The `.deb` recommends it. The dashboard URL works in any browser without it. |
 

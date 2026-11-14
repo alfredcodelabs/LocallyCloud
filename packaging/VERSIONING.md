@@ -36,13 +36,10 @@ For a new version, edit Cargo.toml and update Cargo.lock with `cargo update --wo
 
 ## 0.1.1 release
 
-The next release tag is `v0.1.1`, with packaging revision 1. It includes the
-Lambda reserved-region environment validation and S3 bucket recreation fixes,
-plus Clippy 1.95 compatibility fixes. It publishes only after the workflow gates
-below succeed; the existing `v0.1.0` tag is preserved.
-
-The AUR recipe stays pinned to its verified archive until publication. Then run
-`packaging/aur/update.sh v0.1.1` to refresh the real source checksum and `.SRCINFO`.
+Tag: `v0.1.1`; packaging revision: 1. Includes CloudFormation lifecycle and Lambda
+configuration fixes, Athena joins, KMS alias conditions and Catch-based DLQ detection.
+See [service scope and limits](../docs/SERVICES.md). Publish after the workflow
+gates below; preserve published tags. Update the [AUR recipe](#aur) after publication.
 
 ## 0.1.0 release
 
@@ -58,7 +55,7 @@ Changes since beta.4 include:
 
 The functional candidate at `b780845` passed package installation and SDK/CLI smoke checks in QEMU on Debian 13 and Ubuntu 24.04/26.04, on both architectures: Lambda Node/Python/Go, S3/SQS, PostgreSQL 18 with UUIDv7, and SQL/S3 persistence after restart. Those checks do not replace CI or certify every service integration. Publishing still waits for the workflow gates below.
 
-The AUR recipe remains pinned to its published archive until `v0.1.0` is available. After publication, run `packaging/aur/update.sh v0.1.0` to download the real archive, update its checksum and regenerate `.SRCINFO`; do not invent checksums or use `SKIP`.
+For current source-archive checksums and publication steps, see [AUR](#aur); do not invent checksums or use `SKIP`.
 
 ## Packaging revisions
 

@@ -122,7 +122,7 @@ State is encrypted with the required `LOCALLYCLOUD_KMS_MASTER_KEY`. Keep the sam
 key and state directory when restarting.
 
 The server starts without a compute backend. Executing Lambda, ECS or EC2 requires
-host runtime tools; RDS requires PostgreSQL. See [runtime dependencies](docs/SETUP.md#optional-runtime-dependencies)
+host runtime tools; RDS uses an explicitly installed PostgreSQL runtime pack. See [runtime dependencies](docs/SETUP.md#optional-runtime-dependencies)
 and the [environment variable reference](docs/SETUP.md#configuration).
 
 ## Documentation

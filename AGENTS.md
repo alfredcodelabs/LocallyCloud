@@ -128,10 +128,11 @@ serves every in-process service without any compute backend. Only code-executing
 `locallycloud runtime install/update` commands, never startup or invocation.
 
 - **Host tools come from the distribution:** `crun`/`youki` from `PATH`
-  (`YoukiRuntime::discover`), and PostgreSQL 16+ binaries for RDS
-  (`LOCALLYCLOUD_PG_BIN_DIR`, then `PATH`, then the newest `/usr/lib/postgresql/<major>/bin`). They are optional package
-  dependencies (`Suggests`/`optdepends`), never hard ones. A missing tool must surface a typed,
-  actionable AWS error on first use, not a startup failure.
+  (`YoukiRuntime::discover`). RDS defaults to explicitly installed PostgreSQL OCI packs
+  (16, 17 or 18; default 18), without a host PostgreSQL requirement. An explicit
+  `LOCALLYCLOUD_PG_BIN_DIR` selects a matching host toolchain instead. Host tools are
+  optional package dependencies (`Suggests`/`optdepends`), never hard ones. A missing
+  tool must surface a typed, actionable AWS error on first use, not a startup failure.
 - **Prefer official AWS components:** reuse maintained upstream runtimes and clients;
   implement only the missing integration and remove compatibility adaptations when
   upstream covers them. Lambda uses explicitly pre-imported, digest-verified official

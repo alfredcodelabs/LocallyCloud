@@ -2,52 +2,12 @@
 
 [← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
 
-**Threat models that start from what you deployed, not from a blank canvas.**
+Build a threat model from a deployed CloudFormation stack. Review configuration
+facts, unresolved flows and control gaps with OWASP/STRIDE prompts. Humans validate
+decisions; the MCP companion proposes them. OWASP Threat Dragon v2 import/export
+is supported.
 
-Most threat models are drawn by hand, go stale after the next deploy, and never get
-reopened. LocallyCloud builds the diagram from your CloudFormation stack, flags
-missing controls from its configuration, and tells you exactly which decisions a
-change re-opens. You keep the judgment; the tool does the bookkeeping.
-
-- **Zero drawing.** Resources, flows and trust gaps come from the deployed stack.
-- **Evidence, not guesses.** Every gap cites the template property it comes from,
-  or states that the template does not declare the control.
-- **Re-review only what changed.** A per-resource configuration digest re-opens
-  decisions on changed resources and leaves the rest of your review intact.
-- **OWASP all the way.** The four threat modeling questions, STRIDE, the OWASP Risk
-  Rating Methodology, and references to ASVS 5.0, Top 10:2025 and API Top 10:2023.
-- **Agents that propose, people that decide.** An MCP companion lets an AI agent
-  fill in the review quickly; every proposal waits for your approval.
-- **Works with Threat Dragon.** Open OWASP Threat Dragon v2 models and export
-  reviews back to them.
-- **Local and private.** Runs inside the emulator on your machine. No account, no
-  upload, no telemetry.
-
-[⚖️ Comparison](#how-it-compares) · [🧭 Workflow](#workflow) · [🔎 Evidence](#what-the-view-reads) · [📚 Catalog](#threat-catalog) · [💾 Saving](#saving-and-refreshing) · [🤖 Agents](#agent-companion-mcp) · [⚠️ Limits](#limits)
-
-## How it compares
-
-Established tools are excellent at what they target. LocallyCloud's tool targets a
-narrower job: keeping a threat model in sync with serverless infrastructure you
-are developing locally.
-
-| | Microsoft Threat Modeling Tool | OWASP Threat Dragon | IriusRisk | LocallyCloud |
-| --- | --- | --- | --- | --- |
-| Where it runs | Windows desktop | Web or desktop | Commercial platform (SaaS or self-hosted) | Built into the local emulator, Linux |
-| Where the diagram comes from | Drawn by hand | Drawn by hand | Questionnaires, drawing or infrastructure-as-code import | Read from the deployed stack |
-| Configuration evidence | — | — | From imported definitions | Declared facts with their property paths |
-| After a change | Update the diagram by hand | Update the diagram by hand | Re-import and review | Refresh; only changed resources re-open |
-| Cost | Free | Free, open source | Paid | Free, included |
-
-Comparison based on each project's public documentation as of November 2026:
-[Microsoft Threat Modeling Tool](https://learn.microsoft.com/azure/security/develop/threat-modeling-tool),
-[OWASP Threat Dragon](https://owasp.org/www-project-threat-dragon/) and
-[IriusRisk](https://www.iriusrisk.com/). Check them for current features.
-
-Choose IriusRisk for organization-wide governance and large threat libraries,
-Microsoft's tool for Windows-centric DFD templates, and Threat Dragon for
-open-source diagrams of any system. Use LocallyCloud when the system is an AWS
-serverless stack you deploy to the emulator and want the model to follow the code.
+[Workflow](#workflow) · [Evidence](#what-the-view-reads) · [Catalog](#threat-catalog) · [Saving](#saving-and-refreshing) · [MCP](#agent-companion-mcp) · [Limits](#limits)
 
 ## Workflow
 
@@ -79,7 +39,7 @@ and classifications; property values and policy documents stay on the server.
 | Configured flow | A destination read from deployed configuration (event mappings, rule targets, notifications, state machine tasks, API integrations). Not observed delivery. |
 | Dependency | A `Ref`/`GetAtt`/`DependsOn` relation; provisioning order, not a data flow. Hidden by default. |
 | Unresolved reference | A destination that is external, ambiguous, dynamic or unsupported, listed with its reason instead of guessed. |
-| Declared fact | A classified setting from the template, such as `encryption-at-rest = kms` or `tls-only = not-declared`, with its property path. Values, policy documents and environment values are not exported; secrets in environment variables are detected by variable name only. |
+| Declared fact | A classified setting from the processed template or a supported deployed-service read, such as `encryption-at-rest = kms` or `tls-only = not-declared`, with its property path. Values, policy documents and environment values are not exported; secrets in environment variables are detected by variable name only. |
 | Configuration digest | A SHA-256 of each resource's type, physical ID and properties, with environment values excluded. Used to re-open only decisions on changed resources. |
 
 ## Threat catalog
@@ -179,11 +139,11 @@ treated as untrusted data.
 
 ## Limits
 
-- Facts come from the processed template, not from reading each service. Changes
-  made outside CloudFormation (drift) are not visible.
-- Digests exclude stack parameter values, so a parameter-only change does not
-  re-open decisions. Resources outside the template have no digest; their presence
-  re-opens all decisions.
+- Facts mostly come from the template. Static `sqs:sendMessage` targets reached only
+  through deployed Step Functions `Catch` paths also count as failure queues;
+  shared normal paths and unresolved targets do not. This does not prove delivery.
+- Digests exclude parameter values and direct service updates; review those changes
+  explicitly. Resources outside the template have no digest and re-open all decisions.
 - Some flows are not extracted yet: Lambda calls made from function code, S3
   notifications to EventBridge, API Gateway integrations with Step Functions, rules
   on the default or an external event bus, and Step Functions tasks beyond Lambda,
