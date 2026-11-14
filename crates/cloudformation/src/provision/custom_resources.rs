@@ -120,6 +120,8 @@ impl Provisioner {
         previous: Option<&Value>,
     ) -> Result<ResolvedResource, CfnError> {
         let seconds = service_timeout(props)?;
+        // SigV4 timestamps discard fractional seconds; cover the full response deadline.
+        let callback_expiry = seconds + 1;
         let token = props
             .get("ServiceToken")
             .and_then(Value::as_str)
@@ -163,9 +165,9 @@ impl Provisioner {
             let response_url = match evaluator.filter(|evaluator| evaluator.strict_sigv4_required()) {
                 Some(evaluator) => evaluator.presign_s3_put(locallycloud_core::integration::authorization::S3PutPresignRequest {
                     account: self.account.clone(), access_key: self.caller_access_key.clone().ok_or_else(|| CfnError::ResourceFailed("Custom resource callback requires verified caller credentials".into()))?,
-                    endpoint: self.response_endpoint.clone(), path: path.clone(), region: self.region.clone(), expires: seconds,
+                    endpoint: self.response_endpoint.clone(), path: path.clone(), region: self.region.clone(), expires: callback_expiry,
                 }).map_err(|_| CfnError::ResourceFailed("Could not sign the custom resource callback with active IAM credentials".into()))?,
-                None => locallycloud_s3::presign::presign_local_put(&self.response_endpoint, &path, &self.region, seconds).await.map_err(CfnError::ResourceFailed)?,
+                None => locallycloud_s3::presign::presign_local_put(&self.response_endpoint, &path, &self.region, callback_expiry).await.map_err(CfnError::ResourceFailed)?,
             };
             let mut event = json!({"RequestType": operation, "ResponseURL": response_url, "StackId": stack, "RequestId": request_id, "ResourceType": kind, "LogicalResourceId": logical, "ResourceProperties": props});
             if let Some(current) = current { event["PhysicalResourceId"] = json!(current.ref_value); }

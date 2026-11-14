@@ -51,6 +51,18 @@ impl NativeHandler for Provider {
                 response["RequestId"] = json!("wrong");
             }
             let uri: http::Uri = event["ResponseURL"].as_str().unwrap().parse().unwrap();
+            let expires: u64 = uri
+                .query()
+                .unwrap()
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("X-Amz-Expires="))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                expires > props["ServiceTimeout"].as_u64().unwrap(),
+                "callback URL must cover ServiceTimeout despite SigV4 timestamp truncation"
+            );
             let mut headers = http::HeaderMap::new();
             headers.insert("host", uri.authority().unwrap().as_str().parse().unwrap());
             let callback = ServiceRequest {
@@ -70,7 +82,19 @@ impl NativeHandler for Provider {
                 .unwrap()
                 .handle(callback)
                 .await;
-            assert_eq!(result.status(), 200);
+            let status = result.status();
+            if status != http::StatusCode::OK {
+                let body = axum::body::to_bytes(result.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let body = String::from_utf8_lossy(&body);
+                let code = body
+                    .split("<Code>")
+                    .nth(1)
+                    .and_then(|value| value.split("</Code>").next())
+                    .unwrap_or("unknown");
+                panic!("provider callback failed: HTTP {status}, S3 code {code}");
+            }
         }
         Response::new(Body::from("{}"))
     }
