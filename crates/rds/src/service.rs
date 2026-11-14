@@ -3439,6 +3439,23 @@ mod process_status_tests {
 mod ownership_tests {
     use super::*;
 
+    fn reopen_after_drop(root: PathBuf) -> RdsHandler {
+        // Concurrent process-spawn tests can briefly inherit the lease before exec
+        // closes its CLOEXEC descriptor. A persistent lease still fails this test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match RdsHandler::new(root.clone()) {
+                Ok(handler) => return handler,
+                Err(locallycloud_state::StateError::Io(_))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("RDS lease was not released: {error}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn background_job_keeps_ownership_after_handler_is_dropped() {
         let root = std::env::temp_dir().join(format!("rds-job-lease-{}", uuid::Uuid::new_v4()));
@@ -3465,9 +3482,8 @@ mod ownership_tests {
         release.send(()).unwrap();
         job.await.unwrap();
         let opening = root.clone();
-        let reopened = tokio::task::spawn_blocking(move || RdsHandler::new(opening))
+        let reopened = tokio::task::spawn_blocking(move || reopen_after_drop(opening))
             .await
-            .unwrap()
             .unwrap();
         drop(reopened);
         tokio::fs::remove_dir_all(root).await.unwrap();
@@ -3519,7 +3535,7 @@ mod ownership_tests {
         );
         drop(second);
         drop(owner);
-        let recovered = RdsHandler::new(root.clone()).unwrap();
+        let recovered = reopen_after_drop(root.clone());
         assert!(!partial.exists());
         let saved: Snapshot =
             serde_json::from_slice(&std::fs::read(directory.join("snapshot.json")).unwrap())

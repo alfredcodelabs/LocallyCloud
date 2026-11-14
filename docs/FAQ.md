@@ -129,7 +129,7 @@ Read the startup error and check these requirements:
 
 - `LOCALLYCLOUD_KMS_MASTER_KEY` contains a base64-encoded 32-byte key.
 - The state directory is owned by the current user, has private permissions, and is not a symlink.
-- The linked SQLite version is 3.53.4 or later.
+- The linked SQLite version is 3.54.1 or later.
 - The configured listen address and port are available.
 
 If you set `LOCALLYCLOUD_STATE_DB`, use an absolute path to a SQLite file, not a directory. Startup errors should identify which requirement failed. Follow the [quick start](../README.md#quick-start) before adding optional integrations.

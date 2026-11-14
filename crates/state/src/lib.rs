@@ -11,7 +11,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
-const MIN_SQLITE_VERSION: i32 = 3_053_004;
+const MIN_SQLITE_VERSION: i32 = 3_054_001;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -19,7 +19,7 @@ pub enum StateError {
     Io(#[from] std::io::Error),
     #[error("state SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("SQLite 3.53.4 or newer is required; linked version is {0}")]
+    #[error("SQLite 3.54.1 or newer is required; linked version is {0}")]
     SqliteTooOld(String),
     #[error("state database path is a symlink")]
     Symlink,

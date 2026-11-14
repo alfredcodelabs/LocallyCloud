@@ -755,7 +755,7 @@ mod contention_tests {
             .connection
             .lock()
             .unwrap()
-            .busy_handler(None)
+            .busy_handler(None::<fn(i32) -> bool>)
             .unwrap();
         drop(other_service);
         drop(persistence);

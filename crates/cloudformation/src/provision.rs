@@ -9441,7 +9441,7 @@ mod tests {
             let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
             assert_eq!(archive.len(), 1);
             let mut entry = archive.by_index(0).unwrap();
-            assert_eq!(entry.name(), filename);
+            assert_eq!(entry.name().unwrap(), filename);
             let mut extracted = String::new();
             entry.read_to_string(&mut extracted).unwrap();
             assert_eq!(extracted, source);
@@ -9492,7 +9492,8 @@ mod tests {
                 .unwrap()
                 .by_index(0)
                 .unwrap()
-                .name(),
+                .name()
+                .unwrap(),
             "index.py"
         );
         for runtime in ["provided.al2023", "ruby3.4", "dotnet8"] {

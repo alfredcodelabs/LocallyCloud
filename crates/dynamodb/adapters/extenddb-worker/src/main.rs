@@ -481,7 +481,9 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if runtime.block_on(run()).is_err() {
+    let result = runtime.block_on(run());
+    drop(runtime);
+    if result.is_err() {
         // Upstream error strings may contain paths or SQL input. Keep this
         // boundary generic; domain errors above retain their AWS error shape.
         eprintln!("ExtendDB worker failed to initialize or process its private channel");

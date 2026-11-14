@@ -1,0 +1,32 @@
+--- a/.compat/sqlx-sqlite/src/connection/worker.rs
++++ b/.compat/sqlx-sqlite/src/connection/worker.rs
+@@ -1,7 +1,6 @@
+ use std::future::Future;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Arc;
+-use std::thread;
+ 
+ use futures_channel::oneshot;
+ use futures_intrusive::sync::{Mutex, MutexGuard};
+@@ -105,9 +104,9 @@
+     pub(crate) async fn establish(params: EstablishParams) -> Result<Self, Error> {
+         let (establish_tx, establish_rx) = oneshot::channel();
+ 
+-        thread::Builder::new()
+-            .name(params.thread_name.clone())
+-            .spawn(move || {
++        // SQLCipher finalizers must run after all native connections close.
++        // Runtime-owned blocking tasks are joined during worker shutdown.
++        let _worker = sqlx_core::rt::spawn_blocking(move || {
+                 let (command_tx, command_rx) = flume::bounded(params.command_channel_size);
+ 
+                 let conn = match params.establish() {
+@@ -342,7 +341,7 @@
+                         }
+                     }
+                 }
+-            })?;
++            });
+ 
+         establish_rx.await.map_err(|_| Error::WorkerCrashed)?
+     }

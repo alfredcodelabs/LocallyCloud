@@ -76,7 +76,7 @@ serde_yaml_ng = "0.10.0"
 
 # Concurrency
 dashmap = "6"
-rusqlite = { version = "=0.40.2", default-features = false, features = ["column_metadata"] }
+rusqlite = { version = "=0.42.0", default-features = false, features = ["column_metadata"] }
 
 # Errors
 thiserror = "1"
@@ -100,7 +100,7 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 zeroize = "=1.9.0"
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
 # Zip package handling for Lambda code (deflate only; no bzip2/zstd to keep the footprint small)
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 
 # JWT / OIDC token validation (real RSA signature verification + JWKS)
 jsonwebtoken = "=11.1.0"
@@ -147,12 +147,6 @@ locallycloud-architecture = { path = "crates/architecture" }
 
 [profile.release]
 strip = "symbols"
-
-[profile.dev.package.rsa]
-opt-level = 3
-
-[profile.dev.package.num-bigint-dig]
-opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3

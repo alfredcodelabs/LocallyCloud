@@ -70,7 +70,7 @@ def dependency_license(package, relative):
 
 licenses = [
     root / 'LICENSE.md', work / 'source/source/LICENSE', work / 'source/source/NOTICE',
-    dependency_license('libsqlite3-sys', 'sqlcipher/LICENSE'),
+    dependency_license('sqlcipher-src', 'sqlcipher/LICENSE-sqlcipher'),
     dependency_license('openssl-src', 'openssl/LICENSE.txt'),
 ]
 with (output / f'{name}.LICENSES.txt').open('a') as destination:

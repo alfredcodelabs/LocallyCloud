@@ -1,0 +1,430 @@
+--- a/crates/storage-sqlite/src/data/vector_index.rs
++++ b/crates/storage-sqlite/src/data/vector_index.rs
+@@ -279,7 +279,7 @@
+     if let Some(source) = old_item.or(new_item) {
+         let binds = base_key_binds(source, base_key_schema, attr_defs)?;
+         let sql = format!("DELETE FROM {vec_table} WHERE {where_clause}");
+-        let mut q = sqlx::query(&sql);
++        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+         for b in binds {
+             q = super::bind_bound!(q, b);
+         }
+@@ -400,7 +400,7 @@
+         cols.join(", ")
+     );
+     let key_binds = base_key_binds(item, base_key_schema, attr_defs)?;
+-    let mut q = sqlx::query(&sql).bind(part);
++    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(part);
+     for b in key_binds {
+         q = super::bind_bound!(q, b);
+     }
+@@ -487,7 +487,7 @@
+     let after_rowid = after_rowid.unwrap_or(0);
+     let sql =
+         format!("SELECT rowid, item_data FROM {base_table} WHERE rowid > ? ORDER BY rowid LIMIT ?");
+-    let rows: Vec<(i64, String)> = sqlx::query_as(&sql)
++    let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+         .bind(after_rowid)
+         .bind(limit)
+         .fetch_all(&mut **tx)
+--- a/crates/storage-sqlite/src/data/ddl.rs
++++ b/crates/storage-sqlite/src/data/ddl.rs
+@@ -91,7 +91,7 @@
+             )
+         };
+ 
+-        sqlx::query(&ddl)
++        sqlx::query(sqlx::AssertSqlSafe(ddl.as_str()))
+             .execute(&mut **tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -153,7 +153,7 @@
+             col_defs.join(",\n    "),
+             pk_cols.join(", ")
+         );
+-        sqlx::query(&ddl)
++        sqlx::query(sqlx::AssertSqlSafe(ddl.as_str()))
+             .execute(&mut **tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -162,7 +162,7 @@
+         // search off the full table when a HASH element is declared.
+         let part_idx =
+             format!("CREATE INDEX \"_vidx_part_{table_id}_{index_id}\" ON {vec_table} (part)");
+-        sqlx::query(&part_idx)
++        sqlx::query(sqlx::AssertSqlSafe(part_idx.as_str()))
+             .execute(&mut **tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -188,7 +188,7 @@
+         index_id: &str,
+     ) -> Result<(), StorageError> {
+         let vec_table = vector_table_name(table_id, index_id);
+-        sqlx::query(&format!("DROP TABLE IF EXISTS {vec_table}"))
++        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {vec_table}")))
+             .execute(pool)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -208,7 +208,7 @@
+         .map_err(|e| StorageError::Internal(e.to_string()))?;
+         for name in names {
+             // Names come from sqlite_master, not from user input, and are quoted.
+-            sqlx::query(&format!("DROP TABLE IF EXISTS \"{name}\""))
++            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS \"{name}\"")))
+                 .execute(&mut **tx)
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -222,7 +222,7 @@
+         table_id: &str,
+     ) -> Result<(), StorageError> {
+         let ddb_table = data_table_name(table_id);
+-        sqlx::query(&format!("DROP TABLE IF EXISTS {ddb_table}"))
++        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {ddb_table}")))
+             .execute(&mut **tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -273,7 +273,7 @@
+             col_defs.join(",\n    "),
+             pk_cols.join(", ")
+         );
+-        sqlx::query(&ddl)
++        sqlx::query(sqlx::AssertSqlSafe(ddl.as_str()))
+             .execute(&mut **tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -291,7 +291,7 @@
+                 "CREATE INDEX \"idx_order_{index_id}\" ON {idx_table} ({})",
+                 order_cols.join(", ")
+             );
+-            sqlx::query(&order_idx)
++            sqlx::query(sqlx::AssertSqlSafe(order_idx.as_str()))
+                 .execute(&mut **tx)
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -315,7 +315,7 @@
+                 "CREATE INDEX \"idx_base_key_{index_id}\" ON {idx_table} ({})",
+                 base_key_cols.join(", ")
+             );
+-            sqlx::query(&base_key_idx)
++            sqlx::query(sqlx::AssertSqlSafe(base_key_idx.as_str()))
+                 .execute(&mut **tx)
+                 .await
+                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -330,7 +330,7 @@
+         index_id: &str,
+     ) -> Result<(), StorageError> {
+         let idx_table = index_table_name(index_id);
+-        sqlx::query(&format!("DROP TABLE IF EXISTS {idx_table}"))
++        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {idx_table}")))
+             .execute(&mut **tx)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+@@ -424,10 +424,10 @@
+         &self,
+         table_id: &str,
+     ) -> Result<Vec<extenddb_core::types::VectorIndexKeyInfo>, StorageError> {
+-        let rows: Vec<crate::table_helpers::VectorIndexRow> = sqlx::query_as(&format!(
++        let rows: Vec<crate::table_helpers::VectorIndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+             "SELECT {} FROM vector_indexes WHERE table_id = ? ORDER BY index_name",
+             crate::table_helpers::VECTOR_INDEX_COLUMNS
+-        ))
++        )))
+         .bind(table_id)
+         .fetch_all(&self.pool)
+         .await
+--- a/crates/storage-sqlite/src/backup.rs
++++ b/crates/storage-sqlite/src/backup.rs
+@@ -140,7 +140,7 @@
+         match data {
+             SnapshotData::Current => {
+                 let source = data_table_name(&description.table_id);
+-                sqlx::query(&format!("INSERT INTO backup_items(backup_arn,pk,sk,item_data) SELECT ?,pk,NULL,item_data FROM {source}"))
++                sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO backup_items(backup_arn,pk,sk,item_data) SELECT ?,pk,NULL,item_data FROM {source}")))
+                     .bind(&arn).execute(&mut **tx).await.map_err(crate::history::storage)?;
+             }
+             SnapshotData::Historical(at) => {
+--- a/crates/storage-sqlite/src/data/index.rs
++++ b/crates/storage-sqlite/src/data/index.rs
+@@ -424,7 +424,7 @@
+         where_parts.join(" AND ")
+     );
+ 
+-    let mut query = sqlx::query(&sql).bind(base_pk_text);
++    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(base_pk_text);
+     for &(sk_name, sk_type) in base_sks {
+         // Bind a value for every placeholder, mirroring insert_index_row_multi:
+         // a missing sort-key attribute binds an empty string rather than
+@@ -493,7 +493,7 @@
+         cols.join(", ")
+     );
+ 
+-    let mut query = sqlx::query(&sql);
++    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+     for v in values {
+         query = super::bind_bound!(query, v);
+     }
+--- a/crates/storage-sqlite/src/data/put_item.rs
++++ b/crates/storage-sqlite/src/data/put_item.rs
+@@ -189,7 +189,7 @@
+             row.map(|(v,)| v)
+         } else {
+             let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
+-            let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
++            let row: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+                 .bind(pk_text.as_ref())
+                 .fetch_optional(&self.pool)
+                 .await
+--- a/crates/storage-sqlite/src/data/query.rs
++++ b/crates/storage-sqlite/src/data/query.rs
+@@ -159,7 +159,7 @@
+     values: Vec<BoundValue>,
+     pool: &sqlx::SqlitePool,
+ ) -> Result<Vec<serde_json::Value>, StorageError> {
+-    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
++    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(sql));
+     for v in values {
+         query = match v {
+             BoundValue::Text(s) => query.bind(s),
+--- a/crates/storage-sqlite/src/data/query_scan.rs
++++ b/crates/storage-sqlite/src/data/query_scan.rs
+@@ -373,7 +373,7 @@
+             "SELECT rowid FROM {ddb_table} WHERE {}",
+             conditions.join(" AND ")
+         );
+-        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
++        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql.as_str()));
+         for bound in binds {
+             query = super::bind_bound!(query, bound);
+         }
+--- a/crates/storage-sqlite/src/data/tx_helpers.rs
++++ b/crates/storage-sqlite/src/data/tx_helpers.rs
+@@ -51,7 +51,7 @@
+         row.map(|(v,)| v)
+     } else {
+         let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
+-        let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
++        let row: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+             .bind(pk_text.as_ref())
+             .fetch_optional(&mut **tx)
+             .await
+@@ -104,7 +104,7 @@
+             "INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?) \
+              ON CONFLICT (pk) DO UPDATE SET item_data = excluded.item_data"
+         );
+-        sqlx::query(&sql)
++        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+             .bind(pk_text.as_ref())
+             .bind(&item_json)
+             .execute(&mut **tx)
+@@ -138,7 +138,7 @@
+         bind_sk_only_execute!(&sql, pk_text.as_ref(), &sk, &mut **tx)?;
+     } else {
+         let sql = format!("DELETE FROM {ddb_table} WHERE pk = ?");
+-        sqlx::query(&sql)
++        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+             .bind(pk_text.as_ref())
+             .execute(&mut **tx)
+             .await
+--- a/crates/storage-sqlite/src/delete_table.rs
++++ b/crates/storage-sqlite/src/delete_table.rs
+@@ -22,10 +22,10 @@
+     ) -> Result<TableDescription, StorageError> {
+         Self::validate_account_id(account_id)?;
+ 
+-        let row: Option<TableRow> = sqlx::query_as(&format!(
++        let row: Option<TableRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+             "SELECT {TABLE_COLUMNS} FROM tables \
+              WHERE account_id = ? AND table_name = ? AND table_status IN ('ACTIVE', 'CREATING')"
+-        ))
++        )))
+         .bind(account_id)
+         .bind(&input.table_name)
+         .fetch_optional(&self.pool)
+@@ -37,9 +37,9 @@
+             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
+         }
+ 
+-        let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
++        let index_rows: Vec<IndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
+-        ))
++        )))
+         .bind(&row.table_id)
+         .fetch_all(&self.pool)
+         .await
+--- a/crates/storage-sqlite/src/history.rs
++++ b/crates/storage-sqlite/src/history.rs
+@@ -344,9 +344,9 @@
+                     .map(|(_, kind)| format!("hex(CAST({} AS BLOB))", sk_column(kind)))
+                     .unwrap_or_else(|| "''".into());
+                 let source = data_table_name(&description.table_id);
+-                sqlx::query(&format!(
++                sqlx::query(sqlx::AssertSqlSafe(format!(
+                     "INSERT INTO lc_pitr_versions SELECT ?,pk,{sk},?,item_data FROM {source}"
+-                ))
++                )))
+                 .bind(&description.table_id)
+                 .bind(at)
+                 .execute(&mut *tx)
+--- a/crates/storage-sqlite/src/table_helpers.rs
++++ b/crates/storage-sqlite/src/table_helpers.rs
+@@ -137,9 +137,9 @@
+         account_id: &str,
+         table_name: &str,
+     ) -> Result<TableDescription, StorageError> {
+-        let row: Option<TableRow> = sqlx::query_as(&format!(
++        let row: Option<TableRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ?"
+-        ))
++        )))
+         .bind(account_id)
+         .bind(table_name)
+         .fetch_optional(&mut *connection)
+@@ -148,17 +148,17 @@
+ 
+         let row = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
+ 
+-        let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
++        let index_rows: Vec<IndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
+-        ))
++        )))
+         .bind(&row.table_id)
+         .fetch_all(&mut *connection)
+         .await
+         .map_err(|e| StorageError::Internal(e.to_string()))?;
+ 
+-        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(&format!(
++        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+             "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
+-        ))
++        )))
+         .bind(&row.table_id)
+         .fetch_all(&mut *connection)
+         .await
+@@ -362,7 +362,7 @@
+         let sql = format!("SELECT item_data FROM {base_table} ORDER BY pk LIMIT ? OFFSET ?");
+         let mut offset: i64 = 0;
+         loop {
+-            let rows: Vec<(String,)> = sqlx::query_as(&sql)
++            let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+                 .bind(BATCH)
+                 .bind(offset)
+                 .fetch_all(&mut **tx)
+--- a/crates/storage-sqlite/src/update_table.rs
++++ b/crates/storage-sqlite/src/update_table.rs
+@@ -1211,7 +1211,7 @@
+ ) -> Result<(), StorageError> {
+     // `column` is a compile-time constant from this module, never user input.
+     let sql = format!("UPDATE tables SET {column} = ? WHERE account_id = ? AND table_name = ?");
+-    sqlx::query(&sql)
++    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+         .bind(value)
+         .bind(account_id)
+         .bind(table_name)
+--- a/crates/storage-sqlite/src/bootstrapper.rs
++++ b/crates/storage-sqlite/src/bootstrapper.rs
+@@ -396,9 +396,9 @@
+             let mut key_columns: Vec<(i64, String)> = sqlx::query_as::<
+                 _,
+                 (i64, String, String, i64, Option<String>, i64),
+-            >(&format!(
++            >(sqlx::AssertSqlSafe(format!(
+                 "PRAGMA table_info(\"_ddb_{table_id}\")"
+-            ))
++            )))
+             .fetch_all(&pool)
+             .await
+             .map_err(|e| OpError::Internal(format!("Cannot read columns of {table_name}: {e}")))?
+--- a/crates/storage-sqlite/src/catalog_store.rs
++++ b/crates/storage-sqlite/src/catalog_store.rs
+@@ -211,7 +211,7 @@
+             }
+             sql.push_str(" ORDER BY bucket");
+ 
+-            let mut q = sqlx::query_as::<_, DbMetricsRow>(&sql)
++            let mut q = sqlx::query_as::<_, DbMetricsRow>(sqlx::AssertSqlSafe(sql.as_str()))
+                 .bind(&start_str)
+                 .bind(&end_str);
+             if let Some(tn) = table_filter {
+--- a/crates/storage-sqlite/src/metadata.rs
++++ b/crates/storage-sqlite/src/metadata.rs
+@@ -255,7 +255,7 @@
+                      (CAST(json_extract(item_data, '{path}') AS INTEGER)) \
+                      WHERE json_extract(item_data, '{path}') IS NOT NULL"
+                 );
+-                sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
++                sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&self.pool).await.map_err(|e| {
+                     StorageError::Internal(format!("TTL index creation failed: {e}"))
+                 })?;
+             }
+@@ -294,7 +294,7 @@
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+             let index_name = format!("idx_ttl_{table_id}");
+-            sqlx::query(&format!("DROP INDEX IF EXISTS \"{index_name}\""))
++            sqlx::query(sqlx::AssertSqlSafe(format!("DROP INDEX IF EXISTS \"{index_name}\"")))
+                 .execute(&self.pool)
+                 .await
+                 .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
+@@ -333,7 +333,7 @@
+                  WHERE CAST(json_extract(item_data, ?) AS INTEGER) BETWEEN 1 AND ? \
+                  ORDER BY CAST(json_extract(item_data, ?) AS INTEGER) LIMIT ?"
+             );
+-            let rows: Vec<(String,)> = sqlx::query_as(&sql)
++            let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+                 .bind(&path)
+                 .bind(now)
+                 .bind(&path)
+@@ -363,9 +363,9 @@
+             let _writer = self.write_lock.lock().await;
+             let table_id = self.table_id_for(&account_id, &table_name).await?;
+             let data_table = data::data_table_name(&table_id);
+-            let (item_count, table_size): (i64, i64) = sqlx::query_as(&format!(
++            let (item_count, table_size): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                 "SELECT COUNT(*), COALESCE(SUM(length(item_data)), 0) FROM {data_table}"
+-            ))
++            )))
+             .fetch_one(&self.pool)
+             .await
+             .map_err(|e| StorageError::Internal(e.to_string()))?;
+--- a/crates/storage-sqlite/src/vector_search.rs
++++ b/crates/storage-sqlite/src/vector_search.rs
+@@ -259,7 +259,7 @@
+             // not allocate proportionally to its size. This is the reason the
+             // row-per-vector layout was chosen over a packed blob per partition.
+             use futures::TryStreamExt;
+-            let mut stream = sqlx::query_as::<_, (Vec<u8>, String)>(&sql)
++            let mut stream = sqlx::query_as::<_, (Vec<u8>, String)>(sqlx::AssertSqlSafe(sql.as_str()))
+                 .bind(&partition)
+                 .fetch(&self.pool);
+ 
+--- a/crates/storage-sqlite/src/data/mod.rs
++++ b/crates/storage-sqlite/src/data/mod.rs
+@@ -145,7 +145,7 @@
+ /// Bind `pk` then a sort-key value, then `fetch_optional` a single JSON column.
+ macro_rules! bind_sk_fetch_optional {
+     ($sql:expr, $pk:expr, $sk:expr, $executor:expr) => {{
+-        let __q = sqlx::query_as::<_, (serde_json::Value,)>($sql).bind($pk);
++        let __q = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(($sql).as_str())).bind($pk);
+         let __q = match crate::data::sk_bound($sk) {
+             crate::data::BoundValue::Text(s) => __q.bind(s),
+             crate::data::BoundValue::Blob(b) => __q.bind(b),
+@@ -159,7 +159,7 @@
+ /// Bind `pk`, a sort-key value, then `item_json`, and `execute`.
+ macro_rules! bind_sk_execute {
+     ($sql:expr, $pk:expr, $sk:expr, $item_json:expr, $executor:expr) => {{
+-        let __q = sqlx::query($sql).bind($pk);
++        let __q = sqlx::query(sqlx::AssertSqlSafe(($sql).as_str())).bind($pk);
+         let __q = match crate::data::sk_bound($sk) {
+             crate::data::BoundValue::Text(s) => __q.bind(s),
+             crate::data::BoundValue::Blob(b) => __q.bind(b),
+@@ -174,7 +174,7 @@
+ /// Bind `pk` then a sort-key value, and `execute` (no item payload).
+ macro_rules! bind_sk_only_execute {
+     ($sql:expr, $pk:expr, $sk:expr, $executor:expr) => {{
+-        let __q = sqlx::query($sql).bind($pk);
++        let __q = sqlx::query(sqlx::AssertSqlSafe(($sql).as_str())).bind($pk);
+         let __q = match crate::data::sk_bound($sk) {
+             crate::data::BoundValue::Text(s) => __q.bind(s),
+             crate::data::BoundValue::Blob(b) => __q.bind(b),

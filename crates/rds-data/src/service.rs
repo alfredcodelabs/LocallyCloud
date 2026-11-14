@@ -1544,7 +1544,6 @@ fn execute_statement(
     }
     let columns = statement
         .column_names()
-        .into_iter()
         .map(|name| ColumnMetadata {
             label: name.to_owned(),
             name: name.to_owned(),

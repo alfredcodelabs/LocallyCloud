@@ -99,7 +99,7 @@ pub fn validate_zip(zip_bytes: &[u8]) -> Result<(), LambdaError> {
         if entry.enclosed_name().is_none() {
             return Err(LambdaError::InvalidParameterValue(format!(
                 "Zip entry escapes the archive root: {}",
-                entry.name()
+                String::from_utf8_lossy(entry.name_raw())
             )));
         }
         if entry.is_dir() {
@@ -135,7 +135,7 @@ fn extract_zip_into(zip_bytes: &[u8], dest: &Path) -> Result<(), LambdaError> {
             None => {
                 return Err(LambdaError::InvalidParameterValue(format!(
                     "Zip entry escapes the archive root: {}",
-                    entry.name()
+                    String::from_utf8_lossy(entry.name_raw())
                 )))
             }
         };

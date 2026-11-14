@@ -80,6 +80,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_sqlite_includes_the_database_page_size_security_fix() {
+        // SAFETY: SQLite returns the immutable version number of the linked library.
+        assert!(unsafe { sqlite::sqlite3_libversion_number() } >= 3_054_001);
+    }
+
+    #[test]
     fn raw_keys_use_sqlciphers_raw_format_and_legacy_files_keep_the_passphrase_bytes() {
         assert_eq!(
             &*argument(&[7; 32], KeyEncoding::LegacyPassphrase),

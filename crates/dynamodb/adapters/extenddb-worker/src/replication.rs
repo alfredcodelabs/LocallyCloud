@@ -384,10 +384,10 @@ impl Replication {
             sqlx::query("INSERT OR IGNORE INTO lc_replication_deliveries(change_seq,target) SELECT seq,? FROM lc_replication_changes WHERE global_id=?")
                 .bind(added).bind(global_id).execute(&mut *tx).await.map_err(storage)?;
         }
-        let frontier: i64 = sqlx::query_scalar(&format!(
+        let frontier: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE(MAX(rowid),0) FROM {}",
             base_table(&table_id)?
-        ))
+        )))
         .fetch_one(&mut *tx)
         .await
         .map_err(storage)?;
@@ -706,10 +706,10 @@ impl Replication {
         let mut changes = Vec::new();
         let mut bytes = 0;
         for _ in 0..limit {
-            let row = sqlx::query(&format!(
+            let row = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT rowid,item_data FROM {} WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT 1",
                 base_table(&table_id)?
-            ))
+            )))
             .bind(next)
             .bind(frontier)
             .fetch_optional(&mut *tx)
@@ -758,10 +758,10 @@ impl Replication {
             bytes += json.len();
             next = row.try_get(0).map_err(storage)?;
         }
-        let more: bool = sqlx::query_scalar(&format!(
+        let more: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT EXISTS(SELECT 1 FROM {} WHERE rowid>? AND rowid<=?)",
             base_table(&table_id)?
-        ))
+        )))
         .bind(next)
         .bind(frontier)
         .fetch_one(&mut *tx)

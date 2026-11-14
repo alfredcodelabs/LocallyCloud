@@ -16,7 +16,7 @@ System packages use the distribution's package manager. Installing or removing t
 From the repository root, with these dependencies installed:
 
 - Rust 1.95.0 or later, including Cargo.
-- SQLite 3.53.4 or later, including development headers and the library.
+- SQLite 3.54.1 or later, including development headers and the library.
 - A C/C++ build toolchain, CMake, and pkg-config for native dependencies.
 - OpenSSL CLI for the key-generation example below.
 - AWS CLI v2 for the usage examples, or an AWS SDK for your application.

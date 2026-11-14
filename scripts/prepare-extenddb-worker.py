@@ -20,7 +20,12 @@ PATCH = ROOT / 'crates/dynamodb/adapters/extenddb-worker/patches/0001-sqlite-tra
 PATCHES = (PATCH, PATCH.with_name('0002-sqlite-durable-backups.patch'),
            PATCH.with_name('0003-sqlite-migration-ttl-suspension.patch'),
            PATCH.with_name('0004-sqlite-point-in-time-history.patch'),
-           PATCH.with_name('0005-sqlite-native-pitr-import.patch'))
+           PATCH.with_name('0005-sqlite-native-pitr-import.patch'),
+           PATCH.with_name('0006-sqlite-security-dependencies.patch'),
+           PATCH.with_name('0007-sqlx-safe-query-migration.patch'),
+           PATCH.with_name('0008-sqlx-sqlcipher-shutdown.patch'))
+SQLX_VERSION = '0.9.0'
+SQLX_SHA256 = '488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c'
 MAX_COMPRESSED = 32 * 1024 * 1024
 MAX_EXPANDED = 128 * 1024 * 1024
 
@@ -44,10 +49,9 @@ def tree_digest(path):
     return h.hexdigest()
 
 
-def unpack(archive, destination):
+def unpack(archive, destination, prefix=f'extenddb-{COMMIT}'):
     """Never follow archive links; documentation symlinks are not build inputs."""
     total = 0
-    prefix = f'extenddb-{COMMIT}'
     with tarfile.open(archive, 'r:gz') as source:
         for count, member in enumerate(source, 1):
             if count > 4096:
@@ -85,7 +89,21 @@ def unpack(archive, destination):
                     remaining -= len(chunk)
 
 
-def prepare(directory, supplied_archive=None):
+def download(url, destination, checksum):
+    with urllib.request.urlopen(url, timeout=60) as response, destination.open('xb') as output:
+        if not response.geturl().startswith('https://'):
+            raise ValueError('source download requires HTTPS')
+        count = 0
+        while chunk := response.read(1024 * 1024):
+            count += len(chunk)
+            if count > MAX_COMPRESSED:
+                raise ValueError('source archive exceeds download limit')
+            output.write(chunk)
+    if digest(destination) != checksum:
+        raise ValueError('official source SHA-256 mismatch')
+
+
+def prepare(directory, supplied_archive=None, supplied_sqlx_archive=None):
     if directory.is_symlink():
         raise ValueError('preparation directory must not be a symlink')
     directory = directory.resolve()
@@ -96,7 +114,9 @@ def prepare(directory, supplied_archive=None):
     marker = directory / 'prepared.json'
     expected = {'commit': COMMIT, 'archive_sha256': ARCHIVE_SHA256,
                 'patch_sha256': digest(PATCH),
-                'patches': [{'name': patch.name, 'sha256': digest(patch)} for patch in PATCHES]}
+                'patches': [{'name': patch.name, 'sha256': digest(patch)} for patch in PATCHES],
+                'sqlx_sqlite': {'version': SQLX_VERSION, 'archive_sha256': SQLX_SHA256,
+                                'libsqlite3_sys': '0.40'}}
     if source.is_symlink() or marker.is_symlink():
         raise ValueError('prepared source and marker must not be symlinks')
     if source.exists():
@@ -111,15 +131,7 @@ def prepare(directory, supplied_archive=None):
             archive = supplied_archive
             if archive is None:
                 archive = staging / 'upstream.tar.gz'
-                with urllib.request.urlopen(ARCHIVE_URL, timeout=60) as response, archive.open('xb') as output:
-                    if not response.geturl().startswith('https://'):
-                        raise ValueError('source download requires HTTPS')
-                    count = 0
-                    while chunk := response.read(1024 * 1024):
-                        count += len(chunk)
-                        if count > MAX_COMPRESSED:
-                            raise ValueError('source archive exceeds download limit')
-                        output.write(chunk)
+                download(ARCHIVE_URL, archive, ARCHIVE_SHA256)
             if not archive.is_file() or archive.stat().st_size > MAX_COMPRESSED or digest(archive) != ARCHIVE_SHA256:
                 raise ValueError('official ExtendDB source SHA-256 mismatch')
             tree = staging / 'source'
@@ -128,6 +140,24 @@ def prepare(directory, supplied_archive=None):
             environment = {name: value for name, value in os.environ.items() if not name.startswith('GIT_')}
             environment.update(GIT_CEILING_DIRECTORIES=str(tree.parent),
                                GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+            sqlx_archive = supplied_sqlx_archive
+            if sqlx_archive is None:
+                sqlx_archive = staging / 'sqlx-sqlite.crate'
+                download(f'https://static.crates.io/crates/sqlx-sqlite/sqlx-sqlite-{SQLX_VERSION}.crate',
+                         sqlx_archive, SQLX_SHA256)
+            if (not sqlx_archive.is_file() or sqlx_archive.stat().st_size > MAX_COMPRESSED
+                    or digest(sqlx_archive) != SQLX_SHA256):
+                raise ValueError('official SQLx source SHA-256 mismatch')
+            sqlx = tree / '.compat/sqlx-sqlite'
+            sqlx.mkdir(parents=True, mode=0o700)
+            unpack(sqlx_archive, sqlx, f'sqlx-sqlite-{SQLX_VERSION}')
+            manifest = sqlx / 'Cargo.toml'
+            original = 'version = ">=0.30.1, <0.38.0"'
+            contents = manifest.read_text()
+            if contents.count(original) != 1:
+                raise ValueError('SQLx SQLite compatibility patch no longer applies')
+            # Remove when upstream supports the SQLCipher release with SQLite >=3.54.
+            manifest.write_text(contents.replace(original, 'version = "0.40"') + '\n[workspace]\n')
             for patch in PATCHES:
                 for arguments in (['--check'], []):
                     subprocess.run(['git', 'apply', *arguments, str(patch)], cwd=tree,
@@ -140,7 +170,8 @@ def prepare(directory, supplied_archive=None):
     config = directory / 'cargo-patch.toml'
     config.write_text('[patch."https://github.com/ExtendDB/extenddb"]\n' + ''.join(
         f'extenddb-{name} = {{ path = {json.dumps(str(source / "crates" / name))} }}\n'
-        for name in PACKAGES))
+        for name in PACKAGES) + '\n[patch.crates-io]\n' +
+        f'sqlx-sqlite = {{ path = {json.dumps(str(source / ".compat/sqlx-sqlite"))} }}\n')
     return config
 
 
@@ -149,9 +180,10 @@ def main():
     parser.add_argument('--directory', type=Path,
                         default=ROOT / 'compatibility-tests/.work/extenddb-worker-source')
     parser.add_argument('--archive', type=Path, help='Use the pinned archive offline')
+    parser.add_argument('--sqlx-archive', type=Path, help='Use the pinned SQLx archive offline')
     args = parser.parse_args()
     try:
-        config = prepare(args.directory, args.archive)
+        config = prepare(args.directory, args.archive, args.sqlx_archive)
     except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
         parser.exit(1, f'Cannot prepare ExtendDB source: {type(error).__name__}. Check the private directory, source checksum and patch compatibility.\n')
     print(config)

@@ -3,15 +3,15 @@ set -euo pipefail
 umask 022
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SQLITE_TARBALL="${1:?usage: build-deb.sh sqlite-autoconf-3530400.tar.gz}"
-SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
+SQLITE_TARBALL="${1:?usage: build-deb.sh sqlite-autoconf-3540100.tar.gz}"
+SQLITE_SHA256=926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e
 BUILD_DIR="$ROOT/target/debian-package"
 DEB_ARCH="$(dpkg --print-architecture)"
 case "$DEB_ARCH" in
   amd64|arm64) ;;
   *) echo "Unsupported architecture $DEB_ARCH; amd64 or arm64 required" >&2; exit 1 ;;
 esac
-SQLITE_PREFIX="$BUILD_DIR/sqlite-3.53.4-$DEB_ARCH"
+SQLITE_PREFIX="$BUILD_DIR/sqlite-3.54.1-$DEB_ARCH"
 PACKAGE_VERSION="$(bash "$ROOT/scripts/package-version.sh" debian "${LOCALLYCLOUD_DEBIAN_REVISION:-1}")"
 
 printf '%s  %s\n' "$SQLITE_SHA256" "$SQLITE_TARBALL" | sha256sum -c -

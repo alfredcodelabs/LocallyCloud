@@ -76,7 +76,7 @@ If you fix only the package for an already published version, increment its revi
 
 ```sh
 # Debian, revision 2 of the same product version:
-LOCALLYCLOUD_DEBIAN_REVISION=2 bash packaging/debian/build-deb.sh /path/to/sqlite-autoconf-3530400.tar.gz
+LOCALLYCLOUD_DEBIAN_REVISION=2 bash packaging/debian/build-deb.sh /path/to/sqlite-autoconf-3540100.tar.gz
 ```
 
 Keep revision 1 before the first publication.
@@ -124,7 +124,7 @@ The `.github/workflows/packages.yml` workflow runs on pull requests, pushes to `
 
 It validates version formats, tag matching and workspace versions; runs formatting, workspace tests and Clippy with packaged SQLite; and checks the real ExtendDB worker. Debian installation checks cover both architectures on all supported Debian/Ubuntu releases. Separate jobs check the Arch package and architecture review UI/MCP. Containers do not validate rootless OCI: retain the VM/WSL gate required by `AGENTS.md`.
 
-Debian is built natively on Debian 13 for `amd64` and `arm64` (GitHub `ubuntu-24.04` and `ubuntu-24.04-arm` runners) using the Rust version declared in Cargo.toml. SQLite 3.53.4 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. The `libc6` dependency is computed from the binary and must not exceed glibc 2.39, the oldest supported LTS. A follow-up job installs each `.deb` with `apt` on Debian 13, Ubuntu 24.04, and Ubuntu 26.04 and starts the server; releases wait for it. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories; the PKGBUILD also declares `aarch64` for Arch Linux ARM, which CI does not build yet.
+Debian is built natively on Debian 13 for `amd64` and `arm64` (GitHub `ubuntu-24.04` and `ubuntu-24.04-arm` runners) using the Rust version declared in Cargo.toml. SQLite 3.54.1 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. The `libc6` dependency is computed from the binary and must not exceed glibc 2.39, the oldest supported LTS. A follow-up job installs each `.deb` with `apt` on Debian 13, Ubuntu 24.04, and Ubuntu 26.04 and starts the server; releases wait for it. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories; the PKGBUILD also declares `aarch64` for Arch Linux ARM, which CI does not build yet.
 
 After saving and pushing the version and Cargo.lock changes:
 
