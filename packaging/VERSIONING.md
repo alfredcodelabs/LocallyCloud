@@ -5,7 +5,7 @@ The product version is chosen manually in `[workspace.package].version` in `Carg
 We use three components, `MAJOR.MINOR.PATCH`, with no leading zeros. Prerelease channels use `-alpha.N`, `-beta.N`, or `-rc.N`, with N starting at 1. The `v` prefix is used only for Git tags.
 
 Debian package versions retain `~` in their control metadata. GitHub Release
-asset names replace `~` with `.`, so the release workflow renames `.deb` files
+asset names replace `~` with `.`, so the release workflow renames affected files
 before calculating `SHA256SUMS`. For example, the public first-beta download is
 `locallycloud_0.1.0.beta.1-1_amd64.deb`, with internal version
 `0.1.0~beta.1-1`. This filename change does not change package contents or version
@@ -33,6 +33,22 @@ bash scripts/check-package-version.sh
 ```
 
 For a new version, edit Cargo.toml and update Cargo.lock with `cargo update --workspace --offline`. Run the checks before creating the tag. GitHub Actions requires the tag to match the output of `package-version.sh tag` and builds all artifacts from that commit. The local scripts do not publish releases or packages.
+
+## Local release checks
+
+Use cargo-audit 0.23.0, cargo-cyclonedx 0.5.10 and AWS CLI v2. These commands do not build the product:
+
+```sh
+bash scripts/check-dependencies.sh
+bash scripts/generate-sbom.sh crates/server/Cargo.toml /path/to/locallycloud.cdx.json
+python3 scripts/validate-upgrade.py --previous /path/to/previous/locallycloud --candidate target/release/locallycloud --work-dir /disk/new-upgrade-check
+```
+
+The upgrade probe uses private state: S3 versions, native DynamoDB, SQS and Logs
+in two regions, plus global IAM. It restarts the candidate and records binary hashes,
+startup time and memory in `report.json`; it does not certify OCI or other databases.
+SBOMs describe Rust dependencies. Native-library coverage and VM/OCI checks remain separate.
+Dependency advisories block publication; review applicability before adding exceptions.
 
 ## 0.1.1 release
 
@@ -121,7 +137,7 @@ git tag -a v0.1.1 -m "LocallyCloud 0.1.1"
 git push origin v0.1.1
 ```
 
-Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, the ExtendDB workers and notices, `components.json`, and `SHA256SUMS`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
+Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, the ExtendDB workers and notices, `components.json`, Rust SBOMs, `SHA256SUMS` and `provenance.sigstore.json`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
 
 No personal token or additional secrets are required: the workflow uses `GITHUB_TOKEN`, with write access only in the publishing job. Actions must be enabled in the repository. The workflow does not publish an APT repository or submit the recipe to AUR; those channels need their own configuration.
 

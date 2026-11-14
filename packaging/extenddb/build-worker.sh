@@ -13,6 +13,7 @@ case "$(uname -m)" in
 esac
 [[ "$(uname -s)" == Linux ]] || { echo 'Linux is required' >&2; exit 1; }
 command -v cargo-about >/dev/null || { echo 'cargo-about 0.8 is required' >&2; exit 1; }
+command -v cargo-cyclonedx >/dev/null || { echo 'cargo-cyclonedx 0.5.10 is required' >&2; exit 1; }
 mkdir -p "$WORK"
 SOURCE_ARGS=(--directory "$WORK/source")
 if [[ $# == 3 ]]; then SOURCE_ARGS+=(--archive "$(realpath "$3")"); fi
@@ -92,3 +93,5 @@ assert catalog['artifacts'][0]['binary']['size'] <= 128 * 1024 * 1024
 assert catalog['artifacts'][0]['notices']['size'] <= 2 * 1024 * 1024
 (output / f'extenddb-{arch}.json').write_text(json.dumps(catalog, indent=2) + '\n')
 PY
+
+bash "$ROOT/scripts/generate-sbom.sh" "$MANIFEST" "$OUTPUT/extenddb-$ARCH.cdx.json"

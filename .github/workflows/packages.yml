@@ -46,6 +46,25 @@ jobs:
           [[ "$rust" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
 
+  dependency-audit:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the dependency auditor
+        env:
+          RUST_VERSION: ${{ needs.version.outputs.rust }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          cargo +"$RUST_VERSION" install --locked cargo-audit@0.23.0
+      - name: Audit the server and optional worker
+        run: bash scripts/check-dependencies.sh
+
   architecture-review:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -69,7 +88,7 @@ jobs:
           node tools/architecture-review-mcp/test.mjs
 
   debian:
-    needs: [version, extenddb]
+    needs: [version, dependency-audit, extenddb]
     strategy:
       fail-fast: false
       matrix:
@@ -102,8 +121,10 @@ jobs:
           curl --fail --show-error --silent --location https://sh.rustup.rs -o /tmp/rustup-init.sh
           bash /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_VERSION" --component rustfmt --component clippy
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Install cargo-about for third-party license notices
-        run: cargo install --locked cargo-about@0.8.4
+      - name: Install license and SBOM tools
+        run: |
+          cargo install --locked cargo-about@0.8.4
+          cargo install --locked cargo-cyclonedx@0.5.10
       - name: Check formatting and workspace versions
         run: |
           cargo fmt --all -- --check
@@ -149,10 +170,14 @@ jobs:
           grep -Fq 'Real public SSE lifecycle:' /tmp/public-sse-test.log
           LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud --test dynamodb_migration --locked -- --nocapture 2>&1 | tee /tmp/native-pitr-migration-test.log
           grep -Fq 'Real native PITR migration: passed' /tmp/native-pitr-migration-test.log
+      - name: Generate the server Rust dependency inventory
+        run: bash scripts/generate-sbom.sh crates/server/Cargo.toml "target/debian-package/dist/locallycloud_$(bash scripts/package-version.sh debian)_${{ matrix.arch }}.cdx.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: package-debian-${{ matrix.arch }}
-          path: target/debian-package/dist/*.deb
+          path: |
+            target/debian-package/dist/*.deb
+            target/debian-package/dist/*.cdx.json
           if-no-files-found: error
 
   debian-install:
@@ -203,7 +228,7 @@ jobs:
             --catalog "$GITHUB_WORKSPACE/components/extenddb-$COMPONENT_ARCH.json" --work-dir /home/tester
 
   arch:
-    needs: version
+    needs: [version, dependency-audit]
     runs-on: ubuntu-24.04
     container: archlinux:base-devel
     timeout-minutes: 60
@@ -223,14 +248,23 @@ jobs:
           expected="locallycloud-$(bash ../../scripts/package-version.sh arch)-1-x86_64.pkg.tar.zst"
           test -f "$expected"
           pacman -U --noconfirm "$expected"
+      - name: Generate the server Rust dependency inventory
+        run: |
+          # shellcheck disable=SC2016
+          runuser -u builder -- bash -c '
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo install --locked cargo-cyclonedx@0.5.10
+            bash scripts/generate-sbom.sh crates/server/Cargo.toml "packaging/arch/locallycloud-$(bash scripts/package-version.sh arch)-1-x86_64.cdx.json"'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: package-arch-x86_64
-          path: packaging/arch/locallycloud-*.pkg.tar.zst
+          path: |
+            packaging/arch/locallycloud-*.pkg.tar.zst
+            packaging/arch/*.cdx.json
           if-no-files-found: error
 
   extenddb:
-    needs: version
+    needs: [version, dependency-audit]
     strategy:
       fail-fast: false
       matrix:
@@ -254,6 +288,7 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup override set "$RUST_VERSION"
           cargo install --locked cargo-about@0.8.4
+          cargo install --locked cargo-cyclonedx@0.5.10
       - name: Build and verify the optional component
         env:
           CARGO_BUILD_JOBS: '2'
@@ -310,7 +345,7 @@ jobs:
         working-directory: dist
         run: |
           # GitHub replaces '~' in asset names; checksums must use the published names.
-          for package in *.deb; do
+          for package in *.deb *.cdx.json; do
             published_name="${package//\~/.}"
             if [[ "$package" != "$published_name" ]]; then
               mv -- "$package" "$published_name"
@@ -336,8 +371,16 @@ jobs:
               artifacts.append(artifact)
           catalog['artifacts'] = artifacts
           Path('components.json').write_text(json.dumps(catalog, indent=2) + '\n')
+          inventories = [(p.with_suffix('.cdx.json'), 'locallycloud') for p in Path('.').glob('*.deb')]
+          inventories += [(Path(p.name.removesuffix('.pkg.tar.zst') + '.cdx.json'), 'locallycloud') for p in Path('.').glob('*.pkg.tar.zst')]
+          inventories += [(Path(f'extenddb-{arch}.cdx.json'), 'locallycloud-extenddb-worker') for arch in ('x86_64', 'arm64')]
+          for path, component in inventories:
+              inventory = json.loads(path.read_text())
+              assert inventory['bomFormat'] == 'CycloneDX' and inventory['specVersion'] == '1.5'
+              assert inventory['metadata']['component']['name'] == component
+              assert inventory['components'], f'Empty dependency inventory: {path}'
           PY
-          sha256sum -- *.deb *.pkg.tar.zst locallycloud-extenddb-worker-linux-* components.json > SHA256SUMS
+          sha256sum -- *.deb *.pkg.tar.zst *.cdx.json locallycloud-extenddb-worker-linux-* components.json > SHA256SUMS
           sha256sum --check SHA256SUMS
       - name: Attest final release artifacts
         id: provenance
@@ -362,4 +405,4 @@ jobs:
           else
             flags+=(--latest)
           fi
-          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst locallycloud-extenddb-worker-linux-* components.json SHA256SUMS provenance.sigstore.json
+          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst *.cdx.json locallycloud-extenddb-worker-linux-* components.json SHA256SUMS provenance.sigstore.json
