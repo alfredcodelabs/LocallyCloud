@@ -67,6 +67,42 @@ and 256 KiB, with bounded scans, results and execution time.
 
 See [DuckDB preparation](SETUP.md#duckdb).
 
+### API Gateway endpoints and custom domains
+
+Use the dashboard's stage link, or these local URL formats:
+
+| API | URL |
+| --- | --- |
+| REST | `http://127.0.0.1:4566/restapis/<api-id>/<stage>/_user_request_/<path>` |
+| HTTP | `http://127.0.0.1:4566/execute-api/<api-id>/<stage>/<path>`; use literal `$default` for the default stage |
+
+API IDs resolve in the instance account and owning region. AWS-shaped `ApiEndpoint`
+metadata is not a local connection address.
+
+For REGIONAL REST or HTTP custom domains:
+
+1. Import a valid RSA certificate and its unencrypted PKCS#8 private key into ACM
+   in the API's region.
+2. Create the domain and base-path/API mapping through the CLI, CloudFormation or
+   supported SAM `HttpApi.Domain` configuration. HTTP and HTTPS share the configured port.
+3. Create a Route 53 Alias A/AAAA record using the domain's regional target and hosted-zone ID.
+   Set `LOCALLYCLOUD_ROUTE53_DNS_BIND=127.0.0.1:1053` and configure your OS resolver
+   to send only the development domain to that endpoint.
+
+For a self-signed certificate, use `--cacert`; keep certificate verification enabled.
+To test HTTPS while bypassing DNS:
+
+```sh
+curl --resolve api.example.test:4566:127.0.0.1 --cacert certificate.pem https://api.example.test:4566/shop/orders
+```
+
+LocallyCloud does not change OS DNS or certificate trust. ACM imports persist
+encrypted with the state key; detach domains before deleting their certificates.
+Use distinct domain names across accounts and regions. EDGE endpoints, automatic
+ACM issuance, certificate chains, mutual TLS and wildcard domains are unsupported.
+Authorizers and private-domain restrictions still apply; private custom domains
+have no TLS data plane.
+
 ### API Gateway mapping templates
 
 REST API integrations support a bounded VTL subset: `#set`, `#if`/`#elseif`/`#else`,
@@ -97,13 +133,8 @@ traffic are outside that reference. Validate additional consumer requirements se
 
 ## Persistence and limits
 
-Keep the state directory and KMS master key across restarts. Glue catalog entries,
-ECR images, EC2/VPC topology, ECS configuration and ALB configuration are persisted.
-Desired ECS services reconcile with fresh processes; EC2 instances restore as stopped
-and require explicit `StartInstances` (one ID per request). `StopInstances` is not
-implemented. Live sockets and health state are rebuilt.
-
-Persistence varies elsewhere; see the [restart reference](FAQ.md#will-my-resources-survive-a-restart).
+Keep the state directory and KMS master key across restarts. The [restart reference](FAQ.md#will-my-resources-survive-a-restart)
+lists persisted resources, process-local services and workload recovery behavior.
 Regional failover is manual. Local load results reflect your workstation rather than
 AWS scale, quotas or performance. See [throttling and backpressure](THROTTLING.md)
 for supported simulations and gaps. Use test data; LocallyCloud provides no AWS security,

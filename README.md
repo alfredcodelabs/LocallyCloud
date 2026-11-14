@@ -34,14 +34,7 @@ Use the filename you downloaded. **Run LocallyCloud as your regular user, withou
 `sudo`.** See [supported platforms](docs/PLATFORMS.md) and
 [installation options](docs/SETUP.md#installation), including user-only installation.
 
-To build from source, install Rust 1.95.0+, SQLite 3.53.4+, a C/C++ toolchain,
-CMake and pkg-config, then run:
-
-```sh
-cargo build --release --locked -p locallycloud
-```
-
-The executable is `target/release/locallycloud`.
+Prefer a source build? See [build requirements and commands](docs/SETUP.md#from-source).
 
 ## Quick start
 
@@ -117,13 +110,8 @@ One local endpoint for your AWS workflows.
 
 ## Configuration
 
-The default endpoint is `http://127.0.0.1:4566`; the default region is `us-east-1`.
-State is encrypted with the required `LOCALLYCLOUD_KMS_MASTER_KEY`. Keep the same
-key and state directory when restarting.
-
-The server starts without a compute backend. Executing Lambda, ECS or EC2 requires
-host runtime tools; RDS uses an explicitly installed PostgreSQL runtime pack. See [runtime dependencies](docs/SETUP.md#optional-runtime-dependencies)
-and the [environment variable reference](docs/SETUP.md#configuration).
+Install compute runtimes only for the workflows you use. See [host requirements](docs/SETUP.md#optional-runtime-dependencies)
+and the [settings reference](docs/SETUP.md#configuration).
 
 ## Documentation
 

@@ -14,7 +14,8 @@ Develop and test AWS application workflows locally, including serverless functio
 
 ### Which operating systems are supported?
 
-LocallyCloud runs on Linux. It is developed on Arch Linux `x86_64` and packaged as a `.deb` for Debian 13, Ubuntu 24.04 LTS and 26.04 LTS, and distributions based on them, on `amd64` and `arm64`. WSL 2 on Windows works with the same `.deb`. Native Windows and macOS are not supported; run LocallyCloud in a Linux virtual machine and forward its port to `127.0.0.1:4566` on the host. [Supported platforms](PLATFORMS.md) describes the support levels, the glibc 2.39 requirement, WSL 2 setup, and the virtual-machine setup.
+Linux, including supported WSL 2 distributions. On macOS or Windows without WSL,
+use a Linux VM. See the [platform and architecture matrix](PLATFORMS.md#support-levels).
 
 ### Do I need Docker?
 
@@ -22,7 +23,8 @@ No Docker daemon is required to run LocallyCloud. The server runs as a Rust bina
 
 ### Do I need Rust or SQLite when installing a package?
 
-Rust is needed to build from source, not to run an installed package. The Debian package includes SQLite in the binary. The Arch package uses SQLite from the system repositories and requires version 3.53.4 or later. A source build also requires SQLite 3.53.4 or later, its development files, and a native build toolchain.
+Packages do not need Rust. The `.deb` bundles SQLite; Arch uses the system library.
+See [source-build requirements](SETUP.md#from-source) if you compile it yourself.
 
 ### Can an LLM agent use LocallyCloud without administrator privileges?
 
@@ -30,15 +32,18 @@ Yes. Run the emulator as a regular user and use the `locallycloud` AWS profile f
 
 ### How do I uninstall it, and are my resources deleted?
 
-Stop the emulator, then remove the system package with `sudo apt remove locallycloud` or `sudo pacman -R locallycloud`. For a user-only installation, remove its executable and any dedicated extraction directory. User state, the master key, and AWS profiles are preserved unless you delete them explicitly. The [uninstallation guide](SETUP.md#uninstallation) lists the exact default and custom data locations and optional cleanup steps.
+[Remove the program with its installation method](SETUP.md#uninstallation).
+State, master keys and AWS profiles remain until you explicitly remove them.
 
 ### Where is the dashboard?
 
-With the server running at its default address, open [http://127.0.0.1:4566/_locallycloud/ui](http://127.0.0.1:4566/_locallycloud/ui). The application-menu launcher opens this URL; it does not start the server.
+Open [the dashboard](http://127.0.0.1:4566/_locallycloud/ui) after starting the server.
+The application-menu launcher opens it but does not start the server.
 
-Select an account/profile and region to inspect resources. The active-service filter uses existing resources. Read-only explorers include DynamoDB items, S3 objects, Lambda, Step Functions, SQS, CloudWatch Logs, EventBridge buses/rules/targets, SNS topics/subscriptions, API Gateway APIs and CloudFormation stacks/resources/events. The **Threat modeling** view builds an OWASP threat model from a stack; see [Threat modeling](THREAT_MODELING.md). Lists offer continuation when another page exists; configured log and resource links help investigate errors. Resource status alone does not confirm an entire application workflow succeeded.
-
-In strict IAM mode, recent activity diagnostics also require `cloudtrail:LookupEvents` on `*`. A denied diagnostic view does not mean the emulator is offline; resource explorers still use their own service permissions.
+Select an account/profile and region to browse resources and logs. Resource status
+alone does not prove that an application workflow succeeded. In strict IAM mode,
+recent activity also needs `cloudtrail:LookupEvents` on `*`; denial of that view
+does not mean the server is offline.
 
 ### Can I threat-model my stack?
 
@@ -55,11 +60,9 @@ New S3 object bodies and uploaded parts use encrypted storage. Older objects rem
 
 ### What URL do I use to invoke API Gateway?
 
-Open the API in the dashboard and use the local link beside its stage. REST APIs use `http://127.0.0.1:4566/restapis/<api-id>/<stage>/_user_request_/<path>`; HTTP APIs use `http://127.0.0.1:4566/execute-api/<api-id>/<stage>/<path>`, including the literal `$default` stage. Existing API IDs resolve within the instance account and their owning region. AWS-shaped `ApiEndpoint` metadata is not a local connection address.
-
-REGIONAL REST and HTTP custom domains use ACM certificates, TLS SNI and their base-path/API mappings. Import a valid RSA certificate and its unencrypted PKCS#8 private key into ACM in the API region, then create the domain and mapping through the AWS CLI, CloudFormation or supported SAM `HttpApi.Domain` configuration. HTTP and HTTPS share the configured port (default `4566`); invoke `https://api.example.test:4566/shop/orders`. For a local self-signed certificate, configure client trust, for example `curl --cacert certificate.pem https://api.example.test:4566/shop/orders`; do not disable certificate validation. Imported certificates and their private keys are stored encrypted in the state database and survive a restart with the same master key. Associated certificates cannot be deleted until their domains are removed.
-
-Create a Route 53 Alias A/AAAA record using the domain’s regional target and hosted-zone ID. To serve these records locally, start with `LOCALLYCLOUD_ROUTE53_DNS_BIND=127.0.0.1:1053` and configure your operating-system resolver to send only your development domain to that DNS endpoint. LocallyCloud does not change system DNS or certificate trust. A temporary `curl --resolve api.example.test:4566:127.0.0.1 --cacert certificate.pem https://api.example.test:4566/shop/orders` checks HTTPS but bypasses DNS. Use distinct custom domain names across accounts and regions; duplicate bindings on the single listener are rejected. EDGE endpoints, automatic ACM issuance, certificate chains, mutual TLS and wildcard custom domains are not implemented. API authorizers and private-domain restrictions still apply; private custom domains do not provide this TLS data plane.
+Open the API in the dashboard and copy its stage link. See [local API endpoints
+and custom domains](SERVICES.md#api-gateway-endpoints-and-custom-domains) for URL
+formats, HTTPS and DNS setup.
 
 ### Do I need to include the endpoint and port in every command?
 
@@ -69,14 +72,8 @@ profile, then use `aws --profile locallycloud <service> <command>`. See
 
 ### Can I make LocallyCloud the default for my terminal?
 
-Yes:
-
-```sh
-export AWS_PROFILE=locallycloud
-aws s3 ls
-```
-
-With this profile selected, you do not need `--profile` or `--endpoint-url`. You can also use `[default]` in both AWS files for commands that do not select a named profile. That changes the default destination of requests using that configuration; a named profile keeps local and other environments easy to select separately.
+Run `export AWS_PROFILE=locallycloud`. Requests then use the saved endpoint and
+credentials without `--profile`. See [profile setup](SETUP.md#local-aws-profile).
 
 ### Do I need real AWS credentials?
 
@@ -84,15 +81,17 @@ The quick start uses local `test` credentials with the default permissive IAM mo
 
 ### Why does a command ignore the profile endpoint?
 
-Check for an explicit `--endpoint-url`, an `AWS_ENDPOINT_URL` or service-specific endpoint variable, and service-specific endpoints in AWS config. Higher-priority endpoint settings can override the profile's global endpoint. `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true` disables configured endpoints. Use a dedicated terminal with those overrides cleared when testing the profile.
-
-AWS documents [endpoint configuration and precedence](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-endpoints.html). Selecting a profile configures the client; it does not start LocallyCloud or change the server's listening port.
+An explicit endpoint, environment variable or service-specific setting may override
+it. Check [profile precedence](SETUP.md#local-aws-profile). Selecting a profile
+configures the client; it does not start the server or change its listening port.
 
 ## Compatibility and services
 
 ### Is LocallyCloud compatible with my AWS SDK or LocalStack setup?
 
-AWS CLI and SDK clients can target the local endpoint for implemented AWS operations. Some `LOCALSTACK_*` configuration aliases and the `/_localstack/health` route are accepted. Plugins that depend on additional LocalStack-specific APIs may need changes. Compatibility depends on the operations your application uses; a local result should still be validated on AWS.
+AWS CLI and SDK clients can use the local endpoint for implemented operations.
+See [compatibility scope](SERVICES.md#tool-compatibility) for LocalStack aliases
+and plugin limitations.
 
 ### Can I use Terraform, Serverless Framework, or AWS SAM?
 
@@ -155,7 +154,9 @@ Minimal Debian installations may lack the user D-Bus session needed by the curre
 sudo apt install crun dbus-user-session
 ```
 
-Log out and log back in, or reboot, and verify the user session with `systemctl --user status dbus`. The host must also delegate cgroup v2 memory control to that session. Start LocallyCloud without `sudo`. The `.deb` recommends `dbus-user-session`, but APT may skip it, including when its dependencies require upgrading preinstalled libraries on a minimal image. Install it explicitly with the command above. `crun` is never installed automatically. On WSL 2, systemd must also be enabled; see [Supported platforms](PLATFORMS.md#wsl-2).
+Log out and back in, then check `systemctl --user status dbus`. Run LocallyCloud
+without `sudo` in a session with delegated cgroup v2 memory control. APT may skip
+recommended packages, so install them explicitly. For WSL, [enable systemd](PLATFORMS.md#wsl-2).
 
 ### Why does an API Gateway mapping return 500 before invoking its backend?
 
@@ -170,9 +171,9 @@ an empty request body; LocallyCloud does not replace it with `{}`.
 
 ### RDS cannot start a PostgreSQL database. What is missing?
 
-Install the runtime with `locallycloud runtime install postgres18` and check the [rootless OCI prerequisites](SETUP.md#optional-runtime-dependencies). PostgreSQL 18 is the default; packs for 16 and 17 are also supported. A host PostgreSQL installation is not required. To use one explicitly, set `LOCALLYCLOUD_PG_BIN_DIR` to a `bin` directory containing matching versions of `initdb`, `pg_ctl`, `postgres`, `psql` and `pg_basebackup` (16 or later).
-
-LocallyCloud starts its own databases; RDS Data API uses the same runtime and data.
+Install its pack with `locallycloud runtime install postgres18` and check the
+[OCI requirements and optional host-toolchain override](SETUP.md#optional-runtime-dependencies).
+RDS Data API uses the same runtime and databases.
 
 ### Will my resources survive a restart?
 
@@ -191,7 +192,7 @@ These survive a restart with the same database and master key:
 - Glue catalog databases and tables.
 - ECR repositories and stored images, EC2/VPC topology, ECS clusters/task definitions/services, and ALB configuration.
 
-Interrupted Step Functions executions become `ABORTED`; they are not automatically replayed. ECS desired services reconcile with new processes and rebuilt network leases; interrupted standalone tasks are not replayed. EC2 instances that were not terminated restore as stopped, retaining their configured primary ENI and private IP. Use `StartInstances` with one instance ID per request to start them explicitly. ALB listeners and target health are rebuilt. See [recovery behavior and limits](SERVICES.md#persistence-and-limits).
+Interrupted Step Functions executions become `ABORTED`; they are not automatically replayed. ECS desired services reconcile with new processes and rebuilt network leases; interrupted standalone tasks are not replayed. EC2 instances that were not terminated restore as stopped, retaining their configured primary ENI and private IP. Use `StartInstances` with one instance ID per request to start them explicitly; `StopInstances` is not implemented. ALB listeners and target health are rebuilt.
 
 Cognito user pools, Route 53, CloudFront, WAF v2, CloudTrail, X-Ray, Athena, ARC, and Region Switch resources are still process-local. Recreate or reconcile them after a restart before using resources that depend on them.
 
@@ -233,9 +234,9 @@ Use test data and remove credentials, tokens, signatures, master keys, and sensi
 
 ### Where do packages come from, and how are versions named?
 
-The GitHub Actions workflow builds `.deb` packages for `amd64` and `arm64` and an Arch package for `x86_64`, installs each `.deb` with `apt` on Debian 13, Ubuntu 24.04, and Ubuntu 26.04, and publishes the packages with `SHA256SUMS` when a matching Git tag passes those checks. Alpha, beta, and rc tags publish prereleases. AUR and an APT repository need separate publication setup; they are not automatically populated by the workflow.
-
-For example, `v0.1.0-beta.1` is a beta tag and `v0.1.0` has no prerelease suffix. See [Versioning and packages](../packaging/VERSIONING.md) for package formats, checksums, and release steps. Beta releases should be found through the releases list or their specific tag, rather than `/releases/latest`.
+Tagged releases publish packages to [GitHub Releases](https://github.com/alfredcodelabs/LocallyCloud/releases)
+after the build and installation checks pass. Alpha/beta/rc tags are prereleases;
+AUR and APT publication are separate. See [versioning and release checks](../packaging/VERSIONING.md).
 
 ### Where can I find the license?
 

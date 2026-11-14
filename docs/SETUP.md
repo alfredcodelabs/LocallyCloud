@@ -29,13 +29,16 @@ The executable is `target/release/locallycloud`. Continue with [Quick start](../
 
 ### Debian and Ubuntu package (`.deb`)
 
-The `.deb` supports Debian 13, Ubuntu 24.04 LTS and 26.04 LTS, distributions based on them (such as Linux Mint or Pop!_OS), and WSL 2 distributions based on them. Releases provide one package per architecture: `amd64` for Intel and AMD processors, and `arm64` for ARM processors. The package requires glibc 2.39 or later; older releases such as Ubuntu 22.04 are not supported, and `apt` refuses to install the package there. When a tagged release is available, download the `.deb` for your architecture (`dpkg --print-architecture` shows it). From the download directory:
+Choose `amd64` or `arm64` from [GitHub Releases](https://github.com/alfredcodelabs/LocallyCloud/releases);
+`dpkg --print-architecture` shows your architecture. Check the [supported distributions
+and glibc baseline](PLATFORMS.md#support-levels). Install the downloaded file:
 
 ```sh
 sudo apt install ./locallycloud_0.1.1-1_amd64.deb
 ```
 
-Use the filename for the version and architecture you downloaded. The package includes SQLite and installs its required system libraries through `apt`; Rust and a separate SQLite installation are not needed. It recommends `dbus-user-session`, but APT can leave recommendations uninstalled. Install it explicitly when using OCI compute. The installed command is `locallycloud`.
+The package bundles SQLite and resolves system dependencies through `apt`. Rust is
+not required. For compute, check the [optional runtime requirements](#optional-runtime-dependencies).
 
 ### Arch Linux package
 
@@ -45,7 +48,8 @@ When a tagged release is available, download its `.pkg.tar.zst` for Arch Linux `
 sudo pacman -U ./locallycloud-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
-Use the filename for the version you downloaded. The package requires SQLite 3.53.4 or later from the Arch repositories. The installed command is `locallycloud`. On Arch Linux ARM (`aarch64`), build the package from a source checkout with `makepkg` in `packaging/arch`; that platform is supported on a best-effort basis.
+Arch uses SQLite from its repositories. For Arch Linux ARM, build with `makepkg`
+in `packaging/arch`; see [support levels](PLATFORMS.md#support-levels).
 
 GitHub Actions builds both package formats. The [AUR recipe](../packaging/aur/PKGBUILD) and [signed APT repository tooling](../packaging/apt/README.md) are prepared, but those distribution channels are not yet published. Download packages from [GitHub Releases](https://github.com/alfredcodelabs/LocallyCloud/releases). See the [packaging and release guide](../packaging/VERSIONING.md).
 
@@ -68,9 +72,10 @@ ln -s "$HOME/.local/opt/locallycloud/usr/bin/locallycloud" "$HOME/.local/bin/loc
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Use the filename for your downloaded release and choose one installation method. Extraction does not resolve dependencies or install desktop integration. This user-only installation is not managed by `apt` or `pacman`. Add `~/.local/bin` to your shell's `PATH` if it is not already there.
-
-An agent can then start `locallycloud`, set up the `locallycloud` AWS profile, and use AWS CLI, SDKs, or HTTP requests under the same user. Host preparation for optional features may still need administrator access: installing dependencies or enabling rootless user namespaces and cgroup delegation. Rootless OCI execution depends on the host's kernel and security configuration; access to port 4566 itself does not require root.
+Use your downloaded filename. Extraction does not resolve dependencies, install
+desktop integration or register the program with a package manager. Keep
+`~/.local/bin` in your `PATH`. Preparing optional host tools and OCI permissions
+may still require administrator access; see [runtime requirements](#optional-runtime-dependencies).
 
 ## Optional runtime dependencies
 
@@ -133,7 +138,8 @@ aws_access_key_id = test
 aws_secret_access_key = test
 ```
 
-The `config` file uses `[profile locallycloud]`; the `credentials` file uses `[locallycloud]`. These are local test credentials. The profile name is independent of the emulator's current binary name.
+The section names differ: `[profile locallycloud]` in `config`, `[locallycloud]`
+in `credentials`. These are local test credentials.
 
 Select the profile for a request:
 
@@ -142,12 +148,10 @@ aws --profile locallycloud sts get-caller-identity
 aws --profile locallycloud s3 ls
 ```
 
-To make it the default for the current terminal:
+To select it for the current terminal:
 
 ```sh
 export AWS_PROFILE=locallycloud
-aws sts get-caller-identity
-aws s3 ls
 ```
 
 With `AWS_PROFILE` set, neither `--profile` nor `--endpoint-url` is needed. Alternatively, configure these same entries under `[default]` in both files to use them when no named profile is selected. This changes the default destination of AWS CLI requests in that configuration.

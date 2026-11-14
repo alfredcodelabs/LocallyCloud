@@ -14,9 +14,6 @@ ordering. Local build outputs and APT repository pool files retain `~`.
 | Release | Cargo | Git tag | Debian, revision 1 | Arch, pkgrel 1 |
 | --- | --- | --- | --- | --- |
 | First beta | `0.1.0-beta.1` | `v0.1.0-beta.1` | `0.1.0~beta.1-1` | `0.1.0beta.1-1` |
-| Second beta | `0.1.0-beta.2` | `v0.1.0-beta.2` | `0.1.0~beta.2-1` | `0.1.0beta.2-1` |
-| Third beta | `0.1.0-beta.3` | `v0.1.0-beta.3` | `0.1.0~beta.3-1` | `0.1.0beta.3-1` |
-| Fourth beta | `0.1.0-beta.4` | `v0.1.0-beta.4` | `0.1.0~beta.4-1` | `0.1.0beta.4-1` |
 | Release without a beta suffix | `0.1.0` | `v0.1.0` | `0.1.0-1` | `0.1.0-1` |
 | Subsequent patch | `0.1.1` | `v0.1.1` | `0.1.1-1` | `0.1.1-1` |
 
@@ -143,21 +140,12 @@ No personal token or additional secrets are required: the workflow uses `GITHUB_
 
 ### Repair the first beta checksum manifest
 
-The initial `v0.1.0-beta.1` release uploaded `.deb` assets whose names GitHub
-normalized, while `SHA256SUMS` retained the original `~` filenames. Package bytes
-and internal versions are correct. The permanent release fix calculates hashes
-after renaming the files to their public names.
+The first beta's checksum manifest used `~` where GitHub published `.`. Run
+**Repair release checksums** with tag `v0.1.0-beta.1` to verify the assets and
+replace only `SHA256SUMS`. Keep the tag and packages unchanged.
 
-To repair the existing release, merge `.github/workflows/release-checksums.yml`
-into the repository's default branch (`develop`), then run **Repair release
-checksums** in GitHub Actions with tag `v0.1.0-beta.1`. It downloads the published
-packages and manifest, verifies the original hashes using the public filenames,
-and replaces only `SHA256SUMS` using `GITHUB_TOKEN`. It preserves the tag and
-package assets. Do not rerun the package release job or move the published tag.
-
-The manual workflow must be present on the default branch to appear in the
-Actions UI. See [GitHub's manual workflow instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
-and [asset filename normalization](https://docs.github.com/en/rest/releases/assets#upload-a-release-asset).
+The [repair workflow](../.github/workflows/release-checksums.yml) must be on the
+repository's default branch to appear in Actions; see [manual workflow instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
 
 If a build fails, fix the issue before publishing a new tag; do not move tags that already have a release. Rerunning a workflow with an already published release will fail when attempting to create it, preventing silent replacement of its packages.
 
