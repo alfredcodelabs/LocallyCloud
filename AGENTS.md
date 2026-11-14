@@ -1,5 +1,8 @@
 # locallycloud — Agent & Architecture Guide
 
+Read and follow [RULES.md](RULES.md) for the task delivery and human review workflow.
+This guide defines the project's architecture and technical constraints.
+
 locallycloud is a native-Linux, high-fidelity local AWS emulator (LocalStack-style), written
 in Rust. It is a **standalone product**: a single binary that serves the AWS wire protocols on
 one port and runs compute in lightweight isolation — no JVM, no Docker daemon.
@@ -88,12 +91,12 @@ containers, and browser pages (via DNS rebinding) can reach it.
 
 ## AWS protocol map
 
-| Protocol     | Services                                                 | Routing key                 | Error shape               |
-| ------------ | -------------------------------------------------------- | --------------------------- | ------------------------- |
-| Query        | SNS, IAM, STS, CloudFormation, EC2, ELBv2, RDS           | `Action` + credential scope | XML                       |
-| JSON 1.0/1.1 | DynamoDB, SQS, Kinesis, Step Functions, SSM, EventBridge, KMS, Logs, CloudWatch, Cognito | `X-Amz-Target` | JSON `__type` |
-| REST JSON    | Lambda, API Gateway                                      | path + method               | JSON + `x-amzn-errortype` |
-| REST XML     | S3, Route 53, CloudFront                                 | host/path                   | XML                       |
+| Protocol     | Services                                                                                 | Routing key                 | Error shape               |
+| ------------ | ---------------------------------------------------------------------------------------- | --------------------------- | ------------------------- |
+| Query        | SNS, IAM, STS, CloudFormation, EC2, ELBv2, RDS                                           | `Action` + credential scope | XML                       |
+| JSON 1.0/1.1 | DynamoDB, SQS, Kinesis, Step Functions, SSM, EventBridge, KMS, Logs, CloudWatch, Cognito | `X-Amz-Target`              | JSON `__type`             |
+| REST JSON    | Lambda, API Gateway                                                                      | path + method               | JSON + `x-amzn-errortype` |
+| REST XML     | S3, Route 53, CloudFront                                                                 | host/path                   | XML                       |
 
 The table shows examples; `registry.rs` has the full list. The primary routing key is always the
 **SigV4 credential scope**; protocol-specific sources (`X-Amz-Target`, host/path, `Action`) are
@@ -211,17 +214,17 @@ derivatives through one `.deb` per architecture installed with `apt`.** macOS an
 WSL are served through a Linux VM with a loopback port forward. `docs/PLATFORMS.md` is the
 user-facing source of truth for support levels; keep it in sync with this section.
 
-| | Arch Linux | Debian family (one `.deb`) |
-| --- | --- | --- |
-| Role | Native development platform; where features are built and tested first | Supported install target for `apt` users |
-| Version policy | **Always latest**: rolling repos, current Rust and libraries | Lowered to the oldest supported LTS so plain `apt` resolves every dependency |
-| Supported | current Arch (`x86_64`; `aarch64` on Arch Linux ARM, best effort) | Debian stable (13) and the current Ubuntu LTS releases (24.04, 26.04), plus derivatives built on them (Mint, Pop!_OS, elementary, …) and **WSL 2** distributions based on them |
-| Recipe | `packaging/arch/PKGBUILD` (`makepkg`) | `packaging/debian/build-deb.sh`, built natively per architecture in Debian 13 (`amd64`, `arm64`), never on Arch |
-| Rust | repo `rust`/`cargo` | `rustup` pinned to `rust-version` |
-| SQLite | repo `sqlite>=3.53.4` (dynamic) | 3.53.4 from sqlite.org, SHA-256 verified, **linked statically** |
-| Runtime deps | `glibc`, `gcc-libs`, `sqlite` | `libc6 (>= <computed>)`, `libgcc-s1` |
-| Recommends | — | `dbus-user-session`, `xdg-utils` (installed by `apt` unless recommendations are disabled) |
-| Optional | `optdepends`: `crun`, `postgresql`, `python`, `jq`, `xdg-utils` | `Suggests`: `crun`, `postgresql`, `python3`, `jq` |
+|                | Arch Linux                                                             | Debian family (one `.deb`)                                                                                                                                                      |
+| -------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Role           | Native development platform; where features are built and tested first | Supported install target for `apt` users                                                                                                                                        |
+| Version policy | **Always latest**: rolling repos, current Rust and libraries           | Lowered to the oldest supported LTS so plain `apt` resolves every dependency                                                                                                    |
+| Supported      | current Arch (`x86_64`; `aarch64` on Arch Linux ARM, best effort)      | Debian stable (13) and the current Ubuntu LTS releases (24.04, 26.04), plus derivatives built on them (Mint, Pop!\_OS, elementary, …) and **WSL 2** distributions based on them |
+| Recipe         | `packaging/arch/PKGBUILD` (`makepkg`)                                  | `packaging/debian/build-deb.sh`, built natively per architecture in Debian 13 (`amd64`, `arm64`), never on Arch                                                                 |
+| Rust           | repo `rust`/`cargo`                                                    | `rustup` pinned to `rust-version`                                                                                                                                               |
+| SQLite         | repo `sqlite>=3.53.4` (dynamic)                                        | 3.53.4 from sqlite.org, SHA-256 verified, **linked statically**                                                                                                                 |
+| Runtime deps   | `glibc`, `gcc-libs`, `sqlite`                                          | `libc6 (>= <computed>)`, `libgcc-s1`                                                                                                                                            |
+| Recommends     | —                                                                      | `dbus-user-session`, `xdg-utils` (installed by `apt` unless recommendations are disabled)                                                                                       |
+| Optional       | `optdepends`: `crun`, `postgresql`, `python`, `jq`, `xdg-utils`        | `Suggests`: `crun`, `postgresql`, `python3`, `jq`                                                                                                                               |
 
 Rules:
 
