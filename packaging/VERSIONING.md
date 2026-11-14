@@ -49,6 +49,12 @@ startup time and memory in `report.json`; it does not certify OCI or other datab
 SBOMs describe Rust dependencies. Native-library coverage and VM/OCI checks remain separate.
 Dependency advisories block publication; review applicability before adding exceptions.
 
+## 0.1.2 release
+
+Tag: `v0.1.2`; packaging revision: 1. Adds AppImage packaging for x86_64 and
+aarch64, release bundle checks on branches, and shared tag validation. Full CI,
+security and VM/WSL release checks must pass before publication.
+
 ## 0.1.1 release
 
 Tag: `v0.1.1`; packaging revision: 1. Includes CloudFormation lifecycle and Lambda

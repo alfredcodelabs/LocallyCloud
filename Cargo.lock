@@ -2216,7 +2216,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "locallycloud"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-acm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-analytics"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-apigateway"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-arc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-architecture"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-cloudformation"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-cloudfront"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-cloudtrail"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-cloudwatch-logs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-cloudwatch-monitoring"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-cognito"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2507,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-compute"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2524,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-dynamodb"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2582,7 +2582,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-ec2"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-ecr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2623,7 +2623,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-ecs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-elbv2"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-eventbridge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2688,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-firehose"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-iam-sts"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2740,7 +2740,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-kinesis"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2761,7 +2761,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-kms"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2783,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-lambda"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-rds"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-rds-data"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-region-switch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-route53"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-s3"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-secretsmanager"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2939,7 +2939,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-sns"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-sqs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-ssm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-state"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -3022,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-stepfunctions"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3054,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-wafv2"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "locallycloud-xray"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",

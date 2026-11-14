@@ -34,7 +34,7 @@ Choose `amd64` or `arm64` from [GitHub Releases](https://github.com/alfredcodela
 and glibc baseline](PLATFORMS.md#support-levels). Install the downloaded file:
 
 ```sh
-sudo apt install ./locallycloud_0.1.1-1_amd64.deb
+sudo apt install ./locallycloud_0.1.2-1_amd64.deb
 ```
 
 The package bundles SQLite and resolves system dependencies through `apt`. Rust is
@@ -45,7 +45,7 @@ not required. For compute, check the [optional runtime requirements](#optional-r
 When a tagged release is available, download its `.pkg.tar.zst` for Arch Linux `x86_64`:
 
 ```sh
-sudo pacman -U ./locallycloud-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U ./locallycloud-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 Arch uses SQLite from its repositories. For Arch Linux ARM, build with `makepkg`
@@ -91,7 +91,7 @@ Alternatively, on a supported Debian or Ubuntu host with the required system lib
 
 ```sh
 mkdir -p "$HOME/.local/opt/locallycloud" "$HOME/.local/bin"
-dpkg-deb --extract ./locallycloud_0.1.1-1_amd64.deb "$HOME/.local/opt/locallycloud"
+dpkg-deb --extract ./locallycloud_0.1.2-1_amd64.deb "$HOME/.local/opt/locallycloud"
 ln -s "$HOME/.local/opt/locallycloud/usr/bin/locallycloud" "$HOME/.local/bin/locallycloud"
 export PATH="$HOME/.local/bin:$PATH"
 ```
