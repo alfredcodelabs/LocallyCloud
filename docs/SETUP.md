@@ -51,7 +51,31 @@ sudo pacman -U ./locallycloud-0.1.1-1-x86_64.pkg.tar.zst
 Arch uses SQLite from its repositories. For Arch Linux ARM, build with `makepkg`
 in `packaging/arch`; see [support levels](PLATFORMS.md#support-levels).
 
-GitHub Actions builds both package formats. The [AUR recipe](../packaging/aur/PKGBUILD) and [signed APT repository tooling](../packaging/apt/README.md) are prepared, but those distribution channels are not yet published. Download packages from [GitHub Releases](https://github.com/alfredcodelabs/LocallyCloud/releases). See the [packaging and release guide](../packaging/VERSIONING.md).
+Packages are published through [GitHub Releases](https://github.com/alfredcodelabs/LocallyCloud/releases)
+after CI passes. If a tag shows only **Source code** archives, it has no installers.
+The [AUR recipe](../packaging/aur/PKGBUILD) and [APT repository tooling](../packaging/apt/README.md)
+are prepared; those channels are not published yet.
+
+### AppImage (without installation)
+
+Choose the AppImage matching `uname -m`: `x86_64` or `aarch64`. When available,
+download it from [GitHub Releases](https://github.com/alfredcodelabs/LocallyCloud/releases).
+It contains the same server and bundled SQLite as the `.deb`. Check the
+[Linux and glibc requirements](PLATFORMS.md#support-levels); the host also needs
+libgcc-s1 (`gcc-libs` on Arch).
+
+Replace the example filename with your download:
+
+```sh
+chmod +x ./locallycloud-VERSION-x86_64.AppImage
+./locallycloud-VERSION-x86_64.AppImage --version
+```
+
+Follow [Quick start](../README.md#quick-start) to configure your master key and
+start the server, using the AppImage path in place of `locallycloud`.
+If FUSE is unavailable, prefix the command with `APPIMAGE_EXTRACT_AND_RUN=1`.
+State and caches use the same XDG directories as system packages. Compute still
+needs the [optional host tools and runtime packs](#optional-runtime-dependencies).
 
 ### User-only installation without sudo
 

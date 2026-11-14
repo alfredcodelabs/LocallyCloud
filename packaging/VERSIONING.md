@@ -29,7 +29,9 @@ bash scripts/package-version.sh debian
 bash scripts/check-package-version.sh
 ```
 
-For a new version, edit Cargo.toml and update Cargo.lock with `cargo update --workspace --offline`. Run the checks before creating the tag. GitHub Actions requires the tag to match the output of `package-version.sh tag` and builds all artifacts from that commit. The local scripts do not publish releases or packages.
+For a new version, edit Cargo.toml and update Cargo.lock with
+`cargo update --workspace --offline`. Commit both before following the
+[release steps](#publish-a-release). The tag must match the committed version.
 
 ## Local release checks
 
@@ -120,23 +122,83 @@ References: [SemVer](https://semver.org/), [Debian](https://www.debian.org/doc/d
 
 ## GitHub Actions
 
-The `.github/workflows/packages.yml` workflow runs on pull requests, pushes to `main`, `master`, `develop`, and `stage`, and `v*` tags. It can also be run manually to check a branch without publishing.
+[CI and packages](../.github/workflows/packages.yml) runs on pull requests, pushes
+to `main`, `master`, `develop`, and `stage`, and `v*` tags. Manual runs check a
+branch without publishing.
 
-It validates version formats, tag matching and workspace versions; runs formatting, workspace tests and Clippy with packaged SQLite; and checks the real ExtendDB worker. Debian installation checks cover both architectures on all supported Debian/Ubuntu releases. Separate jobs check the Arch package and architecture review UI/MCP. Containers do not validate rootless OCI: retain the VM/WSL gate required by `AGENTS.md`.
+All runs validate versions, run formatting, workspace tests and Clippy, and check
+the real ExtendDB worker and architecture review UI/MCP. Debian packages are built
+natively in Debian 13 with static SQLite and a computed glibc dependency. Arch
+uses its repository toolchain and SQLite. See [platform coverage](../docs/PLATFORMS.md#support-levels)
+for the installation matrix; containers do not cover the required VM/WSL compute checks.
 
-Debian is built natively on Debian 13 for `amd64` and `arm64` (GitHub `ubuntu-24.04` and `ubuntu-24.04-arm` runners) using the Rust version declared in Cargo.toml. SQLite 3.54.1 is downloaded from the official site, verified against the SHA-256 in the packaging script, and linked statically. The `libc6` dependency is computed from the binary and must not exceed glibc 2.39, the oldest supported LTS. A follow-up job installs each `.deb` with `apt` on Debian 13, Ubuntu 24.04, and Ubuntu 26.04 and starts the server; releases wait for it. Arch is built in its rolling x86_64 environment using Rust and SQLite from its repositories; the PKGBUILD also declares `aarch64` for Arch Linux ARM, which CI does not build yet.
+Branches also assemble `release-bundle`: packages, component metadata, Rust SBOMs
+and verified `SHA256SUMS`. Only attestation and publication require a tag.
 
-After saving and pushing the version and Cargo.lock changes:
+### Check a proposed tag
 
 ```sh
-bash scripts/check-package-version.sh
-git tag -a v0.1.1 -m "LocallyCloud 0.1.1"
-git push origin v0.1.1
+bash scripts/check-release-version.sh vX.Y.Z
 ```
 
-Pushing the tag automatically publishes to GitHub Releases after both builds and the checks pass. Alpha/beta/rc tags are marked as prereleases and do not replace `latest`; tags without a suffix publish a normal release. The release includes `.deb`, `.pkg.tar.zst`, the ExtendDB workers and notices, `components.json`, Rust SBOMs, `SHA256SUMS` and `provenance.sigstore.json`. The first beta will not appear at `/releases/latest`: the website should link to `/releases` or the specific tag.
+Replace `vX.Y.Z` with the intended tag. The check rejects a mismatch with Cargo.toml.
+Without an argument, it checks release tags already pointing at the current commit;
+CI runs this check on branches and tags.
 
-No personal token or additional secrets are required: the workflow uses `GITHUB_TOKEN`, with write access only in the publishing job. Actions must be enabled in the repository. The workflow does not publish an APT repository or submit the recipe to AUR; those channels need their own configuration.
+A green branch cannot validate a tag chosen later. To check one before pushing it,
+run the workflow manually with `release_tag=vX.Y.Z`. The version job summary also
+shows the tag derived from Cargo.toml.
+
+### Build an AppImage
+
+On the matching architecture, pass a `.deb` produced by
+[build-deb.sh](debian/build-deb.sh):
+
+```sh
+bash packaging/appimage/build-appimage.sh target/debian-package/dist/locallycloud_VERSION_ARCH.deb
+```
+
+Replace `VERSION` with the Debian package version and `ARCH` with `amd64` or
+`arm64`. Output goes to `target/appimage/<architecture>/dist/`.
+
+The [builder](appimage/build-appimage.sh) reuses the Debian binary, SQLite and
+license notices. It verifies pinned appimagetool and runtime downloads with
+SHA-256. CI is configured to build native x86_64 and aarch64 images and check
+`--version` without FUSE. This checks packaging and CLI execution; server health,
+compute and AWS behavior need separate tests.
+See [AppImage requirements and usage](../docs/SETUP.md#appimage-without-installation).
+
+Local validation used an x86_64 fixture package. Full server images on both
+architectures still need a successful CI run before publication.
+
+### Publish a release
+
+1. Commit and push the version and Cargo.lock changes.
+2. Complete the [local release checks](#local-release-checks), the security audit
+   required by `AGENTS.md`, and the VM/WSL checks. Wait for CI to pass.
+3. Derive the tag from Cargo.toml and push it:
+
+   ```sh
+   bash scripts/check-package-version.sh
+   release_tag="$(bash scripts/package-version.sh tag)"
+   bash scripts/check-release-version.sh "$release_tag"
+   git tag -a "$release_tag" -m "LocallyCloud $release_tag"
+   git push origin "$release_tag"
+   ```
+
+The tag run publishes after all checks pass. Alpha/beta/rc tags become prereleases
+and keep the existing `latest`; tags without a suffix become normal releases.
+Prerelease downloads use `/releases` or the specific tag, not `/releases/latest`.
+
+Release assets include `.deb`, `.pkg.tar.zst`, both `.AppImage` architectures,
+ExtendDB workers and notices, `components.json`, Rust SBOMs, `SHA256SUMS` and
+`provenance.sigstore.json`. The workflow uses `GITHUB_TOKEN`; only the publishing
+job has write access. No personal token or additional secrets are needed.
+Actions must be enabled. APT and AUR publication remain separate steps.
+
+If a tag fails version validation, fix Cargo.toml and Cargo.lock in a new release
+commit and use a matching, unused tag. Rerunning the old tag uses the old commit.
+Preserve published tags and packages. Publication refuses to replace an existing release.
 
 ### Repair the first beta checksum manifest
 
@@ -146,7 +208,5 @@ replace only `SHA256SUMS`. Keep the tag and packages unchanged.
 
 The [repair workflow](../.github/workflows/release-checksums.yml) must be on the
 repository's default branch to appear in Actions; see [manual workflow instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
-
-If a build fails, fix the issue before publishing a new tag; do not move tags that already have a release. Rerunning a workflow with an already published release will fail when attempting to create it, preventing silent replacement of its packages.
 
 Documentation: [official checkout action](https://github.com/actions/checkout), [artifacts](https://github.com/actions/upload-artifact), [creating releases with GitHub CLI](https://cli.github.com/manual/gh_release_create).

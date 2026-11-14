@@ -34,7 +34,8 @@ Use the filename you downloaded. **Run LocallyCloud as your regular user, withou
 `sudo`.** See [supported platforms](docs/PLATFORMS.md) and
 [installation options](docs/SETUP.md#installation), including user-only installation.
 
-Prefer a source build? See [build requirements and commands](docs/SETUP.md#from-source).
+Use an [AppImage](docs/SETUP.md#appimage-without-installation) to run without installation,
+or [build from source](docs/SETUP.md#from-source).
 
 ## Quick start
 

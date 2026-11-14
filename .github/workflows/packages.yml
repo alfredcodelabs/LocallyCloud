@@ -6,6 +6,11 @@ on:
     branches: [main, master, develop, stage]
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional proposed release tag to validate before publishing (must match Cargo.toml)
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -28,20 +33,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
       - id: version
         name: Validate version and tag
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          PROPOSED_TAG: ${{ inputs.release_tag }}
         run: |
           bash scripts/check-package-version.sh
+          python3 scripts/tests/test-release-packaging.py
+          # Branches and tags validate all release tags already on this commit.
+          bash scripts/check-release-version.sh
           if [[ "$REF_TYPE" == tag ]]; then
-            expected="$(bash scripts/package-version.sh tag)"
-            [[ "$REF_NAME" == "$expected" ]] || {
-              echo "Tag $REF_NAME does not match Cargo.toml ($expected)" >&2
-              exit 1
-            }
+            bash scripts/check-release-version.sh "$REF_NAME"
           fi
+          if [[ -n "$PROPOSED_TAG" ]]; then
+            bash scripts/check-release-version.sh "$PROPOSED_TAG"
+          fi
+          echo "Release tag from Cargo.toml: $(bash scripts/package-version.sh tag)" >> "$GITHUB_STEP_SUMMARY"
           rust="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^rust-version = "\([^"]*\)"/\1/p;}' Cargo.toml)"
           [[ "$rust" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
@@ -178,6 +188,45 @@ jobs:
           path: |
             target/debian-package/dist/*.deb
             target/debian-package/dist/*.cdx.json
+          if-no-files-found: error
+
+  appimage:
+    needs: debian
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            appimage_arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            appimage_arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: package-debian-${{ matrix.arch }}
+          path: dist
+      - name: Build and smoke-test the AppImage without FUSE
+        env:
+          APPIMAGE_ARCH: ${{ matrix.appimage_arch }}
+        run: |
+          bash packaging/appimage/build-appimage.sh dist/*.deb
+          image="target/appimage/$APPIMAGE_ARCH/dist/locallycloud-$(bash scripts/package-version.sh product)-$APPIMAGE_ARCH.AppImage"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$image" --version | grep -Fx "locallycloud $(bash scripts/package-version.sh product)"
+          # Keep the Rust inventory alongside the repackaged binary.
+          cp dist/*.cdx.json "${image%.AppImage}.cdx.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-appimage-${{ matrix.appimage_arch }}
+          path: |
+            target/appimage/${{ matrix.appimage_arch }}/dist/*.AppImage
+            target/appimage/${{ matrix.appimage_arch }}/dist/*.cdx.json
           if-no-files-found: error
 
   debian-install:
@@ -326,9 +375,31 @@ jobs:
           runuser -u tester -- python3 "$GITHUB_WORKSPACE/packaging/extenddb/smoke-component.py" \
             --catalog "$GITHUB_WORKSPACE/components/extenddb-x86_64.json" --work-dir /home/tester
 
+  release-assets:
+    needs: [architecture-review, debian, debian-install, arch, extenddb, arch-extenddb-install, appimage]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: dist
+      - name: Prepare release packages and checksums
+        working-directory: dist
+        run: bash "$GITHUB_WORKSPACE/scripts/prepare-release-assets.sh"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [architecture-review, debian, debian-install, arch, extenddb, arch-extenddb-install]
+    needs: release-assets
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -338,50 +409,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          pattern: package-*
-          merge-multiple: true
+          name: release-bundle
           path: dist
-      - name: Prepare release packages and checksums
-        working-directory: dist
-        run: |
-          # GitHub replaces '~' in asset names; checksums must use the published names.
-          for package in *.deb *.cdx.json; do
-            published_name="${package//\~/.}"
-            if [[ "$package" != "$published_name" ]]; then
-              mv -- "$package" "$published_name"
-            fi
-          done
-          python3 - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          fragments = [json.loads(Path(f'extenddb-{arch}.json').read_text()) for arch in ('x86_64', 'arm64')]
-          catalog = {key:value for key,value in fragments[0].items() if key != 'artifacts'}
-          artifacts = []
-          for arch, fragment in zip(('x86_64', 'arm64'), fragments):
-              assert {key:value for key,value in fragment.items() if key != 'artifacts'} == catalog
-              assert len(fragment['artifacts']) == 1
-              artifact = fragment['artifacts'][0]
-              assert artifact['architecture'] == arch
-              for kind, suffix in [('binary', ''), ('notices', '.LICENSES.txt')]:
-                  item = artifact[kind]
-                  assert item['name'] == f'locallycloud-extenddb-worker-linux-{arch}{suffix}'
-                  body = Path(item['name']).read_bytes()
-                  assert len(body) == item['size'] and hashlib.sha256(body).hexdigest() == item['sha256']
-              artifacts.append(artifact)
-          catalog['artifacts'] = artifacts
-          Path('components.json').write_text(json.dumps(catalog, indent=2) + '\n')
-          inventories = [(p.with_suffix('.cdx.json'), 'locallycloud') for p in Path('.').glob('*.deb')]
-          inventories += [(Path(p.name.removesuffix('.pkg.tar.zst') + '.cdx.json'), 'locallycloud') for p in Path('.').glob('*.pkg.tar.zst')]
-          inventories += [(Path(f'extenddb-{arch}.cdx.json'), 'locallycloud-extenddb-worker') for arch in ('x86_64', 'arm64')]
-          for path, component in inventories:
-              inventory = json.loads(path.read_text())
-              assert inventory['bomFormat'] == 'CycloneDX' and inventory['specVersion'] == '1.5'
-              assert inventory['metadata']['component']['name'] == component
-              assert inventory['components'], f'Empty dependency inventory: {path}'
-          PY
-          sha256sum -- *.deb *.pkg.tar.zst *.cdx.json locallycloud-extenddb-worker-linux-* components.json > SHA256SUMS
-          sha256sum --check SHA256SUMS
       - name: Attest final release artifacts
         id: provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -405,4 +434,4 @@ jobs:
           else
             flags+=(--latest)
           fi
-          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst *.cdx.json locallycloud-extenddb-worker-linux-* components.json SHA256SUMS provenance.sigstore.json
+          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst *.AppImage *.cdx.json locallycloud-extenddb-worker-linux-* components.json SHA256SUMS provenance.sigstore.json

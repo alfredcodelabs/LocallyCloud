@@ -2,8 +2,8 @@
 
 [← README](../README.md) · [Setup](SETUP.md) · [Services](SERVICES.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
 
-LocallyCloud is a Linux program. It is developed natively on Arch Linux and distributed as an
-Arch package and as one `.deb` for Debian, Ubuntu LTS, and their derivatives, including WSL 2.
+LocallyCloud runs on Linux and is developed on Arch. The packaging workflow builds
+Arch packages, `.deb` packages and AppImages; see [installation options](SETUP.md#installation).
 On macOS and on Windows without WSL, run it inside a Linux virtual machine and use it from the
 host through a forwarded port.
 
@@ -19,7 +19,7 @@ host through a forwarded port.
 | Tier 2 | Distributions based on the releases above (Linux Mint, Pop!_OS, elementary OS, …) | amd64, arm64 | `.deb` with `apt` |
 | Tier 2 | Windows 10/11 with WSL 2 running one of the releases above | amd64, arm64 | `.deb` with `apt` inside WSL |
 | Best effort | Arch Linux ARM | aarch64 | `makepkg` with `packaging/arch/PKGBUILD` |
-| Best effort | Other Linux distributions with glibc 2.39 or later (Fedora, openSUSE Tumbleweed, …) | x86_64, aarch64 | Build from source or [user-only installation](SETUP.md#user-only-installation-without-sudo) |
+| Best effort | Other Linux distributions with glibc 2.39 or later (Fedora, openSUSE Tumbleweed, …) | x86_64, aarch64 | [AppImage](SETUP.md#appimage-without-installation), build from source or [user-only installation](SETUP.md#user-only-installation-without-sudo) |
 | Through a VM | macOS (Intel and Apple Silicon), Windows without WSL | — | [Linux VM with a forwarded port](#macos-and-windows-without-wsl) |
 | Not supported | Native Windows or macOS, glibc older than 2.39 (Ubuntu 22.04, Debian 12), 32-bit systems | — | — |
 
@@ -30,7 +30,8 @@ host through a forwarded port.
 - **Best effort:** expected to work and accepted bug reports, but not built or tested by CI.
 
 > [!NOTE]
-> The `.deb` requires glibc 2.39 or later. On older releases, `apt` refuses installation.
+> The `.deb` and AppImage require glibc 2.39 or later. AppImage does not bundle glibc
+> or extend support to older distributions. On older releases, `apt` refuses the `.deb`.
 
 ## What each feature needs
 

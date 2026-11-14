@@ -36,6 +36,10 @@ jobs:
             gh release download "$RELEASE_TAG" --pattern components.json --pattern 'locallycloud-extenddb-worker-linux-*'
             assets+=(components.json locallycloud-extenddb-worker-linux-*)
           fi
+          if grep -Eq '^[a-f0-9]{64}  [^ /]+\.AppImage$' SHA256SUMS; then
+            gh release download "$RELEASE_TAG" --pattern '*.AppImage'
+            assets+=(*.AppImage)
+          fi
           if grep -Eq '^[a-f0-9]{64}  [^ /]+\.cdx\.json$' SHA256SUMS; then
             gh release download "$RELEASE_TAG" --pattern '*.cdx.json'
             assets+=(*.cdx.json)
