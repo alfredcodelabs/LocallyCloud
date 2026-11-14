@@ -326,5 +326,6 @@ Project skills live in `.agents/skills/`:
   in `crates/`.
 - `blackbox-validation` — to validate behavior from outside (CLI/SDK/HTTP) before closing a
   change that affects routes, contracts, state, or integrations.
+- `docs-writing` — to write or simplify concise, practical repository documentation.
 - `dashboard-ui` — to change or review the embedded dashboard (`/_locallycloud/ui`).
 - `local-agent` — to delegate a bounded task to a local OpenCode worker and audit its result.

@@ -25,7 +25,7 @@ jobs:
     outputs:
       rust: ${{ steps.version.outputs.rust }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - id: version
@@ -50,10 +50,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24'
           package-manager-cache: false
@@ -92,7 +92,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential ca-certificates curl git cmake clang libclang-dev pkg-config python3
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install declared Rust toolchain
@@ -130,7 +130,7 @@ jobs:
           export SQLITE3_STATIC=1
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: package-extenddb-${{ matrix.arch == 'amd64' && 'x86_64' || 'arm64' }}
           path: components
@@ -149,7 +149,7 @@ jobs:
           grep -Fq 'Real public SSE lifecycle:' /tmp/public-sse-test.log
           LOCALLYCLOUD_TEST_TABLE_WORKER="$worker" cargo test -p locallycloud --test dynamodb_migration --locked -- --nocapture 2>&1 | tee /tmp/native-pitr-migration-test.log
           grep -Fq 'Real native PITR migration: passed' /tmp/native-pitr-migration-test.log
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: package-debian-${{ matrix.arch }}
           path: target/debian-package/dist/*.deb
@@ -166,14 +166,14 @@ jobs:
     container: ${{ matrix.image }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: package-debian-${{ matrix.arch }}
           path: dist
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: package-extenddb-${{ matrix.arch == 'amd64' && 'x86_64' || 'arm64' }}
           path: components
@@ -210,7 +210,7 @@ jobs:
     steps:
       - name: Install build dependencies
         run: pacman -Syu --noconfirm --needed rust cargo cargo-about git sqlite cmake clang
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Build Arch x86_64 package as unprivileged user
@@ -223,7 +223,7 @@ jobs:
           expected="locallycloud-$(bash ../../scripts/package-version.sh arch)-1-x86_64.pkg.tar.zst"
           test -f "$expected"
           pacman -U --noconfirm "$expected"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: package-arch-x86_64
           path: packaging/arch/locallycloud-*.pkg.tar.zst
@@ -242,7 +242,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install build tools
@@ -258,7 +258,7 @@ jobs:
         env:
           CARGO_BUILD_JOBS: '2'
         run: bash packaging/extenddb/build-worker.sh "$RUNNER_TEMP/extenddb-dist" "$RUNNER_TEMP/extenddb-work"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: package-extenddb-${{ matrix.arch }}
           path: ${{ runner.temp }}/extenddb-dist/*
@@ -272,14 +272,14 @@ jobs:
     steps:
       - name: Install validation tools
         run: pacman -Syu --noconfirm --needed python sqlite git
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: package-arch-x86_64
           path: dist
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: package-extenddb-x86_64
           path: components
@@ -298,18 +298,16 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: package-*
           merge-multiple: true
           path: dist
-      - name: Publish release with packages and checksums
+      - name: Prepare release packages and checksums
         working-directory: dist
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           # GitHub replaces '~' in asset names; checksums must use the published names.
           for package in *.deb; do
@@ -341,10 +339,27 @@ jobs:
           PY
           sha256sum -- *.deb *.pkg.tar.zst locallycloud-extenddb-worker-linux-* components.json > SHA256SUMS
           sha256sum --check SHA256SUMS
+      - name: Attest final release artifacts
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Preserve the verification bundle
+        env:
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+        run: cp -- "$BUNDLE_PATH" dist/provenance.sigstore.json
+      - name: Publish verified release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum --check --strict SHA256SUMS
           flags=(--verify-tag --generate-notes --title "LocallyCloud $RELEASE_TAG")
           if [[ "$RELEASE_TAG" == *-* ]]; then
             flags+=(--prerelease --latest=false)
           else
             flags+=(--latest)
           fi
-          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst locallycloud-extenddb-worker-linux-* components.json SHA256SUMS
+          gh release create "$RELEASE_TAG" "${flags[@]}" -- *.deb *.pkg.tar.zst locallycloud-extenddb-worker-linux-* components.json SHA256SUMS provenance.sigstore.json
