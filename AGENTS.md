@@ -248,6 +248,8 @@ Rules:
 - Packages install only package-owned files under `/usr` (binary, `.desktop` launcher, icons,
   license/docs). Running the emulator never requires root; state and caches live in the user's
   XDG directories and survive uninstall.
+- Before creating a release tag, run [security-audit](.agents/skills/security-audit/SKILL.md)
+  against the current candidate. Security evidence does not replace packaging and compatibility checks.
 - Versions derive from `Cargo.toml` through `scripts/package-version.sh`; see
   `packaging/VERSIONING.md` before changing versions, tags, or package revisions.
 - CI (`debian-install`) installs each `.deb` with `apt` on Debian 13, Ubuntu 24.04, and Ubuntu
@@ -325,6 +327,8 @@ Project skills live in `.agents/skills/`:
 - `findbrief` — exact files, history and reasons from a local index of git and the source tree.
 - `conditional-dispatch` — when writing or reviewing dispatch, mappings, validations, state
   transitions, or growing `if`/`else` chains.
+- `security-audit` — SAST, DAST and dependency auditing when requested, for sensitive security
+  changes, and before release tags; connects evidence to the threat modeling MCP when applicable.
 - `whitebox-review` — for code reviews, security audits, and before closing relevant changes
   in `crates/`.
 - `blackbox-validation` — to validate behavior from outside (CLI/SDK/HTTP) before closing a
