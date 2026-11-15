@@ -95,6 +95,11 @@ pub(crate) const ASSETS: &[Asset] = &[
         gzip: gzip!("crates/core/src/views/architecture/threatdragon.js"),
     },
     Asset {
+        path: "/_locallycloud/views/architecture/report.js",
+        content_type: JS,
+        gzip: gzip!("crates/core/src/views/architecture/report.js"),
+    },
+    Asset {
         path: "/_locallycloud/views/architecture/catalog.json",
         content_type: "application/json",
         gzip: gzip!("crates/core/src/views/architecture/catalog.json"),

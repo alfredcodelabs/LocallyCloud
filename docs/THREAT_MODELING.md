@@ -105,6 +105,22 @@ threats become findings that await review; closed threats without a mitigation o
 description are reopened. Threats of other methodologies, curved boundaries and
 flows without two connected components are skipped and listed.
 
+## Security report
+
+**Security report**, next to the four review steps, lists the control gaps of the
+whole stack ranked by severity (critical, high, medium, low), without answering
+any question. It uses the same catalog, facts and OWASP risk rating as the review
+and adds no rules of its own: each row shows the rule and its STRIDE category, the
+resource or flow, the declared setting that causes it, the control to apply and,
+when the review recorded one, its decision. A second table lists the controls that
+no declared setting can show, such as input validation, with how many elements
+depend on them.
+
+Saved views and the diagram do not change the report. **Download Markdown** and
+**Download JSON** save it; **Print / PDF** prints only the report through the
+browser. Like the review, it reflects declared configuration, not observed
+behavior.
+
 ## Agent companion (MCP)
 
 An optional stdio MCP server lets an agent read a saved review and write proposals.

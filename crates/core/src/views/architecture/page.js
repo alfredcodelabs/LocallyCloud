@@ -1,6 +1,7 @@
 import * as A from "./assessment.js";
 import * as Catalog from "./catalog.js";
 import * as R from "./engine.js";
+import * as Report from "./report.js";
 import { I18N } from "./i18n.js";
 import * as M from "./model.js";
 import * as TD from "./threatdragon.js";
@@ -160,6 +161,7 @@ export function mount(root, ctx) {
     urls.clear();
     root.replaceChildren();
     root.classList.remove("ar");
+    document.documentElement.classList.remove("ar-printing");
   }
 
   if (!ctx.stack) {
@@ -290,6 +292,7 @@ export function mount(root, ctx) {
     drag = null,
     activeView = "";
   let assessment = [];
+  let report = null;
   let phase = A.PHASES[0].id,
     autoFit = true;
   let dirty = false,
@@ -303,7 +306,8 @@ export function mount(root, ctx) {
     dirty = true;
     proposal = null;
   }
-  const phaseStages = () => A.PHASES.find((p) => p.id === phase).stages;
+  const REPORT = "report";
+  const phaseStages = () => A.PHASES.find((p) => p.id === phase)?.stages || [];
   function showPhase(next) {
     phase = next;
     questionIndex = 0;
@@ -1088,6 +1092,7 @@ export function mount(root, ctx) {
           ),
         ),
       ),
+      reportPanel(),
     );
     const canvas = $("canvas");
     canvas.onpointerdown = (event) => {
@@ -1584,6 +1589,7 @@ export function mount(root, ctx) {
     $("catalog-panel").hidden = !model;
     $("coverage-panel").hidden = !model;
     $("phases").hidden = !model;
+    $("report-panel").hidden = !model;
     if (!model) {
       $("title").textContent = ctx.stack;
       $("scope").textContent = loading ? t("loading") : loadError;
@@ -1695,12 +1701,14 @@ export function mount(root, ctx) {
       );
     }
     assessment = A.assess(graph);
+    report = Report.build(model, ctx.lang());
     renderPhases(graph);
     fit();
     renderGraph();
     renderCatalog();
     renderInspector();
     renderReview();
+    renderReport();
   }
   function reviewQuestions() {
     return R.questions(
@@ -1727,7 +1735,19 @@ export function mount(root, ctx) {
           h("span", { cls: "badge", text: String(open(p.id)) }),
         ),
       ),
+      h(
+        "button",
+        {
+          type: "button",
+          cls: "ar-report-tab",
+          "aria-current": phase === REPORT ? "step" : "false",
+          onclick: () => showPhase(REPORT),
+        },
+        `${t("arReportTab")} `,
+        h("span", { cls: "badge", text: String(report?.findings.length ?? 0) }),
+      ),
     );
+    $("workspace").classList.toggle("ar-off", phase === REPORT);
     $("phase-note").textContent = t("arPhaseNote_" + phase);
     for (const element of root.querySelectorAll("[data-phase]")) {
       element.classList.toggle(
@@ -2051,13 +2071,13 @@ export function mount(root, ctx) {
     }, 1000);
     timers.add(timer);
   }
-  function fileName(extension) {
+  function fileName(extension, kind = "architecture-review") {
     const base =
-      (model.title || "architecture-review")
+      (model.title || kind)
         .replace(/[^A-Za-z0-9._-]+/g, "-")
         .replace(/^-+|-+$/g, "")
-        .slice(0, 80) || "architecture-review";
-    return `${base}.architecture-review.${extension}`;
+        .slice(0, 80) || kind;
+    return `${base}.${kind}.${extension}`;
   }
   async function openReview(event) {
     try {
@@ -2122,6 +2142,185 @@ export function mount(root, ctx) {
       t("arTd_" + key, { n }),
     );
     return items.length ? t("arTdNotCarried", { items: items.join("; ") }) : "";
+  }
+  function reportPanel() {
+    const table = (id, keys) =>
+      h(
+        "div",
+        { cls: "table" },
+        h(
+          "table",
+          { cls: "ar-register" },
+          h(
+            "thead",
+            null,
+            h("tr", null, ...keys.map((k) => h("th", { scope: "col", text: t(k) }))),
+          ),
+          h("tbody", { id }),
+        ),
+      );
+    return h(
+      "section",
+      {
+        cls: "panel ar-register-panel ar-report",
+        id: "ar-report-panel",
+        "data-phase": REPORT,
+      },
+      h(
+        "div",
+        { cls: "phead" },
+        h("h2", { text: t("arReportTitle") }),
+        h(
+          "div",
+          { cls: "ar-actions" },
+          h("button", {
+            type: "button",
+            text: t("arReportMarkdown"),
+            onclick: () => exportReport("md"),
+          }),
+          h("button", {
+            type: "button",
+            text: t("arReportJson"),
+            onclick: () => exportReport("json"),
+          }),
+          h("button", {
+            type: "button",
+            text: t("arReportPdf"),
+            onclick: printReport,
+          }),
+        ),
+      ),
+      h("p", { cls: "meta", id: "ar-report-scope" }),
+      h("p", { cls: "dim", text: t("arReportBasis") }),
+      h("ul", { cls: "ar-report-summary", id: "ar-report-summary" }),
+      h("h3", { text: t("arReportFindings") }),
+      table("ar-report-findings", [
+        "arReportSeverity",
+        "arReportRule",
+        "arReportCategory",
+        "arReportElement",
+        "arReportEvidence",
+        "arReportFix",
+        "arReportDecision",
+      ]),
+      h("h3", { text: t("arReportUnverified") }),
+      h("p", { cls: "dim", text: t("arReportUnverifiedNote") }),
+      table("ar-report-unverified", [
+        "arReportControl",
+        "arReportReason",
+        "arReportCount",
+      ]),
+    );
+  }
+  function renderReport() {
+    if (phase !== REPORT || !report) {
+      return;
+    }
+    $("report-scope").textContent = [
+      report.stack,
+      report.scope.account,
+      report.scope.region,
+      report.scope.capturedAt,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    $("report-summary").replaceChildren(
+      ...Object.entries(report.summary.findings)
+        .filter(([, count]) => count)
+        .map(([severity, count]) =>
+          h("li", {
+            cls: "ar-sev-" + severity,
+            text: `${severityLabel(severity)}: ${count}`,
+          }),
+        ),
+      h("li", {
+        cls: "dim",
+        text: t("arReportOthers", {
+          review: report.summary.toReview,
+          declared: report.summary.declared,
+        }),
+      }),
+    );
+    const none = (columns) =>
+      h(
+        "tr",
+        null,
+        h("td", { colspan: String(columns), cls: "dim", text: t("arReportNone") }),
+      );
+    $("report-findings").replaceChildren(
+      ...(report.findings.length
+        ? report.findings.map((f) =>
+            h(
+              "tr",
+              null,
+              h("td", {
+                cls: "ar-sev-" + f.severity,
+                text: severityLabel(f.severity),
+              }),
+              h("td", { text: `${f.rule} ${f.title}` }),
+              h("td", { text: strideLabel(f.category) }),
+              h("td", { text: `${f.element.name} (${f.element.type})` }),
+              h("td", {
+                text: f.evidence
+                  .map((e) => `${e.fact}=${e.value} (${e.source})`)
+                  .join("; "),
+              }),
+              h("td", { text: f.recommendation.map((r) => r.text).join("; ") }),
+              h("td", { text: f.decision ? statusLabel(f.decision) : "—" }),
+            ),
+          )
+        : [none(7)]),
+    );
+    $("report-unverified").replaceChildren(
+      ...(report.unverified.length
+        ? report.unverified.map((u) =>
+            h(
+              "tr",
+              null,
+              h("td", { text: `${u.control} ${u.text}` }),
+              h("td", { text: t("arReportReason_" + u.reason) }),
+              h("td", { text: String(u.elements) }),
+            ),
+          )
+        : [none(3)]),
+    );
+  }
+  function exportReport(format) {
+    try {
+      const current = Report.build(model, ctx.lang());
+      if (format === "json") {
+        download(
+          fileName("json", "security-report"),
+          JSON.stringify(current, null, 2),
+          "application/json",
+        );
+      } else {
+        download(
+          fileName("md", "security-report"),
+          Report.markdown(current, {
+            t,
+            severity: severityLabel,
+            category: strideLabel,
+            status: statusLabel,
+          }),
+          "text/markdown",
+        );
+      }
+      announce(t("arReportExported"));
+    } catch (error) {
+      fail(error);
+    }
+  }
+  /** PDF through the browser's print dialog; the print stylesheet keeps only the report. */
+  function printReport() {
+    const page = document.documentElement;
+    page.classList.add("ar-printing");
+    window.addEventListener(
+      "afterprint",
+      () => page.classList.remove("ar-printing"),
+      { once: true, signal },
+    );
+    window.print();
   }
   function exportThreatDragon() {
     try {

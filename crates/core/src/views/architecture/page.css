@@ -112,3 +112,17 @@
 .ar .ar-coverage { list-style: none; padding: 0; margin: 8px 0; font-size: 13px; display: grid; gap: 8px; }
 .ar .ar-coverage li.ready { color: var(--ok); }
 .ar .ar-coverage button.link { margin-right: 8px; }
+.ar .ar-report-tab { margin-left: auto; }
+.ar .ar-report h3 { font-size: 14px; margin: 16px 0 6px; }
+.ar .ar-report-summary { display: flex; flex-wrap: wrap; gap: 12px; list-style: none; margin: 8px 0; padding: 0; font-size: 13px; }
+.ar .ar-sev-critical, .ar .ar-sev-high { color: var(--bad); font-weight: 700; }
+.ar .ar-sev-medium { color: var(--warn); font-weight: 700; }
+@media print {
+  html.ar-printing body * { visibility: hidden; }
+  html.ar-printing .ar-report, html.ar-printing .ar-report * { visibility: visible; }
+  html.ar-printing .ar-report { position: absolute; inset: 0 auto auto 0; width: 100%; border: 0; }
+  html.ar-printing .ar-report .ar-actions { display: none; }
+  html.ar-printing .ar-report .table { overflow: visible; }
+}
+.ar .ar-report td, .ar .ar-report th { overflow-wrap: break-word; word-break: normal; }
+.ar .ar-report [class^="ar-sev-"] { white-space: nowrap; }
