@@ -1,11 +1,13 @@
 //! S3 service handler: REST-XML operation selection by method + request shape + query
 //! sub-resource markers, registered `Native` in the Core registry.
 
+use locallycloud_core::observability::log_service_error;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use tracing::{error, warn};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -207,7 +209,7 @@ async fn deliver_notification(
                 tokio::time::sleep(Duration::from_millis(25_u64 << attempt)).await;
             }
         }
-        locallycloud_core::observability::log_service_error(
+        log_service_error(
             "s3",
             Some("DeliverNotification"),
             request_id,
@@ -226,7 +228,7 @@ async fn deliver_notification(
     {
         Ok(_) => true,
         Err(_) => {
-            locallycloud_core::observability::log_service_error(
+            log_service_error(
                 "s3",
                 Some("DeliverNotification"),
                 request_id,
@@ -415,7 +417,7 @@ impl S3Handler {
             .storage_keys = Arc::new(storage_keys);
         persistence.restore(&handler.store)?;
         if persistence.remove_orphan_blobs().is_err() {
-            tracing::warn!(
+            warn!(
                 service = "s3",
                 operation = "RestoreState",
                 cause_code = "orphan_blob_cleanup_failed",
@@ -651,26 +653,19 @@ impl S3Handler {
                     };
                     if cursor == 0 {
                         let db = persistence.clone();
-                        cycle_end =
-                            match tokio::task::spawn_blocking(move || db.max_outbox_id()).await {
-                                Ok(Ok(id)) => id,
-                                Ok(Err(_)) => {
-                                    tracing::error!(
-                                        service = "s3",
-                                        cause_code = "outbox_watermark_read_failed",
-                                        "S3 outbox watermark read failed"
-                                    );
-                                    continue;
-                                }
-                                Err(_) => {
-                                    tracing::error!(
-                                        service = "s3",
-                                        cause_code = "outbox_watermark_task_failed",
-                                        "S3 outbox watermark task failed"
-                                    );
-                                    continue;
-                                }
-                            };
+                        cycle_end = match tokio::task::spawn_blocking(move || db.max_outbox_id())
+                            .await
+                        {
+                            Ok(Ok(id)) => id,
+                            Ok(Err(_)) => {
+                                error!(service = "s3", cause_code = "outbox_watermark_read_failed");
+                                continue;
+                            }
+                            Err(_) => {
+                                error!(service = "s3", cause_code = "outbox_watermark_task_failed");
+                                continue;
+                            }
+                        };
                     }
                     let db = persistence.clone();
                     let pending = match tokio::task::spawn_blocking(move || {
@@ -680,19 +675,11 @@ impl S3Handler {
                     {
                         Ok(Ok(pending)) => pending,
                         Ok(Err(_)) => {
-                            tracing::error!(
-                                service = "s3",
-                                cause_code = "outbox_read_failed",
-                                "S3 outbox read failed"
-                            );
+                            error!(service = "s3", cause_code = "outbox_read_failed");
                             continue;
                         }
                         Err(_) => {
-                            tracing::error!(
-                                service = "s3",
-                                cause_code = "outbox_read_task_failed",
-                                "S3 outbox read task failed"
-                            );
+                            error!(service = "s3", cause_code = "outbox_read_task_failed");
                             continue;
                         }
                     };
@@ -709,11 +696,10 @@ impl S3Handler {
                         {
                             Ok(delivery) => delivery,
                             Err(_) => {
-                                tracing::error!(
+                                error!(
                                     service = "s3",
                                     cause_code = "outbox_entry_invalid",
-                                    outbox_id = id,
-                                    "S3 outbox entry is invalid"
+                                    outbox_id = id
                                 );
                                 continue;
                             }
@@ -731,21 +717,19 @@ impl S3Handler {
                             match tokio::task::spawn_blocking(move || db.delete_outbox(id)).await {
                                 Ok(Ok(())) => {}
                                 Ok(Err(_)) => {
-                                    tracing::error!(
+                                    error!(
                                         service = "s3",
                                         cause_code = "outbox_acknowledgement_failed",
                                         outbox_id = id,
-                                        request_id,
-                                        "S3 outbox acknowledgement failed"
+                                        request_id
                                     )
                                 }
                                 Err(_) => {
-                                    tracing::error!(
+                                    error!(
                                         service = "s3",
                                         cause_code = "outbox_acknowledgement_task_failed",
                                         outbox_id = id,
-                                        request_id,
-                                        "S3 outbox acknowledgement task failed"
+                                        request_id
                                     )
                                 }
                             }
@@ -1332,7 +1316,7 @@ impl S3Handler {
             .upgrade()
             .and_then(|registry| registry.internal_dispatcher())
         else {
-            tracing::warn!(
+            warn!(
                 request_id = req.request_id,
                 service = "s3",
                 cause_code = "notification_worker_unavailable",

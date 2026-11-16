@@ -1,4 +1,5 @@
 use locallycloud_core::error_mapping::AwsError;
+use locallycloud_core::observability::log_service_error;
 use locallycloud_core::registry::AwsProtocol;
 
 macro_rules! error_type {
@@ -15,7 +16,7 @@ macro_rules! error_type {
                 match self { $(Self::$variant(_) => $status,)+ }
             }
             pub fn into_response(self, request_id: &str) -> axum::response::Response {
-                locallycloud_core::observability::log_service_error($service, None, request_id, self.code(), self.http_status());
+                log_service_error($service, None, request_id, self.code(), self.http_status());
                 AwsError::new(self.code(), self.to_string(), self.http_status())
                     .with_request_id(request_id.to_string())
                     .render($protocol)

@@ -7,6 +7,7 @@
 //! request into a JSON `Value` and `proto::to_query_xml` serializes the response back into
 //! the request's protocol.
 
+use locallycloud_core::observability::log_service_error;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
@@ -503,7 +504,7 @@ impl NativeHandler for SqsHandler {
                             .any(|failure| failure.get("SenderFault") == Some(&Value::Bool(false)))
                     })
                 {
-                    locallycloud_core::observability::log_service_error(
+                    log_service_error(
                         "sqs",
                         Some(&op),
                         &request.request_id,

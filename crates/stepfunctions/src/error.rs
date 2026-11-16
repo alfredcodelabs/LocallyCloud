@@ -2,6 +2,7 @@
 //! execution errors (`AslError`, the `States.*` catalog).
 
 use locallycloud_core::error_mapping::AwsError;
+use locallycloud_core::observability::log_service_error;
 use locallycloud_core::registry::AwsProtocol;
 
 /// An API-level error returned by control-plane / execution operations.
@@ -125,13 +126,7 @@ impl SfnError {
     }
 
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
-        locallycloud_core::observability::log_service_error(
-            "states",
-            None,
-            request_id,
-            self.code(),
-            self.http_status(),
-        );
+        log_service_error("states", None, request_id, self.code(), self.http_status());
         AwsError::new(self.code(), self.to_string(), self.http_status())
             .with_request_id(request_id.to_string())
             .render(AwsProtocol::Json10)

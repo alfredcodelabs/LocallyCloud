@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
+use tracing::{error, warn};
 
 use http::Method;
 use serde_json::{json, Value};
@@ -1304,15 +1305,12 @@ impl EventsService {
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) => tracing::warn!(
+                Ok(Err(_)) => {
+                    warn!(service = "events", cause_code = "schema_discovery_failed")
+                }
+                Err(_) => warn!(
                     service = "events",
-                    cause_code = "schema_discovery_failed",
-                    "EventBridge schema discovery failed"
-                ),
-                Err(_) => tracing::warn!(
-                    service = "events",
-                    cause_code = "schema_discovery_task_failed",
-                    "EventBridge schema discovery task failed"
+                    cause_code = "schema_discovery_task_failed"
                 ),
             }
         }
@@ -1337,10 +1335,9 @@ impl EventsService {
         let pending = match self.store.pending_fanouts().await {
             Ok(pending) => pending,
             Err(_) => {
-                tracing::error!(
+                error!(
                     service = "events",
-                    cause_code = "pending_fanout_load_failed",
-                    "failed to load pending EventBridge fanout"
+                    cause_code = "pending_fanout_load_failed"
                 );
                 return true;
             }
@@ -1360,11 +1357,7 @@ impl EventsService {
                 .await
             {
                 if self.store.complete_fanout(&work.id).await.is_err() {
-                    tracing::error!(
-                        service = "events",
-                        cause_code = "fanout_completion_failed",
-                        "failed to complete EventBridge fanout"
-                    );
+                    error!(service = "events", cause_code = "fanout_completion_failed");
                     failed = true;
                 }
             } else {
@@ -1400,11 +1393,7 @@ impl EventsService {
                     let pending = match store.pending_fanouts().await {
                         Ok(work) => work,
                         Err(_) => {
-                            tracing::error!(
-                                service = "events",
-                                cause_code = "pending_queue_unavailable",
-                                "EventBridge pending queue unavailable"
-                            );
+                            error!(service = "events", cause_code = "pending_queue_unavailable");
                             return;
                         }
                     };
@@ -1451,11 +1440,7 @@ impl EventsService {
                             )
                             .await;
                             if complete && store.complete_fanout(&work.id).await.is_err() {
-                                tracing::error!(
-                                    service = "events",
-                                    cause_code = "fanout_commit_failed",
-                                    "EventBridge completion could not be committed"
-                                );
+                                error!(service = "events", cause_code = "fanout_commit_failed");
                             }
                         });
                     }
@@ -1985,21 +1970,16 @@ impl EventsService {
                     {
                         Ok(item) => item,
                         Err(_) => {
-                            tracing::error!(
-                                service = "events",
-                                cause_code = "replay_item_load_failed",
-                                "failed to load EventBridge replay item"
-                            );
+                            error!(service = "events", cause_code = "replay_item_load_failed");
                             return;
                         }
                     }
                 };
                 let Some(event) = event else {
-                    tracing::error!(
+                    error!(
                         service = "events",
                         cause_code = "replay_snapshot_incomplete",
-                        index,
-                        "EventBridge replay snapshot is incomplete"
+                        index
                     );
                     return;
                 };
@@ -2047,10 +2027,9 @@ impl EventsService {
                             Ok(true) => break,
                             Ok(false) => return,
                             Err(_) => {
-                                tracing::error!(
+                                error!(
                                     service = "events",
-                                    cause_code = "replay_progress_commit_failed",
-                                    "failed to persist EventBridge replay progress"
+                                    cause_code = "replay_progress_commit_failed"
                                 );
                                 return;
                             }
@@ -2073,11 +2052,9 @@ impl EventsService {
                     }
                 }
                 Ok(false) => {}
-                Err(_) => tracing::error!(
-                    service = "events",
-                    cause_code = "replay_completion_failed",
-                    "failed to complete EventBridge replay"
-                ),
+                Err(_) => {
+                    error!(service = "events", cause_code = "replay_completion_failed")
+                }
             }
             if let Ok(mut workers) = workers.lock() {
                 workers.remove(&completion_key);
@@ -2096,11 +2073,7 @@ impl EventsService {
                     self.spawn_replay_worker(account, region, replay, None, cursor, total);
                 }
             }
-            Err(_) => tracing::error!(
-                service = "events",
-                cause_code = "replay_load_failed",
-                "failed to load EventBridge replays"
-            ),
+            Err(_) => error!(service = "events", cause_code = "replay_load_failed"),
         }
     }
 
@@ -2657,11 +2630,7 @@ impl EventsService {
             ) {
                 Ok(value) => value,
                 Err(_) => {
-                    tracing::error!(
-                        service = "events",
-                        cause_code = "rule_cursor_unavailable",
-                        "scheduled Rule cursor unavailable"
-                    );
+                    error!(service = "events", cause_code = "rule_cursor_unavailable");
                     return;
                 }
             };
@@ -2714,10 +2683,9 @@ impl EventsService {
                     )
                     .is_err()
                 {
-                    tracing::error!(
+                    error!(
                         service = "events",
-                        cause_code = "rule_firing_journal_unavailable",
-                        "scheduled Rule firing journal unavailable"
+                        cause_code = "rule_firing_journal_unavailable"
                     );
                     break;
                 }
@@ -2789,10 +2757,9 @@ async fn deliver_pending_rule(
     let pending = match store.pending_firings("rule", &rule.arn) {
         Ok(rows) => rows,
         Err(_) => {
-            tracing::error!(
+            error!(
                 service = "events",
-                cause_code = "rule_pending_firings_unavailable",
-                "scheduled Rule pending firings unavailable"
+                cause_code = "rule_pending_firings_unavailable"
             );
             return false;
         }
@@ -2803,11 +2770,7 @@ async fn deliver_pending_rule(
             .and_then(|value| serde_json::from_value::<Rule>(value.clone()).ok())
             .zip(payload.get("event").cloned())
         else {
-            tracing::error!(
-                service = "events",
-                cause_code = "rule_snapshot_invalid",
-                "scheduled Rule firing snapshot is invalid"
-            );
+            error!(service = "events", cause_code = "rule_snapshot_invalid");
             return false;
         };
         match store.firing_ready(
@@ -2819,10 +2782,9 @@ async fn deliver_pending_rule(
             Ok(true) => {}
             Ok(false) => return false,
             Err(_) => {
-                tracing::error!(
+                error!(
                     service = "events",
-                    cause_code = "rule_retry_metadata_unavailable",
-                    "scheduled Rule retry metadata unavailable"
+                    cause_code = "rule_retry_metadata_unavailable"
                 );
                 return false;
             }
@@ -2872,19 +2834,17 @@ async fn deliver_pending_rule(
                 store.defer_firing("rule", &rule.arn, due_ns, now_ns)
             };
             if result.is_err() {
-                tracing::error!(
+                error!(
                     service = "events",
-                    cause_code = "rule_retry_metadata_unavailable",
-                    "scheduled Rule retry metadata unavailable"
+                    cause_code = "rule_retry_metadata_unavailable"
                 );
             }
             return false;
         }
         if store.complete_firing("rule", &rule.arn, due_ns).is_err() {
-            tracing::error!(
+            error!(
                 service = "events",
-                cause_code = "rule_completion_unavailable",
-                "scheduled Rule firing completion unavailable"
+                cause_code = "rule_completion_unavailable"
             );
             return false;
         }

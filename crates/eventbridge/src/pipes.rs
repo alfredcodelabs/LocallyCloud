@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use tracing::warn;
 
 use axum::body::to_bytes;
 use bytes::Bytes;
@@ -766,10 +767,9 @@ impl PipesService {
                             if pipe_persistence::save(store.state_db(), &account, &region, &updated)
                                 .is_err()
                             {
-                                tracing::warn!(
+                                warn!(
                                     service = "pipes",
-                                    cause_code = "pipe_checkpoint_commit_failed",
-                                    "pipe checkpoint commit failed"
+                                    cause_code = "pipe_checkpoint_commit_failed"
                                 );
                                 break;
                             }

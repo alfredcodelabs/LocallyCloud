@@ -6,6 +6,7 @@
 
 use axum::body::Body;
 use axum::response::Response;
+use locallycloud_core::observability::log_service_error;
 
 use crate::xml::escape;
 
@@ -219,13 +220,7 @@ impl S3Error {
     pub fn into_response(self, resource: &str, request_id: &str) -> Response {
         let status = self.http_status();
         if status >= 400 {
-            locallycloud_core::observability::log_service_error(
-                "s3",
-                None,
-                request_id,
-                self.code(),
-                status,
-            );
+            log_service_error("s3", None, request_id, self.code(), status);
         }
         let host_id = format!("lc2/{request_id}");
         if status == 304 {

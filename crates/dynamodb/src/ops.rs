@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::error;
 
 use base64::Engine;
 use bytes::Bytes;
@@ -1589,7 +1590,7 @@ pub async fn sweep_expired(store: &TableStore) {
 pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry>) {
     let _gate = store.operation_gate.lock().await;
     if store.has_uncommitted() && store.persist().await.is_err() {
-        tracing::error!(
+        error!(
             service = "dynamodb",
             cause_code = "state_commit_failed",
             "DynamoDB prior write could not be committed"
@@ -1622,10 +1623,9 @@ pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry
     changed |= store.has_dirty_items().await;
     if changed {
         if store.persist().await.is_err() {
-            tracing::error!(
+            error!(
                 service = "dynamodb",
-                cause_code = "maintenance_persistence_failed",
-                "DynamoDB maintenance persistence failed"
+                cause_code = "maintenance_persistence_failed"
             );
         }
     } else {

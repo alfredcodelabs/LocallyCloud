@@ -90,13 +90,19 @@ fn json_diagnostics_keep_fields_and_expected_denials_stay_below_info() {
             "AccessDeniedException",
             403,
         );
+        tracing::warn!(
+            service = "s3",
+            cause_code = "outbox_acknowledgement_failed",
+            outbox_id = 7,
+            request_id = "owned-request"
+        );
     });
     let bytes = capture.0.lock().unwrap();
     let lines: Vec<_> = bytes
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
         .collect();
-    assert_eq!(lines.len(), 1);
+    assert_eq!(lines.len(), 2);
     let event: serde_json::Value = serde_json::from_slice(lines[0]).unwrap();
     assert_eq!(event["level"], "ERROR");
     assert_eq!(event["fields"]["service"], "lambda");
@@ -104,6 +110,17 @@ fn json_diagnostics_keep_fields_and_expected_denials_stay_below_info() {
     assert_eq!(event["fields"]["request_id"], "owned-request");
     assert_eq!(event["fields"]["cause_code"], "ServiceException");
     assert_eq!(event["fields"]["status"], 500);
+    let background: serde_json::Value = serde_json::from_slice(lines[1]).unwrap();
+    assert_eq!(background["level"], "WARN");
+    assert_eq!(background["target"], module_path!());
+    assert_eq!(background["fields"]["service"], "s3");
+    assert_eq!(
+        background["fields"]["cause_code"],
+        "outbox_acknowledgement_failed"
+    );
+    assert_eq!(background["fields"]["outbox_id"], 7);
+    assert_eq!(background["fields"]["request_id"], "owned-request");
+    assert!(background["fields"].get("message").is_none());
     assert!(!bytes.contains(&0x1b));
 }
 
@@ -124,6 +141,12 @@ fn console_diagnostics_render_context_and_preserve_correlation() {
             "destination_denied",
             500,
         );
+        tracing::warn!(
+            service = "s3",
+            cause_code = "outbox_acknowledgement_failed",
+            outbox_id = 7,
+            request_id = "owned-background"
+        );
     });
     let bytes = capture.0.lock().unwrap();
     let text = String::from_utf8_lossy(&bytes);
@@ -133,6 +156,14 @@ fn console_diagnostics_render_context_and_preserve_correlation() {
     );
     assert!(text.contains("owned-request"));
     assert!(text.contains("destination_denied"));
-    assert_eq!(text.lines().count(), 1);
+    for field in [
+        "WARN [S3]",
+        "outbox_acknowledgement_failed",
+        "outbox_id=7",
+        "owned-background",
+    ] {
+        assert!(text.contains(field), "{text}");
+    }
+    assert_eq!(text.lines().count(), 2);
     assert!(!bytes.contains(&0x1b));
 }

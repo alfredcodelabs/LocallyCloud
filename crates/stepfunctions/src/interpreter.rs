@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use tracing::warn;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
@@ -118,17 +119,15 @@ impl Drop for AthenaQueryGuard {
             match result {
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => {
-                    tracing::warn!(
+                    warn!(
                         service = "states",
-                        cause_code = "athena_task_cancellation_failed",
-                        "Athena task cancellation failed"
+                        cause_code = "athena_task_cancellation_failed"
                     )
                 }
                 Err(_) => {
-                    tracing::warn!(
+                    warn!(
                         service = "states",
-                        cause_code = "athena_task_cancellation_timeout",
-                        "Athena task cancellation timed out"
+                        cause_code = "athena_task_cancellation_timeout"
                     )
                 }
             }

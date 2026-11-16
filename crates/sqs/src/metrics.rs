@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::debug;
 
 use locallycloud_core::integration::metrics::{
     EmitOutcome, MetricObservation, MetricOrigin, MetricUnit,
@@ -168,7 +169,7 @@ impl MetricsRecorder {
             return 0;
         }
         let Some(sink) = resolve_sink(&self.registry) else {
-            tracing::debug!(
+            debug!(
                 service = "sqs",
                 cause_code = "metrics_sink_unavailable",
                 count = emitted,
@@ -188,7 +189,7 @@ impl MetricsRecorder {
             }
             let outcome = sink.try_emit(batch);
             if outcome != EmitOutcome::Accepted {
-                tracing::debug!(
+                debug!(
                     service = "sqs",
                     cause_code = "metric_batch_rejected",
                     ?outcome,

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
+use tracing::error;
 
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -785,10 +786,9 @@ impl SchedulerService {
             ) {
                 Ok(value) => value,
                 Err(_) => {
-                    tracing::error!(
+                    error!(
                         service = "scheduler",
-                        cause_code = "schedule_cursor_unavailable",
-                        "Scheduler cursor unavailable"
+                        cause_code = "schedule_cursor_unavailable"
                     );
                     return;
                 }
@@ -858,10 +858,9 @@ impl SchedulerService {
                     )
                     .is_err()
                 {
-                    tracing::error!(
+                    error!(
                         service = "scheduler",
-                        cause_code = "schedule_firing_journal_unavailable",
-                        "Scheduler firing journal unavailable"
+                        cause_code = "schedule_firing_journal_unavailable"
                     );
                     break;
                 }
@@ -929,20 +928,18 @@ async fn deliver_pending_schedule(
     let pending = match store.pending_firings("scheduler", &item.arn) {
         Ok(rows) => rows,
         Err(_) => {
-            tracing::error!(
+            error!(
                 service = "scheduler",
-                cause_code = "schedule_pending_firings_unavailable",
-                "Scheduler pending firings unavailable"
+                cause_code = "schedule_pending_firings_unavailable"
             );
             return false;
         }
     };
     for (due_ns, payload) in pending {
         let Ok(snapshot) = serde_json::from_value::<Schedule>(payload) else {
-            tracing::error!(
+            error!(
                 service = "scheduler",
-                cause_code = "schedule_snapshot_invalid",
-                "Scheduler firing snapshot is invalid"
+                cause_code = "schedule_snapshot_invalid"
             );
             return false;
         };
@@ -955,10 +952,9 @@ async fn deliver_pending_schedule(
             Ok(true) => {}
             Ok(false) => return false,
             Err(_) => {
-                tracing::error!(
+                error!(
                     service = "scheduler",
-                    cause_code = "schedule_retry_metadata_unavailable",
-                    "Scheduler retry metadata unavailable"
+                    cause_code = "schedule_retry_metadata_unavailable"
                 );
                 return false;
             }
@@ -1006,10 +1002,9 @@ async fn deliver_pending_schedule(
                 store.defer_firing("scheduler", &item.arn, due_ns, now_ns)
             };
             if result.is_err() {
-                tracing::error!(
+                error!(
                     service = "scheduler",
-                    cause_code = "schedule_retry_metadata_unavailable",
-                    "Scheduler retry metadata unavailable"
+                    cause_code = "schedule_retry_metadata_unavailable"
                 );
             }
             return false;
@@ -1018,10 +1013,9 @@ async fn deliver_pending_schedule(
             .complete_firing("scheduler", &item.arn, due_ns)
             .is_err()
         {
-            tracing::error!(
+            error!(
                 service = "scheduler",
-                cause_code = "schedule_completion_unavailable",
-                "Scheduler firing completion unavailable"
+                cause_code = "schedule_completion_unavailable"
             );
             return false;
         }
@@ -1060,10 +1054,9 @@ async fn delete_completed_schedule(
             .await
             .is_err()
         {
-            tracing::error!(
+            error!(
                 service = "scheduler",
-                cause_code = "schedule_completion_metadata_unavailable",
-                "Scheduler completion metadata unavailable"
+                cause_code = "schedule_completion_metadata_unavailable"
             );
         }
     }

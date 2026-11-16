@@ -1,5 +1,6 @@
 //! Native EventBridge Schemas REST API. Registry/schema metadata lives in shared SQLite.
 
+use locallycloud_core::observability::log_service_error;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 
@@ -53,13 +54,7 @@ impl SchemasError {
                 m,
             ),
         };
-        locallycloud_core::observability::log_service_error(
-            "schemas",
-            None,
-            request_id,
-            code,
-            status.as_u16(),
-        );
+        log_service_error("schemas", None, request_id, code, status.as_u16());
         Response::builder()
             .status(status)
             .header("content-type", "application/json")

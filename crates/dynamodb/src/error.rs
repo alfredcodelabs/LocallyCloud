@@ -5,6 +5,7 @@
 //! additionally serializes ordered `CancellationReasons`.
 
 use locallycloud_core::error_mapping::AwsError;
+use locallycloud_core::observability::log_service_error;
 use locallycloud_core::registry::AwsProtocol;
 
 const TYPE_PREFIX: &str = "com.amazonaws.dynamodb.v20120810#";
@@ -143,7 +144,7 @@ impl DdbError {
 
     /// Render to an Axum response as the JSON 1.0 error shape.
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
-        locallycloud_core::observability::log_service_error(
+        log_service_error(
             "dynamodb",
             None,
             request_id,

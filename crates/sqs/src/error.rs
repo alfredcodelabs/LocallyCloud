@@ -4,6 +4,7 @@
 //! AWS-faithful HTTP status via the Core error mapper.
 
 use locallycloud_core::error_mapping::AwsError;
+use locallycloud_core::observability::log_service_error;
 use locallycloud_core::registry::AwsProtocol;
 
 const TYPE_PREFIX: &str = "com.amazonaws.sqs#";
@@ -199,7 +200,7 @@ impl SqsError {
     }
 
     pub(crate) fn log(&self, request_id: &str, operation: Option<&str>) {
-        locallycloud_core::observability::log_service_error(
+        log_service_error(
             "sqs",
             operation,
             request_id,
