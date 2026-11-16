@@ -3898,6 +3898,11 @@ impl Provisioner {
         if let Some(path) = props.get("Path").and_then(Value::as_str) {
             form.push_str(&format!("&Path={}", enc(path)));
         }
+        form.push_str(&iam_role_security_parameters(
+            logical_id,
+            props,
+            &self.account,
+        )?);
         let (status, body) = self
             .call("iam", Method::POST, "/", form_host(), Bytes::from(form))
             .await?;
@@ -3909,6 +3914,7 @@ impl Provisioner {
         }
 
         let configuration_result = async {
+            let attributes = iam_created_role_attributes(&body, logical_id, &self.account, &name)?;
             if let Some(policies) = props.get("Policies").and_then(Value::as_array) {
                 for policy in policies {
                     let policy_name = policy
@@ -3955,24 +3961,23 @@ impl Provisioner {
                     }
                 }
             }
-            Ok::<(), CfnError>(())
+            Ok::<_, CfnError>(attributes)
         }
         .await;
 
-        if let Err(error) = configuration_result {
-            return match self.delete_role(&name, props).await {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(with_cleanup_failure(error, cleanup_error)),
-            };
-        }
+        let attributes = match configuration_result {
+            Ok(attributes) => attributes,
+            Err(error) => {
+                return match self.delete_role(&name, props).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(with_cleanup_failure(error, cleanup_error)),
+                };
+            }
+        };
 
-        let arn = format!("arn:aws:iam::{}:role/{name}", self.account);
-        let mut attrs = std::collections::BTreeMap::new();
-        attrs.insert("Arn".into(), arn);
-        attrs.insert("RoleId".into(), format!("AROA{}", short_id()));
         Ok(ResolvedResource {
             ref_value: name,
-            attributes: attrs,
+            attributes,
         })
     }
 
@@ -7650,6 +7655,249 @@ fn event_target_ids(props: &Value) -> Vec<String> {
         .collect()
 }
 
+fn iam_created_role_attributes(
+    body: &[u8],
+    logical_id: &str,
+    account: &str,
+    name: &str,
+) -> Result<std::collections::BTreeMap<String, String>, CfnError> {
+    use quick_xml::events::Event;
+    let invalid = || {
+        CfnError::ResourceFailed(format!(
+            "IAM CreateRole returned invalid role attributes for {logical_id}"
+        ))
+    };
+    // A valid Role response includes only bounded IAM metadata and its trust policy.
+    if body.len() > 2 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    let xml = std::str::from_utf8(body).map_err(|_| invalid())?;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut attributes: std::collections::BTreeMap<String, String> = Default::default();
+    let mut roots = 0;
+    let mut roles = 0;
+    fn field(path: &[Vec<u8>]) -> Option<&'static str> {
+        match path {
+            [root, result, role, field]
+                if root == b"CreateRoleResponse"
+                    && result == b"CreateRoleResult"
+                    && role == b"Role" =>
+            {
+                match field.as_slice() {
+                    b"Arn" => Some("Arn"),
+                    b"RoleId" => Some("RoleId"),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    loop {
+        let event = reader.read_event().map_err(|_| invalid())?;
+        match event {
+            Event::Start(start) => {
+                if path.len() >= 16 || field(&path).is_some() {
+                    return Err(invalid());
+                }
+                if path.is_empty() {
+                    roots += 1;
+                    if roots > 1 {
+                        return Err(invalid());
+                    }
+                }
+                for attribute in start.attributes() {
+                    attribute.map_err(|_| invalid())?;
+                }
+                path.push(start.local_name().as_ref().as_bytes().to_vec());
+                if path.len() == 3
+                    && path.iter().map(Vec::as_slice).eq([
+                        b"CreateRoleResponse".as_slice(),
+                        b"CreateRoleResult".as_slice(),
+                        b"Role".as_slice(),
+                    ])
+                {
+                    roles += 1;
+                    if roles > 1 {
+                        return Err(invalid());
+                    }
+                }
+                if let Some(field) = field(&path) {
+                    if attributes.insert(field.into(), String::new()).is_some() {
+                        return Err(invalid());
+                    }
+                }
+            }
+            Event::End(_) => {
+                path.pop().ok_or_else(invalid)?;
+            }
+            Event::Text(text) => {
+                let content = text.xml10_content();
+                if path.is_empty() && !content.trim().is_empty() {
+                    return Err(invalid());
+                }
+                if let Some(field) = field(&path) {
+                    let value = attributes.get_mut(field).ok_or_else(invalid)?;
+                    if value.len() + content.len() > 8192 {
+                        return Err(invalid());
+                    }
+                    value.push_str(&content);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if path.is_empty() {
+                    return Err(invalid());
+                }
+                let value = match reference.resolve_char_ref().map_err(|_| invalid())? {
+                    Some(character) => character.to_string(),
+                    None => quick_xml::escape::resolve_predefined_entity(reference.as_ref())
+                        .ok_or_else(invalid)?
+                        .to_owned(),
+                };
+                if let Some(field) = field(&path) {
+                    let target = attributes.get_mut(field).ok_or_else(invalid)?;
+                    if target.len() + value.len() > 8192 {
+                        return Err(invalid());
+                    }
+                    target.push_str(&value);
+                }
+            }
+            Event::CData(text) => {
+                if path.is_empty() {
+                    return Err(invalid());
+                }
+                if let Some(field) = field(&path) {
+                    let target = attributes.get_mut(field).ok_or_else(invalid)?;
+                    let content = text.xml10_content();
+                    if target.len() + content.len() > 8192 {
+                        return Err(invalid());
+                    }
+                    target.push_str(&content);
+                }
+            }
+            Event::DocType(_) => return Err(invalid()),
+            Event::Eof => break,
+            Event::Empty(start) => {
+                if path.is_empty() || field(&path).is_some() {
+                    return Err(invalid());
+                }
+                if path.iter().map(Vec::as_slice).eq([
+                    b"CreateRoleResponse".as_slice(),
+                    b"CreateRoleResult".as_slice(),
+                    b"Role".as_slice(),
+                ]) && matches!(start.local_name().as_ref(), "Arn" | "RoleId")
+                {
+                    return Err(invalid());
+                }
+                for attribute in start.attributes() {
+                    attribute.map_err(|_| invalid())?;
+                }
+            }
+            Event::Decl(_) | Event::PI(_) | Event::Comment(_) => {}
+        }
+    }
+    if !path.is_empty() || roles != 1 || attributes.len() != 2 {
+        return Err(invalid());
+    }
+    let arn = attributes.get("Arn").ok_or_else(invalid)?;
+    let parsed = locallycloud_core::integration::arn::Arn::parse(arn).map_err(|_| invalid())?;
+    if arn.len() > 2048
+        || parsed.partition != "aws"
+        || parsed.service != "iam"
+        || !parsed.region.is_empty()
+        || parsed.account_id != account
+        || !parsed.resource.starts_with("role/")
+        || parsed.resource.rsplit('/').next() != Some(name)
+    {
+        return Err(invalid());
+    }
+    let role_id = attributes.get("RoleId").ok_or_else(invalid)?;
+    if role_id.len() <= 4
+        || role_id.len() > 128
+        || !role_id.starts_with("AROA")
+        || !role_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(invalid());
+    }
+    Ok(attributes)
+}
+
+/// Validate create-time security properties before IAM can publish the role.
+fn iam_role_security_parameters(
+    logical_id: &str,
+    props: &Value,
+    account: &str,
+) -> Result<String, CfnError> {
+    let mut parameters = String::new();
+    if props.get("PermissionsBoundary").is_some() {
+        let boundary = required_property(props, "PermissionsBoundary", logical_id)?;
+        let valid = locallycloud_core::integration::arn::Arn::parse(&boundary).is_ok_and(|arn| {
+            boundary.len() <= 2048
+                && arn.partition == "aws"
+                && arn.service == "iam"
+                && arn.region.is_empty()
+                && (arn.account_id == account || arn.account_id == "aws")
+                && arn
+                    .resource
+                    .strip_prefix("policy/")
+                    .is_some_and(|name| !name.is_empty())
+                && !boundary.chars().any(char::is_control)
+        });
+        if !valid {
+            return Err(CfnError::Validation(format!(
+                "AWS::IAM::Role resource {logical_id} requires PermissionsBoundary to identify an IAM managed policy"
+            )));
+        }
+        parameters.push_str(&format!("&PermissionsBoundary={}", enc(&boundary)));
+    }
+    let Some(tags) = props.get("Tags") else {
+        return Ok(parameters);
+    };
+    let invalid = || {
+        CfnError::Validation(format!(
+        "AWS::IAM::Role resource {logical_id} requires up to 50 unique Tags with string Key and Value"
+    ))
+    };
+    let tags = tags
+        .as_array()
+        .filter(|tags| tags.len() <= 50)
+        .ok_or_else(invalid)?;
+    let mut keys = std::collections::BTreeSet::new();
+    static TAG_CHARACTERS: std::sync::OnceLock<Result<regex::Regex, regex::Error>> =
+        std::sync::OnceLock::new();
+    let characters = TAG_CHARACTERS
+        .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{Z}\p{N}_.:/=+\-@]*$"))
+        .as_ref()
+        .map_err(|_| CfnError::Internal)?;
+    for (index, tag) in tags.iter().enumerate() {
+        ensure_known_properties(logical_id, "AWS::IAM::Role.Tags", tag, &["Key", "Value"])?;
+        let key = tag.get("Key").and_then(Value::as_str).ok_or_else(invalid)?;
+        let value = tag
+            .get("Value")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        if key.is_empty()
+            || key.chars().count() > 128
+            || value.chars().count() > 256
+            || key.to_ascii_lowercase().starts_with("aws:")
+            || value.to_ascii_lowercase().starts_with("aws:")
+            || !characters.is_match(key)
+            || !characters.is_match(value)
+            || !keys.insert(key.to_ascii_lowercase())
+        {
+            return Err(invalid());
+        }
+        parameters.push_str(&format!(
+            "&Tags.member.{}.Key={}&Tags.member.{}.Value={}",
+            index + 1,
+            enc(key),
+            index + 1,
+            enc(value)
+        ));
+    }
+    Ok(parameters)
+}
+
 /// An IAM role-scoped Query action and its parameters besides `RoleName`.
 type IamRoleCall = (&'static str, Vec<(&'static str, String)>);
 
@@ -10414,6 +10662,146 @@ mod tests {
             if let Some(policy) = policy {
                 assert!(error.contains(&format!("policy {policy}")), "{error}");
             }
+        }
+    }
+
+    #[test]
+    fn iam_role_security_attributes_parse_escaped_values_and_fail_closed() {
+        let xml = "<CreateRoleResponse><CreateRoleResult><Role><Arn>arn:aws:iam::000000000000:role/team&amp;ops/created</Arn><RoleId>AROA12345678901234567</RoleId></Role></CreateRoleResult></CreateRoleResponse>";
+        let attributes =
+            iam_created_role_attributes(xml.as_bytes(), "Role", "000000000000", "created").unwrap();
+        assert_eq!(
+            attributes["Arn"],
+            "arn:aws:iam::000000000000:role/team&ops/created"
+        );
+        assert_eq!(attributes["RoleId"], "AROA12345678901234567");
+        for invalid in [
+            xml.replace("<RoleId>AROA12345678901234567</RoleId>", ""),
+            xml.replace("<RoleId>AROA12345678901234567</RoleId>", "<RoleId/>"),
+            xml.replace("</Role>", "<RoleId>AROAOTHER</RoleId></Role>"),
+            xml.replace("</Role>", "<Arn>arn:aws:iam::000000000000:role/created</Arn></Role>"),
+            xml.replace("</Role>", "</Other>"),
+            xml.replace("000000000000", "111111111111"),
+            xml.replace("AROA12345678901234567", "invalid"),
+            xml.replace("team&amp;ops/created", "team&amp;ops/another"),
+            xml.replace("<Arn>", "<Arn/><Arn>"),
+            xml.replace("</CreateRoleResponse>", &format!("{}{}{}", "<Extra>".repeat(17), "</Extra>".repeat(17), "</CreateRoleResponse>")),
+            format!("{xml}{}", " ".repeat(2 * 1024 * 1024)),
+            xml.replace("&amp;", "&undefined;"),
+            format!("<!DOCTYPE CreateRoleResponse>{xml}"),
+            "<Role><Arn>arn:aws:iam::000000000000:role/created</Arn><RoleId>AROA123</RoleId></Role>".into(),
+        ] {
+            assert!(iam_created_role_attributes(invalid.as_bytes(), "Role", "000000000000", "created").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn iam_role_security_invalid_create_response_cleans_up_the_role() {
+        struct InvalidRoleReply {
+            calls: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl NativeHandler for InvalidRoleReply {
+            async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+                let query = locallycloud_iam_sts::query::QueryRequest::parse(&request.body);
+                let action = query.action().unwrap().to_owned();
+                self.calls.lock().unwrap().push(action.clone());
+                let reply = if action == "CreateRole" {
+                    "<CreateRoleResponse><CreateRoleResult><Role><Arn>arn:aws:iam::000000000000:role/created</Arn></Role></CreateRoleResult></CreateRoleResponse>"
+                } else {
+                    "<DeleteRoleResponse/>"
+                };
+                http::Response::builder()
+                    .status(200)
+                    .body(axum::body::Body::from(reply))
+                    .unwrap()
+            }
+        }
+        let registry = Arc::new(ServiceRegistry::new());
+        let handler = Arc::new(InvalidRoleReply {
+            calls: Default::default(),
+        });
+        registry.register_native(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            handler.clone(),
+        );
+        let provisioner = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let error = provisioner
+            .iam_role(
+                "Role",
+                "stack",
+                &json!({"RoleName":"created","AssumeRolePolicyDocument":{}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid role attributes"));
+        assert_eq!(*handler.calls.lock().unwrap(), ["CreateRole", "DeleteRole"]);
+    }
+
+    #[tokio::test]
+    async fn iam_role_security_updates_are_rejected_before_dispatch() {
+        let provisioner = Provisioner::new(Weak::new(), "us-east-1".into(), "000000000000".into());
+        let previous = json!({"RoleName":"role","PermissionsBoundary":"arn:aws:iam::000000000000:policy/old","Tags":[{"Key":"env","Value":"prod"}]});
+        for property in ["PermissionsBoundary", "Tags"] {
+            let mut next = previous.clone();
+            next.as_object_mut().unwrap().remove(property);
+            let error = provisioner
+                .update_iam_role("Role", "role", &previous, &next)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("changed properties that are not supported"));
+        }
+    }
+
+    #[test]
+    fn iam_role_security_parameters_validate_before_create_and_encode_tags() {
+        let valid = json!({"PermissionsBoundary":"arn:aws:iam::000000000000:policy/team/read-only","Tags":[{"Key":"team/name","Value":"platform dev"}]});
+        let form = iam_role_security_parameters("Role", &valid, "000000000000").unwrap();
+        assert!(form.contains(
+            "PermissionsBoundary=arn%3Aaws%3Aiam%3A%3A000000000000%3Apolicy%2Fteam%2Fread-only"
+        ));
+        assert!(form.contains("Tags.member.1.Key=team%2Fname&Tags.member.1.Value=platform%20dev"));
+        assert_eq!(
+            iam_role_security_parameters("Role", &json!({}), "000000000000").unwrap(),
+            ""
+        );
+        assert!(iam_role_security_parameters(
+            "Role",
+            &json!({"Tags":[{"Key":"团队/name","Value":"平台"}]}),
+            "000000000000"
+        )
+        .is_ok());
+        for props in [
+            json!({"PermissionsBoundary":false}),
+            json!({"PermissionsBoundary":null}),
+            json!({"PermissionsBoundary":""}),
+            json!({"PermissionsBoundary":"arn:aws:iam::111111111111:policy/foreign"}),
+            json!({"Tags":null}),
+            json!({"Tags":{}}),
+            json!({"Tags":[{"Key":"k","Value":false}]}),
+            json!({"Tags":[{"Key":"k"}]}),
+            json!({"Tags":[{"Key":"","Value":"v"}]}),
+            json!({"Tags":[{"Key":"Env","Value":"prod"},{"Key":"env","Value":"dev"}]}),
+            json!({"Tags":[{"Key":"aws:reserved","Value":"v"}]}),
+            json!({"Tags":[{"Key":"k","Value":"AWS:reserved"}]}),
+            json!({"Tags":[{"Key":"\u{0345}","Value":"v"}]}),
+            json!({"Tags":[{"Key":"k","Value":"\u{0345}"}]}),
+            json!({"Tags":[{"Key":"k","Value":"v","Unknown":"x"}]}),
+            json!({"Tags":[{"Key":"k".repeat(129),"Value":"v"}]}),
+            json!({"Tags":[{"Key":"k","Value":"v".repeat(257)}]}),
+            json!({"Tags":vec![json!({"Key":"k","Value":"v"});51]}),
+        ] {
+            assert!(
+                iam_role_security_parameters("Role", &props, "000000000000").is_err(),
+                "{props}"
+            );
         }
     }
 

@@ -61,6 +61,10 @@ impl QueryRequest {
         self.params.insert("UserName".into(), name);
     }
 
+    pub(crate) fn get_raw(&self, key: &str) -> Option<&str> {
+        self.params.get(key).map(String::as_str)
+    }
+
     /// A required parameter; `ValidationError` when missing or empty.
     pub fn require(&self, key: &str) -> Result<&str, IamStsError> {
         self.get(key).ok_or_else(|| {

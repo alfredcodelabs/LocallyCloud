@@ -165,14 +165,7 @@ pub fn untag_user(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult
 }
 
 pub fn list_user_tags(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
-    let name = q.require("UserName")?;
-    let user = store
-        .get_user(account, name)
-        .ok_or_else(|| no_such_entity("user"))?;
-    Ok(format!(
-        "{}<IsTruncated>false</IsTruncated>",
-        tags_xml(&user.tags)
-    ))
+    crate::tag_pagination::list(store, account, crate::tag_pagination::TagKind::User, q)
 }
 
 // ============================ Groups ===========================================
@@ -420,14 +413,7 @@ pub fn untag_role(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult
 }
 
 pub fn list_role_tags(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
-    let name = q.require("RoleName")?;
-    let role = store
-        .get_role(account, name)
-        .ok_or_else(|| no_such_entity("role"))?;
-    Ok(format!(
-        "{}<IsTruncated>false</IsTruncated>",
-        tags_xml(&role.tags)
-    ))
+    crate::tag_pagination::list(store, account, crate::tag_pagination::TagKind::Role, q)
 }
 
 pub fn delete_role(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
@@ -556,12 +542,7 @@ pub fn untag_policy(store: &IamStore, account: &str, q: &QueryRequest) -> OpResu
 }
 
 pub fn list_policy_tags(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
-    let arn = q.require("PolicyArn")?;
-    let policy = lookup_policy(store, account, arn)?;
-    Ok(format!(
-        "{}<IsTruncated>false</IsTruncated>",
-        tags_xml(&policy.tags)
-    ))
+    crate::tag_pagination::list(store, account, crate::tag_pagination::TagKind::Policy, q)
 }
 
 fn lookup_policy(store: &IamStore, account: &str, arn: &str) -> Result<IamPolicy, IamStsError> {
@@ -1228,13 +1209,12 @@ pub fn untag_instance_profile(store: &IamStore, account: &str, q: &QueryRequest)
 }
 
 pub fn list_instance_profile_tags(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
-    let profile = store
-        .get_instance_profile(account, q.require("InstanceProfileName")?)
-        .ok_or_else(|| no_such_entity("instance profile"))?;
-    Ok(format!(
-        "{}<IsTruncated>false</IsTruncated>",
-        tags_xml(&profile.tags)
-    ))
+    crate::tag_pagination::list(
+        store,
+        account,
+        crate::tag_pagination::TagKind::InstanceProfile,
+        q,
+    )
 }
 
 pub fn add_role_to_instance_profile(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {

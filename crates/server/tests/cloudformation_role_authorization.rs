@@ -266,12 +266,21 @@ impl Fixture {
         properties: Value,
         role_arn: Option<&str>,
     ) -> String {
-        let template = json!({"Resources":{"Resource":{"Type":kind,"Properties":properties}}});
+        let mut template = json!({"Resources":{"Resource":{"Type":kind,"Properties":properties}}});
+        if kind == "AWS::IAM::Role" {
+            template["Outputs"] = json!({
+                "CreatedRoleArn":{"Value":{"Fn::GetAtt":["Resource","Arn"]}},
+                "CreatedRoleId":{"Value":{"Fn::GetAtt":["Resource","RoleId"]}},
+            });
+        }
         let mut params = vec![
             ("StackName", name.into()),
             ("TemplateBody", template.to_string()),
             ("DisableRollback", "true".into()),
         ];
+        if kind == "AWS::IAM::Role" {
+            params.push(("Capabilities.member.1", "CAPABILITY_NAMED_IAM".into()));
+        }
         if let Some(role) = role_arn {
             params.push(("RoleARN", role.into()));
         }
@@ -848,5 +857,199 @@ async fn execution_role_creates_iam_role_and_inline_policy_and_its_deny_wins_ove
             let actual: Value = serde_json::from_str(&role.inline_policies["read"]).unwrap();
             assert_eq!(actual, inline);
         }
+    }
+}
+
+#[tokio::test]
+async fn cfn_role_creation_keeps_boundary_and_tags_in_the_authorized_create_call() {
+    let fixture = Fixture::new();
+    fixture.iam.update_user(ACCOUNT, "creator", |user| {
+        user.inline_policies = policy(false)
+    });
+    locallycloud_s3::register(&fixture.registry);
+    let (status, body) = fixture
+        .query(
+            KEY,
+            "iam",
+            "CreatePolicy",
+            &[
+                ("PolicyName", "read-only".into()),
+                ("Path", "/guardrails/".into()),
+                (
+                    "PolicyDocument",
+                    json!({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}})
+                        .to_string(),
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let boundary = xml_value(&body, "Arn").to_owned();
+    let props = json!({
+        "RoleName":"bounded-from-stack", "Path":"/team/&ops/",
+        "AssumeRolePolicyDocument":{"Statement":{"Effect":"Allow","Principal":{"AWS":format!("arn:aws:iam::{ACCOUNT}:user/creator")},"Action":"sts:AssumeRole"}},
+        "PermissionsBoundary":boundary,
+        "Tags":[{"Key":"team/name","Value":"platform dev"}],
+        "Policies":[{"PolicyName":"s3","PolicyDocument":{"Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}}],
+    });
+    let stack = fixture
+        .stack(KEY, "bounded-role", "AWS::IAM::Role", props, Some(CFN_ROLE))
+        .await;
+    assert!(
+        stack.contains("<StackStatus>CREATE_COMPLETE</StackStatus>"),
+        "{stack}"
+    );
+    assert_eq!(xml_value(&stack, "RoleARN"), CFN_ROLE);
+    let (status, role) = fixture
+        .query(
+            KEY,
+            "iam",
+            "GetRole",
+            &[("RoleName", "bounded-from-stack".into())],
+        )
+        .await;
+    assert_eq!(status, 200, "{role}");
+    assert_eq!(xml_value(&role, "PermissionsBoundaryArn"), boundary);
+    assert!(
+        role.contains("<Key>team/name</Key><Value>platform dev</Value>"),
+        "{role}"
+    );
+    let output = |key: &str| {
+        let (_, tail) = stack
+            .split_once(&format!("<OutputKey>{key}</OutputKey>"))
+            .unwrap();
+        xml_value(tail, "OutputValue").to_owned()
+    };
+    assert_eq!(output("CreatedRoleArn"), xml_value(&role, "Arn"));
+    let role_arn = fixture
+        .iam
+        .get_role(ACCOUNT, "bounded-from-stack")
+        .unwrap()
+        .arn;
+    assert_eq!(output("CreatedRoleId"), xml_value(&role, "RoleId"));
+    for (path, value) in [("/cfn-bounded", ""), ("/cfn-bounded/read", "seed")] {
+        assert_eq!(
+            fixture
+                .call(KEY, "s3", Method::PUT, path, None, value.into())
+                .await
+                .0,
+            200
+        );
+    }
+    let (status, credentials) = fixture
+        .query(
+            KEY,
+            "sts",
+            "AssumeRole",
+            &[
+                ("RoleArn", role_arn),
+                ("RoleSessionName", "boundary-check".into()),
+            ],
+        )
+        .await;
+    assert_eq!(status, 200);
+    let session = xml_value(&credentials, "AccessKeyId");
+    let (status, body) = fixture
+        .call(
+            session,
+            "s3",
+            Method::GET,
+            "/cfn-bounded/read",
+            None,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "seed");
+    let (status, body) = fixture
+        .call(
+            session,
+            "s3",
+            Method::PUT,
+            "/cfn-bounded/forbidden",
+            None,
+            "must not be stored".into(),
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(
+        fixture
+            .call(
+                KEY,
+                "s3",
+                Method::GET,
+                "/cfn-bounded/forbidden",
+                None,
+                String::new()
+            )
+            .await
+            .0,
+        404
+    );
+}
+
+#[tokio::test]
+async fn cfn_tag_dependency_denial_and_malformed_role_security_properties_create_no_role() {
+    let fixture = Fixture::new();
+    fixture.iam.update_user(ACCOUNT, "creator", |user| {
+        user.inline_policies = [("tag-deny".into(), json!({"Statement":[
+            {"Effect":"Allow","Action":"*","Resource":"*"},
+            {"Effect":"Deny","Action":"iam:TagRole","Resource":format!("arn:aws:iam::{ACCOUNT}:role/team/denied-tagged")},
+        ]}).to_string())].into();
+    });
+    let trust = json!({"Statement":{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}});
+    let props = json!({"RoleName":"denied-tagged","Path":"/team/","AssumeRolePolicyDocument":trust,"Tags":[{"Key":"env","Value":"prod"}]});
+    let stack = fixture
+        .stack(KEY, "tag-dependency-denied", "AWS::IAM::Role", props, None)
+        .await;
+    assert!(
+        stack.contains("<StackStatus>CREATE_FAILED</StackStatus>"),
+        "{stack}"
+    );
+    assert!(fixture.iam.get_role(ACCOUNT, "denied-tagged").is_none());
+    assert_eq!(
+        fixture
+            .query(
+                KEY,
+                "iam",
+                "GetRole",
+                &[("RoleName", "denied-tagged".into())]
+            )
+            .await
+            .0,
+        404
+    );
+    for (index, security) in [
+        json!({"Tags":null}),
+        json!({"Tags":{}}),
+        json!({"Tags":[{"Key":"env","Value":12}]}),
+        json!({"PermissionsBoundary":null}),
+        json!({"PermissionsBoundary":12}),
+        json!({"PermissionsBoundary":""}),
+        json!({"PermissionsBoundary":"arn:aws:s3:::wrong-service"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("malformed-security-{index}");
+        let mut props = json!({"RoleName":name,"AssumeRolePolicyDocument":trust});
+        props
+            .as_object_mut()
+            .unwrap()
+            .extend(security.as_object().unwrap().clone());
+        let stack = fixture
+            .stack(
+                KEY,
+                &format!("invalid-security-{index}"),
+                "AWS::IAM::Role",
+                props,
+                None,
+            )
+            .await;
+        assert!(
+            stack.contains("<StackStatus>CREATE_FAILED</StackStatus>"),
+            "{stack}"
+        );
+        assert!(fixture.iam.get_role(ACCOUNT, &name).is_none());
     }
 }

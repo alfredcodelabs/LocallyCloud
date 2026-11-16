@@ -16,6 +16,7 @@ mod resource_policy;
 pub mod service;
 pub mod store;
 pub mod sts;
+mod tag_pagination;
 
 pub use persistence::authenticate_state_key;
 

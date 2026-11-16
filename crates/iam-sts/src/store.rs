@@ -504,6 +504,50 @@ impl IamStore {
             false
         }
     }
+    pub(crate) fn read_tags<T>(
+        &self,
+        account: &str,
+        kind: crate::tag_pagination::TagKind,
+        name: &str,
+        read: impl FnOnce(&str, &BTreeMap<String, String>) -> Result<T, IamStsError>,
+    ) -> Result<T, IamStsError> {
+        use crate::tag_pagination::TagKind;
+        let records = self.records.read().unwrap();
+        let entity_key = key(account, name);
+        let missing = || IamStsError::NoSuchEntity("IAM tag resource not found".into());
+        let (arn, tags) = match kind {
+            TagKind::User => {
+                let user = records.users.get(&entity_key).ok_or_else(missing)?;
+                (&user.arn, &user.tags)
+            }
+            TagKind::Role => {
+                let role = records.roles.get(&entity_key).ok_or_else(missing)?;
+                (&role.arn, &role.tags)
+            }
+            TagKind::Policy => {
+                let policy = records
+                    .policies
+                    .get(&entity_key)
+                    .or_else(|| records.policies.get(&key("aws", name)))
+                    .ok_or_else(missing)?;
+                if policy.is_aws_managed {
+                    return Err(IamStsError::InvalidInput(
+                        "ListPolicyTags supports customer managed policies only".into(),
+                    ));
+                }
+                (&policy.arn, &policy.tags)
+            }
+            TagKind::InstanceProfile => {
+                let profile = records
+                    .instance_profiles
+                    .get(&entity_key)
+                    .ok_or_else(missing)?;
+                (&profile.arn, &profile.tags)
+            }
+        };
+        read(arn, tags)
+    }
+
     pub fn seed_policy(&self, account: &str, policy: IamPolicy) {
         self.records
             .write()

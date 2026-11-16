@@ -61,7 +61,9 @@ boundary. Creating tagged users, roles, policies or instance profiles also requi
 the corresponding `Tag*` permission. Adding a role to an instance profile requires
 `iam:PassRole` to EC2. Boundaries supplied when creating users or roles persist and
 limit their permissions. Instance profile tags also persist across restarts.
-IAM tag quota and character validation remain incomplete.
+IAM tag listings support `MaxItems` and `Marker` and return existing tags as stored.
+Tag quota and character validation remain incomplete; Unicode tag-key case handling
+is not fully validated.
 
 Omitting `UserName` in `GetUser` or access-key operations requires verified,
 long-term IAM user credentials. Supply `UserName` when using an assumed role or
@@ -111,6 +113,9 @@ Supports Lambda `Architectures`, [logging](LAMBDA.md#logging), Lambda-backed cus
 resources, rollback, live resource progress and paginated `ListChangeSets`.
 Install custom-resource runtimes before deployment; missing callbacks wait until
 `ServiceTimeout`.
+
+IAM role creation forwards `PermissionsBoundary` and `Tags` in the same authorized
+`CreateRole` call. Updating either property on an existing role is currently rejected.
 
 A stack's `RoleARN` is persisted and used for creation, updates and deletion.
 Assigning a role requires `iam:PassRole` and trust for `cloudformation.amazonaws.com`.

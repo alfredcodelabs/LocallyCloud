@@ -28,6 +28,8 @@ pub enum IamStsError {
     AccessDenied(String),
     #[error("{0}")]
     InvalidAction(String),
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 impl IamStsError {
@@ -42,6 +44,7 @@ impl IamStsError {
             IamStsError::ValidationError(_) => "ValidationError",
             IamStsError::AccessDenied(_) => "AccessDenied",
             IamStsError::InvalidAction(_) => "InvalidAction",
+            IamStsError::InvalidInput(_) => "InvalidInput",
         }
     }
 
@@ -54,7 +57,8 @@ impl IamStsError {
             | IamStsError::LimitExceeded(_) => 409,
             IamStsError::MalformedPolicyDocument(_)
             | IamStsError::ValidationError(_)
-            | IamStsError::InvalidAction(_) => 400,
+            | IamStsError::InvalidAction(_)
+            | IamStsError::InvalidInput(_) => 400,
             IamStsError::AccessDenied(_) => 403,
         }
     }
