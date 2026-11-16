@@ -38,6 +38,7 @@ use crate::xray::{CallOutcome, Sampler, StageTrace, TracedStage};
 
 pub struct ExecuteCtx<'a> {
     pub store: &'a ApiGwStore,
+    pub original_request: Option<&'a locallycloud_core::handler::ServiceRequest>,
     pub validator: &'a JwtValidator,
     pub http: &'a reqwest::Client,
     pub registry: &'a Weak<ServiceRegistry>,
@@ -133,6 +134,7 @@ enum InvokeFailure {
 
 #[derive(Debug, Default)]
 struct AuthContext {
+    iam: Option<Value>,
     jwt: Option<(Value, Vec<String>)>,
     lambda: Option<Value>,
 }
@@ -701,17 +703,23 @@ async fn invoke_rest_inner(
         }
     };
     let gateway_responses = snapshot.gateway_responses.clone();
-    let resource_decision = match crate::resource_policy::evaluate(
-        ctx.registry,
-        &snapshot.policy,
-        format!(
-            "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
-            ctx.region, ctx.account, target.api_id, stage, method, path
-        ),
-        ctx.policy_context,
-    ) {
-        Ok(decision) => decision,
-        Err(()) => return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden"),
+    let resource_decision = if route.value.get("authorizationType").and_then(Value::as_str)
+        == Some("AWS_IAM")
+    {
+        None
+    } else {
+        match crate::resource_policy::evaluate(
+            ctx.registry,
+            &snapshot.policy,
+            format!(
+                "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
+                ctx.region, ctx.account, target.api_id, stage, method, path
+            ),
+            ctx.policy_context,
+        ) {
+            Ok(decision) => decision,
+            Err(()) => return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden"),
+        }
     };
     use locallycloud_core::integration::authorization::ResourcePolicyDecision;
     if resource_decision == Some(ResourcePolicyDecision::ExplicitDeny) {
@@ -769,7 +777,7 @@ async fn invoke_rest_inner(
         .get("authorizationType")
         .and_then(Value::as_str)
         .unwrap_or("NONE");
-    if !matches!(auth_type, "NONE" | "CUSTOM") {
+    if !matches!(auth_type, "NONE" | "CUSTOM" | "AWS_IAM") {
         return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden");
     }
     if auth_type == "NONE"
@@ -777,7 +785,43 @@ async fn invoke_rest_inner(
     {
         return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden");
     }
-    let auth = if auth_type == "CUSTOM" {
+    let auth = if auth_type == "AWS_IAM" {
+        let Some(original) = ctx.original_request else {
+            return rest_error(
+                &gateway_responses,
+                "AUTHORIZER_CONFIGURATION_ERROR",
+                500,
+                "Original invocation request is unavailable",
+            );
+        };
+        let arn = format!(
+            "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
+            ctx.region, ctx.account, target.api_id, stage, method, path
+        );
+        let document = match &snapshot.policy {
+            Value::Null => None,
+            Value::String(document) => Some(document.as_str()),
+            _ => return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden"),
+        };
+        let identity = match crate::auth::authorize_iam_invoke(
+            ctx.registry,
+            original,
+            arn,
+            document,
+            ctx.account,
+            ctx.policy_context,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let status = match error { locallycloud_core::integration::authorization::AuthorizationError::Denied | locallycloud_core::integration::authorization::AuthorizationError::InvalidRequest => 403, _ => 500 };
+                return rest_error(&gateway_responses, "ACCESS_DENIED", status, "Forbidden");
+            }
+        };
+        AuthContext {
+            iam: identity,
+            ..AuthContext::default()
+        }
+    } else if auth_type == "CUSTOM" {
         match authorizer {
             Some((id, authorizer)) => match lambda_authorize(
                 ctx,
@@ -1344,6 +1388,7 @@ async fn jwt_authorize(
         .await
     {
         AuthOutcome::Allow { claims, scopes } => Ok(AuthContext {
+            iam: None,
             jwt: Some((claims, scopes)),
             lambda: None,
         }),
@@ -1673,6 +1718,7 @@ fn interpret_authorizer(
             return Err(403);
         }
         return Ok(AuthContext {
+            iam: None,
             jwt: None,
             lambda: Some(result.get("context").cloned().unwrap_or_else(|| json!({}))),
         });
@@ -1699,6 +1745,7 @@ fn interpret_authorizer(
         context.insert("principalId".into(), principal_id.clone());
     }
     Ok(AuthContext {
+        iam: None,
         jwt: None,
         lambda: Some(Value::Object(context)),
     })
@@ -1862,6 +1909,11 @@ fn integration_event(
     );
     if format == "1.0" {
         event["requestContext"]["resourceId"] = Value::String(request.resource_id.to_string());
+    }
+    if let Some(identity) = request.auth.iam.as_ref().and_then(Value::as_object) {
+        if let Some(target) = event["requestContext"]["identity"].as_object_mut() {
+            target.extend(identity.clone());
+        }
     }
     event["stageVariables"] = string_object(request.variables);
     if let Some(lambda) = &request.auth.lambda {
@@ -2457,13 +2509,19 @@ fn evaluate_vtl(
         ("resourceId".into(), json!(request.resource_id)),
         ("requestTimeEpoch".into(), json!(now.as_millis() as u64)),
         ("authorizer".into(), authorizer),
-        (
-            "identity".into(),
-            json!({
+        ("identity".into(), {
+            let mut identity = json!({
                 "sourceIp": ctx.trusted_peer_ip.unwrap_or(""),
                 "userAgent": request_user_agent(request.headers).unwrap_or_default(),
-            }),
-        ),
+            });
+            if let (Some(target), Some(fields)) = (
+                identity.as_object_mut(),
+                request.auth.iam.as_ref().and_then(Value::as_object),
+            ) {
+                target.extend(fields.clone());
+            }
+            identity
+        }),
         (
             "httpMethod".to_string(),
             Value::String(request.method.to_string()),
@@ -3005,6 +3063,7 @@ mod tests {
         let validator = JwtValidator::new();
         let http = reqwest::Client::new();
         let ctx = ExecuteCtx {
+            original_request: None,
             store: &store,
             validator: &validator,
             http: &http,
@@ -3042,8 +3101,37 @@ mod tests {
             resource_id: "resource",
             path_params: &path_params,
             variables: &variables,
-            auth: AuthContext::default(),
+            auth: AuthContext {
+                iam: Some(
+                    json!({"userArn":"arn:aws:sts::000000000000:assumed-role/worker/session","user":"AROA:session","caller":"AROA:session","accessKey":"ASIAFIXTURE","accountId":"000000000000"}),
+                ),
+                ..AuthContext::default()
+            },
         };
+        let event = integration_event(&ctx, &request, "1.0");
+        assert_eq!(
+            event["requestContext"]["identity"]["userArn"],
+            "arn:aws:sts::000000000000:assumed-role/worker/session"
+        );
+        assert_eq!(
+            event["requestContext"]["identity"]["caller"],
+            "AROA:session"
+        );
+        assert_eq!(
+            event["requestContext"]["identity"]["accessKey"],
+            "ASIAFIXTURE"
+        );
+        let mapped = evaluate_vtl(
+            &ctx,
+            &request,
+            "$context.identity.userArn|$context.identity.user|$context.identity.accessKey",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            mapped.0,
+            "arn:aws:sts::000000000000:assumed-role/worker/session|AROA:session|ASIAFIXTURE"
+        );
         let integration = json!({
             "type": "AWS",
             "uri": "arn:aws:apigateway:eu-west-1:dynamodb:action/PutItem",
@@ -3107,6 +3195,7 @@ mod tests {
         let validator = JwtValidator::new();
         let http = reqwest::Client::new();
         let ctx = ExecuteCtx {
+            original_request: None,
             store: &store,
             validator: &validator,
             http: &http,

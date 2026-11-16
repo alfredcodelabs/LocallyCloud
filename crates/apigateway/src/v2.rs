@@ -338,7 +338,7 @@ fn validate_route_authorization(
     authorizer_id: Option<&str>,
 ) -> Result<(), ApiGwError> {
     let expected_authorizer = match (protocol(record), authorization_type) {
-        ("HTTP", "NONE") | ("WEBSOCKET", "NONE") => return Ok(()),
+        ("HTTP", "NONE") | ("WEBSOCKET", "NONE" | "AWS_IAM") => return Ok(()),
         ("HTTP", "JWT") => "JWT",
         ("HTTP", "CUSTOM") | ("WEBSOCKET", "CUSTOM") => "REQUEST",
         (api_protocol, other) => {
@@ -395,6 +395,11 @@ pub async fn create_route(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
                 .ok_or_else(|| ApiGwError::BadRequest("authorizerId must be a string".into()))?,
         ),
     };
+    if authorization_type == "AWS_IAM" && route_key != "$connect" {
+        return Err(ApiGwError::BadRequest(
+            "IAM authorization is supported only on WebSocket $connect".into(),
+        ));
+    }
     validate_route_authorization(&guard, authorization_type, authorizer_id)?;
     let id = gen_id();
     let route = json!({
@@ -475,6 +480,17 @@ pub async fn update_route(ctx: &Ctx<'_>, api_id: &str, route_id: &str, body: &Va
         ),
         None => current_route.get("authorizerId").and_then(Value::as_str),
     };
+    if authorization_type == "AWS_IAM"
+        && body
+            .get("routeKey")
+            .or_else(|| current_route.get("routeKey"))
+            .and_then(Value::as_str)
+            != Some("$connect")
+    {
+        return Err(ApiGwError::BadRequest(
+            "IAM authorization is supported only on WebSocket $connect".into(),
+        ));
+    }
     validate_route_authorization(&guard, authorization_type, authorizer_id)?;
     let route = guard.routes.get_mut(route_id).ok_or_else(|| {
         ApiGwError::NotFound(format!("Invalid route identifier specified {route_id}"))

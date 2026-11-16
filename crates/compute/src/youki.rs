@@ -14,6 +14,7 @@
 
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -33,11 +34,29 @@ struct TaskRecord {
     state: TaskState,
     output: crate::output::OutputCapture,
     finished: bool,
+    exit_status: Option<std::process::ExitStatus>,
     bundle: PathBuf,
     isolated_network: bool,
 }
 
+impl TaskRecord {
+    fn record_exit(&mut self, status: std::process::ExitStatus) {
+        self.exit_status = Some(status);
+        if self.state == TaskState::Running {
+            self.state = if status.success() {
+                TaskState::Completed
+            } else {
+                TaskState::Failed
+            };
+        }
+    }
+}
+
 type Slot = Arc<Mutex<TaskRecord>>;
+
+#[cfg(test)]
+#[path = "youki/stop_race_tests.rs"]
+mod stop_race_tests;
 
 /// Guest loopback port reserved for the host-owned transparent IPv4 TCP relay.
 pub const VPC_EGRESS_PORT: u16 = 49152;
@@ -461,6 +480,7 @@ impl YoukiRuntime {
             state: TaskState::Running,
             output: crate::output::OutputCapture::default(),
             finished: false,
+            exit_status: None,
             bundle: bundle.clone(),
             isolated_network,
         }));
@@ -517,12 +537,8 @@ impl YoukiRuntime {
                     }
                     let mut record = slot.lock().await;
                     match status {
-                        Ok(status) if record.state == TaskState::Running => {
-                            record.state = if status.success() {
-                                TaskState::Completed
-                            } else {
-                                TaskState::Failed
-                            };
+                        Ok(status) => {
+                            record.record_exit(status);
                         }
                         Err(error) => {
                             record
@@ -532,7 +548,6 @@ impl YoukiRuntime {
                                 record.state = TaskState::Failed;
                             }
                         }
-                        _ => {}
                     }
                 }
                 Err(error) => {
@@ -1174,13 +1189,20 @@ impl ComputeRuntime for YoukiRuntime {
                 TaskState::Running => Err(error),
             };
         }
+        wait_finished(&slot).await?;
         let mut record = slot.lock().await;
-        if record.state == TaskState::Running {
+        // Classify the acknowledged kill from the owned monitor's final status,
+        // regardless of which completed first. Preserve unrelated failures and exits.
+        if record.state == TaskState::Running
+            || (record.state == TaskState::Failed
+                && record.exit_status.is_some_and(|status| {
+                    status.signal() == Some(libc::SIGKILL)
+                        || status.code() == Some(128 + libc::SIGKILL)
+                }))
+        {
             record.state = TaskState::Stopped;
         }
         let state = record.state;
-        drop(record);
-        wait_finished(&slot).await?;
         Ok(TaskHandle {
             task_id: task_id.into(),
             state,
@@ -1480,6 +1502,7 @@ mod tests {
                 out
             },
             finished: state != TaskState::Running,
+            exit_status: None,
             bundle: PathBuf::new(),
             isolated_network: false,
         }))

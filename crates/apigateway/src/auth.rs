@@ -21,6 +21,53 @@ use locallycloud_cognito::CognitoHandler;
 use locallycloud_core::integration::authorization::ResourcePolicyDecision;
 use serde_json::Value;
 
+/// IAM invocation is explicit route authentication and is enforced in both emulator modes.
+pub(crate) fn authorize_iam_invoke(
+    registry: &Weak<locallycloud_core::registry::ServiceRegistry>,
+    original: &locallycloud_core::handler::ServiceRequest,
+    resource: String,
+    document: Option<&str>,
+    owner: &str,
+    context: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<Option<Value>, locallycloud_core::integration::authorization::AuthorizationError> {
+    use locallycloud_core::integration::authorization::{
+        authenticate_request, AuthorizationError, AuthorizationRequest,
+    };
+    let evaluator = registry
+        .upgrade()
+        .and_then(|registry| {
+            registry.authorization_evaluator(&locallycloud_core::registry::ServiceName::new("iam"))
+        })
+        .ok_or(AuthorizationError::Unavailable)?;
+    let (request_identity, delegated_identity) =
+        authenticate_request(evaluator.as_ref(), original, "execute-api")?;
+    if request_identity.account_id != owner {
+        return Err(AuthorizationError::Denied);
+    }
+    evaluator.authorize_resource_policy(
+        AuthorizationRequest {
+            request_identity: request_identity.clone(),
+            delegated_identity,
+            source_service: "execute-api".into(),
+            action: "execute-api:Invoke".into(),
+            resource,
+            context: context.clone(),
+        },
+        document,
+        owner,
+    )?;
+    let Some(metadata) = evaluator.resolve_caller_metadata(&request_identity)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::json!({
+        "accountId": metadata.account_id,
+        "userArn": metadata.arn,
+        "caller": metadata.user_id,
+        "user": metadata.user_id,
+        "accessKey": request_identity.access_key_id,
+    })))
+}
+
 /// Evaluate an IAM-style Lambda authorizer policy for the current execute-api ARN.
 /// Only statements whose Action and Resource apply participate; an applicable Deny wins.
 pub(crate) fn policy_allows(result: &Value, route_arn: &str) -> bool {

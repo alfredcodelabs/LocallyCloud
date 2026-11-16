@@ -466,7 +466,7 @@ pub async fn put_method(
             .ok_or_else(|| ApiGwError::BadRequest("authorizationType must be a string".into()))?,
         None => "NONE",
     };
-    if !matches!(auth_type, "NONE" | "CUSTOM") {
+    if !matches!(auth_type, "NONE" | "CUSTOM" | "AWS_IAM") {
         return Err(ApiGwError::BadRequest(format!(
             "Unsupported authorizationType: {auth_type}"
         )));
@@ -534,7 +534,7 @@ pub async fn update_method(
             || path.starts_with("/requestModels/")
     })?;
     match method.get("authorizationType").and_then(Value::as_str) {
-        Some("NONE") => {}
+        Some("NONE" | "AWS_IAM") => {}
         Some("CUSTOM") => {
             let authorizer = method
                 .get("authorizerId")

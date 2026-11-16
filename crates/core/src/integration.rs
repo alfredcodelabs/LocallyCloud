@@ -1055,8 +1055,13 @@ impl InternalDispatcher {
                 let strict = evaluator
                     .as_ref()
                     .is_some_and(|evaluator| evaluator.strict_sigv4_required());
-                // Long-lived upgrades require verification even for public HTTP invoke routes.
-                let account_id = if strict {
+                // Public NONE/CUSTOM upgrades may be unsigned; explicit IAM routes authenticate on demand.
+                let verify_upgrade = strict
+                    && claims_sigv4_identity(
+                        header_str(headers, "authorization").as_deref(),
+                        uri.query().and_then(extract_x_amz_credential).as_deref(),
+                    );
+                let account_id = if verify_upgrade {
                     let signing_service = match decision.service_name.as_str() {
                         "streams.dynamodb" => "dynamodb",
                         service => service,
@@ -1109,7 +1114,7 @@ impl InternalDispatcher {
                                 ] {
                                     native_headers.remove(header);
                                 }
-                                if strict {
+                                if verify_upgrade {
                                     native_headers.insert(
                                         "x-locallycloud-verified-external-sigv4",
                                         HeaderValue::from_static("1"),

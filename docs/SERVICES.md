@@ -156,7 +156,14 @@ generate `Content-Length` from the final outbound body, including mapped REST pa
 REST HTTP integrations omit the caller's `Authorization` header when it carries a
 SigV4 signature or the REST method uses `AWS_IAM`; other authorization schemes
 remain available to the configured backend. This rule does not change HTTP API
-or Lambda integration headers. REST `AWS_IAM` invocation itself remains unsupported.
+or Lambda integration headers.
+REST methods and WebSocket `$connect` support `AWS_IAM` with SigV4 HMAC signatures
+and IAM permissions enforced in both emulator modes. Presigned requests validate
+the original URI, headers, body and expiration. Authorization composes the deployed
+REST resource policy with supported identity policies, boundaries and session
+policies. Lambda events and mapping templates receive the authenticated IAM/STS
+identity, including the exact assumed-role session ARN. This support is limited
+to the same account; HTTP API v2 IAM authorization remains unsupported.
 In strict IAM mode, REST API resource policies restrict invocation using the
 policy captured by the stage's deployment. Deploy again after editing a policy.
 Methods with `NONE` authorization require an explicit resource-policy allow when

@@ -95,8 +95,16 @@ pub fn verify(
     expected_service: &str,
     credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
 ) -> bool {
-    if expected_service == "s3" && !headers.contains_key("authorization") {
-        return presign::verify(method, uri, headers, body, expected_region, credentials);
+    if matches!(expected_service, "s3" | "execute-api") && !headers.contains_key("authorization") {
+        return presign::verify_for_service(
+            method,
+            uri,
+            headers,
+            body,
+            expected_region,
+            expected_service,
+            credentials,
+        );
     }
     verify_at(
         method,

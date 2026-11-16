@@ -109,6 +109,7 @@ struct WebSocketRuntime {
     routes: Vec<Value>,
     integrations: BTreeMap<String, Value>,
     authorizer_context: Option<Value>,
+    iam_identity: Option<Value>,
 }
 
 struct LambdaOutput {
@@ -156,6 +157,7 @@ pub async fn handle_websocket(
     request: ServiceRequest,
     upgrade: WebSocketUpgrade,
     custom_domain: Option<String>,
+    original_request: Option<&ServiceRequest>,
 ) -> Response {
     let invoke_host = request
         .headers
@@ -233,6 +235,39 @@ pub async fn handle_websocket(
         is_binary: false,
     });
 
+    let mut iam_identity = None;
+    if connect_route
+        .get("authorizationType")
+        .and_then(Value::as_str)
+        == Some("AWS_IAM")
+    {
+        let original = original_request.unwrap_or(&request);
+        let context =
+            locallycloud_core::integration::request_context::verified_request_context(original);
+        let arn = format!(
+            "arn:aws:execute-api:{}:{}:{api_id}/{stage}/$connect",
+            request.region, request.account_id
+        );
+        iam_identity = match crate::auth::authorize_iam_invoke(
+            &registry,
+            original,
+            arn,
+            None,
+            &request.account_id,
+            &context,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let status = match error { locallycloud_core::integration::authorization::AuthorizationError::Denied | locallycloud_core::integration::authorization::AuthorizationError::InvalidRequest => 403, _ => 500 };
+                return UpgradeFailure::new(status, "IAM authorization failed").into_response();
+            }
+        };
+    }
+    if let Some(identity) = iam_identity.as_ref().and_then(Value::as_object) {
+        if let Some(target) = connect_event["requestContext"]["identity"].as_object_mut() {
+            target.extend(identity.clone());
+        }
+    }
     let authorizer_context = match authorize_connect(
         &store,
         &registry,
@@ -265,6 +300,7 @@ pub async fn handle_websocket(
         routes,
         integrations,
         authorizer_context,
+        iam_identity,
     };
     match invoke_route(&runtime, &connect_route, connect_event).await {
         Ok(output) if !output.function_error => {
@@ -425,6 +461,11 @@ impl WebSocketRuntime {
             body,
             is_binary,
         });
+        if let Some(identity) = self.iam_identity.as_ref().and_then(Value::as_object) {
+            if let Some(target) = event["requestContext"]["identity"].as_object_mut() {
+                target.extend(identity.clone());
+            }
+        }
         if let Some(context) = &self.authorizer_context {
             event["requestContext"]["authorizer"] = context.clone();
         }
@@ -447,7 +488,7 @@ async fn authorize_connect(
         .get("authorizationType")
         .and_then(Value::as_str)
         .unwrap_or("NONE");
-    if authorization_type == "NONE" {
+    if matches!(authorization_type, "NONE" | "AWS_IAM") {
         return Ok(None);
     }
     if authorization_type != "CUSTOM" {
@@ -1410,7 +1451,23 @@ mod strict_dispatch_tests {
                 json!({"integrationType":"AWS_PROXY","integrationUri":"function"}),
             )]),
             authorizer_context: None,
+            iam_identity: Some(
+                json!({"userArn":"arn:aws:sts::000000000000:assumed-role/worker/session","user":"AROA:session","caller":"AROA:session","accessKey":"ASIAFIXTURE","accountId":"000000000000"}),
+            ),
         };
+        for (kind, route) in [
+            (WebSocketEventType::Connect, "$connect"),
+            (WebSocketEventType::Message, "send"),
+            (WebSocketEventType::Disconnect, "$disconnect"),
+        ] {
+            let event = runtime.event("connection", route, kind, None, false);
+            assert_eq!(
+                event["requestContext"]["identity"]["userArn"],
+                "arn:aws:sts::000000000000:assumed-role/worker/session"
+            );
+            assert_eq!(event["requestContext"]["identity"]["user"], "AROA:session");
+            assert_eq!(event["requestContext"]["identity"]["sourceIp"], "127.0.0.1");
+        }
         let output = invoke_route(
             &runtime,
             &json!({"target":"integrations/target","routeKey":"send"}),

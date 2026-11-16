@@ -46,6 +46,14 @@ pub struct AuthorizationRequest {
     pub context: BTreeMap<String, Vec<String>>,
 }
 
+/// Public principal identifiers resolved from authenticated IAM/STS state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerMetadata {
+    pub account_id: String,
+    pub arn: String,
+    pub user_id: String,
+}
+
 /// The result of evaluating one resource policy without an identity-policy union.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePolicyDecision {
@@ -224,6 +232,14 @@ pub trait AuthorizationEvaluator: Send + Sync {
         Ok(None)
     }
 
+    /// Read public principal identifiers; this lookup does not authenticate a request.
+    fn resolve_caller_metadata(
+        &self,
+        _identity: &RequestIdentity,
+    ) -> Result<Option<CallerMetadata>, AuthorizationError> {
+        Ok(None)
+    }
+
     /// Identify an account root from credential provenance, never a supplied ARN.
     /// Legacy sessions without an authenticated root issuer must return false.
     fn is_account_root(
@@ -268,7 +284,8 @@ pub fn verified_caller(
         .headers
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(RequestIdentity::access_key_from_authorization);
+        .and_then(RequestIdentity::access_key_from_authorization)
+        .or_else(|| super::sigv4::query_access_key(&request.uri));
     let delegated_identity = super::identity::trusted_role(request);
     let request_identity = RequestIdentity {
         account_id: request.account_id.clone(),
@@ -295,6 +312,81 @@ pub fn verified_caller(
         }
     }
     Ok((request_identity, delegated_identity))
+}
+
+/// Authenticate an explicit IAM-protected execute-api route using its original wire request.
+/// Permissive services call this only on routes requiring IAM, so other routes keep their mode.
+pub fn authenticate_request(
+    evaluator: &dyn AuthorizationEvaluator,
+    request: &crate::handler::ServiceRequest,
+    signing_service: &str,
+) -> Result<(RequestIdentity, Option<CallerIdentity>), AuthorizationError> {
+    if signing_service != "execute-api" {
+        return Err(AuthorizationError::InvalidRequest);
+    }
+    let external = request
+        .headers
+        .get("x-locallycloud-verified-external-sigv4")
+        .is_some_and(|value| value == "1");
+    if external {
+        let authorization = request
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        let query_credential = request
+            .uri
+            .query()
+            .and_then(super::extract_x_amz_credential);
+        if crate::router::extract_service_from_credential_scope(
+            authorization,
+            query_credential.as_deref(),
+        )
+        .as_ref()
+        .map(|service| service.as_str())
+            != Some(signing_service)
+        {
+            return Err(AuthorizationError::Denied);
+        }
+    }
+    if external
+        || request
+            .headers
+            .get("x-locallycloud-verified-internal-scope")
+            .is_some_and(|value| value == "1")
+    {
+        return verified_caller(evaluator, request);
+    }
+    let key = request
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(RequestIdentity::access_key_from_authorization)
+        .or_else(|| super::sigv4::query_access_key(&request.uri))
+        .ok_or(AuthorizationError::Denied)?;
+    let account = evaluator
+        .credential_account(&key)?
+        .ok_or(AuthorizationError::Denied)?;
+    if account != request.account_id
+        || !evaluator.verify_sigv4(
+            &account,
+            &request.method,
+            &request.uri,
+            &request.headers,
+            &request.body,
+            &request.region,
+            signing_service,
+        )
+    {
+        return Err(AuthorizationError::Denied);
+    }
+    Ok((
+        RequestIdentity {
+            account_id: account,
+            access_key_id: Some(key),
+            arn: None,
+        },
+        None,
+    ))
 }
 
 /// Shared identity verification for external native management reads. Internal dispatcher
@@ -349,6 +441,37 @@ mod caller_tests {
                 .then(|| "arn:aws:iam::000000000000:user/operator".into()))
         }
     }
+    #[test]
+    fn attested_invocation_still_requires_execute_api_signing_scope() {
+        let mut request = ServiceRequest {
+            method: Method::GET,
+            uri: "/api/prod/resource".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::new(),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            request_id: "test".into(),
+        };
+        request.headers.insert(
+            "x-locallycloud-verified-external-sigv4",
+            "1".parse().unwrap(),
+        );
+        for service in ["apigateway", "execute-api"] {
+            request.headers.insert(http::header::AUTHORIZATION, format!("AWS4-HMAC-SHA256 Credential=OPERATOR/20261116/us-east-1/{service}/aws4_request").parse().unwrap());
+            assert_eq!(
+                authenticate_request(&Evaluator, &request, "execute-api").is_ok(),
+                service == "execute-api"
+            );
+        }
+        request
+            .headers
+            .remove("x-locallycloud-verified-external-sigv4");
+        assert_eq!(
+            authenticate_request(&Evaluator, &request, "execute-api"),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
     #[test]
     fn anonymous_resource_policy_default_is_unavailable_even_for_an_allowing_evaluator() {
         let result = Evaluator.evaluate_anonymous_resource_policy(

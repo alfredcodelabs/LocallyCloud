@@ -846,6 +846,47 @@ impl AuthorizationEvaluator for IamStsState {
             .map_err(|_| AuthorizationError::Denied)
     }
 
+    fn resolve_caller_metadata(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<
+        Option<locallycloud_core::integration::authorization::CallerMetadata>,
+        AuthorizationError,
+    > {
+        use locallycloud_core::integration::authorization::CallerMetadata;
+        let Some(key) = identity.access_key_id.as_deref() else {
+            return Ok(None);
+        };
+        if let Some(root) = self.store.root_for_key(&identity.account_id, key) {
+            return Ok(Some(CallerMetadata {
+                account_id: root.account.clone(),
+                arn: root.arn(),
+                user_id: root.account,
+            }));
+        }
+        if let Some(session) = self.sessions.resolve(key) {
+            session
+                .root_provenance(&identity.account_id, &self.store)
+                .map_err(|_| AuthorizationError::Denied)?;
+            if session.account != identity.account_id {
+                return Err(AuthorizationError::Denied);
+            }
+            return Ok(Some(CallerMetadata {
+                account_id: session.account,
+                arn: session.arn,
+                user_id: session.user_id,
+            }));
+        }
+        Ok(self
+            .store
+            .user_for_key(&identity.account_id, key)
+            .map(|user| CallerMetadata {
+                account_id: identity.account_id.clone(),
+                arn: user.arn,
+                user_id: user.user_id,
+            }))
+    }
+
     fn resolve_caller_arn(
         &self,
         identity: &RequestIdentity,
@@ -2039,6 +2080,48 @@ mod tests {
                 Arc::new(SessionStore::new()),
             )),
         }
+    }
+
+    #[test]
+    fn public_caller_metadata_keeps_exact_sts_session_identifiers() {
+        let sessions = Arc::new(SessionStore::new());
+        let state = IamStsState::new(Arc::new(IamStore::new()), sessions.clone());
+        let arn = "arn:aws:sts::000000000000:assumed-role/worker/session";
+        sessions
+            .register(
+                "ASIAFIXTURE",
+                sts::Session {
+                    account: "000000000000".into(),
+                    secret_access_key: "not-returned".into(),
+                    session_token: "not-returned".into(),
+                    arn: arn.into(),
+                    user_id: "AROAFIXTURE:session".into(),
+                    root_account: false,
+                    role_arn: Some("arn:aws:iam::000000000000:role/team/worker".into()),
+                    session_policy: None,
+                    expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                },
+            )
+            .unwrap();
+        let identity = RequestIdentity {
+            account_id: "000000000000".into(),
+            access_key_id: Some("ASIAFIXTURE".into()),
+            arn: Some("forged".into()),
+        };
+        let metadata = state.resolve_caller_metadata(&identity).unwrap().unwrap();
+        assert_eq!(metadata.arn, arn);
+        assert_eq!(metadata.user_id, "AROAFIXTURE:session");
+        assert_eq!(metadata.account_id, "000000000000");
+        assert_eq!(
+            state.resolve_caller_arn(&identity).unwrap().unwrap(),
+            "arn:aws:iam::000000000000:role/team/worker"
+        );
+        assert!(state
+            .resolve_caller_metadata(&RequestIdentity {
+                account_id: "111111111111".into(),
+                ..identity
+            })
+            .is_err());
     }
 
     #[test]

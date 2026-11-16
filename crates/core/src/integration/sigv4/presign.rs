@@ -1,4 +1,4 @@
-//! Host-only S3 query signatures; permission and credential revocation remain in IAM.
+//! S3 and execute-api query signatures; permission and credential revocation remain in IAM.
 use super::*;
 use std::collections::BTreeMap;
 
@@ -67,9 +67,18 @@ fn canonical(query: &str) -> Option<String> {
 }
 
 fn signing_key(secret: &str, date: &str, region: &str) -> Option<Vec<u8>> {
+    signing_key_for_service(secret, date, region, "s3")
+}
+
+fn signing_key_for_service(
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> Option<Vec<u8>> {
     let date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes())?;
     let region = hmac(&date, region.as_bytes())?;
-    let service = hmac(&region, b"s3")?;
+    let service = hmac(&region, service.as_bytes())?;
     hmac(&service, b"aws4_request")
 }
 
@@ -130,7 +139,29 @@ pub fn presign_s3_put(
     ))
 }
 
-pub(super) fn verify(
+pub(super) fn verify_for_service(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    region: &str,
+    service: &str,
+    credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
+) -> bool {
+    verify_for_service_at(
+        method,
+        uri,
+        headers,
+        body,
+        (region, service),
+        credentials,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn verify(
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -138,18 +169,10 @@ pub(super) fn verify(
     region: &str,
     credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
 ) -> bool {
-    verify_at(
-        method,
-        uri,
-        headers,
-        body,
-        region,
-        credentials,
-        OffsetDateTime::now_utc(),
-    )
-    .unwrap_or(false)
+    verify_for_service(method, uri, headers, body, region, "s3", credentials)
 }
 
+#[cfg(test)]
 fn verify_at(
     method: &Method,
     uri: &Uri,
@@ -159,16 +182,32 @@ fn verify_at(
     credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
     now: OffsetDateTime,
 ) -> Option<bool> {
+    verify_for_service_at(method, uri, headers, body, (region, "s3"), credentials, now)
+}
+
+fn verify_for_service_at(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    (region, service): (&str, &str),
+    credentials: impl FnOnce(&str) -> Option<SigningCredentials>,
+    now: OffsetDateTime,
+) -> Option<bool> {
     let params = parameters(uri)?;
-    if headers
-        .keys()
-        .any(|name| name.as_str().starts_with("x-amz-") && name != "x-amz-content-sha256")
+    if !matches!(service, "s3" | "execute-api") {
+        return None;
+    }
+    if service == "s3"
+        && headers
+            .keys()
+            .any(|name| name.as_str().starts_with("x-amz-") && name != "x-amz-content-sha256")
     {
         return None;
     }
     if params.get("X-Amz-Algorithm")? != "AWS4-HMAC-SHA256"
-        || params.get("X-Amz-SignedHeaders")? != "host"
-        || !matches!(*method, Method::GET | Method::PUT)
+        || (service == "s3" && params.get("X-Amz-SignedHeaders")? != "host")
+        || (service == "s3" && !matches!(*method, Method::GET | Method::PUT))
     {
         return None;
     }
@@ -177,7 +216,7 @@ fn verify_at(
         || fields[0].is_empty()
         || fields[1].len() != 8
         || fields[2] != region
-        || fields[3] != "s3"
+        || fields[3] != service
         || fields[4] != "aws4_request"
     {
         return None;
@@ -208,26 +247,77 @@ fn verify_at(
     {
         return None;
     }
-    let payload = header(headers, "x-amz-content-sha256").unwrap_or("UNSIGNED-PAYLOAD");
-    if payload != "UNSIGNED-PAYLOAD" && payload != format!("{:x}", Sha256::digest(body)) {
+    let declared = header(headers, "x-amz-content-sha256");
+    let digest = if service == "s3" && declared.is_none_or(|value| value == "UNSIGNED-PAYLOAD") {
+        String::new()
+    } else {
+        format!("{:x}", Sha256::digest(body))
+    };
+    let payload = declared.unwrap_or(if service == "s3" {
+        "UNSIGNED-PAYLOAD"
+    } else {
+        &digest
+    });
+    if (payload == "UNSIGNED-PAYLOAD" && service != "s3")
+        || (payload != "UNSIGNED-PAYLOAD" && payload != digest)
+    {
         return None;
     }
+    let signed = params.get("X-Amz-SignedHeaders")?;
+    let canonical_headers = if service == "s3" {
+        format!("host:{}\n", header(headers, "host")?)
+    } else {
+        let names: Vec<_> = signed.split(';').collect();
+        if !names.contains(&"host")
+            || names.windows(2).any(|pair| pair[0] >= pair[1])
+            || names.iter().any(|name| {
+                name.is_empty()
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            })
+        {
+            return None;
+        }
+        let mut result = String::new();
+        for name in names {
+            let values = headers.get_all(name);
+            let mut normalized = Vec::new();
+            for value in values.iter() {
+                normalized.push(
+                    value
+                        .to_str()
+                        .ok()?
+                        .split_ascii_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+            if normalized.is_empty() {
+                return None;
+            }
+            result.push_str(&format!("{name}:{}\n", normalized.join(",")));
+        }
+        result
+    };
     let request = format!(
-        "{}\n{}\n{}\nhost:{}\n\nhost\n{payload}",
+        "{}\n{}\n{}\n{}\n{}\n{payload}",
         method,
-        canonical_uri(uri.path(), "s3")?,
+        canonical_uri(uri.path(), service)?,
         canonical(uri.query()?)?,
-        header(headers, "host")?
+        canonical_headers,
+        signed
     );
     let message = format!(
-        "AWS4-HMAC-SHA256\n{date}\n{}/{region}/s3/aws4_request\n{:x}",
+        "AWS4-HMAC-SHA256\n{date}\n{}/{region}/{service}/aws4_request\n{:x}",
         fields[1],
         Sha256::digest(request.as_bytes())
     );
-    let mut verifier = HmacSha256::new_from_slice(&signing_key(
+    let mut verifier = HmacSha256::new_from_slice(&signing_key_for_service(
         &credentials.secret_access_key,
         fields[1],
         region,
+        service,
     )?)
     .ok()?;
     verifier.update(message.as_bytes());
@@ -247,6 +337,90 @@ mod tests {
             secret_access_key: "fixture-secret".into(),
             session_token: Some("temporary+/=".into()),
         }
+    }
+
+    #[test]
+    fn execute_api_query_signatures_bind_body_headers_scope_and_expiry() {
+        let now = OffsetDateTime::now_utc();
+        let date = now
+            .format(
+                &format_description::parse_borrowed::<3>(
+                    "[year][month][day]T[hour][minute][second]Z",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let day = &date[..8];
+        let scope = format!("{day}/us-east-2/execute-api/aws4_request");
+        let credential =
+            percent_encode(format!("ASIATEST/{scope}").as_bytes(), false, false).unwrap();
+        let token = percent_encode(
+            credentials().session_token.unwrap().as_bytes(),
+            false,
+            false,
+        )
+        .unwrap();
+        let query = format!("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={credential}&X-Amz-Date={date}&X-Amz-Expires=60&X-Amz-Security-Token={token}&X-Amz-SignedHeaders=host%3Bx-example");
+        let body = b"fixture body";
+        let request = format!("POST\n/stage/resource\n{}\nhost:aws.localhost:1234\nx-example:one two\n\nhost;x-example\n{:x}", canonical(&query).unwrap(), Sha256::digest(body));
+        let message = format!(
+            "AWS4-HMAC-SHA256\n{date}\n{scope}\n{:x}",
+            Sha256::digest(request.as_bytes())
+        );
+        let signature = hmac(
+            &signing_key_for_service("fixture-secret", day, "us-east-2", "execute-api").unwrap(),
+            message.as_bytes(),
+        )
+        .unwrap()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+        let uri: Uri = format!("/stage/resource?{query}&X-Amz-Signature={signature}")
+            .parse()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "aws.localhost:1234".parse().unwrap());
+        headers.insert("x-example", "one   two".parse().unwrap());
+        let check = |uri: &Uri, headers: &HeaderMap, body: &[u8], now| {
+            verify_for_service_at(
+                &Method::POST,
+                uri,
+                headers,
+                body,
+                ("us-east-2", "execute-api"),
+                |_| Some(credentials()),
+                now,
+            )
+            .unwrap_or(false)
+        };
+        assert!(check(&uri, &headers, body, now));
+        assert!(!check(&uri, &headers, b"changed", now));
+        assert!(!check(
+            &uri,
+            &headers,
+            body,
+            now + time::Duration::seconds(61)
+        ));
+        assert!(!check(
+            &uri.to_string()
+                .replace("Expires=60", "Expires=0")
+                .parse()
+                .unwrap(),
+            &headers,
+            body,
+            now
+        ));
+        assert!(!check(
+            &uri.to_string()
+                .replace("execute-api", "s3")
+                .parse()
+                .unwrap(),
+            &headers,
+            body,
+            now
+        ));
+        headers.insert("x-example", "changed".parse().unwrap());
+        assert!(!check(&uri, &headers, body, now));
     }
 
     #[test]

@@ -966,6 +966,7 @@ impl NativeHandler for ApiGwHandler {
                 .map(|(host, uri)| (host.as_str(), uri))
                 .unwrap_or((host, &request.uri));
             let ctx = ExecuteCtx {
+                original_request: Some(&request),
                 store: &self.store,
                 validator: &self.validator,
                 http: &self.http,
@@ -986,7 +987,7 @@ impl NativeHandler for ApiGwHandler {
                 invoke_host,
                 invoke_uri,
                 &request.headers,
-                request.body,
+                request.body.clone(),
                 custom_target.is_some(),
             )
             .await;
@@ -1159,6 +1160,7 @@ impl NativeHandler for ApiGwHandler {
         }
         let direct = host.to_ascii_lowercase().contains(".execute-api.");
         let mut custom_domain = None;
+        let mut original_request = None;
         if !direct {
             if let Some((target_host, target_uri)) = custom_domain_target(
                 &self.store,
@@ -1185,6 +1187,7 @@ impl NativeHandler for ApiGwHandler {
                         path.push_str(query);
                     }
                     if let (Ok(uri), Ok(parsed_host)) = (path.parse(), target_host.parse()) {
+                        original_request = Some(request.clone());
                         request.uri = uri;
                         request.headers.insert(http::header::HOST, parsed_host);
                         custom_domain = Some(host.clone());
@@ -1198,6 +1201,7 @@ impl NativeHandler for ApiGwHandler {
             request,
             upgrade,
             custom_domain,
+            original_request.as_ref(),
         )
         .await
     }
