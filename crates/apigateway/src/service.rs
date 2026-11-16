@@ -748,6 +748,37 @@ fn management_target<'a>(host: &str, path: &'a str) -> Option<(&'a str, &'a str,
     }
 }
 
+fn authorize_connection_management(
+    registry: &Weak<ServiceRegistry>,
+    request: &ServiceRequest,
+    resource: String,
+    context: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(), ApiGwError> {
+    use locallycloud_core::integration::authorization::{verified_caller, AuthorizationRequest};
+    let Some(evaluator) = registry
+        .upgrade()
+        .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+    else {
+        return Ok(());
+    };
+    if !evaluator.strict_sigv4_required() {
+        return Ok(());
+    }
+    let denied = || ApiGwError::Forbidden("Not authorized to manage this connection".into());
+    let (request_identity, delegated_identity) =
+        verified_caller(evaluator.as_ref(), request).map_err(|_| denied())?;
+    evaluator
+        .authorize(AuthorizationRequest {
+            request_identity,
+            delegated_identity,
+            source_service: "execute-api".into(),
+            action: "execute-api:ManageConnections".into(),
+            resource,
+            context: context.clone(),
+        })
+        .map_err(|_| denied())
+}
+
 async fn connection_belongs_to_endpoint(
     store: &ApiGwStore,
     account: &str,
@@ -818,6 +849,27 @@ impl NativeHandler for ApiGwHandler {
             return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
         }
         if let Some((stage, connection_id, api_id)) = management_target(host, request.uri.path()) {
+            let decoded_id = crate::proxy_event::percent_decode(connection_id);
+            if decoded_id.is_empty()
+                || decoded_id.chars().any(|character| {
+                    character.is_control()
+                        || character.is_whitespace()
+                        || matches!(character, '/' | '\\' | '%' | '?' | '#' | '\u{fffd}')
+                })
+            {
+                return ApiGwError::BadRequest("Invalid connection ID".into())
+                    .into_response(&request.request_id);
+            }
+            let connection_id = decoded_id.as_str();
+            let resource = format!(
+                "arn:aws:execute-api:{}:{}:{api_id}/{stage}/{}/@connections/{connection_id}",
+                request.region, request.account_id, request.method
+            );
+            if let Err(error) =
+                authorize_connection_management(&self.registry, &request, resource, &policy_context)
+            {
+                return error.into_response(&request.request_id);
+            }
             if !connection_belongs_to_endpoint(
                 &self.store,
                 &request.account_id,
@@ -3151,6 +3203,10 @@ mod tests {
         let (s, _) = call(&h, Method::GET, "/bogus", Value::Null).await;
         assert_eq!(s, 404);
     }
+
+    mod websocket_management_tests {
+        include!("service/websocket_management_tests.rs");
+    }
 }
 
 /// End-to-end JWT authorizer tests: a real RSA-signed token is validated against a real
@@ -4221,3 +4277,7 @@ mod http_redirect_tests;
 #[cfg(test)]
 #[path = "service/http_body_tests.rs"]
 mod http_body_tests;
+
+#[cfg(test)]
+#[path = "service/private_endpoint_tests.rs"]
+mod private_endpoint_tests;

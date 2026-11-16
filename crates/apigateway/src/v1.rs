@@ -146,7 +146,13 @@ where
                 }
                 let index = last
                     .parse::<usize>()
-                    .map_err(|_| ApiGwError::BadRequest(format!("Invalid patch path: {path}")))?;
+                    .ok()
+                    .or_else(|| {
+                        (parents == ["endpointConfiguration", "types"])
+                            .then(|| items.iter().position(|item| item.as_str() == Some(last)))
+                            .flatten()
+                    })
+                    .ok_or_else(|| ApiGwError::BadRequest(format!("Invalid patch path: {path}")))?;
                 if op == "remove" {
                     if index >= items.len() {
                         return Err(ApiGwError::BadRequest(format!(
@@ -240,6 +246,7 @@ pub async fn update_account(ctx: &Ctx<'_>, body: &Value) -> Out {
 
 pub async fn create_rest_api(ctx: &Ctx<'_>, body: &Value) -> Out {
     let name = req_str(body, "name")?;
+    crate::endpoint::is_private(body.get("endpointConfiguration").unwrap_or(&Value::Null))?;
     let id = gen_id();
     let root_id = gen_id();
     let policy = crate::resource_policy::normalize(
@@ -303,6 +310,9 @@ pub async fn update_rest_api(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
                 | "/disableExecuteApiEndpoint"
                 | "/policy"
                 | "/endpointConfiguration/types"
+                | "/endpointConfiguration/types/EDGE"
+                | "/endpointConfiguration/types/REGIONAL"
+                | "/endpointConfiguration/types/PRIVATE"
                 | "/binaryMediaTypes/-"
         ) || path
             .strip_prefix("/binaryMediaTypes/")
@@ -314,6 +324,13 @@ pub async fn update_rest_api(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
         ctx.account,
         ctx.region,
         api_id,
+    )?;
+    crate::endpoint::validate_change(
+        guard
+            .api
+            .get("endpointConfiguration")
+            .unwrap_or(&Value::Null),
+        updated.get("endpointConfiguration").unwrap_or(&Value::Null),
     )?;
     guard.api = updated.clone();
     Ok((200, updated))
@@ -859,7 +876,23 @@ pub async fn get_integration_response(
 
 // ============================ Deployments & stages =============================
 
+fn validate_rest_deployment(api: &Value) -> Result<(), ApiGwError> {
+    if crate::endpoint::is_private(api.get("endpointConfiguration").unwrap_or(&Value::Null))?
+        && api
+            .get("policy")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(ApiGwError::BadRequest(
+            "Private REST APIs require a resource policy before deployment".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create_deployment(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
+    let r = rest(ctx, api_id).await?;
+    validate_rest_deployment(&r.read().await.api)?;
     let id = gen_id();
     let deployment = json!({
         "id": id,
@@ -899,8 +932,8 @@ pub async fn create_deployment(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out
         None => None,
     };
 
-    let r = rest(ctx, api_id).await?;
     let mut guard = r.write().await;
+    validate_rest_deployment(&guard.api)?;
     let snapshot = guard.snapshot();
     guard.deployments.insert(id.clone(), deployment.clone());
     guard.deployment_snapshots.insert(id.clone(), snapshot);

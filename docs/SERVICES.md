@@ -165,6 +165,13 @@ resource-policy denies run before Lambda authorizers. Supported policy condition
 use verified peer IP and TLS metadata, not forwarding headers. Unsupported policy
 features are rejected. REST deployments saved before policy snapshots were added
 must be recreated; their original policy cannot be reconstructed.
+REST `PRIVATE` APIs cannot be invoked through the public front door, including
+guest callbacks, in either IAM mode. An `execute-api` VPC endpoint data plane is
+not implemented. Private API deployments require a resource policy. Endpoint-type
+changes take effect when the API is deployed again.
+WebSocket `@connections` management requires `execute-api:ManageConnections` in
+strict IAM mode, scoped to the API, stage, HTTP method and connection ID. This is
+independent of the authorization type configured for the WebSocket routes.
 
 For REGIONAL REST or HTTP custom domains:
 

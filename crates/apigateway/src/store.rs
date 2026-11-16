@@ -29,6 +29,7 @@ pub fn gen_id() -> String {
 pub struct RestDeploymentSnapshot {
     /// Required in persisted deployments: old snapshots cannot reconstruct their policy.
     pub policy: Value,
+    pub endpoint_configuration: Value,
     pub resources: BTreeMap<String, Value>,
     pub authorizers: BTreeMap<String, Value>,
     pub models: BTreeMap<String, Value>,
@@ -54,6 +55,11 @@ impl RestApiRecord {
     pub fn snapshot(&self) -> RestDeploymentSnapshot {
         RestDeploymentSnapshot {
             policy: self.api.get("policy").cloned().unwrap_or(Value::Null),
+            endpoint_configuration: self
+                .api
+                .get("endpointConfiguration")
+                .cloned()
+                .unwrap_or(Value::Null),
             resources: self.resources.clone(),
             authorizers: self.authorizers.clone(),
             models: self.models.clone(),

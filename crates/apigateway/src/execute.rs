@@ -681,6 +681,14 @@ async fn invoke_rest_inner(
         None => guard.snapshot(),
     };
     drop(guard);
+    // There is no execute-api VPC endpoint data plane yet. An external front door,
+    // including the guest callback, must never stand in for a private endpoint.
+    if !matches!(
+        crate::endpoint::is_private(&snapshot.endpoint_configuration),
+        Ok(false)
+    ) {
+        return plain(403, "Forbidden");
+    }
     let route = match rest_route(&snapshot.resources, method, &path) {
         Some(route) => route,
         None => {

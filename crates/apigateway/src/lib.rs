@@ -6,6 +6,7 @@
 
 pub mod auth;
 mod domains;
+mod endpoint;
 pub mod error;
 pub mod execute;
 pub mod logging;
