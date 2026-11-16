@@ -5,6 +5,7 @@
 //! The execute/invoke path (`execute-api`) and the WebSocket runtime are later increments.
 
 pub mod auth;
+pub mod config;
 mod domains;
 mod endpoint;
 pub mod error;
@@ -25,4 +26,7 @@ mod xray;
 #[cfg(test)]
 mod property_tests;
 
-pub use service::{register, register_with_acm, register_with_state};
+pub use config::ApiGatewayConfig;
+pub use service::{
+    register, register_with_acm, register_with_state, register_with_state_and_config,
+};

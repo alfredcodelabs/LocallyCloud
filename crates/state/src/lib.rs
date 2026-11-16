@@ -3,6 +3,7 @@
 mod cipher;
 pub use cipher::{StateCipher, StateCipherError};
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions, Permissions};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -40,7 +41,13 @@ pub struct StateDb {
 
 impl StateDb {
     pub fn data_dir() -> Result<PathBuf, StateError> {
-        let base = match std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        Self::data_dir_from_lookup(&|key| std::env::var_os(key))
+    }
+
+    pub fn data_dir_from_lookup(
+        get: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<PathBuf, StateError> {
+        let base = match get("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
             Some(value) => {
                 let path = PathBuf::from(value);
                 if !path.is_absolute() {
@@ -49,7 +56,7 @@ impl StateDb {
                 path
             }
             None => {
-                let home = std::env::var_os("HOME")
+                let home = get("HOME")
                     .filter(|value| !value.is_empty())
                     .ok_or(StateError::MissingDataHome)?;
                 let home = PathBuf::from(home);
@@ -63,16 +70,20 @@ impl StateDb {
     }
 
     pub fn default_path() -> Result<PathBuf, StateError> {
-        if let Some(value) =
-            std::env::var_os("LOCALLYCLOUD_STATE_DB").filter(|value| !value.is_empty())
-        {
+        Self::default_path_from_lookup(&|key| std::env::var_os(key))
+    }
+
+    pub fn default_path_from_lookup(
+        get: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<PathBuf, StateError> {
+        if let Some(value) = get("LOCALLYCLOUD_STATE_DB").filter(|value| !value.is_empty()) {
             let path = PathBuf::from(value);
             if !path.is_absolute() {
                 return Err(StateError::InvalidPath("LOCALLYCLOUD_STATE_DB"));
             }
             return Ok(path);
         }
-        Ok(Self::data_dir()?.join("state.sqlite3"))
+        Ok(Self::data_dir_from_lookup(get)?.join("state.sqlite3"))
     }
 
     pub fn work_dir(kind: &str) -> PathBuf {
@@ -188,6 +199,39 @@ impl StateDb {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn state_paths_resolve_from_one_explicit_lookup() {
+        let lookup = |key: &str| match key {
+            "LOCALLYCLOUD_STATE_DB" => Some(OsString::from("/isolated/custom.sqlite3")),
+            "XDG_DATA_HOME" => Some(OsString::from("/isolated/xdg")),
+            "HOME" => Some(OsString::from("/isolated/home")),
+            _ => None,
+        };
+        assert_eq!(
+            StateDb::default_path_from_lookup(&lookup).unwrap(),
+            PathBuf::from("/isolated/custom.sqlite3")
+        );
+        assert_eq!(
+            StateDb::data_dir_from_lookup(&lookup).unwrap(),
+            PathBuf::from("/isolated/xdg/locallycloud")
+        );
+        let home_only = |key: &str| (key == "HOME").then(|| OsString::from("/isolated/home"));
+        assert_eq!(
+            StateDb::default_path_from_lookup(&home_only).unwrap(),
+            PathBuf::from("/isolated/home/.local/share/locallycloud/state.sqlite3")
+        );
+        assert!(matches!(
+            StateDb::default_path_from_lookup(&|_| None),
+            Err(StateError::MissingDataHome)
+        ));
+        assert!(matches!(
+            StateDb::default_path_from_lookup(
+                &|key| (key == "LOCALLYCLOUD_STATE_DB").then(|| OsString::from("relative.sqlite3"))
+            ),
+            Err(StateError::InvalidPath("LOCALLYCLOUD_STATE_DB"))
+        ));
+    }
+
     use super::*;
 
     #[test]

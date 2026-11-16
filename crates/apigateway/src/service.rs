@@ -1242,7 +1242,19 @@ pub async fn register_with_state(
     state: Arc<locallycloud_state::StateDb>,
     acm: Arc<dyn locallycloud_acm::AcmAssociationApi>,
 ) -> Result<ApiGatewayWafBinding, String> {
+    register_with_state_and_config(registry, state, acm, crate::ApiGatewayConfig::default()).await
+}
+
+/// Register durable resources with validated operational capacities.
+pub async fn register_with_state_and_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    acm: Arc<dyn locallycloud_acm::AcmAssociationApi>,
+    config: crate::ApiGatewayConfig,
+) -> Result<ApiGatewayWafBinding, String> {
+    config.validate()?;
     let mut handler = ApiGwHandler::new(Arc::downgrade(registry));
+    handler.store = Arc::new(ApiGwStore::with_config(config)?);
     handler.domains = DomainBindings::with_acm(acm);
     let persistence = crate::store::Persistence::new(
         state,

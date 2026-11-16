@@ -16,11 +16,12 @@ mod ecs_network;
 mod ecs_runtime;
 mod migration;
 mod runtime_manager;
+mod startup_config;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 
-use locallycloud_core::config::{LocallyCloudConfig, SqsEndpointStrategy};
+use locallycloud_core::config::SqsEndpointStrategy;
 use locallycloud_core::endpoint::EndpointResolver;
 use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::authorization::{
@@ -340,20 +341,6 @@ async fn main() {
         }
     };
     match command {
-        cli::Command::ApplyDynamoDbMigration(policy) => {
-            if let Err(error) = dynamodb_migration::apply(policy).await {
-                eprintln!("locallycloud migrate-dynamodb: {error}");
-                std::process::exit(5);
-            }
-            return;
-        }
-        cli::Command::InspectDynamoDbMigration => {
-            if let Err(error) = dynamodb_migration::inspect().await {
-                eprintln!("locallycloud migrate-dynamodb: {error}");
-                std::process::exit(5);
-            }
-            return;
-        }
         cli::Command::Component(ref options) => {
             if let Err(error) = component_manager::execute(options).await {
                 eprintln!("locallycloud component: {error}");
@@ -383,26 +370,46 @@ async fn main() {
             }
             return;
         }
-        cli::Command::Serve | cli::Command::MigrateS3Encryption => {}
+        cli::Command::Serve
+        | cli::Command::MigrateS3Encryption
+        | cli::Command::ApplyDynamoDbMigration(_)
+        | cli::Command::InspectDynamoDbMigration => {}
     }
 
     observability::init_tracing();
 
-    let mut config = match LocallyCloudConfig::from_env() {
+    let startup = match startup_config::StartupConfig::load().await {
         Ok(config) => config,
-        Err(err) => {
-            tracing::error!(setting = err.setting, reason = %err.reason, "invalid configuration");
+        Err(error) => {
+            tracing::error!(%error, "invalid startup configuration");
             std::process::exit(2);
         }
     };
-
-    if command == cli::Command::MigrateS3Encryption {
-        if let Err(error) = migration::s3(&config).await {
-            tracing::error!(%error, "S3 encryption migration failed");
-            std::process::exit(5);
+    match command {
+        cli::Command::ApplyDynamoDbMigration(policy) => {
+            if let Err(error) = dynamodb_migration::apply(policy, startup.state.path).await {
+                tracing::error!(%error, "DynamoDB migration failed");
+                std::process::exit(5);
+            }
+            return;
         }
-        return;
+        cli::Command::InspectDynamoDbMigration => {
+            if let Err(error) = dynamodb_migration::inspect(startup.state.path).await {
+                tracing::error!(%error, "DynamoDB inspection failed");
+                std::process::exit(5);
+            }
+            return;
+        }
+        cli::Command::MigrateS3Encryption => {
+            if let Err(error) = migration::s3(&startup.common, &startup.state, startup.iam).await {
+                tracing::error!(%error, "S3 encryption migration failed");
+                std::process::exit(5);
+            }
+            return;
+        }
+        _ => {}
     }
+    let mut config = startup.common;
 
     // Resolve port zero before advertising callback URLs to native services and guests.
     let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
@@ -448,18 +455,10 @@ async fn main() {
         );
     }
 
-    let state = match tokio::task::spawn_blocking(|| {
-        locallycloud_state::StateDb::default_path().and_then(locallycloud_state::StateDb::open)
-    })
-    .await
-    {
-        Ok(Ok(state)) => Arc::new(state),
-        Ok(Err(error)) => {
-            tracing::error!(%error, "failed to open durable state");
-            std::process::exit(4);
-        }
+    let state = match startup.state.open().await {
+        Ok(state) => Arc::new(state),
         Err(error) => {
-            tracing::error!(%error, "durable state startup task failed");
+            tracing::error!(%error, "failed to open durable state");
             std::process::exit(4);
         }
     };
@@ -471,10 +470,11 @@ async fn main() {
         }
     };
     let registry = ServiceRegistry::with_known_services();
-    if let Err(error) = locallycloud_iam_sts::service::register_with_state(
+    if let Err(error) = locallycloud_iam_sts::service::register_with_state_and_config(
         &registry,
         &config.account_id,
         state.clone(),
+        startup.iam,
     ) {
         tracing::error!(%error, "failed to initialize durable IAM state");
         std::process::exit(2);
@@ -578,16 +578,20 @@ async fn main() {
             std::process::exit(4);
         }
     };
-    let gateway_waf =
-        match locallycloud_apigateway::register_with_state(&registry, state.clone(), acm.clone())
-            .await
-        {
-            Ok(gateway) => gateway,
-            Err(error) => {
-                tracing::error!(%error, "failed to load durable API Gateway state");
-                std::process::exit(4);
-            }
-        };
+    let gateway_waf = match locallycloud_apigateway::register_with_state_and_config(
+        &registry,
+        state.clone(),
+        acm.clone(),
+        startup.apigateway,
+    )
+    .await
+    {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            tracing::error!(%error, "failed to load durable API Gateway state");
+            std::process::exit(4);
+        }
+    };
     if let Err(error) = locallycloud_cloudformation::register_with_state_and_endpoint(
         &registry,
         state.clone(),

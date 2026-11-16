@@ -2,11 +2,13 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use locallycloud_dynamodb::error::DdbError;
 use locallycloud_dynamodb::migration::InspectionSummary;
-use locallycloud_state::{StateCipher, StateDb};
+use locallycloud_state::StateCipher;
+#[cfg(test)]
+use locallycloud_state::StateDb;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -80,9 +82,8 @@ fn inspect_path(path: &Path, cipher: &StateCipher, output: &mut impl Write) -> R
         .map_err(|error|error.to_string())
 }
 
-pub async fn inspect() -> Result<(), String> {
-    tokio::task::spawn_blocking(|| {
-        let path = StateDb::default_path().map_err(|error| error.to_string())?;
+pub async fn inspect(path: PathBuf) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
         let cipher = StateCipher::from_env().map_err(|error| error.to_string())?;
         inspect_path(&path, &cipher, &mut io::stdout().lock())
     })

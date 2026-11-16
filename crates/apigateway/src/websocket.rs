@@ -27,8 +27,6 @@ use crate::proxy_event::percent_decode;
 use crate::store::ApiGwStore;
 
 const MAX_POST_PAYLOAD_BYTES: usize = 128 * 1024;
-const OUTBOUND_CHANNEL_CAPACITY: usize = 32;
-const OUTBOUND_HISTORY_CAPACITY: usize = 64;
 const OUTBOUND_MESSAGES: &str = "__outboundMessages";
 
 #[cfg(test)]
@@ -335,7 +333,8 @@ async fn run_connection(mut socket: WebSocket, runtime: WebSocketRuntime, connec
         },
     )
     .await;
-    let (sender, mut outbound) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
+    let (sender, mut outbound) =
+        mpsc::channel(runtime.store.config.websocket_outbound_channel_capacity);
     runtime.store.register_connection_sender(
         &runtime.account,
         &runtime.region,
@@ -574,20 +573,15 @@ async fn authorize_connect(
         .map_err(|_| UpgradeFailure::new(500, "Invalid authorizer response"))?;
     let context = websocket_authorizer_context(authorizer, &result, &route_arn)?;
     if ttl > 0 {
-        const MAX_AUTHORIZER_CACHE_ENTRIES: usize = 1024;
-        let shared = store.shared(&request.account_id, &request.region);
-        let mut guard = shared.write().await;
-        while guard.authorizer_cache.len() >= MAX_AUTHORIZER_CACHE_ENTRIES {
-            let Some(oldest) = guard.authorizer_cache.keys().next().cloned() else {
-                break;
-            };
-            guard.authorizer_cache.remove(&oldest);
-        }
         let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-        guard.authorizer_cache.insert(
-            cache_key,
-            json!({ "expiresAt": now.saturating_add(ttl), "result": result }),
-        );
+        store
+            .cache_authorizer(
+                &request.account_id,
+                &request.region,
+                cache_key,
+                json!({ "expiresAt": now.saturating_add(ttl), "result": result }),
+            )
+            .await;
     }
     Ok(context)
 }
@@ -956,9 +950,10 @@ pub(crate) async fn post_to_connection(
     let history = connection[OUTBOUND_MESSAGES]
         .as_array_mut()
         .ok_or_else(|| ApiGwError::Internal("Outbound message history is invalid".into()))?;
-    if history.len() >= OUTBOUND_HISTORY_CAPACITY {
-        history.remove(0);
-    }
+    let excess = history
+        .len()
+        .saturating_sub(store.config.websocket_outbound_history_capacity - 1);
+    history.drain(..excess);
     history.push(json!({ "data": BASE64.encode(payload) }));
     Ok((200, json!({})))
 }
@@ -1127,6 +1122,35 @@ mod tests {
             touch_connection(&store, ACCOUNT, REGION, "missing").await,
             Err(ApiGwError::Gone(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn configured_history_retains_only_the_latest_messages() {
+        let mut store = registered_store().await;
+        store.config.websocket_outbound_history_capacity = 1;
+        {
+            let shared = store.shared(ACCOUNT, REGION);
+            shared
+                .write()
+                .await
+                .connections
+                .get_mut(CONNECTION)
+                .unwrap()[OUTBOUND_MESSAGES] = json!([{"data":"old-1"}, {"data":"old-2"}]);
+        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        store.register_connection_sender(ACCOUNT, REGION, CONNECTION, sender);
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            post_to_connection(&store, ACCOUNT, REGION, CONNECTION, payload)
+                .await
+                .unwrap();
+            assert_eq!(receiver.recv().await.as_deref(), Some(payload));
+        }
+        let shared = store.shared(ACCOUNT, REGION);
+        let guard = shared.read().await;
+        assert_eq!(
+            guard.connections[CONNECTION][OUTBOUND_MESSAGES],
+            json!([{ "data": BASE64.encode(b"second") }])
+        );
     }
 
     #[tokio::test]

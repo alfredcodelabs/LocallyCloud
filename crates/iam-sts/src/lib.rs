@@ -4,6 +4,7 @@
 //! `ServiceRegistry`. IAM and STS responses and errors are XML only (never JSON).
 
 pub mod arn;
+pub mod config;
 pub mod enforcement;
 pub mod error;
 pub mod iam;
@@ -18,6 +19,10 @@ pub mod store;
 pub mod sts;
 mod tag_pagination;
 
+pub use config::{IamConfig, IamConfigError};
 pub use persistence::authenticate_state_key;
 
-pub use service::{register, register_with_store_and_mode};
+pub use service::{
+    register, register_with_account_and_config, register_with_state_and_config,
+    register_with_store_and_mode,
+};

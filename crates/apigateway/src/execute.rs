@@ -1663,19 +1663,14 @@ async fn lambda_authorize(
     let interpreted =
         interpret_authorizer(kind, authorizer, &result, &method_arn, resource_decision)?;
     if ttl > 0 {
-        const MAX_AUTHORIZER_CACHE_ENTRIES: usize = 1024;
-        let shared = ctx.store.shared(ctx.account, ctx.region);
-        let mut guard = shared.write().await;
-        while guard.authorizer_cache.len() >= MAX_AUTHORIZER_CACHE_ENTRIES {
-            let Some(oldest) = guard.authorizer_cache.keys().next().cloned() else {
-                break;
-            };
-            guard.authorizer_cache.remove(&oldest);
-        }
-        guard.authorizer_cache.insert(
-            cache_key,
-            json!({ "expiresAt": now_secs() + ttl, "result": result }),
-        );
+        ctx.store
+            .cache_authorizer(
+                ctx.account,
+                ctx.region,
+                cache_key,
+                json!({ "expiresAt": now_secs() + ttl, "result": result }),
+            )
+            .await;
     }
     Ok(interpreted)
 }

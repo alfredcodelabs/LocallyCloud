@@ -1476,6 +1476,14 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+async fn link_runtime_fixture(binary: &Path, fixture: &str) {
+    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture);
+    tokio::fs::symlink(target, binary).await.unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1529,13 +1537,11 @@ mod tests {
 
     #[tokio::test]
     async fn oci_bundle_requires_exact_memory_limit() {
-        use std::os::unix::fs::PermissionsExt;
         let root =
             std::env::temp_dir().join(format!("compute-memory-config-{}", std::process::id()));
         crate::private_dir::ensure(&root).unwrap();
         let binary = root.join("runtime");
-        std::fs::write(&binary, "#!/bin/sh\nprintf '%s' '{\"process\":{},\"root\":{},\"linux\":{\"namespaces\":[]},\"mounts\":[]}' > config.json\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        link_runtime_fixture(&binary, "oci-spec.sh").await;
         let rt = YoukiRuntime::new(binary);
         let mut task = spec();
         task.memory_mb = 257;
@@ -1725,12 +1731,16 @@ mod tests {
 
     #[tokio::test]
     async fn finalized_task_churn_and_failed_cleanup_retry() {
-        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("compute-release-{}", std::process::id()));
         crate::private_dir::ensure(&root).unwrap();
         let binary = root.join("runtime");
-        std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in state) echo \"container $2 does not exist\" >&2; exit 1;; list) exit 0;; esac\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        link_runtime_fixture(&binary, "oci-state.sh").await;
+        tokio::fs::write(binary.with_extension("mode"), "churn")
+            .await
+            .unwrap();
+        tokio::fs::write(binary.with_extension("list-exit"), "0")
+            .await
+            .unwrap();
         let rt = YoukiRuntime::new(binary);
         for n in 0..32 {
             let id = format!("ended-{n}");
@@ -1764,7 +1774,6 @@ mod tests {
 
     #[tokio::test]
     async fn crun_missing_status_requires_successful_exact_inventory_absence() {
-        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
             "compute-crun-absence-{}-{}",
             std::process::id(),
@@ -1774,24 +1783,21 @@ mod tests {
                 .as_nanos()
         ));
         crate::private_dir::ensure(&root).unwrap();
-        for (index, inventory, released) in [
-            (0, "exit 0", true),
-            (1, "echo owned-other; exit 0", true),
-            (2, "echo owned; exit 0", false),
-            (3, "exit 1", false),
+        for (index, inventory, list_exit, released) in [
+            (0, "", "0", true),
+            (1, "owned-other\n", "0", true),
+            (2, "owned\n", "0", false),
+            (3, "", "1", false),
         ] {
             let binary = root.join(format!("runtime-{index}"));
-            let script = format!(
-                r#"#!/bin/sh
-case "$1" in
-state) printf "error opening file \`/run/user/1000/crun/$2/status': No such file or directory\n" >&2; exit 1 ;;
-list) {inventory} ;;
-*) exit 1 ;;
-esac
-"#
-            );
-            tokio::fs::write(&binary, script).await.unwrap();
-            tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            link_runtime_fixture(&binary, "oci-state.sh").await;
+            tokio::fs::write(binary.with_extension("mode"), "absent")
+                .await
+                .unwrap();
+            tokio::fs::write(binary.with_extension("inventory"), inventory)
+                .await
+                .unwrap();
+            tokio::fs::write(binary.with_extension("list-exit"), list_exit)
                 .await
                 .unwrap();
             let runtime = YoukiRuntime::new(binary);
@@ -1800,7 +1806,8 @@ esac
             tokio::fs::create_dir(&bundle).await.unwrap();
             slot.lock().await.bundle = bundle.clone();
             runtime.tasks.insert("owned".into(), slot);
-            assert_eq!(runtime.release_task("owned").await.is_ok(), released);
+            let result = runtime.release_task("owned").await;
+            assert_eq!(result.is_ok(), released, "release case {index}: {result:?}");
             assert_eq!(bundle.exists(), !released);
             assert_eq!(runtime.tasks.contains_key("owned"), !released);
         }
@@ -1857,10 +1864,10 @@ esac
         tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .await
             .unwrap();
-        for (index, inventory, released) in [
-            (0, "exit 0", true),
-            (1, "echo owned; exit 0", false),
-            (2, "exit 1", false),
+        for (index, inventory, list_exit, released) in [
+            (0, "", "0", true),
+            (1, "owned\n", "0", false),
+            (2, "", "1", false),
         ] {
             let binary = root.join(format!("runtime-{index}"));
             let bundle = root.join(format!("locallycloud-owned-{index}"));
@@ -1868,23 +1875,17 @@ esac
             let initial_state = serde_json::json!({
                 "id": "owned", "status": "stopped", "bundle": bundle
             });
-            let script = format!(
-                r#"#!/bin/sh
-case "$1" in
-state)
-    if test -f "$0.deleted"; then
-        printf "error opening file \`/run/user/1000/crun/$2/status': No such file or directory\n" >&2
-        exit 1
-    fi
-    printf '%s\n' '{initial_state}' ;;
-delete) touch "$0.deleted"; echo 'state disappeared during delete' >&2; exit 1 ;;
-list) {inventory} ;;
-*) exit 1 ;;
-esac
-"#
-            );
-            tokio::fs::write(&binary, script).await.unwrap();
-            tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            link_runtime_fixture(&binary, "oci-state.sh").await;
+            tokio::fs::write(binary.with_extension("mode"), "delete")
+                .await
+                .unwrap();
+            tokio::fs::write(binary.with_extension("state"), initial_state.to_string())
+                .await
+                .unwrap();
+            tokio::fs::write(binary.with_extension("inventory"), inventory)
+                .await
+                .unwrap();
+            tokio::fs::write(binary.with_extension("list-exit"), list_exit)
                 .await
                 .unwrap();
             let mut runtime = YoukiRuntime::new(&binary);
@@ -1892,10 +1893,14 @@ esac
             let slot = slot_with(TaskState::Completed);
             slot.lock().await.bundle = bundle.clone();
             runtime.tasks.insert("owned".into(), slot);
-            assert_eq!(runtime.release_task("owned").await.is_ok(), released);
-            assert!(tokio::fs::try_exists(binary.with_extension("deleted"))
-                .await
-                .unwrap());
+            let result = runtime.release_task("owned").await;
+            assert_eq!(result.is_ok(), released, "release case {index}: {result:?}");
+            assert!(
+                tokio::fs::try_exists(binary.with_extension("deleted"))
+                    .await
+                    .unwrap(),
+                "delete fixture was not reached in case {index}: {result:?}"
+            );
             assert_eq!(tokio::fs::try_exists(&bundle).await.unwrap(), !released);
             assert_eq!(runtime.tasks.contains_key("owned"), !released);
         }
@@ -1941,19 +1946,8 @@ esac
             tokio::fs::write(binary.with_extension("stderr"), error)
                 .await
                 .unwrap();
-            tokio::fs::write(
-                &binary,
-                r#"#!/bin/sh
-[ "$1" = kill ] || exit 99
-: > "$0.entered"
-while [ ! -f "$0.release" ]; do sleep 0.01; done
-cat "$0.stderr" >&2
-exit 1
-"#,
-            )
-            .await
-            .unwrap();
-            tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            link_runtime_fixture(&binary, "oci-gated-kill.sh").await;
+            tokio::fs::write(binary.with_extension("exit"), "1")
                 .await
                 .unwrap();
             let runtime = Arc::new(YoukiRuntime::new(&binary));

@@ -247,8 +247,7 @@ struct SourceGuard {
     component: (PathBuf, File, ComponentOperationGuard),
 }
 
-fn source_guard() -> Result<SourceGuard, String> {
-    let source = StateDb::default_path().map_err(|e| e.to_string())?;
+fn source_guard(source: PathBuf) -> Result<SourceGuard, String> {
     let lock = super::lock_source(&source)?;
     let cipher = StateCipher::from_env().map_err(|e| e.to_string())?;
     authenticate_source(&source, &cipher)?;
@@ -948,8 +947,8 @@ fn commit(prepared: &mut Prepared) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) async fn apply(policy: MigrationPolicy) -> Result<(), String> {
-    let guard = tokio::task::spawn_blocking(source_guard)
+pub(crate) async fn apply(policy: MigrationPolicy, path: PathBuf) -> Result<(), String> {
+    let guard = tokio::task::spawn_blocking(move || source_guard(path))
         .await
         .map_err(|_| "Migration source preflight task failed".to_owned())??;
     require_migration_support(&guard.component).await?;

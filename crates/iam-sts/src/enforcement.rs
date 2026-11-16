@@ -21,7 +21,8 @@ use crate::store::IamStore;
 use crate::sts::SessionStore;
 
 /// Whether IAM policy decisions gate request handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EnforcementMode {
     #[default]
     Permissive,
@@ -29,18 +30,21 @@ pub enum EnforcementMode {
 }
 
 impl EnforcementMode {
-    /// Resolve from the name-independent configuration; defaults to permissive.
-    pub fn from_env() -> Self {
-        for key in ["LOCALLYCLOUD_IAM_ENFORCEMENT", "LOCALSTACK_IAM_ENFORCEMENT"] {
-            if let Ok(value) = std::env::var(key) {
-                return if value.eq_ignore_ascii_case("strict") {
-                    EnforcementMode::Strict
-                } else {
-                    EnforcementMode::Permissive
-                };
-            }
+    /// Resolve validated startup configuration; missing settings default to permissive.
+    pub fn from_env() -> Result<Self, crate::config::IamConfigError> {
+        crate::config::IamConfig::from_env().map(|config| config.enforcement)
+    }
+}
+
+impl std::str::FromStr for EnforcementMode {
+    type Err = crate::config::IamConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "permissive" => Ok(Self::Permissive),
+            "strict" => Ok(Self::Strict),
+            _ => Err(crate::config::IamConfigError),
         }
-        EnforcementMode::Permissive
     }
 }
 

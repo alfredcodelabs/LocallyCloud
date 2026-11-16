@@ -123,6 +123,7 @@ type ScopeKey = (String, String);
 
 #[derive(Default)]
 pub struct ApiGwStore {
+    pub(crate) config: crate::config::ApiGatewayConfig,
     rest: DashMap<Key, Arc<RwLock<RestApiRecord>>>,
     v2: DashMap<Key, Arc<RwLock<ApiV2Record>>>,
     shared: DashMap<ScopeKey, Arc<RwLock<SharedRecord>>>,
@@ -214,6 +215,32 @@ impl ApiGwStore {
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_config(config: crate::config::ApiGatewayConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            ..Self::default()
+        })
+    }
+
+    pub(crate) async fn cache_authorizer(
+        &self,
+        account: &str,
+        region: &str,
+        key: String,
+        value: Value,
+    ) {
+        let shared = self.shared(account, region);
+        let mut guard = shared.write().await;
+        while guard.authorizer_cache.len() >= self.config.authorizer_cache_capacity {
+            let Some(oldest) = guard.authorizer_cache.keys().next().cloned() else {
+                break;
+            };
+            guard.authorizer_cache.remove(&oldest);
+        }
+        guard.authorizer_cache.insert(key, value);
     }
 
     // ---- v1 REST APIs ----
@@ -337,5 +364,63 @@ mod tests {
         assert!(store.rest("0", "us-east-1", "abc").is_some());
         assert!(store.remove_rest("0", "us-east-1", "abc"));
         assert!(store.rest("0", "us-east-1", "abc").is_none());
+    }
+}
+
+#[cfg(test)]
+mod operational_config_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configured_authorizer_cache_is_bounded_per_scope() {
+        let config = crate::ApiGatewayConfig {
+            authorizer_cache_capacity: 1,
+            ..Default::default()
+        };
+        let store = ApiGwStore::with_config(config).unwrap();
+        store
+            .cache_authorizer(
+                "account",
+                "east",
+                "first".into(),
+                serde_json::json!({"result":1}),
+            )
+            .await;
+        store
+            .cache_authorizer(
+                "account",
+                "west",
+                "other".into(),
+                serde_json::json!({"result":3}),
+            )
+            .await;
+        store
+            .cache_authorizer(
+                "account",
+                "east",
+                "second".into(),
+                serde_json::json!({"result":2}),
+            )
+            .await;
+        let east = store.shared("account", "east");
+        let east = east.read().await;
+        assert_eq!(east.authorizer_cache.len(), 1);
+        assert_eq!(east.authorizer_cache["second"]["result"], 2);
+        drop(east);
+        assert!(store
+            .shared("account", "west")
+            .read()
+            .await
+            .authorizer_cache
+            .contains_key("other"));
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_before_store_construction() {
+        assert!(ApiGwStore::with_config(crate::ApiGatewayConfig {
+            websocket_outbound_channel_capacity: 0,
+            ..Default::default()
+        })
+        .is_err());
     }
 }

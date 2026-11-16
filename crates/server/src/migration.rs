@@ -7,18 +7,25 @@ use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::InternalDispatcher;
 use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
 use locallycloud_core::registry::ServiceRegistry;
-use locallycloud_state::StateDb;
 
-pub async fn s3(config: &LocallyCloudConfig) -> Result<(), String> {
-    let state = tokio::task::spawn_blocking(|| StateDb::default_path().and_then(StateDb::open))
+pub async fn s3(
+    config: &LocallyCloudConfig,
+    state_config: &crate::startup_config::StateConfig,
+    iam_config: locallycloud_iam_sts::IamConfig,
+) -> Result<(), String> {
+    let state = state_config
+        .open()
         .await
-        .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
     let _guard = state.lock_runtime().map_err(|error| error.to_string())?;
     let state = Arc::new(state);
     let registry = ServiceRegistry::with_known_services();
-    locallycloud_iam_sts::service::register_with_account(&registry, &config.account_id)
-        .map_err(|error| error.to_string())?;
+    locallycloud_iam_sts::register_with_account_and_config(
+        &registry,
+        &config.account_id,
+        iam_config,
+    )
+    .map_err(|error| error.to_string())?;
     locallycloud_kms::register_with_state(&registry, state.clone())?;
     let handler = locallycloud_s3::service::S3Handler::for_migration(&registry, state)?;
     let dispatcher = Arc::new(InternalDispatcher::new_shared(

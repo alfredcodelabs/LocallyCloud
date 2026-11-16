@@ -68,8 +68,9 @@ fn pass_role_context(request: &ServiceRoleAuthorizationRequest) -> BTreeMap<Stri
 }
 
 impl IamStsState {
+    #[cfg(test)]
     fn new(store: Arc<IamStore>, sessions: Arc<SessionStore>) -> Self {
-        Self::with_mode(store, sessions, EnforcementMode::from_env())
+        Self::with_mode(store, sessions, EnforcementMode::default())
     }
 
     fn with_mode(store: Arc<IamStore>, sessions: Arc<SessionStore>, mode: EnforcementMode) -> Self {
@@ -1320,6 +1321,8 @@ pub struct BootstrapCredentials {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BootstrapError {
+    #[error(transparent)]
+    Configuration(#[from] crate::config::IamConfigError),
     #[error("strict IAM requires both bootstrap access key ID and secret access key")]
     MissingCredentials,
     #[error("invalid bootstrap access key ID or secret access key")]
@@ -1450,15 +1453,26 @@ pub fn register_with_account(
     registry: &ServiceRegistry,
     account: &str,
 ) -> Result<(), BootstrapError> {
-    let credentials =
-        BootstrapCredentials::from_env(EnforcementMode::from_env() == EnforcementMode::Strict)?;
+    register_with_account_and_config(registry, account, crate::config::IamConfig::from_env()?)
+}
+
+/// Register in-memory handlers with an explicitly resolved startup configuration.
+pub fn register_with_account_and_config(
+    registry: &ServiceRegistry,
+    account: &str,
+    config: crate::config::IamConfig,
+) -> Result<(), BootstrapError> {
+    let mode = config.enforcement;
+    let credentials = BootstrapCredentials::from_env(mode == EnforcementMode::Strict)?;
     let root = configured_root(account)?;
     validate_root_collision(root.as_ref(), credentials.as_ref())?;
-    register_inner(registry, account, credentials, root)
+    register_inner(registry, account, credentials, root, mode)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistrationError {
+    #[error(transparent)]
+    Configuration(#[from] crate::config::IamConfigError),
     #[error(transparent)]
     Bootstrap(#[from] BootstrapError),
     #[error(transparent)]
@@ -1470,8 +1484,18 @@ pub fn register_with_state(
     account: &str,
     db: Arc<locallycloud_state::StateDb>,
 ) -> Result<(), RegistrationError> {
+    register_with_state_and_config(registry, account, db, crate::config::IamConfig::from_env()?)
+}
+
+/// Register with one validated mode used for bootstrap validation and both published handlers.
+pub fn register_with_state_and_config(
+    registry: &ServiceRegistry,
+    account: &str,
+    db: Arc<locallycloud_state::StateDb>,
+    config: crate::config::IamConfig,
+) -> Result<(), RegistrationError> {
     let credentials =
-        BootstrapCredentials::from_env(EnforcementMode::from_env() == EnforcementMode::Strict)?;
+        BootstrapCredentials::from_env(config.enforcement == EnforcementMode::Strict)?;
     let root = configured_root(account)?;
     validate_root_collision(root.as_ref(), credentials.as_ref())?;
     let persistence = Arc::new(crate::persistence::IamPersistence::new(db)?);
@@ -1489,14 +1513,20 @@ pub fn register_with_state(
         }
         Ok(())
     })?;
-    publish_handlers(registry, store, sessions);
+    register_with_store_and_mode(registry, store, sessions, config.enforcement);
     Ok(())
 }
 
 /// Compatibility registration for standalone permissive tests.
 pub fn register(registry: &ServiceRegistry) {
-    register_inner(registry, "000000000000", None, None)
-        .expect("standalone registration has no credentials");
+    register_inner(
+        registry,
+        "000000000000",
+        None,
+        None,
+        EnforcementMode::Permissive,
+    )
+    .expect("standalone registration has no credentials");
 }
 
 fn register_inner(
@@ -1504,6 +1534,7 @@ fn register_inner(
     account: &str,
     credentials: Option<BootstrapCredentials>,
     root: Option<AccountRoot>,
+    mode: EnforcementMode,
 ) -> Result<(), BootstrapError> {
     let store = Arc::new(IamStore::new());
     iam::seed_aws_managed_policies(&store);
@@ -1515,12 +1546,8 @@ fn register_inner(
             .provision_root(root)
             .map_err(|_| BootstrapError::RootCredentialCollision)?;
     }
-    publish_handlers(registry, store, Arc::new(SessionStore::new()));
+    register_with_store_and_mode(registry, store, Arc::new(SessionStore::new()), mode);
     Ok(())
-}
-
-fn publish_handlers(registry: &ServiceRegistry, store: Arc<IamStore>, sessions: Arc<SessionStore>) {
-    publish_state(registry, Arc::new(IamStsState::new(store, sessions)));
 }
 
 /// Publish explicitly provisioned IAM/STS stores with an injected enforcement mode.
@@ -2079,6 +2106,35 @@ mod tests {
                 Arc::new(IamStore::new()),
                 Arc::new(SessionStore::new()),
             )),
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_mode_is_the_mode_published_for_both_services() {
+        for mode in [EnforcementMode::Strict, EnforcementMode::Permissive] {
+            let registry = ServiceRegistry::new();
+            // Startup already validated the mode; publishing must never resolve environment again.
+            register_inner(&registry, "000000000000", None, None, mode).unwrap();
+            assert_eq!(
+                registry
+                    .authorization_evaluator(&ServiceName::new("iam"))
+                    .unwrap()
+                    .strict_sigv4_required(),
+                mode == EnforcementMode::Strict
+            );
+            let response = registry
+                .native_handler(&ServiceName::new("sts"))
+                .unwrap()
+                .handle(request("Action=GetCallerIdentity"))
+                .await;
+            assert_eq!(
+                response.status().as_u16(),
+                if mode == EnforcementMode::Strict {
+                    403
+                } else {
+                    200
+                }
+            );
         }
     }
 

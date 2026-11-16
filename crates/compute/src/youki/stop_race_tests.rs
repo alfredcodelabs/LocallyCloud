@@ -35,21 +35,11 @@ async fn successful_stop_reconciles_a_reaped_kill_without_hiding_unrelated_exits
         (4, libc::SIGKILL, TaskState::Failed, 1, TaskState::Failed),
     ] {
         let binary = root.join(format!("runtime-{index}"));
-        tokio::fs::write(
-            &binary,
-            format!(
-                r#"#!/bin/sh
-[ "$1" = kill ] || exit 99
-: > "$0.entered"
-while [ ! -f "$0.release" ]; do sleep 0.01; done
-echo 'controlled stop result' >&2
-exit {kill_exit}
-"#
-            ),
-        )
-        .await
-        .unwrap();
-        tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        link_runtime_fixture(&binary, "oci-gated-kill.sh").await;
+        tokio::fs::write(binary.with_extension("exit"), kill_exit.to_string())
+            .await
+            .unwrap();
+        tokio::fs::write(binary.with_extension("stderr"), "controlled stop result\n")
             .await
             .unwrap();
         let runtime = Arc::new(YoukiRuntime::new(&binary));
@@ -63,17 +53,24 @@ exit {kill_exit}
         }));
         runtime.tasks.insert("owned".into(), slot.clone());
         let runner = runtime.clone();
-        let stop = tokio::spawn(async move { runner.stop_task("owned").await });
+        let mut stop = tokio::spawn(async move { runner.stop_task("owned").await });
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !tokio::fs::try_exists(binary.with_extension("entered"))
-                .await
-                .unwrap()
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::select! {
+                result = &mut stop => {
+                    panic!("stop completed before OCI fixture entry in case {index}: {result:?}");
+                }
+                () = async {
+                    while !tokio::fs::try_exists(binary.with_extension("entered"))
+                        .await
+                        .unwrap()
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                } => {}
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("OCI fixture entry timed out in case {index}: {error}"));
         // Force the observed ordering: the monitor reaps before the kill CLI acknowledges.
         {
             let mut record = slot.lock().await;
@@ -122,18 +119,8 @@ async fn acknowledged_stop_waits_for_the_monitor_before_classifying_the_exit() {
         (3, (128 + libc::SIGKILL) << 8, TaskState::Stopped),
     ] {
         let binary = root.join(format!("runtime-{index}"));
-        tokio::fs::write(
-            &binary,
-            r#"#!/bin/sh
-[ "$1" = kill ] || exit 99
-: > "$0.entered"
-while [ ! -f "$0.release" ]; do sleep 0.01; done
-exit 0
-"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        link_runtime_fixture(&binary, "oci-gated-kill.sh").await;
+        tokio::fs::write(binary.with_extension("exit"), "0")
             .await
             .unwrap();
         let runtime = YoukiRuntime::new(&binary);
@@ -148,7 +135,11 @@ exit 0
         runtime.tasks.insert("owned".into(), slot.clone());
         // Manual polling prevents the stop task from advancing outside the gates below.
         let mut stop = Box::pin(runtime.stop_task("owned"));
-        assert!(poll_once(stop.as_mut()).is_pending());
+        let initial_poll = poll_once(stop.as_mut());
+        assert!(
+            initial_poll.is_pending(),
+            "initial stop poll in case {index}: {initial_poll:?}"
+        );
         tokio::time::timeout(Duration::from_secs(3), async {
             while !tokio::fs::try_exists(binary.with_extension("entered"))
                 .await
@@ -170,9 +161,18 @@ exit 0
                 "kill acknowledgement was not observed"
             );
             let guard = slot.lock().await;
-            assert!(poll_once(stop.as_mut()).is_pending());
+            let stop_poll = poll_once(stop.as_mut());
+            assert!(
+                stop_poll.is_pending(),
+                "stop poll before observer in case {index}: {stop_poll:?}"
+            );
             let mut observer = Box::pin(slot.lock());
-            assert!(poll_once(observer.as_mut()).is_pending());
+            let observer_poll = poll_once(observer.as_mut());
+            assert!(
+                observer_poll.is_pending(),
+                "observer poll while record is held in case {index}: {:?}",
+                observer_poll.is_ready()
+            );
             drop(guard);
             // FIFO locking proves stop passed the kill ACK, rather than just observing
             // a child-side marker before Command::output had consumed its exit status.
@@ -185,7 +185,11 @@ exit 0
             };
             drop(observer);
             if stop_is_waiting_on_record {
-                assert!(poll_once(stop.as_mut()).is_pending());
+                let drain_poll = poll_once(stop.as_mut());
+                assert!(
+                    drain_poll.is_pending(),
+                    "stop poll after kill acknowledgement in case {index}: {drain_poll:?}"
+                );
                 break;
             }
             tokio::task::yield_now().await;

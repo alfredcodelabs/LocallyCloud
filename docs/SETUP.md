@@ -196,8 +196,55 @@ See [AWS options for other SDKs](https://docs.aws.amazon.com/sdkref/latest/guide
 
 ## Configuration
 
+Startup resolves settings once, in this order: built-in defaults, an optional JSON
+file, then environment variables. Existing priorities between native variables,
+compatibility aliases and AWS variables remain unchanged. Services receive the
+resolved settings; changing the file requires a restart.
+
+The default file is `${XDG_CONFIG_HOME:-$HOME/.config}/locallycloud/config.json`.
+Set `LOCALLYCLOUD_CONFIG_FILE` to an absolute path to select another file. A missing
+default file is allowed; an explicitly selected missing file is an error. Files
+must be regular JSON files of at most 64 KiB. Unknown fields, explicit `null`, wrong
+types and invalid effective values fail startup. Omitted fields inherit defaults.
+Keep encryption keys and credentials in their existing secret inputs; the JSON
+file does not accept them.
+
+```json
+{
+  "common": {
+    "region": "us-east-1",
+    "port": 4566
+  },
+  "iam": {
+    "enforcement": "strict"
+  },
+  "apigateway": {
+    "authorizer_cache_capacity": 1024
+  },
+  "state": {
+    "path": "/home/alice/.local/share/locallycloud/state.sqlite3"
+  }
+}
+```
+
+This first configuration-file stage supports the following fields. Other settings
+continue to use the environment variables below.
+
+| Section | Fields |
+| --- | --- |
+| `common` | `host`, `port`, `region`, `account_id`, `allow_http`, `ui_enabled`, `upstream_timeout_secs`, `max_request_body_bytes` |
+| `iam` | `enforcement`: `strict` or `permissive`; an invalid environment value is also an error |
+| `apigateway` | `authorizer_cache_capacity` (default 1024, range 1–65536), `websocket_outbound_channel_capacity` (32, range 1–256), `websocket_outbound_history_capacity` (64, range 1–1024) |
+| `state` | `path`: absolute SQLite path, shared by the server and offline S3/DynamoDB migrations |
+
+API Gateway capacities bound local buffers and caches; they do not change AWS wire
+limits. They allocate entries on demand. The SQLite engine, encryption, locking and
+transaction durability remain in the shared state layer.
+
+
 | Variable | Purpose | Default |
 | --- | --- | --- |
+| `LOCALLYCLOUD_CONFIG_FILE` | Absolute path to the startup JSON file | XDG configuration path above |
 | `LOCALLYCLOUD_HOST` | Server listen address | `127.0.0.1` |
 | `LOCALLYCLOUD_PORT` | Endpoint port | `4566` |
 | `LOCALLYCLOUD_DEFAULT_REGION` | Local region | `us-east-1` |
@@ -205,6 +252,9 @@ See [AWS options for other SDKs](https://docs.aws.amazon.com/sdkref/latest/guide
 | `LOCALLYCLOUD_STATE_DB` | SQLite state file | `~/.local/share/locallycloud/state.sqlite3`, or under `XDG_DATA_HOME` when set |
 | `LOCALLYCLOUD_KMS_MASTER_KEY` | Base64-encoded 32-byte master key | Required; no default |
 | `LOCALLYCLOUD_IAM_ENFORCEMENT` | IAM mode; `strict` evaluates policies | Permissive |
+| `LOCALLYCLOUD_APIGATEWAY_AUTHORIZER_CACHE_CAPACITY` | Maximum authorizer cache entries per account/region; 1–65536 | `1024` |
+| `LOCALLYCLOUD_APIGATEWAY_WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY` | Per-connection outbound channel capacity; 1–256 | `32` |
+| `LOCALLYCLOUD_APIGATEWAY_WEBSOCKET_OUTBOUND_HISTORY_CAPACITY` | Retained outbound messages per connection; 1–1024 | `64` |
 | `LOCALLYCLOUD_WORK_DIR` | Lambda work files | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/lambda` |
 | `LOCALLYCLOUD_RUNTIME_PACKS_DIR` | Installed Lambda and PostgreSQL runtime packs; relative paths resolve from the server working directory | `<Lambda work directory>/runtime-packs` |
 | `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | Shared Lambda environment budget in MiB; see [memory accounting](LAMBDA.md#memory-budget) | `4096` |
