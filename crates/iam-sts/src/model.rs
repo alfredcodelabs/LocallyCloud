@@ -36,6 +36,10 @@ pub fn tags_xml(tags: &BTreeMap<String, String>) -> String {
     format!("<Tags>{members}</Tags>")
 }
 
+fn permissions_boundary_xml(boundary: Option<&str>) -> String {
+    boundary.map(|arn| format!("<PermissionsBoundary><PermissionsBoundaryType>Policy</PermissionsBoundaryType>{}</PermissionsBoundary>", text_el("PermissionsBoundaryArn", arn))).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IamUser {
     pub user_name: String,
@@ -63,7 +67,12 @@ impl IamUser {
         )
     }
     pub fn xml(&self) -> String {
-        format!("<User>{}</User>", self.fields())
+        format!(
+            "<User>{}{}{}</User>",
+            self.fields(),
+            tags_xml(&self.tags),
+            permissions_boundary_xml(self.permission_boundary.as_deref())
+        )
     }
     pub fn member_xml(&self) -> String {
         format!("<member>{}</member>", self.fields())
@@ -125,7 +134,7 @@ impl IamRole {
             .map(|d| text_el("Description", d))
             .unwrap_or_default();
         format!(
-            "{}{}{}{}{}<AssumeRolePolicyDocument>{}</AssumeRolePolicyDocument>{}<MaxSessionDuration>{}</MaxSessionDuration>{}",
+            "{}{}{}{}{}<AssumeRolePolicyDocument>{}</AssumeRolePolicyDocument>{}<MaxSessionDuration>{}</MaxSessionDuration>",
             text_el("Path", &self.path),
             text_el("RoleName", &self.role_name),
             text_el("RoleId", &self.role_id),
@@ -134,11 +143,15 @@ impl IamRole {
             xml_escape(&urlencode_doc(&self.assume_role_policy_document)),
             description,
             self.max_session_duration,
-            tags_xml(&self.tags),
         )
     }
     pub fn xml(&self) -> String {
-        format!("<Role>{}</Role>", self.fields())
+        format!(
+            "<Role>{}{}{}</Role>",
+            self.fields(),
+            tags_xml(&self.tags),
+            permissions_boundary_xml(self.permission_boundary.as_deref())
+        )
     }
     pub fn member_xml(&self) -> String {
         format!("<member>{}</member>", self.fields())
@@ -230,6 +243,8 @@ pub struct InstanceProfile {
     pub path: String,
     pub create_date: String,
     pub role: Option<String>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// AWS returns policy documents URL-encoded in Query responses. Mirror that so SDKs that

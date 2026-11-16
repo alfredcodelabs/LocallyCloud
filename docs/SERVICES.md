@@ -55,6 +55,18 @@ MFA presence is absent for long-term keys and false for verified temporary sessi
 unverified MFA assertions are rejected. Time conditions use the evaluation clock,
 including `aws:CurrentTime` and `aws:EpochTime`, rather than client-provided values.
 
+Native IAM operations authorize the target ARN, including its path. Supported
+conditions use the target's tags, requested tags, policy ARN and permissions
+boundary. Creating tagged users, roles, policies or instance profiles also requires
+the corresponding `Tag*` permission. Adding a role to an instance profile requires
+`iam:PassRole` to EC2. Boundaries supplied when creating users or roles persist and
+limit their permissions. Instance profile tags also persist across restarts.
+IAM tag quota and character validation remain incomplete.
+
+Omitting `UserName` in `GetUser` or access-key operations requires verified,
+long-term IAM user credentials. Supply `UserName` when using an assumed role or
+delegated credentials. Root access-key administration is unsupported.
+
 SSM and Step Functions evaluate supported resource and request tag conditions,
 including `aws:TagKeys`. SSM also supports `ssm:resourceTag`; Step Functions execution
 authorization uses the current state-machine tags. Creating a tagged state machine
@@ -140,6 +152,8 @@ REST HTTP integrations omit the caller's `Authorization` header when it carries 
 SigV4 signature or the REST method uses `AWS_IAM`; other authorization schemes
 remain available to the configured backend. This rule does not change HTTP API
 or Lambda integration headers. REST `AWS_IAM` invocation itself remains unsupported.
+REST API resource policies are stored but are not enforced on invocation. Do not
+use this path to validate access restrictions, even in strict IAM mode.
 
 For REGIONAL REST or HTTP custom domains:
 

@@ -57,6 +57,10 @@ impl QueryRequest {
             .is_some_and(|(key, _)| key.starts_with(prefix))
     }
 
+    pub(crate) fn set_user_name(&mut self, name: String) {
+        self.params.insert("UserName".into(), name);
+    }
+
     /// A required parameter; `ValidationError` when missing or empty.
     pub fn require(&self, key: &str) -> Result<&str, IamStsError> {
         self.get(key).ok_or_else(|| {

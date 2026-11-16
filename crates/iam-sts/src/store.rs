@@ -39,6 +39,11 @@ pub struct IamStore {
     mutation: Mutex<()>,
     persistence: Option<Arc<IamPersistence>>,
 }
+pub(crate) enum TagTarget {
+    User(String),
+    Role(String),
+}
+
 pub enum Created<T> {
     Inserted(T),
     AlreadyExists,
@@ -74,6 +79,76 @@ impl IamStore {
         *self.records.write().unwrap() = after;
         Ok(result)
     }
+    pub(crate) fn transact_tags<T>(
+        &self,
+        account: &str,
+        target: TagTarget,
+        operation: impl FnOnce(&IamStore) -> Result<T, IamStsError>,
+    ) -> Result<T, IamStsError> {
+        let _mutation = self.mutation.lock().unwrap();
+        let name = match &target {
+            TagTarget::User(name) | TagTarget::Role(name) => name,
+        };
+        let target_key = key(account, name);
+        let mut before = IamRecords::default();
+        {
+            let records = self.records.read().unwrap();
+            match &target {
+                TagTarget::User(_) => {
+                    if let Some(user) = records.users.get(&target_key) {
+                        before.users.insert(target_key.clone(), user.clone());
+                    }
+                }
+                TagTarget::Role(_) => {
+                    if let Some(role) = records.roles.get(&target_key) {
+                        before.roles.insert(target_key.clone(), role.clone());
+                    }
+                }
+            }
+        }
+        let staged = Self {
+            records: RwLock::new(before.clone()),
+            ..Self::default()
+        };
+        let result = operation(&staged)?;
+        let root_untouched = staged.root.read().unwrap().is_none();
+        let after = staged.records.into_inner().unwrap();
+        let only_target = match &target {
+            TagTarget::User(_) => {
+                before.users.len() == 1
+                    && after.users.len() == 1
+                    && after.users.contains_key(&target_key)
+                    && after.roles.is_empty()
+            }
+            TagTarget::Role(_) => {
+                before.roles.len() == 1
+                    && after.roles.len() == 1
+                    && after.roles.contains_key(&target_key)
+                    && after.users.is_empty()
+            }
+        };
+        if !only_target
+            || !root_untouched
+            || !after.bootstrap_initialized.is_empty()
+            || !after.groups.is_empty()
+            || !after.policies.is_empty()
+            || !after.instance_profiles.is_empty()
+        {
+            return Err(crate::persistence::state_error(
+                "IAM tag transaction escaped its target",
+            ));
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.commit_resources(&before, &after)?;
+        }
+        let mut records = self.records.write().unwrap();
+        match target {
+            TagTarget::User(_) => records.users.extend(after.users),
+            TagTarget::Role(_) => records.roles.extend(after.roles),
+        }
+        Ok(result)
+    }
+
     pub(crate) fn provision_root(&self, root: AccountRoot) -> Result<(), ()> {
         if self.records.read().unwrap().users.values().any(|user| {
             user.access_keys
@@ -485,5 +560,274 @@ mod tests {
     fn update_missing_returns_false() {
         let store = IamStore::new();
         assert!(!store.update_user("1", "ghost", |_| {}));
+    }
+    fn role(name: &str) -> IamRole {
+        IamRole {
+            role_name: name.into(),
+            role_id: "AROATEST".into(),
+            arn: format!("arn:aws:iam::1:role/{name}"),
+            path: "/".into(),
+            create_date: "now".into(),
+            assume_role_policy_document: "{}".into(),
+            description: None,
+            max_session_duration: 3600,
+            tags: BTreeMap::new(),
+            attached_policies: Vec::new(),
+            inline_policies: BTreeMap::new(),
+            permission_boundary: None,
+        }
+    }
+
+    #[test]
+    fn tag_staging_is_scoped_and_rejects_errors_or_escaping_deltas() {
+        let store = IamStore::new();
+        store.create_user("1", user("target"));
+        store.create_user("2", user("target"));
+        store.create_user("1", user("other"));
+        store.create_role("1", role("worker"));
+        store.mark_bootstrap_initialized("1");
+        store
+            .provision_root(AccountRoot {
+                account: "1".into(),
+                access_key_id: "fixture".into(),
+                secret_access_key: "fictional".into(),
+            })
+            .unwrap();
+        let query = crate::query::QueryRequest::parse(
+            b"UserName=target&Tags.member.1.Key=k&Tags.member.1.Value=v",
+        );
+        let result = store.transact_tags("1", TagTarget::User("target".into()), |staged| {
+            assert_eq!(staged.records.read().unwrap().users.len(), 1);
+            assert!(staged.get_role("1", "worker").is_none());
+            assert!(staged.get_user("2", "target").is_none());
+            assert!(!staged.bootstrap_initialized("1"));
+            crate::iam::tag_user(staged, "1", &query)?;
+            Err::<(), _>(IamStsError::ValidationError("fixture rejection".into()))
+        });
+        assert!(matches!(result, Err(IamStsError::ValidationError(_))));
+        assert!(store.get_user("1", "target").unwrap().tags.is_empty());
+        for escape in 0..5 {
+            let result = store.transact_tags("1", TagTarget::User("target".into()), |staged| {
+                crate::iam::tag_user(staged, "1", &query)?;
+                match escape {
+                    0 => {
+                        staged.create_user("1", user("extra"));
+                    }
+                    1 => staged.mark_bootstrap_initialized("1"),
+                    2 => {
+                        staged.remove_user("1", "target");
+                    }
+                    3 => {
+                        staged
+                            .provision_root(AccountRoot {
+                                account: "1".into(),
+                                access_key_id: "other".into(),
+                                secret_access_key: "fictional".into(),
+                            })
+                            .unwrap();
+                    }
+                    _ => {
+                        staged.create_role("1", role("extra"));
+                    }
+                }
+                Ok(())
+            });
+            assert!(matches!(result, Err(IamStsError::InternalFailure(_))));
+            assert!(store.get_user("1", "target").unwrap().tags.is_empty());
+        }
+        store
+            .transact_tags("1", TagTarget::User("target".into()), |staged| {
+                crate::iam::tag_user(staged, "1", &query)
+            })
+            .unwrap();
+        assert_eq!(store.get_user("1", "target").unwrap().tags["k"], "v");
+        assert!(store.get_user("2", "target").unwrap().tags.is_empty());
+        assert!(store.get_user("1", "other").unwrap().tags.is_empty());
+        assert!(store.get_user("1", "extra").is_none());
+        assert!(store.get_role("1", "extra").is_none());
+        assert!(store.bootstrap_initialized("1"));
+        assert_eq!(
+            store.root_for_account("1").unwrap().access_key_id,
+            "fixture"
+        );
+        let missing = crate::query::QueryRequest::parse(
+            b"UserName=missing&Tags.member.1.Key=k&Tags.member.1.Value=v",
+        );
+        assert!(matches!(
+            store.transact_tags("1", TagTarget::User("missing".into()), |staged| {
+                crate::iam::tag_user(staged, "1", &missing)
+            }),
+            Err(IamStsError::NoSuchEntity(_))
+        ));
+    }
+
+    #[test]
+    fn tag_transactions_and_full_transactions_share_one_mutation_gate() {
+        let store = Arc::new(IamStore::new());
+        store.create_user("1", user("target"));
+        store.create_user("1", user("other"));
+        store.create_role("1", role("worker"));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|threads| {
+            for (kind, field) in [
+                (0, "UserName=target"),
+                (1, "RoleName=worker"),
+                (2, "UserName=other"),
+            ] {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                threads.spawn(move || {
+                    barrier.wait();
+                    for index in 0..25 {
+                        let query = crate::query::QueryRequest::parse(
+                            format!("{field}&Tags.member.1.Key=k{index}&Tags.member.1.Value=v")
+                                .as_bytes(),
+                        );
+                        match kind {
+                            0 => store.transact_tags(
+                                "1",
+                                TagTarget::User("target".into()),
+                                |staged| crate::iam::tag_user(staged, "1", &query),
+                            ),
+                            1 => store.transact_tags(
+                                "1",
+                                TagTarget::Role("worker".into()),
+                                |staged| crate::iam::tag_role(staged, "1", &query),
+                            ),
+                            _ => store.transact(|staged| crate::iam::tag_user(staged, "1", &query)),
+                        }
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(store.get_user("1", "target").unwrap().tags.len(), 25);
+        assert_eq!(store.get_user("1", "other").unwrap().tags.len(), 25);
+        assert_eq!(store.get_role("1", "worker").unwrap().tags.len(), 25);
+    }
+
+    #[test]
+    fn durable_tag_transactions_preserve_unrelated_rows_and_rollback_before_publish() {
+        use locallycloud_state::{StateCipher, StateDb};
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn rows(db: &StateDb) -> BTreeMap<(String, String, String), Vec<u8>> {
+            let connection = db.connection().unwrap();
+            let mut query = connection
+                .prepare("SELECT account,kind,name,payload FROM iam_resources")
+                .unwrap();
+            let rows = query
+                .query_map([], |row| {
+                    Ok(((row.get(0)?, row.get(1)?, row.get(2)?), row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        }
+        let directory = Directory(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../compatibility-tests/.work/iam-vpc-fixes")
+                .join(format!("iam-scoped-tags-{}", uuid::Uuid::new_v4())),
+        );
+        let db = Arc::new(StateDb::open(directory.0.join("state.db")).unwrap());
+        let persistence = Arc::new(
+            IamPersistence::with_cipher(db.clone(), StateCipher::with_key(&[7; 32])).unwrap(),
+        );
+        let store = IamStore::durable(persistence.clone()).unwrap();
+        store
+            .transact(|staged| {
+                staged.create_user("1", user("target"));
+                staged.create_user("2", user("target"));
+                staged.create_role("1", role("worker"));
+                staged.mark_bootstrap_initialized("1");
+                crate::iam::create_group(
+                    staged,
+                    "1",
+                    &crate::query::QueryRequest::parse(b"GroupName=untouched"),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let before = rows(&db);
+        db.connection().unwrap().execute_batch("CREATE TRIGGER reject_tag BEFORE UPDATE ON iam_resources BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;").unwrap();
+        for (kind, name, field) in [
+            ("user", "target", "UserName"),
+            ("role", "worker", "RoleName"),
+        ] {
+            let query = crate::query::QueryRequest::parse(
+                format!("{field}={name}&Tags.member.1.Key=k&Tags.member.1.Value=v").as_bytes(),
+            );
+            let result = match kind {
+                "user" => store.transact_tags("1", TagTarget::User(name.into()), |staged| {
+                    crate::iam::tag_user(staged, "1", &query)
+                }),
+                _ => store.transact_tags("1", TagTarget::Role(name.into()), |staged| {
+                    crate::iam::tag_role(staged, "1", &query)
+                }),
+            };
+            assert!(matches!(result, Err(IamStsError::InternalFailure(_))));
+        }
+        assert_eq!(rows(&db), before);
+        assert!(store.get_user("1", "target").unwrap().tags.is_empty());
+        assert!(store.get_role("1", "worker").unwrap().tags.is_empty());
+        db.connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_tag")
+            .unwrap();
+        for (kind, name, field) in [
+            ("user", "target", "UserName"),
+            ("role", "worker", "RoleName"),
+        ] {
+            let tag = crate::query::QueryRequest::parse(
+                format!("{field}={name}&Tags.member.1.Key=k&Tags.member.1.Value=v").as_bytes(),
+            );
+            match kind {
+                "user" => store.transact_tags("1", TagTarget::User(name.into()), |staged| {
+                    crate::iam::tag_user(staged, "1", &tag)
+                }),
+                _ => store.transact_tags("1", TagTarget::Role(name.into()), |staged| {
+                    crate::iam::tag_role(staged, "1", &tag)
+                }),
+            }
+            .unwrap();
+        }
+        let after = rows(&db);
+        assert_eq!(after.len(), before.len());
+        for (key, payload) in &before {
+            if key.0 != "1" || !matches!(key.1.as_str(), "user" | "role") {
+                assert_eq!(after.get(key), Some(payload));
+            }
+        }
+        let restored = IamStore::durable(persistence.clone()).unwrap();
+        assert_eq!(restored.get_user("1", "target").unwrap().tags["k"], "v");
+        assert_eq!(restored.get_role("1", "worker").unwrap().tags["k"], "v");
+        assert!(restored.bootstrap_initialized("1"));
+        for (kind, name, field) in [
+            ("user", "target", "UserName"),
+            ("role", "worker", "RoleName"),
+        ] {
+            let untag = crate::query::QueryRequest::parse(
+                format!("{field}={name}&TagKeys.member.1=k").as_bytes(),
+            );
+            match kind {
+                "user" => store.transact_tags("1", TagTarget::User(name.into()), |staged| {
+                    crate::iam::untag_user(staged, "1", &untag)
+                }),
+                _ => store.transact_tags("1", TagTarget::Role(name.into()), |staged| {
+                    crate::iam::untag_role(staged, "1", &untag)
+                }),
+            }
+            .unwrap();
+        }
+        let restored = IamStore::durable(persistence).unwrap();
+        assert!(restored.get_user("1", "target").unwrap().tags.is_empty());
+        assert!(restored.get_role("1", "worker").unwrap().tags.is_empty());
+        assert!(restored.get_group("1", "untouched").is_some());
+        assert!(restored.get_user("2", "target").unwrap().tags.is_empty());
     }
 }

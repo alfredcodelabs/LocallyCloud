@@ -1,6 +1,10 @@
 //! IAM and STS service handlers: Query-protocol dispatch, registered `Native` in the Core
 //! registry. Both services share one [`IamStore`] and [`SessionStore`].
 
+mod iam_authorization;
+#[cfg(test)]
+mod iam_authorization_tests;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -21,7 +25,7 @@ use crate::error::IamStsError;
 use crate::iam::{self, Entity, OpResult};
 use crate::policy::service_trust_allows;
 use crate::query::{response_envelope, QueryRequest, IAM_XMLNS, STS_XMLNS};
-use crate::store::{AccountRoot, IamStore};
+use crate::store::{AccountRoot, IamStore, TagTarget};
 use crate::sts::{self, SessionStore};
 use crate::{
     arn::build_iam_arn,
@@ -295,6 +299,23 @@ impl IamStsState {
         action: &str,
         resource: &str,
     ) -> Result<(), IamStsError> {
+        self.enforce_with_context(
+            request,
+            service,
+            action,
+            resource,
+            locallycloud_core::integration::request_context::verified_request_context(request),
+        )
+    }
+
+    fn enforce_with_context(
+        &self,
+        request: &ServiceRequest,
+        service: &str,
+        action: &str,
+        resource: &str,
+        context: BTreeMap<String, Vec<String>>,
+    ) -> Result<(), IamStsError> {
         let access_key_id = request
             .headers
             .get(http::header::AUTHORIZATION)
@@ -334,8 +355,6 @@ impl IamStsState {
                 )),
             };
         }
-        let context =
-            locallycloud_core::integration::request_context::verified_request_context(request);
         let delegated = if self.mode == EnforcementMode::Strict && service == "iam" {
             locallycloud_core::integration::identity::trusted_role(request)
         } else {
@@ -377,47 +396,6 @@ impl IamStsState {
             );
         }
         result
-    }
-
-    fn iam_resource(
-        &self,
-        account: &str,
-        action: &str,
-        query: &QueryRequest,
-    ) -> Result<String, IamStsError> {
-        match action {
-            "CreateRole" => Ok(build_iam_arn(
-                account,
-                "role",
-                query.get("Path").unwrap_or("/"),
-                query.require("RoleName")?,
-            )),
-            "GetRole"
-            | "UpdateRole"
-            | "UpdateAssumeRolePolicy"
-            | "TagRole"
-            | "UntagRole"
-            | "ListRoleTags"
-            | "DeleteRole"
-            | "AttachRolePolicy"
-            | "DetachRolePolicy"
-            | "ListAttachedRolePolicies"
-            | "PutRolePolicy"
-            | "GetRolePolicy"
-            | "ListRolePolicies"
-            | "DeleteRolePolicy"
-            | "PutRolePermissionsBoundary"
-            | "DeleteRolePermissionsBoundary"
-            | "ListInstanceProfilesForRole" => {
-                let name = query.require("RoleName")?;
-                Ok(self
-                    .store
-                    .get_role(account, name)
-                    .map(|role| role.arn)
-                    .unwrap_or_else(|| build_iam_arn(account, "role", "/", name)))
-            }
-            _ => Ok("*".into()),
-        }
     }
 }
 
@@ -918,7 +896,7 @@ impl NativeHandler for IamHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        let q = QueryRequest::parse(&request.body);
+        let mut q = QueryRequest::parse(&request.body);
         let action = match q.action() {
             Some(a) => a.to_string(),
             None => {
@@ -927,12 +905,9 @@ impl NativeHandler for IamHandler {
             }
         };
         tracing::info!(request_id = %request.request_id, service = "iam", %action, "iam request");
-        let resource = match self.state.iam_resource(&request.account_id, &action, &q) {
-            Ok(resource) => resource,
-            Err(error) => return error.into_response(&request.request_id, IAM_XMLNS),
-        };
-        if let Err(e) = self.state.enforce(&request, "iam", &action, &resource) {
-            return e.into_response(&request.request_id, IAM_XMLNS);
+        self.state.default_iam_user(&request, &action, &mut q);
+        if let Err(error) = self.state.authorize_iam(&request, &action, &q) {
+            return error.into_response(&request.request_id, IAM_XMLNS);
         }
         let result = if action.starts_with("Get")
             || action.starts_with("List")
@@ -943,8 +918,23 @@ impl NativeHandler for IamHandler {
             let store = self.state.store.clone();
             let account = request.account_id.clone();
             let operation = action.clone();
+            let state = self.state.clone();
+            let authorization_request = request.clone();
             tokio::task::spawn_blocking(move || {
-                store.transact(|staged| dispatch_iam_store(staged, &account, &operation, &q))
+                let target = match operation.as_str() {
+                    "TagUser" | "UntagUser" => Some(TagTarget::User(q.require("UserName")?.into())),
+                    "TagRole" | "UntagRole" => Some(TagTarget::Role(q.require("RoleName")?.into())),
+                    _ => None,
+                };
+                let apply = |staged: &IamStore| {
+                    // Evaluate the complete committed store while its mutation gate is held.
+                    state.authorize_iam(&authorization_request, &operation, &q)?;
+                    dispatch_iam_store(staged, &account, &operation, &q)
+                };
+                match target {
+                    Some(target) => store.transact_tags(&account, target, apply),
+                    None => store.transact(apply),
+                }
             })
             .await
             .unwrap_or_else(|_| {
@@ -1107,6 +1097,9 @@ fn dispatch_iam_store(store: &IamStore, account: &str, action: &str, q: &QueryRe
         // Instance profiles
         "CreateInstanceProfile" => iam::create_instance_profile(store, account, q),
         "GetInstanceProfile" => iam::get_instance_profile(store, account, q),
+        "TagInstanceProfile" => iam::tag_instance_profile(store, account, q),
+        "UntagInstanceProfile" => iam::untag_instance_profile(store, account, q),
+        "ListInstanceProfileTags" => iam::list_instance_profile_tags(store, account, q),
         "ListInstanceProfiles" => iam::list_instance_profiles(store, account, q),
         "AddRoleToInstanceProfile" => iam::add_role_to_instance_profile(store, account, q),
         "RemoveRoleFromInstanceProfile" => {
@@ -2618,6 +2611,170 @@ mod tests {
         assert_eq!(
             state.authorize_service_role_execution(request),
             Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_tag_mutations_authorize_with_the_complete_store_before_staging() {
+        let account = "000000000000";
+        let key = "AKIA1234567890123456";
+        let store = Arc::new(IamStore::new());
+        seed_bootstrap_user(
+            &store,
+            account,
+            BootstrapCredentials {
+                access_key_id: key.into(),
+                secret_access_key: "a".repeat(40),
+            },
+        );
+        iam::create_user(&store, account, &QueryRequest::parse(b"UserName=target")).unwrap();
+        store.create_role(
+            account,
+            crate::model::IamRole {
+                role_name: "worker".into(),
+                role_id: "AROATARGET".into(),
+                arn: format!("arn:aws:iam::{account}:role/worker"),
+                path: "/".into(),
+                create_date: "now".into(),
+                assume_role_policy_document: "{}".into(),
+                description: None,
+                max_session_duration: 3600,
+                tags: BTreeMap::new(),
+                attached_policies: Vec::new(),
+                inline_policies: BTreeMap::new(),
+                permission_boundary: None,
+            },
+        );
+        let actions = [
+            "iam:TagUser",
+            "iam:UntagUser",
+            "iam:TagRole",
+            "iam:UntagRole",
+        ];
+        store.update_user(account, "locallycloud-bootstrap", |caller| {
+            caller.attached_policies.clear();
+            caller.inline_policies = BTreeMap::from([("tags".into(), serde_json::json!({"Statement":{"Effect":"Allow","Action":actions,"Resource":[format!("arn:aws:iam::{account}:user/target"),format!("arn:aws:iam::{account}:role/worker")]}}).to_string())]);
+        });
+        let handler = IamHandler {
+            state: Arc::new(IamStsState::with_mode(
+                store.clone(),
+                Arc::new(SessionStore::new()),
+                EnforcementMode::Strict,
+            )),
+        };
+        let operations = [
+            "Action=TagUser&UserName=target&Tags.member.1.Key=k&Tags.member.1.Value=v",
+            "Action=TagRole&RoleName=worker&Tags.member.1.Key=k&Tags.member.1.Value=v",
+            "Action=UntagUser&UserName=target&TagKeys.member.1=k",
+            "Action=UntagRole&RoleName=worker&TagKeys.member.1=k",
+        ];
+        let signed = |body: &str| {
+            let mut req = request(body);
+            req.headers.insert(
+                http::header::AUTHORIZATION,
+                format!("AWS4-HMAC-SHA256 Credential={key}/20261116/us-east-1/iam/aws4_request")
+                    .parse()
+                    .unwrap(),
+            );
+            req.headers.insert(
+                "x-locallycloud-verified-external-sigv4",
+                "1".parse().unwrap(),
+            );
+            req
+        };
+        for body in operations {
+            assert_eq!(handler.handle(signed(body)).await.status(), 200);
+        }
+        assert!(store.get_user(account, "target").unwrap().tags.is_empty());
+        assert!(store.get_role(account, "worker").unwrap().tags.is_empty());
+        store.update_user(account, "locallycloud-bootstrap", |caller| {
+            caller.inline_policies.insert(
+                "deny".into(),
+                serde_json::json!({"Statement":{"Effect":"Deny","Action":actions,"Resource":"*"}})
+                    .to_string(),
+            );
+        });
+        for body in operations {
+            assert_eq!(handler.handle(signed(body)).await.status(), 403);
+        }
+        assert!(store.get_user(account, "target").unwrap().tags.is_empty());
+        assert!(store.get_role(account, "worker").unwrap().tags.is_empty());
+        assert_eq!(store.list_users(account).len(), 2);
+        for action in ["TagUser", "UntagUser", "TagRole", "UntagRole"] {
+            assert_eq!(
+                handler
+                    .handle(signed(&format!("Action={action}")))
+                    .await
+                    .status(),
+                400
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_tag_arn_deny_preserves_real_path_and_prevents_both_mutations() {
+        let account = "000000000000";
+        let key = "AKIA1234567890123456";
+        let store = Arc::new(IamStore::new());
+        seed_bootstrap_user(
+            &store,
+            account,
+            BootstrapCredentials {
+                access_key_id: key.into(),
+                secret_access_key: "a".repeat(40),
+            },
+        );
+        iam::create_user(
+            &store,
+            account,
+            &QueryRequest::parse(b"UserName=target&Path=%2Fteam%2F"),
+        )
+        .unwrap();
+        store.update_user(account, "target", |user| {
+            user.tags.insert("guard".into(), "keep".into());
+        });
+        let target_arn = format!("arn:aws:iam::{account}:user/team/target");
+        assert_eq!(store.get_user(account, "target").unwrap().arn, target_arn);
+        store.update_user(account, "locallycloud-bootstrap", |caller| {
+            caller.attached_policies.clear();
+            caller.inline_policies = BTreeMap::from([(
+                "guard".into(),
+                serde_json::json!({"Statement":[
+                    {"Effect":"Allow","Action":["iam:TagUser","iam:UntagUser"],"Resource":"*"},
+                    {"Effect":"Deny","Action":["iam:TagUser","iam:UntagUser"],"Resource":target_arn}
+                ]})
+                .to_string(),
+            )]);
+        });
+        let handler = IamHandler {
+            state: Arc::new(IamStsState::with_mode(
+                store.clone(),
+                Arc::new(SessionStore::new()),
+                EnforcementMode::Strict,
+            )),
+        };
+        let mut statuses = Vec::new();
+        for body in [
+            "Action=TagUser&UserName=target&Tags.member.1.Key=new&Tags.member.1.Value=value",
+            "Action=UntagUser&UserName=target&TagKeys.member.1=guard",
+        ] {
+            let mut req = request(body);
+            req.headers.insert(
+                http::header::AUTHORIZATION,
+                format!("AWS4-HMAC-SHA256 Credential={key}/20261116/us-east-1/iam/aws4_request")
+                    .parse()
+                    .unwrap(),
+            );
+            req.headers.insert(
+                "x-locallycloud-verified-external-sigv4",
+                "1".parse().unwrap(),
+            );
+            statuses.push(handler.handle(req).await.status().as_u16());
+        }
+        assert_eq!(statuses, [403, 403]);
+        assert_eq!(
+            store.get_user(account, "target").unwrap().tags,
+            BTreeMap::from([("guard".into(), "keep".into())])
         );
     }
 

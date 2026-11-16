@@ -43,6 +43,10 @@ fn members(items: impl IntoIterator<Item = String>) -> String {
 // ============================ Users ============================================
 
 pub fn create_user(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
+    let boundary = q
+        .get("PermissionsBoundary")
+        .map(|arn| lookup_policy(store, account, arn).map(|_| arn.to_owned()))
+        .transpose()?;
     let name = q.require("UserName")?;
     let path = normalize_path(q.get("Path").unwrap_or("/"));
     let user = IamUser {
@@ -55,7 +59,7 @@ pub fn create_user(store: &IamStore, account: &str, q: &QueryRequest) -> OpResul
         attached_policies: Vec::new(),
         inline_policies: BTreeMap::new(),
         groups: Vec::new(),
-        permission_boundary: None,
+        permission_boundary: boundary,
         access_keys: Vec::new(),
     };
     match store.create_user(account, user) {
@@ -312,6 +316,10 @@ fn max_session_duration(q: &QueryRequest) -> Result<Option<u32>, IamStsError> {
 }
 
 pub fn create_role(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
+    let boundary = q
+        .get("PermissionsBoundary")
+        .map(|arn| lookup_policy(store, account, arn).map(|_| arn.to_owned()))
+        .transpose()?;
     let name = q.require("RoleName")?;
     let trust = q.require("AssumeRolePolicyDocument")?;
     PolicyDocument::parse_trust(trust)?;
@@ -329,7 +337,7 @@ pub fn create_role(store: &IamStore, account: &str, q: &QueryRequest) -> OpResul
         tags: tags_map(q.tags("Tags.member")),
         attached_policies: Vec::new(),
         inline_policies: BTreeMap::new(),
-        permission_boundary: None,
+        permission_boundary: boundary,
     };
     match store.create_role(account, role) {
         Created::Inserted(r) => Ok(r.xml()),
@@ -1140,8 +1148,9 @@ fn instance_profile_fields(store: &IamStore, account: &str, profile: &InstancePr
 
 fn instance_profile_xml(store: &IamStore, account: &str, profile: &InstanceProfile) -> String {
     format!(
-        "<InstanceProfile>{}</InstanceProfile>",
-        instance_profile_fields(store, account, profile)
+        "<InstanceProfile>{}{}</InstanceProfile>",
+        instance_profile_fields(store, account, profile),
+        tags_xml(&profile.tags)
     )
 }
 
@@ -1162,6 +1171,7 @@ pub fn create_instance_profile(store: &IamStore, account: &str, q: &QueryRequest
         path,
         create_date: now_iso8601(),
         role: None,
+        tags: tags_map(q.tags("Tags.member")),
     };
     match store.create_instance_profile(account, profile.clone()) {
         Created::Inserted(_) => Ok(instance_profile_xml(store, account, &profile)),
@@ -1197,6 +1207,36 @@ pub fn list_instance_profiles(store: &IamStore, account: &str, q: &QueryRequest)
     ))
 }
 
+pub fn tag_instance_profile(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
+    let name = q.require("InstanceProfileName")?;
+    let tags = tags_map(q.tags("Tags.member"));
+    if !store.update_instance_profile(account, name, |profile| profile.tags.extend(tags)) {
+        return Err(no_such_entity("instance profile"));
+    }
+    Ok(String::new())
+}
+
+pub fn untag_instance_profile(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
+    let name = q.require("InstanceProfileName")?;
+    let keys = q.list("TagKeys.member");
+    if !store.update_instance_profile(account, name, |profile| {
+        profile.tags.retain(|key, _| !keys.contains(key))
+    }) {
+        return Err(no_such_entity("instance profile"));
+    }
+    Ok(String::new())
+}
+
+pub fn list_instance_profile_tags(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
+    let profile = store
+        .get_instance_profile(account, q.require("InstanceProfileName")?)
+        .ok_or_else(|| no_such_entity("instance profile"))?;
+    Ok(format!(
+        "{}<IsTruncated>false</IsTruncated>",
+        tags_xml(&profile.tags)
+    ))
+}
+
 pub fn add_role_to_instance_profile(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
     let name = q.require("InstanceProfileName")?;
     let role_name = q.require("RoleName")?;
@@ -1221,9 +1261,12 @@ pub fn remove_role_from_instance_profile(
     q: &QueryRequest,
 ) -> OpResult {
     let name = q.require("InstanceProfileName")?;
-    let _role_name = q.require("RoleName")?;
-    if store.get_instance_profile(account, name).is_none() {
-        return Err(no_such_entity("instance profile"));
+    let role_name = q.require("RoleName")?;
+    let profile = store
+        .get_instance_profile(account, name)
+        .ok_or_else(|| no_such_entity("instance profile"))?;
+    if profile.role.as_deref() != Some(role_name) {
+        return Err(no_such_entity("role in instance profile"));
     }
     store.update_instance_profile(account, name, |p| p.role = None);
     Ok(String::new())
@@ -1350,25 +1393,47 @@ pub fn simulate_principal_policy(store: &IamStore, account: &str, q: &QueryReque
     simulate(&documents, q)
 }
 
-/// Gather the inline + attached managed policy documents for a user or role principal.
+/// Gather the inline and attached policy documents for the exact IAM source ARN.
 fn principal_policy_documents(
     store: &IamStore,
     account: &str,
     source_arn: &str,
     name: &str,
 ) -> Result<Vec<PolicyDocument>, IamStsError> {
-    let (inline, attached): (BTreeMap<String, String>, Vec<String>) =
-        if source_arn.contains(":role/") {
+    let prefix = format!("arn:aws:iam::{account}:");
+    let resource = source_arn.strip_prefix(&prefix).ok_or_else(|| {
+        IamStsError::ValidationError(
+            "PolicySourceArn must identify an IAM principal in this account".into(),
+        )
+    })?;
+    let (arn, inline, attached) = match resource.split_once('/') {
+        Some(("role", _)) => {
             let role = store
                 .get_role(account, name)
                 .ok_or_else(|| no_such_entity("role"))?;
-            (role.inline_policies, role.attached_policies)
-        } else {
+            (role.arn, role.inline_policies, role.attached_policies)
+        }
+        Some(("user", _)) => {
             let user = store
                 .get_user(account, name)
                 .ok_or_else(|| no_such_entity("user"))?;
-            (user.inline_policies, user.attached_policies)
-        };
+            (user.arn, user.inline_policies, user.attached_policies)
+        }
+        Some(("group", _)) => {
+            let group = store
+                .get_group(account, name)
+                .ok_or_else(|| no_such_entity("group"))?;
+            (group.arn, group.inline_policies, group.attached_policies)
+        }
+        _ => {
+            return Err(IamStsError::ValidationError(
+                "invalid PolicySourceArn resource type".into(),
+            ))
+        }
+    };
+    if arn != source_arn {
+        return Err(no_such_entity("policy source"));
+    }
     let mut documents = Vec::new();
     for doc in inline.values() {
         documents.push(PolicyDocument::parse(doc)?);
