@@ -10,7 +10,13 @@ async fn iam_method_outbound_rule_drops_authorization_without_mutating_caller_he
         axum::serve(
             listener,
             Router::new().fallback(get(|request: Request| async move {
-                if request.headers().contains_key(http::header::AUTHORIZATION) {
+                if request
+                    .headers()
+                    .keys()
+                    .any(|name| name.as_str().starts_with("x-locallycloud-"))
+                {
+                    "reserved"
+                } else if request.headers().contains_key(http::header::AUTHORIZATION) {
                     "present"
                 } else {
                     "absent"
@@ -24,7 +30,9 @@ async fn iam_method_outbound_rule_drops_authorization_without_mutating_caller_he
     let weak = Arc::downgrade(&registry);
     let store = ApiGwStore::new();
     let validator = JwtValidator::new();
-    let http = reqwest::Client::new();
+    let http =
+        crate::http_integration::HttpIntegrationClient::new(std::slice::from_ref(&backend), &[])
+            .unwrap();
     let sampler = Sampler::default();
     let ctx = ExecuteCtx {
         original_request: None,
@@ -49,9 +57,9 @@ async fn iam_method_outbound_rule_drops_authorization_without_mutating_caller_he
         http::header::AUTHORIZATION,
         "Bearer fictional-token".parse().unwrap(),
     );
+    headers.insert("x-locallycloud-fixture", "private".parse().unwrap());
     let params = BTreeMap::new();
-    // AWS_IAM REST invocation remains unsupported. Exercise only the private
-    // outbound rule with metadata that a future verified IAM method would supply.
+    // Exercise the outbound rule independently of invocation authentication.
     let request = IntegrationRequest {
         method: &method,
         host: "api.example",

@@ -1,6 +1,6 @@
 //! Real HTTP front door and IAM evaluator: no forged Core attestation in invocation fixtures.
 #![cfg(feature = "services")]
-use axum::{routing::any, Router};
+use axum::{response::IntoResponse, routing::any, Router};
 use hmac::{Hmac, Mac};
 use http::Method;
 use locallycloud::server::LocallyCloudServer;
@@ -112,6 +112,7 @@ struct Fixture {
     client: reqwest::Client,
     iam: Arc<IamStore>,
     hits: Arc<AtomicUsize>,
+    redirect_hits: Arc<AtomicUsize>,
     workers: Vec<JoinHandle<()>>,
 }
 impl Drop for Fixture {
@@ -123,6 +124,9 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new(mode: EnforcementMode) -> Self {
+        Self::new_with_origins(mode, true).await
+    }
+    async fn new_with_origins(mode: EnforcementMode, allow_backend: bool) -> Self {
         let registry = ServiceRegistry::with_known_services();
         let iam = Arc::new(IamStore::new());
         iam.create_user(
@@ -140,19 +144,46 @@ impl Fixture {
             Arc::new(SessionStore::new()),
             mode,
         );
-        locallycloud_apigateway::register(&registry);
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend_url = format!("http://{}/owned", backend.local_addr().unwrap());
+        let backend_origin = format!("http://{}", backend.local_addr().unwrap());
+        let backend_url = format!("{backend_origin}/owned");
+        locallycloud_apigateway::register_with_config(
+            &registry,
+            locallycloud_apigateway::ApiGatewayConfig {
+                http_local_origins: if allow_backend {
+                    vec![backend_origin]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let redirect_hits = Arc::new(AtomicUsize::new(0));
+        let redirects = redirect_hits.clone();
         let hits = Arc::new(AtomicUsize::new(0));
         let count = hits.clone();
         let backend_task = tokio::spawn(async move {
             axum::serve(
                 backend,
-                Router::new().fallback(any(move || {
+                Router::new().fallback(any(move |uri: http::Uri| {
                     let count = count.clone();
+                    let redirects = redirects.clone();
                     async move {
                         count.fetch_add(1, Ordering::SeqCst);
-                        "owned"
+                        match uri.path() {
+                            "/redirect" => (
+                                http::StatusCode::FOUND,
+                                [(http::header::LOCATION, "/redirect-target")],
+                                "owned redirect",
+                            )
+                                .into_response(),
+                            "/redirect-target" => {
+                                redirects.fetch_add(1, Ordering::SeqCst);
+                                "owned target".into_response()
+                            }
+                            _ => "owned".into_response(),
+                        }
                     }
                 })),
             )
@@ -198,12 +229,14 @@ impl Fixture {
             host: address.to_string(),
             backend: backend_url,
             client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
             iam,
             hits,
+            redirect_hits,
             workers: vec![backend_task, task],
         }
     }
@@ -272,6 +305,9 @@ impl Fixture {
         serde_json::from_str(&body).unwrap()
     }
     async fn rest(&self, authorization: &str, policy: Option<Value>) -> String {
+        self.rest_to(authorization, policy, &self.backend).await
+    }
+    async fn rest_to(&self, authorization: &str, policy: Option<Value>, backend: &str) -> String {
         let mut body = json!({"name":"owned"});
         if let Some(policy) = policy {
             body["policy"] = json!(policy.to_string());
@@ -299,7 +335,7 @@ impl Fixture {
         self.manage(
             Method::PUT,
             &format!("/restapis/{api}/resources/{root}/methods/ANY/integration"),
-            json!({"type":"HTTP_PROXY","httpMethod":"POST","uri":self.backend}),
+            json!({"type":"HTTP_PROXY","httpMethod":"POST","uri":backend}),
         )
         .await;
         self.manage(
@@ -630,4 +666,70 @@ async fn sts_session_policy_cannot_expand_role_invoke_permission() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn http_integration_egress_checks_origins_after_valid_iam_in_both_modes() {
+    for mode in [EnforcementMode::Strict, EnforcementMode::Permissive] {
+        let denied = Fixture::new_with_origins(mode, false).await;
+        let api = denied.rest("AWS_IAM", None).await;
+        // The same valid identity has invoke permission; the outbound origin gate denies it.
+        denied.invoke(Method::GET, &api, Some(SECRET), 500).await;
+
+        let mut allowed = Fixture::new_with_origins(mode, true).await;
+        let api = allowed.rest("AWS_IAM", None).await;
+        allowed.invoke(Method::GET, &api, Some(SECRET), 200).await;
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/owned", second.local_addr().unwrap());
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let counter = second_hits.clone();
+        allowed.workers.push(tokio::spawn(async move {
+            axum::serve(
+                second,
+                Router::new().fallback(any(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        "wrong port"
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        }));
+        let wrong_port = allowed.rest_to("AWS_IAM", None, &target).await;
+        allowed
+            .invoke(Method::GET, &wrong_port, Some(SECRET), 500)
+            .await;
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn allowed_http_integration_returns_redirect_without_following_it() {
+    let fixture = Fixture::new(EnforcementMode::Strict).await;
+    let target = fixture.backend.replace("/owned", "/redirect");
+    let api = fixture.rest_to("AWS_IAM", None, &target).await;
+    let path = format!("/restapis/{api}/dev/_user_request_/");
+    let mut request = fixture.client.get(format!("{}{path}", fixture.base));
+    for (name, value) in signature(
+        "GET",
+        &path,
+        "",
+        &fixture.host,
+        b"",
+        (ACTOR, SECRET),
+        "execute-api",
+    ) {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::FOUND);
+    assert_eq!(
+        response.headers()[http::header::LOCATION],
+        "/redirect-target"
+    );
+    assert_eq!(response.text().await.unwrap(), "owned redirect");
+    assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.redirect_hits.load(Ordering::SeqCst), 0);
 }

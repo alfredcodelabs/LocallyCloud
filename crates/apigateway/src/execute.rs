@@ -40,7 +40,7 @@ pub struct ExecuteCtx<'a> {
     pub store: &'a ApiGwStore,
     pub original_request: Option<&'a locallycloud_core::handler::ServiceRequest>,
     pub validator: &'a JwtValidator,
-    pub http: &'a reqwest::Client,
+    pub(crate) http: &'a crate::http_integration::HttpIntegrationClient,
     pub registry: &'a Weak<ServiceRegistry>,
     pub account: &'a str,
     pub region: &'a str,
@@ -2382,7 +2382,8 @@ async fn forward_http_raw(
         .unwrap_or_else(|| request.method.clone());
     let mut builder = ctx
         .http
-        .request(method, uri)
+        .request(method, &uri)
+        .map_err(|_| InvokeFailure::Configuration)?
         .timeout(Duration::from_millis(timeout_ms(integration)));
     let drop_authorization = match request.rest_authorization_type {
         Some("AWS_IAM") => true,
@@ -2396,6 +2397,7 @@ async fn forward_http_raw(
     };
     for (name, value) in request.headers.iter() {
         if name == http::header::HOST
+            || name.as_str().starts_with("x-locallycloud-")
             || name == http::header::CONTENT_LENGTH
             || (drop_authorization && name == http::header::AUTHORIZATION)
         {
@@ -2413,10 +2415,13 @@ async fn forward_http_raw(
     })?;
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    let body = response
-        .bytes()
+    let body = crate::http_integration::read_response(response)
         .await
-        .map_err(|_| InvokeFailure::Dispatch)?;
+        .map_err(|error| match error {
+            crate::http_integration::BodyError::Timeout => InvokeFailure::Timeout,
+            crate::http_integration::BodyError::TooLarge
+            | crate::http_integration::BodyError::Read => InvokeFailure::Dispatch,
+        })?;
     Ok(RawIntegrationResponse {
         status,
         headers,
@@ -3056,7 +3061,7 @@ mod tests {
         let weak = Arc::downgrade(&registry);
         let store = ApiGwStore::new();
         let validator = JwtValidator::new();
-        let http = reqwest::Client::new();
+        let http = crate::http_integration::HttpIntegrationClient::new(&[], &[]).unwrap();
         let ctx = ExecuteCtx {
             original_request: None,
             store: &store,
@@ -3188,7 +3193,7 @@ mod tests {
         let registry = Arc::new(ServiceRegistry::new());
         let weak = Arc::downgrade(&registry);
         let validator = JwtValidator::new();
-        let http = reqwest::Client::new();
+        let http = crate::http_integration::HttpIntegrationClient::new(&[], &[]).unwrap();
         let ctx = ExecuteCtx {
             original_request: None,
             store: &store,

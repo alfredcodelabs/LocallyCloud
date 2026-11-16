@@ -30,7 +30,7 @@ use crate::{v1, v2, websocket};
 pub(crate) struct ApiGwHandler {
     store: Arc<ApiGwStore>,
     validator: JwtValidator,
-    http: reqwest::Client,
+    http: crate::http_integration::HttpIntegrationClient,
     registry: Weak<ServiceRegistry>,
     waf: RwLock<Option<Weak<dyn WafEvaluator>>>,
     domains: DomainBindings,
@@ -221,10 +221,8 @@ caller_context: locallycloud_core::integration::request_context::verified_reques
     }
 
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> Self {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("HTTP integration client initialization failed");
+        let http = crate::http_integration::HttpIntegrationClient::new(&[], &[])
+            .expect("default HTTP integration policy is valid");
         ApiGwHandler {
             store: Arc::new(ApiGwStore::new()),
             validator: JwtValidator::new(),
@@ -1227,6 +1225,20 @@ pub fn register(registry: &Arc<ServiceRegistry>) -> ApiGatewayWafBinding {
     register_handler(registry, ApiGwHandler::new(Arc::downgrade(registry)))
 }
 
+/// Register in-process services with explicit operational settings.
+pub fn register_with_config(
+    registry: &Arc<ServiceRegistry>,
+    config: crate::ApiGatewayConfig,
+) -> Result<ApiGatewayWafBinding, String> {
+    config.validate()?;
+    let http =
+        crate::http_integration::HttpIntegrationClient::new(&config.http_local_origins, &[])?;
+    let mut handler = ApiGwHandler::new(Arc::downgrade(registry));
+    handler.store = Arc::new(ApiGwStore::with_config(config)?);
+    handler.http = http;
+    Ok(register_handler(registry, handler))
+}
+
 pub fn register_with_acm(
     registry: &Arc<ServiceRegistry>,
     acm: Arc<dyn locallycloud_acm::AcmAssociationApi>,
@@ -1252,9 +1264,23 @@ pub async fn register_with_state_and_config(
     acm: Arc<dyn locallycloud_acm::AcmAssociationApi>,
     config: crate::ApiGatewayConfig,
 ) -> Result<ApiGatewayWafBinding, String> {
+    register_with_state_and_network(registry, state, acm, config, &[]).await
+}
+
+/// The composition root supplies real listener addresses, including wildcard bindings.
+pub async fn register_with_state_and_network(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    acm: Arc<dyn locallycloud_acm::AcmAssociationApi>,
+    config: crate::ApiGatewayConfig,
+    listeners: &[std::net::SocketAddr],
+) -> Result<ApiGatewayWafBinding, String> {
     config.validate()?;
+    let http =
+        crate::http_integration::HttpIntegrationClient::new(&config.http_local_origins, listeners)?;
     let mut handler = ApiGwHandler::new(Arc::downgrade(registry));
     handler.store = Arc::new(ApiGwStore::with_config(config)?);
+    handler.http = http;
     handler.domains = DomainBindings::with_acm(acm);
     let persistence = crate::store::Persistence::new(
         state,
@@ -3399,7 +3425,12 @@ mod jwt_authorizer_e2e {
     async fn valid_token_reaches_integration() {
         let issuer = spawn_issuer().await;
         let backend = spawn_backend().await;
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let mut h = ApiGwHandler::new(std::sync::Weak::new());
+        h.http = crate::http_integration::HttpIntegrationClient::new(
+            std::slice::from_ref(&backend),
+            &[],
+        )
+        .unwrap();
         let api_id = wire_api(&h, &issuer, &backend).await;
 
         let token = sign(
@@ -3424,7 +3455,12 @@ mod jwt_authorizer_e2e {
     async fn missing_token_is_401() {
         let issuer = spawn_issuer().await;
         let backend = spawn_backend().await;
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let mut h = ApiGwHandler::new(std::sync::Weak::new());
+        h.http = crate::http_integration::HttpIntegrationClient::new(
+            std::slice::from_ref(&backend),
+            &[],
+        )
+        .unwrap();
         let api_id = wire_api(&h, &issuer, &backend).await;
         let resp = h.handle(invoke_req(&api_id, "/prod/anything", None)).await;
         assert_eq!(resp.status(), 401);
@@ -3434,7 +3470,12 @@ mod jwt_authorizer_e2e {
     async fn expired_token_is_401() {
         let issuer = spawn_issuer().await;
         let backend = spawn_backend().await;
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let mut h = ApiGwHandler::new(std::sync::Weak::new());
+        h.http = crate::http_integration::HttpIntegrationClient::new(
+            std::slice::from_ref(&backend),
+            &[],
+        )
+        .unwrap();
         let api_id = wire_api(&h, &issuer, &backend).await;
         let token = sign(
             &issuer,
@@ -3454,7 +3495,12 @@ mod jwt_authorizer_e2e {
     async fn malformed_nbf_is_401() {
         let issuer = spawn_issuer().await;
         let backend = spawn_backend().await;
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let mut h = ApiGwHandler::new(std::sync::Weak::new());
+        h.http = crate::http_integration::HttpIntegrationClient::new(
+            std::slice::from_ref(&backend),
+            &[],
+        )
+        .unwrap();
         let api_id = wire_api(&h, &issuer, &backend).await;
         let token = sign(
             &issuer,
@@ -3474,7 +3520,12 @@ mod jwt_authorizer_e2e {
     async fn wrong_audience_is_401() {
         let issuer = spawn_issuer().await;
         let backend = spawn_backend().await;
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let mut h = ApiGwHandler::new(std::sync::Weak::new());
+        h.http = crate::http_integration::HttpIntegrationClient::new(
+            std::slice::from_ref(&backend),
+            &[],
+        )
+        .unwrap();
         let api_id = wire_api(&h, &issuer, &backend).await;
         let token = sign(
             &issuer,
@@ -3494,7 +3545,12 @@ mod jwt_authorizer_e2e {
     async fn wrong_issuer_is_401() {
         let issuer = spawn_issuer().await;
         let backend = spawn_backend().await;
-        let h = ApiGwHandler::new(std::sync::Weak::new());
+        let mut h = ApiGwHandler::new(std::sync::Weak::new());
+        h.http = crate::http_integration::HttpIntegrationClient::new(
+            std::slice::from_ref(&backend),
+            &[],
+        )
+        .unwrap();
         let api_id = wire_api(&h, &issuer, &backend).await;
         // Sign with a different iss than the authorizer's configured issuer.
         let token = sign(

@@ -174,6 +174,14 @@ impl StartupConfig {
                     .ok_or_else(|| invalid(name))?;
             }
         }
+        if let Some(value) = get("LOCALLYCLOUD_HTTP_INTEGRATION_LOCAL_ORIGINS") {
+            apigateway.http_local_origins = serde_json::from_str(
+                value
+                    .to_str()
+                    .ok_or_else(|| invalid("LOCALLYCLOUD_HTTP_INTEGRATION_LOCAL_ORIGINS"))?,
+            )
+            .map_err(|_| invalid("LOCALLYCLOUD_HTTP_INTEGRATION_LOCAL_ORIGINS"))?;
+        }
         apigateway.validate().map_err(StartupError::Invalid)?;
         let path = match get("LOCALLYCLOUD_STATE_DB") {
             Some(path) => absolute(path.into(), "LOCALLYCLOUD_STATE_DB")?,

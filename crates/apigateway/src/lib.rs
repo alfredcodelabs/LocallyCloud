@@ -10,6 +10,7 @@ mod domains;
 mod endpoint;
 pub mod error;
 pub mod execute;
+mod http_integration;
 pub mod logging;
 pub mod proxy_event;
 mod resource_policy;
@@ -28,5 +29,6 @@ mod property_tests;
 
 pub use config::ApiGatewayConfig;
 pub use service::{
-    register, register_with_acm, register_with_state, register_with_state_and_config,
+    register, register_with_acm, register_with_config, register_with_state,
+    register_with_state_and_config, register_with_state_and_network,
 };

@@ -175,7 +175,12 @@ async fn http_api(handler: &ApiGwHandler, backend: &str) -> String {
 async fn http_integrations_generate_content_length_from_the_final_body() {
     let mut backend = backend().await;
     let registry = ServiceRegistry::with_known_services();
-    let handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    let mut handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    handler.http = crate::http_integration::HttpIntegrationClient::new(
+        std::slice::from_ref(&backend.url),
+        &[],
+    )
+    .unwrap();
     let cases = [
         ("HTTP", None, "{}", "{}"),
         ("HTTP", Some("mapped-long-body"), "{}", "mapped-long-body"),

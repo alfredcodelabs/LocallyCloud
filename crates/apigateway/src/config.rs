@@ -5,6 +5,7 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiGatewayConfig {
+    pub http_local_origins: Vec<String>,
     pub websocket_outbound_channel_capacity: usize,
     pub websocket_outbound_history_capacity: usize,
     pub authorizer_cache_capacity: usize,
@@ -13,6 +14,7 @@ pub struct ApiGatewayConfig {
 impl Default for ApiGatewayConfig {
     fn default() -> Self {
         Self {
+            http_local_origins: Vec::new(),
             websocket_outbound_channel_capacity: 32,
             websocket_outbound_history_capacity: 64,
             authorizer_cache_capacity: 1024,
@@ -22,6 +24,7 @@ impl Default for ApiGatewayConfig {
 
 impl ApiGatewayConfig {
     pub fn validate(&self) -> Result<(), String> {
+        crate::http_integration::validate_local_origins(&self.http_local_origins)?;
         for (name, value, maximum) in [
             (
                 "websocket_outbound_channel_capacity",

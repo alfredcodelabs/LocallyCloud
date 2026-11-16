@@ -578,11 +578,12 @@ async fn main() {
             std::process::exit(4);
         }
     };
-    let gateway_waf = match locallycloud_apigateway::register_with_state_and_config(
+    let gateway_waf = match locallycloud_apigateway::register_with_state_and_network(
         &registry,
         state.clone(),
         acm.clone(),
         startup.apigateway,
+        &[config.listen_addr],
     )
     .await
     {

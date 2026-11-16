@@ -195,7 +195,12 @@ async fn http_and_rest_proxy_preserve_redirects_without_contacting_the_target() 
     .await;
     let registry = ServiceRegistry::with_known_services();
     // No IAM or external AWS provider is installed in this owned integration fixture.
-    let handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    let mut handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    handler.http = crate::http_integration::HttpIntegrationClient::new(
+        std::slice::from_ref(&backend.url),
+        &[],
+    )
+    .unwrap();
     for protocol in ["HTTP", "REST"] {
         for status in [200, 302, 307] {
             let path = wire_api(&handler, protocol, &format!("{}/{status}", backend.url)).await;
@@ -239,7 +244,12 @@ async fn rest_http_omits_sigv4_authorization_without_changing_other_schemes_or_v
     })))
     .await;
     let registry = ServiceRegistry::with_known_services();
-    let handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    let mut handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    handler.http = crate::http_integration::HttpIntegrationClient::new(
+        std::slice::from_ref(&backend.url),
+        &[],
+    )
+    .unwrap();
     for protocol in ["REST", "REST_HTTP", "HTTP"] {
         let path = wire_api(&handler, protocol, &backend.url).await;
         for authorization in [

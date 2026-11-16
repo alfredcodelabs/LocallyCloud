@@ -191,3 +191,38 @@ fn retired_settings_remain_ignored_without_masking_invalid_active_settings() {
         .ignored_settings
         .contains(&"LOCALLYCLOUD_RUNTIME"));
 }
+
+#[test]
+fn http_origin_environment_override_can_clear_file_entries_and_rejects_invalid_values() {
+    let json = r#"{"apigateway":{"http_local_origins":["http://127.0.0.1:8080"]}}"#;
+    assert_eq!(
+        resolve(json, &[])
+            .unwrap()
+            .apigateway
+            .http_local_origins
+            .len(),
+        1
+    );
+    assert!(resolve(
+        json,
+        &[("LOCALLYCLOUD_HTTP_INTEGRATION_LOCAL_ORIGINS", "[]")]
+    )
+    .unwrap()
+    .apigateway
+    .http_local_origins
+    .is_empty());
+    for value in [
+        "",
+        "null",
+        "localhost",
+        "[1]",
+        "[\"http://127.0.0.1:8080/path\"]",
+        "[\"http://169.254.169.254\"]",
+    ] {
+        assert!(resolve(
+            json,
+            &[("LOCALLYCLOUD_HTTP_INTEGRATION_LOCAL_ORIGINS", value)]
+        )
+        .is_err());
+    }
+}

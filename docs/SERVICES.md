@@ -153,6 +153,13 @@ metadata is not a local connection address.
 HTTP proxy integrations preserve the backend's status, headers and body, including
 redirect responses; API Gateway does not fetch the redirect target. HTTP integrations
 generate `Content-Length` from the final outbound body, including mapped REST payloads.
+API Gateway HTTP/HTTP_PROXY integrations apply the destination policy described in
+[Setup](SETUP.md#configuration), in both IAM modes. Buffered HTTP integration responses
+are limited to 10 MiB, including responses without Content-Length. Oversized or
+unreadable responses currently use the generic integration failure (500); the exact
+AWS status for an oversized backend response remains unverified. Body-read timeouts
+return 504. Response streaming is not implemented.
+
 REST HTTP integrations omit the caller's `Authorization` header when it carries a
 SigV4 signature or the REST method uses `AWS_IAM`; other authorization schemes
 remain available to the configured backend. This rule does not change HTTP API

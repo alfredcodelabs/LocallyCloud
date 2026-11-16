@@ -235,7 +235,27 @@ continue to use the environment variables below.
 | `common` | `host`, `port`, `region`, `account_id`, `allow_http`, `ui_enabled`, `upstream_timeout_secs`, `max_request_body_bytes` |
 | `iam` | `enforcement`: `strict` or `permissive`; an invalid environment value is also an error |
 | `apigateway` | `authorizer_cache_capacity` (default 1024, range 1–65536), `websocket_outbound_channel_capacity` (32, range 1–256), `websocket_outbound_history_capacity` (64, range 1–1024) |
+| `apigateway` | `http_local_origins`: exact HTTP(S) origins allowed to reach host/private backends; default `[]` |
 | `state` | `path`: absolute SQLite path, shared by the server and offline S3/DynamoDB migrations |
+
+HTTP integrations can reach public destinations. Host addresses, loopback, private
+networks and shared address space require an exact origin in `http_local_origins`,
+for example `["http://127.0.0.1:8080", "https://api.internal:8443"]`. Origins include
+scheme, hostname and effective port; paths, credentials, fragments, queries and
+wildcards are not accepted. DNS aliases require their own entry. Metadata and
+credential endpoints, link-local and non-destination ranges, known IPv6 transition
+mechanisms and LocallyCloud's own listener remain blocked even with an allowlist entry.
+
+The connector checks the addresses returned by DNS for each new connection; mixed
+allowed/forbidden answers fail closed. It preserves Host/SNI and certificate checks,
+ignores environment proxies, and returns redirects without following them. Internal
+`x-locallycloud-*` headers are removed before forwarding. Configuration is resolved
+at startup and requires a restart to change.
+
+Host-address checks follow current kernel address ownership, including interfaces
+added after startup. Unusual host networking such as nonlocal bind can conservatively
+reject a destination. This is an application-level destination policy, not a network
+sandbox for custom NAT64 prefixes, NAT reflection or routing rules.
 
 API Gateway capacities bound local buffers and caches; they do not change AWS wire
 limits. They allocate entries on demand. The SQLite engine, encryption, locking and
@@ -252,6 +272,7 @@ transaction durability remain in the shared state layer.
 | `LOCALLYCLOUD_STATE_DB` | SQLite state file | `~/.local/share/locallycloud/state.sqlite3`, or under `XDG_DATA_HOME` when set |
 | `LOCALLYCLOUD_KMS_MASTER_KEY` | Base64-encoded 32-byte master key | Required; no default |
 | `LOCALLYCLOUD_IAM_ENFORCEMENT` | IAM mode; `strict` evaluates policies | Permissive |
+| `LOCALLYCLOUD_HTTP_INTEGRATION_LOCAL_ORIGINS` | JSON array overriding `apigateway.http_local_origins`, including `[]` to clear the file value | `[]` |
 | `LOCALLYCLOUD_APIGATEWAY_AUTHORIZER_CACHE_CAPACITY` | Maximum authorizer cache entries per account/region; 1–65536 | `1024` |
 | `LOCALLYCLOUD_APIGATEWAY_WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY` | Per-connection outbound channel capacity; 1–256 | `32` |
 | `LOCALLYCLOUD_APIGATEWAY_WEBSOCKET_OUTBOUND_HISTORY_CAPACITY` | Retained outbound messages per connection; 1–1024 | `64` |
