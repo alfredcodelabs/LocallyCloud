@@ -465,6 +465,8 @@ impl CfnHandler {
                     ));
                     if self.store.put(&account, &region, stack).is_err() {
                         tracing::error!(
+                            service = "cloudformation",
+                            cause_code = "background_failure_persistence_failed",
                             "failed to persist CloudFormation background operation failure"
                         );
                     }
@@ -2524,6 +2526,13 @@ impl NativeHandler for CfnHandler {
                 )
                 .is_ok();
             if !allowed || !list_allowed {
+                locallycloud_core::observability::log_service_error(
+                    "cloudformation",
+                    None,
+                    &request.request_id,
+                    "AccessDenied",
+                    403,
+                );
                 return locallycloud_core::error_mapping::AwsError::new(
                     "AccessDenied",
                     "Not authorized to perform this CloudFormation operation",
@@ -2603,7 +2612,22 @@ pub fn register_with_state_and_endpoint(
     state: Arc<locallycloud_state::StateDb>,
     response_endpoint: &str,
 ) -> Result<(), String> {
-    let store = CfnStore::with_state(&state).map_err(|_| {
+    register_with_state_and_endpoint_config(
+        registry,
+        state,
+        response_endpoint,
+        crate::CloudFormationConfig::default(),
+    )
+}
+
+pub fn register_with_state_and_endpoint_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    response_endpoint: &str,
+    config: crate::CloudFormationConfig,
+) -> Result<(), String> {
+    config.validate()?;
+    let store = CfnStore::with_state_and_config(&state, config).map_err(|_| {
         "CloudFormation state could not be loaded; check the state database and master key"
             .to_owned()
     })?;

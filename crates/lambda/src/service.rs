@@ -1104,8 +1104,12 @@ impl LambdaHandler {
                 region,
             ) {
                 Ok(source) => Arc::new(source),
-                Err(error) => {
-                    tracing::warn!(%error,"could not start event source mapping");
+                Err(_) => {
+                    tracing::warn!(
+                        service = "lambda",
+                        cause_code = "event_source_mapping_start_failed",
+                        "could not start event source mapping"
+                    );
                     return;
                 }
             },
@@ -1118,8 +1122,12 @@ impl LambdaHandler {
                 region,
             ) {
                 Ok(source) => Arc::new(source),
-                Err(error) => {
-                    tracing::warn!(%error, "could not start event source mapping");
+                Err(_) => {
+                    tracing::warn!(
+                        service = "lambda",
+                        cause_code = "event_source_mapping_start_failed",
+                        "could not start event source mapping"
+                    );
                     return;
                 }
             },
@@ -1132,8 +1140,12 @@ impl LambdaHandler {
                 region,
             ) {
                 Ok(source) => Arc::new(source),
-                Err(error) => {
-                    tracing::warn!(%error, "could not start event source mapping");
+                Err(_) => {
+                    tracing::warn!(
+                        service = "lambda",
+                        cause_code = "event_source_mapping_start_failed",
+                        "could not start event source mapping"
+                    );
                     return;
                 }
             },
@@ -1227,13 +1239,9 @@ impl LambdaHandler {
                             .await
                         {
                             Ok(output) => output,
-                            Err(error) => {
-                                tracing::warn!(error_kind = ?error, "Event source mapping Lambda invocation rejected");
-                                return Err(crate::esm::PollError::Invocation(error));
-                            }
+                            Err(error) => return Err(crate::esm::PollError::Invocation(error)),
                         };
-                        if let Some(error) = output.function_error {
-                            tracing::warn!(error_kind = ?error, "Event source mapping Lambda function failed");
+                        if output.function_error.is_some() {
                             return Err(crate::esm::PollError::FunctionFailed);
                         }
                         Ok(output.payload.into_vec())
@@ -1249,7 +1257,13 @@ impl LambdaHandler {
                 let _ = store.set_processing_result(&worker_uuid, processing);
                 if let Some(control) = &polling { control.report(&result, current.reports_batch_item_failures()); }
                 if let Err(error) = result {
-                    tracing::warn!(uuid = %worker_uuid, %error, "Event source mapping cycle failed");
+                    let cause_code = match error {
+                        crate::esm::PollError::Source(_) => "event_source_read_failed",
+                        crate::esm::PollError::Invocation(_) => "event_source_invocation_rejected",
+                        crate::esm::PollError::FunctionFailed => "event_source_function_failed",
+                        crate::esm::PollError::InvalidResponse(_) => "event_source_response_invalid",
+                    };
+                    tracing::warn!(service = "lambda", cause_code, mapping_id = %worker_uuid, "Event source mapping cycle failed");
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -1470,11 +1484,8 @@ impl LambdaHandler {
         match invocation_type {
             "DryRun" => empty_status(204),
             "Event" => {
-                if req.body.len() > MAX_ASYNC_PAYLOAD {
-                    return LambdaError::RequestTooLarge(
-                        "async invocation payload exceeds 256 KB".into(),
-                    )
-                    .into_response(&req.request_id);
+                if let Err(error) = validate_async_payload(&req.body) {
+                    return error.into_response(&req.request_id);
                 }
                 if let Err(error) = executor.validate_async_capacity(account, region, &func) {
                     return error.into_response(&req.request_id);
@@ -1722,7 +1733,16 @@ fn map_internal_lambda_error(error: LambdaError) -> LambdaInternalError {
 
 /// AWS synchronous / asynchronous invocation payload caps.
 const MAX_SYNC_PAYLOAD: usize = 6 * 1024 * 1024;
-const MAX_ASYNC_PAYLOAD: usize = 256 * 1024;
+const MAX_ASYNC_PAYLOAD: usize = 1024 * 1024;
+
+fn validate_async_payload(payload: &[u8]) -> Result<(), LambdaError> {
+    if payload.len() > MAX_ASYNC_PAYLOAD {
+        return Err(LambdaError::RequestTooLarge(
+            "async invocation payload exceeds the 1 MB limit".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Extract a single query parameter value.
 fn percent_decode_path(value: &str) -> String {
@@ -2069,6 +2089,40 @@ pub async fn register_with_execution_config(
     config: LambdaConcurrencyConfig,
     sqs_esm_max_pollers: u32,
 ) -> Option<Arc<LambdaHandler>> {
+    let settings = match std::env::current_dir()
+        .map_err(|_| "could not resolve current directory".to_owned())
+        .and_then(|current| {
+            crate::config::LambdaExecutionConfig::default()
+                .resolve_with(&|name| std::env::var_os(name), &current)
+        }) {
+        Ok(settings) => settings,
+        Err(_) => {
+            tracing::error!(
+                service = "lambda",
+                cause_code = "invalid_execution_configuration",
+                "Lambda invocation disabled"
+            );
+            return Some(register_with_config(registry, config));
+        }
+    };
+    register_with_execution_settings(
+        registry,
+        aws_endpoint_url,
+        config,
+        sqs_esm_max_pollers,
+        settings,
+    )
+    .await
+}
+
+/// Register with startup-resolved operational settings and no execution environment reads.
+pub async fn register_with_execution_settings(
+    registry: &Arc<ServiceRegistry>,
+    aws_endpoint_url: &str,
+    config: LambdaConcurrencyConfig,
+    sqs_esm_max_pollers: u32,
+    settings: crate::config::ResolvedLambdaExecutionConfig,
+) -> Option<Arc<LambdaHandler>> {
     use crate::code_store::CodeStore;
     use crate::executor::Executor;
     use crate::runtime_api::InvocationBroker;
@@ -2076,59 +2130,40 @@ pub async fn register_with_execution_config(
     use locallycloud_compute::runtime::ComputeRuntime;
     use locallycloud_compute::youki::YoukiRuntime;
 
+    if settings.validate().is_err() {
+        tracing::error!(
+            service = "lambda",
+            cause_code = "invalid_execution_configuration",
+            "Lambda invocation disabled"
+        );
+        return Some(register_with_config(registry, config));
+    }
     let runtime = match YoukiRuntime::discover() {
         Some(rt) => Arc::new(rt) as Arc<dyn ComputeRuntime>,
         None => {
-            tracing::warn!("no daemonless OCI runtime (crun/youki) found; Lambda invoke disabled");
+            tracing::warn!(
+                service = "lambda",
+                cause_code = "compute_runtime_unavailable",
+                "no daemonless OCI runtime (crun/youki) found; Lambda invoke disabled"
+            );
             return Some(register_with_config(registry, config));
         }
     };
 
-    let max_warm_total = match std::env::var("LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL") {
-        Ok(value) => Executor::parse_max_warm_total(Some(&value)),
-        Err(std::env::VarError::NotPresent) => Executor::parse_max_warm_total(None),
-        Err(error) => Err(error.to_string()),
-    };
-    let max_warm_total = match max_warm_total {
-        Ok(limit) => limit,
-        Err(error) => {
-            tracing::error!(%error, "invalid LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL; Lambda invoke disabled");
-            return Some(register_with_config(registry, config));
-        }
-    };
-
-    let memory_budget = match std::env::var("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB") {
-        Ok(value) => Executor::parse_memory_budget(Some(&value)),
-        Err(std::env::VarError::NotPresent) => Executor::parse_memory_budget(None),
-        Err(error) => Err(error.to_string()),
-    };
-    let memory_budget = match memory_budget {
-        Ok(limit) => limit,
-        Err(error) => {
-            tracing::error!(%error, "invalid LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB; Lambda invoke disabled");
-            return Some(register_with_config(registry, config));
-        }
-    };
-
-    let work = match std::env::var_os("LOCALLYCLOUD_WORK_DIR") {
-        Some(path) if !path.is_empty() => {
-            let path = std::path::PathBuf::from(path);
-            if path.is_absolute() {
-                path
-            } else {
-                match std::env::current_dir() {
-                    Ok(current) => current.join(path),
-                    Err(error) => {
-                        tracing::error!(%error, "could not resolve LOCALLYCLOUD_WORK_DIR");
-                        return Some(register_with_config(registry, config));
-                    }
-                }
-            }
-        }
-        _ => locallycloud_compute::private_dir::work_dir("lambda"),
-    };
-    if let Err(error) = locallycloud_compute::private_dir::ensure(&work) {
-        tracing::error!(%error, path = %work.display(), "Lambda work directory is unavailable or insecure");
+    let max_warm_total = settings.max_warm_total;
+    let memory_budget = settings.memory_budget_mb;
+    let work = settings.work_dir;
+    let directory = work.clone();
+    if !matches!(
+        tokio::task::spawn_blocking(move || locallycloud_compute::private_dir::ensure(&directory))
+            .await,
+        Ok(Ok(()))
+    ) {
+        tracing::error!(
+            service = "lambda",
+            cause_code = "work_directory_unavailable",
+            "Lambda work directory is unavailable or insecure"
+        );
         return Some(register_with_config(registry, config));
     }
 
@@ -2138,8 +2173,12 @@ pub async fn register_with_execution_config(
     // network namespace (see YoukiRuntime egress).
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, "could not bind the Lambda Runtime API; invoke disabled");
+        Err(_) => {
+            tracing::error!(
+                service = "lambda",
+                cause_code = "runtime_api_listener_failed",
+                "could not bind the Lambda Runtime API; invoke disabled"
+            );
             return Some(register_with_config(registry, config));
         }
     };
@@ -2153,10 +2192,7 @@ pub async fn register_with_execution_config(
     });
 
     let layers = Arc::new(LayerStore::new());
-    let packs = std::env::var_os("LOCALLYCLOUD_RUNTIME_PACKS_DIR")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| work.join("runtime-packs"));
+    let packs = settings.runtime_packs_dir;
     let executor = Executor::new(
         broker,
         Arc::new(CodeStore::new(work.join("code"))),
@@ -2169,6 +2205,7 @@ pub async fn register_with_execution_config(
     )
     .with_layer_store(layers)
     .with_max_warm_total(max_warm_total)
+    .with_warm_pool_limits(settings.max_warm_per_key, settings.warm_idle_timeout_secs)
     .with_memory_budget(memory_budget)
     .with_service_registry(Arc::downgrade(registry))
     .with_destination_router(Arc::new(RegistryDestinationRouter::new(Arc::downgrade(
@@ -2283,6 +2320,38 @@ fn json_response(status: u16, body: Option<Value>) -> Response {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn async_payload_accepts_current_aws_limit_and_rejects_larger_requests() {
+        let payload = |size: usize| {
+            let mut body = vec![b'a'; size];
+            body[0] = b'"';
+            body[size - 1] = b'"';
+            body
+        };
+        for size in [256 * 1024 + 1, 512 * 1024, 1024 * 1024] {
+            assert!(validate_async_payload(&payload(size)).is_ok(), "{size}");
+        }
+        let error = validate_async_payload(&payload(1024 * 1024 + 1)).unwrap_err();
+        let response = error.into_response("payload-limit-request");
+        assert_eq!(response.status(), 413);
+        assert_eq!(
+            response.headers()["x-amzn-errortype"],
+            "RequestTooLargeException"
+        );
+        assert_eq!(
+            response.headers()["x-amzn-requestid"],
+            "payload-limit-request"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let document: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            document["Message"],
+            "async invocation payload exceeds the 1 MB limit"
+        );
+    }
 
     #[test]
     fn empty_invoke_payload_is_delivered_as_empty_object() {

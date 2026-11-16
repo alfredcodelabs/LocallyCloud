@@ -9,7 +9,16 @@ fn resolve(json: &str, pairs: &[(&str, &str)]) -> Result<StartupConfig, StartupE
             .iter()
             .find(|(name, _)| *name == key)
             .map(|(_, value)| OsString::from(value))
-            .or_else(|| (key == "HOME").then(|| OsString::from("/owned-home")))
+            .or_else(|| match key {
+                "HOME" => Some(OsString::from("/owned-home")),
+                "LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID" => {
+                    Some(OsString::from("AKIA0000000000000000"))
+                }
+                "LOCALLYCLOUD_BOOTSTRAP_SECRET_ACCESS_KEY" => {
+                    Some(OsString::from("SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS"))
+                }
+                _ => None,
+            })
     })
 }
 
@@ -225,4 +234,164 @@ fn http_origin_environment_override_can_clear_file_entries_and_rejects_invalid_v
         )
         .is_err());
     }
+}
+
+#[test]
+fn http_pool_settings_resolve_file_environment_and_defaults() {
+    let json = r#"{"apigateway":{"http_client_cache_capacity":2,"http_max_idle_per_host":3,"http_idle_timeout_secs":4}}"#;
+    let file = resolve(json, &[]).unwrap().apigateway;
+    assert_eq!(
+        (
+            file.http_client_cache_capacity,
+            file.http_max_idle_per_host,
+            file.http_idle_timeout_secs
+        ),
+        (2, 3, 4)
+    );
+    let environment = [
+        ("LOCALLYCLOUD_APIGATEWAY_HTTP_CLIENT_CACHE_CAPACITY", "5"),
+        ("LOCALLYCLOUD_APIGATEWAY_HTTP_MAX_IDLE_PER_HOST", "6"),
+        ("LOCALLYCLOUD_APIGATEWAY_HTTP_IDLE_TIMEOUT_SECS", "7"),
+    ];
+    let overrides = resolve(json, &environment).unwrap().apigateway;
+    assert_eq!(
+        (
+            overrides.http_client_cache_capacity,
+            overrides.http_max_idle_per_host,
+            overrides.http_idle_timeout_secs
+        ),
+        (5, 6, 7)
+    );
+    let defaults = resolve("{}", &[]).unwrap().apigateway;
+    assert_eq!(
+        (
+            defaults.http_client_cache_capacity,
+            defaults.http_max_idle_per_host,
+            defaults.http_idle_timeout_secs
+        ),
+        (16, 1, 30)
+    );
+    for (name, _) in environment {
+        for value in ["", "0", "301", "null", "-1", "1.5"] {
+            assert!(resolve(json, &[(name, value)]).is_err(), "{name}={value}");
+        }
+    }
+    for name in [
+        "http_client_cache_capacity",
+        "http_max_idle_per_host",
+        "http_idle_timeout_secs",
+    ] {
+        assert!(serde_json::from_str::<FileConfig>(&format!(
+            r#"{{"apigateway":{{"{name}":null}}}}"#
+        ))
+        .is_err());
+    }
+}
+
+#[test]
+fn logging_is_resolved_before_initialization_with_explicit_precedence() {
+    let file = r#"{"logging":{"filter":"warn","format":"json","color":"always"}}"#;
+    let configured = resolve(file, &[]).unwrap().logging;
+    assert_eq!(configured.filter, "warn");
+    assert_eq!(configured.format, LogFormat::Json);
+    let overridden = resolve(
+        file,
+        &[
+            ("RUST_LOG", "error"),
+            ("LOCALLYCLOUD_LOG_FORMAT", "pretty"),
+            ("LOCALLYCLOUD_LOG_COLOR", "auto"),
+            ("NO_COLOR", "1"),
+        ],
+    )
+    .unwrap()
+    .logging;
+    assert_eq!(overridden.filter, "error");
+    assert_eq!(overridden.format, LogFormat::Pretty);
+    assert_eq!(overridden.color, LogColor::Never);
+    for (key, value) in [
+        ("RUST_LOG", "owned=invalid_level"),
+        ("RUST_LOG", ""),
+        ("LOCALLYCLOUD_LOG_FORMAT", "JSON"),
+        ("LOCALLYCLOUD_LOG_COLOR", "maybe"),
+    ] {
+        assert!(resolve(file, &[(key, value)]).is_err(), "{key}");
+    }
+    for document in [
+        r#"{"logging":null}"#,
+        r#"{"logging":{"filter":null}}"#,
+        r#"{"logging":{"format":"xml"}}"#,
+        r#"{"logging":{"extra":1}}"#,
+    ] {
+        assert!(serde_json::from_str::<FileConfig>(document).is_err());
+    }
+}
+
+#[test]
+fn batch_one_runtime_settings_resolve_through_startup() {
+    let file = r#"{"lambda":{"max_warm_total":2,"memory_budget_mb":512,"work_dir":"local-lambda"},"ec2":{"image_rootfs":"local-image","startup_timeout_secs":3,"connect_timeout_secs":4},"cloudformation":{"operation_capacity":2}}"#;
+    let configured = resolve(file, &[]).unwrap();
+    assert_eq!(configured.lambda.max_warm_total, 2);
+    assert_eq!(configured.lambda.memory_budget_mb, 512);
+    assert!(configured.lambda.work_dir.ends_with("local-lambda"));
+    assert!(configured
+        .ec2
+        .image_rootfs
+        .unwrap()
+        .ends_with("local-image"));
+    assert_eq!(configured.ec2.startup_timeout_secs, 3);
+    assert_eq!(configured.ec2.connect_timeout_secs, 4);
+    assert_eq!(configured.cloudformation.operation_capacity, 2);
+    let overridden = resolve(
+        file,
+        &[
+            ("LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL", "0"),
+            ("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB", "1024"),
+            ("LOCALLYCLOUD_WORK_DIR", "/env/lambda"),
+            ("LOCALLYCLOUD_EC2_IMAGE_ROOTFS", "/env/image"),
+            ("LOCALLYCLOUD_EC2_STARTUP_TIMEOUT_SECS", "7"),
+            ("LOCALLYCLOUD_EC2_CONNECT_TIMEOUT_SECS", "8"),
+            ("LOCALLYCLOUD_CLOUDFORMATION_OPERATION_CAPACITY", "3"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(overridden.lambda.max_warm_total, 0);
+    assert_eq!(overridden.lambda.memory_budget_mb, 1024);
+    assert_eq!(overridden.lambda.work_dir, PathBuf::from("/env/lambda"));
+    assert_eq!(
+        overridden.ec2.image_rootfs,
+        Some(PathBuf::from("/env/image"))
+    );
+    assert_eq!(
+        (
+            overridden.ec2.startup_timeout_secs,
+            overridden.ec2.connect_timeout_secs
+        ),
+        (7, 8)
+    );
+    assert_eq!(overridden.cloudformation.operation_capacity, 3);
+    for (key, value) in [
+        ("LOCALLYCLOUD_EC2_IMAGE_ROOTFS", ""),
+        ("LOCALLYCLOUD_EC2_STARTUP_TIMEOUT_SECS", "0"),
+        ("LOCALLYCLOUD_EC2_CONNECT_TIMEOUT_SECS", "301"),
+        ("LOCALLYCLOUD_CLOUDFORMATION_OPERATION_CAPACITY", "65"),
+        ("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB", "0"),
+    ] {
+        assert!(resolve(file, &[(key, value)]).is_err(), "{key}");
+    }
+    for document in [
+        r#"{"ec2":{"image_rootfs":null}}"#,
+        r#"{"lambda":{"work_dir":null}}"#,
+        r#"{"cloudformation":{"operation_capacity":null}}"#,
+    ] {
+        assert!(serde_json::from_str::<FileConfig>(document).is_err());
+    }
+}
+
+#[test]
+fn strict_startup_requires_explicit_secret_inputs_before_service_registration() {
+    let document = serde_json::from_str(r#"{"iam":{"enforcement":"strict"}}"#).unwrap();
+    let result = StartupConfig::resolve(document, &|key| {
+        (key == "HOME").then(|| "/owned-home".into())
+    });
+    assert!(result.is_err());
 }

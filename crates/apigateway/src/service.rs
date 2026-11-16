@@ -221,8 +221,11 @@ caller_context: locallycloud_core::integration::request_context::verified_reques
     }
 
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> Self {
-        let http = crate::http_integration::HttpIntegrationClient::new(&[], &[])
-            .expect("default HTTP integration policy is valid");
+        let http = crate::http_integration::HttpIntegrationClient::with_config(
+            &crate::ApiGatewayConfig::default(),
+            &[],
+        )
+        .expect("default HTTP integration policy is valid");
         ApiGwHandler {
             store: Arc::new(ApiGwStore::new()),
             validator: JwtValidator::new(),
@@ -1231,8 +1234,7 @@ pub fn register_with_config(
     config: crate::ApiGatewayConfig,
 ) -> Result<ApiGatewayWafBinding, String> {
     config.validate()?;
-    let http =
-        crate::http_integration::HttpIntegrationClient::new(&config.http_local_origins, &[])?;
+    let http = crate::http_integration::HttpIntegrationClient::with_config(&config, &[])?;
     let mut handler = ApiGwHandler::new(Arc::downgrade(registry));
     handler.store = Arc::new(ApiGwStore::with_config(config)?);
     handler.http = http;
@@ -1276,8 +1278,7 @@ pub async fn register_with_state_and_network(
     listeners: &[std::net::SocketAddr],
 ) -> Result<ApiGatewayWafBinding, String> {
     config.validate()?;
-    let http =
-        crate::http_integration::HttpIntegrationClient::new(&config.http_local_origins, listeners)?;
+    let http = crate::http_integration::HttpIntegrationClient::with_config(&config, listeners)?;
     let mut handler = ApiGwHandler::new(Arc::downgrade(registry));
     handler.store = Arc::new(ApiGwStore::with_config(config)?);
     handler.http = http;

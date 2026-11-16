@@ -376,15 +376,25 @@ async fn main() {
         | cli::Command::InspectDynamoDbMigration => {}
     }
 
-    observability::init_tracing();
-
     let startup = match startup_config::StartupConfig::load().await {
         Ok(config) => config,
         Err(error) => {
-            tracing::error!(%error, "invalid startup configuration");
+            eprintln!(
+                "ERROR [Startup] {}",
+                error
+                    .to_string()
+                    .chars()
+                    .take(512)
+                    .flat_map(char::escape_debug)
+                    .collect::<String>()
+            );
             std::process::exit(2);
         }
     };
+    if let Err(error) = observability::init_tracing(&startup.logging) {
+        eprintln!("ERROR [Startup] {error}");
+        std::process::exit(2);
+    }
     match command {
         cli::Command::ApplyDynamoDbMigration(policy) => {
             if let Err(error) = dynamodb_migration::apply(policy, startup.state.path).await {
@@ -401,7 +411,14 @@ async fn main() {
             return;
         }
         cli::Command::MigrateS3Encryption => {
-            if let Err(error) = migration::s3(&startup.common, &startup.state, startup.iam).await {
+            if let Err(error) = migration::s3(
+                &startup.common,
+                &startup.state,
+                startup.iam,
+                startup.iam_credentials,
+            )
+            .await
+            {
                 tracing::error!(%error, "S3 encryption migration failed");
                 std::process::exit(5);
             }
@@ -470,25 +487,47 @@ async fn main() {
         }
     };
     let registry = ServiceRegistry::with_known_services();
-    if let Err(error) = locallycloud_iam_sts::service::register_with_state_and_config(
-        &registry,
-        &config.account_id,
-        state.clone(),
-        startup.iam,
-    ) {
-        tracing::error!(%error, "failed to initialize durable IAM state");
+    let iam_initialization = {
+        let registry = registry.clone();
+        let account = config.account_id.clone();
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            locallycloud_iam_sts::service::register_with_state_and_inputs(
+                &registry,
+                &account,
+                state,
+                startup.iam,
+                startup.iam_credentials,
+            )
+        })
+        .await
+    };
+    if !matches!(iam_initialization, Ok(Ok(()))) {
+        tracing::error!(
+            service = "iam",
+            cause_code = "state_initialization_failed",
+            "failed to initialize durable IAM state"
+        );
         std::process::exit(2);
     }
-    let lambda_handler = locallycloud_lambda::service::register_with_execution_config(
+    let lambda_handler = locallycloud_lambda::service::register_with_execution_settings(
         &registry,
         endpoint.guest_endpoint(),
         config.lambda_concurrency,
         config.sqs_esm_max_pollers,
+        startup.lambda,
     )
     .await;
     if let Some(lambda) = &lambda_handler {
-        if let Err(error) = lambda.attach_state(state.clone()) {
-            tracing::error!(%error, "failed to load durable Lambda state");
+        let lambda = lambda.clone();
+        let state = state.clone();
+        let initialization = tokio::task::spawn_blocking(move || lambda.attach_state(state)).await;
+        if !matches!(initialization, Ok(Ok(()))) {
+            tracing::error!(
+                service = "lambda",
+                cause_code = "state_initialization_failed",
+                "failed to load durable Lambda state"
+            );
             std::process::exit(4);
         }
     }
@@ -593,12 +632,26 @@ async fn main() {
             std::process::exit(4);
         }
     };
-    if let Err(error) = locallycloud_cloudformation::register_with_state_and_endpoint(
-        &registry,
-        state.clone(),
-        endpoint.guest_endpoint(),
-    ) {
-        tracing::error!(%error, "failed to load durable CloudFormation state");
+    let cloudformation_initialization = {
+        let registry = registry.clone();
+        let state = state.clone();
+        let response_endpoint = endpoint.guest_endpoint().to_owned();
+        tokio::task::spawn_blocking(move || {
+            locallycloud_cloudformation::register_with_state_and_endpoint_config(
+                &registry,
+                state,
+                &response_endpoint,
+                startup.cloudformation,
+            )
+        })
+        .await
+    };
+    if !matches!(cloudformation_initialization, Ok(Ok(()))) {
+        tracing::error!(
+            service = "cloudformation",
+            cause_code = "state_initialization_failed",
+            "failed to load durable CloudFormation state"
+        );
         std::process::exit(4);
     }
     let ecr = match locallycloud_ecr::register_with_state_and_endpoint(
@@ -614,7 +667,7 @@ async fn main() {
             std::process::exit(4);
         }
     };
-    let ec2_runtime = Arc::new(ec2_runtime::Ec2OciRuntime::default());
+    let ec2_runtime = Arc::new(ec2_runtime::Ec2OciRuntime::new(startup.ec2));
     let ec2 = match locallycloud_ec2::register_with_state_and_instance_runtime(
         &registry,
         state.clone(),

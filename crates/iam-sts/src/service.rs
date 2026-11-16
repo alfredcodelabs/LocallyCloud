@@ -20,6 +20,10 @@ use locallycloud_core::integration::authorization::{
 };
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 
+use crate::config::IamCredentials;
+#[cfg(test)]
+use crate::config::{root_from_lookup, validate_root_collision};
+pub use crate::config::{BootstrapCredentials, BootstrapError};
 use crate::enforcement::{EnforcementFilter, EnforcementMode};
 use crate::error::IamStsError;
 use crate::iam::{self, Entity, OpResult};
@@ -388,14 +392,6 @@ impl IamStsState {
                 &context,
             ),
         };
-        if let Err(IamStsError::AccessDenied(_)) = &result {
-            tracing::info!(
-                request_id = %request.request_id,
-                service,
-                action,
-                "strict-mode enforcement denied request"
-            );
-        }
         result
     }
 }
@@ -994,11 +990,10 @@ impl NativeHandler for IamHandler {
         let action = match q.action() {
             Some(a) => a.to_string(),
             None => {
-                return IamStsError::InvalidAction("missing Action".into())
+                return IamStsError::MissingAction("Action is required".into())
                     .into_response(&request.request_id, IAM_XMLNS)
             }
         };
-        tracing::info!(request_id = %request.request_id, service = "iam", %action, "iam request");
         self.state.default_iam_user(&request, &action, &mut q);
         if let Err(error) = self.state.authorize_iam(&request, &action, &q) {
             return error.into_response(&request.request_id, IAM_XMLNS);
@@ -1056,12 +1051,11 @@ impl NativeHandler for StsHandler {
         let action = match q.action() {
             Some(a) => a.to_string(),
             None => {
-                return IamStsError::InvalidAction("missing Action".into())
+                return IamStsError::MissingAction("Action is required".into())
                     .into_response(&request.request_id, STS_XMLNS)
             }
         };
         let caller_key = access_key_id_from_auth(&request);
-        tracing::info!(request_id = %request.request_id, service = "sts", %action, "sts request");
         let authorization = match action.as_str() {
             "GetSessionToken" if self.state.mode == EnforcementMode::Strict
                 && (q.get("SerialNumber").is_some() || q.get("TokenCode").is_some()) => {
@@ -1312,104 +1306,6 @@ fn xml_response(body: &str) -> Response {
         .expect("xml response is always valid")
 }
 
-/// Explicit startup credential for a strict-mode IAM administrator.
-/// Durable registration preserves an existing credential and its revocation state.
-pub struct BootstrapCredentials {
-    access_key_id: String,
-    secret_access_key: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum BootstrapError {
-    #[error(transparent)]
-    Configuration(#[from] crate::config::IamConfigError),
-    #[error("strict IAM requires both bootstrap access key ID and secret access key")]
-    MissingCredentials,
-    #[error("invalid bootstrap access key ID or secret access key")]
-    InvalidCredentials,
-    #[error("root provisioning requires a valid LocallyCloud root credential pair and account")]
-    InvalidRootCredentials,
-    #[error("root access key conflicts with an existing IAM credential")]
-    RootCredentialCollision,
-}
-
-impl BootstrapCredentials {
-    /// Read only explicit LocallyCloud settings. Never include credential values in errors.
-    pub fn from_env(strict: bool) -> Result<Option<Self>, BootstrapError> {
-        Self::from_lookup(strict, &|name| std::env::var(name).ok())
-    }
-
-    fn from_lookup(
-        strict: bool,
-        get: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<Option<Self>, BootstrapError> {
-        let id = get("LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID");
-        let secret = get("LOCALLYCLOUD_BOOTSTRAP_SECRET_ACCESS_KEY");
-        match (id, secret) {
-            (None, None) if !strict => Ok(None),
-            (Some(access_key_id), Some(secret_access_key)) => {
-                let valid_id = access_key_id.len() == 20
-                    && access_key_id.starts_with("AKIA")
-                    && access_key_id
-                        .bytes()
-                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
-                let valid_secret = secret_access_key.len() == 40
-                    && secret_access_key
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/');
-                if !valid_id || !valid_secret {
-                    return Err(BootstrapError::InvalidCredentials);
-                }
-                Ok(Some(Self {
-                    access_key_id,
-                    secret_access_key,
-                }))
-            }
-            _ => Err(BootstrapError::MissingCredentials),
-        }
-    }
-}
-
-fn root_from_lookup(
-    account: &str,
-    get: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<AccountRoot>, BootstrapError> {
-    let credentials = BootstrapCredentials::from_lookup(false, &|name| {
-        get(match name {
-            "LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID" => "LOCALLYCLOUD_ROOT_ACCESS_KEY_ID",
-            "LOCALLYCLOUD_BOOTSTRAP_SECRET_ACCESS_KEY" => "LOCALLYCLOUD_ROOT_SECRET_ACCESS_KEY",
-            _ => return None,
-        })
-    })
-    .map_err(|_| BootstrapError::InvalidRootCredentials)?;
-    let Some(credentials) = credentials else {
-        return Ok(None);
-    };
-    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(BootstrapError::InvalidRootCredentials);
-    }
-    Ok(Some(AccountRoot {
-        account: account.into(),
-        access_key_id: credentials.access_key_id,
-        secret_access_key: credentials.secret_access_key,
-    }))
-}
-fn configured_root(account: &str) -> Result<Option<AccountRoot>, BootstrapError> {
-    root_from_lookup(account, &|name| std::env::var(name).ok())
-}
-fn validate_root_collision(
-    root: Option<&AccountRoot>,
-    bootstrap: Option<&BootstrapCredentials>,
-) -> Result<(), BootstrapError> {
-    if root
-        .zip(bootstrap)
-        .is_some_and(|(root, bootstrap)| root.access_key_id == bootstrap.access_key_id)
-    {
-        return Err(BootstrapError::RootCredentialCollision);
-    }
-    Ok(())
-}
-
 fn seed_bootstrap_user(store: &IamStore, account: &str, credentials: BootstrapCredentials) {
     let name = "locallycloud-bootstrap";
     let mut inline_policies = BTreeMap::new();
@@ -1462,11 +1358,25 @@ pub fn register_with_account_and_config(
     account: &str,
     config: crate::config::IamConfig,
 ) -> Result<(), BootstrapError> {
-    let mode = config.enforcement;
-    let credentials = BootstrapCredentials::from_env(mode == EnforcementMode::Strict)?;
-    let root = configured_root(account)?;
-    validate_root_collision(root.as_ref(), credentials.as_ref())?;
-    register_inner(registry, account, credentials, root, mode)
+    let credentials = IamCredentials::from_lookup(account, config, |name| std::env::var_os(name))?;
+    register_with_account_and_inputs(registry, account, config, credentials)
+}
+
+/// Register without consulting the process environment for credentials.
+pub fn register_with_account_and_inputs(
+    registry: &ServiceRegistry,
+    account: &str,
+    config: crate::config::IamConfig,
+    credentials: IamCredentials,
+) -> Result<(), BootstrapError> {
+    credentials.validate(account, config)?;
+    register_inner(
+        registry,
+        account,
+        credentials.bootstrap,
+        credentials.root,
+        config.enforcement,
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1494,10 +1404,24 @@ pub fn register_with_state_and_config(
     db: Arc<locallycloud_state::StateDb>,
     config: crate::config::IamConfig,
 ) -> Result<(), RegistrationError> {
-    let credentials =
-        BootstrapCredentials::from_env(config.enforcement == EnforcementMode::Strict)?;
-    let root = configured_root(account)?;
-    validate_root_collision(root.as_ref(), credentials.as_ref())?;
+    let credentials = IamCredentials::from_lookup(account, config, |name| std::env::var_os(name))?;
+    register_with_state_and_inputs(registry, account, db, config, credentials)
+}
+
+/// Register durable handlers using the credentials resolved by the composition root.
+pub fn register_with_state_and_inputs(
+    registry: &ServiceRegistry,
+    account: &str,
+    db: Arc<locallycloud_state::StateDb>,
+    config: crate::config::IamConfig,
+    credentials: IamCredentials,
+) -> Result<(), RegistrationError> {
+    credentials.validate(account, config)?;
+    let IamCredentials {
+        bootstrap: credentials,
+        root,
+        ..
+    } = credentials;
     let persistence = Arc::new(crate::persistence::IamPersistence::new(db)?);
     let store = Arc::new(IamStore::durable(persistence.clone())?);
     let sessions = Arc::new(SessionStore::durable(persistence)?);
@@ -2985,6 +2909,24 @@ mod tests {
         let h = iam_handler();
         let resp = h.handle(request("Action=GetUser&UserName=ghost")).await;
         assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn missing_action_uses_the_documented_error_in_each_service_namespace() {
+        let registry = ServiceRegistry::new();
+        register(&registry);
+        for (service, xmlns) in [("iam", IAM_XMLNS), ("sts", STS_XMLNS)] {
+            let handler = registry.native_handler(&ServiceName::new(service)).unwrap();
+            let response = handler.handle(request("")).await;
+            assert_eq!(response.status(), 400);
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.contains("<Code>MissingAction</Code>"), "{service}");
+            assert!(body.contains(xmlns), "{service}");
+            assert!(!body.contains("<Code>InvalidAction</Code>"), "{service}");
+        }
     }
 
     #[tokio::test]

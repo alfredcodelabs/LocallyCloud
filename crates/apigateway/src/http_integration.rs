@@ -1,6 +1,6 @@
 //! HTTP integration egress checks applied to the addresses used by the connector.
 mod body;
-pub(crate) use body::{read_response, BodyError};
+pub(crate) use body::{read_response, BodyError, MAX_RESPONSE_BYTES};
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -10,9 +10,64 @@ use std::time::Duration;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Method, RequestBuilder, Url};
 
-const CLIENT_CAPACITY: usize = 16;
 const MAX_DNS_ADDRESSES: usize = 64;
-const DENIED: &str = "HTTP integration destination is not permitted";
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum HttpIntegrationError {
+    #[error("Invalid HTTP integration URL")]
+    InvalidUrl,
+    #[error("{0}")]
+    InvalidOrigin(&'static str),
+    #[error("HTTP integration destination is not permitted")]
+    DestinationDenied,
+    #[error("HTTP integration host-address check failed")]
+    HostProbe,
+    #[error("HTTP integration DNS resolution failed")]
+    DnsResolution,
+    #[error("HTTP integration DNS answer count is invalid")]
+    DnsAnswers,
+    #[error("HTTP integration client cache unavailable")]
+    CacheUnavailable,
+    #[error("HTTP integration client initialization failed")]
+    ClientInitialization,
+    #[error("HTTP integration TLS configuration is invalid")]
+    TlsConfiguration,
+    #[error("HTTP integration connection failed")]
+    Connection,
+    #[error("HTTP integration timed out")]
+    Timeout,
+}
+
+impl HttpIntegrationError {
+    pub(crate) fn from_request(error: &reqwest::Error) -> Self {
+        let is_https = error.url().is_some_and(|url| url.scheme() == "https");
+        let mut invalid_tls = false;
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(cause) = source {
+            if let Some(error) = cause.downcast_ref::<Self>() {
+                return *error;
+            }
+            if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+                invalid_tls |= is_https
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                    );
+                if let Some(inner) = error.get_ref() {
+                    source = Some(inner);
+                    continue;
+                }
+            }
+            source = cause.source();
+        }
+        if error.is_timeout() {
+            Self::Timeout
+        } else if invalid_tls {
+            Self::TlsConfiguration
+        } else {
+            Self::Connection
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Origin {
@@ -22,30 +77,36 @@ struct Origin {
 }
 
 impl Origin {
-    fn parse(value: &str) -> Result<(Self, Url), String> {
-        let url = Url::parse(value).map_err(|_| "Invalid HTTP integration URL")?;
+    fn parse(value: &str) -> Result<(Self, Url), HttpIntegrationError> {
+        let url = Url::parse(value).map_err(|_| HttpIntegrationError::InvalidUrl)?;
         if !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
             || url.password().is_some()
             || url.fragment().is_some()
             || value.chars().any(char::is_control)
         {
-            return Err(
-                "HTTP integrations require HTTP(S) without credentials or fragments".into(),
-            );
+            return Err(HttpIntegrationError::InvalidOrigin(
+                "HTTP integrations require HTTP(S) without credentials or fragments",
+            ));
         }
-        let host = url
-            .host_str()
-            .ok_or("HTTP integration URL requires a host")?;
+        let host = url.host_str().ok_or(HttpIntegrationError::InvalidOrigin(
+            "HTTP integration URL requires a host",
+        ))?;
         let host = host.trim_start_matches('[').trim_end_matches(']');
         if host.contains('*') {
-            return Err("HTTP integration hosts cannot contain wildcards".into());
+            return Err(HttpIntegrationError::InvalidOrigin(
+                "HTTP integration hosts cannot contain wildcards",
+            ));
         }
         let port = url
             .port_or_known_default()
-            .ok_or("Invalid HTTP integration port")?;
+            .ok_or(HttpIntegrationError::InvalidOrigin(
+                "Invalid HTTP integration port",
+            ))?;
         if port == 0 {
-            return Err("HTTP integration port must be nonzero".into());
+            return Err(HttpIntegrationError::InvalidOrigin(
+                "HTTP integration port must be nonzero",
+            ));
         }
         Ok((
             Self {
@@ -64,18 +125,27 @@ struct Policy {
 }
 
 impl Policy {
-    fn new(local_origins: &[String], listeners: &[SocketAddr]) -> Result<Self, String> {
+    fn new(
+        local_origins: &[String],
+        listeners: &[SocketAddr],
+    ) -> Result<Self, HttpIntegrationError> {
         if local_origins.len() > 128 || listeners.len() > 4096 {
-            return Err("Too many HTTP integration origins or listener addresses".into());
+            return Err(HttpIntegrationError::InvalidOrigin(
+                "Too many HTTP integration origins or listener addresses",
+            ));
         }
         let mut origins = Vec::new();
         for value in local_origins {
             if value.len() > 2048 {
-                return Err("HTTP integration origin exceeds 2048 bytes".into());
+                return Err(HttpIntegrationError::InvalidOrigin(
+                    "HTTP integration origin exceeds 2048 bytes",
+                ));
             }
             let (origin, url) = Origin::parse(value)?;
             if url.path() != "/" || url.query().is_some() {
-                return Err("HTTP integration origins cannot contain a path or query".into());
+                return Err(HttpIntegrationError::InvalidOrigin(
+                    "HTTP integration origins cannot contain a path or query",
+                ));
             }
             if !origins.contains(&origin) {
                 origins.push(origin);
@@ -93,7 +163,7 @@ impl Policy {
         Ok(policy)
     }
 
-    fn check(&self, origin: &Origin, address: IpAddr) -> Result<(), String> {
+    fn check(&self, origin: &Origin, address: IpAddr) -> Result<(), HttpIntegrationError> {
         self.check_with_local(origin, address, is_host_address)
     }
 
@@ -101,8 +171,8 @@ impl Policy {
         &self,
         origin: &Origin,
         address: IpAddr,
-        is_local: impl Fn(IpAddr) -> Result<bool, String>,
-    ) -> Result<(), String> {
+        is_local: impl Fn(IpAddr) -> Result<bool, HttpIntegrationError>,
+    ) -> Result<(), HttpIntegrationError> {
         let address = normalize(address);
         let mut known_local = None;
         for listener in &self.listeners {
@@ -111,15 +181,15 @@ impl Policy {
             }
             let bound = normalize(listener.ip());
             if bound == address {
-                return Err(DENIED.into());
+                return Err(HttpIntegrationError::DestinationDenied);
             }
             if bound.is_unspecified() && (bound.is_ipv6() || address.is_ipv4()) {
                 if address.is_loopback() {
-                    return Err(DENIED.into());
+                    return Err(HttpIntegrationError::DestinationDenied);
                 }
                 let local = is_local(address)?;
                 if local {
-                    return Err(DENIED.into());
+                    return Err(HttpIntegrationError::DestinationDenied);
                 }
                 known_local = Some(local);
             }
@@ -159,7 +229,7 @@ impl Policy {
             }
         };
         if !permitted {
-            return Err(DENIED.into());
+            return Err(HttpIntegrationError::DestinationDenied);
         }
         if !self.local_origins.contains(origin)
             && match known_local {
@@ -167,15 +237,15 @@ impl Policy {
                 None => is_local(address)?,
             }
         {
-            return Err(DENIED.into());
+            return Err(HttpIntegrationError::DestinationDenied);
         }
         Ok(())
     }
 
-    fn addresses(&self, origin: &Origin, addresses: Addrs) -> Result<Addrs, String> {
+    fn addresses(&self, origin: &Origin, addresses: Addrs) -> Result<Addrs, HttpIntegrationError> {
         let addresses: Vec<_> = addresses.take(MAX_DNS_ADDRESSES + 1).collect();
         if addresses.is_empty() || addresses.len() > MAX_DNS_ADDRESSES {
-            return Err(DENIED.into());
+            return Err(HttpIntegrationError::DnsAnswers);
         }
         let mut checked = Vec::with_capacity(addresses.len());
         for address in addresses {
@@ -188,21 +258,23 @@ impl Policy {
 
 // A successful port-zero bind identifies a currently assigned host address without
 // listening or sending traffic. Unexpected errors deny the destination conservatively.
-fn is_host_address(address: IpAddr) -> Result<bool, String> {
+fn is_host_address(address: IpAddr) -> Result<bool, HttpIntegrationError> {
     let socket = match address {
         IpAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
         IpAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
     }
-    .map_err(|_| DENIED)?;
+    .map_err(|_| HttpIntegrationError::HostProbe)?;
     match socket.bind(SocketAddr::new(address, 0)) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => Ok(false),
-        Err(_) => Err(DENIED.into()),
+        Err(_) => Err(HttpIntegrationError::HostProbe),
     }
 }
 
 pub(crate) fn validate_local_origins(local_origins: &[String]) -> Result<(), String> {
-    Policy::new(local_origins, &[]).map(|_| ())
+    Policy::new(local_origins, &[])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn normalize(ip: IpAddr) -> IpAddr {
@@ -256,13 +328,18 @@ impl Resolve for FilteredResolver {
         let origin = self.origin.clone();
         let policy = self.policy.clone();
         if name.as_str().strip_suffix('.').unwrap_or(name.as_str()) != origin.host {
-            return Box::pin(async { Err(std::io::Error::other(DENIED).into()) });
+            return Box::pin(async { Err(HttpIntegrationError::DestinationDenied.into()) });
         }
         let result = self.source.resolve(name);
         Box::pin(async move {
             policy
-                .addresses(&origin, result.await?)
-                .map_err(|_| std::io::Error::other(DENIED).into())
+                .addresses(
+                    &origin,
+                    result
+                        .await
+                        .map_err(|_| HttpIntegrationError::DnsResolution)?,
+                )
+                .map_err(Into::into)
         })
     }
 }
@@ -271,19 +348,47 @@ pub(crate) struct HttpIntegrationClient {
     policy: Arc<Policy>,
     resolver: Arc<dyn Resolve>,
     clients: Mutex<VecDeque<(Origin, Client)>>,
+    client_capacity: usize,
+    max_idle_per_host: usize,
+    idle_timeout: Duration,
 }
 
 impl HttpIntegrationClient {
+    #[cfg(test)]
     pub(crate) fn new(local_origins: &[String], listeners: &[SocketAddr]) -> Result<Self, String> {
-        let policy = Arc::new(Policy::new(local_origins, listeners)?);
+        Self::with_config(
+            &crate::ApiGatewayConfig {
+                http_local_origins: local_origins.to_vec(),
+                ..Default::default()
+            },
+            listeners,
+        )
+    }
+
+    pub(crate) fn with_config(
+        config: &crate::ApiGatewayConfig,
+        listeners: &[SocketAddr],
+    ) -> Result<Self, String> {
+        config.validate()?;
+        let policy = Arc::new(
+            Policy::new(&config.http_local_origins, listeners)
+                .map_err(|error| error.to_string())?,
+        );
         Ok(Self {
             policy,
             resolver: Arc::new(SystemResolver),
             clients: Mutex::new(VecDeque::new()),
+            client_capacity: config.http_client_cache_capacity,
+            max_idle_per_host: config.http_max_idle_per_host,
+            idle_timeout: Duration::from_secs(config.http_idle_timeout_secs as u64),
         })
     }
 
-    pub(crate) fn request(&self, method: Method, url: &str) -> Result<RequestBuilder, String> {
+    pub(crate) fn request(
+        &self,
+        method: Method,
+        url: &str,
+    ) -> Result<RequestBuilder, HttpIntegrationError> {
         let (origin, url) = Origin::parse(url)?;
         // Hyper bypasses DNS resolution for literals, so they must pass the same check here.
         if let Ok(ip) = origin.host.parse() {
@@ -293,7 +398,7 @@ impl HttpIntegrationClient {
             let mut clients = self
                 .clients
                 .lock()
-                .map_err(|_| "HTTP integration client cache unavailable")?;
+                .map_err(|_| HttpIntegrationError::CacheUnavailable)?;
             if let Some(index) = clients.iter().position(|(key, _)| key == &origin) {
                 if let Some((key, client)) = clients.remove(index) {
                     let request = client.request(method, url);
@@ -305,21 +410,21 @@ impl HttpIntegrationClient {
         let client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(1)
-            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(self.max_idle_per_host)
+            .pool_idle_timeout(self.idle_timeout)
             .dns_resolver(Arc::new(FilteredResolver {
                 origin: origin.clone(),
                 policy: self.policy.clone(),
                 source: self.resolver.clone(),
             }))
             .build()
-            .map_err(|_| "HTTP integration client initialization failed")?;
+            .map_err(|_| HttpIntegrationError::ClientInitialization)?;
         let request = client.request(method, url);
         let mut clients = self
             .clients
             .lock()
-            .map_err(|_| "HTTP integration client cache unavailable")?;
-        if clients.len() == CLIENT_CAPACITY {
+            .map_err(|_| HttpIntegrationError::CacheUnavailable)?;
+        if clients.len() >= self.client_capacity {
             clients.pop_front();
         }
         clients.push_back((origin, client));
@@ -430,7 +535,7 @@ mod tests {
             .check_with_local(&origin, address, |_| Ok(false))
             .is_ok());
         assert!(denied
-            .check_with_local(&origin, address, |_| Err("probe failed".into()))
+            .check_with_local(&origin, address, |_| Err(HttpIntegrationError::HostProbe))
             .is_err());
         let allowed = Policy::new(&["http://public-backend.test:8080".into()], &[]).unwrap();
         assert!(allowed
@@ -513,23 +618,129 @@ mod tests {
             .contains(&format!("host: backend.test:{}", address.port())));
         let mut denied = HttpIntegrationClient::new(&[], &[]).unwrap();
         denied.resolver = Arc::new(Answers(Mutex::new(VecDeque::from([vec![address]]))));
-        assert!(denied
+        let error = denied
             .request(Method::GET, &hostname)
             .unwrap()
             .timeout(Duration::from_secs(2))
             .send()
             .await
-            .is_err());
+            .unwrap_err();
+        assert_eq!(
+            HttpIntegrationError::from_request(&error),
+            HttpIntegrationError::DestinationDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_dns_resolution_is_preserved_as_a_configuration_failure() {
+        struct FailedDns;
+        impl Resolve for FailedDns {
+            fn resolve(&self, _: Name) -> Resolving {
+                Box::pin(async { Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()) })
+            }
+        }
+        let mut client = HttpIntegrationClient::new(&[], &[]).unwrap();
+        client.resolver = Arc::new(FailedDns);
+        let error = client
+            .request(Method::GET, "https://owned-dns-failure.test")
+            .unwrap()
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_err();
+        let failure = HttpIntegrationError::from_request(&error);
+        assert_eq!(failure, HttpIntegrationError::DnsResolution);
+        assert_eq!(
+            crate::error::InvokeFailure::Http(failure)
+                .gateway_failure()
+                .status(),
+            500
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_tls_certificate_is_a_configuration_failure_without_sending_http() {
+        use axum::{routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("https://{}", listener.local_addr().unwrap());
+        let identity = Arc::new(
+            locallycloud_core::tls::GuestCallbackTls::new()
+                .await
+                .unwrap(),
+        );
+        let server = identity.clone().spawn(
+            listener,
+            Router::new().route(
+                "/",
+                get(move || {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        "owned TLS backend"
+                    }
+                }),
+            ),
+            false,
+        );
+        let trusted = Client::builder()
+            .no_proxy()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(identity.ca_pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            trusted
+                .get(&origin)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let client = HttpIntegrationClient::new(std::slice::from_ref(&origin), &[]).unwrap();
+        let error = client
+            .request(Method::GET, &origin)
+            .unwrap()
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_err();
+        let failure = HttpIntegrationError::from_request(&error);
+        assert_eq!(failure, HttpIntegrationError::TlsConfiguration);
+        assert_eq!(
+            crate::error::InvokeFailure::Http(failure)
+                .gateway_failure()
+                .status(),
+            500
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[test]
     fn client_cache_is_bounded_under_many_origins() {
-        let client = HttpIntegrationClient::new(&[], &[]).unwrap();
-        for index in 0..CLIENT_CAPACITY + 4 {
+        let config = crate::ApiGatewayConfig {
+            http_client_cache_capacity: 2,
+            http_max_idle_per_host: 3,
+            http_idle_timeout_secs: 4,
+            ..Default::default()
+        };
+        let client = HttpIntegrationClient::with_config(&config, &[]).unwrap();
+        assert_eq!(client.max_idle_per_host, 3);
+        assert_eq!(client.idle_timeout, Duration::from_secs(4));
+        for index in 0..config.http_client_cache_capacity + 4 {
             let _request = client
                 .request(Method::GET, &format!("https://backend-{index}.example"))
                 .unwrap();
         }
-        assert_eq!(client.clients.lock().unwrap().len(), CLIENT_CAPACITY);
+        assert_eq!(
+            client.clients.lock().unwrap().len(),
+            config.http_client_cache_capacity
+        );
     }
 }

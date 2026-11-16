@@ -29,6 +29,8 @@ pub enum IamStsError {
     #[error("{0}")]
     InvalidAction(String),
     #[error("{0}")]
+    MissingAction(String),
+    #[error("{0}")]
     InvalidInput(String),
 }
 
@@ -44,6 +46,7 @@ impl IamStsError {
             IamStsError::ValidationError(_) => "ValidationError",
             IamStsError::AccessDenied(_) => "AccessDenied",
             IamStsError::InvalidAction(_) => "InvalidAction",
+            IamStsError::MissingAction(_) => "MissingAction",
             IamStsError::InvalidInput(_) => "InvalidInput",
         }
     }
@@ -58,6 +61,7 @@ impl IamStsError {
             IamStsError::MalformedPolicyDocument(_)
             | IamStsError::ValidationError(_)
             | IamStsError::InvalidAction(_)
+            | IamStsError::MissingAction(_)
             | IamStsError::InvalidInput(_) => 400,
             IamStsError::AccessDenied(_) => 403,
         }
@@ -66,6 +70,18 @@ impl IamStsError {
     /// Render to an Axum response as the Query/XML error envelope in the service's
     /// XML namespace (`IAM_XMLNS` for IAM, `STS_XMLNS` for STS).
     pub fn into_response(self, request_id: &str, xmlns: &'static str) -> axum::response::Response {
+        let service = if xmlns == crate::query::STS_XMLNS {
+            "sts"
+        } else {
+            "iam"
+        };
+        locallycloud_core::observability::log_service_error(
+            service,
+            None,
+            request_id,
+            self.code(),
+            self.http_status(),
+        );
         AwsError::new(self.code(), self.to_string(), self.http_status())
             .with_request_id(request_id.to_string())
             .with_xml_namespace(xmlns)
@@ -94,6 +110,7 @@ mod tests {
         assert_eq!(IamStsError::ValidationError("x".into()).http_status(), 400);
         assert_eq!(IamStsError::AccessDenied("x".into()).http_status(), 403);
         assert_eq!(IamStsError::InvalidAction("x".into()).http_status(), 400);
+        assert_eq!(IamStsError::MissingAction("x".into()).http_status(), 400);
     }
 
     #[test]

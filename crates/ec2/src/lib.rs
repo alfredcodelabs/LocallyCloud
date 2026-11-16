@@ -401,6 +401,7 @@ impl Default for Ec2Handler {
             runtime: None,
             persistence: None,
             registry: None,
+            // This is the instance lifecycle exclusion gate, including shutdown.
             instance_operations: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
@@ -2594,7 +2595,11 @@ impl Ec2Handler {
         })
         .await;
         if !matches!(result, Ok(Ok(()))) {
-            tracing::warn!("EC2 failed instance cleanup remains pending");
+            tracing::warn!(
+                service = "ec2",
+                cause_code = "instance_cleanup_pending",
+                "EC2 failed instance cleanup remains pending"
+            );
         }
     }
 
@@ -2696,10 +2701,18 @@ impl Ec2Handler {
                 .await
                 .is_err()
             {
-                tracing::warn!("EC2 shutdown intent persistence remains pending");
+                tracing::warn!(
+                    service = "ec2",
+                    cause_code = "shutdown_intent_pending",
+                    "EC2 shutdown intent persistence remains pending"
+                );
             }
             if runtime.stop_instance(&id).await.is_err() {
-                tracing::warn!("EC2 runtime shutdown cleanup remains pending");
+                tracing::warn!(
+                    service = "ec2",
+                    cause_code = "shutdown_cleanup_pending",
+                    "EC2 runtime shutdown cleanup remains pending"
+                );
                 continue;
             }
             if self
@@ -2707,7 +2720,11 @@ impl Ec2Handler {
                 .await
                 .is_err()
             {
-                tracing::warn!("EC2 stopped-state persistence remains pending");
+                tracing::warn!(
+                    service = "ec2",
+                    cause_code = "stopped_state_persistence_pending",
+                    "EC2 stopped-state persistence remains pending"
+                );
             }
         }
     }
@@ -2809,7 +2826,11 @@ async fn serve_instance_proxy(
                 .await
                 .is_err()
             {
-                tracing::warn!("EC2 exited instance state persistence remains pending");
+                tracing::warn!(
+                    service = "ec2",
+                    cause_code = "exited_state_persistence_pending",
+                    "EC2 exited instance state persistence remains pending"
+                );
             }
             break;
         }
@@ -3043,7 +3064,21 @@ impl Ec2Error {
     fn unsupported(field: &str) -> Self {
         Self::new("UnsupportedOperation", format!("{field} is not supported"))
     }
+    fn http_status(&self) -> u16 {
+        match self.code {
+            "InternalError" => 500,
+            "UnauthorizedOperation" => 403,
+            _ => 400,
+        }
+    }
     fn into_response(self, request_id: &str) -> Response {
+        locallycloud_core::observability::log_service_error(
+            "ec2",
+            None,
+            request_id,
+            self.code,
+            self.http_status(),
+        );
         // EC2 Query errors use a different envelope from the generic AWS Query
         // protocol. The EC2 SDK reads Code only below Response/Errors/Error.
         let body = format!(
@@ -3053,11 +3088,7 @@ impl Ec2Error {
             escape(request_id),
         );
         Response::builder()
-            .status(match self.code {
-                "InternalError" => 500,
-                "UnauthorizedOperation" => 403,
-                _ => 400,
-            })
+            .status(self.http_status())
             .header("content-type", "text/xml")
             .header("x-amzn-RequestId", request_id)
             .body(Body::from(body))

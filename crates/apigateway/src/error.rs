@@ -41,7 +41,7 @@ impl ApiGwError {
             ApiGwError::Unauthorized(_) => "UnauthorizedException",
             ApiGwError::Forbidden(_) => "ForbiddenException",
             ApiGwError::TooManyRequests(_) => "TooManyRequestsException",
-            ApiGwError::Internal(_) => "InternalFailureException",
+            ApiGwError::Internal(_) => "InternalFailure",
             ApiGwError::Gone(_) => "GoneException",
             ApiGwError::PayloadTooLarge(_) => "PayloadTooLargeException",
         }
@@ -62,6 +62,13 @@ impl ApiGwError {
     }
 
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
+        locallycloud_core::observability::log_service_error(
+            "apigateway",
+            None,
+            request_id,
+            self.code(),
+            self.http_status(),
+        );
         let is_throttled = self.http_status() == 429;
         let mut response = AwsError::new(self.code(), self.to_string(), self.http_status())
             .with_request_id(request_id.to_string())
@@ -76,9 +83,158 @@ impl ApiGwError {
     }
 }
 
+/// Internal invocation causes remain distinct from control-plane AWS exceptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvokeFailure {
+    Configuration,
+    Dispatch,
+    Timeout,
+    Http(crate::http_integration::HttpIntegrationError),
+    ResponseTooLarge,
+    ResponseRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayFailure {
+    Configuration,
+    Integration,
+    Timeout,
+    Internal,
+}
+
+impl GatewayFailure {
+    pub(crate) fn response_type(self) -> &'static str {
+        match self {
+            Self::Configuration => "API_CONFIGURATION_ERROR",
+            Self::Integration => "INTEGRATION_FAILURE",
+            Self::Timeout => "INTEGRATION_TIMEOUT",
+            Self::Internal => "DEFAULT_5XX",
+        }
+    }
+
+    pub(crate) fn status(self) -> u16 {
+        match self {
+            Self::Configuration | Self::Internal => 500,
+            Self::Integration | Self::Timeout => 504,
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Timeout => "Endpoint request timed out",
+            Self::Configuration | Self::Integration | Self::Internal => "Internal server error",
+        }
+    }
+}
+
+impl InvokeFailure {
+    pub(crate) fn http_api_status(self) -> u16 {
+        use crate::http_integration::HttpIntegrationError as HttpError;
+        match self {
+            Self::Timeout | Self::Http(HttpError::Timeout) => 504,
+            Self::Configuration
+            | Self::Dispatch
+            | Self::ResponseTooLarge
+            | Self::ResponseRead
+            | Self::Http(
+                HttpError::InvalidUrl
+                | HttpError::InvalidOrigin(_)
+                | HttpError::DestinationDenied
+                | HttpError::HostProbe
+                | HttpError::DnsResolution
+                | HttpError::DnsAnswers
+                | HttpError::CacheUnavailable
+                | HttpError::ClientInitialization
+                | HttpError::TlsConfiguration
+                | HttpError::Connection,
+            ) => 500,
+        }
+    }
+
+    pub(crate) fn gateway_failure(self) -> GatewayFailure {
+        use crate::http_integration::HttpIntegrationError as HttpError;
+        match self {
+            Self::Configuration => GatewayFailure::Configuration,
+            Self::Timeout | Self::Http(HttpError::Timeout) => GatewayFailure::Timeout,
+            Self::Http(HttpError::Connection) | Self::ResponseRead => GatewayFailure::Integration,
+            Self::Http(
+                HttpError::InvalidUrl
+                | HttpError::InvalidOrigin(_)
+                | HttpError::DestinationDenied
+                | HttpError::HostProbe
+                | HttpError::DnsResolution
+                | HttpError::DnsAnswers
+                | HttpError::CacheUnavailable
+                | HttpError::ClientInitialization
+                | HttpError::TlsConfiguration,
+            ) => GatewayFailure::Configuration,
+            // AWS's exact oversized backend response error is not yet verified.
+            // Preserve its existing generic 500, rather than treating it as request 413.
+            Self::ResponseTooLarge | Self::Dispatch => GatewayFailure::Internal,
+        }
+    }
+
+    pub(crate) fn cause_code(self) -> &'static str {
+        use crate::http_integration::HttpIntegrationError as HttpError;
+        match self {
+            Self::Configuration => "integration_configuration",
+            Self::Dispatch => "integration_dispatch",
+            Self::Timeout | Self::Http(HttpError::Timeout) => "integration_timeout",
+            Self::Http(HttpError::InvalidUrl | HttpError::InvalidOrigin(_)) => {
+                "invalid_integration_url"
+            }
+            Self::Http(HttpError::DestinationDenied) => "destination_denied",
+            Self::Http(HttpError::HostProbe) => "host_address_check_failed",
+            Self::Http(HttpError::DnsAnswers) => "dns_answer_limit",
+            Self::Http(HttpError::DnsResolution) => "dns_resolution_failed",
+            Self::Http(HttpError::CacheUnavailable) => "http_client_cache_unavailable",
+            Self::Http(HttpError::ClientInitialization) => "http_client_initialization_failed",
+            Self::Http(HttpError::TlsConfiguration) => "tls_configuration_failed",
+            Self::Http(HttpError::Connection) => "connection_failed",
+            Self::ResponseTooLarge => "integration_response_too_large",
+            Self::ResponseRead => "integration_response_read_failed",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integration_contracts_distinguish_configuration_transport_and_response_size() {
+        use crate::http_integration::HttpIntegrationError as HttpError;
+        let configuration = InvokeFailure::Http(HttpError::DestinationDenied);
+        let transport = InvokeFailure::Http(HttpError::Connection);
+        let timeout = InvokeFailure::Http(HttpError::Timeout);
+        assert_eq!(
+            configuration.gateway_failure().response_type(),
+            "API_CONFIGURATION_ERROR"
+        );
+        assert_eq!(configuration.gateway_failure().status(), 500);
+        assert_eq!(
+            transport.gateway_failure().response_type(),
+            "INTEGRATION_FAILURE"
+        );
+        assert_eq!(transport.gateway_failure().status(), 504);
+        assert_eq!(
+            timeout.gateway_failure().response_type(),
+            "INTEGRATION_TIMEOUT"
+        );
+        assert_eq!(timeout.gateway_failure().status(), 504);
+        assert_eq!(
+            InvokeFailure::ResponseTooLarge
+                .gateway_failure()
+                .response_type(),
+            "DEFAULT_5XX"
+        );
+        assert_eq!(
+            InvokeFailure::ResponseTooLarge.gateway_failure().status(),
+            500
+        );
+        assert_eq!(transport.http_api_status(), 500);
+        assert_eq!(timeout.http_api_status(), 504);
+    }
 
     #[test]
     fn codes_and_statuses() {
@@ -105,11 +261,7 @@ mod tests {
                 "TooManyRequestsException",
                 429,
             ),
-            (
-                ApiGwError::Internal("x".into()),
-                "InternalFailureException",
-                500,
-            ),
+            (ApiGwError::Internal("x".into()), "InternalFailure", 500),
             (ApiGwError::Gone("x".into()), "GoneException", 410),
             (
                 ApiGwError::PayloadTooLarge("x".into()),

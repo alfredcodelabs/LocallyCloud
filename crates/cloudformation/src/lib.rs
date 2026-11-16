@@ -10,6 +10,8 @@
 //! This is the surface the Serverless Framework (which deploys exclusively via CloudFormation)
 //! and other CloudFormation-based tools consume.
 
+pub mod config;
+pub use config::CloudFormationConfig;
 pub mod error;
 pub mod model;
 mod persistence;
@@ -21,4 +23,7 @@ pub mod store;
 pub mod template;
 pub mod xml;
 
-pub use service::{register, register_with_state, register_with_state_and_endpoint};
+pub use service::{
+    register, register_with_state, register_with_state_and_endpoint,
+    register_with_state_and_endpoint_config,
+};

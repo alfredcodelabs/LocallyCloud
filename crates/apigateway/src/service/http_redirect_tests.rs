@@ -277,3 +277,90 @@ async fn rest_http_omits_sigv4_authorization_without_changing_other_schemes_or_v
     }
     assert_eq!(hits.load(Ordering::SeqCst), 12);
 }
+
+#[tokio::test]
+async fn rest_http_proxy_uses_configured_gateway_responses_for_local_policy_failures() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed = hits.clone();
+    let backend = serve(Router::new().fallback(get(move || {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            "must not run"
+        }
+    })))
+    .await;
+    let registry = ServiceRegistry::with_known_services();
+    let handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    let path = wire_api(&handler, "REST", &backend.url).await;
+    let api = path.split('/').nth(2).unwrap();
+    control(
+        &handler,
+        Method::PUT,
+        &format!("/restapis/{api}/gatewayresponses/API_CONFIGURATION_ERROR"),
+        json!({"statusCode":"503","responseParameters":{"gatewayresponse.header.x-owned-error":"'configured'"},"responseTemplates":{"application/json":"{\"message\":\"configured failure\"}"}}),
+    )
+    .await;
+    control(
+        &handler,
+        Method::POST,
+        &format!("/restapis/{api}/deployments"),
+        json!({"stageName":"prod"}),
+    )
+    .await;
+    let response = handler
+        .handle(request(Method::GET, &path, Value::Null))
+        .await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.headers().get("x-amzn-requestid").unwrap(),
+        "http-redirect"
+    );
+    assert_eq!(
+        response.headers().get("x-owned-error").unwrap(),
+        "configured"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"message":"configured failure"})
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rest_http_transport_failure_uses_integration_failure_504() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let backend = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        drop(socket);
+    });
+    let registry = ServiceRegistry::with_known_services();
+    let mut handler = ApiGwHandler::new(Arc::downgrade(&registry));
+    handler.http =
+        crate::http_integration::HttpIntegrationClient::new(std::slice::from_ref(&origin), &[])
+            .unwrap();
+    let path = wire_api(&handler, "REST", &origin).await;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handler.handle(request(Method::GET, &path, Value::Null)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 504);
+    assert_eq!(
+        response.headers().get("x-amzn-requestid").unwrap(),
+        "http-redirect"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"message":"Internal server error"})
+    );
+    backend.await.unwrap();
+}

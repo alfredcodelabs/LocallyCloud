@@ -122,7 +122,7 @@ impl AwsError {
             message: message.into(),
             http_status,
             request_id: String::new(),
-            sender_fault: true,
+            sender_fault: http_status < 500,
             rest_json_message_key: "message",
             xml_namespace: None,
         }
@@ -338,5 +338,25 @@ mod tests {
     fn status_is_carried_through() {
         let e = AwsError::new("TooManyRequestsException", "slow down", 429);
         assert_eq!(e.render(AwsProtocol::RestJson).status, 429);
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+
+    #[test]
+    fn query_fault_default_tracks_client_and_server_errors() {
+        for (status, code, fault) in [
+            (400, "ValidationError", "Sender"),
+            (403, "AccessDenied", "Sender"),
+            (500, "InternalFailure", "Receiver"),
+            (503, "ServiceUnavailable", "Receiver"),
+        ] {
+            let response = AwsError::new(code, "safe message", status).render(AwsProtocol::Query);
+            let body = response.body;
+            assert!(body.contains(&format!("<Type>{fault}</Type>")));
+            assert!(body.contains(&format!("<Code>{code}</Code>")));
+        }
     }
 }

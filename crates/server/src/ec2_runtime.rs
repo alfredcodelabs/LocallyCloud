@@ -1,6 +1,8 @@
 //! Narrow EC2 adapter for a local OCI HTTP image.
 
-use std::path::PathBuf;
+use serde::{Deserialize, Deserializer};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,12 +11,90 @@ use locallycloud_compute::youki::YoukiRuntime;
 use locallycloud_ec2::{InstanceRuntime, InstanceSpec};
 use tokio::net::TcpStream;
 
+fn configured_path<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PathBuf>, D::Error> {
+    PathBuf::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ec2RuntimeConfig {
+    #[serde(deserialize_with = "configured_path")]
+    pub image_rootfs: Option<PathBuf>,
+    pub startup_timeout_secs: u64,
+    pub connect_timeout_secs: u64,
+}
+
+impl Default for Ec2RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            image_rootfs: None,
+            startup_timeout_secs: 5,
+            connect_timeout_secs: 2,
+        }
+    }
+}
+
+impl Ec2RuntimeConfig {
+    pub fn resolve_with(
+        mut self,
+        get: &dyn Fn(&str) -> Option<OsString>,
+        current_dir: &Path,
+    ) -> Result<Self, String> {
+        if let Some(path) = get("LOCALLYCLOUD_EC2_IMAGE_ROOTFS") {
+            self.image_rootfs = Some(path.into());
+        }
+        for (name, target) in [
+            (
+                "LOCALLYCLOUD_EC2_STARTUP_TIMEOUT_SECS",
+                &mut self.startup_timeout_secs,
+            ),
+            (
+                "LOCALLYCLOUD_EC2_CONNECT_TIMEOUT_SECS",
+                &mut self.connect_timeout_secs,
+            ),
+        ] {
+            if let Some(value) = get(name) {
+                *target = value
+                    .to_str()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or_else(|| format!("{name} must be an integer"))?;
+            }
+        }
+        for (name, value) in [
+            ("startup_timeout_secs", self.startup_timeout_secs),
+            ("connect_timeout_secs", self.connect_timeout_secs),
+        ] {
+            if !(1..=300).contains(&value) {
+                return Err(format!("ec2.{name} must be between 1 and 300"));
+            }
+        }
+        if let Some(path) = &mut self.image_rootfs {
+            if path.as_os_str().is_empty() {
+                return Err("ec2.image_rootfs must not be empty".into());
+            }
+            if path.is_relative() {
+                *path = current_dir.join(&*path);
+            }
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Default)]
 pub struct Ec2OciRuntime {
     runtime: Mutex<Option<Arc<YoukiRuntime>>>,
+    config: Ec2RuntimeConfig,
 }
 
 impl Ec2OciRuntime {
+    pub fn new(config: Ec2RuntimeConfig) -> Self {
+        Self {
+            runtime: Mutex::new(None),
+            config,
+        }
+    }
     fn runtime(&self) -> Result<Arc<YoukiRuntime>, String> {
         let mut runtime = self
             .runtime
@@ -38,12 +118,18 @@ impl InstanceRuntime for Ec2OciRuntime {
         {
             return Err("Only ami-locallycloud-http on t3.micro port 8080 is supported".into());
         }
-        let rootfs = std::env::var_os("LOCALLYCLOUD_EC2_IMAGE_ROOTFS")
-            .map(PathBuf::from)
-            .ok_or_else(|| "LOCALLYCLOUD_EC2_IMAGE_ROOTFS is required".to_owned())?
-            .canonicalize()
-            .map_err(|error| format!("EC2 image rootfs is unavailable: {error}"))?;
-        if !rootfs.is_dir() {
+        let configured = self.config.image_rootfs.as_ref().ok_or_else(|| {
+            "Configure ec2.image_rootfs or LOCALLYCLOUD_EC2_IMAGE_ROOTFS to run EC2 instances"
+                .to_owned()
+        })?;
+        let rootfs = tokio::fs::canonicalize(configured)
+            .await
+            .map_err(|_| "EC2 image rootfs is unavailable".to_owned())?;
+        if !tokio::fs::metadata(&rootfs)
+            .await
+            .map_err(|_| "EC2 image rootfs is unavailable".to_owned())?
+            .is_dir()
+        {
             return Err("EC2 image rootfs must be a directory".into());
         }
         let runtime = self.runtime()?;
@@ -62,7 +148,7 @@ impl InstanceRuntime for Ec2OciRuntime {
                 &spec.instance_id,
                 &task,
                 spec.guest_port,
-                Duration::from_secs(5),
+                Duration::from_secs(self.config.startup_timeout_secs),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -75,7 +161,11 @@ impl InstanceRuntime for Ec2OciRuntime {
         guest_port: u16,
     ) -> Result<TcpStream, String> {
         self.runtime()?
-            .connect_isolated_tcp(instance_id, guest_port, Duration::from_secs(2))
+            .connect_isolated_tcp(
+                instance_id,
+                guest_port,
+                Duration::from_secs(self.config.connect_timeout_secs),
+            )
             .await
             .map_err(|error| error.to_string())
     }
@@ -108,5 +198,40 @@ impl InstanceRuntime for Ec2OciRuntime {
             runtime.task_state(instance_id).await,
             Ok(TaskState::Running)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn absent_or_missing_rootfs_fails_only_when_an_instance_is_started() {
+        let spec = InstanceSpec {
+            instance_id: "i-owned-test".into(),
+            image_id: "ami-locallycloud-http".into(),
+            instance_type: "t3.micro".into(),
+            vpc_id: "vpc-owned".into(),
+            subnet_id: "subnet-owned".into(),
+            private_ip: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            security_group_ids: Vec::new(),
+            guest_port: 8080,
+        };
+        let runtime = Ec2OciRuntime::new(Ec2RuntimeConfig::default());
+        let error = runtime.start_instance(&spec).await.unwrap_err();
+        assert!(error.contains("ec2.image_rootfs"));
+        let config = Ec2RuntimeConfig {
+            image_rootfs: Some(
+                std::env::temp_dir()
+                    .join(uuid::Uuid::new_v4().to_string())
+                    .join("missing-rootfs"),
+            ),
+            ..Default::default()
+        };
+        let error = Ec2OciRuntime::new(config)
+            .start_instance(&spec)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "EC2 image rootfs is unavailable");
     }
 }

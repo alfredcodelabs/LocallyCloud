@@ -19,10 +19,10 @@ pub mod store;
 pub mod sts;
 mod tag_pagination;
 
-pub use config::{IamConfig, IamConfigError};
+pub use config::{IamConfig, IamConfigError, IamCredentials};
 pub use persistence::authenticate_state_key;
 
 pub use service::{
-    register, register_with_account_and_config, register_with_state_and_config,
-    register_with_store_and_mode,
+    register, register_with_account_and_config, register_with_account_and_inputs,
+    register_with_state_and_config, register_with_state_and_inputs, register_with_store_and_mode,
 };

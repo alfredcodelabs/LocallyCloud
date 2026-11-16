@@ -788,7 +788,7 @@ impl Executor {
             log_state: DashMap::new(),
             owned_envs: DashMap::new(),
             environment_functions: DashMap::new(),
-            memory_budget_mb: Self::DEFAULT_MEMORY_BUDGET_MB,
+            memory_budget_mb: crate::config::DEFAULT_MEMORY_BUDGET_MB,
             memory_reservations: Arc::new(Mutex::new(HashMap::new())),
             stopping: DashMap::new(),
             closed: AtomicBool::new(false),
@@ -797,9 +797,9 @@ impl Executor {
             warm: DashMap::new(),
             warm_gate: Mutex::new(()),
             warm_sequence: AtomicU64::new(0),
-            idle_timeout: Duration::from_secs(300),
-            max_warm_per_key: 10,
-            max_warm_total: 16,
+            idle_timeout: Duration::from_secs(crate::config::DEFAULT_WARM_IDLE_TIMEOUT_SECS),
+            max_warm_per_key: crate::config::DEFAULT_MAX_WARM_PER_KEY,
+            max_warm_total: crate::config::DEFAULT_MAX_WARM_TOTAL,
             init_timeout: INIT_TIMEOUT,
             sampler: crate::trace_header::Sampler::default(),
             xray_daemons: DashMap::new(),
@@ -835,27 +835,14 @@ impl Executor {
         self.layers.clone()
     }
 
-    pub(crate) fn parse_max_warm_total(value: Option<&str>) -> Result<usize, String> {
-        match value {
-            None => Ok(16),
-            Some(raw) => match raw.parse::<usize>() {
-                Ok(limit) if limit <= 1024 => Ok(limit),
-                _ => Err("expected an integer from 0 to 1024".into()),
-            },
-        }
-    }
-
-    pub(crate) const DEFAULT_MEMORY_BUDGET_MB: u64 = 4096;
-
-    pub(crate) fn parse_memory_budget(value: Option<&str>) -> Result<u64, String> {
-        match value {
-            None => Ok(Self::DEFAULT_MEMORY_BUDGET_MB),
-            Some(raw) => raw
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value > 0 && *value <= u64::from(u32::MAX))
-                .ok_or_else(|| "expected a positive memory budget in MiB".into()),
-        }
+    pub(crate) fn with_warm_pool_limits(
+        mut self,
+        max_per_key: usize,
+        idle_timeout_secs: u64,
+    ) -> Self {
+        self.max_warm_per_key = max_per_key;
+        self.idle_timeout = Duration::from_secs(idle_timeout_secs);
+        self
     }
 
     pub(crate) fn with_memory_budget(mut self, memory_mb: u64) -> Self {
@@ -3787,12 +3774,6 @@ mod tests {
 
     #[tokio::test]
     async fn memory_budget_evicts_warm_and_releases_after_shutdown_and_start_failure() {
-        assert_eq!(Executor::parse_memory_budget(None).unwrap(), 4096);
-
-        assert!(Executor::parse_memory_budget(None).unwrap() >= 1024 + 32);
-        for invalid in ["0", "-1", "oops", "18446744073709551615"] {
-            assert!(Executor::parse_memory_budget(Some(invalid)).is_err());
-        }
         let broker = Arc::new(InvocationBroker::new());
         let mut exec = build_executor(broker, GuestBehavior::EchoUppercaseLen).await;
         exec.memory_budget_mb = 160; // 128 MiB guest + 32 MiB host overhead.
@@ -4241,16 +4222,6 @@ mod tests {
             1,
             "second invoke reused the warm env"
         );
-    }
-
-    #[test]
-    fn global_warm_limit_configuration_is_validated() {
-        assert_eq!(Executor::parse_max_warm_total(None).unwrap(), 16);
-        assert_eq!(Executor::parse_max_warm_total(Some("0")).unwrap(), 0);
-        assert_eq!(Executor::parse_max_warm_total(Some("1024")).unwrap(), 1024);
-        for value in ["", "-1", "1.5", "1025", "many"] {
-            assert!(Executor::parse_max_warm_total(Some(value)).is_err());
-        }
     }
 
     #[tokio::test]
@@ -6714,7 +6685,7 @@ mod tests {
         assert_eq!(bad_qual.status(), 404);
 
         // An oversized async payload → 413 RequestTooLarge.
-        let big = vec![b'x'; 256 * 1024 + 1];
+        let big = vec![b'x'; 1024 * 1024 + 1];
         let too_big = handler
             .handle(req(
                 Method::POST,

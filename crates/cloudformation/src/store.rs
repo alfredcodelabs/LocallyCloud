@@ -31,7 +31,9 @@ impl Default for CfnStore {
             persistence: None,
             mutation: Mutex::new(()),
             operations: Mutex::new(Default::default()),
-            operation_limit: Arc::new(tokio::sync::Semaphore::new(4)),
+            operation_limit: Arc::new(tokio::sync::Semaphore::new(
+                crate::CloudFormationConfig::default().operation_capacity,
+            )),
         }
     }
 }
@@ -107,14 +109,32 @@ impl CfnStore {
     }
 
     pub fn with_state(db: &StateDb) -> Result<Arc<Self>, CfnError> {
-        let cipher = StateCipher::from_env().map_err(|_| CfnError::Internal)?;
-        Self::with_cipher(db, cipher)
+        Self::with_state_and_config(db, crate::CloudFormationConfig::default())
     }
 
+    pub fn with_state_and_config(
+        db: &StateDb,
+        config: crate::CloudFormationConfig,
+    ) -> Result<Arc<Self>, CfnError> {
+        let cipher = StateCipher::from_env().map_err(|_| CfnError::Internal)?;
+        Self::with_cipher_and_config(db, cipher, config)
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_cipher(db: &StateDb, cipher: StateCipher) -> Result<Arc<Self>, CfnError> {
+        Self::with_cipher_and_config(db, cipher, crate::CloudFormationConfig::default())
+    }
+
+    fn with_cipher_and_config(
+        db: &StateDb,
+        cipher: StateCipher,
+        config: crate::CloudFormationConfig,
+    ) -> Result<Arc<Self>, CfnError> {
+        config.validate().map_err(CfnError::Validation)?;
         let persistence = Persistence::new(db, cipher)?;
         let store = Self {
             persistence: Some(persistence),
+            operation_limit: Arc::new(tokio::sync::Semaphore::new(config.operation_capacity)),
             ..Self::default()
         };
         store
@@ -575,6 +595,32 @@ fn apply_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_stack_operation_capacity_is_enforced_and_released() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compatibility-tests/.work/cfn-capacity")
+            .join(uuid::Uuid::new_v4().to_string());
+        let db = StateDb::open(root.join("state.sqlite3")).unwrap();
+        let store = CfnStore::with_cipher_and_config(
+            &db,
+            StateCipher::with_key(&[47; 32]),
+            crate::CloudFormationConfig {
+                operation_capacity: 2,
+            },
+        )
+        .unwrap();
+        let first = store.operation("owner", "region", "one").unwrap();
+        let second = store.operation("owner", "region", "two").unwrap();
+        assert!(matches!(
+            store.operation("owner", "region", "three"),
+            Err(CfnError::LimitExceeded(_))
+        ));
+        drop(first);
+        let third = store.operation("owner", "region", "three").unwrap();
+        drop((second, third, store, db));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn progress_is_incremental_visible_and_recovered_before_interruption() {

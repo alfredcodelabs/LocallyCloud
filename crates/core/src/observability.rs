@@ -1,27 +1,40 @@
 //! Structured observability.
 //!
-//! Initializes tracing (JSON primary, plain-text fallback) and emits per-request
+//! Formats tracing for interactive consoles or JSON consumers and emits per-request
 //! routing-decision records correlated by request id. Never logs SigV4 signatures, secret
 //! keys or security tokens. See Requirement 19.
 
 use crate::router::RoutingDecision;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter};
+mod logging;
+pub use logging::{init_tracing, LogColor, LogFormat, LoggingConfig};
 
-/// Initialize the global tracing subscriber. Tries JSON output first and falls back to
-/// plain text rather than terminating startup if JSON initialization fails (Req 19.5).
-/// Idempotent: a second call is a no-op once a global subscriber exists.
-pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let json_ok = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().json())
-        .try_init()
-        .is_ok();
-    if !json_ok {
-        // Either a subscriber is already set, or JSON could not initialize. A plain-text
-        // attempt covers the latter and is harmless for the former.
-        let _ = fmt().try_init();
+/// Record a failure once at its owning boundary, using only approved diagnostic fields.
+/// Callers supply a static/typed cause code, never a raw source error or client payload.
+pub fn log_service_error(
+    service: &str,
+    operation: Option<&str>,
+    request_id: &str,
+    cause_code: &str,
+    status: u16,
+) {
+    if status >= 500 {
+        tracing::error!(
+            service,
+            operation,
+            request_id,
+            cause_code,
+            status,
+            "service request failed"
+        );
+    } else {
+        tracing::debug!(
+            service,
+            operation,
+            request_id,
+            cause_code,
+            status,
+            "service request rejected"
+        );
     }
 }
 

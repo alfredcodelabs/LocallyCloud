@@ -4,9 +4,13 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::ec2_runtime::Ec2RuntimeConfig;
 use locallycloud_apigateway::ApiGatewayConfig;
+use locallycloud_cloudformation::CloudFormationConfig;
 use locallycloud_core::config::LocallyCloudConfig;
-use locallycloud_iam_sts::IamConfig;
+use locallycloud_core::observability::{LogColor, LogFormat, LoggingConfig};
+use locallycloud_iam_sts::{IamConfig, IamCredentials};
+use locallycloud_lambda::config::{LambdaExecutionConfig, ResolvedLambdaExecutionConfig};
 use locallycloud_state::StateDb;
 use serde::{Deserialize, Deserializer};
 use tokio::io::AsyncReadExt;
@@ -30,8 +34,13 @@ pub enum StartupError {
 pub struct StartupConfig {
     pub common: LocallyCloudConfig,
     pub iam: IamConfig,
+    pub iam_credentials: IamCredentials,
+    pub lambda: ResolvedLambdaExecutionConfig,
+    pub ec2: Ec2RuntimeConfig,
+    pub cloudformation: CloudFormationConfig,
     pub apigateway: ApiGatewayConfig,
     pub state: StateConfig,
+    pub logging: LoggingConfig,
 }
 
 pub struct StateConfig {
@@ -90,8 +99,12 @@ struct StateOverrides {
 struct FileConfig {
     common: CommonOverrides,
     iam: IamConfig,
+    lambda: LambdaExecutionConfig,
+    ec2: Ec2RuntimeConfig,
+    cloudformation: CloudFormationConfig,
     apigateway: ApiGatewayConfig,
     state: StateOverrides,
+    logging: LoggingConfig,
 }
 
 fn invalid(setting: &str) -> StartupError {
@@ -144,6 +157,31 @@ impl StartupConfig {
         get: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<Self, StartupError> {
         let common = resolve_common(document.common, get)?;
+        let mut logging = document.logging;
+        if let Some(value) = get("RUST_LOG") {
+            logging.filter = value.into_string().map_err(|_| invalid("RUST_LOG"))?;
+        }
+        if let Some(value) = get("LOCALLYCLOUD_LOG_FORMAT") {
+            logging.format = match value.to_str() {
+                Some("auto") => LogFormat::Auto,
+                Some("pretty") => LogFormat::Pretty,
+                Some("json") => LogFormat::Json,
+                _ => return Err(invalid("LOCALLYCLOUD_LOG_FORMAT")),
+            };
+        }
+        if let Some(value) = get("LOCALLYCLOUD_LOG_COLOR") {
+            logging.color = match value.to_str() {
+                Some("auto") => LogColor::Auto,
+                Some("always") => LogColor::Always,
+                Some("never") => LogColor::Never,
+                _ => return Err(invalid("LOCALLYCLOUD_LOG_COLOR")),
+            };
+        }
+        if logging.color == LogColor::Auto && get("NO_COLOR").is_some_and(|value| !value.is_empty())
+        {
+            logging.color = LogColor::Never;
+        }
+        logging.validate().map_err(StartupError::Invalid)?;
         let iam = if ["LOCALLYCLOUD_IAM_ENFORCEMENT", "LOCALSTACK_IAM_ENFORCEMENT"]
             .iter()
             .any(|key| get(key).is_some())
@@ -152,8 +190,39 @@ impl StartupConfig {
         } else {
             document.iam
         };
+        let iam_credentials = IamCredentials::from_lookup(&common.account_id, iam, get)
+            .map_err(|error| StartupError::Invalid(error.to_string()))?;
+        let current_dir = std::env::current_dir()?;
+        let lambda = document
+            .lambda
+            .resolve_with(get, &current_dir)
+            .map_err(StartupError::Invalid)?;
+        let ec2 = document
+            .ec2
+            .resolve_with(get, &current_dir)
+            .map_err(StartupError::Invalid)?;
+        let mut cloudformation = document.cloudformation;
+        if let Some(value) = get("LOCALLYCLOUD_CLOUDFORMATION_OPERATION_CAPACITY") {
+            cloudformation.operation_capacity = value
+                .to_str()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| invalid("LOCALLYCLOUD_CLOUDFORMATION_OPERATION_CAPACITY"))?;
+        }
+        cloudformation.validate().map_err(StartupError::Invalid)?;
         let mut apigateway = document.apigateway;
         for (name, target) in [
+            (
+                "LOCALLYCLOUD_APIGATEWAY_HTTP_CLIENT_CACHE_CAPACITY",
+                &mut apigateway.http_client_cache_capacity,
+            ),
+            (
+                "LOCALLYCLOUD_APIGATEWAY_HTTP_MAX_IDLE_PER_HOST",
+                &mut apigateway.http_max_idle_per_host,
+            ),
+            (
+                "LOCALLYCLOUD_APIGATEWAY_HTTP_IDLE_TIMEOUT_SECS",
+                &mut apigateway.http_idle_timeout_secs,
+            ),
             (
                 "LOCALLYCLOUD_APIGATEWAY_WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY",
                 &mut apigateway.websocket_outbound_channel_capacity,
@@ -193,8 +262,13 @@ impl StartupConfig {
         Ok(Self {
             common,
             iam,
+            iam_credentials,
+            lambda,
+            ec2,
+            cloudformation,
             apigateway,
             state: StateConfig { path },
+            logging,
         })
     }
 }

@@ -62,6 +62,13 @@ impl CfnError {
     }
 
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
+        locallycloud_core::observability::log_service_error(
+            "cloudformation",
+            None,
+            request_id,
+            self.code(),
+            self.http_status(),
+        );
         let mut err = AwsError::new(self.code(), self.to_string(), self.http_status())
             .with_request_id(request_id.to_string())
             .with_xml_namespace(CFN_XMLNS);

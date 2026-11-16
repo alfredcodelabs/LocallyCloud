@@ -12,6 +12,7 @@ pub async fn s3(
     config: &LocallyCloudConfig,
     state_config: &crate::startup_config::StateConfig,
     iam_config: locallycloud_iam_sts::IamConfig,
+    credentials: locallycloud_iam_sts::IamCredentials,
 ) -> Result<(), String> {
     let state = state_config
         .open()
@@ -20,10 +21,12 @@ pub async fn s3(
     let _guard = state.lock_runtime().map_err(|error| error.to_string())?;
     let state = Arc::new(state);
     let registry = ServiceRegistry::with_known_services();
-    locallycloud_iam_sts::register_with_account_and_config(
+    let bootstrap_access_key = credentials.bootstrap_access_key_id().map(str::to_owned);
+    locallycloud_iam_sts::register_with_account_and_inputs(
         &registry,
         &config.account_id,
         iam_config,
+        credentials,
     )
     .map_err(|error| error.to_string())?;
     locallycloud_kms::register_with_state(&registry, state.clone())?;
@@ -50,7 +53,7 @@ pub async fn s3(
         account_id: config.account_id.clone(),
         request_id: "offline-s3-migration".into(),
     };
-    if let Ok(access) = std::env::var("LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID") {
+    if let Some(access) = bootstrap_access_key {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential={access}/19700101/{}/s3/aws4_request",
             config.default_region

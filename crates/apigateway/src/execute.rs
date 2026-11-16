@@ -21,6 +21,8 @@ use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::ServiceRegistry;
 use locallycloud_wafv2::{WafDecision, WafEvaluator, WafRequest};
 
+use crate::error::InvokeFailure;
+
 use crate::auth::{
     policy_allows, policy_decision, valid_rest_authorizer_policy, AuthOutcome, JwtConfig,
     JwtValidator,
@@ -123,13 +125,6 @@ struct AwsIntegrationUri<'a> {
     region: &'a str,
     service: &'a str,
     operation: AwsIntegrationOperation<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum InvokeFailure {
-    Configuration,
-    Dispatch,
-    Timeout,
 }
 
 #[derive(Debug, Default)]
@@ -424,6 +419,25 @@ pub async fn invoke(
     body: Bytes,
     custom_domain: bool,
 ) -> Response {
+    let mut response = invoke_inner(ctx, method, host, uri, headers, body, custom_domain).await;
+    if let Ok(request_id) = http::HeaderValue::from_str(ctx.request_id) {
+        response
+            .headers_mut()
+            .entry("x-amzn-requestid")
+            .or_insert(request_id);
+    }
+    response
+}
+
+async fn invoke_inner(
+    ctx: &ExecuteCtx<'_>,
+    method: &Method,
+    host: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+    custom_domain: bool,
+) -> Response {
     let target = match invocation_target(host, uri.path()) {
         Some(target) => target,
         None => return plain(404, "Not Found"),
@@ -458,10 +472,16 @@ async fn finish_logging(
     }
     let status = response.status().as_u16();
     let (parts, body) = response.into_parts();
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
+    let body = match axum::body::to_bytes(body, crate::http_integration::MAX_RESPONSE_BYTES).await {
         Ok(body) => body,
-        Err(error) => {
-            tracing::warn!(request_id = ctx.request_id, cause = %error, "failed to buffer response for API Gateway logging");
+        Err(_) => {
+            locallycloud_core::observability::log_service_error(
+                "apigateway",
+                None,
+                ctx.request_id,
+                "log_response_buffer_failed",
+                500,
+            );
             return logging_failure(&logging);
         }
     };
@@ -481,7 +501,7 @@ async fn finish_logging(
         response_length: body.len(),
         integration_status: logging.resource_path.as_ref().map(|_| status),
     };
-    if let Err(error) = emit_logs(
+    if emit_logs(
         ctx.registry,
         ctx.store,
         ctx.account,
@@ -490,8 +510,15 @@ async fn finish_logging(
         &values,
     )
     .await
+    .is_err()
     {
-        tracing::warn!(request_id = ctx.request_id, cause = %error, "API Gateway log delivery failed");
+        locallycloud_core::observability::log_service_error(
+            "apigateway",
+            None,
+            ctx.request_id,
+            "log_delivery_failed",
+            500,
+        );
         return logging_failure(&logging);
     }
     Response::from_parts(parts, Body::from(body))
@@ -557,8 +584,14 @@ async fn invoke_rest(
     };
     let logging = match logging.transpose() {
         Ok(logging) => logging,
-        Err(error) => {
-            tracing::warn!(request_id = ctx.request_id, cause = %error, "invalid stored API Gateway logging configuration");
+        Err(_) => {
+            locallycloud_core::observability::log_service_error(
+                "apigateway",
+                None,
+                ctx.request_id,
+                "invalid_stage_logging_configuration",
+                500,
+            );
             return plain(500, "Internal Server Error");
         }
     };
@@ -755,7 +788,7 @@ async fn invoke_rest_inner(
         None => {
             return rest_error(
                 &gateway_responses,
-                "INTEGRATION_FAILURE",
+                "API_CONFIGURATION_ERROR",
                 500,
                 "Internal server error",
             )
@@ -1184,8 +1217,14 @@ async fn invoke_http(
     };
     let logging = match logging.transpose() {
         Ok(logging) => logging,
-        Err(error) => {
-            tracing::warn!(request_id = ctx.request_id, cause = %error, "invalid stored API Gateway logging configuration");
+        Err(_) => {
+            locallycloud_core::observability::log_service_error(
+                "apigateway",
+                None,
+                ctx.request_id,
+                "invalid_stage_logging_configuration",
+                500,
+            );
             return plain(500, "Internal Server Error");
         }
     };
@@ -1392,12 +1431,24 @@ async fn jwt_authorize(
             jwt: Some((claims, scopes)),
             lambda: None,
         }),
-        AuthOutcome::Deny(reason) => {
-            tracing::info!(request_id = ctx.request_id, reason = %reason, "JWT authorizer denied request");
+        AuthOutcome::Deny(_) => {
+            locallycloud_core::observability::log_service_error(
+                "apigateway",
+                None,
+                ctx.request_id,
+                "jwt_authorizer_denied",
+                401,
+            );
             Err(401)
         }
-        AuthOutcome::Error(reason) => {
-            tracing::warn!(request_id = ctx.request_id, reason = %reason, "JWT authorizer failed");
+        AuthOutcome::Error(_) => {
+            locallycloud_core::observability::log_service_error(
+                "apigateway",
+                None,
+                ctx.request_id,
+                "jwt_authorizer_failed",
+                500,
+            );
             Err(500)
         }
     }
@@ -1963,8 +2014,7 @@ async fn execute_http_integration(
                     output.function_error,
                     &output.body,
                 )),
-                Err(InvokeFailure::Timeout) => plain(504, "Endpoint request timed out"),
-                Err(_) => plain(500, "Internal Server Error"),
+                Err(error) => integration_error(ctx, error, None),
             }
         }
         "HTTP_PROXY" => {
@@ -2018,18 +2068,7 @@ async fn execute_rest_integration(
                     output.function_error,
                     &output.body,
                 )),
-                Err(InvokeFailure::Timeout) => rest_error(
-                    gateway_responses,
-                    "INTEGRATION_TIMEOUT",
-                    504,
-                    "Endpoint request timed out",
-                ),
-                Err(_) => rest_error(
-                    gateway_responses,
-                    "INTEGRATION_FAILURE",
-                    500,
-                    "Internal server error",
-                ),
+                Err(error) => integration_error(ctx, error, Some(gateway_responses)),
             }
         }
         "AWS" => {
@@ -2046,7 +2085,7 @@ async fn execute_rest_integration(
                 Err(_) => {
                     return rest_error(
                         gateway_responses,
-                        "INTEGRATION_FAILURE",
+                        "API_CONFIGURATION_ERROR",
                         500,
                         "Internal server error",
                     )
@@ -2062,7 +2101,7 @@ async fn execute_rest_integration(
                 None => {
                     return rest_error(
                         gateway_responses,
-                        "INTEGRATION_FAILURE",
+                        "API_CONFIGURATION_ERROR",
                         500,
                         "Internal server error",
                     )
@@ -2097,18 +2136,7 @@ async fn execute_rest_integration(
             };
             match response {
                 Ok(response) => map_integration_response(ctx, integration, response, &request),
-                Err(InvokeFailure::Timeout) => rest_error(
-                    gateway_responses,
-                    "INTEGRATION_TIMEOUT",
-                    504,
-                    "Endpoint request timed out",
-                ),
-                Err(_) => rest_error(
-                    gateway_responses,
-                    "INTEGRATION_FAILURE",
-                    500,
-                    "Internal server error",
-                ),
+                Err(error) => integration_error(ctx, error, Some(gateway_responses)),
             }
         }
         "HTTP_PROXY" => {
@@ -2117,7 +2145,10 @@ async fn execute_rest_integration(
                 request.variables,
                 request.path_params,
             );
-            forward_http(ctx, integration, &request, &uri, request.body.clone()).await
+            match forward_http_raw(ctx, integration, &request, &uri, request.body.clone()).await {
+                Ok(response) => render_http_response(response),
+                Err(error) => integration_error(ctx, error, Some(gateway_responses)),
+            }
         }
         "HTTP" => {
             let mapped = match map_request(ctx, integration, &request) {
@@ -2133,7 +2164,7 @@ async fn execute_rest_integration(
                 Err(_) => {
                     return rest_error(
                         gateway_responses,
-                        "INTEGRATION_FAILURE",
+                        "API_CONFIGURATION_ERROR",
                         500,
                         "Internal server error",
                     )
@@ -2147,18 +2178,7 @@ async fn execute_rest_integration(
             let response = forward_http_raw(ctx, integration, &request, &uri, mapped).await;
             match response {
                 Ok(response) => map_integration_response(ctx, integration, response, &request),
-                Err(InvokeFailure::Timeout) => rest_error(
-                    gateway_responses,
-                    "INTEGRATION_TIMEOUT",
-                    504,
-                    "Endpoint request timed out",
-                ),
-                Err(_) => rest_error(
-                    gateway_responses,
-                    "INTEGRATION_FAILURE",
-                    500,
-                    "Internal server error",
-                ),
+                Err(error) => integration_error(ctx, error, Some(gateway_responses)),
             }
         }
         "MOCK" => {
@@ -2175,7 +2195,7 @@ async fn execute_rest_integration(
                 Err(_) => {
                     return rest_error(
                         gateway_responses,
-                        "INTEGRATION_FAILURE",
+                        "API_CONFIGURATION_ERROR",
                         500,
                         "Internal server error",
                     )
@@ -2199,7 +2219,7 @@ async fn execute_rest_integration(
         }
         _ => rest_error(
             gateway_responses,
-            "INTEGRATION_FAILURE",
+            "API_CONFIGURATION_ERROR",
             500,
             "Internal server error",
         ),
@@ -2318,9 +2338,12 @@ async fn invoke_aws_native(
     .map_err(|_| InvokeFailure::Timeout)?;
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .map_err(|_| InvokeFailure::Dispatch)?;
+    let body = axum::body::to_bytes(
+        response.into_body(),
+        crate::http_integration::MAX_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|_| InvokeFailure::Dispatch)?;
     Ok(RawIntegrationResponse {
         status,
         headers,
@@ -2343,6 +2366,42 @@ struct RawIntegrationResponse {
     selection: String,
 }
 
+fn integration_error(
+    ctx: &ExecuteCtx<'_>,
+    error: InvokeFailure,
+    gateway_responses: Option<&BTreeMap<String, Value>>,
+) -> Response {
+    let failure = error.gateway_failure();
+    let status = if gateway_responses.is_some() {
+        failure.status()
+    } else {
+        error.http_api_status()
+    };
+    locallycloud_core::observability::log_service_error(
+        "apigateway",
+        None,
+        ctx.request_id,
+        error.cause_code(),
+        status,
+    );
+    match gateway_responses {
+        Some(responses) => rest_error(
+            responses,
+            failure.response_type(),
+            status,
+            failure.message(),
+        ),
+        None => plain(
+            status,
+            if status == 500 {
+                "Internal Server Error"
+            } else {
+                failure.message()
+            },
+        ),
+    }
+}
+
 async fn forward_http(
     ctx: &ExecuteCtx<'_>,
     integration: &Value,
@@ -2351,16 +2410,17 @@ async fn forward_http(
     body: Bytes,
 ) -> Response {
     match forward_http_raw(ctx, integration, request, uri, body).await {
-        Ok(response) => {
-            let mut builder = http::Response::builder().status(response.status);
-            for (name, value) in response.headers.iter() {
-                builder = builder.header(name, value);
-            }
-            safe_response(builder, Body::from(response.body))
-        }
-        Err(InvokeFailure::Timeout) => plain(504, "Endpoint request timed out"),
-        Err(_) => plain(500, "Internal Server Error"),
+        Ok(response) => render_http_response(response),
+        Err(error) => integration_error(ctx, error, None),
     }
+}
+
+fn render_http_response(response: RawIntegrationResponse) -> Response {
+    let mut builder = http::Response::builder().status(response.status);
+    for (name, value) in response.headers.iter() {
+        builder = builder.header(name, value);
+    }
+    safe_response(builder, Body::from(response.body))
 }
 
 async fn forward_http_raw(
@@ -2383,7 +2443,7 @@ async fn forward_http_raw(
     let mut builder = ctx
         .http
         .request(method, &uri)
-        .map_err(|_| InvokeFailure::Configuration)?
+        .map_err(InvokeFailure::Http)?
         .timeout(Duration::from_millis(timeout_ms(integration)));
     let drop_authorization = match request.rest_authorization_type {
         Some("AWS_IAM") => true,
@@ -2406,12 +2466,9 @@ async fn forward_http_raw(
         builder = builder.header(name, value);
     }
     let response = builder.body(body).send().await.map_err(|error| {
-        if error.is_timeout() {
-            InvokeFailure::Timeout
-        } else {
-            tracing::warn!(request_id = ctx.request_id, cause = %error.without_url(), "HTTP integration failed");
-            InvokeFailure::Dispatch
-        }
+        InvokeFailure::Http(crate::http_integration::HttpIntegrationError::from_request(
+            &error,
+        ))
     })?;
     let status = response.status().as_u16();
     let headers = response.headers().clone();
@@ -2419,8 +2476,8 @@ async fn forward_http_raw(
         .await
         .map_err(|error| match error {
             crate::http_integration::BodyError::Timeout => InvokeFailure::Timeout,
-            crate::http_integration::BodyError::TooLarge
-            | crate::http_integration::BodyError::Read => InvokeFailure::Dispatch,
+            crate::http_integration::BodyError::TooLarge => InvokeFailure::ResponseTooLarge,
+            crate::http_integration::BodyError::Read => InvokeFailure::ResponseRead,
         })?;
     Ok(RawIntegrationResponse {
         status,
@@ -2854,9 +2911,12 @@ async fn invoke_lambda(
     let status = response.status().as_u16();
     let headers = response.headers().clone();
     let function_error = headers.contains_key("x-amz-function-error");
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .map_err(|_| InvokeFailure::Dispatch)?;
+    let body = axum::body::to_bytes(
+        response.into_body(),
+        crate::http_integration::MAX_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|_| InvokeFailure::Dispatch)?;
     Ok(LambdaOutput {
         status,
         headers,
@@ -3168,6 +3228,98 @@ mod tests {
             recorded.headers.get("x-amz-target").unwrap(),
             "DynamoDB_20120810.PutItem"
         );
+    }
+
+    #[tokio::test]
+    async fn native_and_lambda_response_buffers_enforce_the_shared_buffered_limit() {
+        struct SizedResponse(Bytes);
+        #[async_trait]
+        impl NativeHandler for SizedResponse {
+            async fn handle(&self, _: ServiceRequest) -> Response {
+                http::Response::builder()
+                    .status(200)
+                    .body(Body::from(self.0.clone()))
+                    .unwrap()
+            }
+        }
+        let limit = crate::http_integration::MAX_RESPONSE_BYTES;
+        for size in [limit, limit + 1] {
+            let handler = Arc::new(SizedResponse(Bytes::from(vec![b'x'; size])));
+            let registry = Arc::new(ServiceRegistry::new());
+            registry.register_native(
+                ServiceName::new("dynamodb"),
+                ServiceMetadata::new(AwsProtocol::Json10, Some("DynamoDB_20120810")),
+                handler.clone(),
+            );
+            registry.register_native(
+                ServiceName::new("lambda"),
+                ServiceMetadata::new(AwsProtocol::RestJson, None),
+                handler,
+            );
+            install_dispatcher(&registry);
+            let weak = Arc::downgrade(&registry);
+            let store = ApiGwStore::new();
+            let validator = JwtValidator::new();
+            let http = crate::http_integration::HttpIntegrationClient::new(&[], &[]).unwrap();
+            let ctx = ExecuteCtx {
+                original_request: None,
+                store: &store,
+                validator: &validator,
+                http: &http,
+                registry: &weak,
+                account: "000000000000",
+                region: "us-east-1",
+                request_id: "bounded-owned-response",
+                waf: None,
+                policy_context: &BTreeMap::new(),
+                trusted_peer_ip: None,
+                trace_header: None,
+                trace_sampler: &Sampler::default(),
+                stage_trace: None,
+            };
+            let method = Method::POST;
+            let uri = Uri::from_static("/source");
+            let headers = HeaderMap::new();
+            let params = BTreeMap::new();
+            let request = IntegrationRequest {
+                method: &method,
+                host: "owned.example",
+                uri: &uri,
+                headers: &headers,
+                rest_authorization_type: None,
+                body: Bytes::new(),
+                api_id: "api",
+                stage: "prod",
+                path: "/source",
+                route_template: "/source",
+                resource_id: "resource",
+                path_params: &params,
+                variables: &params,
+                auth: AuthContext::default(),
+            };
+            let integration = json!({"httpMethod":"POST"});
+            let target =
+                parse_aws_integration_uri("arn:aws:apigateway:us-east-1:dynamodb:action/GetItem")
+                    .unwrap();
+            let native =
+                invoke_aws_native(&ctx, &integration, &request, target, Bytes::new()).await;
+            let lambda = invoke_lambda(
+                &ctx,
+                "owned",
+                Bytes::new(),
+                1000,
+                "arn:aws:execute-api:us-east-1:000000000000:api/prod/POST/source",
+                None,
+            )
+            .await;
+            if size == limit {
+                assert_eq!(native.unwrap().body.len(), limit);
+                assert_eq!(lambda.unwrap().body.len(), limit);
+            } else {
+                assert!(matches!(native, Err(InvokeFailure::Dispatch)));
+                assert!(matches!(lambda, Err(InvokeFailure::Dispatch)));
+            }
+        }
     }
 
     #[tokio::test]

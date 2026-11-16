@@ -714,9 +714,12 @@ async fn invoke_lambda(
         return Err(());
     }
     let function_error = response.headers().contains_key("x-amz-function-error");
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .map_err(|_| ())?;
+    let body = axum::body::to_bytes(
+        response.into_body(),
+        crate::http_integration::MAX_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|_| ())?;
     Ok(LambdaOutput {
         function_error,
         body,

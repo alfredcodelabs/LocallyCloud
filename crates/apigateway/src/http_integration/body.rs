@@ -3,7 +3,7 @@
 //! https://docs.aws.amazon.com/apigateway/latest/developerguide/response-transfer-mode.html
 use bytes::{Bytes, BytesMut};
 
-const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyError {

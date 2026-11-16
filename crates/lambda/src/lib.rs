@@ -6,6 +6,7 @@
 
 pub mod code_store;
 pub mod concurrency;
+pub mod config;
 pub mod control_plane;
 pub mod error;
 pub mod esm;
