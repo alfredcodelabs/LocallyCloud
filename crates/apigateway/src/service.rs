@@ -800,6 +800,8 @@ impl NativeHandler for ApiGwHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
+        let policy_context =
+            locallycloud_core::integration::request_context::verified_request_context(&request);
         let mut request = request;
         let trusted_peer_ip = request
             .headers
@@ -920,6 +922,7 @@ impl NativeHandler for ApiGwHandler {
                 region: &request.region,
                 request_id: &request.request_id,
                 waf,
+                policy_context: &policy_context,
                 trusted_peer_ip: trusted_peer_ip.as_deref(),
                 trace_header: request.headers.get("x-amzn-trace-id"),
                 trace_sampler: &self.trace_sampler,
@@ -976,6 +979,30 @@ impl NativeHandler for ApiGwHandler {
                 )
                 .into_response(&request.request_id);
             }
+        }
+        let changes_policy = request.method == Method::PATCH
+            && segs.len() == 2
+            && segs[0] == "restapis"
+            && body
+                .get("patchOperations")
+                .and_then(Value::as_array)
+                .is_some_and(|patches| {
+                    patches
+                        .iter()
+                        .any(|patch| patch.get("path").and_then(Value::as_str) == Some("/policy"))
+                });
+        if changes_policy
+            && locallycloud_core::integration::authorization::authorize_native_read(
+                &self.registry,
+                &request,
+                "apigateway",
+                "apigateway:UpdateRestApiPolicy",
+                &format!("arn:aws:apigateway:{}::{}", request.region, path),
+            )
+            .is_err()
+        {
+            return ApiGwError::Forbidden("Not authorized to update REST API policy".into())
+                .into_response(&request.request_id);
         }
         let write = !matches!(request.method, Method::GET | Method::HEAD | Method::OPTIONS);
         let _write = if write {

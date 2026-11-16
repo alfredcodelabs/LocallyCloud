@@ -242,6 +242,13 @@ pub async fn create_rest_api(ctx: &Ctx<'_>, body: &Value) -> Out {
     let name = req_str(body, "name")?;
     let id = gen_id();
     let root_id = gen_id();
+    let policy = crate::resource_policy::normalize(
+        ctx.registry,
+        body.get("policy").unwrap_or(&Value::Null),
+        ctx.account,
+        ctx.region,
+        &id,
+    )?;
     let api = json!({
         "id": id,
         "name": name,
@@ -253,7 +260,7 @@ pub async fn create_rest_api(ctx: &Ctx<'_>, body: &Value) -> Out {
         "endpointConfiguration": body.get("endpointConfiguration").cloned().unwrap_or(json!({ "types": ["EDGE"] })),
         "binaryMediaTypes": body.get("binaryMediaTypes").cloned().unwrap_or(json!([])),
         "minimumCompressionSize": body.get("minimumCompressionSize").cloned().unwrap_or(Value::Null),
-        "policy": body.get("policy").cloned().unwrap_or(Value::Null),
+        "policy": policy,
         "tags": crate::tags::input_tags(body.get("tags").unwrap_or(&json!({})))?,
         "disableExecuteApiEndpoint": body.get("disableExecuteApiEndpoint").and_then(Value::as_bool).unwrap_or(false),
     });
@@ -301,6 +308,13 @@ pub async fn update_rest_api(ctx: &Ctx<'_>, api_id: &str, body: &Value) -> Out {
             .strip_prefix("/binaryMediaTypes/")
             .is_some_and(|index| index.parse::<usize>().is_ok())
     })?;
+    updated["policy"] = crate::resource_policy::normalize(
+        ctx.registry,
+        updated.get("policy").unwrap_or(&Value::Null),
+        ctx.account,
+        ctx.region,
+        api_id,
+    )?;
     guard.api = updated.clone();
     Ok((200, updated))
 }

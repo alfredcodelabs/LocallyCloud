@@ -10,6 +10,7 @@ pub mod error;
 pub mod execute;
 pub mod logging;
 pub mod proxy_event;
+mod resource_policy;
 pub mod service;
 mod stage_path;
 pub mod store;

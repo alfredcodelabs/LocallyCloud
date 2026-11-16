@@ -48,8 +48,11 @@ impl Persistence {
                 .cipher
                 .open(&["apigateway", &account, &region], &payload)
                 .map_err(|e| e.to_string())?;
-            let snapshot: ScopeSnapshot =
-                serde_json::from_slice(&clear).map_err(|e| e.to_string())?;
+            let snapshot: ScopeSnapshot = serde_json::from_slice(&clear).map_err(|error| {
+                format!(
+                    "Incompatible API Gateway state; recreate local API Gateway resources: {error}"
+                )
+            })?;
             store.install_scope(&account, &region, snapshot);
         }
         Ok(())

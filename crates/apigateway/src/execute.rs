@@ -12,14 +12,19 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 use tokio::time::timeout;
 
-use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
+use locallycloud_core::integration::authorization::{
+    ResourcePolicyDecision, ServiceRoleAuthorizationRequest,
+};
 use locallycloud_core::integration::identity::{CallerIdentity, IdentityPropagator};
 use locallycloud_core::integration::lambda::MAX_TRACE_HEADER_LEN;
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::ServiceRegistry;
 use locallycloud_wafv2::{WafDecision, WafEvaluator, WafRequest};
 
-use crate::auth::{policy_allows, AuthOutcome, JwtConfig, JwtValidator};
+use crate::auth::{
+    policy_allows, policy_decision, valid_rest_authorizer_policy, AuthOutcome, JwtConfig,
+    JwtValidator,
+};
 use crate::logging::{
     emit as emit_logs, http_stage_logging, request_source_ip, request_user_agent,
     rest_stage_logging, RequestLogValues, StageLogging,
@@ -40,6 +45,7 @@ pub struct ExecuteCtx<'a> {
     pub region: &'a str,
     pub request_id: &'a str,
     pub waf: Option<std::sync::Arc<dyn WafEvaluator>>,
+    pub policy_context: &'a BTreeMap<String, Vec<String>>,
     pub trusted_peer_ip: Option<&'a str>,
     /// Client `X-Amzn-Trace-Id`, forwarded to Lambda integrations so the trace continues.
     pub trace_header: Option<&'a http::HeaderValue>,
@@ -687,6 +693,22 @@ async fn invoke_rest_inner(
         }
     };
     let gateway_responses = snapshot.gateway_responses.clone();
+    let resource_decision = match crate::resource_policy::evaluate(
+        ctx.registry,
+        &snapshot.policy,
+        format!(
+            "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
+            ctx.region, ctx.account, target.api_id, stage, method, path
+        ),
+        ctx.policy_context,
+    ) {
+        Ok(decision) => decision,
+        Err(()) => return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden"),
+    };
+    use locallycloud_core::integration::authorization::ResourcePolicyDecision;
+    if resource_decision == Some(ResourcePolicyDecision::ExplicitDeny) {
+        return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden");
+    }
     if route
         .value
         .get("apiKeyRequired")
@@ -742,6 +764,11 @@ async fn invoke_rest_inner(
     if !matches!(auth_type, "NONE" | "CUSTOM") {
         return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden");
     }
+    if auth_type == "NONE"
+        && resource_decision.is_some_and(|decision| decision != ResourcePolicyDecision::Allow)
+    {
+        return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden");
+    }
     let auth = if auth_type == "CUSTOM" {
         match authorizer {
             Some((id, authorizer)) => match lambda_authorize(
@@ -760,25 +787,18 @@ async fn invoke_rest_inner(
                 &route.template,
                 &route.params,
                 &variables,
+                resource_decision.unwrap_or(ResourcePolicyDecision::ImplicitDeny),
             )
             .await
             {
                 Ok(auth) => auth,
                 Err(status) => {
-                    return rest_error(
-                        &gateway_responses,
-                        if status == 401 {
-                            "UNAUTHORIZED"
-                        } else {
-                            "ACCESS_DENIED"
-                        },
-                        status,
-                        if status == 401 {
-                            "Unauthorized"
-                        } else {
-                            "Forbidden"
-                        },
-                    )
+                    let (response_type, message) = match status {
+                        401 => ("UNAUTHORIZED", "Unauthorized"),
+                        403 => ("ACCESS_DENIED", "Forbidden"),
+                        _ => ("AUTHORIZER_FAILURE", "Internal server error"),
+                    };
+                    return rest_error(&gateway_responses, response_type, status, message);
                 }
             },
             None => {
@@ -1247,6 +1267,7 @@ async fn invoke_http_inner(
                 &route.template,
                 &route.params,
                 &variables,
+                ResourcePolicyDecision::ImplicitDeny,
             )
             .await
             {
@@ -1454,6 +1475,7 @@ async fn lambda_authorize(
     route_template: &str,
     path_params: &BTreeMap<String, String>,
     stage_variables: &BTreeMap<String, String>,
+    resource_decision: ResourcePolicyDecision,
 ) -> Result<AuthContext, u16> {
     let query = query_map(uri.query().unwrap_or(""));
     let identities = identity_values(authorizer, Some(&query), headers, path_params);
@@ -1486,7 +1508,7 @@ async fn lambda_authorize(
             cached_authorizer(&guard.authorizer_cache, &cache_key)
         };
         if let Some(result) = cached {
-            return interpret_authorizer(kind, authorizer, &result, &method_arn);
+            return interpret_authorizer(kind, authorizer, &result, &method_arn, resource_decision);
         }
     }
 
@@ -1585,7 +1607,8 @@ async fn lambda_authorize(
         return Err(500);
     }
     let result: Value = serde_json::from_slice(&output.body).map_err(|_| 500u16)?;
-    let interpreted = interpret_authorizer(kind, authorizer, &result, &method_arn)?;
+    let interpreted =
+        interpret_authorizer(kind, authorizer, &result, &method_arn, resource_decision)?;
     if ttl > 0 {
         const MAX_AUTHORIZER_CACHE_ENTRIES: usize = 1024;
         let shared = ctx.store.shared(ctx.account, ctx.region);
@@ -1630,6 +1653,7 @@ fn interpret_authorizer(
     authorizer: &Value,
     result: &Value,
     route_arn: &str,
+    resource_decision: ResourcePolicyDecision,
 ) -> Result<AuthContext, u16> {
     if kind == ApiKind::Http
         && authorizer
@@ -1645,7 +1669,17 @@ fn interpret_authorizer(
             lambda: Some(result.get("context").cloned().unwrap_or_else(|| json!({}))),
         });
     }
-    if !policy_allows(result, route_arn) {
+    if kind == ApiKind::Rest {
+        if !valid_rest_authorizer_policy(result) {
+            return Err(500);
+        }
+        match (policy_decision(result, route_arn), resource_decision) {
+            (ResourcePolicyDecision::ExplicitDeny, _)
+            | (_, ResourcePolicyDecision::ExplicitDeny) => return Err(403),
+            (ResourcePolicyDecision::Allow, _) | (_, ResourcePolicyDecision::Allow) => {}
+            _ => return Err(403),
+        }
+    } else if !policy_allows(result, route_arn) {
         return Err(403);
     }
     let mut context = result
@@ -2971,6 +3005,7 @@ mod tests {
             region: "us-east-1",
             request_id: "rid",
             waf: None,
+            policy_context: &BTreeMap::new(),
             trusted_peer_ip: None,
             trace_header: None,
             trace_sampler: &Sampler::default(),
@@ -3072,6 +3107,7 @@ mod tests {
             region: "us-east-1",
             request_id: "rid",
             waf: None,
+            policy_context: &BTreeMap::new(),
             trusted_peer_ip: None,
             trace_header: None,
             trace_sampler: &Sampler::default(),
@@ -3103,3 +3139,7 @@ mod tests {
 #[cfg(test)]
 #[path = "execute/http_header_tests.rs"]
 mod http_header_tests;
+
+#[cfg(test)]
+#[path = "execute/rest_authorizer_policy_tests.rs"]
+mod rest_authorizer_policy_tests;

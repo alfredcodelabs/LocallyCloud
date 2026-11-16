@@ -46,6 +46,23 @@ pub struct AuthorizationRequest {
     pub context: BTreeMap<String, Vec<String>>,
 }
 
+/// The result of evaluating one resource policy without an identity-policy union.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourcePolicyDecision {
+    Allow,
+    ExplicitDeny,
+    ImplicitDeny,
+}
+
+/// Verified request properties for anonymous-only resource-policy evaluation.
+/// This request deliberately carries no credentials or delegated identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePolicyEvaluationRequest {
+    pub action: String,
+    pub resource: String,
+    pub context: BTreeMap<String, Vec<String>>,
+}
+
 /// Authorization for a service to use one IAM role for one concrete operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceRoleAuthorizationRequest {
@@ -102,6 +119,19 @@ pub trait AuthorizationEvaluator: Send + Sync {
     fn validate_resource_policy(&self, _document: &str) -> Result<(), ResourcePolicyError> {
         Err(ResourcePolicyError::Unsupported(
             "resource policies unavailable".into(),
+        ))
+    }
+
+    /// Evaluate only this document for an anonymous caller, regardless of SigV4.
+    /// Context must come from verified native-service metadata. Identity policies,
+    /// boundaries and session policies never participate in this decision.
+    fn evaluate_anonymous_resource_policy(
+        &self,
+        _request: ResourcePolicyEvaluationRequest,
+        _document: &str,
+    ) -> Result<ResourcePolicyDecision, ResourcePolicyError> {
+        Err(ResourcePolicyError::Unsupported(
+            "anonymous resource policy evaluation unavailable".into(),
         ))
     }
 
@@ -319,6 +349,19 @@ mod caller_tests {
                 .then(|| "arn:aws:iam::000000000000:user/operator".into()))
         }
     }
+    #[test]
+    fn anonymous_resource_policy_default_is_unavailable_even_for_an_allowing_evaluator() {
+        let result = Evaluator.evaluate_anonymous_resource_policy(
+            ResourcePolicyEvaluationRequest {
+                action: "execute-api:Invoke".into(),
+                resource: "arn:aws:execute-api:us-east-1:000000000000:api/prod/GET/".into(),
+                context: BTreeMap::new(),
+            },
+            r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}}"#,
+        );
+        assert!(matches!(result, Err(ResourcePolicyError::Unsupported(_))));
+    }
+
     #[test]
     fn caller_requires_one_attestation_and_distinguishes_operators_from_roles() {
         let mut request = ServiceRequest {

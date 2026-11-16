@@ -4516,6 +4516,9 @@ impl Provisioner {
         if body.get("name").is_none() {
             body["name"] = json!(logical_id);
         }
+        if let Some(policy) = props.get("Policy") {
+            body["policy"] = json!(policy.to_string());
+        }
         let response = self
             .call_json("apigateway", Method::POST, "/restapis", body, logical_id)
             .await?;
@@ -4948,9 +4951,18 @@ impl Provisioner {
                 "BinaryMediaTypes",
                 "MinimumCompressionSize",
                 "ApiKeySourceType",
+                "Policy",
             ],
         )?;
         let mut operations = Vec::new();
+        if previous.get("Policy") != props.get("Policy") {
+            operations.push(match props.get("Policy") {
+                Some(policy) => {
+                    json!({"op":"replace", "path":"/policy", "value":policy.to_string()})
+                }
+                None => json!({"op":"remove", "path":"/policy"}),
+            });
+        }
         for (property, path, default) in [
             ("Name", "/name", json!(logical_id)),
             ("Description", "/description", Value::Null),
@@ -11373,5 +11385,84 @@ mod tests {
         let mut cleared = props;
         cleared["ScalingConfig"] = json!({});
         validate_lambda_event_source_mapping("Mapping", &cleared).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rest_api_policy_is_serialized_on_create_replaced_and_removed_on_update() {
+        #[derive(Default)]
+        struct ApiRequests(Mutex<Vec<(Method, String, Value)>>);
+
+        #[async_trait]
+        impl NativeHandler for ApiRequests {
+            async fn handle(&self, req: ServiceRequest) -> axum::response::Response {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((req.method, req.uri.path().to_string(), body));
+                http::Response::builder()
+                    .status(200)
+                    .body(Body::from(
+                        json!({"id":"policy-api", "rootResourceId":"root"}).to_string(),
+                    ))
+                    .unwrap()
+            }
+        }
+
+        let registry = Arc::new(ServiceRegistry::new());
+        let requests = Arc::new(ApiRequests::default());
+        registry.register_native(
+            ServiceName::new("apigateway"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            requests.clone(),
+        );
+        let provisioner = Provisioner::new(
+            Arc::downgrade(&registry),
+            "us-east-1".into(),
+            "000000000000".into(),
+        );
+        let old = json!({"Name":"policy", "Policy":{"Version":"2012-10-17", "Statement":[{
+            "Effect":"Deny", "Principal":"*", "Action":"execute-api:Invoke", "Resource":"execute-api:/*"
+        }]}});
+        let mut next = old.clone();
+        next["Policy"]["Statement"][0]["Effect"] = json!("Allow");
+        let resource = provisioner.apigateway_rest_api("Api", &old).await.unwrap();
+        provisioner
+            .update_apigateway_rest_api("Api", &resource.ref_value, &old, &next)
+            .await
+            .unwrap();
+        provisioner
+            .update_apigateway_rest_api(
+                "Api",
+                &resource.ref_value,
+                &next,
+                &json!({"Name":"policy"}),
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            (requests[0].0.clone(), requests[0].1.as_str()),
+            (Method::POST, "/restapis")
+        );
+        assert_eq!(requests[0].2["policy"], old["Policy"].to_string());
+        for request in &requests[1..] {
+            assert_eq!(request.0, Method::PATCH);
+            assert_eq!(request.1, "/restapis/policy-api");
+        }
+        assert_eq!(
+            requests[1].2["patchOperations"],
+            json!([{
+                "op":"replace", "path":"/policy", "value":next["Policy"].to_string()
+            }])
+        );
+        assert_eq!(
+            requests[2].2["patchOperations"],
+            json!([{
+                "op":"remove", "path":"/policy"
+            }])
+        );
     }
 }

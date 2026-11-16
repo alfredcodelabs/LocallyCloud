@@ -14,9 +14,9 @@ use axum::response::Response;
 
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::{
-    AuthorizationError, AuthorizationEvaluator, AuthorizationRequest, ResourcePolicyError,
-    S3PutPresignRequest, ServiceRoleAuthorizationRequest, ServiceRoleCredentials,
-    SigningCredentials,
+    AuthorizationError, AuthorizationEvaluator, AuthorizationRequest, ResourcePolicyDecision,
+    ResourcePolicyError, ResourcePolicyEvaluationRequest, S3PutPresignRequest,
+    ServiceRoleAuthorizationRequest, ServiceRoleCredentials, SigningCredentials,
 };
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 
@@ -475,6 +475,58 @@ impl AuthorizationEvaluator for IamStsState {
 
     fn validate_resource_policy(&self, document: &str) -> Result<(), ResourcePolicyError> {
         crate::resource_policy::parse(document).map(|_| ())
+    }
+
+    fn evaluate_anonymous_resource_policy(
+        &self,
+        mut request: ResourcePolicyEvaluationRequest,
+        document: &str,
+    ) -> Result<ResourcePolicyDecision, ResourcePolicyError> {
+        use crate::policy::{evaluate, Decision, EvalRequest, PolicyDocument};
+        if request.action.is_empty() || request.resource.is_empty() {
+            return Err(ResourcePolicyError::Malformed(
+                "resource policy evaluation requires an action and resource".into(),
+            ));
+        }
+        let statements = crate::resource_policy::parse(document)?
+            .into_iter()
+            .filter(|statement| statement.principal_match("", None, None).is_some())
+            .map(|statement| statement.statement)
+            .collect();
+        crate::enforcement::strip_principal_attributes(&mut request.context);
+        request.context.retain(|key, _| {
+            !matches!(
+                key.to_ascii_lowercase().as_str(),
+                "aws:username"
+                    | "aws:multifactorauthage"
+                    | "aws:tokenissuetime"
+                    | "aws:sourceidentity"
+                    | "aws:sourcearn"
+                    | "aws:sourceaccount"
+            )
+        });
+        crate::enforcement::apply_time_attributes(&mut request.context);
+        request
+            .context
+            .insert("aws:principalaccount".into(), vec!["anonymous".into()]);
+        request
+            .context
+            .insert("aws:principaltype".into(), vec!["Anonymous".into()]);
+        request
+            .context
+            .insert("aws:userid".into(), vec!["anonymous".into()]);
+        let evaluation = EvalRequest {
+            action: request.action,
+            resource: request.resource,
+            context: request.context,
+        };
+        Ok(
+            match evaluate(&[PolicyDocument { statements }], None, None, &evaluation) {
+                Decision::Allowed => ResourcePolicyDecision::Allow,
+                Decision::ExplicitDeny => ResourcePolicyDecision::ExplicitDeny,
+                Decision::ImplicitDeny => ResourcePolicyDecision::ImplicitDeny,
+            },
+        )
     }
 
     fn authorize_resource_policy(
@@ -3247,3 +3299,7 @@ mod assume_role_tests;
 #[cfg(test)]
 #[path = "principal_attributes_tests.rs"]
 mod principal_attributes_tests;
+
+#[cfg(test)]
+#[path = "service/anonymous_resource_policy_tests.rs"]
+mod anonymous_resource_policy_tests;

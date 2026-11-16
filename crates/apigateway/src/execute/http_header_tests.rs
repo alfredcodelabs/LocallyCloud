@@ -35,6 +35,7 @@ async fn iam_method_outbound_rule_drops_authorization_without_mutating_caller_he
         region: "us-east-1",
         request_id: "outbound-header",
         waf: None,
+        policy_context: &BTreeMap::new(),
         trusted_peer_ip: None,
         trace_header: None,
         trace_sampler: &sampler,

@@ -18,22 +18,33 @@ use dashmap::DashMap;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use locallycloud_cognito::CognitoHandler;
+use locallycloud_core::integration::authorization::ResourcePolicyDecision;
 use serde_json::Value;
 
 /// Evaluate an IAM-style Lambda authorizer policy for the current execute-api ARN.
 /// Only statements whose Action and Resource apply participate; an applicable Deny wins.
 pub(crate) fn policy_allows(result: &Value, route_arn: &str) -> bool {
-    let Some(statements) = result
+    // Keep the HTTP/WebSocket authorizer contract while REST supports the IAM singleton form.
+    result
         .pointer("/policyDocument/Statement")
-        .and_then(Value::as_array)
-    else {
-        return false;
+        .is_some_and(Value::is_array)
+        && policy_decision(result, route_arn) == ResourcePolicyDecision::Allow
+}
+
+pub(crate) fn policy_decision(result: &Value, route_arn: &str) -> ResourcePolicyDecision {
+    let Some(statements) = result.pointer("/policyDocument/Statement") else {
+        return ResourcePolicyDecision::ImplicitDeny;
+    };
+    let statements = match statements {
+        Value::Array(statements) => statements.as_slice(),
+        Value::Object(_) => std::slice::from_ref(statements),
+        _ => return ResourcePolicyDecision::ImplicitDeny,
     };
     let mut allowed = false;
     for statement in statements {
         if !policy_values(statement.get("Action"))
             .into_iter()
-            .any(|action| wildcard_matches(action, "execute-api:Invoke"))
+            .any(|action| wildcard_matches(&action.to_ascii_lowercase(), "execute-api:invoke"))
             || !policy_values(statement.get("Resource"))
                 .into_iter()
                 .any(|resource| wildcard_matches(resource, route_arn))
@@ -41,12 +52,63 @@ pub(crate) fn policy_allows(result: &Value, route_arn: &str) -> bool {
             continue;
         }
         match statement.get("Effect").and_then(Value::as_str) {
-            Some("Deny") => return false,
+            Some("Deny") => return ResourcePolicyDecision::ExplicitDeny,
             Some("Allow") => allowed = true,
             _ => {}
         }
     }
-    allowed
+    if allowed {
+        ResourcePolicyDecision::Allow
+    } else {
+        ResourcePolicyDecision::ImplicitDeny
+    }
+}
+
+pub(crate) fn valid_rest_authorizer_policy(result: &Value) -> bool {
+    if !result
+        .get("principalId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        || result
+            .get("context")
+            .is_some_and(|value| !value.is_object())
+    {
+        return false;
+    }
+    let Some(document) = result.get("policyDocument").and_then(Value::as_object) else {
+        return false;
+    };
+    let statements = match document.get("Statement") {
+        Some(Value::Array(statements)) => statements.as_slice(),
+        Some(statement @ Value::Object(_)) => std::slice::from_ref(statement),
+        _ => return false,
+    };
+    !statements.is_empty()
+        && statements.iter().all(|statement| {
+            let Some(statement) = statement.as_object() else {
+                return false;
+            };
+            let strings = |value: Option<&Value>| match value {
+                Some(Value::String(value)) => !value.is_empty(),
+                Some(Value::Array(values)) => {
+                    !values.is_empty()
+                        && values
+                            .iter()
+                            .all(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+                }
+                _ => false,
+            };
+            statement
+                .keys()
+                .all(|key| matches!(key.as_str(), "Action" | "Resource" | "Effect" | "Sid"))
+                && matches!(
+                    statement.get("Effect").and_then(Value::as_str),
+                    Some("Allow" | "Deny")
+                )
+                && strings(statement.get("Action"))
+                && strings(statement.get("Resource"))
+                && statement.get("Sid").is_none_or(Value::is_string)
+        })
 }
 
 fn policy_values(value: Option<&Value>) -> Vec<&str> {
@@ -58,36 +120,39 @@ fn policy_values(value: Option<&Value>) -> Vec<&str> {
 }
 
 fn wildcard_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if !pattern.contains('*') {
-        return pattern == value;
-    }
-    let mut remainder = value;
-    let mut parts = pattern.split('*').peekable();
-    if !pattern.starts_with('*') {
-        let Some(prefix) = parts.next() else {
-            return value.is_empty();
-        };
-        let Some(rest) = remainder.strip_prefix(prefix) else {
-            return false;
-        };
-        remainder = rest;
-    }
-    while let Some(part) = parts.next() {
-        if part.is_empty() {
-            continue;
+    let mut pattern = pattern.chars();
+    let mut value = value.chars();
+    let (mut expected, mut actual) = (pattern.next(), value.next());
+    let mut star = None;
+    while actual.is_some() {
+        match (expected, actual) {
+            (Some('*'), _) => {
+                star = Some((pattern.clone(), value.clone()));
+                expected = pattern.next();
+            }
+            (Some('?'), _) => {
+                expected = pattern.next();
+                actual = value.next();
+            }
+            (Some(left), Some(right)) if left == right => {
+                expected = pattern.next();
+                actual = value.next();
+            }
+            _ => {
+                let Some((saved_pattern, saved_value)) = star.as_mut() else {
+                    return false;
+                };
+                pattern = saved_pattern.clone();
+                expected = pattern.next();
+                actual = saved_value.next();
+                value = saved_value.clone();
+            }
         }
-        if parts.peek().is_none() && !pattern.ends_with('*') {
-            return remainder.ends_with(part);
-        }
-        let Some(index) = remainder.find(part) else {
-            return false;
-        };
-        remainder = &remainder[index + part.len()..];
     }
-    true
+    while expected == Some('*') {
+        expected = pattern.next();
+    }
+    expected.is_none()
 }
 
 /// AWS caches issuer public keys for up to two hours.

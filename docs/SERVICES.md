@@ -157,8 +157,14 @@ REST HTTP integrations omit the caller's `Authorization` header when it carries 
 SigV4 signature or the REST method uses `AWS_IAM`; other authorization schemes
 remain available to the configured backend. This rule does not change HTTP API
 or Lambda integration headers. REST `AWS_IAM` invocation itself remains unsupported.
-REST API resource policies are stored but are not enforced on invocation. Do not
-use this path to validate access restrictions, even in strict IAM mode.
+In strict IAM mode, REST API resource policies restrict invocation using the
+policy captured by the stage's deployment. Deploy again after editing a policy.
+Methods with `NONE` authorization require an explicit resource-policy allow when
+a policy is present; IAM credentials do not authenticate these methods. Explicit
+resource-policy denies run before Lambda authorizers. Supported policy conditions
+use verified peer IP and TLS metadata, not forwarding headers. Unsupported policy
+features are rejected. REST deployments saved before policy snapshots were added
+must be recreated; their original policy cannot be reconstructed.
 
 For REGIONAL REST or HTTP custom domains:
 

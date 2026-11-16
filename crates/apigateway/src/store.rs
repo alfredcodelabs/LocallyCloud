@@ -27,6 +27,8 @@ pub fn gen_id() -> String {
 /// Immutable v1 configuration captured by a deployment.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct RestDeploymentSnapshot {
+    /// Required in persisted deployments: old snapshots cannot reconstruct their policy.
+    pub policy: Value,
     pub resources: BTreeMap<String, Value>,
     pub authorizers: BTreeMap<String, Value>,
     pub models: BTreeMap<String, Value>,
@@ -51,6 +53,7 @@ pub struct RestApiRecord {
 impl RestApiRecord {
     pub fn snapshot(&self) -> RestDeploymentSnapshot {
         RestDeploymentSnapshot {
+            policy: self.api.get("policy").cloned().unwrap_or(Value::Null),
             resources: self.resources.clone(),
             authorizers: self.authorizers.clone(),
             models: self.models.clone(),
