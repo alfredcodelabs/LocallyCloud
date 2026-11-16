@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use http::Method;
 use locallycloud::server::LocallyCloudServer;
 use locallycloud_core::{
-    config::{LambdaConcurrencyConfig, LocallyCloudConfig, SqsEndpointStrategy},
+    config::{LambdaConcurrencyConfig, LocallyCloudConfig},
     registry::ServiceRegistry,
 };
 use locallycloud_iam_sts::{
@@ -207,9 +207,7 @@ impl Fixture {
             allow_http: true,
             ui_enabled: false,
             lambda_concurrency: LambdaConcurrencyConfig::default(),
-            events_retry_second: Duration::from_secs(1),
             sqs_esm_max_pollers: 2,
-            sqs_endpoint_strategy: SqsEndpointStrategy::Path,
         };
         let (ready, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {

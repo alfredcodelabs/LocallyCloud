@@ -8,16 +8,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Shape of the SQS queue URLs returned to clients (`LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SqsEndpointStrategy {
-    /// `<guest endpoint>/<account>/<queue>`: SDKs that use the queue URL as their endpoint
-    /// keep calling this instance.
-    Path,
-    /// `https://sqs.<region>.amazonaws.com/<account>/<queue>`.
-    Aws,
-}
-
 /// All resolved configuration values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocallyCloudConfig {
@@ -54,31 +44,11 @@ pub struct LocallyCloudConfig {
     /// `LOCALLYCLOUD_UI=off` removes every dashboard route. Default: on.
     pub ui_enabled: bool,
     pub lambda_concurrency: LambdaConcurrencyConfig,
-    /// Duration of one simulated EventBridge retry second; defaults to real time.
-    pub events_retry_second: Duration,
     pub sqs_esm_max_pollers: u32,
-    /// Default: [`SqsEndpointStrategy::Path`].
-    pub sqs_endpoint_strategy: SqsEndpointStrategy,
 }
 
 const LAMBDA_ACCOUNT_CONCURRENCY: &str = "LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY";
 
-fn retry_second(get: &dyn Fn(&str) -> Option<String>) -> Result<Duration, ConfigError> {
-    let Some(value) = get("LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE") else {
-        return Ok(Duration::from_secs(1));
-    };
-    let scale = value
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite() && (0.000001..=1.0).contains(value))
-        .ok_or_else(|| {
-            ConfigError::new(
-                "LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE",
-                "expected a finite number from 0.000001 to 1",
-            )
-        })?;
-    Ok(Duration::from_secs_f64(scale))
-}
 const LAMBDA_MIN_UNRESERVED: &str = "LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY";
 
 /// Validated simulation limits. Every account/region receives its own independent pool.
@@ -190,7 +160,6 @@ impl LocallyCloudConfig {
         for setting in [
             LAMBDA_ACCOUNT_CONCURRENCY,
             LAMBDA_MIN_UNRESERVED,
-            "LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE",
             "LOCALLYCLOUD_SQS_ESM_MAX_POLLERS",
         ] {
             if matches!(
@@ -369,7 +338,6 @@ impl LocallyCloudConfig {
             allow_http,
             ui_enabled,
             lambda_concurrency: LambdaConcurrencyConfig::resolve(get)?,
-            events_retry_second: retry_second(get)?,
             sqs_esm_max_pollers: match get("LOCALLYCLOUD_SQS_ESM_MAX_POLLERS") {
                 None => 10,
                 Some(value) => value
@@ -383,25 +351,7 @@ impl LocallyCloudConfig {
                         )
                     })?,
             },
-            sqs_endpoint_strategy: match resolve(get, &["LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY"]) {
-                Some((v, src)) => parse_sqs_endpoint_strategy(&v, src)?,
-                None => SqsEndpointStrategy::Path,
-            },
         })
-    }
-}
-
-fn parse_sqs_endpoint_strategy(
-    value: &str,
-    src: &'static str,
-) -> Result<SqsEndpointStrategy, ConfigError> {
-    match value.to_ascii_lowercase().as_str() {
-        "path" => Ok(SqsEndpointStrategy::Path),
-        "aws" => Ok(SqsEndpointStrategy::Aws),
-        other => Err(ConfigError::new(
-            src,
-            format!("expected one of path|aws, got `{other}`"),
-        )),
     }
 }
 
@@ -526,24 +476,19 @@ mod tests {
     }
 
     #[test]
-    fn retry_time_scale_and_poller_ceiling_have_independent_validated_defaults() {
-        let config = LocallyCloudConfig::resolve(&env(&[])).unwrap();
-        assert_eq!(config.events_retry_second, Duration::from_secs(1));
-        assert_eq!(config.sqs_esm_max_pollers, 10);
-        let config = LocallyCloudConfig::resolve(&env(&[
-            ("LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE", "0.001"),
-            ("LOCALLYCLOUD_SQS_ESM_MAX_POLLERS", "20"),
-        ]))
-        .unwrap();
-        assert_eq!(config.events_retry_second, Duration::from_millis(1));
-        assert_eq!(config.sqs_esm_max_pollers, 20);
-        for value in ["0", "-1", "NaN", "inf", "1.1", "0.0000001", "bad"] {
-            assert!(LocallyCloudConfig::resolve(&env(&[(
-                "LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE",
-                value
-            )]))
-            .is_err());
-        }
+    fn poller_ceiling_has_a_validated_default() {
+        assert_eq!(
+            LocallyCloudConfig::resolve(&env(&[]))
+                .unwrap()
+                .sqs_esm_max_pollers,
+            10
+        );
+        assert_eq!(
+            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_SQS_ESM_MAX_POLLERS", "20")]))
+                .unwrap()
+                .sqs_esm_max_pollers,
+            20
+        );
         for value in ["0", "1", "1001", "1.5", "-1", "bad"] {
             assert!(LocallyCloudConfig::resolve(&env(&[(
                 "LOCALLYCLOUD_SQS_ESM_MAX_POLLERS",
@@ -739,29 +684,5 @@ mod tests {
             LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_UI", "disabled")])).unwrap_err();
         assert_eq!(err.setting, "LOCALLYCLOUD_UI");
         assert!(err.to_string().contains("on|off"));
-    }
-
-    #[test]
-    fn sqs_endpoint_strategy_defaults_to_path_and_rejects_unknown_values() {
-        let strategy = |value: &str| {
-            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY", value)]))
-        };
-        assert_eq!(
-            LocallyCloudConfig::resolve(&env(&[]))
-                .unwrap()
-                .sqs_endpoint_strategy,
-            SqsEndpointStrategy::Path
-        );
-        assert_eq!(
-            strategy("AWS").unwrap().sqs_endpoint_strategy,
-            SqsEndpointStrategy::Aws
-        );
-        assert_eq!(
-            strategy("path").unwrap().sqs_endpoint_strategy,
-            SqsEndpointStrategy::Path
-        );
-        let err = strategy("domain").unwrap_err();
-        assert_eq!(err.setting, "LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY");
-        assert!(err.to_string().contains("path|aws"));
     }
 }

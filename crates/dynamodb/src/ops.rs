@@ -1588,11 +1588,13 @@ pub async fn sweep_expired(store: &TableStore) {
 /// Core dispatcher used by external requests. Failed/unavailable deliveries remain queued.
 pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry>) {
     let _gate = store.operation_gate.lock().await;
-    if store.has_uncommitted() {
-        if let Err(error) = store.persist().await {
-            tracing::error!(%error, "DynamoDB prior write could not be committed");
-            return;
-        }
+    if store.has_uncommitted() && store.persist().await.is_err() {
+        tracing::error!(
+            service = "dynamodb",
+            cause_code = "state_commit_failed",
+            "DynamoDB prior write could not be committed"
+        );
+        return;
     }
     store.mark_uncommitted();
     store.purge_expired_txn_tokens();
@@ -1619,8 +1621,12 @@ pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry
     }
     changed |= store.has_dirty_items().await;
     if changed {
-        if let Err(error) = store.persist().await {
-            tracing::error!(%error, "DynamoDB maintenance persistence failed");
+        if store.persist().await.is_err() {
+            tracing::error!(
+                service = "dynamodb",
+                cause_code = "maintenance_persistence_failed",
+                "DynamoDB maintenance persistence failed"
+            );
         }
     } else {
         store.clear_uncommitted();

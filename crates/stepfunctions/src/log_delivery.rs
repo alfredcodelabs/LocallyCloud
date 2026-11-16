@@ -381,7 +381,7 @@ mod tests {
                 let text = body.to_string();
                 assert!(!text.contains("private-backend-detail"));
                 if expected == 500 {
-                    assert_eq!(body["__type"], "InternalServerError");
+                    assert_eq!(body["__type"], "InternalFailure");
                     assert!(!text.contains("Execution role"));
                 } else {
                     assert_eq!(body["__type"], "InvalidLoggingConfiguration");

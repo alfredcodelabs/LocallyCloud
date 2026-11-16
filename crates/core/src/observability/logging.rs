@@ -120,6 +120,11 @@ where
             Some("lambda") => "Lambda",
             Some("ec2") => "EC2",
             Some("cloudformation") => "CloudFormation",
+            Some("s3") => "S3",
+            Some("sqs") => "SQS",
+            Some("dynamodb") => "DynamoDB",
+            Some("events" | "eventbridge") => "EventBridge",
+            Some("states" | "stepfunctions") => "StepFunctions",
             Some(service) => service,
             None => event.metadata().target(),
         };

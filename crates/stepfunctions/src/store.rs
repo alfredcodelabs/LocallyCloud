@@ -290,6 +290,7 @@ pub enum InsertExecutionResult {
 
 #[derive(Clone, Default)]
 pub struct SfnStore {
+    pub(crate) config: crate::StepFunctionsConfig,
     pub(crate) active_metrics: Arc<std::sync::Mutex<BTreeMap<String, u32>>>,
     pub(crate) metric_sampler: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     machines: Arc<DashMap<Key, Arc<RwLock<StateMachineRecord>>>>,
@@ -343,6 +344,14 @@ impl SfnStore {
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_config(config: crate::StepFunctionsConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            ..Self::default()
+        })
     }
 
     pub(crate) async fn admit_execution_worker(

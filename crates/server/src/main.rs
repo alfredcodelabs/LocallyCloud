@@ -21,13 +21,13 @@ mod startup_config;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 
-use locallycloud_core::config::SqsEndpointStrategy;
 use locallycloud_core::endpoint::EndpointResolver;
 use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::authorization::{
     AuthorizationRequest, ServiceRoleAuthorizationRequest,
 };
 use locallycloud_core::integration::RequestIdentity;
+use locallycloud_sqs::SqsEndpointStrategy;
 
 use locallycloud::server::LocallyCloudServer;
 use locallycloud_core::observability;
@@ -330,6 +330,19 @@ impl locallycloud_elbv2::TargetEndpointResolver for Ec2TargetResolver {
     }
 }
 
+async fn initialize_persistent_service<E: Send + 'static>(
+    service: &'static str,
+    initialize: impl FnOnce() -> Result<(), E> + Send + 'static,
+) {
+    let cause = match tokio::task::spawn_blocking(initialize).await {
+        Ok(Ok(())) => return,
+        Ok(Err(_)) => "state_initialization_failed",
+        Err(_) => "initializer_task_failed",
+    };
+    observability::log_service_error(service, Some("startup"), "startup", cause, 500);
+    std::process::exit(4);
+}
+
 #[tokio::main]
 async fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -531,84 +544,117 @@ async fn main() {
             std::process::exit(4);
         }
     }
-    let dynamodb_engine =
-        std::env::var("LOCALLYCLOUD_DYNAMODB_ENGINE").unwrap_or_else(|_| "native".into());
-    if !matches!(dynamodb_engine.as_str(), "native" | "extenddb") {
-        tracing::error!("LOCALLYCLOUD_DYNAMODB_ENGINE must be native or extenddb");
-        std::process::exit(4);
-    }
+    let dynamodb_config = startup.dynamodb;
+    let dynamodb_engine = dynamodb_config.engine;
     let dynamodb_state = state.clone();
-    let selected_engine = dynamodb_engine.clone();
+    let selected_engine = dynamodb_engine.as_str();
     match tokio::task::spawn_blocking(move || {
-        dynamodb_engine::bind_store(&dynamodb_state, &selected_engine)
+        dynamodb_engine::bind_store(&dynamodb_state, selected_engine)
     })
     .await
     {
         Ok(Ok(())) => {}
-        result => {
-            tracing::error!(?result, "DynamoDB engine cannot open this state");
+        _ => {
+            tracing::error!(service = "dynamodb", cause_code = "engine_binding_failed", "DynamoDB cannot open this state with the selected engine; inspect with migrate-dynamodb --dry-run");
             std::process::exit(4);
         }
     }
     let mut managed_dynamodb = None;
-    let dynamodb_registration = match dynamodb_engine.as_str() {
-        "extenddb" => dynamodb_engine::ExtendDb::new(state.clone(), Arc::downgrade(&registry))
+    match dynamodb_engine {
+        locallycloud_dynamodb::DynamoDbEngineChoice::ExtendDb => {
+            match dynamodb_engine::ExtendDb::with_config(
+                state.clone(),
+                Arc::downgrade(&registry),
+                dynamodb_config,
+            )
             .await
-            .map(|engine| {
-                let engine = Arc::new(engine);
-                locallycloud_dynamodb::register_with_engine(&registry, engine.clone());
-                managed_dynamodb = Some(engine);
+            {
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    locallycloud_dynamodb::register_with_engine(&registry, engine.clone());
+                    managed_dynamodb = Some(engine);
+                }
+                Err(_) => {
+                    observability::log_service_error(
+                        "dynamodb",
+                        Some("startup"),
+                        "startup",
+                        "engine_initialization_failed",
+                        500,
+                    );
+                    std::process::exit(4);
+                }
+            }
+        }
+        locallycloud_dynamodb::DynamoDbEngineChoice::Native => {
+            let registry = registry.clone();
+            let state = state.clone();
+            initialize_persistent_service("dynamodb", move || {
+                locallycloud_dynamodb::register_with_state_and_config(
+                    &registry,
+                    state,
+                    dynamodb_config,
+                )
             })
-            .map_err(|e| e.to_string()),
-        "native" => locallycloud_dynamodb::register_with_state(&registry, state.clone())
-            .map_err(|e| e.to_string()),
-        _ => Err("LOCALLYCLOUD_DYNAMODB_ENGINE must be native or extenddb".into()),
-    };
-    if let Err(error) = dynamodb_registration {
-        tracing::error!(%error, "failed to register DynamoDB");
-        std::process::exit(4);
+            .await;
+        }
     }
-    if let Err(error) = locallycloud_s3::register_with_state_and_endpoint(
-        &registry,
-        state.clone(),
-        endpoint.guest_endpoint(),
-    ) {
-        tracing::error!(%error, "failed to register S3");
-        std::process::exit(4);
+    {
+        let registry = registry.clone();
+        let state = state.clone();
+        let endpoint = endpoint.guest_endpoint().to_owned();
+        let sources = startup.s3_credential_sources.clone();
+        initialize_persistent_service("s3", move || {
+            locallycloud_s3::register_with_state_endpoint_config_and_sources(
+                &registry, state, &endpoint, startup.s3, sources,
+            )
+            .map(|_| ())
+        })
+        .await;
     }
-    // Queue URLs use the same base injected into guests as AWS_ENDPOINT_URL, because SDKs
-    // send queue operations to the QueueUrl host.
-    let queue_urls = match config.sqs_endpoint_strategy {
+    // Queue URLs share the endpoint advertised to guests, because SDKs follow them.
+    let queue_urls = match startup.sqs.endpoint_strategy {
         SqsEndpointStrategy::Path => {
-            locallycloud_sqs::QueueUrlStyle::Endpoint(endpoint.guest_endpoint().to_string())
+            locallycloud_sqs::QueueUrlStyle::Endpoint(endpoint.guest_endpoint().to_owned())
         }
         SqsEndpointStrategy::Aws => locallycloud_sqs::QueueUrlStyle::Aws,
     };
-    if let Err(error) =
-        locallycloud_sqs::register_with_state_and_queue_urls(&registry, state.clone(), queue_urls)
     {
-        tracing::error!(%error, "failed to register SQS");
-        std::process::exit(4);
+        let registry = registry.clone();
+        let state = state.clone();
+        initialize_persistent_service("sqs", move || {
+            locallycloud_sqs::register_with_state_and_queue_urls(&registry, state, queue_urls)
+        })
+        .await;
     }
     if let Err(error) = locallycloud_sns::register_with_state(&registry, state.clone()) {
         tracing::error!(%error, "failed to register SNS");
         std::process::exit(4);
     }
-    if let Err(error) = locallycloud_eventbridge::service::register_with_state_and_retry_timing(
-        &registry,
-        state.clone(),
-        config.events_retry_second,
-    ) {
-        tracing::error!(%error, "failed to register EventBridge");
-        std::process::exit(4);
+    {
+        let registry = registry.clone();
+        let state = state.clone();
+        initialize_persistent_service("events", move || {
+            locallycloud_eventbridge::service::register_with_state_and_config(
+                &registry,
+                state.clone(),
+                startup.eventbridge,
+            )?;
+            locallycloud_eventbridge::schemas::register(&registry, state)
+        })
+        .await;
     }
-    if let Err(error) = locallycloud_eventbridge::schemas::register(&registry, state.clone()) {
-        tracing::error!(%error, "failed to register EventBridge Schemas");
-        std::process::exit(4);
-    }
-    if let Err(error) = locallycloud_stepfunctions::register_with_state(&registry, state.clone()) {
-        tracing::error!(%error, "failed to load durable Step Functions state");
-        std::process::exit(4);
+    {
+        let registry = registry.clone();
+        let state = state.clone();
+        initialize_persistent_service("states", move || {
+            locallycloud_stepfunctions::register_with_state_and_config(
+                &registry,
+                state,
+                startup.stepfunctions,
+            )
+        })
+        .await;
     }
     let acm = match locallycloud_acm::register_with_state(&registry, state.clone()) {
         Ok(acm) => acm,
@@ -637,11 +683,12 @@ async fn main() {
         let state = state.clone();
         let response_endpoint = endpoint.guest_endpoint().to_owned();
         tokio::task::spawn_blocking(move || {
-            locallycloud_cloudformation::register_with_state_and_endpoint_config(
+            locallycloud_cloudformation::register_with_state_endpoint_config_and_s3_sources(
                 &registry,
                 state,
                 &response_endpoint,
                 startup.cloudformation,
+                startup.s3_credential_sources,
             )
         })
         .await

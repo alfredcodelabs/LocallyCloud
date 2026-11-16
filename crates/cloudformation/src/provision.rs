@@ -131,6 +131,7 @@ pub struct Provisioner {
     source_stack_arn: Option<String>,
     stack_id: Option<String>,
     response_endpoint: String,
+    permissive_s3_sources: Option<std::sync::Arc<locallycloud_s3::S3CredentialSources>>,
 }
 
 impl Provisioner {
@@ -144,7 +145,16 @@ impl Provisioner {
             source_stack_arn: None,
             stack_id: None,
             response_endpoint: "http://127.0.0.1:4566".into(),
+            permissive_s3_sources: None,
         }
+    }
+
+    pub(crate) fn with_s3_sources(
+        mut self,
+        sources: Option<std::sync::Arc<locallycloud_s3::S3CredentialSources>>,
+    ) -> Self {
+        self.permissive_s3_sources = sources;
+        self
     }
 
     pub(crate) fn with_stack(mut self, stack_id: &str, endpoint: &str) -> Self {

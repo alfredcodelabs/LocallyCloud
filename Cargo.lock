@@ -2898,6 +2898,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "http",
+ "libc",
  "locallycloud",
  "locallycloud-core",
  "locallycloud-iam-sts",

@@ -55,40 +55,163 @@ pub async fn execute_transaction(ctx: &Ctx<'_>, req: &Value) -> Result<Value, Dd
 }
 
 pub async fn batch_execute_statement(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let statements = req
-        .get("Statements")
-        .and_then(Value::as_array)
-        .ok_or_else(|| DdbError::Validation("Statements is required".into()))?;
-    let mut responses = Vec::new();
+    let statements = batch_entries(req)?;
+    // Reject invalid request structure or a mixed batch before any statement mutates state.
+    let mut parsed = Vec::with_capacity(statements.len());
     for entry in statements {
-        let statement = match entry.get("Statement").and_then(Value::as_str) {
-            Some(s) => s,
-            None => {
-                responses.push(json!({ "Error": { "Code": "ValidationError", "Message": "Statement is required" } }));
-                continue;
-            }
-        };
+        let statement = batch_statement(entry)?;
         let params = parse_parameters(entry)?;
-        let result = match parse(statement, &params) {
-            Ok(stmt) => run(ctx, stmt, entry).await,
-            Err(e) => Err(e),
+        parsed.push(parse(statement, &params));
+    }
+    let reads = parsed
+        .iter()
+        .any(|statement| matches!(statement, Ok(Stmt::Select { .. })));
+    let writes = parsed.iter().any(|statement| {
+        matches!(
+            statement,
+            Ok(Stmt::Insert { .. } | Stmt::Delete { .. } | Stmt::Update { .. })
+        )
+    });
+    if reads && writes {
+        return Err(DdbError::Validation(
+            "Read and write statements cannot be mixed in one batch".into(),
+        ));
+    }
+    let mut responses = Vec::with_capacity(statements.len());
+    for (entry, statement) in statements.iter().zip(parsed) {
+        let result = match statement {
+            Ok(Stmt::Select { table, wheres }) => batch_select(ctx, &table, &wheres, entry).await,
+            Ok(statement) => run(ctx, statement, entry).await,
+            Err(error) => Err(error),
         };
         match result {
-            Ok(v) => {
-                let mut item = Map::new();
-                if let Some(items) = v.get("Items").and_then(Value::as_array) {
-                    // SELECT returns multiple; batch reports the first matched item per statement.
-                    if let Some(first) = items.first() {
-                        item.insert("Item".into(), first.clone());
-                    }
-                }
-                responses.push(Value::Object(item));
-            }
-            Err(e) => responses
-                .push(json!({ "Error": { "Code": e.batch_code(), "Message": e.to_string() } })),
+            Ok(response) => responses.push(response),
+            Err(error) => responses
+                .push(json!({"Error":{"Code":error.batch_code(),"Message":error.to_string()}})),
         }
     }
     Ok(json!({ "Responses": responses }))
+}
+
+fn batch_entries(request: &Value) -> Result<&[Value], DdbError> {
+    let entries = request
+        .get("Statements")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DdbError::Validation("Statements is required".into()))?;
+    if !(1..=25).contains(&entries.len()) {
+        return Err(DdbError::Validation(
+            "Statements must contain between 1 and 25 entries".into(),
+        ));
+    }
+    Ok(entries)
+}
+
+fn batch_statement(entry: &Value) -> Result<&str, DdbError> {
+    let fields = entry
+        .as_object()
+        .ok_or_else(|| DdbError::Validation("Each Statements entry must be an object".into()))?;
+    let statement = fields
+        .get("Statement")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DdbError::Validation("Each Statements entry requires a string Statement".into())
+        })?;
+    if !(1..=8192).contains(&statement.chars().take(8193).count()) {
+        return Err(DdbError::Validation(
+            "Statement must contain between 1 and 8192 characters".into(),
+        ));
+    }
+    if fields
+        .get("ConsistentRead")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(DdbError::Validation(
+            "ConsistentRead must be a boolean".into(),
+        ));
+    }
+    if let Some(values) = fields.get("Parameters") {
+        if !values.as_array().is_some_and(|values| !values.is_empty()) {
+            return Err(DdbError::Validation(
+                "Parameters must be a non-empty array".into(),
+            ));
+        }
+    }
+    if let Some(mode) = fields.get("ReturnValuesOnConditionCheckFailure") {
+        if !matches!(mode.as_str(), Some("ALL_OLD" | "NONE")) {
+            return Err(DdbError::Validation(
+                "ReturnValuesOnConditionCheckFailure must be ALL_OLD or NONE".into(),
+            ));
+        }
+    }
+    Ok(statement)
+}
+
+/// Batch SELECT is a point read: every primary-key attribute must have an equality term.
+async fn batch_select(
+    ctx: &Ctx<'_>,
+    table_name: &str,
+    wheres: &[(String, String, Value)],
+    req: &Value,
+) -> Result<Value, DdbError> {
+    let key_names = {
+        let table = ctx
+            .store
+            .get(ctx.account, ctx.region, table_name)
+            .ok_or_else(|| {
+                DdbError::ResourceNotFound(format!(
+                    "Requested resource not found: Table: {table_name} not found"
+                ))
+            })?;
+        let guard = table.read().await;
+        guard
+            .def
+            .key_schema
+            .iter()
+            .map(|key| key.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut key = Map::new();
+    for name in key_names {
+        let value = wheres
+            .iter()
+            .find(|(attribute, operator, _)| attribute == &name && operator == "=")
+            .map(|(_, _, value)| value)
+            .ok_or_else(|| {
+                DdbError::Validation(
+                    "Batch SELECT requires equality on every primary-key attribute".into(),
+                )
+            })?;
+        key.insert(name, value.clone());
+    }
+    let (filter, names, values) = build_filter(wheres);
+    let names = serde_json::from_value(names)
+        .map_err(|_| DdbError::Internal("Could not prepare batch predicate".into()))?;
+    let values = values
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| {
+            Ok((
+                name.clone(),
+                crate::value::AttributeValue::from_json(value)?,
+            ))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, DdbError>>()?;
+    let predicate = crate::expression::ConditionExpression::parse(&filter, &names, &values)?;
+    let mut get = json!({"TableName":table_name,"Key":key});
+    if let Some(consistent) = req.get("ConsistentRead") {
+        get["ConsistentRead"] = consistent.clone();
+    }
+    let response = ops::get_item(ctx, &get).await?;
+    let Some(item) = response.get("Item") else {
+        return Ok(json!({}));
+    };
+    let decoded = crate::value::item_from_json(item)?;
+    if predicate.matches(&decoded) {
+        Ok(json!({"Item":item}))
+    } else {
+        Ok(json!({}))
+    }
 }
 
 fn parse_parameters(req: &Value) -> Result<Vec<Value>, DdbError> {
@@ -144,21 +267,18 @@ pub(crate) fn authorization_targets(
             .ok_or_else(|| DdbError::Validation("TransactStatements is required".into()))?
             .iter()
             .collect(),
-        "BatchExecuteStatement" => request
-            .get("Statements")
-            .and_then(Value::as_array)
-            .ok_or_else(|| DdbError::Validation("Statements is required".into()))?
-            .iter()
-            .collect(),
+        "BatchExecuteStatement" => batch_entries(request)?.iter().collect(),
         _ => return Ok(Vec::new()),
     };
     let mut targets = Vec::new();
     for entry in entries {
-        let Some(statement) = entry.get("Statement").and_then(Value::as_str) else {
-            if op == "BatchExecuteStatement" {
-                continue; // The batch handler reports this as a per-statement error.
-            }
-            return Err(DdbError::Validation("Statement is required".into()));
+        let statement = if op == "BatchExecuteStatement" {
+            batch_statement(entry)?
+        } else {
+            entry
+                .get("Statement")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DdbError::Validation("Statement is required".into()))?
         };
         let params = parse_parameters(entry)?;
         let parsed = match parse(statement, &params) {
@@ -698,6 +818,165 @@ fn decode_token(token: &str) -> Result<Value, DdbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn batch_statement_count_is_validated_before_any_write() {
+        let store = crate::store::TableStore::new();
+        let ctx = Ctx {
+            store: &store,
+            account: "000000000000",
+            region: "us-east-1",
+        };
+        ops::create_table(&ctx, &json!({"TableName":"batch-limit","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"})).await.unwrap();
+        assert!(matches!(
+            batch_execute_statement(&ctx, &json!({"Statements":[]})).await,
+            Err(DdbError::Validation(_))
+        ));
+        let statements: Vec<_> = (0..26).map(|index| json!({"Statement":"INSERT INTO \"batch-limit\" VALUE {'id': ?}","Parameters":[{"S":format!("key-{index}")}]})).collect();
+        assert!(matches!(
+            batch_execute_statement(&ctx, &json!({"Statements":statements})).await,
+            Err(DdbError::Validation(_))
+        ));
+        let empty = ops::scan(&ctx, &json!({"TableName":"batch-limit"}))
+            .await
+            .unwrap();
+        assert_eq!(empty["Count"], 0);
+        let response = batch_execute_statement(&ctx, &json!({"Statements":&statements[..25]}))
+            .await
+            .unwrap();
+        let responses = response["Responses"].as_array().unwrap();
+        assert_eq!(responses.len(), 25);
+        assert!(responses.iter().all(|entry| entry.get("Error").is_none()));
+        let full = ops::scan(&ctx, &json!({"TableName":"batch-limit"}))
+            .await
+            .unwrap();
+        assert_eq!(full["Count"], 25);
+    }
+
+    #[tokio::test]
+    async fn malformed_batch_entries_fail_before_writes_but_sql_errors_remain_per_statement() {
+        let store = crate::store::TableStore::new();
+        let ctx = Ctx {
+            store: &store,
+            account: "000000000000",
+            region: "us-east-1",
+        };
+        ops::create_table(&ctx, &json!({"TableName":"batch-shape","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"})).await.unwrap();
+        let insert = json!({"Statement":"INSERT INTO \"batch-shape\" VALUE {'id': 'new'}"});
+        let invalid = [
+            json!({}),
+            Value::Null,
+            json!("not-a-structure"),
+            json!([]),
+            json!({"Statement":null}),
+            json!({"Statement":42}),
+            json!({"Statement":""}),
+            json!({"Statement":"x".repeat(8193)}),
+            json!({"Statement":"SELECT * FROM tbl","ConsistentRead":"yes"}),
+            json!({"Statement":"SELECT * FROM tbl","Parameters":[]}),
+            json!({"Statement":"SELECT * FROM tbl","ReturnValuesOnConditionCheckFailure":"invalid"}),
+        ];
+        for malformed in invalid {
+            for statements in [
+                vec![insert.clone(), malformed.clone()],
+                vec![malformed.clone(), insert.clone()],
+            ] {
+                let batch = json!({"Statements":statements});
+                assert!(matches!(
+                    authorization_targets("BatchExecuteStatement", &batch),
+                    Err(DdbError::Validation(_))
+                ));
+                assert!(matches!(
+                    batch_execute_statement(&ctx, &batch).await,
+                    Err(DdbError::Validation(_))
+                ));
+                let item = ops::get_item(
+                    &ctx,
+                    &json!({"TableName":"batch-shape","Key":{"id":{"S":"new"}}}),
+                )
+                .await
+                .unwrap();
+                assert!(item.get("Item").is_none());
+            }
+        }
+        assert!(batch_statement(&json!({"Statement":"é".repeat(8192)})).is_ok());
+        let response = batch_execute_statement(
+            &ctx,
+            &json!({"Statements":[insert,{"Statement":"NOT_A_SUPPORTED_SQL_STATEMENT"}]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["Responses"][0], json!({}));
+        assert_eq!(response["Responses"][1]["Error"]["Code"], "ValidationError");
+        let item = ops::get_item(
+            &ctx,
+            &json!({"TableName":"batch-shape","Key":{"id":{"S":"new"}}}),
+        )
+        .await
+        .unwrap();
+        assert!(item.get("Item").is_some());
+    }
+
+    #[tokio::test]
+    async fn mixed_batches_are_rejected_before_writes_in_either_order() {
+        let store = crate::store::TableStore::new();
+        let ctx = Ctx {
+            store: &store,
+            account: "000000000000",
+            region: "us-east-1",
+        };
+        ops::create_table(&ctx, &json!({"TableName":"mixed-batch","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"})).await.unwrap();
+        let write = json!({"Statement":"INSERT INTO \"mixed-batch\" VALUE {'id': 'new'}"});
+        let read = json!({"Statement":"SELECT * FROM \"mixed-batch\" WHERE id = 'new'"});
+        for statements in [vec![write.clone(), read.clone()], vec![read, write]] {
+            assert!(matches!(
+                batch_execute_statement(&ctx, &json!({"Statements":statements})).await,
+                Err(DdbError::Validation(_))
+            ));
+            let response = ops::get_item(
+                &ctx,
+                &json!({"TableName":"mixed-batch","Key":{"id":{"S":"new"}}}),
+            )
+            .await
+            .unwrap();
+            assert!(response.get("Item").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_select_uses_the_complete_key_and_preserves_additional_conditions() {
+        let store = crate::store::TableStore::new();
+        let ctx = Ctx {
+            store: &store,
+            account: "000000000000",
+            region: "us-east-1",
+        };
+        ops::create_table(&ctx, &json!({"TableName":"point-reads","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"}],"BillingMode":"PAY_PER_REQUEST"})).await.unwrap();
+        for item in [
+            json!({"pk":{"S":"p"},"sk":{"N":"1"},"flag":{"S":"keep"}}),
+            json!({"pk":{"S":"p"},"sk":{"N":"2"},"flag":{"S":"drop"}}),
+            json!({"pk":{"S":"q"},"sk":{"N":"1"},"flag":{"S":"keep"}}),
+        ] {
+            ops::put_item(&ctx, &json!({"TableName":"point-reads","Item":item}))
+                .await
+                .unwrap();
+        }
+        let result = batch_execute_statement(&ctx, &json!({"Statements":[
+            {"Statement":"SELECT * FROM \"point-reads\" WHERE pk = 'p' AND sk = 2 AND flag = 'drop'"},
+            {"Statement":"SELECT * FROM \"point-reads\" WHERE pk = 'p' AND sk = 1 AND flag = 'drop'"},
+            {"Statement":"SELECT * FROM \"point-reads\" WHERE pk = 'p'"},
+            {"Statement":"SELECT * FROM \"point-reads\" WHERE pk = 'p' AND sk > 0"},
+            {"Statement":"SELECT * FROM \"point-reads\" WHERE pk = 'q' AND sk = 1"},
+            {"Statement":"SELECT * FROM \"point-reads\" WHERE pk = 'absent' AND sk = 1"}
+        ]})).await.unwrap();
+        let responses = result["Responses"].as_array().unwrap();
+        assert_eq!(responses[0]["Item"]["sk"]["N"], "2");
+        assert_eq!(responses[1], json!({}));
+        assert_eq!(responses[2]["Error"]["Code"], "ValidationError");
+        assert_eq!(responses[3]["Error"]["Code"], "ValidationError");
+        assert_eq!(responses[4]["Item"]["pk"]["S"], "q");
+        assert_eq!(responses[5], json!({}));
+    }
 
     #[test]
     fn lex_insert() {

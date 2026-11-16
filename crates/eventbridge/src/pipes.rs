@@ -763,13 +763,14 @@ impl PipesService {
                             updated
                                 .source_checkpoints
                                 .insert(shard.clone(), sequence.clone());
-                            if let Err(error) = pipe_persistence::save(
-                                store.state_db(),
-                                &account,
-                                &region,
-                                &updated,
-                            ) {
-                                tracing::warn!(%error, pipe = %item.name, "pipe checkpoint commit failed");
+                            if pipe_persistence::save(store.state_db(), &account, &region, &updated)
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    service = "pipes",
+                                    cause_code = "pipe_checkpoint_commit_failed",
+                                    "pipe checkpoint commit failed"
+                                );
                                 break;
                             }
                             state.pipes.insert(item.name.clone(), updated);
@@ -1529,7 +1530,7 @@ mod tests {
         let service = PipesService::new(
             store.clone(),
             Weak::new(),
-            Arc::new(crate::http_client::CurlHttpClient),
+            Arc::new(crate::http_client::CurlHttpClient::default()),
         );
         service.restore().unwrap();
         service
@@ -1584,7 +1585,7 @@ mod tests {
         let service = PipesService::new(
             reopened,
             Weak::new(),
-            Arc::new(crate::http_client::CurlHttpClient),
+            Arc::new(crate::http_client::CurlHttpClient::default()),
         );
         service.restore().unwrap();
         let pipe = service
@@ -1772,7 +1773,7 @@ mod tests {
         let service = PipesService::new(
             store.clone(),
             Arc::downgrade(&registry),
-            Arc::new(crate::http_client::CurlHttpClient),
+            Arc::new(crate::http_client::CurlHttpClient::default()),
         );
         service
             .dispatch(
@@ -1851,7 +1852,7 @@ mod tests {
         let service = PipesService::new(
             Arc::new(EbStore::new()),
             Arc::downgrade(&registry),
-            Arc::new(crate::http_client::CurlHttpClient),
+            Arc::new(crate::http_client::CurlHttpClient::default()),
         );
         service
             .dispatch(
@@ -1937,7 +1938,7 @@ mod tests {
         let service = PipesService::new(
             Arc::new(EbStore::new()),
             Arc::downgrade(&registry),
-            Arc::new(crate::http_client::CurlHttpClient),
+            Arc::new(crate::http_client::CurlHttpClient::default()),
         );
         service
             .dispatch(
@@ -2077,7 +2078,7 @@ mod tests {
         let service = PipesService::new(
             Arc::new(EbStore::new()),
             Arc::downgrade(&registry),
-            Arc::new(crate::http_client::CurlHttpClient),
+            Arc::new(crate::http_client::CurlHttpClient::default()),
         );
         for name in ["a", "b", "c"] {
             service

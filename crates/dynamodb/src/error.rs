@@ -128,12 +128,28 @@ impl DdbError {
             DdbError::Throttling(_) => "ThrottlingError",
             DdbError::TransactionConflict(_) => "TransactionConflict",
             DdbError::IdempotentParameterMismatch(_) => "IdempotentParameterMismatch",
-            _ => "ValidationError",
+            DdbError::Internal(_) => "InternalServerError",
+            DdbError::ResourceInUse(_)
+            | DdbError::Validation(_)
+            | DdbError::ExpiredIterator(_)
+            | DdbError::LimitExceeded(_)
+            | DdbError::TransactionCanceled(_)
+            | DdbError::ExportNotFound(_)
+            | DdbError::UnknownOperation(_)
+            | DdbError::RecoveryUnavailable(_)
+            | DdbError::InvalidRestoreTime(_) => "ValidationError",
         }
     }
 
     /// Render to an Axum response as the JSON 1.0 error shape.
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
+        locallycloud_core::observability::log_service_error(
+            "dynamodb",
+            None,
+            request_id,
+            self.exception(),
+            self.http_status(),
+        );
         if let DdbError::TransactionCanceled(reasons) = &self {
             return self.render_transaction_canceled(reasons, request_id);
         }
@@ -192,6 +208,28 @@ mod tests {
     fn statuses() {
         assert_eq!(DdbError::Validation("x".into()).http_status(), 400);
         assert_eq!(DdbError::Internal("x".into()).http_status(), 500);
+    }
+
+    #[tokio::test]
+    async fn internal_faults_keep_server_classification_in_batch_and_json() {
+        let error = DdbError::Internal("DynamoDB storage is unavailable".into());
+        assert_eq!(error.batch_code(), "InternalServerError");
+        let response = error.into_response("owned-request");
+        assert_eq!(response.status(), 500);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/x-amz-json-1.0"
+        );
+        assert_eq!(response.headers()["x-amzn-requestid"], "owned-request");
+        let bytes = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["__type"],
+            "com.amazonaws.dynamodb.v20120810#InternalServerError"
+        );
+        assert_eq!(body["message"], "DynamoDB storage is unavailable");
     }
 
     #[test]

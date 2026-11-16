@@ -5,6 +5,8 @@
 //! timeouts, long polling, FIFO ordering/deduplication, and dead-letter redrive are all
 //! enforced.
 
+pub mod config;
+pub use config::{SqsConfig, SqsEndpointStrategy};
 pub mod error;
 pub mod md5;
 pub mod metrics;

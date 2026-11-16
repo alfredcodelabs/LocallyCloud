@@ -20,7 +20,7 @@ async fn unchanged_stream_identity_skips_writes_but_new_identity_fails_closed() 
     let service = PipesService::new(
         store.clone(),
         Weak::new(),
-        Arc::new(crate::http_client::CurlHttpClient),
+        Arc::new(crate::http_client::CurlHttpClient::default()),
     );
     service.restore().unwrap();
     let pipe = configure(&service, &store, json!({"StartingPosition":"TRIM_HORIZON"})).await;
@@ -197,7 +197,7 @@ async fn stream_batches_fence_concurrency_checkpoints_and_durable_failure_handof
         );
     }
     crate::register(&registry);
-    let http = Arc::new(crate::http_client::CurlHttpClient);
+    let http = Arc::new(crate::http_client::CurlHttpClient::default());
     let service = PipesService::new(store.clone(), Weak::new(), http.clone());
     service.restore().unwrap();
     let pipe = configure(

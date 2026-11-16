@@ -218,6 +218,15 @@ impl S3Error {
     /// `x-amz-id-2` header, as real S3 does.
     pub fn into_response(self, resource: &str, request_id: &str) -> Response {
         let status = self.http_status();
+        if status >= 400 {
+            locallycloud_core::observability::log_service_error(
+                "s3",
+                None,
+                request_id,
+                self.code(),
+                status,
+            );
+        }
         let host_id = format!("lc2/{request_id}");
         if status == 304 {
             return Response::builder()

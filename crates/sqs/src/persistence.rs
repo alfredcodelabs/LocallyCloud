@@ -13,8 +13,7 @@ use crate::error::SqsError;
 use crate::model::{EncryptedBody, Message, MessageAttribute, QueueArn};
 use crate::store::{GuardedQueue, MoveTask, QueueState, ReceiveAttempt, SqsStore};
 
-fn storage_error(error: impl std::fmt::Display) -> SqsError {
-    tracing::error!(%error, "SQS persistent state failure");
+fn storage_error(_: impl std::fmt::Display) -> SqsError {
     SqsError::StorageUnavailable
 }
 

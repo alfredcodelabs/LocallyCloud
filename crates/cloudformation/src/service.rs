@@ -73,6 +73,7 @@ pub struct CfnHandler {
     registry: Weak<ServiceRegistry>,
     caller_access_key: Option<String>,
     response_endpoint: String,
+    permissive_s3_sources: Option<Arc<locallycloud_s3::S3CredentialSources>>,
     execution_role: Option<String>,
     source_stack_arn: Option<String>,
     caller_context: BTreeMap<String, Vec<String>>,
@@ -89,6 +90,7 @@ impl CfnHandler {
             source_stack_arn: None,
             caller_context: BTreeMap::new(),
             delegated_caller: None,
+            permissive_s3_sources: None,
             response_endpoint: "http://127.0.0.1:4566".into(),
         }
     }
@@ -100,6 +102,7 @@ impl CfnHandler {
             account.to_string(),
         )
         .with_caller_access_key(self.caller_access_key.clone())
+        .with_s3_sources(self.permissive_s3_sources.clone())
         .with_execution_role(self.execution_role.clone(), self.source_stack_arn.clone())
     }
 
@@ -2547,6 +2550,7 @@ impl NativeHandler for CfnHandler {
         let execution = Self {
             store: self.store.clone(),
             registry: self.registry.clone(),
+            permissive_s3_sources: self.permissive_s3_sources.clone(),
             response_endpoint: self.response_endpoint.clone(),
             execution_role: None,
             source_stack_arn: None,
@@ -2626,6 +2630,25 @@ pub fn register_with_state_and_endpoint_config(
     response_endpoint: &str,
     config: crate::CloudFormationConfig,
 ) -> Result<(), String> {
+    let sources = Arc::new(locallycloud_s3::S3CredentialSources::from_lookup(
+        &|name| std::env::var_os(name),
+    )?);
+    register_with_state_endpoint_config_and_s3_sources(
+        registry,
+        state,
+        response_endpoint,
+        config,
+        sources,
+    )
+}
+
+pub fn register_with_state_endpoint_config_and_s3_sources(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    response_endpoint: &str,
+    config: crate::CloudFormationConfig,
+    sources: Arc<locallycloud_s3::S3CredentialSources>,
+) -> Result<(), String> {
     config.validate()?;
     let store = CfnStore::with_state_and_config(&state, config).map_err(|_| {
         "CloudFormation state could not be loaded; check the state database and master key"
@@ -2642,6 +2665,7 @@ pub fn register_with_state_and_endpoint_config(
             source_stack_arn: None,
             caller_context: BTreeMap::new(),
             delegated_caller: None,
+            permissive_s3_sources: Some(sources),
             response_endpoint: response_endpoint.into(),
         }),
     );
@@ -3831,6 +3855,7 @@ mod tests {
                 source_stack_arn: None,
                 caller_context: BTreeMap::new(),
                 delegated_caller: None,
+                permissive_s3_sources: None,
                 response_endpoint: "http://127.0.0.1:4566".into(),
             };
             (registry, handler)
@@ -5857,6 +5882,7 @@ mod interrupted_progress_tests {
             source_stack_arn: None,
             caller_context: BTreeMap::new(),
             delegated_caller: None,
+            permissive_s3_sources: None,
             response_endpoint: "http://127.0.0.1:4566".into(),
         }
     }

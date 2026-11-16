@@ -395,3 +395,97 @@ fn strict_startup_requires_explicit_secret_inputs_before_service_registration() 
     });
     assert!(result.is_err());
 }
+
+#[test]
+fn second_batch_defaults_file_and_environment_are_resolved_by_service() {
+    let defaults = resolve("{}", &[]).unwrap();
+    assert_eq!(defaults.s3.notification_queue_capacity, 1024);
+    assert_eq!(defaults.s3.notification_retry_interval_ms, 1000);
+    assert_eq!(
+        defaults.sqs.endpoint_strategy,
+        locallycloud_sqs::SqsEndpointStrategy::Path
+    );
+    assert_eq!(
+        defaults.dynamodb.engine,
+        locallycloud_dynamodb::DynamoDbEngineChoice::Native
+    );
+    assert!(!defaults.dynamodb.simulate_write_limits);
+    assert_eq!(
+        defaults.eventbridge.retry_second(),
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(defaults.stepfunctions.execution_poll_interval_ms, 10);
+    let file = r#"{"s3":{"notification_queue_capacity":2,"notification_retry_interval_ms":2000},"sqs":{"endpoint_strategy":"aws"},"dynamodb":{"engine":"native","simulate_write_limits":true,"kms_timeout_secs":7},"eventbridge":{"retry_time_scale":0.01,"pending_retry_poll_interval_ms":5,"http_connect_timeout_secs":2,"http_request_timeout_secs":3,"http_response_body_limit_bytes":4096},"stepfunctions":{"execution_poll_interval_ms":5,"athena_poll_interval_ms":20,"athena_cancel_timeout_secs":2}}"#;
+    let configured = resolve(file, &[]).unwrap();
+    assert_eq!(configured.s3.notification_queue_capacity, 2);
+    assert_eq!(configured.s3.notification_retry_interval_ms, 2000);
+    assert_eq!(
+        configured.sqs.endpoint_strategy,
+        locallycloud_sqs::SqsEndpointStrategy::Aws
+    );
+    assert!(configured.dynamodb.simulate_write_limits);
+    assert_eq!(configured.dynamodb.kms_timeout_secs, 7);
+    assert_eq!(
+        configured.eventbridge.retry_second(),
+        std::time::Duration::from_millis(10)
+    );
+    assert_eq!(configured.eventbridge.http_response_body_limit_bytes, 4096);
+    assert_eq!(configured.stepfunctions.athena_poll_interval_ms, 20);
+    let env = [
+        ("LOCALLYCLOUD_S3_NOTIFICATION_QUEUE_CAPACITY", "3"),
+        ("LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY", "PATH"),
+        ("LOCALLYCLOUD_DYNAMODB_ENGINE", "extenddb"),
+        ("LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS", "false"),
+        ("LOCALLYCLOUD_DYNAMODB_KMS_TIMEOUT_SECS", "8"),
+        ("LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE", "0.02"),
+        ("LOCALLYCLOUD_STEPFUNCTIONS_ATHENA_POLL_INTERVAL_MS", "30"),
+    ];
+    let overridden = resolve(file, &env).unwrap();
+    assert_eq!(overridden.s3.notification_queue_capacity, 3);
+    assert_eq!(overridden.s3.notification_retry_interval_ms, 2000);
+    assert_eq!(
+        overridden.sqs.endpoint_strategy,
+        locallycloud_sqs::SqsEndpointStrategy::Path
+    );
+    assert_eq!(
+        overridden.dynamodb.engine,
+        locallycloud_dynamodb::DynamoDbEngineChoice::ExtendDb
+    );
+    assert!(!overridden.dynamodb.simulate_write_limits);
+    assert_eq!(overridden.dynamodb.kms_timeout_secs, 8);
+    assert_eq!(
+        overridden.eventbridge.retry_second(),
+        std::time::Duration::from_millis(20)
+    );
+    assert_eq!(overridden.stepfunctions.athena_poll_interval_ms, 30);
+}
+
+#[test]
+fn second_batch_invalid_inputs_do_not_become_silent_defaults() {
+    for (name, value) in [
+        ("LOCALLYCLOUD_S3_NOTIFICATION_QUEUE_CAPACITY", "0"),
+        ("LOCALLYCLOUD_S3_NOTIFICATION_RETRY_INTERVAL_MS", "1"),
+        ("LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY", "domain"),
+        ("LOCALLYCLOUD_DYNAMODB_ENGINE", "other"),
+        ("LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS", "other"),
+        ("LOCALLYCLOUD_DYNAMODB_KMS_TIMEOUT_SECS", "0"),
+        ("LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE", "NaN"),
+        (
+            "LOCALLYCLOUD_EVENTBRIDGE_HTTP_RESPONSE_BODY_LIMIT_BYTES",
+            "0",
+        ),
+        ("LOCALLYCLOUD_STEPFUNCTIONS_EXECUTION_POLL_INTERVAL_MS", "0"),
+    ] {
+        assert!(resolve("{}", &[(name, value)]).is_err(), "{name}");
+    }
+    for document in [
+        r#"{"s3":null}"#,
+        r#"{"sqs":{"endpoint_strategy":null}}"#,
+        r#"{"dynamodb":{"simulate_write_limits":null}}"#,
+        r#"{"eventbridge":{"retry_time_scale":null}}"#,
+        r#"{"stepfunctions":{"execution_poll_interval_ms":null}}"#,
+        r#"{"dynamodb":{"unknown":true}}"#,
+    ] {
+        assert!(serde_json::from_str::<FileConfig>(document).is_err());
+    }
+}

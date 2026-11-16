@@ -13,8 +13,7 @@ pub(crate) struct CapacityModel {
 impl Default for CapacityModel {
     fn default() -> Self {
         Self {
-            enabled: std::env::var("LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS").as_deref()
-                == Ok("1"),
+            enabled: crate::DynamoDbConfig::default().simulate_write_limits,
             clock: Instant::now,
         }
     }
@@ -113,8 +112,11 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_write_limits_preserve_atomicity_retry_configuration_and_scopes() {
-        let mut store = TableStore::new();
-        store.capacity.enabled = true;
+        let mut store = TableStore::with_config(crate::DynamoDbConfig {
+            simulate_write_limits: true,
+            ..Default::default()
+        })
+        .unwrap();
         store.capacity.clock = fixed_time;
         for (name, capacity) in [("ledger", 6), ("payments", 1)] {
             ops::create_table(&context(&store), &json!({"TableName":name,"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PROVISIONED","ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":capacity}})).await.unwrap();

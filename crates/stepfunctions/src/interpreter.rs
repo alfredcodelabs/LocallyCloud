@@ -106,7 +106,7 @@ impl Drop for AthenaQueryGuard {
         let resource = self.resource.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(interpreter.store.config.athena_cancel_timeout_secs),
                 interpreter.dispatch_json_with_resource(
                     "athena",
                     "AmazonAthena.StopQueryExecution",
@@ -117,11 +117,19 @@ impl Drop for AthenaQueryGuard {
             .await;
             match result {
                 Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(execution_arn = %interpreter.exec_arn, query_id, error = %error.error, "Athena task cancellation failed")
+                Ok(Err(_)) => {
+                    tracing::warn!(
+                        service = "states",
+                        cause_code = "athena_task_cancellation_failed",
+                        "Athena task cancellation failed"
+                    )
                 }
                 Err(_) => {
-                    tracing::warn!(execution_arn = %interpreter.exec_arn, query_id, "Athena task cancellation timed out")
+                    tracing::warn!(
+                        service = "states",
+                        cause_code = "athena_task_cancellation_timeout",
+                        "Athena task cancellation timed out"
+                    )
                 }
             }
         });
@@ -2619,7 +2627,10 @@ impl Interpreter {
                 .unwrap_or("RUNNING")
             {
                 "RUNNING" | "PENDING_REDRIVE" => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        self.store.config.execution_poll_interval_ms,
+                    ))
+                    .await;
                 }
                 "SUCCEEDED" => {
                     if matches!(pattern, IntegrationPattern::Sync2) {
@@ -2698,7 +2709,12 @@ impl Interpreter {
                 guard.armed = false;
             }
             match state {
-                "QUEUED" | "RUNNING" => tokio::time::sleep(Duration::from_millis(50)).await,
+                "QUEUED" | "RUNNING" => {
+                    tokio::time::sleep(Duration::from_millis(
+                        self.store.config.athena_poll_interval_ms,
+                    ))
+                    .await
+                }
                 "SUCCEEDED" => return Ok(response),
                 _ => {
                     let cause = response

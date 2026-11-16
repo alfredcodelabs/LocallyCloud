@@ -1,9 +1,6 @@
 //! SigV4 query and browser POST validation for S3.
 
 use std::collections::BTreeMap;
-use std::env;
-use std::fs;
-use std::path::PathBuf;
 
 use base64::Engine;
 use bytes::Bytes;
@@ -15,6 +12,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::error::S3Error;
+use crate::S3CredentialSources;
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const MAX_EXPIRES: i64 = 604_800;
@@ -99,24 +97,43 @@ pub fn presign_put(
     ))
 }
 
-/// Sign a local service callback with the same credentials accepted by S3.
+/// Standalone helper; server callers inject shared startup sources instead.
 pub async fn presign_local_put(
     endpoint: &str,
     path: &str,
     region: &str,
     expires: u32,
 ) -> Result<String, String> {
-    let (key, secret) = tokio::task::spawn_blocking(|| {
-        let key =
-            env::var("LOCALLYCLOUD_S3_ACCESS_KEY_ID").unwrap_or_else(|_| "locallycloud".into());
-        let secret = resolve_secret(&key).ok_or("S3 callback signing credentials unavailable")?;
-        Ok::<_, String>((key, secret))
-    })
-    .await
-    .map_err(|_| "S3 callback signing failed")??;
-    presign_put(endpoint, path, region, &key, &secret, expires)
+    let sources = S3CredentialSources::from_lookup(&|name| std::env::var_os(name))?;
+    presign_local_put_with_sources(endpoint, path, region, expires, &sources).await
 }
-pub fn validate_url(req: &ServiceRequest) -> Result<(), S3Error> {
+
+pub async fn presign_local_put_with_sources(
+    endpoint: &str,
+    path: &str,
+    region: &str,
+    expires: u32,
+    sources: &S3CredentialSources,
+) -> Result<String, String> {
+    let key = sources.callback_access_key();
+    let secret = sources
+        .resolve_secret(key)
+        .await
+        .ok_or("S3 callback signing credentials unavailable")?;
+    presign_put(endpoint, path, region, key, &secret, expires)
+}
+
+/// Standalone helper; native handlers inject shared startup sources instead.
+pub async fn validate_url(req: &ServiceRequest) -> Result<(), S3Error> {
+    let sources = S3CredentialSources::from_lookup(&|name| std::env::var_os(name))
+        .map_err(|_| S3Error::AccessDenied)?;
+    validate_url_with_sources(req, &sources).await
+}
+
+pub async fn validate_url_with_sources(
+    req: &ServiceRequest,
+    sources: &S3CredentialSources,
+) -> Result<(), S3Error> {
     let pairs = raw_query_pairs(req.uri.query().unwrap_or_default());
     let required = |name: &str| -> Result<String, S3Error> {
         query_value(&pairs, name)
@@ -175,7 +192,10 @@ pub fn validate_url(req: &ServiceRequest) -> Result<(), S3Error> {
         "{ALGORITHM}\n{date}\n{credential_scope}\n{}",
         hex(&Sha256::digest(canonical_request.as_bytes()))
     );
-    let secret = resolve_secret(&scope.access_key).ok_or(S3Error::AccessDenied)?;
+    let secret = sources
+        .resolve_secret(&scope.access_key)
+        .await
+        .ok_or(S3Error::AccessDenied)?;
     let expected = hex(&hmac_sha256(
         &signing_key(&secret, &scope.date, &scope.region, &scope.service),
         string_to_sign.as_bytes(),
@@ -187,7 +207,17 @@ pub fn validate_url(req: &ServiceRequest) -> Result<(), S3Error> {
     Ok(())
 }
 
-pub fn parse_post(req: &ServiceRequest, bucket: &str) -> Result<PostUpload, S3Error> {
+pub async fn parse_post(req: &ServiceRequest, bucket: &str) -> Result<PostUpload, S3Error> {
+    let sources = S3CredentialSources::from_lookup(&|name| std::env::var_os(name))
+        .map_err(|_| S3Error::AccessDenied)?;
+    parse_post_with_sources(req, bucket, &sources).await
+}
+
+pub async fn parse_post_with_sources(
+    req: &ServiceRequest,
+    bucket: &str,
+    sources: &S3CredentialSources,
+) -> Result<PostUpload, S3Error> {
     let content_type = req
         .headers
         .get("content-type")
@@ -195,9 +225,13 @@ pub fn parse_post(req: &ServiceRequest, bucket: &str) -> Result<PostUpload, S3Er
         .ok_or(S3Error::AccessDenied)?;
     let boundary = multipart_boundary(content_type).ok_or(S3Error::AccessDenied)?;
     let parts = parse_multipart(&req.body, &boundary)?;
-    validate_post(parts, bucket)
+    validate_post(parts, bucket, sources).await
 }
-fn validate_post(parts: Vec<Part>, bucket: &str) -> Result<PostUpload, S3Error> {
+async fn validate_post(
+    parts: Vec<Part>,
+    bucket: &str,
+    sources: &S3CredentialSources,
+) -> Result<PostUpload, S3Error> {
     let mut fields = BTreeMap::new();
     let mut file = None;
     for part in parts {
@@ -241,7 +275,10 @@ fn validate_post(parts: Vec<Part>, bucket: &str) -> Result<PostUpload, S3Error> 
     if !date.starts_with(&scope.date) {
         return Err(S3Error::AccessDenied);
     }
-    let secret = resolve_secret(&scope.access_key).ok_or(S3Error::AccessDenied)?;
+    let secret = sources
+        .resolve_secret(&scope.access_key)
+        .await
+        .ok_or(S3Error::AccessDenied)?;
     let expected = hex(&hmac_sha256(
         &signing_key(&secret, &scope.date, &scope.region, &scope.service),
         policy_b64.as_bytes(),
@@ -636,61 +673,6 @@ fn parse_amz_date(value: &str) -> Result<OffsetDateTime, S3Error> {
         .map_err(|_| S3Error::AccessDenied)
 }
 
-fn resolve_secret(access_key: &str) -> Option<String> {
-    if let Ok(secret) = env::var("LOCALLYCLOUD_S3_SECRET_ACCESS_KEY") {
-        let configured_key = env::var("LOCALLYCLOUD_S3_ACCESS_KEY_ID").ok();
-        if configured_key
-            .as_deref()
-            .is_none_or(|key| key == access_key)
-        {
-            return Some(secret);
-        }
-    }
-    if env::var("AWS_ACCESS_KEY_ID").ok().as_deref() == Some(access_key) {
-        if let Ok(secret) = env::var("AWS_SECRET_ACCESS_KEY") {
-            return Some(secret);
-        }
-    }
-    if let Some(secret) = profile_secret(access_key) {
-        return Some(secret);
-    }
-    matches!(access_key, "test" | "locallycloud").then(|| "test".to_string())
-}
-
-fn profile_secret(access_key: &str) -> Option<String> {
-    let profile = env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
-    let path = env::var_os("AWS_SHARED_CREDENTIALS_FILE")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".aws/credentials")))?;
-    let contents = fs::read_to_string(path).ok()?;
-    let mut active = false;
-    let mut key = None;
-    let mut secret = None;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            if active {
-                break;
-            }
-            active = line[1..line.len() - 1].trim() == profile;
-            continue;
-        }
-        if !active || line.starts_with(['#', ';']) || line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        match name.trim() {
-            "aws_access_key_id" => key = Some(value.trim().to_string()),
-            "aws_secret_access_key" => secret = Some(value.trim().to_string()),
-            _ => {}
-        }
-    }
-    (key.as_deref() == Some(access_key))
-        .then_some(secret)
-        .flatten()
-}
 fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
     let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let region_key = hmac_sha256(&date_key, region.as_bytes());
@@ -813,8 +795,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn explicit_put_presign_round_trip_and_method_binding() {
+    #[tokio::test]
+    async fn explicit_put_presign_round_trip_and_method_binding() {
         let url = presign_put(
             "http://localhost:4599",
             "/responses/key",
@@ -832,13 +814,16 @@ mod tests {
             headers,
             Bytes::from_static(b"response"),
         );
-        assert!(validate_url(&put).is_ok());
+        assert!(validate_url(&put).await.is_ok());
         put.method = Method::GET;
-        assert!(matches!(validate_url(&put), Err(S3Error::AccessDenied)));
+        assert!(matches!(
+            validate_url(&put).await,
+            Err(S3Error::AccessDenied)
+        ));
     }
 
-    #[test]
-    fn presigned_url_round_trip_and_tamper() {
+    #[tokio::test]
+    async fn presigned_url_round_trip_and_tamper() {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("localhost:4599"));
         let valid = request(
@@ -847,7 +832,7 @@ mod tests {
             headers.clone(),
             Bytes::new(),
         );
-        assert!(validate_url(&valid).is_ok());
+        assert!(validate_url(&valid).await.is_ok());
 
         let tampered = request(
             Method::GET,
@@ -870,13 +855,12 @@ mod tests {
             Bytes::new(),
         );
         assert!(matches!(
-            validate_url(&tampered),
+            validate_url(&tampered).await,
             Err(S3Error::AccessDenied)
         ));
     }
 
-    #[test]
-    fn presigned_post_validates_policy_and_filename() {
+    fn signed_post_request(access_key: &str, secret: &str) -> ServiceRequest {
         let now = OffsetDateTime::now_utc();
         let date_format = time::format_description::parse_borrowed::<2>(
             "[year][month][day]T[hour][minute][second]Z",
@@ -884,7 +868,7 @@ mod tests {
         .unwrap();
         let date = now.format(&date_format).unwrap();
         let expiration = (now + time::Duration::minutes(5)).format(&Rfc3339).unwrap();
-        let credential = format!("test/{}/us-east-1/s3/aws4_request", &date[..8]);
+        let credential = format!("{access_key}/{}/us-east-1/s3/aws4_request", &date[..8]);
         let policy = serde_json::json!({
             "expiration": expiration,
             "conditions": [
@@ -896,7 +880,7 @@ mod tests {
         });
         let policy = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
         let signature = hex(&hmac_sha256(
-            &signing_key("test", &date[..8], "us-east-1", "s3"),
+            &signing_key(secret, &date[..8], "us-east-1", "s3"),
             policy.as_bytes(),
         ));
         let boundary = "lc-boundary";
@@ -919,18 +903,62 @@ mod tests {
             "content-type",
             HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
         );
-        let upload = parse_post(
-            &request(
-                Method::POST,
-                "/bucket".parse().unwrap(),
-                headers,
-                Bytes::from(body),
-            ),
-            "bucket",
+        request(
+            Method::POST,
+            "/bucket".parse().unwrap(),
+            headers,
+            Bytes::from(body),
         )
-        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn presigned_post_validates_policy_and_filename() {
+        let upload = parse_post(&signed_post_request("test", "test"), "bucket")
+            .await
+            .unwrap();
         assert_eq!(upload.key, "uploads/note.txt");
         assert_eq!(upload.body, "hello");
         assert_eq!(upload.headers.get("content-type").unwrap(), "text/plain");
+    }
+
+    #[tokio::test]
+    async fn presigned_post_uses_live_profile_and_rejects_rotated_or_invalid_secrets() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compatibility-tests/.work/s3-live-credentials");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let directory = tempfile::tempdir_in(base).unwrap();
+        let path = directory.path().join("credentials");
+        let replacement = directory.path().join("replacement");
+        let profile = |secret| {
+            format!("[owned]\naws_access_key_id = KEY\naws_secret_access_key = {secret}\n")
+        };
+        tokio::fs::write(&path, profile("old")).await.unwrap();
+        let sources = S3CredentialSources::from_lookup(&|name| match name {
+            "AWS_SHARED_CREDENTIALS_FILE" => Some(path.as_os_str().to_owned()),
+            "AWS_PROFILE" => Some("owned".into()),
+            _ => None,
+        })
+        .unwrap();
+        let old = signed_post_request("KEY", "old");
+        assert!(parse_post_with_sources(&old, "bucket", &sources)
+            .await
+            .is_ok());
+        tokio::fs::write(&replacement, profile("new"))
+            .await
+            .unwrap();
+        tokio::fs::rename(&replacement, &path).await.unwrap();
+        assert!(matches!(
+            parse_post_with_sources(&old, "bucket", &sources).await,
+            Err(S3Error::AccessDenied)
+        ));
+        let new = signed_post_request("KEY", "new");
+        assert!(parse_post_with_sources(&new, "bucket", &sources)
+            .await
+            .is_ok());
+        tokio::fs::write(&path, "malformed").await.unwrap();
+        assert!(matches!(
+            parse_post_with_sources(&new, "bucket", &sources).await,
+            Err(S3Error::AccessDenied)
+        ));
     }
 }

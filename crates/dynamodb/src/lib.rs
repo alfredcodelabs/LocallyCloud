@@ -4,6 +4,8 @@
 //! `ServiceRegistry`. Operations are selected from the `X-Amz-Target` header.
 
 mod capacity;
+pub mod config;
+pub use config::{DynamoDbConfig, DynamoDbEngineChoice};
 pub mod encryption;
 mod engine;
 pub mod error;
@@ -18,4 +20,6 @@ pub mod streams;
 pub mod value;
 
 pub use engine::{register_with_engine, DynamoEngine};
-pub use service::{register, register_with_state};
+pub use service::{
+    register, register_with_config, register_with_state, register_with_state_and_config,
+};

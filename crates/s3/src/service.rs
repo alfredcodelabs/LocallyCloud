@@ -35,6 +35,7 @@ use crate::presign;
 use crate::query::QueryParams;
 use crate::select;
 use crate::store::AccountStore;
+use crate::{S3Config, S3CredentialSources};
 
 #[derive(Clone, Copy)]
 enum BucketRead {
@@ -62,6 +63,8 @@ enum BucketRead {
 /// The natively-implemented S3 service.
 pub struct S3Handler {
     endpoint_hostname: String,
+    config: S3Config,
+    credential_sources: Arc<S3CredentialSources>,
     store: Arc<AccountStore>,
     registry: Weak<ServiceRegistry>,
     notification_tx: mpsc::Sender<NotificationJob>,
@@ -74,7 +77,6 @@ pub struct S3Handler {
 }
 
 // A bounded queue wakes the worker. Persistent handlers replay committed outbox rows.
-const NOTIFICATION_QUEUE_CAPACITY: usize = 1024;
 pub(super) const MAX_PENDING_NOTIFICATIONS: i64 = 100_000;
 
 struct NotificationJob {
@@ -160,10 +162,6 @@ async fn deliver_notification(
     delivery: notifications::DeliveryRequest,
 ) -> bool {
     let target = delivery.target;
-    let arn = delivery
-        .arn
-        .clone()
-        .unwrap_or_else(|| "eventbridge".to_string());
     let call = || CrossServiceCall {
         source_service: ServiceName::new("s3"),
         account_id: account_id.to_string(),
@@ -209,7 +207,13 @@ async fn deliver_notification(
                 tokio::time::sleep(Duration::from_millis(25_u64 << attempt)).await;
             }
         }
-        tracing::error!(request_id, target = ?target, arn = %arn, "S3 EventBridge notification failed or partially accepted; pending outbox entry will retry");
+        locallycloud_core::observability::log_service_error(
+            "s3",
+            Some("DeliverNotification"),
+            request_id,
+            "eventbridge_notification_failed",
+            500,
+        );
         return false;
     }
     let policy = AsyncDeliveryPolicy {
@@ -221,8 +225,14 @@ async fn deliver_notification(
         .await
     {
         Ok(_) => true,
-        Err(error) => {
-            tracing::error!(request_id, target = ?target, arn = %arn, %error, "S3 notification delivery failed; pending outbox entry will retry");
+        Err(_) => {
+            locallycloud_core::observability::log_service_error(
+                "s3",
+                Some("DeliverNotification"),
+                request_id,
+                "notification_delivery_failed",
+                500,
+            );
             false
         }
     }
@@ -296,9 +306,31 @@ impl S3Handler {
     }
 
     fn with_registry(registry: Weak<ServiceRegistry>) -> Self {
-        let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_QUEUE_CAPACITY);
-        S3Handler {
+        Self::with_registry_and_config(registry, S3Config::default()).expect("valid S3 defaults")
+    }
+
+    fn with_registry_and_config(
+        registry: Weak<ServiceRegistry>,
+        config: S3Config,
+    ) -> Result<Self, String> {
+        Self::with_registry_config_and_sources(
+            registry,
+            config,
+            Arc::new(S3CredentialSources::default()),
+        )
+    }
+
+    fn with_registry_config_and_sources(
+        registry: Weak<ServiceRegistry>,
+        config: S3Config,
+        credential_sources: Arc<S3CredentialSources>,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        let (notification_tx, notification_rx) = mpsc::channel(config.notification_queue_capacity);
+        Ok(S3Handler {
             endpoint_hostname: "aws.localhost".into(),
+            config,
+            credential_sources,
             store: Arc::new(AccountStore::new()),
             registry,
             notification_tx,
@@ -308,15 +340,28 @@ impl S3Handler {
             namespace_gate: tokio::sync::RwLock::new(()),
             persisted_in_route: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
-        }
+        })
     }
 
-    fn with_state(registry: Weak<ServiceRegistry>, state: Arc<StateDb>) -> Result<Self, String> {
+    fn with_state_and_config(
+        registry: Weak<ServiceRegistry>,
+        state: Arc<StateDb>,
+        config: S3Config,
+        credential_sources: Arc<S3CredentialSources>,
+    ) -> Result<Self, String> {
+        config.validate()?;
         let storage_keys = crate::encryption::StorageKeys::persistent(&state).map_err(|_| {
             "S3 storage key unavailable; check LOCALLYCLOUD_KMS_MASTER_KEY and state database"
                 .to_string()
         })?;
-        Self::load_state(registry, state, storage_keys, true)
+        Self::load_state(
+            registry,
+            state,
+            storage_keys,
+            true,
+            config,
+            credential_sources,
+        )
     }
 
     /// Load offline migration state without replaying notification work.
@@ -328,7 +373,14 @@ impl S3Handler {
             "S3 storage key unavailable; check LOCALLYCLOUD_KMS_MASTER_KEY and state database"
                 .to_string()
         })?;
-        Self::load_state(Arc::downgrade(registry), state, storage_keys, false)
+        Self::load_state(
+            Arc::downgrade(registry),
+            state,
+            storage_keys,
+            false,
+            S3Config::default(),
+            Arc::new(S3CredentialSources::default()),
+        )
     }
 
     #[cfg(test)]
@@ -337,7 +389,14 @@ impl S3Handler {
         state: Arc<StateDb>,
         storage_keys: crate::encryption::StorageKeys,
     ) -> Result<Self, String> {
-        Self::load_state(registry, state, storage_keys, true)
+        Self::load_state(
+            registry,
+            state,
+            storage_keys,
+            true,
+            S3Config::default(),
+            Arc::new(S3CredentialSources::default()),
+        )
     }
 
     fn load_state(
@@ -345,15 +404,23 @@ impl S3Handler {
         state: Arc<StateDb>,
         storage_keys: crate::encryption::StorageKeys,
         replay_notifications: bool,
+        config: S3Config,
+        credential_sources: Arc<S3CredentialSources>,
     ) -> Result<Self, String> {
         let persistence = S3Persistence::new(state)?;
-        let mut handler = Self::with_registry(registry);
+        let mut handler =
+            Self::with_registry_config_and_sources(registry, config, credential_sources)?;
         Arc::get_mut(&mut handler.store)
             .expect("new S3 store")
             .storage_keys = Arc::new(storage_keys);
         persistence.restore(&handler.store)?;
-        if let Err(error) = persistence.remove_orphan_blobs() {
-            tracing::warn!(%error, "S3 orphan blob cleanup at startup failed");
+        if persistence.remove_orphan_blobs().is_err() {
+            tracing::warn!(
+                service = "s3",
+                operation = "RestoreState",
+                cause_code = "orphan_blob_cleanup_failed",
+                "S3 orphan blob cleanup at startup failed"
+            );
         }
         let has_pending = persistence.has_pending()?;
         handler.persistence = Some(persistence);
@@ -515,19 +582,10 @@ impl S3Handler {
         let commit = || {
             let rows = self
                 .store
-                .durable_delta(account, bucket, &persistence.blobs)
-                .inspect_err(|_| {
-                    tracing::error!(
-                        stage = "metadata_delta",
-                        "S3 durable commit failed before SQLite transaction"
-                    );
-                })?;
+                .durable_delta(account, bucket, &persistence.blobs)?;
             persistence
                 .save_delta(&rows, &notifications, self.store.durable_next_id())
-                .map_err(|error| {
-                    tracing::error!(stage = "sqlite_delta", %error, "S3 durable commit failed");
-                    S3Error::InternalError
-                })
+                .map_err(|_| S3Error::InternalError)
         };
         let result = if tokio::runtime::Handle::current().runtime_flavor()
             == tokio::runtime::RuntimeFlavor::MultiThread
@@ -559,7 +617,7 @@ impl S3Handler {
         } else {
             restore()
         };
-        result.map_err(|error| { tracing::error!(stage = "committed_restore", %error, "S3 failed commit recovery remains unavailable"); S3Error::InternalError })?;
+        result.map_err(|_| S3Error::InternalError)?;
         self.poisoned.store(false, Ordering::Release);
         Ok(())
     }
@@ -575,8 +633,9 @@ impl S3Handler {
         };
         if let Some(persistence) = self.persistence.clone() {
             let registry = self.registry.clone();
+            let retry_interval = Duration::from_millis(self.config.notification_retry_interval_ms);
             tokio::spawn(async move {
-                let mut retry = tokio::time::interval(Duration::from_secs(1));
+                let mut retry = tokio::time::interval(retry_interval);
                 let mut cursor = 0_i64;
                 let mut cycle_end = 0_i64;
                 loop {
@@ -595,12 +654,20 @@ impl S3Handler {
                         cycle_end =
                             match tokio::task::spawn_blocking(move || db.max_outbox_id()).await {
                                 Ok(Ok(id)) => id,
-                                Ok(Err(error)) => {
-                                    tracing::error!(%error, "S3 outbox watermark read failed");
+                                Ok(Err(_)) => {
+                                    tracing::error!(
+                                        service = "s3",
+                                        cause_code = "outbox_watermark_read_failed",
+                                        "S3 outbox watermark read failed"
+                                    );
                                     continue;
                                 }
-                                Err(error) => {
-                                    tracing::error!(%error, "S3 outbox watermark task failed");
+                                Err(_) => {
+                                    tracing::error!(
+                                        service = "s3",
+                                        cause_code = "outbox_watermark_task_failed",
+                                        "S3 outbox watermark task failed"
+                                    );
                                     continue;
                                 }
                             };
@@ -612,12 +679,20 @@ impl S3Handler {
                     .await
                     {
                         Ok(Ok(pending)) => pending,
-                        Ok(Err(error)) => {
-                            tracing::error!(%error, "S3 outbox read failed");
+                        Ok(Err(_)) => {
+                            tracing::error!(
+                                service = "s3",
+                                cause_code = "outbox_read_failed",
+                                "S3 outbox read failed"
+                            );
                             continue;
                         }
-                        Err(error) => {
-                            tracing::error!(%error, "S3 outbox read task failed");
+                        Err(_) => {
+                            tracing::error!(
+                                service = "s3",
+                                cause_code = "outbox_read_task_failed",
+                                "S3 outbox read task failed"
+                            );
                             continue;
                         }
                     };
@@ -633,8 +708,13 @@ impl S3Handler {
                         let (request_id, account_id, region, delivery) = match stored.into_request()
                         {
                             Ok(delivery) => delivery,
-                            Err(error) => {
-                                tracing::error!(%error, id, "S3 outbox entry is invalid");
+                            Err(_) => {
+                                tracing::error!(
+                                    service = "s3",
+                                    cause_code = "outbox_entry_invalid",
+                                    outbox_id = id,
+                                    "S3 outbox entry is invalid"
+                                );
                                 continue;
                             }
                         };
@@ -650,11 +730,23 @@ impl S3Handler {
                             let db = persistence.clone();
                             match tokio::task::spawn_blocking(move || db.delete_outbox(id)).await {
                                 Ok(Ok(())) => {}
-                                Ok(Err(error)) => {
-                                    tracing::error!(%error, id, "S3 outbox acknowledgement failed")
+                                Ok(Err(_)) => {
+                                    tracing::error!(
+                                        service = "s3",
+                                        cause_code = "outbox_acknowledgement_failed",
+                                        outbox_id = id,
+                                        request_id,
+                                        "S3 outbox acknowledgement failed"
+                                    )
                                 }
-                                Err(error) => {
-                                    tracing::error!(%error, id, "S3 outbox acknowledgement task failed")
+                                Err(_) => {
+                                    tracing::error!(
+                                        service = "s3",
+                                        cause_code = "outbox_acknowledgement_task_failed",
+                                        outbox_id = id,
+                                        request_id,
+                                        "S3 outbox acknowledgement task failed"
+                                    )
                                 }
                             }
                         }
@@ -1242,6 +1334,8 @@ impl S3Handler {
         else {
             tracing::warn!(
                 request_id = req.request_id,
+                service = "s3",
+                cause_code = "notification_worker_unavailable",
                 "S3 notification worker unavailable; committed outbox will retry"
             );
             return;
@@ -1341,7 +1435,7 @@ impl S3Handler {
                 return Err(S3Error::AccessDenied);
             }
             if !Self::strict_external(req) {
-                presign::validate_url(req)?;
+                presign::validate_url_with_sources(req, &self.credential_sources).await?;
             }
         }
 
@@ -1692,7 +1786,8 @@ impl S3Handler {
                         })
                     }) =>
             {
-                let upload = presign::parse_post(req, b)?;
+                let upload =
+                    presign::parse_post_with_sources(req, b, &self.credential_sources).await?;
                 self.authorize_object_write(req, b, &upload.key).await?;
                 self.run_mutation(req, storage_account, async {
                     let mut result = ops::put_object_with_event(
@@ -2032,12 +2127,40 @@ pub fn register_with_state_and_endpoint(
     state: Arc<StateDb>,
     endpoint: &str,
 ) -> Result<Arc<S3Handler>, String> {
+    register_with_state_endpoint_and_config(registry, state, endpoint, S3Config::default())
+}
+
+pub fn register_with_state_endpoint_and_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    endpoint: &str,
+    config: S3Config,
+) -> Result<Arc<S3Handler>, String> {
+    let sources = Arc::new(S3CredentialSources::from_lookup(&|name| {
+        std::env::var_os(name)
+    })?);
+    register_with_state_endpoint_config_and_sources(registry, state, endpoint, config, sources)
+}
+
+pub fn register_with_state_endpoint_config_and_sources(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    endpoint: &str,
+    config: S3Config,
+    credential_sources: Arc<S3CredentialSources>,
+) -> Result<Arc<S3Handler>, String> {
+    config.validate()?;
     let hostname = endpoint
         .parse::<http::Uri>()
         .ok()
         .and_then(|uri| uri.host().map(str::to_ascii_lowercase))
         .ok_or("S3 endpoint must include a hostname")?;
-    let mut handler = S3Handler::with_state(Arc::downgrade(registry), state)?;
+    let mut handler = S3Handler::with_state_and_config(
+        Arc::downgrade(registry),
+        state,
+        config,
+        credential_sources,
+    )?;
     handler.endpoint_hostname = hostname;
     let handler = Arc::new(handler);
     registry.register_native(
@@ -2379,6 +2502,28 @@ mod tests {
             account_id: "000000000000".to_string(),
             request_id: "rid".to_string(),
         }
+    }
+
+    #[test]
+    fn configured_notification_channel_is_bounded_without_starting_a_worker() {
+        let handler = S3Handler::with_registry_and_config(
+            Weak::new(),
+            S3Config {
+                notification_queue_capacity: 2,
+                notification_retry_interval_ms: 2000,
+            },
+        )
+        .unwrap();
+        let first = handler.notification_tx.try_reserve().unwrap();
+        let second = handler.notification_tx.try_reserve().unwrap();
+        assert!(matches!(
+            handler.notification_tx.try_reserve(),
+            Err(TrySendError::Full(_))
+        ));
+        assert!(handler.notification_rx.lock().unwrap().is_some());
+        drop(first);
+        assert!(handler.notification_tx.try_reserve().is_ok());
+        drop(second);
     }
 
     #[tokio::test]
@@ -4248,7 +4393,7 @@ mod tests {
         // Keep the receiver alive but undrained to model a saturated worker.
         let _receiver = handler.notification_rx.lock().unwrap().take().unwrap();
         let dispatcher = registry.internal_dispatcher().unwrap();
-        for _ in 0..NOTIFICATION_QUEUE_CAPACITY {
+        for _ in 0..S3Config::default().notification_queue_capacity {
             handler
                 .notification_tx
                 .try_send(NotificationJob {

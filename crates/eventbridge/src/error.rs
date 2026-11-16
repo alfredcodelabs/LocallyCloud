@@ -2,7 +2,7 @@ use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::registry::AwsProtocol;
 
 macro_rules! error_type {
-    ($name:ident, $protocol:expr, {$($variant:ident => ($code:literal, $status:literal)),+ $(,)?}) => {
+    ($name:ident, $service:literal, $protocol:expr, {$($variant:ident => ($code:literal, $status:literal)),+ $(,)?}) => {
         #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
         pub enum $name {
             $(#[error("{0}")] $variant(String),)+
@@ -15,6 +15,7 @@ macro_rules! error_type {
                 match self { $(Self::$variant(_) => $status,)+ }
             }
             pub fn into_response(self, request_id: &str) -> axum::response::Response {
+                locallycloud_core::observability::log_service_error($service, None, request_id, self.code(), self.http_status());
                 AwsError::new(self.code(), self.to_string(), self.http_status())
                     .with_request_id(request_id.to_string())
                     .render($protocol)
@@ -24,10 +25,10 @@ macro_rules! error_type {
     };
 }
 
-error_type!(EventsError, AwsProtocol::Json11, {
+error_type!(EventsError, "events", AwsProtocol::Json11, {
     AccessDenied => ("AccessDeniedException", 403),
     ResourceNotFound => ("ResourceNotFoundException", 400),
-    ResourceAlreadyExists => ("ResourceAlreadyExistsException", 409),
+    ResourceAlreadyExists => ("ResourceAlreadyExistsException", 400),
     InvalidEventPattern => ("InvalidEventPatternException", 400),
     Validation => ("ValidationException", 400),
     ConcurrentModification => ("ConcurrentModificationException", 400),
@@ -37,7 +38,7 @@ error_type!(EventsError, AwsProtocol::Json11, {
     Internal => ("InternalException", 500),
 });
 
-error_type!(SchedulerError, AwsProtocol::RestJson, {
+error_type!(SchedulerError, "scheduler", AwsProtocol::RestJson, {
     AccessDenied => ("AccessDeniedException", 403),
     ResourceNotFound => ("ResourceNotFoundException", 404),
     Conflict => ("ConflictException", 409),
@@ -47,7 +48,7 @@ error_type!(SchedulerError, AwsProtocol::RestJson, {
     Internal => ("InternalServerException", 500),
 });
 
-error_type!(PipesError, AwsProtocol::RestJson, {
+error_type!(PipesError, "pipes", AwsProtocol::RestJson, {
     AccessDenied => ("AccessDeniedException", 403),
     NotFound => ("NotFoundException", 404),
     Conflict => ("ConflictException", 409),
@@ -59,6 +60,23 @@ error_type!(PipesError, AwsProtocol::RestJson, {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn duplicate_event_bus_uses_documented_json11_error_and_request_id() {
+        let response = EventsError::ResourceAlreadyExists("already exists".into())
+            .into_response("owned-eventbridge-request");
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.headers()["x-amzn-requestid"],
+            "owned-eventbridge-request"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["__type"], "ResourceAlreadyExistsException");
+        assert_eq!(body["message"], "already exists");
+    }
 
     #[test]
     fn events_and_rest_errors_use_distinct_protocol_shapes() {

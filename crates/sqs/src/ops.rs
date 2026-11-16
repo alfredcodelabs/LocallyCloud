@@ -2674,8 +2674,13 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
             match move_one_message(&worker_ctx, &source, &destination).await {
                 MoveOneResult::Moved => {
                     retry_delay = Duration::from_millis(100);
-                    if !matches!(store.record_message_moved(&task_handle), Ok(true)) {
-                        return;
+                    match store.record_message_moved(&task_handle) {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(error) => {
+                            error.log(&request_id, Some("MoveMessages"));
+                            return;
+                        }
                     }
                     tokio::time::sleep(interval).await;
                 }
@@ -2684,14 +2689,18 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
                     retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
                 }
                 MoveOneResult::Blocked => {
-                    let _ = store.finish_move_task(&task_handle, "FAILED");
+                    if let Err(error) = store.finish_move_task(&task_handle, "FAILED") {
+                        error.log(&request_id, Some("MoveMessages"));
+                    }
                     return;
                 }
                 MoveOneResult::Waiting => {
                     tokio::time::sleep(interval.max(Duration::from_millis(100))).await;
                 }
                 MoveOneResult::Empty => {
-                    let _ = store.finish_move_task(&task_handle, "COMPLETED");
+                    if let Err(error) = store.finish_move_task(&task_handle, "COMPLETED") {
+                        error.log(&request_id, Some("MoveMessages"));
+                    }
                     return;
                 }
             }

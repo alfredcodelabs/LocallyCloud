@@ -25,5 +25,5 @@ pub mod xml;
 
 pub use service::{
     register, register_with_state, register_with_state_and_endpoint,
-    register_with_state_and_endpoint_config,
+    register_with_state_and_endpoint_config, register_with_state_endpoint_config_and_s3_sources,
 };

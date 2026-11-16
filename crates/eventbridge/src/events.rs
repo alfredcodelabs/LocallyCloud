@@ -1304,8 +1304,16 @@ impl EventsService {
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "EventBridge schema discovery failed"),
-                Err(error) => tracing::warn!(%error, "EventBridge schema discovery task failed"),
+                Ok(Err(_)) => tracing::warn!(
+                    service = "events",
+                    cause_code = "schema_discovery_failed",
+                    "EventBridge schema discovery failed"
+                ),
+                Err(_) => tracing::warn!(
+                    service = "events",
+                    cause_code = "schema_discovery_task_failed",
+                    "EventBridge schema discovery task failed"
+                ),
             }
         }
         drop(active);
@@ -1328,8 +1336,12 @@ impl EventsService {
     pub async fn resume_pending(&self) -> bool {
         let pending = match self.store.pending_fanouts().await {
             Ok(pending) => pending,
-            Err(error) => {
-                tracing::error!(%error, "failed to load pending EventBridge fanout");
+            Err(_) => {
+                tracing::error!(
+                    service = "events",
+                    cause_code = "pending_fanout_load_failed",
+                    "failed to load pending EventBridge fanout"
+                );
                 return true;
             }
         };
@@ -1347,8 +1359,12 @@ impl EventsService {
                 .fanout(&ctx, &work.rules, &work.event, None, work.accepted_at)
                 .await
             {
-                if let Err(error) = self.store.complete_fanout(&work.id).await {
-                    tracing::error!(%error, "failed to complete EventBridge fanout");
+                if self.store.complete_fanout(&work.id).await.is_err() {
+                    tracing::error!(
+                        service = "events",
+                        cause_code = "fanout_completion_failed",
+                        "failed to complete EventBridge fanout"
+                    );
                     failed = true;
                 }
             } else {
@@ -1373,43 +1389,84 @@ impl EventsService {
         let registry = self.registry.clone();
         let http = self.http.clone();
         let active = self.active_fanouts.clone();
-        workers.insert(key, tokio::spawn(async move {
-            let notify = store.pending_notify();
-            loop {
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                let pending = match store.pending_fanouts().await {
-                    Ok(work) => work,
-                    Err(error) => { tracing::error!(%error, "EventBridge pending queue unavailable"); return; }
-                };
-                if pending.is_empty() { notified.await; continue; }
-                let mut deliveries = tokio::task::JoinSet::new();
-                for work in pending {
-                    let claimed = active.lock().map(|mut active| active.insert(work.id.clone())).unwrap_or(false);
-                    if !claimed { continue; }
-                    let guard = ActiveFanout { id: work.id.clone(), active: active.clone() };
-                    let store = store.clone(); let registry = registry.clone(); let http = http.clone();
-                    deliveries.spawn(async move {
-                        let _guard = guard;
-                        let Some(registry) = registry.upgrade() else { return };
-                        let complete = fanout_rules(FanoutContext {
-                            registry: &registry, store: &store, http: http.as_ref(),
-                            account: &work.account, region: &work.region,
-                            correlation: CorrelationContext::root(),
-                            accepted_at: work.accepted_at.unwrap_or_else(OffsetDateTime::now_utc),
-                        }, &work.rules, &work.event, None).await;
-                        if complete {
-                            if let Err(error) = store.complete_fanout(&work.id).await {
-                                tracing::error!(%error, "EventBridge completion could not be committed");
-                            }
+        workers.insert(
+            key,
+            tokio::spawn(async move {
+                let notify = store.pending_notify();
+                loop {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let pending = match store.pending_fanouts().await {
+                        Ok(work) => work,
+                        Err(_) => {
+                            tracing::error!(
+                                service = "events",
+                                cause_code = "pending_queue_unavailable",
+                                "EventBridge pending queue unavailable"
+                            );
+                            return;
                         }
-                    });
+                    };
+                    if pending.is_empty() {
+                        notified.await;
+                        continue;
+                    }
+                    let mut deliveries = tokio::task::JoinSet::new();
+                    for work in pending {
+                        let claimed = active
+                            .lock()
+                            .map(|mut active| active.insert(work.id.clone()))
+                            .unwrap_or(false);
+                        if !claimed {
+                            continue;
+                        }
+                        let guard = ActiveFanout {
+                            id: work.id.clone(),
+                            active: active.clone(),
+                        };
+                        let store = store.clone();
+                        let registry = registry.clone();
+                        let http = http.clone();
+                        deliveries.spawn(async move {
+                            let _guard = guard;
+                            let Some(registry) = registry.upgrade() else {
+                                return;
+                            };
+                            let complete = fanout_rules(
+                                FanoutContext {
+                                    registry: &registry,
+                                    store: &store,
+                                    http: http.as_ref(),
+                                    account: &work.account,
+                                    region: &work.region,
+                                    correlation: CorrelationContext::root(),
+                                    accepted_at: work
+                                        .accepted_at
+                                        .unwrap_or_else(OffsetDateTime::now_utc),
+                                },
+                                &work.rules,
+                                &work.event,
+                                None,
+                            )
+                            .await;
+                            if complete && store.complete_fanout(&work.id).await.is_err() {
+                                tracing::error!(
+                                    service = "events",
+                                    cause_code = "fanout_commit_failed",
+                                    "EventBridge completion could not be committed"
+                                );
+                            }
+                        });
+                    }
+                    while deliveries.join_next().await.is_some() {}
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        store.config.pending_retry_poll_interval_ms,
+                    ))
+                    .await;
                 }
-                while deliveries.join_next().await.is_some() {}
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }));
+            }),
+        );
     }
 
     pub async fn resume_scheduled_rules(&self) {
@@ -1927,14 +1984,23 @@ impl EventsService {
                         .await
                     {
                         Ok(item) => item,
-                        Err(error) => {
-                            tracing::error!(%error, "failed to load EventBridge replay item");
+                        Err(_) => {
+                            tracing::error!(
+                                service = "events",
+                                cause_code = "replay_item_load_failed",
+                                "failed to load EventBridge replay item"
+                            );
                             return;
                         }
                     }
                 };
                 let Some(event) = event else {
-                    tracing::error!(index, "EventBridge replay snapshot is incomplete");
+                    tracing::error!(
+                        service = "events",
+                        cause_code = "replay_snapshot_incomplete",
+                        index,
+                        "EventBridge replay snapshot is incomplete"
+                    );
                     return;
                 };
                 loop {
@@ -1980,8 +2046,12 @@ impl EventsService {
                         {
                             Ok(true) => break,
                             Ok(false) => return,
-                            Err(error) => {
-                                tracing::error!(%error, "failed to persist EventBridge replay progress");
+                            Err(_) => {
+                                tracing::error!(
+                                    service = "events",
+                                    cause_code = "replay_progress_commit_failed",
+                                    "failed to persist EventBridge replay progress"
+                                );
                                 return;
                             }
                         }
@@ -2003,7 +2073,11 @@ impl EventsService {
                     }
                 }
                 Ok(false) => {}
-                Err(error) => tracing::error!(%error, "failed to complete EventBridge replay"),
+                Err(_) => tracing::error!(
+                    service = "events",
+                    cause_code = "replay_completion_failed",
+                    "failed to complete EventBridge replay"
+                ),
             }
             if let Ok(mut workers) = workers.lock() {
                 workers.remove(&completion_key);
@@ -2022,7 +2096,11 @@ impl EventsService {
                     self.spawn_replay_worker(account, region, replay, None, cursor, total);
                 }
             }
-            Err(error) => tracing::error!(%error, "failed to load EventBridge replays"),
+            Err(_) => tracing::error!(
+                service = "events",
+                cause_code = "replay_load_failed",
+                "failed to load EventBridge replays"
+            ),
         }
     }
 
@@ -2578,8 +2656,12 @@ impl EventsService {
                 now.unix_timestamp_nanos() as i64,
             ) {
                 Ok(value) => value,
-                Err(error) => {
-                    tracing::error!(%error, "scheduled Rule cursor unavailable");
+                Err(_) => {
+                    tracing::error!(
+                        service = "events",
+                        cause_code = "rule_cursor_unavailable",
+                        "scheduled Rule cursor unavailable"
+                    );
                     return;
                 }
             };
@@ -2622,14 +2704,21 @@ impl EventsService {
                     "detail-type":"Scheduled Event","source":"aws.events","account":account,
                     "time":due.format(&Rfc3339).unwrap_or_default(),"region":region,"resources":[],"detail":{}});
                 let payload = json!({"rule":current,"event":event});
-                if let Err(error) = store.enqueue_firing(
-                    "rule",
-                    &rule.arn,
-                    generation,
-                    due.unix_timestamp_nanos() as i64,
-                    &payload,
-                ) {
-                    tracing::error!(%error, "scheduled Rule firing journal unavailable");
+                if store
+                    .enqueue_firing(
+                        "rule",
+                        &rule.arn,
+                        generation,
+                        due.unix_timestamp_nanos() as i64,
+                        &payload,
+                    )
+                    .is_err()
+                {
+                    tracing::error!(
+                        service = "events",
+                        cause_code = "rule_firing_journal_unavailable",
+                        "scheduled Rule firing journal unavailable"
+                    );
                     break;
                 }
                 drop(guard);
@@ -2699,8 +2788,12 @@ async fn deliver_pending_rule(
 ) -> bool {
     let pending = match store.pending_firings("rule", &rule.arn) {
         Ok(rows) => rows,
-        Err(error) => {
-            tracing::error!(%error, "scheduled Rule pending firings unavailable");
+        Err(_) => {
+            tracing::error!(
+                service = "events",
+                cause_code = "rule_pending_firings_unavailable",
+                "scheduled Rule pending firings unavailable"
+            );
             return false;
         }
     };
@@ -2710,7 +2803,11 @@ async fn deliver_pending_rule(
             .and_then(|value| serde_json::from_value::<Rule>(value.clone()).ok())
             .zip(payload.get("event").cloned())
         else {
-            tracing::error!("scheduled Rule firing snapshot is invalid");
+            tracing::error!(
+                service = "events",
+                cause_code = "rule_snapshot_invalid",
+                "scheduled Rule firing snapshot is invalid"
+            );
             return false;
         };
         match store.firing_ready(
@@ -2721,8 +2818,12 @@ async fn deliver_pending_rule(
         ) {
             Ok(true) => {}
             Ok(false) => return false,
-            Err(error) => {
-                tracing::error!(%error, "scheduled Rule retry metadata unavailable");
+            Err(_) => {
+                tracing::error!(
+                    service = "events",
+                    cause_code = "rule_retry_metadata_unavailable",
+                    "scheduled Rule retry metadata unavailable"
+                );
                 return false;
             }
         }
@@ -2770,13 +2871,21 @@ async fn deliver_pending_rule(
             } else {
                 store.defer_firing("rule", &rule.arn, due_ns, now_ns)
             };
-            if let Err(error) = result {
-                tracing::error!(%error, "scheduled Rule retry metadata unavailable");
+            if result.is_err() {
+                tracing::error!(
+                    service = "events",
+                    cause_code = "rule_retry_metadata_unavailable",
+                    "scheduled Rule retry metadata unavailable"
+                );
             }
             return false;
         }
-        if let Err(error) = store.complete_firing("rule", &rule.arn, due_ns) {
-            tracing::error!(%error, "scheduled Rule firing completion unavailable");
+        if store.complete_firing("rule", &rule.arn, due_ns).is_err() {
+            tracing::error!(
+                service = "events",
+                cause_code = "rule_completion_unavailable",
+                "scheduled Rule firing completion unavailable"
+            );
             return false;
         }
     }
@@ -2905,7 +3014,7 @@ async fn deliver_event_target(
                 }
                 let outcome = tokio::time::timeout(
                     remaining,
-                    invoke_api_destination(http, &destination, &connection, &payload),
+                    invoke_api_destination_for_status(http, &destination, &connection, &payload),
                 )
                 .await
                 .unwrap_or(ApiDelivery::RetriableFailure);
@@ -3032,11 +3141,44 @@ pub(crate) enum ApiDelivery {
     TerminalFailure,
 }
 
+#[derive(Clone, Copy)]
+enum ResponseMode {
+    Body,
+    StatusOnly,
+}
+
 pub(crate) async fn invoke_api_destination(
     http: &dyn HttpClient,
     destination: &ApiDestination,
     connection: &Connection,
     payload: &str,
+) -> ApiDelivery {
+    invoke_api_destination_with_response(http, destination, connection, payload, ResponseMode::Body)
+        .await
+}
+
+pub(crate) async fn invoke_api_destination_for_status(
+    http: &dyn HttpClient,
+    destination: &ApiDestination,
+    connection: &Connection,
+    payload: &str,
+) -> ApiDelivery {
+    invoke_api_destination_with_response(
+        http,
+        destination,
+        connection,
+        payload,
+        ResponseMode::StatusOnly,
+    )
+    .await
+}
+
+async fn invoke_api_destination_with_response(
+    http: &dyn HttpClient,
+    destination: &ApiDestination,
+    connection: &Connection,
+    payload: &str,
+    response_mode: ResponseMode,
 ) -> ApiDelivery {
     let Ok(method) = Method::from_bytes(destination.method.as_bytes()) else {
         return ApiDelivery::TerminalFailure;
@@ -3061,7 +3203,7 @@ pub(crate) async fn invoke_api_destination(
                 values.get("ApiKeyValue").and_then(Value::as_str),
             ) {
                 (Some(name), Some(value)) => request.header(name, value),
-                _ => Err(HttpError),
+                _ => Err(HttpError::Transport),
             }
         }
         "BASIC" => {
@@ -3077,7 +3219,7 @@ pub(crate) async fn invoke_api_destination(
                     "authorization",
                     &format!("Basic {}", base64(&format!("{username}:{password}"))),
                 ),
-                _ => Err(HttpError),
+                _ => Err(HttpError::Transport),
             }
         }
         "OAUTH_CLIENT_CREDENTIALS" => match oauth_token(http, &connection.auth_parameters).await {
@@ -3090,9 +3232,13 @@ pub(crate) async fn invoke_api_destination(
         return ApiDelivery::TerminalFailure;
     }
     request.body = payload.to_string();
-    match tokio::time::timeout(std::time::Duration::from_secs(5), http.send(request))
+    let delivery = match response_mode {
+        ResponseMode::Body => http.send(request),
+        ResponseMode::StatusOnly => http.send_for_status(request),
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), delivery)
         .await
-        .unwrap_or(Err(HttpError))
+        .unwrap_or(Err(HttpError::Transport))
     {
         Ok(response) if (200..300).contains(&response.status) => {
             let value = if response.body.is_empty() {
@@ -3327,6 +3473,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classic_api_destination_uses_status_without_reading_or_retrying_a_success_body() {
+        use crate::http_client::HttpResponse;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct StatusClient {
+            status_reads: AtomicUsize,
+            body_reads: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl HttpClient for StatusClient {
+            async fn send(&self, _: HttpRequest) -> Result<HttpResponse, HttpError> {
+                self.body_reads.fetch_add(1, Ordering::SeqCst);
+                Err(HttpError::ResponseTooLarge)
+            }
+            async fn send_for_status(&self, _: HttpRequest) -> Result<HttpResponse, HttpError> {
+                self.status_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: 202,
+                    body: Vec::new(),
+                })
+            }
+        }
+        let client = StatusClient {
+            status_reads: AtomicUsize::new(0),
+            body_reads: AtomicUsize::new(0),
+        };
+        let destination = ApiDestination {
+            name: "owned-status".into(),
+            arn: "arn:aws:events:us-east-1:000000000000:api-destination/owned-status".into(),
+            connection_arn: "arn:aws:events:us-east-1:000000000000:connection/owned-status".into(),
+            endpoint: "https://owned-status.invalid/invoke".into(),
+            method: "POST".into(),
+            rate_limit: None,
+            tags: BTreeMap::new(),
+        };
+        let connection = Connection {
+            name: "owned-status".into(),
+            arn: destination.connection_arn.clone(),
+            auth_type: "API_KEY".into(),
+            auth_parameters: json!({"ApiKeyAuthParameters":{"ApiKeyName":"x-api-key","ApiKeyValue":"fictional-key"}}),
+            tags: BTreeMap::new(),
+        };
+        assert_eq!(
+            invoke_api_destination_for_status(&client, &destination, &connection, "{}").await,
+            ApiDelivery::Success(Value::Null)
+        );
+        assert_eq!(client.status_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(client.body_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            invoke_api_destination(&client, &destination, &connection, "{}").await,
+            ApiDelivery::RetriableFailure
+        );
+        assert_eq!(client.status_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(client.body_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn local_body_budget_failure_retains_existing_destination_retry_classification() {
+        use crate::http_client::HttpResponse;
+        struct Fixed(Result<HttpResponse, HttpError>);
+        #[async_trait::async_trait]
+        impl HttpClient for Fixed {
+            async fn send(&self, _: HttpRequest) -> Result<HttpResponse, HttpError> {
+                self.0.clone()
+            }
+        }
+        let destination = ApiDestination {
+            name: "owned-budget".into(),
+            arn: "arn:aws:events:us-east-1:000000000000:api-destination/owned-budget".into(),
+            connection_arn: "arn:aws:events:us-east-1:000000000000:connection/owned-budget".into(),
+            endpoint: "https://owned-budget.invalid/invoke".into(),
+            method: "POST".into(),
+            rate_limit: None,
+            tags: BTreeMap::new(),
+        };
+        let connection = Connection {
+            name: "owned-budget".into(),
+            arn: destination.connection_arn.clone(),
+            auth_type: "API_KEY".into(),
+            auth_parameters: json!({"ApiKeyAuthParameters":{"ApiKeyName":"x-api-key","ApiKeyValue":"fictional-key"}}),
+            tags: BTreeMap::new(),
+        };
+        for (reply, expected) in [
+            (
+                Err(HttpError::ResponseTooLarge),
+                ApiDelivery::RetriableFailure,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 503,
+                    body: Vec::new(),
+                }),
+                ApiDelivery::RetriableFailure,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 429,
+                    body: Vec::new(),
+                }),
+                ApiDelivery::RetriableFailure,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 403,
+                    body: Vec::new(),
+                }),
+                ApiDelivery::TerminalFailure,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 201,
+                    body: b"{}".to_vec(),
+                }),
+                ApiDelivery::Success(json!({})),
+            ),
+        ] {
+            assert_eq!(
+                invoke_api_destination(&Fixed(reply), &destination, &connection, "{}").await,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn injectable_http_client_records_api_key_basic_and_oauth() {
         use std::collections::VecDeque;
 
@@ -3348,7 +3617,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .ok_or(crate::http_client::HttpError)
+                    .ok_or(crate::http_client::HttpError::Transport)
             }
         }
 
@@ -3601,7 +3870,7 @@ mod tests {
             Arc::new(EbStore::new()),
             Weak::new(),
             Arc::new(FixedClock(now)),
-            Arc::new(crate::http_client::CurlHttpClient),
+            Arc::new(crate::http_client::CurlHttpClient::default()),
         )
     }
 

@@ -43,7 +43,7 @@ impl Services {
         clock: Arc<dyn Clock>,
         store: Arc<EbStore>,
     ) -> Self {
-        let http: Arc<dyn HttpClient> = Arc::new(CurlHttpClient);
+        let http: Arc<dyn HttpClient> = Arc::new(CurlHttpClient::with_config(store.config));
         Self {
             registry: registry.clone(),
             events: EventsService::new(
@@ -448,10 +448,7 @@ mod query_tests {
     }
 }
 
-pub fn register(registry: &Arc<ServiceRegistry>) {
-    register_with_clock(registry, Arc::new(SystemClock));
-}
-pub fn register_with_clock(registry: &Arc<ServiceRegistry>, clock: Arc<dyn Clock>) {
+fn ensure_dispatcher(registry: &Arc<ServiceRegistry>) {
     if registry.internal_dispatcher().is_none() {
         let dispatcher = Arc::new(InternalDispatcher::new_shared(
             registry,
@@ -465,7 +462,9 @@ pub fn register_with_clock(registry: &Arc<ServiceRegistry>, clock: Arc<dyn Clock
         ));
         registry.set_internal_dispatcher(dispatcher);
     }
-    let services = Arc::new(Services::new(Arc::downgrade(registry), clock));
+}
+
+fn register_services(registry: &Arc<ServiceRegistry>, services: Arc<Services>) {
     registry.register_native(
         ServiceName::new("events"),
         ServiceMetadata::new(AwsProtocol::Json11, Some("AWSEvents")),
@@ -482,11 +481,38 @@ pub fn register_with_clock(registry: &Arc<ServiceRegistry>, clock: Arc<dyn Clock
         Arc::new(PipesHandler(services)),
     );
 }
+
+pub fn register(registry: &Arc<ServiceRegistry>) {
+    register_with_clock(registry, Arc::new(SystemClock));
+}
+pub fn register_with_clock(registry: &Arc<ServiceRegistry>, clock: Arc<dyn Clock>) {
+    ensure_dispatcher(registry);
+    let services = Arc::new(Services::new(Arc::downgrade(registry), clock));
+    register_services(registry, services);
+}
+pub fn register_with_config(
+    registry: &Arc<ServiceRegistry>,
+    config: crate::EventBridgeConfig,
+) -> Result<(), String> {
+    config.validate()?;
+    ensure_dispatcher(registry);
+    let mut store = EbStore::new();
+    store.retry_second = Some(config.retry_second());
+    store.config = config;
+    let services = Arc::new(Services::with_store(
+        Arc::downgrade(registry),
+        Arc::new(SystemClock),
+        Arc::new(store),
+    ));
+    register_services(registry, services);
+    Ok(())
+}
+
 pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
 ) -> Result<(), String> {
-    register_with_state_and_retry_timing(registry, state, Duration::from_secs(1))
+    register_with_state_and_config(registry, state, crate::EventBridgeConfig::default())
 }
 
 pub fn register_with_state_and_retry_timing(
@@ -494,21 +520,26 @@ pub fn register_with_state_and_retry_timing(
     state: Arc<StateDb>,
     retry_second: Duration,
 ) -> Result<(), String> {
-    if registry.internal_dispatcher().is_none() {
-        let dispatcher = Arc::new(InternalDispatcher::new_shared(
-            registry,
-            ProxyConfig {
-                backend_url: "http://127.0.0.1:1".into(),
-                upstream_timeout: Duration::from_secs(2),
-            },
-            LegacyHealth::new(false),
-            "us-east-1".into(),
-            "000000000000".into(),
-        ));
-        registry.set_internal_dispatcher(dispatcher);
-    }
+    register_with_state_and_config(
+        registry,
+        state,
+        crate::EventBridgeConfig {
+            retry_time_scale: retry_second.as_secs_f64(),
+            ..Default::default()
+        },
+    )
+}
+
+pub fn register_with_state_and_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    config: crate::EventBridgeConfig,
+) -> Result<(), String> {
+    config.validate()?;
+    ensure_dispatcher(registry);
     let mut store = EbStore::with_state(state)?;
-    store.retry_second = Some(retry_second);
+    store.retry_second = Some(config.retry_second());
+    store.config = config;
     let store = Arc::new(store);
     let services = Arc::new(Services::with_store(
         Arc::downgrade(registry),
@@ -516,21 +547,7 @@ pub fn register_with_state_and_retry_timing(
         store,
     ));
     services.pipes.restore()?;
-    registry.register_native(
-        ServiceName::new("events"),
-        ServiceMetadata::new(AwsProtocol::Json11, Some("AWSEvents")),
-        Arc::new(EventsHandler(services.clone())),
-    );
-    registry.register_native(
-        ServiceName::new("scheduler"),
-        ServiceMetadata::new(AwsProtocol::RestJson, None),
-        Arc::new(SchedulerHandler(services.clone())),
-    );
-    registry.register_native(
-        ServiceName::new("pipes"),
-        ServiceMetadata::new(AwsProtocol::RestJson, None),
-        Arc::new(PipesHandler(services.clone())),
-    );
+    register_services(registry, services.clone());
     tokio::spawn(async move {
         services.events.resume_scheduled_rules().await;
         services.events.resume_replays().await;

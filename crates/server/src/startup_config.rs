@@ -9,9 +9,14 @@ use locallycloud_apigateway::ApiGatewayConfig;
 use locallycloud_cloudformation::CloudFormationConfig;
 use locallycloud_core::config::LocallyCloudConfig;
 use locallycloud_core::observability::{LogColor, LogFormat, LoggingConfig};
+use locallycloud_dynamodb::DynamoDbConfig;
+use locallycloud_eventbridge::EventBridgeConfig;
 use locallycloud_iam_sts::{IamConfig, IamCredentials};
 use locallycloud_lambda::config::{LambdaExecutionConfig, ResolvedLambdaExecutionConfig};
+use locallycloud_s3::{S3Config, S3CredentialSources};
+use locallycloud_sqs::SqsConfig;
 use locallycloud_state::StateDb;
+use locallycloud_stepfunctions::StepFunctionsConfig;
 use serde::{Deserialize, Deserializer};
 use tokio::io::AsyncReadExt;
 
@@ -41,6 +46,12 @@ pub struct StartupConfig {
     pub apigateway: ApiGatewayConfig,
     pub state: StateConfig,
     pub logging: LoggingConfig,
+    pub s3: S3Config,
+    pub s3_credential_sources: std::sync::Arc<S3CredentialSources>,
+    pub sqs: SqsConfig,
+    pub dynamodb: DynamoDbConfig,
+    pub eventbridge: EventBridgeConfig,
+    pub stepfunctions: StepFunctionsConfig,
 }
 
 pub struct StateConfig {
@@ -105,6 +116,11 @@ struct FileConfig {
     apigateway: ApiGatewayConfig,
     state: StateOverrides,
     logging: LoggingConfig,
+    s3: S3Config,
+    sqs: SqsConfig,
+    dynamodb: DynamoDbConfig,
+    eventbridge: EventBridgeConfig,
+    stepfunctions: StepFunctionsConfig,
 }
 
 fn invalid(setting: &str) -> StartupError {
@@ -157,6 +173,29 @@ impl StartupConfig {
         get: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<Self, StartupError> {
         let common = resolve_common(document.common, get)?;
+        let s3 = document
+            .s3
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let s3_credential_sources = std::sync::Arc::new(
+            S3CredentialSources::from_lookup(get).map_err(StartupError::Invalid)?,
+        );
+        let sqs = document
+            .sqs
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let dynamodb = document
+            .dynamodb
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let eventbridge = document
+            .eventbridge
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let stepfunctions = document
+            .stepfunctions
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
         let mut logging = document.logging;
         if let Some(value) = get("RUST_LOG") {
             logging.filter = value.into_string().map_err(|_| invalid("RUST_LOG"))?;
@@ -269,6 +308,12 @@ impl StartupConfig {
             apigateway,
             state: StateConfig { path },
             logging,
+            s3,
+            s3_credential_sources,
+            sqs,
+            dynamodb,
+            eventbridge,
+            stepfunctions,
         })
     }
 }

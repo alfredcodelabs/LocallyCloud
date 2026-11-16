@@ -493,7 +493,26 @@ impl NativeHandler for SqsHandler {
             ctx.metrics.touch();
         }
         match result {
-            Ok(value) => success_response(&op, value, protocol, &request.request_id),
+            Ok(value) => {
+                if value
+                    .get("Failed")
+                    .and_then(Value::as_array)
+                    .is_some_and(|failures| {
+                        failures
+                            .iter()
+                            .any(|failure| failure.get("SenderFault") == Some(&Value::Bool(false)))
+                    })
+                {
+                    locallycloud_core::observability::log_service_error(
+                        "sqs",
+                        Some(&op),
+                        &request.request_id,
+                        "batch_receiver_failure",
+                        500,
+                    );
+                }
+                success_response(&op, value, protocol, &request.request_id)
+            }
             Err(err) => error_response(err, &request, protocol),
         }
     }
@@ -634,7 +653,7 @@ fn query_xml_response(op: &str, value: Value, request_id: &str) -> Response {
 /// `awsQueryCompatible` JSON clients (Terraform, AWS SDK v2 in query mode).
 fn error_response(err: SqsError, request: &ServiceRequest, protocol: Protocol) -> Response {
     let query_compat_header = (protocol == Protocol::Json && is_query_compat(request))
-        .then(|| format!("{};Sender", err.query_code()));
+        .then(|| format!("{};{}", err.query_code(), err.fault()));
     let mut response = err.into_protocol_response(&request.request_id, protocol.aws());
     if let Some(value) = query_compat_header {
         if let Ok(header) = http::HeaderValue::from_str(&value) {
@@ -842,6 +861,23 @@ mod tests {
         drop(restored);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn query_compatible_storage_failures_are_receiver_faults() {
+        let mut request = request("GetQueueUrl", json!({}));
+        request.request_id = "owned-receiver".into();
+        request
+            .headers
+            .insert("x-amzn-query-mode", HeaderValue::from_static("true"));
+        let response = error_response(SqsError::StorageUnavailable, &request, Protocol::Json);
+        assert_eq!(response.status(), 500);
+        assert_eq!(
+            response.headers().get("x-amzn-query-error").unwrap(),
+            "InternalError;Receiver"
+        );
+        let rendered = SqsError::StorageUnavailable.render_query("owned-receiver");
+        assert!(rendered.body.contains("<Type>Receiver</Type>"));
     }
 
     #[tokio::test]

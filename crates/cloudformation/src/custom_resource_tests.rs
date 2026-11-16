@@ -7,6 +7,7 @@ struct Provider {
     registry: Weak<ServiceRegistry>,
     requests: Arc<Mutex<Vec<Value>>>,
     override_mode: Arc<Mutex<Option<String>>>,
+    expected_callback_secret: Option<Arc<Mutex<String>>>,
 }
 
 #[async_trait]
@@ -65,7 +66,7 @@ impl NativeHandler for Provider {
             );
             let mut headers = http::HeaderMap::new();
             headers.insert("host", uri.authority().unwrap().as_str().parse().unwrap());
-            let callback = ServiceRequest {
+            let mut callback = ServiceRequest {
                 method: Method::PUT,
                 uri,
                 headers,
@@ -74,6 +75,32 @@ impl NativeHandler for Provider {
                 account_id: request.account_id,
                 request_id: "callback".into(),
             };
+            if let Some(expected) = &self.expected_callback_secret {
+                let query = locallycloud_s3::query::QueryParams::parse(callback.uri.query());
+                assert!(
+                    query
+                        .get("X-Amz-Credential")
+                        .is_some_and(|credential| credential.starts_with("INJECTED/")),
+                    "custom resource URL must use the injected signing identity"
+                );
+                let expected = expected.lock().unwrap().clone();
+                let sources =
+                    locallycloud_s3::S3CredentialSources::from_lookup(&|name| match name {
+                        "LOCALLYCLOUD_S3_ACCESS_KEY_ID" => Some("INJECTED".into()),
+                        "LOCALLYCLOUD_S3_SECRET_ACCESS_KEY" => Some(expected.clone().into()),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    locallycloud_s3::presign::validate_url_with_sources(&callback, &sources)
+                        .await
+                        .is_ok(),
+                    "custom resource URL must use the expected injected credential generation"
+                );
+                // The provider validates the signed URL above. The existing in-memory S3
+                // fixture is callback storage only; it does not share these credential sources.
+                callback.uri = callback.uri.path().parse().unwrap();
+            }
             let result = self
                 .registry
                 .upgrade()
@@ -108,6 +135,10 @@ type Fixture = (
 );
 
 fn fixture() -> Fixture {
+    fixture_with_callback_secret(None)
+}
+
+fn fixture_with_callback_secret(expected_callback_secret: Option<Arc<Mutex<String>>>) -> Fixture {
     let registry = Arc::new(ServiceRegistry::new());
     locallycloud_s3::register(&registry);
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -119,6 +150,7 @@ fn fixture() -> Fixture {
             registry: Arc::downgrade(&registry),
             requests: requests.clone(),
             override_mode: override_mode.clone(),
+            expected_callback_secret,
         }),
     );
     let handler = CfnHandler::new(Arc::downgrade(&registry));
@@ -207,6 +239,92 @@ async fn custom_resource_stack_lifecycle_and_replacement_use_provider_identity()
     assert_eq!(events[2]["PhysicalResourceId"], "physical-one");
     assert_eq!(events[3]["PhysicalResourceId"], "physical-two");
     assert!(events.iter().all(|e| e["StackId"] == stack.stack_id));
+}
+
+#[tokio::test]
+async fn public_stack_operations_presign_with_injected_live_profile_credentials() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../compatibility-tests/.work/cfn-live-credentials")
+        .join(uuid::Uuid::new_v4().to_string());
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("credentials");
+    let profile = |secret: &str| {
+        format!("[owned]\naws_access_key_id=INJECTED\naws_secret_access_key={secret}\n")
+    };
+    tokio::fs::write(&path, profile("first-generation"))
+        .await
+        .unwrap();
+    let sources = Arc::new(
+        locallycloud_s3::S3CredentialSources::from_lookup(&|name| match name {
+            "LOCALLYCLOUD_S3_ACCESS_KEY_ID" => Some("INJECTED".into()),
+            "AWS_PROFILE" => Some("owned".into()),
+            "AWS_SHARED_CREDENTIALS_FILE" => Some(path.as_os_str().to_owned()),
+            _ => None,
+        })
+        .unwrap(),
+    );
+    let expected = Arc::new(Mutex::new("first-generation".to_owned()));
+    let (_registry, mut handler, requests, _control) =
+        fixture_with_callback_secret(Some(expected.clone()));
+    handler.permissive_s3_sources = Some(sources);
+
+    async fn public_operation(
+        handler: &CfnHandler,
+        action: &str,
+        revision: u32,
+        expected: StackStatus,
+    ) {
+        let mut document: Value =
+            serde_json::from_str(&template("Success", "stable-physical", revision)).unwrap();
+        document["Resources"]["Role"]["Properties"]["ServiceTimeout"] = json!(5);
+        let body = format!(
+            "Action={action}&StackName=custom-stack&TemplateBody={}",
+            encode(&document.to_string())
+        );
+        let response = handler
+            .handle(ServiceRequest {
+                method: Method::POST,
+                uri: "/".parse().unwrap(),
+                headers: Default::default(),
+                body: Bytes::from(body),
+                account_id: "000000000000".into(),
+                region: "us-east-1".into(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .await;
+        assert_eq!(response.status(), 200);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if handler
+                    .store
+                    .get("000000000000", "us-east-1", "custom-stack")
+                    .is_some_and(|stack| stack.status == expected)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("public stack operation must complete using the injected callback credential");
+    }
+
+    public_operation(&handler, "CreateStack", 1, StackStatus::CreateComplete).await;
+    let replacement = root.join("replacement");
+    tokio::fs::write(&replacement, profile("second-generation"))
+        .await
+        .unwrap();
+    tokio::fs::rename(&replacement, &path).await.unwrap();
+    *expected.lock().unwrap() = "second-generation".into();
+    public_operation(&handler, "UpdateStack", 2, StackStatus::UpdateComplete).await;
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["RequestType"], "Create");
+        assert_eq!(requests[1]["RequestType"], "Update");
+    }
+    operation(&handler, "DeleteStack", None).await;
+    tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ pub mod asl;
 mod authorization;
 pub mod choice;
 pub mod clock;
+pub mod config;
 pub mod error;
 pub mod interpreter;
 pub mod jsonata;
@@ -25,4 +26,7 @@ pub mod store;
 #[cfg(test)]
 mod property_tests;
 
-pub use service::{register, register_with_state};
+pub use config::StepFunctionsConfig;
+pub use service::{
+    register, register_with_config, register_with_state, register_with_state_and_config,
+};

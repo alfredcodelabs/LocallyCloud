@@ -5,6 +5,10 @@
 //! query-string sub-resource markers — never an `X-Amz-Target` header.
 
 pub mod addr;
+pub mod config;
+mod credentials;
+pub use config::S3Config;
+pub use credentials::S3CredentialSources;
 mod bucket_keys;
 mod dirty;
 mod encryption;
@@ -20,4 +24,7 @@ pub mod service;
 pub mod store;
 pub mod xml;
 
-pub use service::{register, register_with_state, register_with_state_and_endpoint};
+pub use service::{
+    register, register_with_state, register_with_state_and_endpoint,
+    register_with_state_endpoint_and_config, register_with_state_endpoint_config_and_sources,
+};

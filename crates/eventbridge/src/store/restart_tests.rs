@@ -26,7 +26,7 @@ async fn connection_and_destination_restore_without_plaintext_secrets() {
         store.clone(),
         Weak::new(),
         Arc::new(SystemClock),
-        Arc::new(CurlHttpClient),
+        Arc::new(CurlHttpClient::default()),
     );
     let ctx = RequestContext {
         account: "000000000001",
@@ -103,7 +103,7 @@ async fn failed_delivery_keeps_accepted_event_in_outbox() {
         store.clone(),
         Weak::new(),
         Arc::new(SystemClock),
-        Arc::new(CurlHttpClient),
+        Arc::new(CurlHttpClient::default()),
     );
     let ctx = RequestContext {
         account: "000000000001",
@@ -179,7 +179,7 @@ async fn acknowledged_rule_and_pending_fanout_survive_reopen() {
         store.clone(),
         Weak::new(),
         Arc::new(SystemClock),
-        Arc::new(CurlHttpClient),
+        Arc::new(CurlHttpClient::default()),
     );
     let ctx = RequestContext {
         account: "000000000001",

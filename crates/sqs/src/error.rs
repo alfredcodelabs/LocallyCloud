@@ -44,7 +44,7 @@ pub enum SqsError {
     BatchEntryIdsNotDistinct,
     #[error("The length of all the messages put together is more than the limit.")]
     BatchRequestTooLong,
-    #[error("Indicates that the message referred to by the receipt handle has expired.")]
+    #[error("Only one PurgeQueue operation is allowed per queue every 60 seconds.")]
     PurgeQueueInProgress,
     #[error("{0}")]
     UnsupportedOperation(String),
@@ -91,8 +91,27 @@ impl SqsError {
         match self {
             SqsError::StorageUnavailable => 500,
             SqsError::QueueDoesNotExist => 400,
-            SqsError::OverLimit(_) | SqsError::AccessDenied => 403,
-            _ => 400,
+            SqsError::AccessDenied => 403,
+            SqsError::QueueNameExists
+            | SqsError::QueueDeletedRecently
+            | SqsError::ResourceNotFound(_)
+            | SqsError::InvalidParameterValue(_)
+            | SqsError::MissingParameter(_)
+            | SqsError::InvalidAttributeName(_)
+            | SqsError::InvalidAttributeValue(_)
+            | SqsError::ReceiptHandleIsInvalid
+            | SqsError::MessageNotInflight
+            | SqsError::InvalidMessageContents
+            | SqsError::InvalidBatchEntryId(_)
+            | SqsError::TooManyEntriesInBatchRequest
+            | SqsError::EmptyBatchRequest
+            | SqsError::BatchEntryIdsNotDistinct
+            | SqsError::BatchRequestTooLong
+            | SqsError::PurgeQueueInProgress
+            | SqsError::UnsupportedOperation(_)
+            | SqsError::OverLimit(_)
+            | SqsError::InvalidSecurity
+            | SqsError::KmsAccessDenied => 400,
         }
     }
 
@@ -129,7 +148,15 @@ impl SqsError {
         }
     }
 
-    /// `SenderFault` is true for all client errors (the SQS catalog here is client-fault).
+    pub(crate) fn fault(&self) -> &'static str {
+        if self.http_status() >= 500 {
+            "Receiver"
+        } else {
+            "Sender"
+        }
+    }
+
+    /// Render the service's JSON error shape; faults remain classified by status.
     pub fn render_json(&self, request_id: &str) -> locallycloud_core::error_mapping::RenderedError {
         let mut rendered = AwsError::new(
             format!("{TYPE_PREFIX}{}", self.code()),
@@ -168,7 +195,17 @@ impl SqsError {
     }
 
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
-        self.render_json(request_id).into_response()
+        self.into_protocol_response(request_id, AwsProtocol::Json10)
+    }
+
+    pub(crate) fn log(&self, request_id: &str, operation: Option<&str>) {
+        locallycloud_core::observability::log_service_error(
+            "sqs",
+            operation,
+            request_id,
+            self.code(),
+            self.http_status(),
+        );
     }
 
     /// Build the Axum error response in the request's protocol.
@@ -177,6 +214,7 @@ impl SqsError {
         request_id: &str,
         protocol: AwsProtocol,
     ) -> axum::response::Response {
+        self.log(request_id, None);
         self.render(request_id, protocol).into_response()
     }
 }
@@ -196,8 +234,8 @@ mod tests {
     }
 
     #[test]
-    fn over_limit_is_403() {
-        assert_eq!(SqsError::OverLimit("x".into()).http_status(), 403);
+    fn over_limit_is_400() {
+        assert_eq!(SqsError::OverLimit("x".into()).http_status(), 400);
     }
 
     #[test]

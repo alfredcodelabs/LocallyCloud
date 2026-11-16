@@ -334,9 +334,20 @@ fn validate_event(event: &HistoryEvent, expected_id: usize) -> Result<(), String
 }
 
 impl SfnStore {
+    #[cfg(test)]
     pub(crate) fn with_state(state: Arc<StateDb>, cipher: StateCipher) -> Result<Self, String> {
+        Self::with_state_and_config(state, cipher, crate::StepFunctionsConfig::default())
+    }
+
+    pub(crate) fn with_state_and_config(
+        state: Arc<StateDb>,
+        cipher: StateCipher,
+        config: crate::StepFunctionsConfig,
+    ) -> Result<Self, String> {
+        config.validate()?;
         let persistence = Arc::new(Persistence::new(state, cipher)?);
         let store = Self {
+            config,
             persistence: Some(persistence.clone()),
             ..Self::default()
         };

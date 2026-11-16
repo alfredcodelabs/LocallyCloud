@@ -784,8 +784,12 @@ impl SchedulerService {
                 initial_anchor.unix_timestamp_nanos() as i64,
             ) {
                 Ok(value) => value,
-                Err(error) => {
-                    tracing::error!(%error, "Scheduler cursor unavailable");
+                Err(_) => {
+                    tracing::error!(
+                        service = "scheduler",
+                        cause_code = "schedule_cursor_unavailable",
+                        "Scheduler cursor unavailable"
+                    );
                     return;
                 }
             };
@@ -844,14 +848,21 @@ impl SchedulerService {
                     break;
                 };
                 let payload = serde_json::to_value(&current).unwrap_or(Value::Null);
-                if let Err(error) = store.enqueue_firing(
-                    "scheduler",
-                    &item.arn,
-                    item.generation,
-                    scheduled_due.unix_timestamp_nanos() as i64,
-                    &payload,
-                ) {
-                    tracing::error!(%error, "Scheduler firing journal unavailable");
+                if store
+                    .enqueue_firing(
+                        "scheduler",
+                        &item.arn,
+                        item.generation,
+                        scheduled_due.unix_timestamp_nanos() as i64,
+                        &payload,
+                    )
+                    .is_err()
+                {
+                    tracing::error!(
+                        service = "scheduler",
+                        cause_code = "schedule_firing_journal_unavailable",
+                        "Scheduler firing journal unavailable"
+                    );
                     break;
                 }
                 drop(guard);
@@ -917,14 +928,22 @@ async fn deliver_pending_schedule(
 ) -> bool {
     let pending = match store.pending_firings("scheduler", &item.arn) {
         Ok(rows) => rows,
-        Err(error) => {
-            tracing::error!(%error, "Scheduler pending firings unavailable");
+        Err(_) => {
+            tracing::error!(
+                service = "scheduler",
+                cause_code = "schedule_pending_firings_unavailable",
+                "Scheduler pending firings unavailable"
+            );
             return false;
         }
     };
     for (due_ns, payload) in pending {
         let Ok(snapshot) = serde_json::from_value::<Schedule>(payload) else {
-            tracing::error!("Scheduler firing snapshot is invalid");
+            tracing::error!(
+                service = "scheduler",
+                cause_code = "schedule_snapshot_invalid",
+                "Scheduler firing snapshot is invalid"
+            );
             return false;
         };
         match store.firing_ready(
@@ -935,8 +954,12 @@ async fn deliver_pending_schedule(
         ) {
             Ok(true) => {}
             Ok(false) => return false,
-            Err(error) => {
-                tracing::error!(%error, "Scheduler retry metadata unavailable");
+            Err(_) => {
+                tracing::error!(
+                    service = "scheduler",
+                    cause_code = "schedule_retry_metadata_unavailable",
+                    "Scheduler retry metadata unavailable"
+                );
                 return false;
             }
         }
@@ -982,13 +1005,24 @@ async fn deliver_pending_schedule(
             } else {
                 store.defer_firing("scheduler", &item.arn, due_ns, now_ns)
             };
-            if let Err(error) = result {
-                tracing::error!(%error, "Scheduler retry metadata unavailable");
+            if result.is_err() {
+                tracing::error!(
+                    service = "scheduler",
+                    cause_code = "schedule_retry_metadata_unavailable",
+                    "Scheduler retry metadata unavailable"
+                );
             }
             return false;
         }
-        if let Err(error) = store.complete_firing("scheduler", &item.arn, due_ns) {
-            tracing::error!(%error, "Scheduler firing completion unavailable");
+        if store
+            .complete_firing("scheduler", &item.arn, due_ns)
+            .is_err()
+        {
+            tracing::error!(
+                service = "scheduler",
+                cause_code = "schedule_completion_unavailable",
+                "Scheduler firing completion unavailable"
+            );
             return false;
         }
         if matches!(
@@ -1021,11 +1055,16 @@ async fn delete_completed_schedule(
     {
         state.schedules.remove(&key);
         drop(state);
-        if let Err(error) = store
+        if store
             .persist_scheduler(account, region, OffsetDateTime::now_utc())
             .await
+            .is_err()
         {
-            tracing::error!(%error, "Scheduler completion metadata unavailable");
+            tracing::error!(
+                service = "scheduler",
+                cause_code = "schedule_completion_metadata_unavailable",
+                "Scheduler completion metadata unavailable"
+            );
         }
     }
 }

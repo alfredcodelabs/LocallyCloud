@@ -535,11 +535,30 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
     register_store(registry, Arc::new(TableStore::new()));
 }
 
+pub fn register_with_config(
+    registry: &Arc<ServiceRegistry>,
+    config: crate::DynamoDbConfig,
+) -> Result<(), DdbError> {
+    register_store(registry, Arc::new(TableStore::with_config(config)?));
+    Ok(())
+}
+
 pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
 ) -> Result<(), DdbError> {
-    register_store(registry, Arc::new(TableStore::with_state(state)?));
+    register_with_state_and_config(registry, state, crate::DynamoDbConfig::default())
+}
+
+pub fn register_with_state_and_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    config: crate::DynamoDbConfig,
+) -> Result<(), DdbError> {
+    register_store(
+        registry,
+        Arc::new(TableStore::with_state_and_config(state, config)?),
+    );
     Ok(())
 }
 

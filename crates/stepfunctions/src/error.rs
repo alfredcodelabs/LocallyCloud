@@ -64,7 +64,7 @@ pub enum SfnError {
 impl SfnError {
     pub fn code(&self) -> &'static str {
         match self {
-            SfnError::Internal(_) => "InternalServerError",
+            SfnError::Internal(_) => "InternalFailure",
             SfnError::AccessDenied => "AccessDeniedException",
             SfnError::StateMachineDoesNotExist(_) => "StateMachineDoesNotExist",
             SfnError::StateMachineAlreadyExists(_) => "StateMachineAlreadyExists",
@@ -93,21 +93,49 @@ impl SfnError {
         }
     }
 
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::Internal(_) => 500,
+            Self::AccessDenied => 403,
+            Self::StateMachineDoesNotExist(_)
+            | Self::StateMachineAlreadyExists(_)
+            | Self::StateMachineDeleting(_)
+            | Self::StateMachineLimitExceeded(_)
+            | Self::ExecutionDoesNotExist(_)
+            | Self::ExecutionAlreadyExists(_)
+            | Self::ExecutionLimitExceeded(_)
+            | Self::ExecutionNotRedrivable(_)
+            | Self::ActivityDoesNotExist(_)
+            | Self::ActivityLimitExceeded(_)
+            | Self::TaskDoesNotExist(_)
+            | Self::TaskTimedOut(_)
+            | Self::InvalidExecutionInput(_)
+            | Self::InvalidDefinition(_)
+            | Self::InvalidName(_)
+            | Self::InvalidArn(_)
+            | Self::StateMachineTypeNotSupported(_)
+            | Self::InvalidLoggingConfiguration(_)
+            | Self::InvalidTracingConfiguration(_)
+            | Self::InvalidEncryptionConfiguration(_)
+            | Self::ConflictException(_)
+            | Self::ResourceNotFound(_)
+            | Self::Validation(_)
+            | Self::UnknownOperation(_) => 400,
+        }
+    }
+
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
-        AwsError::new(
+        locallycloud_core::observability::log_service_error(
+            "states",
+            None,
+            request_id,
             self.code(),
-            self.to_string(),
-            if matches!(self, Self::Internal(_)) {
-                500
-            } else if matches!(self, Self::AccessDenied) {
-                403
-            } else {
-                400
-            },
-        )
-        .with_request_id(request_id.to_string())
-        .render(AwsProtocol::Json10)
-        .into_response()
+            self.http_status(),
+        );
+        AwsError::new(self.code(), self.to_string(), self.http_status())
+            .with_request_id(request_id.to_string())
+            .render(AwsProtocol::Json10)
+            .into_response()
     }
 }
 
@@ -164,6 +192,24 @@ impl AslError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn internal_failure_uses_documented_common_code_and_json10_correlation() {
+        let response =
+            SfnError::Internal("owned failure".into()).into_response("owned-sfn-request");
+        assert_eq!(response.status(), 500);
+        assert_eq!(response.headers()["x-amzn-requestid"], "owned-sfn-request");
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/x-amz-json-1.0"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["__type"], "InternalFailure");
+        assert_eq!(body["message"], "owned failure");
+    }
 
     #[test]
     fn api_error_renders_json10() {

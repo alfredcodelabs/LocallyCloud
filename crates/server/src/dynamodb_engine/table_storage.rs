@@ -22,6 +22,7 @@ pub(super) struct TableStorage {
     state: Arc<StateDb>,
     registry: Weak<ServiceRegistry>,
     services: OnceCell<Services>,
+    config: locallycloud_dynamodb::DynamoDbConfig,
 }
 
 struct Services {
@@ -159,11 +160,25 @@ impl TableStorage {
         };
         self.for_access(record, request, access)
     }
+    #[cfg(test)]
     pub fn new(state: Arc<StateDb>, registry: Weak<ServiceRegistry>) -> Arc<Self> {
+        Self::with_config(
+            state,
+            registry,
+            locallycloud_dynamodb::DynamoDbConfig::default(),
+        )
+    }
+
+    pub fn with_config(
+        state: Arc<StateDb>,
+        registry: Weak<ServiceRegistry>,
+        config: locallycloud_dynamodb::DynamoDbConfig,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state,
             registry,
             services: OnceCell::new(),
+            config,
         })
     }
 
@@ -176,7 +191,10 @@ impl TableStorage {
                     .and_then(|r| r.internal_dispatcher())
                     .ok_or_else(unavailable)?;
                 let cipher = Arc::new(StateCipher::from_env().map_err(|_| unavailable())?);
-                let keys = Arc::new(TableKeys::new(dispatcher, cipher));
+                let keys = Arc::new(
+                    TableKeys::with_config(dispatcher, cipher, &self.config)
+                        .map_err(|_| unavailable())?,
+                );
                 let catalog = TableCatalog::new(self.state.clone(), keys.clone()).await?;
                 Ok(Services { keys, catalog })
             })

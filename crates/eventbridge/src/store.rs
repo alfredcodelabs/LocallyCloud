@@ -38,6 +38,7 @@ pub struct AccountState {
 
 #[derive(Default)]
 pub struct EbStore {
+    pub(crate) config: crate::EventBridgeConfig,
     pub(crate) retry_second: Option<std::time::Duration>,
     pub(crate) memory_fanouts: std::sync::Mutex<BTreeMap<String, PendingFanout>>,
     scopes: DashMap<ScopeKey, Arc<RwLock<AccountState>>>,

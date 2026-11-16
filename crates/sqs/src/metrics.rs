@@ -169,6 +169,8 @@ impl MetricsRecorder {
         }
         let Some(sink) = resolve_sink(&self.registry) else {
             tracing::debug!(
+                service = "sqs",
+                cause_code = "metrics_sink_unavailable",
                 count = emitted,
                 "AWS/SQS metrics dropped: monitoring unavailable"
             );
@@ -186,7 +188,12 @@ impl MetricsRecorder {
             }
             let outcome = sink.try_emit(batch);
             if outcome != EmitOutcome::Accepted {
-                tracing::debug!(?outcome, "AWS/SQS metric batch not accepted");
+                tracing::debug!(
+                    service = "sqs",
+                    cause_code = "metric_batch_rejected",
+                    ?outcome,
+                    "AWS/SQS metric batch not accepted"
+                );
             }
         }
         emitted

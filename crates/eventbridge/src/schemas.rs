@@ -44,15 +44,22 @@ impl SchemasError {
             Self::Conflict(m) => (StatusCode::CONFLICT, "ConflictException", m),
             Self::AccessDenied => (
                 StatusCode::FORBIDDEN,
-                "AccessDeniedException",
+                "ForbiddenException",
                 "User is not authorized to perform this operation".into(),
             ),
             Self::Internal(m) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalServerException",
+                "InternalServerErrorException",
                 m,
             ),
         };
+        locallycloud_core::observability::log_service_error(
+            "schemas",
+            None,
+            request_id,
+            code,
+            status.as_u16(),
+        );
         Response::builder()
             .status(status)
             .header("content-type", "application/json")
@@ -917,6 +924,32 @@ mod tests {
     use http::{HeaderMap, Uri};
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn schema_failures_keep_the_service_specific_code_message_envelope() {
+        for (error, status, code) in [
+            (
+                SchemasError::Internal("owned failure".into()),
+                500,
+                "InternalServerErrorException",
+            ),
+            (SchemasError::AccessDenied, 403, "ForbiddenException"),
+        ] {
+            let response = error.response("owned-schema-request");
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["x-amzn-requestid"],
+                "owned-schema-request"
+            );
+            assert_eq!(response.headers()["x-amzn-errortype"], code);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["Code"], code);
+            assert!(body["Message"].is_string());
+        }
+    }
 
     fn request(
         method: Method,

@@ -505,19 +505,44 @@ impl TableStore {
         Self::default()
     }
 
+    pub fn with_config(config: crate::DynamoDbConfig) -> Result<Self, DdbError> {
+        config.validate().map_err(DdbError::Internal)?;
+        let mut store = Self::default();
+        store.capacity.enabled = config.simulate_write_limits;
+        Ok(store)
+    }
+
     pub fn with_state(state: Arc<StateDb>) -> Result<Self, DdbError> {
+        Self::with_state_and_config(state, crate::DynamoDbConfig::default())
+    }
+
+    pub fn with_state_and_config(
+        state: Arc<StateDb>,
+        config: crate::DynamoDbConfig,
+    ) -> Result<Self, DdbError> {
+        config.validate().map_err(DdbError::Internal)?;
         let cipher = if std::env::var_os("LOCALLYCLOUD_KMS_MASTER_KEY").is_some() {
             Some(Arc::new(StateCipher::from_env().map_err(persist_error)?))
         } else {
             None
         };
-        Self::with_state_and_cipher(state, cipher)
+        Self::with_state_cipher_and_config(state, cipher, config)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_state_and_cipher(
         state: Arc<StateDb>,
         cipher: Option<Arc<StateCipher>>,
     ) -> Result<Self, DdbError> {
+        Self::with_state_cipher_and_config(state, cipher, crate::DynamoDbConfig::default())
+    }
+
+    fn with_state_cipher_and_config(
+        state: Arc<StateDb>,
+        cipher: Option<Arc<StateCipher>>,
+        config: crate::DynamoDbConfig,
+    ) -> Result<Self, DdbError> {
+        config.validate().map_err(DdbError::Internal)?;
         let connection = state.connection().map_err(persist_error)?;
         connection
             .execute_batch(
@@ -559,7 +584,7 @@ impl TableStore {
         connection
             .execute_batch(crate::recovery::SCHEMA)
             .map_err(persist_error)?;
-        let mut store = Self::new();
+        let mut store = Self::with_config(config)?;
         store.state = Some(state);
         store.cipher = cipher;
         {
@@ -1089,6 +1114,19 @@ impl TableStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn persistence_errors_do_not_expose_source_paths_or_values() {
+        let marker = "/owned/private/host-path-secret";
+        let response = persist_error(marker).into_response("owned-request");
+        assert_eq!(response.status(), 500);
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains(marker));
+        assert!(body.contains("state database and master key"));
+    }
 
     fn simple_def(name: &str) -> TableDefinition {
         TableDefinition {
@@ -1677,8 +1715,11 @@ pub(crate) fn migration_table(
     Ok((saved.into_data(), unknown))
 }
 
-fn persist_error(error: impl std::fmt::Display) -> DdbError {
-    DdbError::Internal(format!("DynamoDB persistence failed: {error}"))
+fn persist_error(_: impl std::fmt::Display) -> DdbError {
+    DdbError::Internal(
+        "DynamoDB state could not be committed or loaded; check the state database and master key"
+            .into(),
+    )
 }
 
 fn unix_secs() -> i64 {

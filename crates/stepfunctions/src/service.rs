@@ -50,13 +50,9 @@ impl SfnHandler {
     }
 
     fn operation(req: &ServiceRequest) -> Option<String> {
-        req.headers
-            .get("x-amz-target")?
-            .to_str()
-            .ok()?
-            .rsplit('.')
-            .next()
-            .map(str::to_string)
+        let target = req.headers.get("x-amz-target")?.to_str().ok()?;
+        let (prefix, operation) = target.split_once('.')?;
+        (prefix == TARGET_PREFIX && !operation.is_empty()).then(|| operation.to_owned())
     }
 
     async fn dispatch(&self, op: &str, ctx: &Ctx<'_>, body: &Value) -> Result<Value, SfnError> {
@@ -119,7 +115,7 @@ impl NativeHandler for SfnHandler {
         let op = match Self::operation(&request) {
             Some(o) => o,
             None => {
-                return SfnError::UnknownOperation("missing X-Amz-Target".into())
+                return SfnError::UnknownOperation("missing or invalid X-Amz-Target".into())
                     .into_response(&request.request_id)
             }
         };
@@ -251,13 +247,38 @@ pub fn register(registry: &Arc<ServiceRegistry>) {
     register_handler(registry, SfnHandler::new(Arc::downgrade(registry)));
 }
 
+pub fn register_with_config(
+    registry: &Arc<ServiceRegistry>,
+    config: crate::StepFunctionsConfig,
+) -> Result<(), String> {
+    let store = Arc::new(SfnStore::with_config(config)?);
+    ensure_dispatcher(registry);
+    register_handler(
+        registry,
+        SfnHandler {
+            store,
+            registry: Arc::downgrade(registry),
+        },
+    );
+    Ok(())
+}
+
 pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<locallycloud_state::StateDb>,
 ) -> Result<(), String> {
-    let store = SfnStore::with_state(
+    register_with_state_and_config(registry, state, crate::StepFunctionsConfig::default())
+}
+
+pub fn register_with_state_and_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    config: crate::StepFunctionsConfig,
+) -> Result<(), String> {
+    let store = SfnStore::with_state_and_config(
         state,
         locallycloud_state::StateCipher::from_env().map_err(|e| e.to_string())?,
+        config,
     )?;
     ensure_dispatcher(registry);
     register_handler(
@@ -290,6 +311,41 @@ mod tests {
     };
     use serde_json::json;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn target_prefix_is_validated_before_dispatching_a_known_operation() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let handler = SfnHandler::new(Arc::downgrade(&registry));
+        for target in [
+            "Other.ListStateMachines",
+            "ListStateMachines",
+            "AWSStepFunctions.",
+        ] {
+            let request = ServiceRequest {
+                method: Method::POST,
+                uri: "/".parse().unwrap(),
+                headers: HeaderMap::from_iter([(
+                    "x-amz-target".parse().unwrap(),
+                    HeaderValue::from_str(target).unwrap(),
+                )]),
+                body: Bytes::from_static(b"{}"),
+                region: "us-east-1".into(),
+                account_id: "000000000000".into(),
+                request_id: "owned-prefix-request".into(),
+            };
+            let response = handler.handle(request).await;
+            assert_eq!(response.status(), 400);
+            assert_eq!(
+                response.headers()["x-amzn-requestid"],
+                "owned-prefix-request"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["__type"], "UnknownOperationException");
+        }
+    }
 
     fn durable_handler(
         registry: &Arc<ServiceRegistry>,

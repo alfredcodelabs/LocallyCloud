@@ -654,17 +654,20 @@ proptest! {
     // Feature: locallycloud-s3, Property 17: Presign Round-Trip
     #[test]
     fn presign_round_trip(key in "[a-z0-9]{1,8}", put in any::<bool>(), expires in 30u16..300) {
+        runtime().block_on(async {
         let method = if put { Method::PUT } else { Method::GET };
         let path = format!("/bucket/{key}");
         let valid = signed_request(method.clone(), &path, expires);
         prop_assert!(locallycloud_s3::presign::is_presigned_url(&valid));
-        prop_assert!(locallycloud_s3::presign::validate_url(&valid).is_ok());
+        prop_assert!(locallycloud_s3::presign::validate_url(&valid).await.is_ok());
         let mut tampered = valid.clone();
         tampered.uri = format!("/bucket/{key}x?{}", valid.uri.query().expect("signed query"))
             .parse()
             .expect("tampered URI");
-        let error = locallycloud_s3::presign::validate_url(&tampered).expect_err("tamper must fail");
+        let error = locallycloud_s3::presign::validate_url(&tampered).await.expect_err("tamper must fail");
         prop_assert_eq!(error.http_status(), 403);
+        Ok(())
+        })?;
     }
 
     // Feature: locallycloud-s3, Property 18: aws-chunked Decode Round-Trip

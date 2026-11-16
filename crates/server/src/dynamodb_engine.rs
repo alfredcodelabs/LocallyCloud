@@ -124,13 +124,20 @@ pub struct ExtendDb {
 }
 
 impl ExtendDb {
-    pub async fn new(
+    pub async fn with_config(
         state: Arc<locallycloud_state::StateDb>,
         registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
+        config: locallycloud_dynamodb::DynamoDbConfig,
     ) -> io::Result<Self> {
+        config.validate().map_err(io::Error::other)?;
         let notifier = crate::dynamodb_replication::RelayNotifier::new();
-        let mut pool = WorkerPool::new(&state, notifier.clone())?;
-        pool.table_storage = Some(TableStorage::new(state.clone(), registry));
+        let worker_state = state.clone();
+        let worker_notifier = notifier.clone();
+        let mut pool =
+            tokio::task::spawn_blocking(move || WorkerPool::new(&worker_state, worker_notifier))
+                .await
+                .map_err(|_| io::Error::other("DynamoDB worker pool initialization failed"))??;
+        pool.table_storage = Some(TableStorage::with_config(state.clone(), registry, config));
         let pool = Arc::new(pool);
         let coordinator =
             crate::dynamodb_replication::Coordinator::new(pool.clone(), state, notifier).await?;

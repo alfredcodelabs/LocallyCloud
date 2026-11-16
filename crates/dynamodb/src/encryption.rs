@@ -20,7 +20,6 @@ use uuid::Uuid;
 
 use crate::error::DdbError;
 
-const KMS_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_ENVELOPE: usize = 64 * 1024;
 const MAX_WRAPPED_KEY: usize = 16 * 1024;
 
@@ -163,6 +162,7 @@ pub struct TableKeyMaterial {
 pub struct TableKeys {
     dispatcher: Arc<InternalDispatcher>,
     metadata_cipher: Arc<StateCipher>,
+    timeout: Duration,
 }
 
 impl TableKeys {
@@ -170,7 +170,21 @@ impl TableKeys {
         Self {
             dispatcher,
             metadata_cipher,
+            timeout: crate::DynamoDbConfig::default().kms_timeout(),
         }
+    }
+
+    pub fn with_config(
+        dispatcher: Arc<InternalDispatcher>,
+        metadata_cipher: Arc<StateCipher>,
+        config: &crate::DynamoDbConfig,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
+            dispatcher,
+            metadata_cipher,
+            timeout: config.kms_timeout(),
+        })
     }
 
     /// Rebuild IAM decisions for the current caller, including warm-worker requests.
@@ -219,7 +233,7 @@ impl TableKeys {
         };
         let resolved = self
             .dispatcher
-            .kms_validate_key_bounded(request, KMS_TIMEOUT)
+            .kms_validate_key_bounded(request, self.timeout)
             .await?;
         scope.validate_key_arn(&resolved.key_arn)?;
         let call = self.call_context(
@@ -352,7 +366,7 @@ impl TableKeys {
                     encryption_context: scope.context(),
                     action,
                 },
-                KMS_TIMEOUT,
+                self.timeout,
             )
             .await
     }
@@ -374,7 +388,7 @@ impl TableKeys {
                     number_of_bytes: 32,
                     encryption_context: scope.context(),
                 },
-                KMS_TIMEOUT,
+                self.timeout,
             )
             .await?;
         scope.validate_key_arn(&generated.key_id)?;
@@ -431,7 +445,7 @@ impl TableKeys {
                     ciphertext: SensitiveBytes::new(wrapped.ciphertext),
                     encryption_context: scope.context(),
                 },
-                KMS_TIMEOUT,
+                self.timeout,
             )
             .await?;
         if opened.key_id != wrapped.key_arn || opened.plaintext.as_slice().len() != 32 {
