@@ -65,10 +65,6 @@ pub enum RuntimeError {
     TaskNotFound { task_id: String },
     #[error("task already completed: {task_id}")]
     TaskAlreadyCompleted { task_id: String },
-    #[error("KVM unavailable: {reason}")]
-    KvmUnavailable { reason: String },
-    #[error("microVM boot failed: {reason}")]
-    BootFailed { reason: String },
     #[error("OCI runtime not found: {binary}")]
     OciRuntimeNotFound { binary: String },
     #[error("task execution failed: {reason}")]

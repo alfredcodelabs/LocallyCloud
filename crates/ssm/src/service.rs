@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::error::SsmError;
 use crate::model::{ParameterValue, ParameterValueSnapshot, Scope, SecretString};
+use crate::protocol::Operation;
 use crate::protocol::{
     self, AddTagsToResourceRequest, DeleteParameterRequest, DescribeParametersRequest,
     DescribeParametersResponse, GetParameterRequest, GetParameterResponse,
@@ -47,8 +48,8 @@ impl SsmHandler {
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> Self {
         Self {
             registry,
-            store: Arc::new(ParameterStore::new()),
             persistence_failed: AtomicBool::new(false),
+            store: Arc::new(ParameterStore::new()),
             path_tokens: by_path::token_cipher(),
         }
     }
@@ -59,17 +60,10 @@ impl SsmHandler {
     ) -> Result<Self, SsmError> {
         Ok(Self {
             registry,
-            store: Arc::new(ParameterStore::with_state(state)?),
             persistence_failed: AtomicBool::new(false),
+            store: Arc::new(ParameterStore::with_state(state)?),
             path_tokens: by_path::token_cipher(),
         })
-    }
-
-    async fn persist(&self) -> Result<(), SsmError> {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.save())
-            .await
-            .map_err(|_| SsmError::Internal)?
     }
 
     async fn process(&self, request: &ServiceRequest) -> Result<Value, SsmError> {
@@ -84,30 +78,32 @@ impl SsmHandler {
             return Err(SsmError::Validation);
         }
         let operation = protocol::operation(&request.headers)?;
-        if !protocol::is_allowed(operation) {
-            return Err(SsmError::UnknownOperation);
-        }
         let scope = Scope::new(&request.account_id, &request.region);
         match operation {
-            "GetParameters" => {
+            Operation::GetParameters => {
                 self.get_parameters(decode(&request.body)?, &scope, request)
                     .await
             }
-            "GetParametersByPath" => self.get_parameters_by_path(request, &scope).await,
-            "PutParameter" => {
+            Operation::GetParametersByPath => self.get_parameters_by_path(request, &scope).await,
+            Operation::PutParameter => {
                 self.put_parameter(decode(&request.body)?, &scope, request)
                     .await
             }
-            "GetParameter" => {
-                self.get_parameter(decode(&request.body)?, &scope, request)
+            Operation::GetParameter => {
+                self.get_parameter(decode(&request.body)?, &scope, request, operation)
                     .await
             }
-            "DescribeParameters" => self.describe_parameters(decode(&request.body)?, &scope),
-            "DeleteParameter" => self.delete_parameter(decode(&request.body)?, &scope),
-            "AddTagsToResource" => self.add_tags(decode(&request.body)?, &scope),
-            "RemoveTagsFromResource" => self.remove_tags(decode(&request.body)?, &scope),
-            "ListTagsForResource" => self.list_tags(decode(&request.body)?, &scope),
-            _ => Err(SsmError::UnknownOperation),
+            Operation::DescribeParameters => {
+                self.describe_parameters(decode(&request.body)?, &scope)
+            }
+            Operation::DeleteParameter => {
+                self.delete_parameter(decode(&request.body)?, &scope).await
+            }
+            Operation::AddTagsToResource => self.add_tags(decode(&request.body)?, &scope).await,
+            Operation::RemoveTagsFromResource => {
+                self.remove_tags(decode(&request.body)?, &scope).await
+            }
+            Operation::ListTagsForResource => self.list_tags(decode(&request.body)?, &scope),
         }
     }
 
@@ -187,15 +183,21 @@ impl SsmHandler {
         } else {
             ParameterValue::Plain(SecretString::new(request.value))
         };
-        let version = self.store.put(
-            scope,
-            request.name,
-            value,
-            request.description,
-            request.overwrite.unwrap_or(false),
-            tags,
-            now_epoch()?,
-        )?;
+        let store = self.store.clone();
+        let scope = scope.clone();
+        let version = tokio::task::spawn_blocking(move || {
+            store.put(
+                &scope,
+                request.name,
+                value,
+                request.description,
+                request.overwrite.unwrap_or(false),
+                tags,
+                now_epoch()?,
+            )
+        })
+        .await
+        .map_err(|_| SsmError::Internal)??;
         serialize(PutParameterResponse {
             version,
             tier: "Standard",
@@ -207,15 +209,14 @@ impl SsmHandler {
         request: GetParameterRequest,
         scope: &Scope,
         service_request: &ServiceRequest,
+        operation: Operation,
     ) -> Result<Value, SsmError> {
         let (name, selector) = batch::query_name(&request.name, scope)?;
         locallycloud_core::integration::authorization::authorize_native_read(
             &self.registry,
             service_request,
             "ssm",
-            if protocol::operation(&service_request.headers)
-                .is_ok_and(|operation| operation == "GetParameters")
-            {
+            if operation == Operation::GetParameters {
                 "ssm:GetParameters"
             } else {
                 "ssm:GetParameter"
@@ -336,17 +337,21 @@ impl SsmHandler {
         serialize(DescribeParametersResponse { parameters })
     }
 
-    fn delete_parameter(
+    async fn delete_parameter(
         &self,
         request: DeleteParameterRequest,
         scope: &Scope,
     ) -> Result<Value, SsmError> {
         validate_name(&request.name)?;
-        self.store.delete(scope, &request.name)?;
+        let store = self.store.clone();
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || store.delete(&scope, &request.name))
+            .await
+            .map_err(|_| SsmError::Internal)??;
         Ok(json!({}))
     }
 
-    fn add_tags(
+    async fn add_tags(
         &self,
         request: AddTagsToResourceRequest,
         scope: &Scope,
@@ -356,11 +361,15 @@ impl SsmHandler {
         if tags.is_empty() {
             return Err(SsmError::Validation);
         }
-        self.store.add_tags(scope, &request.resource_id, tags)?;
+        let store = self.store.clone();
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || store.add_tags(&scope, &request.resource_id, tags))
+            .await
+            .map_err(|_| SsmError::Internal)??;
         Ok(json!({}))
     }
 
-    fn remove_tags(
+    async fn remove_tags(
         &self,
         request: RemoveTagsFromResourceRequest,
         scope: &Scope,
@@ -376,8 +385,13 @@ impl SsmHandler {
                 return Err(SsmError::Validation);
             }
         }
-        self.store
-            .remove_tags(scope, &request.resource_id, &request.tag_keys)?;
+        let store = self.store.clone();
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || {
+            store.remove_tags(&scope, &request.resource_id, &request.tag_keys)
+        })
+        .await
+        .map_err(|_| SsmError::Internal)??;
         Ok(json!({}))
     }
 
@@ -439,23 +453,11 @@ impl NativeHandler for SsmHandler {
         let result = if self.persistence_failed.load(Ordering::Acquire) {
             Err(SsmError::Internal)
         } else {
-            let write = protocol::operation(&request.headers).is_ok_and(|op| {
-                matches!(
-                    op,
-                    "PutParameter"
-                        | "DeleteParameter"
-                        | "AddTagsToResource"
-                        | "RemoveTagsFromResource"
-                )
-            });
-            let result = self.process(&request).await;
-            if write && result.is_ok() && self.persist().await.is_err() {
-                self.persistence_failed.store(true, Ordering::Release);
-                Err(SsmError::Internal)
-            } else {
-                result
-            }
+            self.process(&request).await
         };
+        if matches!(result, Err(SsmError::Persistence)) {
+            self.persistence_failed.store(true, Ordering::Release);
+        }
         match result {
             Ok(value) => Response::builder()
                 .status(200)

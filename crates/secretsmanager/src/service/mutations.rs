@@ -89,31 +89,33 @@ impl SecretsManagerHandler {
             apply_stages(&mut record, version_id, &stages)?;
         }
         let name = record.name.clone();
-        let mut guard = lock(&slot)?;
-        if let Some(existing) = guard.as_ref() {
-            if version_id.as_deref().is_some_and(|id| {
-                record
-                    .versions
-                    .get(id)
-                    .is_some_and(|prepared| prepared_version_matches(existing, id, prepared))
-            }) {
-                return serialize(json!({
-                    "ARN": existing.arn,
-                    "Name": existing.name,
-                    "VersionId": version_id
-                }));
-            }
-            return Err(SecretsError::ResourceExists);
-        }
-        *guard = Some(record);
-        let mut response = json!({"ARN": arn, "Name": name});
-        if let Some(version_id) = version_id {
-            response
-                .as_object_mut()
-                .ok_or(SecretsError::Internal)?
-                .insert("VersionId".to_owned(), version_id.into());
-        }
-        serialize(response)
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                if let Some(existing) = guard.as_ref() {
+                    if version_id.as_deref().is_some_and(|id| {
+                        record.versions.get(id).is_some_and(|prepared| {
+                            prepared_version_matches(existing, id, prepared)
+                        })
+                    }) {
+                        return serialize(json!({
+                            "ARN": existing.arn,
+                            "Name": existing.name,
+                            "VersionId": version_id
+                        }));
+                    }
+                    return Err(SecretsError::ResourceExists);
+                }
+                *guard = Some(record);
+                let mut response = json!({"ARN": arn, "Name": name});
+                if let Some(version_id) = version_id {
+                    response
+                        .as_object_mut()
+                        .ok_or(SecretsError::Internal)?
+                        .insert("VersionId".to_owned(), version_id.into());
+                }
+                serialize(response)
+            })
+            .await
     }
 
     pub(super) async fn put_secret_value(
@@ -161,8 +163,8 @@ impl SecretsManagerHandler {
                 now,
             )
             .await?;
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
+        self.store.update(scope.clone(), slot, move |guard| {
+        let record = active_record_mut(guard)?;
         if record.arn != arn || record.kms_key_id != key_id {
             return Err(SecretsError::InvalidRequest);
         }
@@ -186,6 +188,7 @@ impl SecretsManagerHandler {
             "VersionId": version_id,
             "VersionStages": record.versions.get(&version_id).ok_or(SecretsError::Internal)?.stages
         }))
+        }).await
     }
 
     pub(super) async fn update_secret(
@@ -242,47 +245,50 @@ impl SecretsManagerHandler {
         } else {
             None
         };
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
-        if record.arn != arn || record.kms_key_id != current_key_id {
-            return Err(SecretsError::InvalidRequest);
-        }
-        if let (Some(prepared), Some(id)) = (version.as_ref(), version_id.as_deref()) {
-            if prepared_version_matches(record, id, prepared) {
-                return serialize(json!({
-                    "ARN": record.arn,
-                    "Name": record.name,
-                    "VersionId": id
-                }));
-            }
-            if record.versions.contains_key(id) {
-                return Err(SecretsError::ResourceExists);
-            }
-        }
-        if let (Some(version), Some(version_id)) = (version, version_id.as_deref()) {
-            if input.kms_key_id.is_some() {
-                record.kms_key_id = Some(version.key_arn.clone());
-            }
-            record.versions.insert(version_id.to_owned(), version);
-            apply_stages(record, version_id, &stages)?;
-        } else if let Some(key_id) = input.kms_key_id {
-            record.kms_key_id = Some(key_id);
-        }
-        if let Some(description) = input.description {
-            record.description = Some(description);
-        }
-        record.last_changed_date = now;
-        let mut response = json!({"ARN": record.arn, "Name": record.name});
-        if let Some(version_id) = version_id {
-            response
-                .as_object_mut()
-                .ok_or(SecretsError::Internal)?
-                .insert("VersionId".to_owned(), version_id.into());
-        }
-        serialize(response)
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = active_record_mut(guard)?;
+                if record.arn != arn || record.kms_key_id != current_key_id {
+                    return Err(SecretsError::InvalidRequest);
+                }
+                if let (Some(prepared), Some(id)) = (version.as_ref(), version_id.as_deref()) {
+                    if prepared_version_matches(record, id, prepared) {
+                        return serialize(json!({
+                            "ARN": record.arn,
+                            "Name": record.name,
+                            "VersionId": id
+                        }));
+                    }
+                    if record.versions.contains_key(id) {
+                        return Err(SecretsError::ResourceExists);
+                    }
+                }
+                if let (Some(version), Some(version_id)) = (version, version_id.as_deref()) {
+                    if input.kms_key_id.is_some() {
+                        record.kms_key_id = Some(version.key_arn.clone());
+                    }
+                    record.versions.insert(version_id.to_owned(), version);
+                    apply_stages(record, version_id, &stages)?;
+                } else if let Some(key_id) = input.kms_key_id {
+                    record.kms_key_id = Some(key_id);
+                }
+                if let Some(description) = input.description {
+                    record.description = Some(description);
+                }
+                record.last_changed_date = now;
+                let mut response = json!({"ARN": record.arn, "Name": record.name});
+                if let Some(version_id) = version_id {
+                    response
+                        .as_object_mut()
+                        .ok_or(SecretsError::Internal)?
+                        .insert("VersionId".to_owned(), version_id.into());
+                }
+                serialize(response)
+            })
+            .await
     }
 
-    pub(super) fn update_secret_version_stage(
+    pub(super) async fn update_secret_version_stage(
         &self,
         input: UpdateSecretVersionStageRequest,
         scope: &Scope,
@@ -300,48 +306,51 @@ impl SecretsManagerHandler {
             request,
             "UpdateSecretVersionStage",
         )?;
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
-        if let Some(id) = input.move_to_version_id.as_deref() {
-            if !record.versions.contains_key(id) {
-                return Err(SecretsError::ResourceNotFound);
-            }
-        }
-        if let Some(id) = input.remove_from_version_id.as_deref() {
-            if !record.versions.contains_key(id) {
-                return Err(SecretsError::ResourceNotFound);
-            }
-        }
-        let owner = record.stage_index.get(&input.version_stage).cloned();
-        if let Some(remove) = input.remove_from_version_id.as_deref() {
-            if owner.as_deref() != Some(remove) {
-                return Err(SecretsError::InvalidRequest);
-            }
-        }
-        match input.move_to_version_id.as_deref() {
-            Some(destination) => {
-                if owner.as_deref() != Some(destination)
-                    && owner.is_some()
-                    && input.remove_from_version_id.is_none()
-                {
-                    return Err(SecretsError::InvalidRequest);
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = active_record_mut(guard)?;
+                if let Some(id) = input.move_to_version_id.as_deref() {
+                    if !record.versions.contains_key(id) {
+                        return Err(SecretsError::ResourceNotFound);
+                    }
                 }
-                if input.version_stage == "AWSCURRENT" {
-                    promote_current(record, destination)?;
-                } else {
-                    move_stage(record, &input.version_stage, destination)?;
+                if let Some(id) = input.remove_from_version_id.as_deref() {
+                    if !record.versions.contains_key(id) {
+                        return Err(SecretsError::ResourceNotFound);
+                    }
                 }
-            }
-            None => {
-                let owner = owner.ok_or(SecretsError::InvalidRequest)?;
-                remove_stage(record, &input.version_stage, &owner)?;
-            }
-        }
-        record.last_changed_date = now_epoch()?;
-        serialize(json!({"ARN": record.arn, "Name": record.name}))
+                let owner = record.stage_index.get(&input.version_stage).cloned();
+                if let Some(remove) = input.remove_from_version_id.as_deref() {
+                    if owner.as_deref() != Some(remove) {
+                        return Err(SecretsError::InvalidRequest);
+                    }
+                }
+                match input.move_to_version_id.as_deref() {
+                    Some(destination) => {
+                        if owner.as_deref() != Some(destination)
+                            && owner.is_some()
+                            && input.remove_from_version_id.is_none()
+                        {
+                            return Err(SecretsError::InvalidRequest);
+                        }
+                        if input.version_stage == "AWSCURRENT" {
+                            promote_current(record, destination)?;
+                        } else {
+                            move_stage(record, &input.version_stage, destination)?;
+                        }
+                    }
+                    None => {
+                        let owner = owner.ok_or(SecretsError::InvalidRequest)?;
+                        remove_stage(record, &input.version_stage, &owner)?;
+                    }
+                }
+                record.last_changed_date = now_epoch()?;
+                serialize(json!({"ARN": record.arn, "Name": record.name}))
+            })
+            .await
     }
 
-    pub(super) fn delete_secret(
+    pub(super) async fn delete_secret(
         &self,
         input: DeleteSecretRequest,
         scope: &Scope,
@@ -356,49 +365,55 @@ impl SecretsManagerHandler {
             return Err(SecretsError::InvalidParameter);
         }
         let slot = self.resolve_and_authorize(scope, &input.secret_id, request, "DeleteSecret")?;
-        let mut guard = lock(&slot)?;
-        let record = guard.as_mut().ok_or(SecretsError::ResourceNotFound)?;
-        if record.deleted_date.is_some() {
-            return Err(SecretsError::InvalidRequest);
-        }
-        let deletion_date = if force {
-            now_epoch()?
-        } else {
-            now_epoch()? + f64::from(days) * 86_400.0
-        };
-        let arn = record.arn.clone();
-        let name = record.name.clone();
-        if force {
-            *guard = None;
-        } else {
-            record.deleted_date = Some(deletion_date);
-            record.last_changed_date = now_epoch()?;
-        }
-        serialize(json!({
-            "ARN": arn,
-            "Name": name,
-            "DeletionDate": deletion_date
-        }))
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = guard.as_mut().ok_or(SecretsError::ResourceNotFound)?;
+                if record.deleted_date.is_some() {
+                    return Err(SecretsError::InvalidRequest);
+                }
+                let deletion_date = if force {
+                    now_epoch()?
+                } else {
+                    now_epoch()? + f64::from(days) * 86_400.0
+                };
+                let arn = record.arn.clone();
+                let name = record.name.clone();
+                if force {
+                    *guard = None;
+                } else {
+                    record.deleted_date = Some(deletion_date);
+                    record.last_changed_date = now_epoch()?;
+                }
+                serialize(json!({
+                    "ARN": arn,
+                    "Name": name,
+                    "DeletionDate": deletion_date
+                }))
+            })
+            .await
     }
 
-    pub(super) fn restore_secret(
+    pub(super) async fn restore_secret(
         &self,
         input: SecretIdRequest,
         scope: &Scope,
         request: &ServiceRequest,
     ) -> Result<Vec<u8>, SecretsError> {
         let slot = self.resolve_and_authorize(scope, &input.secret_id, request, "RestoreSecret")?;
-        let mut guard = lock(&slot)?;
-        let record = guard.as_mut().ok_or(SecretsError::ResourceNotFound)?;
-        if record.deleted_date.is_none() {
-            return Err(SecretsError::InvalidRequest);
-        }
-        record.deleted_date = None;
-        record.last_changed_date = now_epoch()?;
-        serialize(json!({"ARN": record.arn, "Name": record.name}))
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = guard.as_mut().ok_or(SecretsError::ResourceNotFound)?;
+                if record.deleted_date.is_none() {
+                    return Err(SecretsError::InvalidRequest);
+                }
+                record.deleted_date = None;
+                record.last_changed_date = now_epoch()?;
+                serialize(json!({"ARN": record.arn, "Name": record.name}))
+            })
+            .await
     }
 
-    pub(super) fn tag_resource(
+    pub(super) async fn tag_resource(
         &self,
         input: TagResourceRequest,
         scope: &Scope,
@@ -406,19 +421,22 @@ impl SecretsManagerHandler {
     ) -> Result<Vec<u8>, SecretsError> {
         let additions = validate_tags(input.tags)?;
         let slot = self.resolve_and_authorize(scope, &input.secret_id, request, "TagResource")?;
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
-        let mut tags = record.tags.clone();
-        tags.extend(additions);
-        if tags.len() > 50 {
-            return Err(SecretsError::InvalidParameter);
-        }
-        record.tags = tags;
-        record.last_changed_date = now_epoch()?;
-        serialize(json!({}))
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = active_record_mut(guard)?;
+                let mut tags = record.tags.clone();
+                tags.extend(additions);
+                if tags.len() > 50 {
+                    return Err(SecretsError::InvalidParameter);
+                }
+                record.tags = tags;
+                record.last_changed_date = now_epoch()?;
+                serialize(json!({}))
+            })
+            .await
     }
 
-    pub(super) fn untag_resource(
+    pub(super) async fn untag_resource(
         &self,
         input: UntagResourceRequest,
         scope: &Scope,
@@ -431,16 +449,19 @@ impl SecretsManagerHandler {
             validate_tag_key(key)?;
         }
         let slot = self.resolve_and_authorize(scope, &input.secret_id, request, "UntagResource")?;
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
-        for key in input.tag_keys {
-            record.tags.remove(&key);
-        }
-        record.last_changed_date = now_epoch()?;
-        serialize(json!({}))
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = active_record_mut(guard)?;
+                for key in input.tag_keys {
+                    record.tags.remove(&key);
+                }
+                record.last_changed_date = now_epoch()?;
+                serialize(json!({}))
+            })
+            .await
     }
 
-    pub(super) fn put_resource_policy(
+    pub(super) async fn put_resource_policy(
         &self,
         input: PutResourcePolicyRequest,
         scope: &Scope,
@@ -456,14 +477,17 @@ impl SecretsManagerHandler {
         }
         let slot =
             self.resolve_and_authorize(scope, &input.secret_id, request, "PutResourcePolicy")?;
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
-        record.resource_policy = Some(input.resource_policy);
-        record.last_changed_date = now_epoch()?;
-        serialize(json!({"ARN": record.arn, "Name": record.name}))
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = active_record_mut(guard)?;
+                record.resource_policy = Some(input.resource_policy);
+                record.last_changed_date = now_epoch()?;
+                serialize(json!({"ARN": record.arn, "Name": record.name}))
+            })
+            .await
     }
 
-    pub(super) fn delete_resource_policy(
+    pub(super) async fn delete_resource_policy(
         &self,
         input: SecretIdRequest,
         scope: &Scope,
@@ -471,10 +495,13 @@ impl SecretsManagerHandler {
     ) -> Result<Vec<u8>, SecretsError> {
         let slot =
             self.resolve_and_authorize(scope, &input.secret_id, request, "DeleteResourcePolicy")?;
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
-        record.resource_policy = None;
-        record.last_changed_date = now_epoch()?;
-        serialize(json!({"ARN": record.arn, "Name": record.name}))
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = active_record_mut(guard)?;
+                record.resource_policy = None;
+                record.last_changed_date = now_epoch()?;
+                serialize(json!({"ARN": record.arn, "Name": record.name}))
+            })
+            .await
     }
 }

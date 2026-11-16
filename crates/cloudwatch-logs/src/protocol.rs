@@ -25,43 +25,91 @@ pub const RETENTION_DAYS: &[u16] = &[
     3288, 3653,
 ];
 
-const OPERATIONS: &[&str] = &[
-    "PutResourcePolicy",
-    "DescribeResourcePolicies",
-    "DeleteResourcePolicy",
-    "CreateLogGroup",
-    "DescribeLogGroups",
-    "DeleteLogGroup",
-    "PutRetentionPolicy",
-    "DeleteRetentionPolicy",
-    "CreateLogStream",
-    "DescribeLogStreams",
-    "DeleteLogStream",
-    "PutLogEvents",
-    "GetLogEvents",
-    "FilterLogEvents",
-    "PutMetricFilter",
-    "DescribeMetricFilters",
-    "DeleteMetricFilter",
-    "TestMetricFilter",
-    "PutSubscriptionFilter",
-    "DescribeSubscriptionFilters",
-    "DeleteSubscriptionFilter",
-    "PutDestination",
-    "PutDestinationPolicy",
-    "DescribeDestinations",
-    "DeleteDestination",
-    "StartQuery",
-    "GetQueryResults",
-    "StopQuery",
-    "DescribeQueries",
-    "TagResource",
-    "UntagResource",
-    "ListTagsForResource",
-    "TagLogGroup",
-    "UntagLogGroup",
-    "ListTagsLogGroup",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) enum Operation {
+    PutResourcePolicy,
+    DescribeResourcePolicies,
+    DeleteResourcePolicy,
+    CreateLogGroup,
+    DescribeLogGroups,
+    DeleteLogGroup,
+    PutRetentionPolicy,
+    DeleteRetentionPolicy,
+    CreateLogStream,
+    DescribeLogStreams,
+    DeleteLogStream,
+    PutLogEvents,
+    GetLogEvents,
+    FilterLogEvents,
+    PutMetricFilter,
+    DescribeMetricFilters,
+    DeleteMetricFilter,
+    TestMetricFilter,
+    PutSubscriptionFilter,
+    DescribeSubscriptionFilters,
+    DeleteSubscriptionFilter,
+    PutDestination,
+    PutDestinationPolicy,
+    DescribeDestinations,
+    DeleteDestination,
+    StartQuery,
+    GetQueryResults,
+    StopQuery,
+    DescribeQueries,
+    TagResource,
+    UntagResource,
+    ListTagsForResource,
+    TagLogGroup,
+    UntagLogGroup,
+    ListTagsLogGroup,
+}
+impl Operation {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::PutResourcePolicy => "PutResourcePolicy",
+            Self::DescribeResourcePolicies => "DescribeResourcePolicies",
+            Self::DeleteResourcePolicy => "DeleteResourcePolicy",
+            Self::CreateLogGroup => "CreateLogGroup",
+            Self::DescribeLogGroups => "DescribeLogGroups",
+            Self::DeleteLogGroup => "DeleteLogGroup",
+            Self::PutRetentionPolicy => "PutRetentionPolicy",
+            Self::DeleteRetentionPolicy => "DeleteRetentionPolicy",
+            Self::CreateLogStream => "CreateLogStream",
+            Self::DescribeLogStreams => "DescribeLogStreams",
+            Self::DeleteLogStream => "DeleteLogStream",
+            Self::PutLogEvents => "PutLogEvents",
+            Self::GetLogEvents => "GetLogEvents",
+            Self::FilterLogEvents => "FilterLogEvents",
+            Self::PutMetricFilter => "PutMetricFilter",
+            Self::DescribeMetricFilters => "DescribeMetricFilters",
+            Self::DeleteMetricFilter => "DeleteMetricFilter",
+            Self::TestMetricFilter => "TestMetricFilter",
+            Self::PutSubscriptionFilter => "PutSubscriptionFilter",
+            Self::DescribeSubscriptionFilters => "DescribeSubscriptionFilters",
+            Self::DeleteSubscriptionFilter => "DeleteSubscriptionFilter",
+            Self::PutDestination => "PutDestination",
+            Self::PutDestinationPolicy => "PutDestinationPolicy",
+            Self::DescribeDestinations => "DescribeDestinations",
+            Self::DeleteDestination => "DeleteDestination",
+            Self::StartQuery => "StartQuery",
+            Self::GetQueryResults => "GetQueryResults",
+            Self::StopQuery => "StopQuery",
+            Self::DescribeQueries => "DescribeQueries",
+            Self::TagResource => "TagResource",
+            Self::UntagResource => "UntagResource",
+            Self::ListTagsForResource => "ListTagsForResource",
+            Self::TagLogGroup => "TagLogGroup",
+            Self::UntagLogGroup => "UntagLogGroup",
+            Self::ListTagsLogGroup => "ListTagsLogGroup",
+        }
+    }
+}
+
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 pub fn validate_content_type(headers: &HeaderMap) -> Result<(), LogsError> {
     let value = headers
@@ -78,7 +126,7 @@ pub fn validate_content_type(headers: &HeaderMap) -> Result<(), LogsError> {
     }
 }
 
-pub fn operation(headers: &HeaderMap) -> Result<&str, LogsError> {
+pub fn operation(headers: &HeaderMap) -> Result<Operation, LogsError> {
     let target = headers
         .get("x-amz-target")
         .and_then(|value| value.to_str().ok())
@@ -88,11 +136,10 @@ pub fn operation(headers: &HeaderMap) -> Result<&str, LogsError> {
         .and_then(|suffix| suffix.strip_prefix('.'))
         .filter(|operation| !operation.is_empty() && !operation.contains('.'))
         .ok_or_else(|| LogsError::UnknownOperation("x-amz-target is invalid".into()))?;
-    Ok(operation)
-}
-
-pub fn is_allowed(operation: &str) -> bool {
-    OPERATIONS.contains(&operation)
+    Operation::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(operation),
+    )
+    .map_err(|_| LogsError::UnknownOperation(format!("operation {operation} is not supported")))
 }
 
 #[derive(Debug, Deserialize)]

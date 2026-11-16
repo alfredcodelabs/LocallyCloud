@@ -36,6 +36,7 @@ impl SsmHandler {
                     },
                     scope,
                     request,
+                    Operation::GetParameters,
                 )
                 .await;
             match result {

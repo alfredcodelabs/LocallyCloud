@@ -15,6 +15,7 @@ pub(crate) enum SecretsError {
     UnsupportedOperation,
     UnknownOperation,
     Internal,
+    Persistence,
 }
 
 impl SecretsError {
@@ -105,7 +106,7 @@ impl From<SecretsError> for AwsError {
                 "The requested Secrets Manager operation is unknown",
                 400,
             ),
-            SecretsError::Internal => (
+            SecretsError::Internal | SecretsError::Persistence => (
                 "InternalServiceError",
                 "Secrets Manager could not complete the request",
                 500,

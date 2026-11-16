@@ -1,64 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+//! Shared form decoding and XML escaping for Monitoring operations.
+use std::collections::BTreeMap;
 
-#[derive(Debug)]
-pub struct QueryRequest {
-    params: BTreeMap<String, String>,
-}
-
-impl QueryRequest {
-    pub fn parse(body: &[u8]) -> Self {
-        let mut params = BTreeMap::new();
-        for pair in String::from_utf8_lossy(body).split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            params.insert(form_decode(key), form_decode(value));
-        }
-        Self { params }
-    }
-
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.params
-            .get(key)
-            .map(String::as_str)
-            .filter(|value| !value.is_empty())
-    }
-
-    pub fn indices(&self, prefix: &str) -> Vec<usize> {
-        let mut indices = BTreeSet::new();
-        for key in self.params.keys() {
-            if let Some(rest) = key.strip_prefix(prefix) {
-                if let Some(index) = rest.split('.').next() {
-                    if let Ok(index) = index.parse::<usize>() {
-                        if index > 0 {
-                            indices.insert(index);
-                        }
-                    }
-                }
-            }
-        }
-        indices.into_iter().collect()
-    }
-}
-
-pub fn response_envelope(action: &str, result: &str, request_id: &str) -> String {
-    let result = if result.is_empty() {
-        String::new()
-    } else {
-        format!("<{action}Result>{result}</{action}Result>")
-    };
-    format!(
-        "<{action}Response xmlns=\"{XMLNS}\">{result}<ResponseMetadata><RequestId>{}</RequestId></ResponseMetadata></{action}Response>",
-        xml_escape(request_id)
-    )
-}
-
-pub fn text_element(name: &str, value: &str) -> String {
+pub(super) fn text_element(name: &str, value: &str) -> String {
     format!("<{name}>{}</{name}>", xml_escape(value))
 }
 
-pub fn xml_escape(value: &str) -> String {
+pub(super) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -67,7 +14,53 @@ pub fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-pub const XMLNS: &str = "http://monitoring.amazonaws.com/doc/2010-08-01/";
+#[derive(Debug)]
+pub(super) struct QueryRequest {
+    pub(super) params: BTreeMap<String, String>,
+}
+
+impl QueryRequest {
+    pub(super) fn parse(body: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(body);
+        let params = text
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (form_decode(key), form_decode(value))
+            })
+            .collect();
+        Self { params }
+    }
+
+    pub(super) fn get(&self, key: &str) -> Option<&str> {
+        self.params
+            .get(key)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub(super) fn has_prefix(&self, prefix: &str) -> bool {
+        self.params
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(key, _)| key.starts_with(prefix))
+    }
+
+    pub(super) fn list(&self, prefix: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        for index in 1.. {
+            let Some(value) = self.get(&format!("{prefix}.{index}")) else {
+                break;
+            };
+            values.push(value.to_owned());
+        }
+        values
+    }
+}
 
 fn form_decode(value: &str) -> String {
     let bytes = value.as_bytes();
@@ -80,15 +73,12 @@ fn form_decode(value: &str) -> String {
                 index += 1;
             }
             b'%' if index + 2 < bytes.len() => {
-                match (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
-                    (Some(high), Some(low)) => {
-                        output.push((high << 4) | low);
-                        index += 3;
-                    }
-                    _ => {
-                        output.push(b'%');
-                        index += 1;
-                    }
+                if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                    output.push((high << 4) | low);
+                    index += 3;
+                } else {
+                    output.push(bytes[index]);
+                    index += 1;
                 }
             }
             byte => {
@@ -100,11 +90,11 @@ fn form_decode(value: &str) -> String {
     String::from_utf8_lossy(&output).into_owned()
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
+fn hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
     }
 }

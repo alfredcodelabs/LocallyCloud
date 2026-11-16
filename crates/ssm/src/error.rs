@@ -17,6 +17,7 @@ pub(crate) enum SsmError {
     InvalidFilterOption,
     InvalidFilterValue,
     Internal,
+    Persistence,
     AccessDenied,
 }
 
@@ -94,7 +95,7 @@ impl From<SsmError> for AwsError {
                 "The requested parameter resource was not found",
                 400,
             ),
-            SsmError::Internal => (
+            SsmError::Internal | SsmError::Persistence => (
                 "InternalServerError",
                 "The request could not be completed",
                 500,

@@ -148,5 +148,11 @@ locallycloud-architecture = { path = "crates/architecture" }
 [profile.release]
 strip = "symbols"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.dev.package.sha2]
 opt-level = 3

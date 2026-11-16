@@ -450,7 +450,7 @@ impl InternalDispatcher {
     }
 
     /// Dashboard region selection is an external request, never a trusted account scope.
-    pub(crate) async fn dispatch_dashboard(
+    pub async fn dispatch_dashboard(
         &self,
         method: &Method,
         uri: &Uri,
@@ -501,7 +501,7 @@ impl InternalDispatcher {
 
     /// Only the socket listener supplies transport security; forwarded headers cannot attest TLS.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn dispatch_verified_connection(
+    pub async fn dispatch_verified_connection(
         &self,
         method: &Method,
         uri: &Uri,
@@ -792,6 +792,7 @@ impl InternalDispatcher {
         } else {
             match decision.disposition {
                 RouteDisposition::ProxiedToLegacy => {
+                    self.legacy_health.activate();
                     if !self.legacy_health.is_healthy() {
                         tracing::warn!(
                             request_id,
@@ -1142,10 +1143,7 @@ fn invalid_signature(request_id: &str, protocol: AwsProtocol) -> Response {
     )
 }
 
-pub(crate) fn claims_sigv4_identity(
-    authorization: Option<&str>,
-    query_credential: Option<&str>,
-) -> bool {
+pub fn claims_sigv4_identity(authorization: Option<&str>, query_credential: Option<&str>) -> bool {
     authorization
         .is_some_and(|value| value.contains("AWS4-HMAC-SHA256") || value.contains("Credential="))
         || query_credential.is_some()
@@ -1296,7 +1294,7 @@ fn safe_operation(
     "Unknown".to_string()
 }
 
-pub(crate) fn render(r: RenderedError) -> Response {
+pub fn render(r: RenderedError) -> Response {
     r.into_response()
 }
 

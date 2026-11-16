@@ -1,5 +1,6 @@
 //! Public DynamoDB SSE lifecycle against an explicitly supplied real ExtendDB worker.
 
+#![cfg(feature = "services")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

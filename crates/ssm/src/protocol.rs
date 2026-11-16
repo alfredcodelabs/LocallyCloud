@@ -7,17 +7,18 @@ pub(crate) const TARGET_PREFIX: &str = "AmazonSSM";
 pub(crate) const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 pub(crate) const MAX_REQUEST_BODY: usize = 64 * 1024;
 
-const OPERATIONS: &[&str] = &[
-    "PutParameter",
-    "GetParameter",
-    "GetParameters",
-    "GetParametersByPath",
-    "DescribeParameters",
-    "DeleteParameter",
-    "AddTagsToResource",
-    "RemoveTagsFromResource",
-    "ListTagsForResource",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) enum Operation {
+    PutParameter,
+    GetParameter,
+    GetParameters,
+    GetParametersByPath,
+    DescribeParameters,
+    DeleteParameter,
+    AddTagsToResource,
+    RemoveTagsFromResource,
+    ListTagsForResource,
+}
 
 pub(crate) fn validate_content_type(headers: &HeaderMap) -> Result<(), SsmError> {
     let media_type = headers
@@ -33,20 +34,20 @@ pub(crate) fn validate_content_type(headers: &HeaderMap) -> Result<(), SsmError>
     }
 }
 
-pub(crate) fn operation(headers: &HeaderMap) -> Result<&str, SsmError> {
+pub(crate) fn operation(headers: &HeaderMap) -> Result<Operation, SsmError> {
     let target = headers
         .get("x-amz-target")
         .and_then(|value| value.to_str().ok())
         .ok_or(SsmError::UnknownOperation)?;
-    target
+    let operation = target
         .strip_prefix(TARGET_PREFIX)
         .and_then(|suffix| suffix.strip_prefix('.'))
         .filter(|operation| !operation.is_empty() && !operation.contains('.'))
-        .ok_or(SsmError::UnknownOperation)
-}
-
-pub(crate) fn is_allowed(operation: &str) -> bool {
-    OPERATIONS.contains(&operation)
+        .ok_or(SsmError::UnknownOperation)?;
+    Operation::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(operation),
+    )
+    .map_err(|_| SsmError::UnknownOperation)
 }
 
 #[derive(Deserialize)]

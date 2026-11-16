@@ -11,15 +11,6 @@ use crate::cost::CostReport;
 use crate::metering::ServiceMetrics;
 use crate::registry::{Disposition, ServiceRegistry};
 
-/// The built-in dashboard page, polling `/_locallycloud/status`.
-pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
-pub const DASHBOARD_JS: &str = include_str!("dashboard.js");
-pub const DASHBOARD_I18N: &str = include_str!("dashboard-i18n.js");
-pub const DASHBOARD_CSS: &str = include_str!("dashboard.css");
-
-/// One embedded SVG sprite; related API namespaces share the same symbol.
-pub const SERVICE_ICONS_SVG: &str = include_str!("icons/sprite.svg");
-
 pub fn runtime_capabilities(registry: &ServiceRegistry) -> serde_json::Value {
     let api = registry.lambda_api(&crate::registry::ServiceName::new("lambda"));
     let reason = api.as_ref().and_then(|api| api.unavailable_reason());
@@ -178,16 +169,5 @@ mod tests {
             .find(|s| s["name"] == "sqs")
             .unwrap();
         assert_eq!(sqs["requests"], 1_000_000);
-    }
-
-    #[test]
-    fn dashboard_html_is_embedded() {
-        assert!(DASHBOARD_HTML.contains("locallycloud"));
-        assert!(DASHBOARD_HTML.contains("/_locallycloud/dashboard.js"));
-        assert!(DASHBOARD_HTML.contains("/_locallycloud/dashboard.css"));
-        assert!(!DASHBOARD_HTML.contains("<style>"));
-        assert!(DASHBOARD_CSS.contains(".brand-logo"));
-        assert!(DASHBOARD_HTML.contains("/_locallycloud/brand/icon.svg"));
-        assert!(DASHBOARD_JS.contains("/_locallycloud/status"));
     }
 }

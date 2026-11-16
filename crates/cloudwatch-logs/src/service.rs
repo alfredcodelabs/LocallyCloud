@@ -17,6 +17,7 @@ use crate::error::{LogsError, RegistrationError};
 use crate::metric_delivery::MetricDeliveryWorker;
 use crate::model::{GroupKey, ScopeKey};
 use crate::pagination::{DescribePaginator, EventPaginator, StreamDescribePaginator};
+use crate::protocol::Operation;
 use crate::query_worker::QueryWorker;
 use crate::retention::RetentionWorker;
 use crate::store::LogsStore;
@@ -110,7 +111,7 @@ impl LogsHandler {
 }
 
 impl LogsApi {
-    async fn process(&self, request: &ServiceRequest) -> Result<Value, LogsError> {
+    async fn process(&self, request: &ServiceRequest) -> Result<(Value, Operation), LogsError> {
         if request.method != http::Method::POST {
             return Err(LogsError::UnknownOperation(
                 "CloudWatch Logs JSON operations require POST".into(),
@@ -123,11 +124,6 @@ impl LogsApi {
         }
         protocol::validate_content_type(&request.headers)?;
         let operation = protocol::operation(&request.headers)?;
-        if !protocol::is_allowed(operation) {
-            return Err(LogsError::UnknownOperation(format!(
-                "operation {operation} is not supported"
-            )));
-        }
         if request.body.len() > protocol::MAX_REQUEST_BODY_BYTES {
             return Err(LogsError::InvalidParameter(
                 "request body exceeds the CloudWatch Logs safety limit".into(),
@@ -143,13 +139,15 @@ impl LogsApi {
         }
         let scope = ScopeKey::new(&request.account_id, &request.region);
         self.authorize(request, operation, &body, &scope)?;
-        self.dispatch(operation, body, scope).await
+        self.dispatch(operation, body, scope)
+            .await
+            .map(|value| (value, operation))
     }
 
     fn authorize(
         &self,
         request: &ServiceRequest,
-        operation: &str,
+        operation: Operation,
         body: &Value,
         scope: &ScopeKey,
     ) -> Result<(), LogsError> {
@@ -260,10 +258,24 @@ impl LogsApi {
                 resource: resource.clone(),
                 context,
             };
-            let result=if matches!(operation,"CreateLogStream"|"PutLogEvents") && matches!(authorization.delegated_identity,Some(locallycloud_core::integration::identity::CallerIdentity::ServicePrincipal{..})) {
-                let document=self.store.delivery_policy(scope,&resource)?;
-                evaluator.authorize_resource_policy(authorization,document.as_deref(),&scope.account_id)
-            } else {evaluator.authorize(authorization)};
+            let result = if matches!(
+                operation,
+                Operation::CreateLogStream | Operation::PutLogEvents
+            ) && matches!(
+                authorization.delegated_identity,
+                Some(
+                    locallycloud_core::integration::identity::CallerIdentity::ServicePrincipal { .. }
+                )
+            ) {
+                let document = self.store.delivery_policy(scope, &resource)?;
+                evaluator.authorize_resource_policy(
+                    authorization,
+                    document.as_deref(),
+                    &scope.account_id,
+                )
+            } else {
+                evaluator.authorize(authorization)
+            };
             result.map_err(|_| {
                 LogsError::AccessDenied("Not authorized for this CloudWatch Logs operation".into())
             })?;
@@ -273,7 +285,7 @@ impl LogsApi {
 
     fn authorization_resources(
         &self,
-        operation: &str,
+        operation: Operation,
         body: &Value,
         scope: &ScopeKey,
     ) -> Result<Vec<String>, LogsError> {
@@ -295,37 +307,44 @@ impl LogsApi {
             )
         };
         let resource = match operation {
-            "CreateLogStream" | "DeleteLogStream" | "PutLogEvents" | "GetLogEvents" => {
+            Operation::CreateLogStream
+            | Operation::DeleteLogStream
+            | Operation::PutLogEvents
+            | Operation::GetLogEvents => {
                 let group = group_name()?;
                 let stream = required("logStreamName")?;
                 streams::validate_stream_name(stream)?;
                 format!("{prefix}log-group:{group}:log-stream:{stream}")
             }
-            "CreateLogGroup"
-            | "DeleteLogGroup"
-            | "PutRetentionPolicy"
-            | "DeleteRetentionPolicy"
-            | "DescribeLogStreams"
-            | "FilterLogEvents"
-            | "PutMetricFilter"
-            | "DeleteMetricFilter"
-            | "PutSubscriptionFilter"
-            | "DescribeSubscriptionFilters"
-            | "DeleteSubscriptionFilter"
-            | "TagLogGroup"
-            | "UntagLogGroup"
-            | "ListTagsLogGroup" => group_arn(&group_name()?)?,
-            "DescribeMetricFilters" => match body.get("logGroupName").and_then(Value::as_str) {
-                Some(name) => group_arn(name)?,
-                None => "*".into(),
-            },
-            "PutDestination" | "PutDestinationPolicy" | "DeleteDestination" => {
+            Operation::CreateLogGroup
+            | Operation::DeleteLogGroup
+            | Operation::PutRetentionPolicy
+            | Operation::DeleteRetentionPolicy
+            | Operation::DescribeLogStreams
+            | Operation::FilterLogEvents
+            | Operation::PutMetricFilter
+            | Operation::DeleteMetricFilter
+            | Operation::PutSubscriptionFilter
+            | Operation::DescribeSubscriptionFilters
+            | Operation::DeleteSubscriptionFilter
+            | Operation::TagLogGroup
+            | Operation::UntagLogGroup
+            | Operation::ListTagsLogGroup => group_arn(&group_name()?)?,
+            Operation::DescribeMetricFilters => {
+                match body.get("logGroupName").and_then(Value::as_str) {
+                    Some(name) => group_arn(name)?,
+                    None => "*".into(),
+                }
+            }
+            Operation::PutDestination
+            | Operation::PutDestinationPolicy
+            | Operation::DeleteDestination => {
                 format!("{prefix}destination:{}", required("destinationName")?)
             }
-            "TagResource" | "UntagResource" | "ListTagsForResource" => {
+            Operation::TagResource | Operation::UntagResource | Operation::ListTagsForResource => {
                 required("resourceArn")?.into()
             }
-            "GetQueryResults" => {
+            Operation::GetQueryResults => {
                 let query = self.store.get_query(scope, required("queryId")?)?;
                 return query
                     .group_names
@@ -333,7 +352,7 @@ impl LogsApi {
                     .map(|name| group_arn(name))
                     .collect();
             }
-            "StartQuery" => {
+            Operation::StartQuery => {
                 let mut names = Vec::new();
                 if let Some(name) = body.get("logGroupName").and_then(Value::as_str) {
                     names.push(name.to_owned());
@@ -374,31 +393,26 @@ impl LogsApi {
                 }
                 return names.iter().map(|name| group_arn(name)).collect();
             }
-            "DescribeLogGroups"
-            | "PutResourcePolicy"
-            | "DeleteResourcePolicy"
-            | "DescribeResourcePolicies"
-            | "DescribeDestinations"
-            | "DescribeQueries"
-            | "TestMetricFilter"
-            | "StopQuery" => "*".into(),
-            _ => {
-                return Err(LogsError::UnknownOperation(
-                    "Operation authorization is not implemented".into(),
-                ))
-            }
+            Operation::DescribeLogGroups
+            | Operation::PutResourcePolicy
+            | Operation::DeleteResourcePolicy
+            | Operation::DescribeResourcePolicies
+            | Operation::DescribeDestinations
+            | Operation::DescribeQueries
+            | Operation::TestMetricFilter
+            | Operation::StopQuery => "*".into(),
         };
         Ok(vec![resource])
     }
 
     async fn dispatch(
         &self,
-        operation: &str,
+        operation: Operation,
         body: Value,
         scope: ScopeKey,
     ) -> Result<Value, LogsError> {
         match operation {
-            "PutResourcePolicy" => {
+            Operation::PutResourcePolicy => {
                 let input: crate::resource_policies::Put = decode(body)?;
                 if let Some(evaluator) = self
                     .registry
@@ -418,21 +432,21 @@ impl LogsApi {
                     .put_resource_policy(scope, input, self.clock.now_ms())?;
                 Ok(json!({"revisionId":policy.revision_id,"resourcePolicy":policy}))
             }
-            "DeleteResourcePolicy" => {
+            Operation::DeleteResourcePolicy => {
                 self.store.delete_resource_policy(scope, decode(body)?)?;
                 Ok(json!({}))
             }
-            "DescribeResourcePolicies" => crate::resource_policies::describe(
+            Operation::DescribeResourcePolicies => crate::resource_policies::describe(
                 &self.store,
                 scope,
                 decode(body)?,
                 self.clock.now_ms(),
             ),
-            "CreateLogGroup" => {
+            Operation::CreateLogGroup => {
                 groups::create(&self.store, decode(body)?, scope, self.clock.now_ms())?;
                 Ok(json!({}))
             }
-            "DescribeLogGroups" => serde_json::to_value(groups::describe(
+            Operation::DescribeLogGroups => serde_json::to_value(groups::describe(
                 &self.store,
                 &self.paginator,
                 decode(body)?,
@@ -440,23 +454,23 @@ impl LogsApi {
                 self.clock.now_ms(),
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "DeleteLogGroup" => {
+            Operation::DeleteLogGroup => {
                 groups::delete(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "PutRetentionPolicy" => {
+            Operation::PutRetentionPolicy => {
                 groups::put_retention(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "DeleteRetentionPolicy" => {
+            Operation::DeleteRetentionPolicy => {
                 groups::delete_retention(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "CreateLogStream" => {
+            Operation::CreateLogStream => {
                 streams::create(&self.store, decode(body)?, scope, self.clock.now_ms())?;
                 Ok(json!({}))
             }
-            "DescribeLogStreams" => serde_json::to_value(streams::describe(
+            Operation::DescribeLogStreams => serde_json::to_value(streams::describe(
                 &self.store,
                 &self.stream_paginator,
                 decode(body)?,
@@ -464,26 +478,18 @@ impl LogsApi {
                 self.clock.now_ms(),
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "DeleteLogStream" => {
+            Operation::DeleteLogStream => {
                 streams::delete(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "PutLogEvents" => serde_json::to_value(events::put(
+            Operation::PutLogEvents => serde_json::to_value(events::put(
                 &self.store,
                 decode(body)?,
                 scope,
                 self.clock.now_ms(),
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "GetLogEvents" => serde_json::to_value(events::get(
-                &self.store,
-                &self.event_paginator,
-                decode(body)?,
-                scope,
-                self.clock.now_ms(),
-            )?)
-            .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "FilterLogEvents" => serde_json::to_value(events::filter(
+            Operation::GetLogEvents => serde_json::to_value(events::get(
                 &self.store,
                 &self.event_paginator,
                 decode(body)?,
@@ -491,7 +497,15 @@ impl LogsApi {
                 self.clock.now_ms(),
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "PutMetricFilter" => {
+            Operation::FilterLogEvents => serde_json::to_value(events::filter(
+                &self.store,
+                &self.event_paginator,
+                decode(body)?,
+                scope,
+                self.clock.now_ms(),
+            )?)
+            .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
+            Operation::PutMetricFilter => {
                 let registry = self.registry.upgrade().ok_or_else(|| {
                     LogsError::OperationUnavailable("Monitoring is unavailable".into())
                 })?;
@@ -506,19 +520,22 @@ impl LogsApi {
                 metric_filters::put(&self.store, decode(body)?, scope, self.clock.now_ms())?;
                 Ok(json!({}))
             }
-            "DescribeMetricFilters" => {
+            Operation::DescribeMetricFilters => {
                 serde_json::to_value(metric_filters::describe(&self.store, decode(body)?, scope)?)
                     .map_err(|_| {
                         LogsError::ServiceUnavailable("response serialization failed".into())
                     })
             }
-            "DeleteMetricFilter" => {
+            Operation::DeleteMetricFilter => {
                 metric_filters::delete(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "TestMetricFilter" => serde_json::to_value(metric_filters::test(decode(body)?)?)
-                .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "PutSubscriptionFilter" => {
+            Operation::TestMetricFilter => {
+                serde_json::to_value(metric_filters::test(decode(body)?)?).map_err(|_| {
+                    LogsError::ServiceUnavailable("response serialization failed".into())
+                })
+            }
+            Operation::PutSubscriptionFilter => {
                 let registry = self.registry.upgrade().ok_or_else(|| {
                     LogsError::OperationUnavailable("Lambda is unavailable".into())
                 })?;
@@ -532,45 +549,30 @@ impl LogsApi {
                 .await?;
                 Ok(json!({}))
             }
-            "DescribeSubscriptionFilters" => {
+            Operation::DescribeSubscriptionFilters => {
                 serde_json::to_value(subscriptions::describe(&self.store, decode(body)?, scope)?)
                     .map_err(|_| {
                         LogsError::ServiceUnavailable("response serialization failed".into())
                     })
             }
-            "DeleteSubscriptionFilter" => {
+            Operation::DeleteSubscriptionFilter => {
                 subscriptions::delete(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "PutDestination"
-            | "PutDestinationPolicy"
-            | "DescribeDestinations"
-            | "DeleteDestination" => Err(LogsError::OperationUnavailable(
+            Operation::PutDestination
+            | Operation::PutDestinationPolicy
+            | Operation::DescribeDestinations
+            | Operation::DeleteDestination => Err(LogsError::OperationUnavailable(
                 "destination resources require a concrete supported destination adapter".into(),
             )),
-            "StartQuery" => serde_json::to_value(insights::start(
+            Operation::StartQuery => serde_json::to_value(insights::start(
                 &self.store,
                 decode(body)?,
                 scope,
                 self.clock.now_ms(),
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "GetQueryResults" => serde_json::to_value(insights::get(
-                &self.store,
-                &self.insights_paginator,
-                decode(body)?,
-                scope,
-                self.clock.now_ms(),
-            )?)
-            .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "StopQuery" => serde_json::to_value(insights::stop(
-                &self.store,
-                decode(body)?,
-                scope,
-                self.clock.now_ms(),
-            )?)
-            .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "DescribeQueries" => serde_json::to_value(insights::describe(
+            Operation::GetQueryResults => serde_json::to_value(insights::get(
                 &self.store,
                 &self.insights_paginator,
                 decode(body)?,
@@ -578,37 +580,49 @@ impl LogsApi {
                 self.clock.now_ms(),
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "TagResource" => {
+            Operation::StopQuery => serde_json::to_value(insights::stop(
+                &self.store,
+                decode(body)?,
+                scope,
+                self.clock.now_ms(),
+            )?)
+            .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
+            Operation::DescribeQueries => serde_json::to_value(insights::describe(
+                &self.store,
+                &self.insights_paginator,
+                decode(body)?,
+                scope,
+                self.clock.now_ms(),
+            )?)
+            .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
+            Operation::TagResource => {
                 groups::tag_resource(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "UntagResource" => {
+            Operation::UntagResource => {
                 groups::untag_resource(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "ListTagsForResource" => serde_json::to_value(groups::list_tags_for_resource(
+            Operation::ListTagsForResource => serde_json::to_value(groups::list_tags_for_resource(
                 &self.store,
                 decode(body)?,
                 scope,
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            "TagLogGroup" => {
+            Operation::TagLogGroup => {
                 groups::tag_log_group(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "UntagLogGroup" => {
+            Operation::UntagLogGroup => {
                 groups::untag_log_group(&self.store, decode(body)?, scope)?;
                 Ok(json!({}))
             }
-            "ListTagsLogGroup" => serde_json::to_value(groups::list_tags_log_group(
+            Operation::ListTagsLogGroup => serde_json::to_value(groups::list_tags_log_group(
                 &self.store,
                 decode(body)?,
                 scope,
             )?)
             .map_err(|_| LogsError::ServiceUnavailable("response serialization failed".into())),
-            _ => Err(LogsError::OperationUnavailable(format!(
-                "operation {operation} is recognized but not implemented"
-            ))),
         }
     }
 }
@@ -625,20 +639,6 @@ impl NativeHandler for LogsHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        let operation = protocol::operation(&request.headers).ok();
-        let wakes_retention = operation.is_some_and(|operation| {
-            matches!(
-                operation,
-                "PutRetentionPolicy"
-                    | "DeleteRetentionPolicy"
-                    | "DeleteLogGroup"
-                    | "DeleteLogStream"
-                    | "PutLogEvents"
-            )
-        });
-        let wakes_metric_delivery = operation == Some("PutLogEvents");
-        let wakes_subscription_delivery = operation == Some("PutLogEvents");
-        let wakes_query_worker = operation == Some("StartQuery");
         let api = self.api.clone();
         let owned = request.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -649,22 +649,29 @@ impl NativeHandler for LogsHandler {
                     "CloudWatch Logs operation failed".into(),
                 ))
             });
-        if result.is_ok() {
-            if wakes_retention {
+        if let Ok((_, operation)) = &result {
+            if matches!(
+                operation,
+                Operation::PutRetentionPolicy
+                    | Operation::DeleteRetentionPolicy
+                    | Operation::DeleteLogGroup
+                    | Operation::DeleteLogStream
+                    | Operation::PutLogEvents
+            ) {
                 self.retention_worker.wake();
             }
-            if wakes_metric_delivery {
+            if *operation == Operation::PutLogEvents {
                 self.metric_delivery_worker.wake();
             }
-            if wakes_subscription_delivery {
+            if *operation == Operation::PutLogEvents {
                 self.subscription_delivery_worker.wake();
             }
-            if wakes_query_worker {
+            if *operation == Operation::StartQuery {
                 self.query_worker.wake();
             }
         }
         match result {
-            Ok(value) => Response::builder()
+            Ok((value, _)) => Response::builder()
                 .status(200)
                 .header(http::header::CONTENT_TYPE, protocol::CONTENT_TYPE)
                 .header("x-amzn-RequestId", &request.request_id)

@@ -2,6 +2,7 @@
 //! throwaway state, cache and AWS configuration, deploys a stack through the CloudFormation
 //! API and reads its topology through the dashboard endpoint.
 
+#![cfg(feature = "services")]
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;

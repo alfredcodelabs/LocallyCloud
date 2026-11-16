@@ -39,9 +39,10 @@ pub fn register_with_cluster_resolver(
     resolver: Option<Arc<dyn ClusterResolver>>,
 ) -> Result<RdsDataHandle, StartupError> {
     config.validate()?;
-    let (_, mut handle) = service::RdsDataHandler::new(config.clone());
-    let handler = postgres::PgHandler::new(registry.clone(), resolver, config.clone());
-    handle.pg_state = Some(handler.state.clone());
+    let handler = postgres::PgHandler::new(registry.clone(), resolver, config);
+    let handle = RdsDataHandle {
+        state: handler.state.clone(),
+    };
     let handler: Arc<dyn NativeHandler> = Arc::new(handler);
     registry.register_native(
         ServiceName::new("rds-data"),

@@ -179,7 +179,7 @@ pub struct Execution {
     pub variables: BTreeMap<String, Value>,
     pub redrive_count: u32,
     pub redrive_date: Option<f64>,
-    pub history: Vec<HistoryEvent>,
+    pub history: Vec<Arc<HistoryEvent>>,
 }
 
 impl Execution {
@@ -198,13 +198,13 @@ impl Execution {
             return None;
         }
         let id = self.history.len() as u64 + 1;
-        self.history.push(HistoryEvent {
+        self.history.push(Arc::new(HistoryEvent {
             id,
             previous_event_id,
             event_type: event_type.to_string(),
             timestamp: crate::clock::now_iso(),
             details,
-        });
+        }));
         Some(id)
     }
 }

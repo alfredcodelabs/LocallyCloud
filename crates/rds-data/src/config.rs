@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::StartupError;
@@ -42,10 +41,8 @@ impl Default for RdsDataLimits {
 
 #[derive(Debug, Clone)]
 pub struct RdsDataConfig {
-    pub state_root: PathBuf,
     pub identity_mode: IdentityMode,
     pub limits: RdsDataLimits,
-    pub busy_timeout: Duration,
     pub transaction_idle_timeout: Duration,
     pub transaction_absolute_timeout: Duration,
 }
@@ -53,12 +50,8 @@ pub struct RdsDataConfig {
 impl Default for RdsDataConfig {
     fn default() -> Self {
         Self {
-            state_root: locallycloud_state::StateDb::data_dir()
-                .map(|root| root.join("rds-data"))
-                .unwrap_or_default(),
             identity_mode: IdentityMode::LocalIdentity,
             limits: RdsDataLimits::default(),
-            busy_timeout: Duration::from_secs(5),
             transaction_idle_timeout: Duration::from_secs(3 * 60),
             transaction_absolute_timeout: Duration::from_secs(24 * 60 * 60),
         }
@@ -67,11 +60,6 @@ impl Default for RdsDataConfig {
 
 impl RdsDataConfig {
     pub(crate) fn validate(&self) -> Result<(), StartupError> {
-        if !self.state_root.is_absolute() {
-            return Err(StartupError::InvalidConfig(
-                "state_root must be absolute".into(),
-            ));
-        }
         if self.identity_mode != IdentityMode::LocalIdentity {
             return Err(StartupError::InvalidConfig(
                 "SecretsValidation mode is unavailable because Core has no approved capability"
@@ -102,8 +90,6 @@ impl RdsDataConfig {
             || limits.max_transactions > limits.max_blocking_operations
             || limits.max_field_bytes > 10 * 1024 * 1024
             || limits.max_blocking_operations > 256
-            || self.busy_timeout.is_zero()
-            || self.busy_timeout > Duration::from_secs(60)
             || self.transaction_idle_timeout.is_zero()
             || self.transaction_absolute_timeout.is_zero()
             || self.transaction_idle_timeout >= self.transaction_absolute_timeout

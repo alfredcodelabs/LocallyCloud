@@ -24,29 +24,29 @@ const CSS: &str = "text/css; charset=utf-8";
 pub(crate) const PAGE: Asset = Asset {
     path: "/_locallycloud/ui",
     content_type: "text/html; charset=utf-8",
-    gzip: gzip!("crates/core/src/dashboard.html"),
+    gzip: gzip!("crates/server/src/dashboard.html"),
 };
 
 pub(crate) const ASSETS: &[Asset] = &[
     Asset {
         path: "/_locallycloud/dashboard.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/dashboard.js"),
+        gzip: gzip!("crates/server/src/dashboard.js"),
     },
     Asset {
         path: "/_locallycloud/dashboard-i18n.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/dashboard-i18n.js"),
+        gzip: gzip!("crates/server/src/dashboard-i18n.js"),
     },
     Asset {
         path: "/_locallycloud/dashboard.css",
         content_type: CSS,
-        gzip: gzip!("crates/core/src/dashboard.css"),
+        gzip: gzip!("crates/server/src/dashboard.css"),
     },
     Asset {
         path: "/_locallycloud/icons.svg",
         content_type: SVG,
-        gzip: gzip!("crates/core/src/icons/sprite.svg"),
+        gzip: gzip!("crates/server/src/icons/sprite.svg"),
     },
     Asset {
         path: "/_locallycloud/brand/icon.svg",
@@ -67,52 +67,52 @@ pub(crate) const ASSETS: &[Asset] = &[
     Asset {
         path: "/_locallycloud/views/architecture/page.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/page.js"),
+        gzip: gzip!("crates/server/src/views/architecture/page.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/model.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/model.js"),
+        gzip: gzip!("crates/server/src/views/architecture/model.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/engine.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/engine.js"),
+        gzip: gzip!("crates/server/src/views/architecture/engine.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/catalog.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/catalog.js"),
+        gzip: gzip!("crates/server/src/views/architecture/catalog.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/assessment.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/assessment.js"),
+        gzip: gzip!("crates/server/src/views/architecture/assessment.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/threatdragon.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/threatdragon.js"),
+        gzip: gzip!("crates/server/src/views/architecture/threatdragon.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/report.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/report.js"),
+        gzip: gzip!("crates/server/src/views/architecture/report.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/catalog.json",
         content_type: "application/json",
-        gzip: gzip!("crates/core/src/views/architecture/catalog.json"),
+        gzip: gzip!("crates/server/src/views/architecture/catalog.json"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/i18n.js",
         content_type: JS,
-        gzip: gzip!("crates/core/src/views/architecture/i18n.js"),
+        gzip: gzip!("crates/server/src/views/architecture/i18n.js"),
     },
     Asset {
         path: "/_locallycloud/views/architecture/page.css",
         content_type: CSS,
-        gzip: gzip!("crates/core/src/views/architecture/page.css"),
+        gzip: gzip!("crates/server/src/views/architecture/page.css"),
     },
 ];
 
@@ -282,7 +282,7 @@ mod tests {
         const MACRO: &str = "gzip!(\"";
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let table =
-            std::fs::read_to_string(workspace.join("crates/core/src/views/assets.rs")).unwrap();
+            std::fs::read_to_string(workspace.join("crates/server/src/views/assets.rs")).unwrap();
         let sources: Vec<_> = table
             .match_indices(MACRO)
             .map(|(start, _)| {

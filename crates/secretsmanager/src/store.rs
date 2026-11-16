@@ -47,7 +47,7 @@ pub(crate) struct SecretStore {
     secrets: DashMap<StoreKey, Arc<Mutex<Option<SecretRecord>>>>,
     pages: DashMap<String, FrozenPage>,
     state: Option<Arc<StateDb>>,
-    save_lock: Mutex<()>,
+    mutation: Mutex<()>,
 }
 
 impl SecretStore {
@@ -74,7 +74,7 @@ impl SecretStore {
             secrets: DashMap::new(),
             pages: DashMap::new(),
             state: None,
-            save_lock: Mutex::new(()),
+            mutation: Mutex::new(()),
         }
     }
 
@@ -87,46 +87,60 @@ impl SecretStore {
         Ok(store)
     }
 
-    pub(crate) fn save(&self) -> Result<(), SecretsError> {
+    /// Stage one secret, commit it, then publish it. Readers retain the last
+    /// committed value while the writer waits for SQLite.
+    pub(crate) async fn update<T: Send + 'static>(
+        self: &Arc<Self>,
+        scope: Scope,
+        slot: Arc<Mutex<Option<SecretRecord>>>,
+        change: impl FnOnce(&mut Option<SecretRecord>) -> Result<T, SecretsError> + Send + 'static,
+    ) -> Result<T, SecretsError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _serial = store.mutation.lock().map_err(|_| SecretsError::Internal)?;
+            let mut candidate = slot.lock().map_err(|_| SecretsError::Internal)?.clone();
+            let previous_name = candidate.as_ref().map(|record| record.name.clone());
+            let result = change(&mut candidate)?;
+            if let Some(name) = candidate
+                .as_ref()
+                .map(|record| record.name.as_str())
+                .or(previous_name.as_deref())
+            {
+                store.persist(&scope, name, candidate.as_ref())?;
+            }
+            *slot.lock().map_err(|_| SecretsError::Internal)? = candidate;
+            Ok(result)
+        })
+        .await
+        .map_err(|_| SecretsError::Internal)?
+    }
+
+    fn persist(
+        &self,
+        scope: &Scope,
+        name: &str,
+        record: Option<&SecretRecord>,
+    ) -> Result<(), SecretsError> {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        // ponytail: full secrets snapshot per write; use per-record upserts if write volume grows.
-        let _serial = self.save_lock.lock().map_err(|_| SecretsError::Internal)?;
-        let mut records = Vec::new();
-        for entry in self.secrets.iter() {
-            if let Some(record) = entry
-                .value()
-                .lock()
-                .map_err(|_| SecretsError::Internal)?
-                .as_ref()
-            {
-                let json = serde_json::to_vec(record).map_err(|_| SecretsError::Internal)?;
-                records.push((
-                    entry.key().scope.account_id.clone(),
-                    entry.key().scope.region.clone(),
-                    entry.key().name.clone(),
-                    json,
-                ));
+        let mut db = state.connection().map_err(|_| SecretsError::Persistence)?;
+        let tx = db.transaction().map_err(|_| SecretsError::Persistence)?;
+        match record {
+            Some(record) => {
+                let json = serde_json::to_vec(record).map_err(|_| SecretsError::Persistence)?;
+                tx.execute("INSERT INTO sm_secrets(account_id,region,name,record) VALUES (?1,?2,?3,?4) ON CONFLICT(account_id,region,name) DO UPDATE SET record=excluded.record",
+                    params![scope.account_id, scope.region, name, json]).map_err(|_| SecretsError::Persistence)?;
             }
-        }
-        let mut db = state.connection().map_err(|_| SecretsError::Internal)?;
-        let tx = db.transaction().map_err(|_| SecretsError::Internal)?;
-        tx.execute("DELETE FROM sm_secrets", [])
-            .map_err(|_| SecretsError::Internal)?;
-        {
-            let mut insert = tx
-                .prepare(
-                    "INSERT INTO sm_secrets(account_id,region,name,record) VALUES (?1,?2,?3,?4)",
+            None => {
+                tx.execute(
+                    "DELETE FROM sm_secrets WHERE account_id=?1 AND region=?2 AND name=?3",
+                    params![scope.account_id, scope.region, name],
                 )
-                .map_err(|_| SecretsError::Internal)?;
-            for (account, region, name, json) in records {
-                insert
-                    .execute(params![account, region, name, json])
-                    .map_err(|_| SecretsError::Internal)?;
+                .map_err(|_| SecretsError::Persistence)?;
             }
         }
-        tx.commit().map_err(|_| SecretsError::Internal)
+        tx.commit().map_err(|_| SecretsError::Persistence)
     }
 
     pub(crate) fn reload(&self) -> Result<(), SecretsError> {
@@ -148,7 +162,8 @@ impl SecretStore {
                 ))
             })
             .map_err(|_| SecretsError::Internal)?;
-        let mut loaded = Vec::new();
+        self.secrets.clear();
+        self.pages.clear();
         for row in records {
             let (account, region, name, json) = row.map_err(|_| SecretsError::Internal)?;
             let mut record: SecretRecord =
@@ -165,16 +180,11 @@ impl SecretStore {
             {
                 return Err(SecretsError::Internal);
             }
-            loaded.push((
+            self.secrets.insert(
                 StoreKey::new(&Scope::new(&account, &region), &name),
                 Arc::new(Mutex::new(Some(record))),
-            ));
+            );
         }
-        self.secrets.clear();
-        for (key, record) in loaded {
-            self.secrets.insert(key, record);
-        }
-        self.pages.clear();
         Ok(())
     }
 

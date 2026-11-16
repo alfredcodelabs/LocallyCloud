@@ -3439,7 +3439,7 @@ mod process_status_tests {
 mod ownership_tests {
     use super::*;
 
-    fn reopen_after_drop(root: PathBuf) -> RdsHandler {
+    pub(super) fn reopen_after_drop(root: PathBuf) -> RdsHandler {
         // Concurrent process-spawn tests can briefly inherit the lease before exec
         // closes its CLOEXEC descriptor. A persistent lease still fails this test.
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -4055,7 +4055,12 @@ mod vpc_tests {
         let foreign = handler.handle(request("Action=ListTagsForResource&ResourceName=arn:aws:rds:us-west-2:000000000000:subgrp:orders".to_owned())).await;
         assert_eq!(foreign.status(), 400);
         drop(handler);
-        let restarted = RdsHandler::new(root.clone()).unwrap();
+        let reopen_root = root.clone();
+        let restarted = tokio::task::spawn_blocking(move || {
+            super::ownership_tests::reopen_after_drop(reopen_root)
+        })
+        .await
+        .unwrap();
         let described = restarted
             .handle(request(
                 "Action=DescribeDBSubnetGroups&DBSubnetGroupName=orders".to_owned(),

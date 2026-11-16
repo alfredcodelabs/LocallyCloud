@@ -1,5 +1,6 @@
 //! Offline native PITR cutover and historical restores with an explicitly supplied worker.
 
+#![cfg(feature = "services")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};

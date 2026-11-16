@@ -90,6 +90,16 @@ pub struct ServiceEntry {
     dynamodb_streams_api: Option<Arc<dyn DynamoDbStreamsApi>>,
 }
 
+#[derive(Default)]
+struct NativeCapabilities {
+    metric_sink: Option<Arc<dyn MetricSink>>,
+    log_sink: Option<Arc<dyn InternalLogSink>>,
+    kms_api: Option<Arc<dyn KmsInternalApi>>,
+    lambda_api: Option<Arc<dyn LambdaInternalApi>>,
+    authorization_evaluator: Option<Arc<dyn AuthorizationEvaluator>>,
+    dynamodb_streams_api: Option<Arc<dyn DynamoDbStreamsApi>>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct ResourcePresence {
     pub regions: Vec<String>,
@@ -285,7 +295,7 @@ impl ServiceRegistry {
         metadata: ServiceMetadata,
         handler: Arc<dyn NativeHandler>,
     ) {
-        self.register_native_entry(name, metadata, handler, None, None, None, None, None, None);
+        self.register_native_entry(name, metadata, handler, NativeCapabilities::default());
     }
 
     /// Register Monitoring and its typed receiver in one observable transition.
@@ -300,12 +310,10 @@ impl ServiceRegistry {
             name,
             metadata,
             handler,
-            Some(metric_sink),
-            None,
-            None,
-            None,
-            None,
-            None,
+            NativeCapabilities {
+                metric_sink: Some(metric_sink),
+                ..Default::default()
+            },
         );
     }
 
@@ -321,12 +329,10 @@ impl ServiceRegistry {
             name,
             metadata,
             handler,
-            None,
-            Some(log_sink),
-            None,
-            None,
-            None,
-            None,
+            NativeCapabilities {
+                log_sink: Some(log_sink),
+                ..Default::default()
+            },
         );
     }
 
@@ -342,12 +348,10 @@ impl ServiceRegistry {
             name,
             metadata,
             handler,
-            None,
-            None,
-            Some(kms_api),
-            None,
-            None,
-            None,
+            NativeCapabilities {
+                kms_api: Some(kms_api),
+                ..Default::default()
+            },
         );
     }
 
@@ -363,12 +367,10 @@ impl ServiceRegistry {
             name,
             metadata,
             handler,
-            None,
-            None,
-            None,
-            Some(lambda_api),
-            None,
-            None,
+            NativeCapabilities {
+                lambda_api: Some(lambda_api),
+                ..Default::default()
+            },
         );
     }
 
@@ -384,28 +386,28 @@ impl ServiceRegistry {
             name,
             metadata,
             handler,
-            None,
-            None,
-            None,
-            None,
-            Some(authorization_evaluator),
-            None,
+            NativeCapabilities {
+                authorization_evaluator: Some(authorization_evaluator),
+                ..Default::default()
+            },
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn register_native_entry(
         &self,
         name: ServiceName,
         metadata: ServiceMetadata,
         handler: Arc<dyn NativeHandler>,
-        metric_sink: Option<Arc<dyn MetricSink>>,
-        log_sink: Option<Arc<dyn InternalLogSink>>,
-        kms_api: Option<Arc<dyn KmsInternalApi>>,
-        lambda_api: Option<Arc<dyn LambdaInternalApi>>,
-        authorization_evaluator: Option<Arc<dyn AuthorizationEvaluator>>,
-        dynamodb_streams_api: Option<Arc<dyn DynamoDbStreamsApi>>,
+        capabilities: NativeCapabilities,
     ) {
+        let NativeCapabilities {
+            metric_sink,
+            log_sink,
+            kms_api,
+            lambda_api,
+            authorization_evaluator,
+            dynamodb_streams_api,
+        } = capabilities;
         self.services.insert(
             name,
             ServiceEntry {
@@ -485,12 +487,10 @@ impl ServiceRegistry {
             name,
             metadata,
             handler,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(api),
+            NativeCapabilities {
+                dynamodb_streams_api: Some(api),
+                ..Default::default()
+            },
         );
     }
 

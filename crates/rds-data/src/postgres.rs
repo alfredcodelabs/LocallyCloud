@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -74,10 +74,11 @@ struct Transaction {
 
 pub(crate) struct PgState {
     config: RdsDataConfig,
-    transactions: Mutex<HashMap<String, Arc<Transaction>>>,
+    transactions: std::sync::Mutex<HashMap<String, Arc<Transaction>>>,
     reaper: Mutex<Option<JoinHandle<()>>>,
     shutdown: AtomicBool,
     requests: Arc<Semaphore>,
+    open_connections: Arc<AtomicUsize>,
 }
 
 impl PgState {
@@ -85,10 +86,19 @@ impl PgState {
         let max_requests = config.limits.max_blocking_operations;
         Self {
             config,
-            transactions: Mutex::new(HashMap::new()),
+            transactions: std::sync::Mutex::new(HashMap::new()),
+            open_connections: Arc::new(AtomicUsize::new(0)),
             reaper: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             requests: Arc::new(Semaphore::new(max_requests)),
+        }
+    }
+
+    pub(crate) fn statistics(&self) -> crate::service::RdsDataStats {
+        crate::service::RdsDataStats {
+            open_connections: self.open_connections.load(Ordering::Acquire),
+            transactions: self.transactions.lock().expect("transactions lock").len(),
+            ..Default::default()
         }
     }
 
@@ -111,7 +121,7 @@ impl PgState {
                     break;
                 }
                 let candidates = {
-                    let transactions = state.transactions.lock().await;
+                    let transactions = state.transactions.lock().expect("transactions lock");
                     transactions
                         .iter()
                         .filter(|(_, transaction)| {
@@ -129,7 +139,11 @@ impl PgState {
                         continue;
                     }
                     transaction.closed.store(true, Ordering::Release);
-                    state.transactions.lock().await.remove(&id);
+                    state
+                        .transactions
+                        .lock()
+                        .expect("transactions lock")
+                        .remove(&id);
                     let _ = transaction.client.simple_query("ROLLBACK").await;
                 }
             }
@@ -148,7 +162,8 @@ impl PgState {
             reaper.abort();
             let _ = reaper.await;
         }
-        let transactions = std::mem::take(&mut *self.transactions.lock().await);
+        let transactions =
+            std::mem::take(&mut *self.transactions.lock().expect("transactions lock"));
         for (_, transaction) in transactions {
             let _operation = transaction.operation_lock.lock().await;
             transaction.closed.store(true, Ordering::Release);
@@ -158,7 +173,7 @@ impl PgState {
 }
 
 pub(crate) struct PgHandler {
-    registry: Arc<ServiceRegistry>,
+    registry: Weak<ServiceRegistry>,
     resolver: Option<Arc<dyn ClusterResolver>>,
     pub(crate) state: Arc<PgState>,
 }
@@ -170,7 +185,7 @@ impl PgHandler {
         config: RdsDataConfig,
     ) -> Self {
         Self {
-            registry,
+            registry: Arc::downgrade(&registry),
             resolver,
             state: Arc::new(PgState::new(config)),
         }
@@ -233,6 +248,8 @@ impl PgHandler {
         }
         let dispatcher = self
             .registry
+            .upgrade()
+            .ok_or(RdsDataError::Unavailable)?
             .internal_dispatcher()
             .ok_or(RdsDataError::Unavailable)?;
         let mut headers = HeaderMap::new();
@@ -310,7 +327,16 @@ impl PgHandler {
             .connect(NoTls)
             .await
             .map_err(|_| RdsDataError::Database("could not authenticate with DB cluster"))?;
+        struct ConnectionGuard(Arc<AtomicUsize>);
+        impl Drop for ConnectionGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.state.open_connections.fetch_add(1, Ordering::AcqRel);
+        let guard = ConnectionGuard(self.state.open_connections.clone());
         tokio::spawn(async move {
+            let _guard = guard;
             let _ = connection.await;
         });
         Ok((Arc::new(client), endpoint.port))
@@ -325,7 +351,7 @@ impl PgHandler {
         finalizing: bool,
     ) -> Result<(Arc<Client>, OwnedMutexGuard<()>), RdsDataError> {
         let transaction = {
-            let transactions = self.state.transactions.lock().await;
+            let transactions = self.state.transactions.lock().expect("transactions lock");
             let transaction = transactions
                 .get(id)
                 .ok_or(RdsDataError::TransactionNotFound)?;
@@ -354,7 +380,11 @@ impl PgHandler {
             .is_ok_and(|endpoint| endpoint.port == transaction.port)
         {
             transaction.closed.store(true, Ordering::Release);
-            self.state.transactions.lock().await.remove(id);
+            self.state
+                .transactions
+                .lock()
+                .expect("transactions lock")
+                .remove(id);
             let _ = transaction.client.simple_query("ROLLBACK").await;
             return Err(RdsDataError::TransactionNotFound);
         }
@@ -550,27 +580,28 @@ impl PgHandler {
                     .await
                     .map_err(|_| RdsDataError::Database("transaction could not start"))?;
                 let id = Uuid::new_v4().to_string();
-                let mut transactions = self.state.transactions.lock().await;
-                if transactions.len() >= self.state.config.limits.max_transactions {
-                    let _ = client.simple_query("ROLLBACK").await;
-                    return Err(RdsDataError::Unavailable);
+                {
+                    let mut transactions =
+                        self.state.transactions.lock().expect("transactions lock");
+                    if transactions.len() >= self.state.config.limits.max_transactions {
+                        return Err(RdsDataError::Unavailable);
+                    }
+                    transactions.insert(
+                        id.clone(),
+                        Arc::new(Transaction {
+                            client,
+                            operation_lock: Arc::new(Mutex::new(())),
+                            closed: Arc::new(AtomicBool::new(false)),
+                            account: req.account_id.clone(),
+                            region: req.region.clone(),
+                            resource_arn: input.resource_arn,
+                            secret_arn: input.secret_arn,
+                            port,
+                            created: Instant::now(),
+                            last_activity: std::sync::Mutex::new(Instant::now()),
+                        }),
+                    );
                 }
-                transactions.insert(
-                    id.clone(),
-                    Arc::new(Transaction {
-                        client,
-                        operation_lock: Arc::new(Mutex::new(())),
-                        closed: Arc::new(AtomicBool::new(false)),
-                        account: req.account_id.clone(),
-                        region: req.region.clone(),
-                        resource_arn: input.resource_arn,
-                        secret_arn: input.secret_arn,
-                        port,
-                        created: Instant::now(),
-                        last_activity: std::sync::Mutex::new(Instant::now()),
-                    }),
-                );
-                drop(transactions);
                 self.state.ensure_reaper().await;
                 serde_json::to_vec(&json!({"transactionId": id}))
                     .map_err(|_| RdsDataError::Internal)
@@ -590,7 +621,7 @@ impl PgHandler {
                 self.state
                     .transactions
                     .lock()
-                    .await
+                    .expect("transactions lock")
                     .remove(&input.transaction_id);
                 let commit = req.uri.path() == "/CommitTransaction";
                 client
@@ -828,6 +859,56 @@ mod tests {
             account_id: "000000000000".to_owned(),
             request_id: "test".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn registered_backend_is_idle_and_does_not_retain_registry() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let weak = Arc::downgrade(&registry);
+        let handle = crate::register(&registry).unwrap();
+        assert_eq!(handle.statistics(), crate::RdsDataStats::default());
+        drop(registry);
+        assert!(weak.upgrade().is_none());
+        tokio::join!(handle.shutdown(), handle.shutdown());
+        assert_eq!(handle.statistics(), crate::RdsDataStats::default());
+    }
+
+    #[tokio::test]
+    async fn postgres_boundary_preserves_rest_errors_and_shutdown_admission() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let handler = PgHandler::new(registry, None, RdsDataConfig::default());
+        let resource = "arn:aws:rds:us-east-1:000000000000:cluster:test";
+        for case in 0..7 {
+            let mut req = request(resource);
+            match case {
+                0 => req.method = Method::GET,
+                1 => req.uri = Uri::from_static("/Execute?unexpected=1"),
+                2 => {
+                    req.headers
+                        .insert("x-amz-target", HeaderValue::from_static("Execute"));
+                }
+                3 => {
+                    req.headers.remove("content-type");
+                }
+                4 => req.body = Bytes::from_static(b"{"),
+                5 => req.body = Bytes::from_static(b"{}"),
+                _ => req.uri = Uri::from_static("/Unknown"),
+            }
+            let response = handler.handle(req).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case {case}");
+            assert_eq!(
+                response.headers()["x-amzn-errortype"],
+                "BadRequestException"
+            );
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert!(value["message"].is_string());
+        }
+        handler.state.shutdown().await;
+        assert_eq!(
+            handler.handle(request(resource)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]

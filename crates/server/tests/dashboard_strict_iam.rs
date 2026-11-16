@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use axum::response::Response;
 use http::{HeaderMap, Method, Uri};
+use locallycloud::server::LocallyCloudServer;
 use locallycloud_core::audit::{CompletionObserver, DispatchOutcome};
 use locallycloud_core::config::LocallyCloudConfig;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
@@ -17,7 +18,6 @@ use locallycloud_core::integration::authorization::{
     AuthorizationError, AuthorizationEvaluator, AuthorizationRequest, SigningCredentials,
 };
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
-use locallycloud_core::server::LocallyCloudServer;
 
 const ACCESS_KEY: &str = "AKIDLOCALDASHBOARD";
 const SECRET: &str = "local-dashboard-secret";
@@ -136,15 +136,19 @@ fn aws_home() -> &'static PathBuf {
     })
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn listener() -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    listener
 }
 
-async fn start(port: u16, extra: &[(&str, &str)], registry: Arc<ServiceRegistry>) -> String {
+async fn start(
+    listener: std::net::TcpListener,
+    extra: &[(&str, &str)],
+    registry: Arc<ServiceRegistry>,
+) -> String {
+    let port = listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     let port_value = port.to_string();
     let mut vars = vec![
         ("LOCALLYCLOUD_PORT", port_value.as_str()),
@@ -157,7 +161,7 @@ async fn start(port: u16, extra: &[(&str, &str)], registry: Arc<ServiceRegistry>
             .map(|(_, value)| value.to_string())
     })
     .unwrap();
-    tokio::spawn(LocallyCloudServer::new(config, registry).run());
+    tokio::spawn(LocallyCloudServer::new(config, registry).run_with_listener(listener, || {}));
     let base = format!("http://127.0.0.1:{port}");
     for _ in 0..200 {
         if reqwest::get(format!("{base}/_locallycloud/health"))
@@ -199,7 +203,8 @@ async fn read(
 #[tokio::test]
 async fn strict_iam_dashboard_reads_are_signed_audited_and_bounded() {
     let home = aws_home();
-    let port = free_port();
+    let listener = listener();
+    let port = listener.local_addr().unwrap().port();
     std::fs::write(
         home.join("config"),
         format!(
@@ -232,7 +237,7 @@ async fn strict_iam_dashboard_reads_are_signed_audited_and_bounded() {
     );
     let observer = Arc::new(CaptureObserver::default());
     registry.set_completion_observer(observer.clone());
-    let base = start(port, &[], registry).await;
+    let base = start(listener, &[], registry).await;
     let client = reqwest::Client::new();
     let list = serde_json::json!({"profile": "dev", "service": "dynamodb", "operation": "ListTables", "body": {}});
 
@@ -399,9 +404,10 @@ async fn strict_iam_dashboard_reads_are_signed_audited_and_bounded() {
 #[tokio::test]
 async fn ui_off_removes_every_dashboard_route_but_keeps_health_and_status() {
     aws_home();
-    let port = free_port();
+    let listener = listener();
+
     let base = start(
-        port,
+        listener,
         &[("LOCALLYCLOUD_UI", "off")],
         ServiceRegistry::with_known_services(),
     )
@@ -455,8 +461,9 @@ async fn ui_off_removes_every_dashboard_route_but_keeps_health_and_status() {
 #[tokio::test]
 async fn ui_on_by_default_serves_the_dashboard() {
     aws_home();
-    let port = free_port();
-    let base = start(port, &[], ServiceRegistry::with_known_services()).await;
+    let listener = listener();
+
+    let base = start(listener, &[], ServiceRegistry::with_known_services()).await;
     let client = reqwest::Client::new();
     for path in ["/_locallycloud/ui", "/_locallycloud/dashboard.js"] {
         let response = client.get(format!("{base}{path}")).send().await.unwrap();

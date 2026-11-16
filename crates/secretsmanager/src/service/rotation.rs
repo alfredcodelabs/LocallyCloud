@@ -20,172 +20,190 @@ impl SecretsManagerHandler {
         }
         let version_id = version_id(input.client_request_token.as_deref())?;
         let slot = self.resolve_and_authorize(scope, &input.secret_id, request, "RotateSecret")?;
-        {
-            let mut guard = lock(&slot)?;
-            let record = active_record_mut(&mut guard)?;
-            let configured_lambda = record
-                .rotation
-                .as_ref()
-                .map(|rotation| rotation.lambda_arn.clone());
-            let lambda_arn = input
-                .rotation_lambda_arn
-                .or(configured_lambda)
-                .ok_or(SecretsError::InvalidParameter)?;
-            validate_rotation_lambda_arn(&lambda_arn, scope)?;
+        let scope_owned = scope.clone();
+        let version = version_id.clone();
+        let completed = self
+            .store
+            .update(scope.clone(), slot.clone(), move |guard| {
+                let scope = &scope_owned;
+                let version_id = version;
+                let record = active_record_mut(guard)?;
+                let configured_lambda = record
+                    .rotation
+                    .as_ref()
+                    .map(|rotation| rotation.lambda_arn.clone());
+                let lambda_arn = input
+                    .rotation_lambda_arn
+                    .or(configured_lambda)
+                    .ok_or(SecretsError::InvalidParameter)?;
+                validate_rotation_lambda_arn(&lambda_arn, scope)?;
 
-            if let Some(rotation) = record.rotation.as_ref() {
-                if let Some(occurrence) = rotation.occurrence.as_ref() {
-                    if occurrence.version_id == version_id
-                        && occurrence.step == RotationStep::Complete
-                    {
-                        return serialize(json!({
+                if let Some(rotation) = record.rotation.as_ref() {
+                    if let Some(occurrence) = rotation.occurrence.as_ref() {
+                        if occurrence.version_id == version_id
+                            && occurrence.step == RotationStep::Complete
+                        {
+                            return Ok(Some(serialize(json!({
+                                "ARN": record.arn,
+                                "Name": record.name,
+                                "VersionId": version_id
+                            }))?));
+                        }
+                        if occurrence.step != RotationStep::Complete
+                            && (occurrence.version_id != version_id
+                                || rotation.lambda_arn != lambda_arn
+                                || occurrence.in_flight)
+                        {
+                            return Err(SecretsError::InvalidRequest);
+                        }
+                    }
+                }
+
+                let rotation = record.rotation.get_or_insert_with(|| RotationState {
+                    enabled: true,
+                    lambda_arn: lambda_arn.clone(),
+                    occurrence: None,
+                    last_rotated_date: None,
+                });
+                rotation.enabled = true;
+                rotation.lambda_arn = lambda_arn;
+                if rotation.occurrence.as_ref().is_none_or(|occurrence| {
+                    occurrence.step == RotationStep::Complete && occurrence.version_id != version_id
+                }) {
+                    rotation.occurrence = Some(RotationOccurrence {
+                        version_id: version_id.clone(),
+                        step: RotationStep::Create,
+                        in_flight: false,
+                    });
+                }
+                record.last_changed_date = now_epoch()?;
+                Ok(None)
+            })
+            .await?;
+        if let Some(response) = completed {
+            return Ok(response);
+        }
+        loop {
+            let version = version_id.clone();
+            let next = self
+                .store
+                .update(scope.clone(), slot.clone(), move |guard| {
+                    let version_id = version;
+                    let record = active_record_mut(guard)?;
+                    let rotation = record
+                        .rotation
+                        .as_mut()
+                        .ok_or(SecretsError::InvalidRequest)?;
+                    if !rotation.enabled {
+                        return Err(SecretsError::InvalidRequest);
+                    }
+                    let occurrence = rotation
+                        .occurrence
+                        .as_mut()
+                        .ok_or(SecretsError::InvalidRequest)?;
+                    if occurrence.version_id != version_id {
+                        return Err(SecretsError::InvalidRequest);
+                    }
+                    if occurrence.step == RotationStep::Complete {
+                        return Ok(Err(serialize(json!({
                             "ARN": record.arn,
                             "Name": record.name,
                             "VersionId": version_id
-                        }));
+                        }))?));
                     }
-                    if occurrence.step != RotationStep::Complete
-                        && (occurrence.version_id != version_id
-                            || rotation.lambda_arn != lambda_arn
-                            || occurrence.in_flight)
-                    {
+                    if occurrence.in_flight {
                         return Err(SecretsError::InvalidRequest);
                     }
-                }
-            }
-
-            let rotation = record.rotation.get_or_insert_with(|| RotationState {
-                enabled: true,
-                lambda_arn: lambda_arn.clone(),
-                occurrence: None,
-                last_rotated_date: None,
-            });
-            rotation.enabled = true;
-            rotation.lambda_arn = lambda_arn;
-            if rotation.occurrence.as_ref().is_none_or(|occurrence| {
-                occurrence.step == RotationStep::Complete && occurrence.version_id != version_id
-            }) {
-                rotation.occurrence = Some(RotationOccurrence {
-                    version_id: version_id.clone(),
-                    step: RotationStep::Create,
-                    in_flight: false,
-                });
-            }
-            record.last_changed_date = now_epoch()?;
-        }
-
-        self.persist().await?;
-        loop {
-            let (arn, name, lambda_arn, step) = {
-                let mut guard = lock(&slot)?;
-                let record = active_record_mut(&mut guard)?;
-                let rotation = record
-                    .rotation
-                    .as_mut()
-                    .ok_or(SecretsError::InvalidRequest)?;
-                if !rotation.enabled {
-                    return Err(SecretsError::InvalidRequest);
-                }
-                let occurrence = rotation
-                    .occurrence
-                    .as_mut()
-                    .ok_or(SecretsError::InvalidRequest)?;
-                if occurrence.version_id != version_id {
-                    return Err(SecretsError::InvalidRequest);
-                }
-                if occurrence.step == RotationStep::Complete {
-                    return serialize(json!({
-                        "ARN": record.arn,
-                        "Name": record.name,
-                        "VersionId": version_id
-                    }));
-                }
-                if occurrence.in_flight {
-                    return Err(SecretsError::InvalidRequest);
-                }
-                occurrence.in_flight = true;
-                (
-                    record.arn.clone(),
-                    record.name.clone(),
-                    rotation.lambda_arn.clone(),
-                    occurrence.step,
-                )
+                    occurrence.in_flight = true;
+                    Ok(Ok((
+                        record.arn.clone(),
+                        record.name.clone(),
+                        rotation.lambda_arn.clone(),
+                        occurrence.step,
+                    )))
+                })
+                .await?;
+            let (arn, name, lambda_arn, step) = match next {
+                Ok(next) => next,
+                Err(response) => return Ok(response),
             };
-
-            self.persist().await?;
             let invocation = self
                 .invoke_rotation_step(request, scope, &lambda_arn, &arn, &version_id, step)
                 .await;
 
-            let completed = {
-                let mut guard = lock(&slot)?;
-                let record = active_record_mut(&mut guard)?;
-                let state_matches = record.rotation.as_ref().is_some_and(|rotation| {
-                    rotation.enabled
-                        && rotation.occurrence.as_ref().is_some_and(|occurrence| {
-                            occurrence.version_id == version_id && occurrence.step == step
-                        })
-                });
-                if !state_matches {
-                    return Err(SecretsError::InvalidRequest);
-                }
-                if let Err(error) = invocation {
-                    if let Some(occurrence) = record
-                        .rotation
-                        .as_mut()
-                        .and_then(|rotation| rotation.occurrence.as_mut())
-                    {
-                        occurrence.in_flight = false;
+            let version = version_id.clone();
+            let completed = self
+                .store
+                .update(scope.clone(), slot.clone(), move |guard| {
+                    let version_id = version;
+                    let record = active_record_mut(guard)?;
+                    let state_matches = record.rotation.as_ref().is_some_and(|rotation| {
+                        rotation.enabled
+                            && rotation.occurrence.as_ref().is_some_and(|occurrence| {
+                                occurrence.version_id == version_id && occurrence.step == step
+                            })
+                    });
+                    if !state_matches {
+                        return Err(SecretsError::InvalidRequest);
                     }
-                    return Err(error);
-                }
-
-                match step {
-                    RotationStep::Create => {
-                        let pending = record.stage_index.get("AWSPENDING");
-                        let version = record.versions.get(&version_id);
-                        if pending.map(String::as_str) != Some(version_id.as_str())
-                            || version.is_none_or(|version| !version.stages.contains("AWSPENDING"))
+                    if let Err(error) = invocation {
+                        if let Some(occurrence) = record
+                            .rotation
+                            .as_mut()
+                            .and_then(|rotation| rotation.occurrence.as_mut())
                         {
-                            if let Some(occurrence) = record
-                                .rotation
-                                .as_mut()
-                                .and_then(|rotation| rotation.occurrence.as_mut())
+                            occurrence.in_flight = false;
+                        }
+                        return Ok(Err(error));
+                    }
+
+                    match step {
+                        RotationStep::Create => {
+                            let pending = record.stage_index.get("AWSPENDING");
+                            let version = record.versions.get(&version_id);
+                            if pending.map(String::as_str) != Some(version_id.as_str())
+                                || version
+                                    .is_none_or(|version| !version.stages.contains("AWSPENDING"))
                             {
-                                occurrence.in_flight = false;
+                                if let Some(occurrence) = record
+                                    .rotation
+                                    .as_mut()
+                                    .and_then(|rotation| rotation.occurrence.as_mut())
+                                {
+                                    occurrence.in_flight = false;
+                                }
+                                return Ok(Err(SecretsError::InvalidRequest));
                             }
-                            return Err(SecretsError::InvalidRequest);
                         }
+                        RotationStep::Finish => {
+                            if record.stage_index.get("AWSCURRENT").map(String::as_str)
+                                != Some(version_id.as_str())
+                            {
+                                promote_current(record, &version_id)?;
+                            }
+                            if record.stage_index.get("AWSPENDING").map(String::as_str)
+                                == Some(version_id.as_str())
+                            {
+                                remove_stage(record, "AWSPENDING", &version_id)?;
+                            }
+                        }
+                        RotationStep::Set | RotationStep::Test => {}
+                        RotationStep::Complete => return Err(SecretsError::Internal),
                     }
-                    RotationStep::Finish => {
-                        if record.stage_index.get("AWSCURRENT").map(String::as_str)
-                            != Some(version_id.as_str())
-                        {
-                            promote_current(record, &version_id)?;
-                        }
-                        if record.stage_index.get("AWSPENDING").map(String::as_str)
-                            == Some(version_id.as_str())
-                        {
-                            remove_stage(record, "AWSPENDING", &version_id)?;
-                        }
+
+                    let now = now_epoch()?;
+                    let rotation = record.rotation.as_mut().ok_or(SecretsError::Internal)?;
+                    let occurrence = rotation.occurrence.as_mut().ok_or(SecretsError::Internal)?;
+                    occurrence.in_flight = false;
+                    occurrence.step = step.next();
+                    if occurrence.step == RotationStep::Complete {
+                        rotation.last_rotated_date = Some(now);
                     }
-                    RotationStep::Set | RotationStep::Test => {}
-                    RotationStep::Complete => return Err(SecretsError::Internal),
-                }
+                    record.last_changed_date = now;
 
-                let now = now_epoch()?;
-                let rotation = record.rotation.as_mut().ok_or(SecretsError::Internal)?;
-                let occurrence = rotation.occurrence.as_mut().ok_or(SecretsError::Internal)?;
-                occurrence.in_flight = false;
-                occurrence.step = step.next();
-                if occurrence.step == RotationStep::Complete {
-                    rotation.last_rotated_date = Some(now);
-                }
-                record.last_changed_date = now;
-
-                occurrence.step == RotationStep::Complete
-            };
-            self.persist().await?;
+                    Ok(Ok(occurrence.step == RotationStep::Complete))
+                })
+                .await??;
             if completed {
                 return serialize(json!({
                     "ARN": arn,
@@ -196,7 +214,7 @@ impl SecretsManagerHandler {
         }
     }
 
-    pub(super) fn cancel_rotate_secret(
+    pub(super) async fn cancel_rotate_secret(
         &self,
         input: SecretIdRequest,
         scope: &Scope,
@@ -204,20 +222,23 @@ impl SecretsManagerHandler {
     ) -> Result<Vec<u8>, SecretsError> {
         let slot =
             self.resolve_and_authorize(scope, &input.secret_id, request, "CancelRotateSecret")?;
-        let mut guard = lock(&slot)?;
-        let record = active_record_mut(&mut guard)?;
-        let rotation = record
-            .rotation
-            .as_mut()
-            .ok_or(SecretsError::InvalidRequest)?;
-        if rotation.occurrence.as_ref().is_some_and(|occurrence| {
-            occurrence.step != RotationStep::Complete || occurrence.in_flight
-        }) {
-            return Err(SecretsError::InvalidRequest);
-        }
-        rotation.enabled = false;
-        record.last_changed_date = now_epoch()?;
-        serialize(json!({"ARN": record.arn, "Name": record.name}))
+        self.store
+            .update(scope.clone(), slot, move |guard| {
+                let record = active_record_mut(guard)?;
+                let rotation = record
+                    .rotation
+                    .as_mut()
+                    .ok_or(SecretsError::InvalidRequest)?;
+                if rotation.occurrence.as_ref().is_some_and(|occurrence| {
+                    occurrence.step != RotationStep::Complete || occurrence.in_flight
+                }) {
+                    return Err(SecretsError::InvalidRequest);
+                }
+                rotation.enabled = false;
+                record.last_changed_date = now_epoch()?;
+                serialize(json!({"ARN": record.arn, "Name": record.name}))
+            })
+            .await
     }
 
     async fn invoke_rotation_step(

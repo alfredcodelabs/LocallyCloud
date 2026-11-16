@@ -1,4 +1,6 @@
 //! ASL acceptance fixtures use public service requests and independently read S3 effects.
+#![cfg(feature = "services")]
+
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -19,8 +21,10 @@ use serde_json::{json, Value};
 
 #[tokio::test]
 async fn jsonata_range_matches_observed_aws_test_state_contracts() {
-    let fixture: Value =
-        serde_json::from_str(include_str!("fixtures/aws-range-2026-10-06.json")).unwrap();
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../stepfunctions/tests/fixtures/aws-range-2026-10-06.json"
+    ))
+    .unwrap();
     let registry = registry();
     for case in fixture["cases"].as_array().unwrap() {
         let definition = json!({
@@ -63,7 +67,7 @@ async fn jsonata_range_matches_observed_aws_test_state_contracts() {
 #[tokio::test]
 async fn test_state_matches_recorded_aws_choices_errors_and_inspection() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "fixtures/aws-test-state-contract-2026-10-06.json"
+        "../../stepfunctions/tests/fixtures/aws-test-state-contract-2026-10-06.json"
     ))
     .unwrap();
     let registry = registry();

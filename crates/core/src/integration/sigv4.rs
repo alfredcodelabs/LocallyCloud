@@ -20,7 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// Sign local dashboard reads using server-held profile credentials and the verifier's
 /// canonicalization. Secrets and signatures never enter browser responses.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sign(
+pub fn sign(
     method: &Method,
     uri: &Uri,
     headers: &mut HeaderMap,

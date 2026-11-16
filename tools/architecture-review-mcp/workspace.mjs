@@ -3,8 +3,8 @@ import { constants } from 'node:fs';
 import { open, realpath, mkdir, opendir } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import * as M from '../../crates/core/src/views/architecture/model.js';
-import * as R from '../../crates/core/src/views/architecture/engine.js';
+import * as M from '../../crates/server/src/views/architecture/model.js';
+import * as R from '../../crates/server/src/views/architecture/engine.js';
 const READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 export async function workspace(directory) {
   if (!path.isAbsolute(directory) || path.resolve(directory) !== await realpath(directory)) { throw new Error('Use an absolute workspace without symlinks'); }

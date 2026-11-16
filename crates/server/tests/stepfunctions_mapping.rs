@@ -1,5 +1,7 @@
 //! Regression for Accounting's deployed serverless-step-functions mapping templates.
 //! Fixtures retain the application's VTL; only its account/region are bound to this test.
+#![cfg(feature = "services")]
+use locallycloud::server::LocallyCloudServer;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -13,7 +15,6 @@ use locallycloud_core::{
     config::LocallyCloudConfig,
     handler::{NativeHandler, ServiceRequest},
     registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry},
-    server::LocallyCloudServer,
 };
 use serde_json::{json, Value};
 
@@ -163,8 +164,9 @@ async fn accounting_template_reaches_real_sync_workflow_and_maps_its_response() 
         shutdown: Some(shutdown),
     };
     started.await.unwrap();
-    let request_template = include_str!("fixtures/accounting-stepfunctions-request.vtl")
-        .replace("\"0\"", "\"000000000000\"");
+    let request_template =
+        include_str!("../../apigateway/tests/fixtures/accounting-stepfunctions-request.vtl")
+            .replace("\"0\"", "\"000000000000\"");
     // The actual VTL determines the machine name. Keep it in sync with the fixture.
     let machine_name = request_template
         .lines()
@@ -232,7 +234,7 @@ async fn accounting_template_reaches_real_sync_workflow_and_maps_its_response() 
     api(&registry, "apigateway", Method::PUT,
         &format!("{method}/integration/responses/200"), json!({
             "statusCode": "200",
-            "responseTemplates": {"application/json": include_str!("fixtures/accounting-stepfunctions-response.vtl")}
+            "responseTemplates": {"application/json": include_str!("../../apigateway/tests/fixtures/accounting-stepfunctions-response.vtl")}
         })).await;
     api(
         &registry,

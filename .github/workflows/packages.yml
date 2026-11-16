@@ -88,10 +88,10 @@ jobs:
           package-manager-cache: false
       - name: Check dashboard view modules and review engine
         run: |
-          for file in crates/core/src/views/architecture/*.js crates/core/src/views/architecture/tests/*.mjs tools/architecture-review-mcp/*.mjs; do
+          for file in crates/server/src/views/architecture/*.js crates/server/src/views/architecture/tests/*.mjs tools/architecture-review-mcp/*.mjs; do
             node --check "$file"
           done
-          node --test crates/core/src/views/architecture/tests/*.test.mjs
+          node --test crates/server/src/views/architecture/tests/*.test.mjs
       - name: Check the optional MCP companion
         run: |
           npm ci --prefix tools/architecture-review-mcp --ignore-scripts

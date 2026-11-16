@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use base64::Engine;
 use bytes::Bytes;
+use locallycloud::server::LocallyCloudServer;
 use locallycloud_core::config::LocallyCloudConfig;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::{
@@ -14,7 +15,6 @@ use locallycloud_core::integration::authorization::{
     ServiceRoleAuthorizationRequest,
 };
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
-use locallycloud_core::server::LocallyCloudServer;
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Barrier, Notify};
 
@@ -24,7 +24,7 @@ struct WireServer {
     base: String,
     client: reqwest::Client,
     shutdown: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<Result<(), locallycloud_core::server::ServerError>>,
+    task: tokio::task::JoinHandle<Result<(), locallycloud::server::ServerError>>,
     firehose: crate::FirehoseHandle,
 }
 

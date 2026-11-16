@@ -424,6 +424,7 @@ pub async fn set_topic_attributes(ctx: &Ctx<'_>, input: &Input) -> Result<Reply,
         validate_topic_attributes(&BTreeMap::from([(name.clone(), value.clone())]))?;
     }
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     if name == "ContentBasedDeduplication" && !state.fifo {
         return Err(SnsError::InvalidParameter(
             "ContentBasedDeduplication is only valid for FIFO topics".into(),
@@ -485,6 +486,7 @@ pub async fn subscribe(
     }
 
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     if state.fifo {
         if protocol != "sqs" {
             return Err(SnsError::InvalidParameter(
@@ -548,6 +550,7 @@ pub async fn confirm_subscription(ctx: &Ctx<'_>, input: &Input) -> Result<Reply,
     let topic = resolve_topic(ctx, input)?;
     let token = input.require("Token")?;
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     let sub = state
         .subscriptions
         .iter_mut()
@@ -562,6 +565,7 @@ pub async fn unsubscribe(ctx: &Ctx<'_>, input: &Input) -> Result<Reply, SnsError
     let sub_arn = input.require("SubscriptionArn")?;
     let topic = topic_of_subscription(ctx, &sub_arn)?;
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     let before = state.subscriptions.len();
     state.subscriptions.retain(|s| s.arn != sub_arn);
     if state.subscriptions.len() == before {
@@ -696,6 +700,7 @@ pub async fn set_subscription_attributes(
         }
     }
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     let sub = state
         .subscriptions
         .iter_mut()
@@ -712,6 +717,7 @@ pub async fn tag_resource(ctx: &Ctx<'_>, input: &Input) -> Result<Reply, SnsErro
     let tags = input.tags();
     validate_tags(&tags)?;
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     let resulting = state.tags.len()
         + tags
             .iter()
@@ -732,6 +738,7 @@ pub async fn untag_resource(ctx: &Ctx<'_>, input: &Input) -> Result<Reply, SnsEr
     let topic = resolve_topic_by_field(ctx, input, "ResourceArn")?;
     let keys = input.tag_keys();
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     state.tags.retain(|k, _| !keys.contains(k));
     Ok(Reply::Empty)
 }
@@ -867,6 +874,7 @@ async fn do_publish(
     let timestamp = now_iso();
 
     let mut state = topic.write().await;
+    ctx.store.mark_uncommitted(&state.arn);
     if state.fifo {
         let Some(group_id_value) = group_id.as_deref() else {
             return Err(SnsError::InvalidParameter(

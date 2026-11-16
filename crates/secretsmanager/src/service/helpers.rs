@@ -14,9 +14,7 @@ pub(super) fn lock(
     slot.lock().map_err(|_| SecretsError::Internal)
 }
 
-pub(super) fn active_record<'a>(
-    guard: &'a std::sync::MutexGuard<'_, Option<SecretRecord>>,
-) -> Result<&'a SecretRecord, SecretsError> {
+pub(super) fn active_record(guard: &Option<SecretRecord>) -> Result<&SecretRecord, SecretsError> {
     let record = guard.as_ref().ok_or(SecretsError::ResourceNotFound)?;
     if record.deleted_date.is_some() {
         Err(SecretsError::InvalidRequest)
@@ -25,9 +23,9 @@ pub(super) fn active_record<'a>(
     }
 }
 
-pub(super) fn active_record_mut<'a>(
-    guard: &'a mut std::sync::MutexGuard<'_, Option<SecretRecord>>,
-) -> Result<&'a mut SecretRecord, SecretsError> {
+pub(super) fn active_record_mut(
+    guard: &mut Option<SecretRecord>,
+) -> Result<&mut SecretRecord, SecretsError> {
     let record = guard.as_mut().ok_or(SecretsError::ResourceNotFound)?;
     if record.deleted_date.is_some() {
         Err(SecretsError::InvalidRequest)

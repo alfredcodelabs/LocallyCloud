@@ -2,7 +2,7 @@
 //!
 //! Tracks locallycloud's own readiness, reported independently of the legacy backend, and
 //! shapes the health response. The HTTP routes (`/_locallycloud/health` and the
-//! `/_localstack/health` compatibility alias) are wired in [`crate::server`].
+//! `/_localstack/health` compatibility alias) are wired in the server crate.
 //! See Requirements 4 and 12.
 
 use std::sync::atomic::{AtomicBool, Ordering};

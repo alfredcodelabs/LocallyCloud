@@ -10,45 +10,87 @@ description = "Native Linux AWS emulator"
 [[bin]]
 name = "locallycloud"
 path = "src/main.rs"
+required-features = ["services"]
+
+[features]
+default = ["services"]
+services = [
+    "dep:locallycloud-state",
+    "dep:locallycloud-compute",
+    "dep:locallycloud-lambda",
+    "dep:locallycloud-iam-sts",
+    "dep:locallycloud-dynamodb",
+    "dep:locallycloud-s3",
+    "dep:locallycloud-sqs",
+    "dep:locallycloud-sns",
+    "dep:locallycloud-eventbridge",
+    "dep:locallycloud-stepfunctions",
+    "dep:locallycloud-apigateway",
+    "dep:locallycloud-cloudformation",
+    "dep:locallycloud-ecr",
+    "dep:locallycloud-ecs",
+    "dep:locallycloud-ec2",
+    "dep:locallycloud-elbv2",
+    "dep:locallycloud-kms",
+    "dep:locallycloud-ssm",
+    "dep:locallycloud-secretsmanager",
+    "dep:locallycloud-cloudwatch-monitoring",
+    "dep:locallycloud-cloudwatch-logs",
+    "dep:locallycloud-rds-data",
+    "dep:locallycloud-rds",
+    "dep:locallycloud-analytics",
+    "dep:locallycloud-kinesis",
+    "dep:locallycloud-firehose",
+    "dep:locallycloud-xray",
+    "dep:locallycloud-cloudtrail",
+    "dep:locallycloud-route53",
+    "dep:locallycloud-arc",
+    "dep:locallycloud-region-switch",
+    "dep:locallycloud-wafv2",
+    "dep:locallycloud-cognito",
+    "dep:locallycloud-acm",
+    "dep:locallycloud-cloudfront",
+    "dep:locallycloud-architecture",
+]
 
 [dependencies]
 locallycloud-core.workspace = true
-locallycloud-state.workspace = true
-locallycloud-compute.workspace = true
-locallycloud-lambda.workspace = true
-locallycloud-iam-sts.workspace = true
-locallycloud-dynamodb.workspace = true
-locallycloud-s3.workspace = true
-locallycloud-sqs.workspace = true
-locallycloud-sns.workspace = true
-locallycloud-eventbridge.workspace = true
-locallycloud-stepfunctions.workspace = true
-locallycloud-apigateway.workspace = true
-locallycloud-cloudformation.workspace = true
-locallycloud-ecr.workspace = true
-locallycloud-ecs.workspace = true
-locallycloud-ec2.workspace = true
-locallycloud-elbv2.workspace = true
-locallycloud-kms.workspace = true
-locallycloud-ssm.workspace = true
-locallycloud-secretsmanager.workspace = true
-locallycloud-cloudwatch-monitoring.workspace = true
-locallycloud-cloudwatch-logs.workspace = true
-locallycloud-rds-data.workspace = true
-locallycloud-rds.workspace = true
-locallycloud-analytics.workspace = true
-locallycloud-kinesis.workspace = true
-locallycloud-firehose.workspace = true
-locallycloud-xray.workspace = true
-locallycloud-cloudtrail.workspace = true
-locallycloud-route53.workspace = true
-locallycloud-arc.workspace = true
-locallycloud-region-switch.workspace = true
-locallycloud-wafv2.workspace = true
-locallycloud-cognito.workspace = true
-locallycloud-acm.workspace = true
-locallycloud-cloudfront.workspace = true
-locallycloud-architecture.workspace = true
+locallycloud-state = { workspace = true, optional = true }
+locallycloud-compute = { workspace = true, optional = true }
+locallycloud-lambda = { workspace = true, optional = true }
+locallycloud-iam-sts = { workspace = true, optional = true }
+locallycloud-dynamodb = { workspace = true, optional = true }
+locallycloud-s3 = { workspace = true, optional = true }
+locallycloud-sqs = { workspace = true, optional = true }
+locallycloud-sns = { workspace = true, optional = true }
+locallycloud-eventbridge = { workspace = true, optional = true }
+locallycloud-stepfunctions = { workspace = true, optional = true }
+locallycloud-apigateway = { workspace = true, optional = true }
+locallycloud-cloudformation = { workspace = true, optional = true }
+locallycloud-ecr = { workspace = true, optional = true }
+locallycloud-ecs = { workspace = true, optional = true }
+locallycloud-ec2 = { workspace = true, optional = true }
+locallycloud-elbv2 = { workspace = true, optional = true }
+locallycloud-kms = { workspace = true, optional = true }
+locallycloud-ssm = { workspace = true, optional = true }
+locallycloud-secretsmanager = { workspace = true, optional = true }
+locallycloud-cloudwatch-monitoring = { workspace = true, optional = true }
+locallycloud-cloudwatch-logs = { workspace = true, optional = true }
+locallycloud-rds-data = { workspace = true, optional = true }
+locallycloud-rds = { workspace = true, optional = true }
+locallycloud-analytics = { workspace = true, optional = true }
+locallycloud-kinesis = { workspace = true, optional = true }
+locallycloud-firehose = { workspace = true, optional = true }
+locallycloud-xray = { workspace = true, optional = true }
+locallycloud-cloudtrail = { workspace = true, optional = true }
+locallycloud-route53 = { workspace = true, optional = true }
+locallycloud-arc = { workspace = true, optional = true }
+locallycloud-region-switch = { workspace = true, optional = true }
+locallycloud-wafv2 = { workspace = true, optional = true }
+locallycloud-cognito = { workspace = true, optional = true }
+locallycloud-acm = { workspace = true, optional = true }
+locallycloud-cloudfront = { workspace = true, optional = true }
+locallycloud-architecture = { workspace = true, optional = true }
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
@@ -64,6 +106,14 @@ reqwest.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 base64.workspace = true
+
+bytes.workspace = true
+thiserror.workspace = true
+tokio-rustls.workspace = true
+pem = "=3.0.6"
+
+[build-dependencies]
+flate2.workspace = true
 
 [dev-dependencies]
 hmac.workspace = true

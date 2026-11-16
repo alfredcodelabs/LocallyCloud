@@ -134,6 +134,21 @@ cargo clippy -j 4 --workspace --all-targets --locked -- -D warnings
 cargo test -j 4 --workspace --locked
 ```
 
+Local dev/test builds keep incremental compilation and line tables for backtraces.
+For full debugger variable inspection, set `CARGO_PROFILE_DEV_DEBUG=2` or
+`CARGO_PROFILE_TEST_DEBUG=2` for the command you are running.
+
+Work on one service with `cargo test -j 4 -p locallycloud-ssm --locked`. Test the
+HTTP transport and dashboard with `cargo test -j 4 -p locallycloud --no-default-features --lib --test dashboard_strict_iam --locked`.
+The default `services` feature builds the complete emulator. Scenarios that combine
+CloudFormation with Firehose or Step Functions with Analytics live in
+`crates/server/tests/` and run with the workspace suite. Analytics and Firehose
+still need Iceberg's full Parquet dependency tree; their supported formats are unchanged.
+
+The HTTP front door, dashboard assets and compression build script live in
+`crates/server/`. Shared dispatch, service contracts, architecture read ports and
+TLS primitives used by guest callbacks stay in `crates/core/`.
+
 See [versioning and packages](packaging/VERSIONING.md) for releases and
 [brand assets](packaging/assets/README.md) for logo exports.
 

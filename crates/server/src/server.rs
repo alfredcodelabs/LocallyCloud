@@ -140,8 +140,7 @@ impl LocallyCloudServer {
         self.readiness.mark_ready();
         tracing::info!(%addr, "locallycloud listening");
 
-        let legacy_health = LegacyHealth::new(true);
-        let _health_checker = legacy_health.clone().spawn_checker(
+        let legacy_health = LegacyHealth::monitored(
             self.config.legacy_backend_url.clone(),
             self.config.legacy_health_check_interval,
         );
@@ -714,7 +713,8 @@ impl crate::views::architecture::AwsReader for DashboardReader {
         &self,
         read: crate::views::architecture::AwsRead,
     ) -> Result<crate::views::architecture::AwsReply, crate::views::architecture::ReadError> {
-        use crate::views::architecture::{is_read, AwsReply, ReadError};
+        use crate::views::architecture::{AwsReply, ReadError};
+        use crate::views::architecture_read::is_read;
         const LIMIT: usize = 8 * 1024 * 1024;
         let profile = self.dashboard.profile(&self.profile);
         let Some(profile) = profile.filter(|_| is_read(&read)) else {

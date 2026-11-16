@@ -1,6 +1,3 @@
-//! Dashboard views: the route table, the embedded assets served under `/_locallycloud/`,
-//! and the ports that injected view sources implement.
+//! Shared ports for injected dashboard data sources.
 
 pub mod architecture;
-pub(crate) mod assets;
-pub(crate) mod routes;

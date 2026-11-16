@@ -1,9 +1,9 @@
 //! CloudFormation must provision response mappings before snapshotting a deployment.
+#![cfg(feature = "services")]
+use locallycloud::server::LocallyCloudServer;
 use std::time::Duration;
 
-use locallycloud_core::{
-    config::LocallyCloudConfig, registry::ServiceRegistry, server::LocallyCloudServer,
-};
+use locallycloud_core::{config::LocallyCloudConfig, registry::ServiceRegistry};
 use serde_json::{json, Value};
 
 struct Fixture {

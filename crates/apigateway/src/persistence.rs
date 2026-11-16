@@ -113,6 +113,30 @@ impl ApiGwStore {
         }
         snapshot
     }
+    /// Move the staged records into the commit snapshot, avoiding a second copy of
+    /// every API configuration after a successful mutation.
+    pub(crate) async fn into_scope_snapshot(self) -> ScopeSnapshot {
+        async fn owned<T: Clone>(record: Arc<RwLock<T>>) -> T {
+            match Arc::try_unwrap(record) {
+                Ok(record) => record.into_inner(),
+                Err(record) => record.read().await.clone(),
+            }
+        }
+        let mut snapshot = ScopeSnapshot::default();
+        for ((_, _, id), record) in self.rest {
+            snapshot.rest.push((id, owned(record).await));
+        }
+        for ((_, _, id), record) in self.v2 {
+            snapshot.v2.push((id, owned(record).await));
+        }
+        for (_, record) in self.shared {
+            snapshot.shared = owned(record).await;
+            snapshot.shared.connections.clear();
+            snapshot.shared.authorizer_cache.clear();
+        }
+        snapshot
+    }
+
     pub(crate) fn install_scope(&self, account: &str, region: &str, snapshot: ScopeSnapshot) {
         self.rest
             .retain(|key, _| key.0 != account || key.1 != region);

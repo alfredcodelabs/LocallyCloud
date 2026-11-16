@@ -32,7 +32,6 @@ zip.workspace = true
 reqwest.workspace = true
 locallycloud-eventbridge.workspace = true
 locallycloud-stepfunctions.workspace = true
-locallycloud-firehose.workspace = true
 locallycloud-ecs.workspace = true
 locallycloud-elbv2.workspace = true
 locallycloud-apigateway.workspace = true

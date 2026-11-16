@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -131,49 +131,4 @@ pub(crate) enum LongReturnType {
     Long,
     #[serde(rename = "STRING")]
     String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ColumnMetadata {
-    pub label: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub type_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ExecuteResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub column_metadata: Option<Vec<ColumnMetadata>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub number_of_records_updated: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub records: Option<Vec<Vec<serde_json::Value>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub formatted_records: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BatchResponse {
-    pub update_results: Vec<UpdateResult>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct UpdateResult {}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BeginResponse {
-    pub transaction_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FinalizeResponse {
-    pub transaction_status: &'static str,
 }

@@ -5,13 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "locallycloud core: HTTP server, multi-protocol router, reverse proxy, registry, error mapping, observability"
+description = "locallycloud core: multi-protocol router, reverse proxy, registry, error mapping, observability"
 
 [dependencies]
 tokio.workspace = true
 async-trait.workspace = true
 axum.workspace = true
-tower-http.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -30,12 +29,7 @@ sha2.workspace = true
 time.workspace = true
 tokio-rustls.workspace = true
 zeroize.workspace = true
-flate2.workspace = true
-pem = "=3.0.6"
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
-
-[build-dependencies]
-flate2.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

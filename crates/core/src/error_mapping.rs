@@ -6,7 +6,7 @@
 
 use crate::registry::AwsProtocol;
 
-pub(crate) fn cloudwatch_cbor_request(uri: &http::Uri, headers: &http::HeaderMap) -> bool {
+pub fn cloudwatch_cbor_request(uri: &http::Uri, headers: &http::HeaderMap) -> bool {
     uri.path()
         .starts_with("/service/GraniteServiceVersion20100801/operation/")
         && headers
@@ -18,9 +18,7 @@ pub(crate) fn cloudwatch_cbor_request(uri: &http::Uri, headers: &http::HeaderMap
 }
 
 /// Preserve early routing/signature errors for current CloudWatch SDK clients.
-pub(crate) async fn cloudwatch_cbor_error(
-    response: axum::response::Response,
-) -> axum::response::Response {
+pub async fn cloudwatch_cbor_error(response: axum::response::Response) -> axum::response::Response {
     if response.status().is_success()
         || response
             .headers()

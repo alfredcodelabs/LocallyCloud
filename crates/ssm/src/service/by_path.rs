@@ -251,6 +251,7 @@ impl SsmHandler {
                     },
                     scope,
                     request,
+                    Operation::GetParameter,
                 )
                 .await?;
             parameters.push(value["Parameter"].clone());

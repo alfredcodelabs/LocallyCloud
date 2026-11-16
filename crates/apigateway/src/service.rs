@@ -961,10 +961,8 @@ impl NativeHandler for ApiGwHandler {
             .await
         {
             Ok((status, value)) => {
-                if let (Some(staged), Some(persistence)) = (&staged, &self.persistence) {
-                    let snapshot = staged
-                        .snapshot_scope(&request.account_id, &request.region)
-                        .await;
+                if let (Some(staged), Some(persistence)) = (staged, &self.persistence) {
+                    let snapshot = staged.into_scope_snapshot().await;
                     if self
                         .store
                         .publish_scope(&request.account_id, &request.region, snapshot, |snapshot| {

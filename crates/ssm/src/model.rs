@@ -24,7 +24,7 @@ impl Scope {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SecretString(String);
 
 impl SecretString {
@@ -43,7 +43,7 @@ impl Drop for SecretString {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum ParameterValue {
     Plain(SecretString),
     Encrypted {
@@ -69,7 +69,7 @@ impl ParameterValue {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ParameterRecord {
     pub(crate) name: String,
     pub(crate) description: Option<String>,

@@ -1,7 +1,6 @@
 //! locallycloud core foundation library.
 //!
 //! Shared infrastructure every native AWS service builds upon:
-//! - [`server`]: Axum HTTP server, binding, graceful shutdown
 //! - [`router`]: multi-protocol service router (SigV4 scope → X-Amz-Target → host/path → Action)
 //! - [`proxy`]: SigV4-preserving reverse proxy to an optional external backend
 //! - [`registry`]: concurrent service registry (Native / Proxied disposition)
@@ -18,7 +17,6 @@ pub mod activity;
 pub mod audit;
 pub mod config;
 pub mod cost;
-mod dashboard_context;
 pub mod endpoint;
 pub mod error_mapping;
 pub mod handler;
@@ -29,7 +27,6 @@ pub mod observability;
 pub mod proxy;
 pub mod registry;
 pub mod router;
-pub mod server;
 pub mod status;
 pub mod tls;
 pub mod views;

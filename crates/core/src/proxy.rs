@@ -6,6 +6,8 @@
 //! the configured backend authority, kept separate from the forwarded `Host` header value
 //! by using a low-level HTTP/1 connection. See Requirements 9, 10 and 11.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -56,25 +58,41 @@ impl ProxyError {
 /// fast-failed before any probe has run. See Requirement 12.
 #[derive(Clone)]
 pub struct LegacyHealth {
-    healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<HealthState>,
+}
+
+struct HealthState {
+    healthy: AtomicBool,
+    monitor: Option<(String, Duration)>,
+    checker: OnceLock<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HealthState {
+    fn drop(&mut self) {
+        if let Some(checker) = self.checker.take() {
+            checker.abort();
+        }
+    }
 }
 
 impl LegacyHealth {
     pub fn new(initial: bool) -> Self {
         LegacyHealth {
-            healthy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(initial)),
+            state: Arc::new(HealthState {
+                healthy: AtomicBool::new(initial),
+                monitor: None,
+                checker: OnceLock::new(),
+            }),
         }
     }
 
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(std::sync::atomic::Ordering::SeqCst)
+        self.state.healthy.load(Ordering::SeqCst)
     }
 
     /// Set the liveness state, logging only on a transition (Req 12.2).
     pub fn set(&self, healthy: bool) {
-        let prev = self
-            .healthy
-            .swap(healthy, std::sync::atomic::Ordering::SeqCst);
+        let prev = self.state.healthy.swap(healthy, Ordering::SeqCst);
         if prev != healthy {
             if healthy {
                 tracing::info!("legacy backend became healthy");
@@ -84,33 +102,41 @@ impl LegacyHealth {
         }
     }
 
-    /// Spawn a background task that probes the legacy backend by TCP-connecting to its
-    /// authority on each interval, updating the shared state (Req 12.1, 12.2).
-    pub fn spawn_checker(
-        self,
-        backend_url: String,
-        interval: Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let addr = match connect_addr(&backend_url) {
-                Some(a) => a,
-                None => {
-                    tracing::error!(
-                        backend_url,
-                        "cannot parse legacy backend url; health checks disabled"
-                    );
+    /// Configure monitoring without starting work before the first proxied request.
+    pub fn monitored(backend_url: String, interval: Duration) -> Self {
+        Self {
+            state: Arc::new(HealthState {
+                healthy: AtomicBool::new(true),
+                monitor: Some((backend_url, interval.max(Duration::from_millis(1)))),
+                checker: OnceLock::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn activate(&self) {
+        let Some((backend_url, interval)) = &self.state.monitor else {
+            return;
+        };
+        self.state.checker.get_or_init(|| {
+            let address = connect_addr(backend_url);
+            let interval = *interval;
+            let state = Arc::downgrade(&self.state);
+            tokio::spawn(async move {
+                let Some(address) = address else {
+                    tracing::error!("invalid legacy backend URL; health checks disabled");
                     return;
+                };
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let ok = matches!(
+                        timeout(interval, TcpStream::connect(&address)).await,
+                        Ok(Ok(_))
+                    );
+                    let Some(state) = state.upgrade() else { break };
+                    LegacyHealth { state }.set(ok);
                 }
-            };
-            loop {
-                tokio::time::sleep(interval).await;
-                let ok = matches!(
-                    timeout(interval, TcpStream::connect(&addr)).await,
-                    Ok(Ok(_))
-                );
-                self.set(ok);
-            }
-        })
+            })
+        });
     }
 }
 
@@ -191,6 +217,45 @@ mod tests {
     use axum::extract::Request;
     use axum::routing::any;
     use axum::Router;
+
+    #[tokio::test]
+    async fn monitor_starts_lazily_recovers_and_releases_its_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let health =
+            LegacyHealth::monitored(format!("http://{address}"), Duration::from_millis(10));
+        assert!(health.state.checker.get().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(listener);
+        health.activate();
+        health.activate();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while health.is_healthy() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !health.is_healthy() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let state = Arc::downgrade(&health.state);
+        drop(health);
+        assert!(state.upgrade().is_none());
+    }
 
     /// Spin a fake "legacy backend" that echoes the method, the received `Host` header, and
     /// the request body. Returns its base URL.

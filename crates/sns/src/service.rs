@@ -209,18 +209,6 @@ impl NativeHandler for SnsHandler {
                 return error.into_response(protocol.aws(), &request.request_id);
             }
         }
-        let read_only = matches!(
-            op.as_str(),
-            "ListTopics"
-                | "GetTopicAttributes"
-                | "ListSubscriptions"
-                | "ListSubscriptionsByTopic"
-                | "GetSubscriptionAttributes"
-                | "ListTagsForResource"
-        );
-        if !read_only {
-            self.store.mark_uncommitted();
-        }
         let result = self.dispatch(&op, &ctx, &input).await;
         if self.store.has_uncommitted() {
             if let Err(error) = self.store.persist_metadata().await {
@@ -528,7 +516,7 @@ mod tests {
                 .as_nanos()
         ));
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
-        let store = SnsStore::with_state(state.clone()).unwrap();
+        let store = Arc::new(SnsStore::with_state(state.clone()).unwrap());
         let arn = TopicArn::new("us-east-1", "000000000000", "replay");
         store.insert(arn.clone(), false, Default::default(), Default::default());
         let topic = store.get(&arn).unwrap();

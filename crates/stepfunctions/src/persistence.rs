@@ -301,6 +301,55 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "manual history clone/commit measurement; run with --ignored --nocapture"]
+    fn execution_history_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let root = std::env::temp_dir().join(format!("sfn-history-cost-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let persistence = Persistence::new(state, StateCipher::with_key(&[7; 32])).unwrap();
+        let mut execution: Execution = serde_json::from_value(serde_json::json!({
+            "arn":"arn:aws:states:us-east-1:000000000000:execution:bench:run",
+            "name":"run", "state_machine_arn":"arn:aws:states:us-east-1:000000000000:stateMachine:bench",
+            "state_machine_type":"STANDARD", "definition":"{}", "role_arn":"role",
+            "status":"Running", "input":{}, "start_date":1.0, "start_time":"time",
+            "variables":{}, "redrive_count":0, "history":[]
+        })).unwrap();
+        for count in [0, 1_000, MAX_HISTORY_EVENTS] {
+            while execution.history.len() < count {
+                execution.record(
+                    "PassStateExited",
+                    serde_json::json!({"output":"x".repeat(256)}),
+                );
+            }
+            let start = Instant::now();
+            for _ in 0..20 {
+                black_box(
+                    execution
+                        .history
+                        .iter()
+                        .map(|event| (**event).clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let deep_clone_us = start.elapsed().as_micros() / 20;
+            let start = Instant::now();
+            for _ in 0..20 {
+                black_box(execution.clone());
+            }
+            let clone_us = start.elapsed().as_micros() / 20;
+            let start = Instant::now();
+            for _ in 0..5 {
+                persistence.save_execution(&execution).unwrap();
+            }
+            let commit_us = start.elapsed().as_micros() / 5;
+            eprintln!("history={count} deep_history_clone_us={deep_clone_us} execution_clone_us={clone_us} encrypted_commit_us={commit_us}");
+        }
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reused_writer_recovers_from_sql_failure_and_preserves_encrypted_scopes() {
         let root = std::env::temp_dir().join(format!("sfn-writer-{}", uuid::Uuid::new_v4()));

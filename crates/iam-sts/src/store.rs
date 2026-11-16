@@ -60,17 +60,16 @@ impl IamStore {
         operation: impl FnOnce(&IamStore) -> Result<T, IamStsError>,
     ) -> Result<T, IamStsError> {
         let _mutation = self.mutation.lock().unwrap();
-        // ponytail: clone control-plane metadata; stage per entity if IAM scale warrants it.
-        let before = self.records.read().unwrap().clone();
+        // Stage one copy; the mutation gate keeps the committed comparison stable.
         let staged = Self {
-            records: RwLock::new(before.clone()),
+            records: RwLock::new(self.records.read().unwrap().clone()),
             root: RwLock::new(self.root.read().unwrap().clone()),
             ..Self::default()
         };
         let result = operation(&staged)?;
         let after = staged.records.into_inner().unwrap();
         if let Some(persistence) = &self.persistence {
-            persistence.commit_resources(&before, &after)?;
+            persistence.commit_resources(&self.records.read().unwrap(), &after)?;
         }
         *self.records.write().unwrap() = after;
         Ok(result)

@@ -28,9 +28,9 @@ use locallycloud_core::integration::authorization::{
 };
 use locallycloud_core::integration::RequestIdentity;
 
+use locallycloud::server::LocallyCloudServer;
 use locallycloud_core::observability;
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
-use locallycloud_core::server::LocallyCloudServer;
 
 struct ArcRoutingControls(Arc<locallycloud_arc::ArcService>);
 
@@ -801,14 +801,7 @@ async fn main() {
             }
         }
     };
-    let rds_data_config = locallycloud_rds_data::RdsDataConfig {
-        state_root: state
-            .path()
-            .parent()
-            .expect("state database has a parent")
-            .join("rds-data"),
-        ..Default::default()
-    };
+    let rds_data_config = locallycloud_rds_data::RdsDataConfig::default();
     let rds_data_handle = match locallycloud_rds_data::register_with_cluster_resolver(
         &registry,
         rds_data_config,

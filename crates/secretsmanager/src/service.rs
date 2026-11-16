@@ -55,8 +55,8 @@ impl SecretsManagerHandler {
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> Self {
         Self {
             registry,
-            store: Arc::new(SecretStore::new()),
             persistence_failed: AtomicBool::new(false),
+            store: Arc::new(SecretStore::new()),
         }
     }
 
@@ -66,19 +66,9 @@ impl SecretsManagerHandler {
     ) -> Result<Self, SecretsError> {
         Ok(Self {
             registry,
-            store: Arc::new(SecretStore::with_state(state)?),
             persistence_failed: AtomicBool::new(false),
+            store: Arc::new(SecretStore::with_state(state)?),
         })
-    }
-
-    async fn persist(&self) -> Result<(), SecretsError> {
-        let store = self.store.clone();
-        let saved = tokio::task::spawn_blocking(move || store.save()).await;
-        if !matches!(saved, Ok(Ok(()))) {
-            self.persistence_failed.store(true, Ordering::Release);
-            return Err(SecretsError::Internal);
-        }
-        Ok(())
     }
 
     async fn process(&self, request: &ServiceRequest) -> Result<Vec<u8>, SecretsError> {
@@ -113,24 +103,39 @@ impl SecretsManagerHandler {
             }
             "UpdateSecretVersionStage" => {
                 self.update_secret_version_stage(decode(&request.body)?, &scope, request)
+                    .await
             }
             "ListSecretVersionIds" => {
                 self.list_secret_version_ids(decode(&request.body)?, &scope, request)
             }
-            "DeleteSecret" => self.delete_secret(decode(&request.body)?, &scope, request),
-            "RestoreSecret" => self.restore_secret(decode(&request.body)?, &scope, request),
+            "DeleteSecret" => {
+                self.delete_secret(decode(&request.body)?, &scope, request)
+                    .await
+            }
+            "RestoreSecret" => {
+                self.restore_secret(decode(&request.body)?, &scope, request)
+                    .await
+            }
             "DescribeSecret" => self.describe_secret(decode(&request.body)?, &scope, request),
             "ListSecrets" => self.list_secrets(decode(&request.body)?, &scope, request),
-            "TagResource" => self.tag_resource(decode(&request.body)?, &scope, request),
-            "UntagResource" => self.untag_resource(decode(&request.body)?, &scope, request),
+            "TagResource" => {
+                self.tag_resource(decode(&request.body)?, &scope, request)
+                    .await
+            }
+            "UntagResource" => {
+                self.untag_resource(decode(&request.body)?, &scope, request)
+                    .await
+            }
             "GetResourcePolicy" => {
                 self.get_resource_policy(decode(&request.body)?, &scope, request)
             }
             "PutResourcePolicy" => {
                 self.put_resource_policy(decode(&request.body)?, &scope, request)
+                    .await
             }
             "DeleteResourcePolicy" => {
                 self.delete_resource_policy(decode(&request.body)?, &scope, request)
+                    .await
             }
             "RotateSecret" => {
                 self.rotate_secret(decode(&request.body)?, &scope, request)
@@ -138,6 +143,7 @@ impl SecretsManagerHandler {
             }
             "CancelRotateSecret" => {
                 self.cancel_rotate_secret(decode(&request.body)?, &scope, request)
+                    .await
             }
             _ => Err(SecretsError::UnknownOperation),
         }
@@ -310,31 +316,11 @@ impl NativeHandler for SecretsManagerHandler {
         let result = if self.persistence_failed.load(Ordering::Acquire) {
             Err(SecretsError::Internal)
         } else {
-            let write = protocol::operation(&request.headers).is_ok_and(|op| {
-                matches!(
-                    op,
-                    "CreateSecret"
-                        | "PutSecretValue"
-                        | "UpdateSecret"
-                        | "UpdateSecretVersionStage"
-                        | "DeleteSecret"
-                        | "RestoreSecret"
-                        | "TagResource"
-                        | "UntagResource"
-                        | "PutResourcePolicy"
-                        | "DeleteResourcePolicy"
-                        | "RotateSecret"
-                        | "CancelRotateSecret"
-                )
-            });
-            let result = self.process(&request).await;
-            if write && result.is_ok() && self.persist().await.is_err() {
-                self.persistence_failed.store(true, Ordering::Release);
-                Err(SecretsError::Internal)
-            } else {
-                result
-            }
+            self.process(&request).await
         };
+        if matches!(result, Err(SecretsError::Persistence)) {
+            self.persistence_failed.store(true, Ordering::Release);
+        }
         match result {
             Ok(body) => Response::builder()
                 .status(200)
@@ -417,7 +403,7 @@ mod kms_boundary_tests {
     use locallycloud_core::integration::InternalDispatcher;
     use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
     use locallycloud_core::registry::{ServiceMetadata, ServiceName};
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::AtomicU8;
 
     struct EmptyHandler;
 
@@ -670,6 +656,156 @@ mod kms_boundary_tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sqlite_wait_does_not_block_reads_of_committed_secret_metadata() {
+        let (_, _, registry) = setup();
+        let path = std::env::temp_dir()
+            .join(format!("sm-read-{}", Uuid::new_v4()))
+            .join("state.sqlite3");
+        let state = Arc::new(StateDb::open(path).unwrap());
+        let handler =
+            SecretsManagerHandler::with_state(Arc::downgrade(&registry), state.clone()).unwrap();
+        assert_eq!(
+            handler
+                .handle(request(
+                    "CreateSecret",
+                    json!({"Name":"edited","Description":"old"})
+                ))
+                .await
+                .status(),
+            http::StatusCode::OK
+        );
+        let scope = Scope::new("000000000000", "us-east-1");
+        let slot = handler.store.resolve(&scope, "edited").unwrap();
+        let blocker = state.connection().unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let store = handler.store.clone();
+        let writing_slot = slot.clone();
+        let (prepared, ready) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            store
+                .update(scope, writing_slot, move |record| {
+                    record.as_mut().unwrap().description = Some("new".into());
+                    prepared.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        ready.await.unwrap();
+        let reading_slot = slot.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            reading_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .description
+                .clone()
+        });
+        let value = tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("old"));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        writer.await.unwrap().unwrap();
+        assert_eq!(
+            slot.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_delta_preserves_other_rows_concurrent_tags_and_failed_commit() {
+        let (_, _, registry) = setup();
+        let path = std::env::temp_dir()
+            .join(format!("sm-delta-{}", Uuid::new_v4()))
+            .join("state.sqlite3");
+        let state = Arc::new(StateDb::open(path).unwrap());
+        let handler =
+            SecretsManagerHandler::with_state(Arc::downgrade(&registry), state.clone()).unwrap();
+        for name in ["edited", "unrelated"] {
+            assert_eq!(
+                handler
+                    .handle(request("CreateSecret", json!({"Name":name})))
+                    .await
+                    .status(),
+                http::StatusCode::OK
+            );
+        }
+        state.connection().unwrap().execute_batch("CREATE TRIGGER protect_other_update BEFORE UPDATE ON sm_secrets WHEN OLD.name='unrelated' BEGIN SELECT RAISE(ABORT,'unrelated update'); END;
+            CREATE TRIGGER protect_other_delete BEFORE DELETE ON sm_secrets WHEN OLD.name='unrelated' BEGIN SELECT RAISE(ABORT,'unrelated delete'); END;").unwrap();
+        let (a, b) = tokio::join!(
+            handler.handle(request(
+                "TagResource",
+                json!({"SecretId":"edited","Tags":[{"Key":"a","Value":"1"}]})
+            )),
+            handler.handle(request(
+                "TagResource",
+                json!({"SecretId":"edited","Tags":[{"Key":"b","Value":"2"}]})
+            ))
+        );
+        assert_eq!(a.status(), http::StatusCode::OK);
+        assert_eq!(b.status(), http::StatusCode::OK);
+        state.connection().unwrap().execute_batch("CREATE TRIGGER fail_write BEFORE UPDATE ON sm_secrets WHEN OLD.name='edited' BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        assert_eq!(
+            handler
+                .handle(request(
+                    "UntagResource",
+                    json!({"SecretId":"edited","TagKeys":["a"]})
+                ))
+                .await
+                .status(),
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let scope = Scope::new("000000000000", "us-east-1");
+        assert_eq!(
+            lock(&handler.store.resolve(&scope, "edited").unwrap())
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .tags
+                .len(),
+            2
+        );
+        drop(handler);
+        state
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_write;")
+            .unwrap();
+        let restarted =
+            SecretsManagerHandler::with_state(Arc::downgrade(&registry), state.clone()).unwrap();
+        assert_eq!(
+            lock(&restarted.store.resolve(&scope, "edited").unwrap())
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .tags
+                .len(),
+            2
+        );
+        assert_eq!(
+            restarted
+                .handle(request(
+                    "DeleteSecret",
+                    json!({"SecretId":"edited","ForceDeleteWithoutRecovery":true})
+                ))
+                .await
+                .status(),
+            http::StatusCode::OK
+        );
+        drop(restarted);
+        let restored = SecretsManagerHandler::with_state(Arc::downgrade(&registry), state).unwrap();
+        assert!(restored.store.resolve(&scope, "edited").is_err());
+        assert!(restored.store.resolve(&scope, "unrelated").is_ok());
     }
 
     #[tokio::test]

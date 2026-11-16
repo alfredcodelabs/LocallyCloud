@@ -1,9 +1,8 @@
 //! Region/account-scoped SNS store. Subscriptions live within their topic.
 
 use locallycloud_state::StateDb;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use dashmap::mapref::entry::Entry;
@@ -61,7 +60,8 @@ pub struct SnsStore {
     topics: DashMap<Key, Arc<RwLock<TopicState>>>,
     state: Option<Arc<StateDb>>,
     pub operation_gate: Mutex<()>,
-    uncommitted: AtomicBool,
+    pub(crate) metadata_gate: Arc<Mutex<()>>,
+    uncommitted: StdMutex<BTreeSet<Key>>,
 }
 
 fn key(arn: &TopicArn) -> Key {
@@ -89,8 +89,8 @@ impl SnsStore {
         }
     }
 
-    pub(crate) fn state(&self) -> Option<&StateDb> {
-        self.state.as_deref()
+    pub(crate) fn state(&self) -> Option<&Arc<StateDb>> {
+        self.state.as_ref()
     }
 
     pub(crate) fn insert_loaded(&self, topic: TopicState) {
@@ -98,24 +98,40 @@ impl SnsStore {
             .insert(key(&topic.arn), Arc::new(RwLock::new(topic)));
     }
 
-    pub(crate) fn all_topics(&self) -> Vec<Arc<RwLock<TopicState>>> {
-        self.topics
+    pub(crate) fn pending_metadata(&self) -> Vec<TopicArn> {
+        self.uncommitted
+            .lock()
+            .expect("SNS metadata lock")
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|(account, region, name)| TopicArn::new(region, account, name))
             .collect()
     }
 
-    pub fn mark_uncommitted(&self) {
+    pub fn mark_uncommitted(&self, arn: &TopicArn) {
         if self.state.is_some() {
-            self.uncommitted.store(true, Ordering::Release);
+            self.uncommitted
+                .lock()
+                .expect("SNS metadata lock")
+                .insert(key(arn));
         }
     }
 
     pub fn has_uncommitted(&self) -> bool {
-        self.uncommitted.load(Ordering::Acquire)
+        !self
+            .uncommitted
+            .lock()
+            .expect("SNS metadata lock")
+            .is_empty()
     }
+    pub(crate) fn clear_topic_uncommitted(&self, arn: &TopicArn) {
+        self.uncommitted
+            .lock()
+            .expect("SNS metadata lock")
+            .remove(&key(arn));
+    }
+
     pub fn clear_uncommitted(&self) {
-        self.uncommitted.store(false, Ordering::Release);
+        self.uncommitted.lock().expect("SNS metadata lock").clear();
     }
 
     /// Atomically insert a topic without replacing an existing topic or its state.
@@ -140,6 +156,7 @@ impl SnsStore {
         match self.topics.entry(key(&arn)) {
             Entry::Occupied(entry) => InsertResult::Existing(entry.get().clone()),
             Entry::Vacant(entry) => {
+                self.mark_uncommitted(&arn);
                 entry.insert(state.clone());
                 InsertResult::Inserted(state)
             }
@@ -155,7 +172,11 @@ impl SnsStore {
     }
 
     pub fn remove(&self, arn: &TopicArn) -> Option<Arc<RwLock<TopicState>>> {
-        self.topics.remove(&key(arn)).map(|(_, v)| v)
+        let removed = self.topics.remove(&key(arn)).map(|(_, v)| v);
+        if removed.is_some() {
+            self.mark_uncommitted(arn);
+        }
+        removed
     }
 
     /// Topic handles in a scope, sorted by name.

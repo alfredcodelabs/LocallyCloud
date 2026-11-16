@@ -3,10 +3,10 @@ use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
+use locallycloud::server::LocallyCloudServer;
 use locallycloud_core::{
     config::LocallyCloudConfig,
     registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry},
-    server::LocallyCloudServer,
 };
 use locallycloud_state::StateDb;
 
