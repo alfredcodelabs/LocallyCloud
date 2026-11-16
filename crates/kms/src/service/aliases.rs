@@ -30,14 +30,29 @@ impl KmsService {
         body: &Map<String, Value>,
         scope: &Scope,
     ) -> Result<Value, KmsError> {
+        self.update_alias_checked(body, scope, None)
+    }
+
+    pub(crate) fn update_alias_checked(
+        &self,
+        body: &Map<String, Value>,
+        scope: &Scope,
+        expected_target: Option<&str>,
+    ) -> Result<Value, KmsError> {
+        let expected_target = expected_target
+            .map(|id| parse_direct_key_id(id, scope))
+            .transpose()?;
         require_known_fields(body, &["AliasName", "TargetKeyId"])?;
         let alias_name = required_alias_name(body, "AliasName")?;
         let target_key_id =
             self.validate_alias_target(required_string(body, "TargetKeyId")?, scope)?;
-        if !self
-            .store
-            .update_alias(scope, alias_name, target_key_id, now_epoch()?)?
-        {
+        if !self.store.update_alias(
+            scope,
+            alias_name,
+            target_key_id,
+            now_epoch()?,
+            expected_target.as_deref(),
+        )? {
             return Err(KmsError::NotFound);
         }
         Ok(json!({}))

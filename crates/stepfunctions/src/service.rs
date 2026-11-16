@@ -144,14 +144,6 @@ impl NativeHandler for SfnHandler {
         let Some(registry) = self.registry.upgrade() else {
             return SfnError::AccessDenied.into_response(&request.request_id);
         };
-        if let Err(error) = authorization::authorize(&registry, &request, &op, &body) {
-            return error.into_response(&request.request_id);
-        }
-        if let Err(error) =
-            authorization::authorize_role_assignment(&registry, &request, &op, &body)
-        {
-            return error.into_response(&request.request_id);
-        }
         let configuration_write = matches!(
             op.as_str(),
             "CreateStateMachine"
@@ -185,6 +177,16 @@ impl NativeHandler for SfnHandler {
         if !self.store.healthy() {
             return SfnError::Internal("Step Functions durable state is unavailable".into())
                 .into_response(&request.request_id);
+        }
+        if let Err(error) =
+            authorization::authorize_with_tags(&registry, &self.store, &request, &op, &body).await
+        {
+            return error.into_response(&request.request_id);
+        }
+        if let Err(error) =
+            authorization::authorize_role_assignment(&registry, &request, &op, &body)
+        {
+            return error.into_response(&request.request_id);
         }
         let mut commit_guard = configuration_write.then(|| ConfigurationCommit {
             store: &self.store,

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::authorization::{verified_caller, AuthorizationRequest};
 use locallycloud_core::integration::RequestIdentity;
 
 use super::*;
@@ -18,33 +18,42 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
         return Ok(());
     }
     // Core removes client-supplied markers and sets them only after verification.
-    if req
+    let internal = req
         .headers
         .get("x-locallycloud-verified-internal-scope")
-        .is_some_and(|v| v == "1")
-    {
-        return Ok(());
-    }
+        .is_some_and(|v| v == "1");
     let denied = || {
         LambdaError::AccessDenied("User is not authorized to perform this Lambda operation".into())
     };
-    if req
+    let external = req
         .headers
         .get("x-locallycloud-verified-external-sigv4")
-        .is_none_or(|v| v != "1")
-    {
-        return Err(denied());
-    }
-    let access_key_id = req
-        .headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(RequestIdentity::access_key_from_authorization)
-        .ok_or_else(denied)?;
-    let identity = RequestIdentity {
-        account_id: req.account_id.clone(),
-        access_key_id: Some(access_key_id),
-        arn: None,
+        .is_some_and(|v| v == "1");
+    let service_principal = if internal && !external {
+        req.headers
+            .get(locallycloud_core::integration::identity::PRINCIPAL_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|principal| principal.strip_suffix(".amazonaws.com"))
+            .filter(|service| !service.is_empty() && !service.contains('/'))
+            .map(|service| {
+                locallycloud_core::integration::identity::CallerIdentity::ServicePrincipal {
+                    service: service.into(),
+                }
+            })
+    } else {
+        None
+    };
+    let (identity, delegated_identity) = if let Some(principal) = service_principal {
+        (
+            RequestIdentity {
+                account_id: req.account_id.clone(),
+                access_key_id: None,
+                arn: None,
+            },
+            Some(principal),
+        )
+    } else {
+        verified_caller(evaluator.as_ref(), req).map_err(|_| denied())?
     };
     let segments: Vec<&str> = req.uri.path().trim_matches('/').split('/').collect();
     let method = req.method.as_str();
@@ -82,7 +91,8 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
             percent_decode_path(name)
         )
     };
-    let mut context = BTreeMap::new();
+    let mut context =
+        locallycloud_core::integration::request_context::verified_request_context(req);
     let (action, resource): (&str, String) = match (segments.as_slice(), method) {
         (["2016-08-19", "account-settings"], "GET") => ("GetAccountSettings", "*".into()),
         (["2015-03-31", "functions"], "POST") => {
@@ -99,27 +109,16 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
         (["2015-03-31", "functions", name], "GET") => ("GetFunction", function(name)?),
         (["2015-03-31", "functions", name], "DELETE") => ("DeleteFunction", function(name)?),
         (["2015-03-31", "functions", name, "invocations"], "POST") => {
-            let mut arn = function(name)?;
-            let reference = percent_decode_path(name);
-            let path_qualifier = if reference.starts_with("arn:") {
-                reference.split(':').nth(7)
-            } else {
-                reference.split_once(':').map(|(_, qualifier)| qualifier)
-            };
-            if let Some(q) = query_value(req.uri.query().unwrap_or(""), "Qualifier")
-                .or_else(|| path_qualifier.map(str::to_string))
-            {
-                if !q.is_empty() {
-                    arn.push(':');
-                    arn.push_str(&q);
-                }
-            }
-            ("InvokeFunction", arn)
+            ("InvokeFunction", event_function(name)?)
         }
-        (["2015-03-31", "functions", name, "policy"], "POST") => ("AddPermission", function(name)?),
-        (["2015-03-31", "functions", name, "policy"], "GET") => ("GetPolicy", function(name)?),
+        (["2015-03-31", "functions", name, "policy"], "POST") => {
+            ("AddPermission", event_function(name)?)
+        }
+        (["2015-03-31", "functions", name, "policy"], "GET") => {
+            ("GetPolicy", event_function(name)?)
+        }
         (["2015-03-31", "functions", name, "policy", _], "DELETE") => {
-            ("RemovePermission", function(name)?)
+            ("RemovePermission", event_function(name)?)
         }
         (["2015-03-31", "functions", name, "configuration"], "GET") => {
             ("GetFunctionConfiguration", function(name)?)
@@ -239,7 +238,7 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
         evaluator
             .authorize(AuthorizationRequest {
                 request_identity: identity.clone(),
-                delegated_identity: None,
+                delegated_identity: delegated_identity.clone(),
                 source_service: "lambda".into(),
                 action: action.into(),
                 resource,
@@ -302,11 +301,54 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
             );
         }
     }
-    let context: BTreeMap<_, _> = context
+    let mut context: BTreeMap<_, _> = context
         .into_iter()
         .map(|(key, value)| (key.to_ascii_lowercase(), value))
         .collect();
-    authorize(&format!("lambda:{action}"), resource, context.clone())?;
+    if action == "InvokeFunction" {
+        let name = resource.split(':').nth(6).ok_or_else(denied)?;
+        let document = handler
+            .store
+            .permissions_for_resource(&req.account_id, &req.region, name, &resource)
+            .filter(|statements| !statements.is_empty())
+            .map(|statements| json!({"Version":"2012-10-17", "Statement":statements}).to_string());
+        if internal {
+            for (header, key) in [
+                ("x-locallycloud-source-arn", "aws:sourcearn"),
+                ("x-locallycloud-source-account", "aws:sourceaccount"),
+            ] {
+                if let Some(value) = req
+                    .headers
+                    .get(header)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    context.insert(key.into(), vec![value.into()]);
+                }
+            }
+        }
+        evaluator
+            .authorize_resource_policy(
+                AuthorizationRequest {
+                    request_identity: identity.clone(),
+                    delegated_identity: delegated_identity.clone(),
+                    source_service: "lambda".into(),
+                    action: "lambda:InvokeFunction".into(),
+                    resource,
+                    context: context.clone(),
+                },
+                document.as_deref(),
+                &req.account_id,
+            )
+            .map_err(|_| denied())?;
+    } else {
+        if matches!(
+            delegated_identity,
+            Some(locallycloud_core::integration::identity::CallerIdentity::ServicePrincipal { .. })
+        ) {
+            return Err(denied());
+        }
+        authorize(&format!("lambda:{action}"), resource, context.clone())?;
+    }
     if action == "CreateEventSourceMapping" {
         let input = parse_json(&req.body)?;
         if input
@@ -321,12 +363,27 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
     if action == "CreateFunction" || action == "UpdateFunctionConfiguration" {
         let body = parse_json(&req.body)?;
         if let Some(role) = body.get("Role").and_then(Value::as_str) {
-            let mut conditions = BTreeMap::new();
+            let mut conditions =
+                locallycloud_core::integration::request_context::verified_request_context(req);
             conditions.insert(
-                "iam:PassedToService".into(),
+                "iam:passedtoservice".into(),
                 vec!["lambda.amazonaws.com".into()],
             );
             authorize("iam:PassRole", role.into(), conditions)?;
+            evaluator.authorize_service_role_trust(
+                locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest {
+                    delegated_caller: locallycloud_core::integration::identity::trusted_role(req),
+                    caller_context: BTreeMap::new(),
+                    caller: identity.clone(),
+                    role_arn: role.into(),
+                    service_principal: "lambda.amazonaws.com".into(),
+                    source_arn: None,
+                    action: "lambda:InvokeFunction".into(),
+                    resource: "*".into(),
+                }
+            ).map_err(|_| LambdaError::InvalidParameterValue(
+                "The role defined for the function cannot be assumed by Lambda".into()
+            ))?;
         }
     }
     Ok(())
@@ -387,6 +444,290 @@ mod tests {
             account_id: "000000000000".into(),
             request_id: "tags-policy".into(),
         }
+    }
+
+    #[test]
+    fn invocation_composes_resource_grants_and_identity_denies() {
+        use locallycloud_iam_sts::{
+            enforcement::EnforcementMode, model::IamRole, store::IamStore, sts::SessionStore,
+        };
+        let account = "000000000000";
+        let role_arn = format!("arn:aws:iam::{account}:role/invoker");
+        let registry = Arc::new(ServiceRegistry::new());
+        let store = Arc::new(IamStore::new());
+        let sessions = Arc::new(SessionStore::new());
+        store.create_role(
+            account,
+            IamRole {
+                role_name: "invoker".into(),
+                role_id: "AROAEXAMPLE".into(),
+                arn: role_arn.clone(),
+                path: "/".into(),
+                create_date: "2026-01-01T00:00:00Z".into(),
+                assume_role_policy_document: "{}".into(),
+                description: None,
+                max_session_duration: 3600,
+                tags: BTreeMap::new(),
+                attached_policies: Vec::new(),
+                inline_policies: BTreeMap::new(),
+                permission_boundary: None,
+            },
+        );
+        let credentials = locallycloud_iam_sts::sts::issue_service_role_credentials(
+            &store, &sessions, account, &role_arn,
+        )
+        .unwrap();
+        locallycloud_iam_sts::register_with_store_and_mode(
+            &registry,
+            store.clone(),
+            sessions,
+            EnforcementMode::Strict,
+        );
+        let handler = LambdaHandler::with_parts(Arc::downgrade(&registry), None);
+        create_function(&handler.store, "us-east-1", account, &json!({
+            "FunctionName":"fn", "Role":role_arn, "Runtime":"python3.12", "Handler":"index.handler",
+            "Code":{"ZipFile":"UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA=="}
+        }), None).unwrap();
+        let mut invoke = request(Method::POST, "/2015-03-31/functions/fn/invocations", "");
+        invoke.headers.insert(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/20261006/us-east-1/lambda/aws4_request",
+                credentials.access_key_id
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert!(check(&handler, &invoke).is_err());
+        store.update_role(account, "invoker", |role| {
+            role.inline_policies.insert(
+                "invoke".into(),
+                json!({"Statement":{
+                    "Effect":"Allow", "Action":"lambda:InvokeFunction", "Resource":"*"
+                }})
+                .to_string(),
+            );
+        });
+        check(&handler, &invoke).unwrap();
+        let mut scoped_operator = invoke.clone();
+        scoped_operator
+            .headers
+            .remove("x-locallycloud-verified-external-sigv4");
+        scoped_operator.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        let caller = registry
+            .authorization_evaluator(&ServiceName::new("iam"))
+            .unwrap()
+            .resolve_caller_arn(&RequestIdentity {
+                account_id: account.into(),
+                access_key_id: Some(credentials.access_key_id.clone()),
+                arn: None,
+            })
+            .unwrap()
+            .unwrap();
+        scoped_operator.headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            caller.parse().unwrap(),
+        );
+        check(&handler, &scoped_operator).unwrap();
+        let mut forged = scoped_operator.clone();
+        forged.headers.insert(
+            locallycloud_core::integration::identity::PRINCIPAL_HEADER,
+            "arn:aws:iam::000000000000:user/other".parse().unwrap(),
+        );
+        assert!(check(&handler, &forged).is_err());
+        scoped_operator.headers.insert(
+            "x-locallycloud-verified-external-sigv4",
+            "1".parse().unwrap(),
+        );
+        assert!(check(&handler, &scoped_operator).is_err());
+        scoped_operator
+            .headers
+            .remove("x-locallycloud-verified-external-sigv4");
+        store.update_role(account, "invoker", |role| role.inline_policies.clear());
+        handler.store.add_permission(account, "us-east-1", "fn", "role", json!({
+            "Effect":"Allow", "Principal":{"AWS":role_arn}, "Action":"lambda:InvokeFunction",
+            "Resource":function_arn("us-east-1", account, "fn")
+        })).unwrap();
+        check(&handler, &invoke).unwrap();
+        let mut partial = invoke.clone();
+        partial.uri = "/2015-03-31/functions/000000000000:function:fn/invocations"
+            .parse()
+            .unwrap();
+        check(&handler, &partial).unwrap();
+        let mut other = invoke.clone();
+        other.uri = "/2015-03-31/functions/fn".parse().unwrap();
+        other.method = Method::GET;
+        assert!(check(&handler, &other).is_err());
+        store.update_role(account, "invoker", |role| {
+            role.inline_policies.insert(
+                "deny".into(),
+                json!({"Statement":{
+                    "Effect":"Deny", "Action":"lambda:InvokeFunction", "Resource":"*"
+                }})
+                .to_string(),
+            );
+        });
+        assert!(check(&handler, &invoke).is_err());
+        assert!(check(&handler, &scoped_operator).is_err());
+    }
+
+    #[tokio::test]
+    async fn foreign_and_malformed_function_arns_never_mutate_local_collisions() {
+        let handler = LambdaHandler::default();
+        let account = "000000000000";
+        create_function(
+            &handler.store,
+            "us-east-1",
+            account,
+            &json!({
+                "FunctionName":"fn", "Role":format!("arn:aws:iam::{account}:role/execution"),
+                "Runtime":"python3.12", "Handler":"index.handler",
+                "Code":{"ZipFile":"UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA=="}
+            }),
+            None,
+        )
+        .unwrap();
+        for reference in ["fn", "000000000000:function:fn"] {
+            for method in [Method::GET, Method::POST, Method::DELETE] {
+                let response = handler
+                    .handle(request(
+                        method,
+                        &format!("/2017-03-31/tags/{reference}"),
+                        "{\"Tags\":{\"critical\":\"changed\"}}",
+                    ))
+                    .await;
+                assert_eq!(response.status(), 400);
+            }
+            assert!(handler
+                .store
+                .get_tags(account, "us-east-1", "fn")
+                .unwrap()
+                .is_empty());
+        }
+
+        for qualifier in ["1", "live", "$LATEST"] {
+            for (method, expected) in [
+                (Method::GET, 501),
+                (Method::POST, 400),
+                (Method::DELETE, 400),
+            ] {
+                let response = handler.handle(request(method,
+                    &format!("/2017-03-31/tags/arn:aws:lambda:us-east-1:{account}:function:fn:{qualifier}"),
+                    "{\"Tags\":{\"critical\":\"changed\"}}" )).await;
+                assert_eq!(response.status().as_u16(), expected);
+                assert!(handler
+                    .store
+                    .get_tags(account, "us-east-1", "fn")
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+        for (reference, expected) in [
+            ("arn:aws:lambda:us-east-1:111111111111:function:fn", 501),
+            ("111111111111:function:fn", 501),
+            ("arn:aws:s3:us-east-1:000000000000:function:fn", 400),
+            ("arn:other:lambda:us-east-1:000000000000:function:fn", 400),
+            ("arn:aws:lambda:us-east-1:bad:function:fn", 400),
+        ] {
+            for method in [Method::GET, Method::POST, Method::DELETE] {
+                let response = handler
+                    .handle(request(
+                        method,
+                        &format!("/2017-03-31/tags/{reference}?tagKeys=critical"),
+                        "{\"Tags\":{\"critical\":\"changed\"}}",
+                    ))
+                    .await;
+                assert_eq!(
+                    response.status().as_u16(),
+                    if reference.starts_with("arn:") {
+                        expected
+                    } else {
+                        400
+                    },
+                    "tag ARN {reference}"
+                );
+                assert!(handler
+                    .store
+                    .get_tags(account, "us-east-1", "fn")
+                    .unwrap()
+                    .is_empty());
+            }
+            for method in [Method::GET, Method::DELETE] {
+                let response = handler
+                    .handle(request(
+                        method,
+                        &format!("/2015-03-31/functions/{reference}"),
+                        "",
+                    ))
+                    .await;
+                assert_eq!(response.status().as_u16(), expected, "{reference}");
+                assert!(handler.store.get(account, "us-east-1", "fn").is_some());
+            }
+            let response = handler
+                .handle(request(
+                    Method::POST,
+                    &format!("/2015-03-31/functions/{reference}/invocations"),
+                    "{}",
+                ))
+                .await;
+            assert_eq!(response.status().as_u16(), expected, "{reference}");
+        }
+    }
+
+    #[test]
+    fn internal_service_invocation_requires_matching_function_policy() {
+        use locallycloud_iam_sts::{
+            enforcement::EnforcementMode, store::IamStore, sts::SessionStore,
+        };
+        let account = "000000000000";
+        let registry = Arc::new(ServiceRegistry::new());
+        locallycloud_iam_sts::register_with_store_and_mode(
+            &registry,
+            Arc::new(IamStore::new()),
+            Arc::new(SessionStore::new()),
+            EnforcementMode::Strict,
+        );
+        let handler = LambdaHandler::with_parts(Arc::downgrade(&registry), None);
+        create_function(&handler.store, "us-east-1", account, &json!({
+            "FunctionName":"fn", "Role":format!("arn:aws:iam::{account}:role/execution"), "Runtime":"python3.12", "Handler":"index.handler",
+            "Code":{"ZipFile":"UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA=="}
+        }), None).unwrap();
+        let mut invoke = request(Method::POST, "/2015-03-31/functions/fn/invocations", "");
+        invoke
+            .headers
+            .remove("x-locallycloud-verified-external-sigv4");
+        invoke.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            "1".parse().unwrap(),
+        );
+        invoke.headers.insert(
+            "x-locallycloud-caller-principal",
+            "events.amazonaws.com".parse().unwrap(),
+        );
+        let rule = format!("arn:aws:events:us-east-1:{account}:rule/allowed");
+        invoke
+            .headers
+            .insert("x-locallycloud-source-arn", rule.parse().unwrap());
+        assert!(check(&handler, &invoke).is_err());
+        handler.store.add_permission(account, "us-east-1", "fn", "events", json!({
+            "Effect":"Allow", "Principal":{"Service":"events.amazonaws.com"}, "Action":"lambda:InvokeFunction",
+            "Resource":function_arn("us-east-1", account, "fn"), "Condition":{"ArnEquals":{"aws:SourceArn":rule}}
+        })).unwrap();
+        check(&handler, &invoke).unwrap();
+        invoke.headers.insert(
+            "x-locallycloud-source-arn",
+            "arn:aws:events:us-east-1:000000000000:rule/other"
+                .parse()
+                .unwrap(),
+        );
+        assert!(check(&handler, &invoke).is_err());
+        invoke
+            .headers
+            .remove("x-locallycloud-verified-internal-scope");
+        assert!(check(&handler, &invoke).is_err());
     }
     #[tokio::test]
     async fn esm_tags_iam_receives_real_context_and_denial_has_no_effect() {

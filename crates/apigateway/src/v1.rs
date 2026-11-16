@@ -479,6 +479,64 @@ pub async fn put_method(
     Ok((201, method))
 }
 
+pub async fn update_method(
+    ctx: &Ctx<'_>,
+    api_id: &str,
+    resource_id: &str,
+    http_method: &str,
+    body: &Value,
+) -> Out {
+    let record = rest(ctx, api_id).await?;
+    let mut guard = record.write().await;
+    let mut method = guard
+        .resources
+        .get(resource_id)
+        .and_then(|resource| resource.get("resourceMethods"))
+        .and_then(|methods| methods.get(http_method))
+        .cloned()
+        .ok_or_else(|| ApiGwError::NotFound("Invalid method identifier specified".into()))?;
+    apply_patch_operations(&mut method, body, |path| {
+        matches!(
+            path,
+            "/authorizationType" | "/authorizerId" | "/apiKeyRequired" | "/operationName"
+        ) || path.starts_with("/requestParameters/")
+            || path.starts_with("/requestModels/")
+    })?;
+    match method.get("authorizationType").and_then(Value::as_str) {
+        Some("NONE") => {}
+        Some("CUSTOM") => {
+            let authorizer = method
+                .get("authorizerId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ApiGwError::BadRequest("CUSTOM authorization requires authorizerId".into())
+                })?;
+            if !guard.authorizers.contains_key(authorizer) {
+                return Err(ApiGwError::NotFound(
+                    "Invalid authorizer identifier specified".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(ApiGwError::BadRequest(
+                "Unsupported authorizationType".into(),
+            ))
+        }
+    }
+    if method
+        .get("apiKeyRequired")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(ApiGwError::BadRequest(
+            "apiKeyRequired must be a boolean".into(),
+        ));
+    }
+    if let Some(resource) = guard.resources.get_mut(resource_id) {
+        with_method(resource, http_method, |value| *value = method.clone());
+    }
+    Ok((200, method))
+}
+
 pub async fn get_method(ctx: &Ctx<'_>, api_id: &str, resource_id: &str, http_method: &str) -> Out {
     let r = rest(ctx, api_id).await?;
     let guard = r.read().await;

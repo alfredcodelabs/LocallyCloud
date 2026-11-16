@@ -26,18 +26,15 @@ pub(super) fn check(
     if !evaluator.strict_sigv4_required() {
         return Ok(());
     }
-    // Core strips caller-supplied trust markers before setting either marker.
-    if request
+    let internal = request
         .headers
         .get("x-locallycloud-verified-internal-scope")
-        .is_some_and(|value| value == "1")
-    {
-        return Ok(());
-    }
-    if request
-        .headers
-        .get("x-locallycloud-verified-external-sigv4")
-        .is_none_or(|value| value != "1")
+        .is_some_and(|value| value == "1");
+    if !internal
+        && request
+            .headers
+            .get("x-locallycloud-verified-external-sigv4")
+            .is_none_or(|value| value != "1")
     {
         return Err(());
     }
@@ -52,11 +49,14 @@ pub(super) fn check(
         access_key_id: Some(key),
         arn: None,
     };
-    let authorize = |action: &str, resource: String, context: BTreeMap<String, Vec<String>>| {
+    let authorize = |action: &str, resource: String, mut context: BTreeMap<String, Vec<String>>| {
+        context.extend(
+            locallycloud_core::integration::request_context::verified_request_context(request),
+        );
         evaluator
             .authorize(AuthorizationRequest {
                 request_identity: identity.clone(),
-                delegated_identity: None,
+                delegated_identity: locallycloud_core::integration::identity::trusted_role(request),
                 source_service: service.into(),
                 action: action.into(),
                 resource,
@@ -156,6 +156,11 @@ pub(super) fn check(
     if let Some(role) = role {
         evaluator
             .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+                delegated_caller: locallycloud_core::integration::identity::trusted_role(request),
+                caller_context:
+                    locallycloud_core::integration::request_context::verified_request_context(
+                        request,
+                    ),
                 source_arn: Some(if service == "scheduler" {
                     format!(
                         "arn:aws:scheduler:{}:{}:schedule-group/{}",

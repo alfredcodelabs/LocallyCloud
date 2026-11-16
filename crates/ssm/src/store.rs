@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::{Arc, Mutex};
 
 use locallycloud_state::StateDb;
@@ -183,6 +183,34 @@ impl ParameterStore {
         })
     }
 
+    /// Select the next names without cloning metadata for the full store.
+    pub(crate) fn page_names(
+        &self,
+        scope: &Scope,
+        after: &str,
+        limit: usize,
+        matches: impl Fn(&ParameterRecord) -> bool,
+    ) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        // ponytail: bounded heap keeps O(page) memory; add an ordered index only if scans become a measured bottleneck.
+        let mut names = BinaryHeap::with_capacity(limit);
+        for record in &self.parameters {
+            if record.key().scope != *scope || record.name.as_str() <= after || !matches(&record) {
+                continue;
+            }
+            if names.len() < limit {
+                names.push(record.name.clone());
+            } else if let Some(mut last) = names.peek_mut() {
+                if record.name < *last {
+                    *last = record.name.clone();
+                }
+            }
+        }
+        names.into_sorted_vec()
+    }
+
     pub(crate) fn describe(
         &self,
         scope: &Scope,
@@ -264,6 +292,17 @@ impl ParameterStore {
         Ok(())
     }
 
+    pub(crate) fn authorization_tags(&self, scope: &Scope, name: &str) -> BTreeMap<String, String> {
+        self.parameters
+            .get(&StoreKey::new(scope, name))
+            .or_else(|| {
+                self.parameters
+                    .get(&StoreKey::new(scope, &format!("/{name}")))
+            })
+            .map(|record| record.tags.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn list_tags(
         &self,
         scope: &Scope,
@@ -284,6 +323,67 @@ impl ParameterStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_pages_match_sorted_metadata_without_materializing_the_store() {
+        let store = ParameterStore::new();
+        let scope = Scope::new("000000000000", "us-east-1");
+        let foreign = Scope::new("111111111111", "us-east-1");
+        let region = Scope::new("000000000000", "us-west-2");
+        let put = |scope: &Scope, name: String| {
+            store
+                .put(
+                    scope,
+                    name,
+                    ParameterValue::Plain(crate::model::SecretString::new("value".into())),
+                    Some("d".repeat(128)),
+                    false,
+                    None,
+                    1.0,
+                )
+                .unwrap()
+        };
+        for index in 0..20_000 {
+            put(&scope, format!("/app/{index:05}"));
+        }
+        for other in [&foreign, &region] {
+            put(other, "/app/00000/foreign".into());
+        }
+        put(&scope, "/app-near/00000".into());
+        put(&scope, "/app/00000/nested".into());
+        let start = std::time::Instant::now();
+        let metadata = store.describe(&scope, None);
+        let expected: Vec<_> = metadata
+            .iter()
+            .filter(|record| {
+                record.name.as_str() > "/app/00020"
+                    && record
+                        .name
+                        .strip_prefix("/app/")
+                        .is_some_and(|tail| !tail.contains('/'))
+            })
+            .take(11)
+            .map(|record| record.name.clone())
+            .collect();
+        let old_time = start.elapsed();
+        let old_text_bytes: usize = metadata
+            .iter()
+            .map(|record| record.name.len() + record.description.as_ref().map_or(0, String::len))
+            .sum();
+        let start = std::time::Instant::now();
+        let page = store.page_names(&scope, "/app/00020", 11, |record| {
+            record
+                .name
+                .strip_prefix("/app/")
+                .is_some_and(|tail| !tail.contains('/'))
+        });
+        let new_time = start.elapsed();
+        assert_eq!(page, expected);
+        assert_eq!(page.len(), 11);
+        assert!(page.windows(2).all(|names| names[0] < names[1]));
+        assert!(store.page_names(&scope, "", 0, |_| true).is_empty());
+        eprintln!("ssm_page_20000 old_us={} bounded_us={} old_metadata_rows={} retained_names={} old_text_bytes={} retained_name_bytes={}", old_time.as_micros(), new_time.as_micros(), metadata.len(), page.len(), old_text_bytes, page.iter().map(String::len).sum::<usize>());
+    }
 
     #[tokio::test]
     async fn sqlite_wait_does_not_block_reads_of_committed_parameters() {

@@ -548,12 +548,26 @@ pub fn delivery_requests(
             source_ip,
         ));
     }
+    if let (Ok(source_arn), Ok(source_account)) = (
+        HeaderValue::from_str(&format!("arn:aws:s3:::{}", event.bucket)),
+        HeaderValue::from_str(account),
+    ) {
+        for request in &mut requests {
+            request
+                .headers
+                .insert("x-locallycloud-source-arn", source_arn.clone());
+            request
+                .headers
+                .insert("x-locallycloud-source-account", source_account.clone());
+        }
+    }
     requests
 }
 
 pub fn coalesce_event_bridge(requests: Vec<DeliveryRequest>) -> Vec<DeliveryRequest> {
     let mut other = Vec::new();
-    let mut entries = Vec::new();
+    let mut batches =
+        std::collections::BTreeMap::<(String, String), (HeaderMap, Vec<Value>)>::new();
     for request in requests {
         if request.target != DeliveryTarget::EventBridge {
             other.push(request);
@@ -565,17 +579,34 @@ pub fn coalesce_event_bridge(requests: Vec<DeliveryRequest>) -> Vec<DeliveryRequ
                 .and_then(Value::as_array_mut)
                 .map(std::mem::take)
             {
-                entries.extend(values);
+                let key = ("x-locallycloud-source-arn", "x-locallycloud-source-account");
+                let value = |header| {
+                    request
+                        .headers
+                        .get(header)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned()
+                };
+                batches
+                    .entry((value(key.0), value(key.1)))
+                    .or_insert_with(|| (request.headers, Vec::new()))
+                    .1
+                    .extend(values);
             }
         }
     }
-    for chunk in entries.chunks(10) {
-        other.push(json_request(
-            DeliveryTarget::EventBridge,
-            "AWSEvents.PutEvents",
-            "application/x-amz-json-1.1",
-            json!({"Entries": chunk}),
-        ));
+    for (headers, entries) in batches.into_values() {
+        for chunk in entries.chunks(10) {
+            let mut request = json_request(
+                DeliveryTarget::EventBridge,
+                "AWSEvents.PutEvents",
+                "application/x-amz-json-1.1",
+                json!({"Entries": chunk}),
+            );
+            request.headers.extend(headers.clone());
+            other.push(request);
+        }
     }
     other
 }
@@ -857,6 +888,16 @@ mod tests {
             "127.0.0.1",
         );
         assert_eq!(requests.len(), 4);
+        for request in &requests {
+            assert_eq!(
+                request.headers["x-locallycloud-source-arn"],
+                "arn:aws:s3:::bucket"
+            );
+            assert_eq!(
+                request.headers["x-locallycloud-source-account"],
+                "123456789012"
+            );
+        }
         assert!(requests
             .iter()
             .any(|request| request.target == DeliveryTarget::Lambda));
@@ -900,5 +941,46 @@ mod tests {
         assert!(!filtered
             .iter()
             .any(|request| request.target == DeliveryTarget::Queue));
+    }
+    #[test]
+    fn event_bridge_batches_preserve_the_exact_producer_scope() {
+        let mut requests = Vec::new();
+        for bucket in ["bucket-one", "bucket-two"] {
+            for index in 0..11 {
+                let mut object = event(
+                    NotificationConfiguration {
+                        event_bridge: true,
+                        ..Default::default()
+                    },
+                    &format!("object-{index}"),
+                );
+                object.bucket = bucket.into();
+                requests.extend(delivery_requests(
+                    &object,
+                    "123456789012",
+                    "111111111111",
+                    "eu-west-1",
+                    "rid",
+                    "127.0.0.1",
+                ));
+            }
+        }
+        let batches = coalesce_event_bridge(requests);
+        assert_eq!(batches.len(), 4);
+        for request in batches {
+            let source = request.headers["x-locallycloud-source-arn"]
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                request.headers["x-locallycloud-source-account"],
+                "123456789012"
+            );
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let entries = body["Entries"].as_array().unwrap();
+            assert!(!entries.is_empty() && entries.len() <= 10);
+            for entry in entries {
+                assert_eq!(entry["Resources"], json!([source]));
+            }
+        }
     }
 }

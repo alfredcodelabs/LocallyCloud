@@ -77,8 +77,8 @@ fn host_region(host: &str) -> Option<&str> {
 /// ListDeadLetterSourceQueues are shaped. Every shape is accepted as input regardless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueUrlStyle {
-    /// `<endpoint>/<account>/<name>` on the locallycloud endpoint, so SDKs that use the
-    /// queue URL as their endpoint keep calling this instance.
+    /// Canonical `<endpoint>/<account>/<name>` injected by the server. Request Host and
+    /// transport never change the endpoint advertised to SDKs.
     Endpoint(String),
     /// `https://sqs.<region>.amazonaws.com/<account>/<name>`.
     Aws,

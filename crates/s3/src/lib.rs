@@ -20,4 +20,4 @@ pub mod service;
 pub mod store;
 pub mod xml;
 
-pub use service::{register, register_with_state};
+pub use service::{register, register_with_state, register_with_state_and_endpoint};

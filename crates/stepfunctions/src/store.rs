@@ -179,6 +179,7 @@ pub struct Execution {
     pub variables: BTreeMap<String, Value>,
     pub redrive_count: u32,
     pub redrive_date: Option<f64>,
+    #[serde(default, skip_serializing)]
     pub history: Vec<Arc<HistoryEvent>>,
 }
 

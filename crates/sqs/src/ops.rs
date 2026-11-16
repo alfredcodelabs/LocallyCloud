@@ -8,13 +8,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, RandomizedNonceKey, UnboundKey, AES_256_GCM};
 use base64::Engine;
-use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::kms::{
-    KmsCallContext, KmsDecryptRequest, KmsGenerateDataKeyRequest, KmsInternalError,
-    KmsValidateKeyRequest, SensitiveBytes,
+    KmsCallContext, KmsDecryptRequest, KmsGenerateDataKeyRequest, KmsInternalError, SensitiveBytes,
 };
 use locallycloud_core::integration::lambda::MAX_TRACE_HEADER_LEN;
-use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
+use locallycloud_core::integration::InternalDispatcher;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -44,7 +43,7 @@ pub struct Ctx<'a> {
     pub account: &'a str,
     pub request_id: &'a str,
     pub dispatcher: Option<Arc<InternalDispatcher>>,
-    pub authorization: Option<String>,
+    pub request: &'a ServiceRequest,
     pub metrics: Arc<MetricsRecorder>,
     /// Shape of the queue URLs this instance returns.
     pub queue_urls: &'a QueueUrlStyle,
@@ -644,6 +643,42 @@ pub async fn create_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     ensure_redrive_allowed(ctx, &arn, &attributes).await?;
 
     let mut stored = default_attributes(fifo);
+    if !attributes.contains_key("KmsMasterKeyId")
+        && !attributes.contains_key("SqsManagedSseEnabled")
+    {
+        let strict = ctx
+            .dispatcher
+            .as_ref()
+            .is_some_and(|dispatcher| dispatcher.strict_sigv4_required());
+        let internal = ctx
+            .request
+            .headers
+            .get("x-locallycloud-verified-internal-scope")
+            .is_some_and(|value| value == "1");
+        let tls = ctx
+            .request
+            .headers
+            .get("x-locallycloud-verified-secure-transport")
+            .is_some_and(|value| value == "true");
+        let verified = ctx
+            .request
+            .headers
+            .get("x-locallycloud-verified-external-sigv4")
+            .is_some_and(|value| value == "1");
+        let modeled_sigv4 = ctx
+            .request
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.starts_with("AWS4-HMAC-SHA256 "))
+            .and_then(
+                locallycloud_core::integration::RequestIdentity::access_key_from_authorization,
+            )
+            .is_some();
+        if (strict && internal) || (tls && (verified || (!strict && modeled_sigv4))) {
+            stored.insert("SqsManagedSseEnabled".into(), "true".into());
+        }
+    }
     stored.extend(attributes);
     let store = ctx.store.clone();
     let arn = tokio::task::spawn_blocking(move || {
@@ -1190,52 +1225,29 @@ fn queue_key_id(state: &QueueState) -> Option<String> {
 
 const KMS_WAIT_LIMIT: Duration = Duration::from_secs(2);
 
-fn request_identity(ctx: &Ctx<'_>) -> RequestIdentity {
-    RequestIdentity {
-        account_id: ctx.account.into(),
-        access_key_id: ctx
-            .authorization
-            .as_deref()
-            .and_then(RequestIdentity::access_key_from_authorization),
-        arn: None,
-    }
-}
-
-fn kms_call(ctx: &Ctx<'_>) -> KmsCallContext {
-    let caller_arn = ctx
-        .dispatcher
-        .as_ref()
-        .and_then(|dispatcher| dispatcher.resolve_caller_arn(&request_identity(ctx)).ok())
-        .flatten();
-    KmsCallContext {
-        source_service: "sqs".into(),
-        account_id: ctx.account.into(),
-        region: ctx.region.into(),
-        request_id: ctx.request_id.into(),
-        caller_arn,
-        iam_policy_allowed: false,
-        iam_policy_denied: false,
-    }
-}
-
 fn kms_context(arn: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("aws:sqs:queuearn".into(), arn.into())])
 }
 
-fn authorize_kms(ctx: &Ctx<'_>, action: &str, resource: &str) -> Result<bool, SqsError> {
-    let dispatcher = ctx.dispatcher.as_ref().ok_or(SqsError::KmsAccessDenied)?;
-    let request = AuthorizationRequest {
-        request_identity: request_identity(ctx),
-        delegated_identity: None,
-        source_service: "sqs".into(),
-        action: action.into(),
-        resource: resource.into(),
-        context: BTreeMap::new(),
-    };
-    dispatcher
-        .authorize(request.clone())
-        .map_err(|_| SqsError::KmsAccessDenied)?;
-    Ok(dispatcher.identity_policy_allows(request))
+async fn kms_call(
+    ctx: &Ctx<'_>,
+    action: &str,
+    key_id: &str,
+    arn: &str,
+) -> Result<(KmsCallContext, String), MoveKmsFailure> {
+    ctx.dispatcher
+        .as_ref()
+        .ok_or(MoveKmsFailure::Terminal)?
+        .kms_call_context(
+            ctx.request,
+            "sqs",
+            action,
+            key_id,
+            &kms_context(arn),
+            KMS_WAIT_LIMIT,
+        )
+        .await
+        .map_err(move_kms_failure)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1260,21 +1272,6 @@ fn public_kms_failure(_: MoveKmsFailure) -> SqsError {
     SqsError::KmsAccessDenied
 }
 
-fn authorize_move_destination_key(ctx: &Ctx<'_>, key_id: &str) -> Result<(), MoveKmsFailure> {
-    let dispatcher = ctx.dispatcher.as_ref().ok_or(MoveKmsFailure::Terminal)?;
-    let resolved = dispatcher
-        .kms_validate_key(KmsValidateKeyRequest {
-            call: kms_call(ctx),
-            key_id: key_id.into(),
-        })
-        .map_err(move_kms_failure)?;
-    authorize_kms(ctx, "kms:GenerateDataKey", &resolved.key_arn)
-        .map_err(|_| MoveKmsFailure::Terminal)?;
-    authorize_kms(ctx, "kms:Decrypt", &resolved.key_arn)
-        .map(|_| ())
-        .map_err(|_| MoveKmsFailure::Terminal)
-}
-
 async fn encrypt_body(
     ctx: &Ctx<'_>,
     arn: &str,
@@ -1293,22 +1290,12 @@ async fn encrypt_body_classified(
     body: &str,
 ) -> Result<EncryptedBody, MoveKmsFailure> {
     let dispatcher = ctx.dispatcher.as_ref().ok_or(MoveKmsFailure::Terminal)?;
-    let resolved = dispatcher
-        .kms_validate_key(KmsValidateKeyRequest {
-            call: kms_call(ctx),
-            key_id: key_id.into(),
-        })
-        .map_err(move_kms_failure)?;
-    let iam_policy_allowed = authorize_kms(ctx, "kms:GenerateDataKey", &resolved.key_arn)
-        .map_err(|_| MoveKmsFailure::Terminal)?;
+    let (call, key_arn) = kms_call(ctx, "kms:GenerateDataKey", key_id, arn).await?;
     let data_key = dispatcher
         .kms_generate_data_key_bounded(
             KmsGenerateDataKeyRequest {
-                call: KmsCallContext {
-                    iam_policy_allowed,
-                    ..kms_call(ctx)
-                },
-                key_id: key_id.into(),
+                call,
+                key_id: key_arn,
                 number_of_bytes: 32,
                 encryption_context: kms_context(arn),
             },
@@ -1345,16 +1332,12 @@ async fn decrypt_body_classified(
 ) -> Result<String, MoveKmsFailure> {
     let arn = &encrypted.encryption_context_arn;
     let dispatcher = ctx.dispatcher.as_ref().ok_or(MoveKmsFailure::Terminal)?;
-    let iam_policy_allowed = authorize_kms(ctx, "kms:Decrypt", &encrypted.key_id)
-        .map_err(|_| MoveKmsFailure::Terminal)?;
+    let (call, key_arn) = kms_call(ctx, "kms:Decrypt", &encrypted.key_id, arn).await?;
     let data_key = dispatcher
         .kms_decrypt_bounded(
             KmsDecryptRequest {
-                call: KmsCallContext {
-                    iam_policy_allowed,
-                    ..kms_call(ctx)
-                },
-                key_id: Some(encrypted.key_id.clone()),
+                call,
+                key_id: Some(key_arn),
                 ciphertext: SensitiveBytes::new(encrypted.encrypted_data_key.clone()),
                 encryption_context: kms_context(arn),
             },
@@ -1809,24 +1792,6 @@ fn restore_selection(state: &mut QueueState, selected: &[Message]) {
 
 pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
-    let key_id = q
-        .state
-        .lock()
-        .await
-        .attributes
-        .get("KmsMasterKeyId")
-        .cloned()
-        .filter(|key| !key.is_empty());
-    if let Some(key_id) = key_id {
-        let dispatcher = ctx.dispatcher.as_ref().ok_or(SqsError::KmsAccessDenied)?;
-        let resolved = dispatcher
-            .kms_validate_key(KmsValidateKeyRequest {
-                call: kms_call(ctx),
-                key_id,
-            })
-            .map_err(|_| SqsError::KmsAccessDenied)?;
-        authorize_kms(ctx, "kms:Decrypt", &resolved.key_arn)?;
-    }
     let max = bounded_i64(v, "MaxNumberOfMessages", 1, 1, 10)? as usize;
     let vis_override = optional_i64(v, "VisibilityTimeout")?;
     if vis_override.is_some_and(|visibility| !(0..=43_200).contains(&visibility)) {
@@ -2515,11 +2480,6 @@ async fn move_one_message(
     };
     let encrypted = match destination_key.as_deref() {
         Some(key) => {
-            match authorize_move_destination_key(ctx, key) {
-                Ok(()) => {}
-                Err(MoveKmsFailure::Retryable) => return MoveOneResult::Retryable,
-                Err(MoveKmsFailure::Terminal) => return MoveOneResult::Blocked,
-            }
             match encrypt_body_classified(ctx, &destination.arn.to_arn(), key, &plaintext).await {
                 Ok(encrypted) => match decrypt_body_classified(ctx, &encrypted).await {
                     Ok(_) => Some(encrypted),
@@ -2660,7 +2620,6 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
         queue_key_id(&state)
     };
     if let Some(key) = destination_key.as_deref() {
-        authorize_move_destination_key(ctx, key).map_err(public_kms_failure)?;
         // IAM authorization alone cannot establish that the key policy permits
         // SQS. Probe the actual KMS calls before publishing a task handle.
         let probe = encrypt_body(ctx, &destination.arn.to_arn(), key, "").await?;
@@ -2689,7 +2648,8 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
     let account = ctx.account.to_string();
     let request_id = ctx.request_id.to_string();
     let dispatcher = ctx.dispatcher.clone();
-    let authorization = ctx.authorization.clone();
+    let mut request = ctx.request.clone();
+    request.body = bytes::Bytes::new();
     let metrics = ctx.metrics.clone();
     let queue_urls = ctx.queue_urls.clone();
     tokio::spawn(async move {
@@ -2700,7 +2660,7 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
             account: &account,
             request_id: &request_id,
             dispatcher,
-            authorization,
+            request: &request,
             metrics,
             queue_urls: &queue_urls,
             trace_header: None,

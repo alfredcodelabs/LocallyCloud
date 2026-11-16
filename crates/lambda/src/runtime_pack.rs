@@ -1,5 +1,4 @@
 //! Lambda-specific trust overlays for shared verified runtime packs.
-use locallycloud_compute::runtime_pack::read_guest_file;
 pub use locallycloud_compute::runtime_pack::{official_image, validate};
 pub(crate) use locallycloud_compute::runtime_pack::{RuntimePack, RuntimePacks};
 use std::collections::BTreeMap;
@@ -11,58 +10,35 @@ pub(crate) fn install_guest_trust(
     root: &Path,
     environment: &mut BTreeMap<String, String>,
     ca: &str,
+    endpoint: &str,
 ) -> Result<(), String> {
-    const BUNDLE: &str = "/var/runtime/locallycloud-ca-bundle.pem";
-    let root = root.to_path_buf();
-    let mut configured = Vec::new();
-    for key in ["AWS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"] {
-        if let Some(path) = environment.get(key) {
-            if !path.starts_with('/') || path.len() > 4096 {
-                return Err(format!("{key} must name an absolute path inside the guest"));
-            }
-            configured.push(path.clone());
-        }
+    let configured = ["AWS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"]
+        .into_iter()
+        .filter_map(|key| environment.get(key).map(String::as_str))
+        .collect::<Vec<_>>();
+    let bundle = locallycloud_compute::runtime_pack::install_guest_ca(root, &configured, ca)
+        .map_err(|error| format!("guest trust bundle unavailable: {error}"))?;
+    let resolver = root.join("etc/resolv.conf");
+    let etc = root.join("etc");
+    let metadata = fs::symlink_metadata(&etc).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("guest resolver directory must be a real directory".into());
     }
-    let ca = ca.to_owned();
-    (|| -> io::Result<()> {
-        let mut bundle = read_guest_file(
-            &root,
-            Path::new("/etc/pki/tls/certs/ca-bundle.crt"),
-            4 * 1024 * 1024,
-        )?;
-        for path in configured {
-            bundle.push(b'\n');
-            bundle.extend(read_guest_file(&root, Path::new(&path), 4 * 1024 * 1024)?);
-        }
-        bundle.push(b'\n');
-        bundle.extend(ca.as_bytes());
-        let target = root.join(BUNDLE.trim_start_matches('/'));
-        match fs::remove_file(&target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        fs::write(target, bundle)?;
-        let hosts = root.join("etc/hosts");
-        let mut contents = match read_guest_file(&root, Path::new("/etc/hosts"), 65536) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error),
-        };
-        // These are the supported isolated guest endpoint hosts. Smithy prefixes
-        // StartSyncExecution with `sync-`; it must reach the same private proxy.
-        contents.extend(b"\n127.0.0.1 localhost sync-localhost sync-127.0.0.1\n");
-        match fs::remove_file(&hosts) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        fs::write(hosts, contents)
-    })()
-    .map_err(|e| format!("guest trust bundle unavailable: {e}"))?;
-    for key in ["AWS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"] {
-        environment.insert(key.into(), BUNDLE.into());
+    match fs::remove_file(&resolver) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
     }
+    fs::write(
+        resolver,
+        b"nameserver 169.254.169.253\noptions timeout:2 attempts:1\n",
+    )
+    .map_err(|error| error.to_string())?;
+    for key in ["AWS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"] {
+        environment.insert(key.into(), bundle.into());
+    }
+    environment.retain(|key, _| !key.starts_with("AWS_ENDPOINT_URL_"));
+    environment.insert("AWS_ENDPOINT_URL".into(), endpoint.into());
     Ok(())
 }
 
@@ -71,7 +47,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt};
     #[test]
-    fn guest_hosts_include_sdk_prefixes_without_mutating_pack_files() {
+    fn guest_endpoint_and_resolver_do_not_mutate_shared_pack_files() {
         for symlinked in [false, true] {
             let fixture = Fixture::new();
             let root = fixture.0.join("guest");
@@ -93,25 +69,30 @@ mod tests {
             }
             let original_inode = fs::metadata(&shared_hosts).unwrap().ino();
             let mut environment = BTreeMap::new();
+            environment.insert("AWS_ENDPOINT_URL".into(), "http://127.0.0.1:4566".into());
+            environment.insert("AWS_ENDPOINT_URL_S3".into(), "http://other-instance".into());
 
-            install_guest_trust(&root, &mut environment, "guest callback CA").unwrap();
+            install_guest_trust(
+                &root,
+                &mut environment,
+                "guest callback CA",
+                "https://aws.localhost:4566",
+            )
+            .unwrap();
+            assert_eq!(
+                environment["AWS_ENDPOINT_URL"],
+                "https://aws.localhost:4566"
+            );
+            assert!(!environment.contains_key("AWS_ENDPOINT_URL_S3"));
 
             assert_eq!(fs::read(&shared_hosts).unwrap(), original);
-            assert_ne!(
-                fs::metadata(root.join("etc/hosts")).unwrap().ino(),
-                original_inode
+            assert_eq!(fs::metadata(&shared_hosts).unwrap().ino(), original_inode);
+            assert_eq!(fs::read(root.join("etc/hosts")).unwrap(), original);
+            assert_eq!(
+                fs::read(root.join("etc/resolv.conf")).unwrap(),
+                b"nameserver 169.254.169.253\noptions timeout:2 attempts:1\n"
             );
-            let hosts = fs::read_to_string(root.join("etc/hosts")).unwrap();
-            assert!(hosts.contains("10.0.0.10 private.database.internal"));
-            for endpoint in ["127.0.0.1", "localhost"] {
-                let prefixed = format!("sync-{endpoint}");
-                let resolved = hosts.lines().find_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    let address = fields.next()?;
-                    fields.any(|name| name == prefixed).then_some(address)
-                });
-                assert_eq!(resolved, Some("127.0.0.1"));
-            }
+            assert!(!environment.contains_key("AWS_ENDPOINT_URL_SFN"));
         }
     }
     #[test]

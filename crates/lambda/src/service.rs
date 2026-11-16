@@ -30,17 +30,17 @@ use locallycloud_ec2::Ec2Handler;
 use crate::concurrency::ConcurrencyLimiter;
 const EXECUTION_UNAVAILABLE: &str = "Lambda invocation is disabled: no compute executor is available. Install crun or youki, ensure a rootless systemd user session and a writable Lambda work directory, and check startup diagnostics.";
 use crate::control_plane::{
-    add_permission, create_alias, create_function, create_function_url_config, delete_alias,
-    delete_function, delete_function_concurrency, delete_function_event_invoke_config,
-    delete_function_url_config, delete_layer_version, delete_provisioned_concurrency, get_alias,
-    get_function, get_function_code_signing_config, get_function_concurrency,
-    get_function_configuration, get_function_event_invoke_config, get_function_url_config,
-    get_layer_version, get_policy, get_provisioned_concurrency, list_aliases, list_functions,
-    list_layer_versions, list_layers, list_provisioned_concurrency, list_tags,
-    list_versions_by_function, parse_layers, publish_layer_version, publish_version,
-    put_function_concurrency, put_function_event_invoke_config, put_provisioned_concurrency,
-    remove_permission, tag_resource, untag_resource, update_alias, update_function_code,
-    update_function_configuration, update_function_event_invoke_config, update_function_url_config,
+    create_alias, create_function, create_function_url_config, delete_alias, delete_function,
+    delete_function_concurrency, delete_function_event_invoke_config, delete_function_url_config,
+    delete_layer_version, delete_provisioned_concurrency, get_alias, get_function,
+    get_function_code_signing_config, get_function_concurrency, get_function_configuration,
+    get_function_event_invoke_config, get_function_url_config, get_layer_version,
+    get_provisioned_concurrency, list_aliases, list_functions, list_layer_versions, list_layers,
+    list_provisioned_concurrency, list_tags, list_versions_by_function, parse_layers,
+    publish_layer_version, publish_version, put_function_concurrency,
+    put_function_event_invoke_config, put_provisioned_concurrency, tag_resource, untag_resource,
+    update_alias, update_function_code, update_function_configuration,
+    update_function_event_invoke_config, update_function_url_config,
 };
 use crate::error::LambdaError;
 use crate::esm::{
@@ -461,6 +461,58 @@ impl LambdaHandler {
             path.split('/').collect()
         };
         let (region, account) = (req.region.as_str(), req.account_id.as_str());
+        let policy_qualifier = match (segments.as_slice(), &req.method) {
+            (["2015-03-31", "functions", _, "policy"], &Method::POST | &Method::GET)
+            | (["2015-03-31", "functions", _, "policy", _], &Method::DELETE) => {
+                let mut qualifier: Option<String> = None;
+                for pair in req
+                    .uri
+                    .query()
+                    .into_iter()
+                    .flat_map(|query| query.split('&'))
+                {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    match percent_decode_query(key).as_str() {
+                        "Qualifier" => {
+                            let value = percent_decode_query(value);
+                            if qualifier.as_ref().is_some_and(|prior| prior != &value) {
+                                return Err(LambdaError::InvalidParameterValue(
+                                    "Conflicting policy qualifiers".into(),
+                                ));
+                            }
+                            qualifier = Some(value);
+                        }
+                        "RevisionId" if req.method == Method::DELETE => {
+                            return Err(LambdaError::NotImplemented(
+                                "Lambda policy revision preconditions are not supported".into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                qualifier
+            }
+            (["2015-03-31", "functions", name], &Method::DELETE) => {
+                let qualified_query = req
+                    .uri
+                    .query()
+                    .into_iter()
+                    .flat_map(|query| query.split('&'))
+                    .any(|pair| {
+                        percent_decode_query(pair.split_once('=').map_or(pair, |(key, _)| key))
+                            == "Qualifier"
+                    });
+                if qualified_query
+                    || crate::model::function_qualifier(&percent_decode_path(name)).is_some()
+                {
+                    return Err(LambdaError::NotImplemented(
+                        "Deleting a qualified Lambda function is not supported".into(),
+                    ));
+                }
+                None
+            }
+            _ => None,
+        };
 
         match segments.as_slice() {
             ["2016-08-19", "account-settings"] if req.method == Method::GET => {
@@ -513,15 +565,33 @@ impl LambdaHandler {
             ["2015-03-31", "functions", name, "policy"] => match req.method {
                 Method::POST => {
                     let input = parse_json(&req.body)?;
-                    add_permission(&self.store, region, account, name, &input)
+                    crate::control_plane::add_permission_qualified(
+                        &self.store,
+                        region,
+                        account,
+                        &percent_decode_path(name),
+                        policy_qualifier.as_deref(),
+                        &input,
+                    )
                 }
-                Method::GET => get_policy(&self.store, region, account, name),
+                Method::GET => crate::control_plane::get_policy_qualified(
+                    &self.store,
+                    region,
+                    account,
+                    &percent_decode_path(name),
+                    policy_qualifier.as_deref(),
+                ),
                 _ => Err(unsupported()),
             },
             ["2015-03-31", "functions", name, "policy", statement_id] => match req.method {
-                Method::DELETE => {
-                    remove_permission(&self.store, region, account, name, statement_id)
-                }
+                Method::DELETE => crate::control_plane::remove_permission_qualified(
+                    &self.store,
+                    region,
+                    account,
+                    &percent_decode_path(name),
+                    &percent_decode_path(statement_id),
+                    policy_qualifier.as_deref(),
+                ),
                 _ => Err(unsupported()),
             },
             ["2015-03-31", "functions", name, "configuration"] => match req.method {
@@ -723,6 +793,7 @@ impl LambdaHandler {
                         .ok_or_else(|| {
                             LambdaError::InvalidParameterValue("FunctionName is required".into())
                         })?;
+                    crate::model::validate_function_scope(fn_ref, region, account)?;
                     let name = resolve_function_name(fn_ref, region)?;
                     let function = self.store.get(account, region, &name).ok_or_else(|| {
                         LambdaError::ResourceNotFound(format!("Function not found: {name}"))
@@ -1258,6 +1329,9 @@ impl NativeHandler for LambdaHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
+        if let Err(error) = validate_function_path(&request) {
+            return error.into_response(&request.request_id);
+        }
         if let Err(error) = authorization::check(self, &request) {
             return error.into_response(&request.request_id);
         }
@@ -1270,6 +1344,22 @@ impl NativeHandler for LambdaHandler {
             Err(err) => err.into_response(&request.request_id),
         }
     }
+}
+
+fn validate_function_path(request: &ServiceRequest) -> Result<(), LambdaError> {
+    let mut segments = request.uri.path().trim_matches('/').split('/');
+    segments.next();
+    if segments.next() != Some("functions") {
+        return Ok(());
+    }
+    let Some(reference) = segments.next() else {
+        return Ok(());
+    };
+    crate::model::validate_function_scope(
+        &percent_decode_path(reference),
+        &request.region,
+        &request.account_id,
+    )
 }
 
 /// Whether the request targets `POST /2015-03-31/functions/{name}/invocations`.
@@ -1548,6 +1638,8 @@ impl LambdaInternalApi for LambdaHandler {
             trace_header,
         } = request;
         let trace_header = trace_header.filter(|header| header.len() <= MAX_TRACE_HEADER_LEN);
+        crate::model::validate_function_scope(&function_name, &call.region, &call.account_id)
+            .map_err(map_internal_lambda_error)?;
         if call.source_service.is_empty()
             || call.account_id.is_empty()
             || call.region.is_empty()
@@ -1622,6 +1714,7 @@ fn map_internal_lambda_error(error: LambdaError) -> LambdaInternalError {
         | LambdaError::RequestTooLarge(_) => LambdaInternalError::InvalidRequest,
         LambdaError::AccessDenied(_)
         | LambdaError::CodeStorageExceeded(_)
+        | LambdaError::PolicyLengthExceeded(_)
         | LambdaError::InternalError(_)
         | LambdaError::NotImplemented(_) => LambdaInternalError::Internal,
     }
@@ -1651,11 +1744,11 @@ fn percent_decode_path(value: &str) -> String {
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    query
-        .split('&')
-        .find_map(|pair| pair.strip_prefix(prefix.as_str()))
-        .map(percent_decode_query)
+    query.split('&').find_map(|pair| {
+        let (raw_key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (raw_key == key || (raw_key.contains(['%', '+']) && percent_decode_query(raw_key) == key))
+            .then(|| percent_decode_query(value))
+    })
 }
 
 fn percent_decode_query(value: &str) -> String {
@@ -1832,6 +1925,8 @@ impl DestinationRouter for RegistryDestinationRouter {
             .as_ref()
             .is_some_and(|evaluator| evaluator.strict_sigv4_required());
         let role_request = ServiceRoleAuthorizationRequest {
+            delegated_caller: None,
+            caller_context: Default::default(),
             source_arn: None,
             caller: RequestIdentity {
                 account_id: (*account).into(),
@@ -2810,7 +2905,7 @@ mod tests {
             "/2019-09-30/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A111111111111%3Afunction%3Afn/concurrency",
             "/2019-09-30/functions/111111111111%3Afunction%3Afn/concurrency",
         ] {
-            assert_eq!(handler.handle(request(Method::GET,path, "")).await.status(),404);
+            assert_eq!(handler.handle(request(Method::GET,path, "")).await.status(),501);
         }
         for scope in [("111111111111", "us-east-1"), ("000000000000", "us-west-2")] {
             let mut foreign = request(Method::GET, get_path, "");

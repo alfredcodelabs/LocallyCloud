@@ -132,7 +132,7 @@ async fn event_configs_are_qualified_validated_paginated_and_durable() {
         400
     );
     for suffix in ["", "/list"] {
-        assert_eq!(call(&handler,Method::GET,&format!("/2019-09-25/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A111111111111%3Afunction%3Aqualified/event-invoke-config{suffix}"),Value::Null).await.0,400);
+        assert_eq!(call(&handler,Method::GET,&format!("/2019-09-25/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A111111111111%3Afunction%3Aqualified/event-invoke-config{suffix}"),Value::Null).await.0,501);
     }
     let first = call(
         &handler,
@@ -316,6 +316,14 @@ async fn async_destination_uses_execution_role_and_denial_prevents_delivery() {
         }
         fn authorize(&self, _: AuthorizationRequest) -> Result<(), AuthorizationError> {
             Ok(())
+        }
+        fn authorize_resource_policy(
+            &self,
+            request: AuthorizationRequest,
+            _document: Option<&str>,
+            _owner: &str,
+        ) -> Result<(), AuthorizationError> {
+            self.authorize(request)
         }
         fn issue_service_role_credentials(
             &self,
@@ -722,6 +730,15 @@ async fn destination_bursts_wait_for_credential_workers_without_losing_accepted_
         }
         fn authorize(&self, request: AuthorizationRequest) -> Result<(), AuthorizationError> {
             self.inner.authorize(request)
+        }
+        fn authorize_resource_policy(
+            &self,
+            request: AuthorizationRequest,
+            document: Option<&str>,
+            owner: &str,
+        ) -> Result<(), AuthorizationError> {
+            self.inner
+                .authorize_resource_policy(request, document, owner)
         }
         fn resolve_caller_arn(
             &self,

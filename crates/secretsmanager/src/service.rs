@@ -12,8 +12,7 @@ use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::AuthorizationRequest;
 use locallycloud_core::integration::kms::{
-    KmsCallContext, KmsDecryptRequest, KmsEncryptRequest, KmsKeySelector, KmsServiceKey,
-    SensitiveBytes as KmsSensitiveBytes,
+    KmsDecryptRequest, KmsEncryptRequest, KmsKeySelector, SensitiveBytes as KmsSensitiveBytes,
 };
 use locallycloud_core::integration::lambda::{
     LambdaCallContext, LambdaInternalError, LambdaInvokeRequest, SensitivePayload,
@@ -161,7 +160,6 @@ impl SecretsManagerHandler {
             .as_ref()
             .map(|record| (record.arn.clone(), record.resource_policy.clone()))
             .ok_or(SecretsError::ResourceNotFound)?;
-        self.authorize(request, operation, &arn)?;
         if let Some(policy) = policy {
             let evaluator = self
                 .registry
@@ -175,6 +173,8 @@ impl SecretsManagerHandler {
                     &scope.account_id,
                 )
                 .map_err(SecretsError::from_authorization)?;
+        } else {
+            self.authorize(request, operation, &arn)?;
         }
         Ok(slot)
     }
@@ -199,11 +199,8 @@ impl SecretsManagerHandler {
             .headers
             .get(http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
-        let mut context = BTreeMap::new();
-        context.insert(
-            "aws:RequestedRegion".to_owned(),
-            vec![request.region.clone()],
-        );
+        let mut context =
+            locallycloud_core::integration::request_context::verified_request_context(request);
         context.insert(
             "aws:ResourceAccount".to_owned(),
             vec![request.account_id.clone()],
@@ -215,7 +212,7 @@ impl SecretsManagerHandler {
                     .and_then(RequestIdentity::access_key_from_authorization),
                 arn: None,
             },
-            delegated_identity: None,
+            delegated_identity: locallycloud_core::integration::identity::trusted_role(request),
             source_service: "secretsmanager".to_owned(),
             action: format!("secretsmanager:{operation}"),
             resource: resource.to_owned(),
@@ -227,7 +224,7 @@ impl SecretsManagerHandler {
     async fn encrypt_version(
         &self,
         request: &ServiceRequest,
-        scope: &Scope,
+        _scope: &Scope,
         arn: &str,
         version_id: &str,
         value: PlainValue,
@@ -242,17 +239,26 @@ impl SecretsManagerHandler {
             bytes,
             digest,
         } = value;
-        let output = self
-            .dispatcher()?
+        let dispatcher = self.dispatcher()?;
+        let context = encryption_context(arn, version_id);
+        let (call, canonical_key) = dispatcher
+            .kms_call_context(
+                request,
+                "secretsmanager",
+                "kms:Encrypt",
+                kms_key_id.unwrap_or("alias/aws/secretsmanager"),
+                &context,
+                KMS_WAIT_LIMIT,
+            )
+            .await
+            .map_err(SecretsError::from_encrypt)?;
+        let output = dispatcher
             .kms_encrypt_bounded(
                 KmsEncryptRequest {
-                    call: kms_call(request, scope),
-                    key: kms_key_id.map_or(
-                        KmsKeySelector::ServiceDefault(KmsServiceKey::SecretsManager),
-                        |key| KmsKeySelector::Explicit(key.to_owned()),
-                    ),
+                    call,
+                    key: KmsKeySelector::Explicit(canonical_key),
                     plaintext: KmsSensitiveBytes::new(bytes.into_vec()),
-                    encryption_context: encryption_context(arn, version_id),
+                    encryption_context: context,
                 },
                 KMS_WAIT_LIMIT,
             )
@@ -274,20 +280,32 @@ impl SecretsManagerHandler {
     async fn decrypt_value(
         &self,
         request: &ServiceRequest,
-        scope: &Scope,
+        _scope: &Scope,
         arn: &str,
         version_id: &str,
         key_arn: &str,
         ciphertext: SensitiveBytes,
     ) -> Result<SensitiveBytes, SecretsError> {
-        let output = self
-            .dispatcher()?
+        let dispatcher = self.dispatcher()?;
+        let context = encryption_context(arn, version_id);
+        let (call, canonical_key) = dispatcher
+            .kms_call_context(
+                request,
+                "secretsmanager",
+                "kms:Decrypt",
+                key_arn,
+                &context,
+                KMS_WAIT_LIMIT,
+            )
+            .await
+            .map_err(SecretsError::from_decrypt)?;
+        let output = dispatcher
             .kms_decrypt_bounded(
                 KmsDecryptRequest {
-                    call: kms_call(request, scope),
-                    key_id: Some(key_arn.to_owned()),
+                    call,
+                    key_id: Some(canonical_key),
                     ciphertext: KmsSensitiveBytes::new(ciphertext.into_vec()),
-                    encryption_context: encryption_context(arn, version_id),
+                    encryption_context: context,
                 },
                 KMS_WAIT_LIMIT,
             )
@@ -583,7 +601,9 @@ mod kms_boundary_tests {
             &self,
             _: KmsValidateKeyRequest,
         ) -> Result<KmsValidateKeyOutput, KmsInternalError> {
-            Err(KmsInternalError::Unavailable)
+            Ok(KmsValidateKeyOutput {
+                key_arn: "arn:aws:kms:us-east-1:000000000000:key/test".into(),
+            })
         }
     }
 

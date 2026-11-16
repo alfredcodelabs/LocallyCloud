@@ -153,6 +153,7 @@ async fn start(
     let mut vars = vec![
         ("LOCALLYCLOUD_PORT", port_value.as_str()),
         ("LOCALLYCLOUD_LEGACY_BACKEND_URL", "http://127.0.0.1:1"),
+        ("LOCALLYCLOUD_ALLOW_HTTP", "true"),
     ];
     vars.extend_from_slice(extra);
     let config = LocallyCloudConfig::resolve(&|name| {
@@ -381,19 +382,24 @@ async fn strict_iam_dashboard_reads_are_signed_audited_and_bounded() {
         "application/x-www-form-urlencoded",
         "multipart/form-data; boundary=x",
     ] {
-        let response = client
-            .post(format!("{base}/_locallycloud/explore/read"))
-            .header("content-type", content_type)
-            .header("origin", "https://attacker.example")
-            .body(list.to_string())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 415, "{content_type}");
-        assert!(response
-            .headers()
-            .get("access-control-allow-origin")
-            .is_none());
+        for (origin, expected) in [
+            (same_origin.as_str(), 415),
+            ("https://attacker.example", 403),
+        ] {
+            let response = client
+                .post(format!("{base}/_locallycloud/explore/read"))
+                .header("content-type", content_type)
+                .header("origin", origin)
+                .body(list.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{content_type}, {origin}");
+            assert!(response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none());
+        }
     }
 
     // Only the two accepted reads reached the handler.

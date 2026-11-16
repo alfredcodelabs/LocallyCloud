@@ -136,10 +136,45 @@ impl SessionStore {
     }
 }
 
-fn duration_or(q: &QueryRequest, default: i64) -> i64 {
-    q.get("DurationSeconds")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(default)
+fn duration_or(q: &QueryRequest, default: i64, maximum: i64) -> Result<i64, IamStsError> {
+    let duration = q.get("DurationSeconds").map_or(Ok(default), |value| {
+        value
+            .parse::<i64>()
+            .map_err(|_| IamStsError::ValidationError("DurationSeconds must be an integer".into()))
+    })?;
+    if !(900..=maximum).contains(&duration) {
+        return Err(IamStsError::ValidationError(format!(
+            "DurationSeconds must be between 900 and {maximum}"
+        )));
+    }
+    Ok(duration)
+}
+
+fn assume_role_duration(
+    q: &QueryRequest,
+    role: &IamRole,
+    chained: bool,
+) -> Result<i64, IamStsError> {
+    let maximum = i64::from(role.max_session_duration).min(43200);
+    duration_or(
+        q,
+        ASSUME_ROLE_DEFAULT,
+        if chained { maximum.min(3600) } else { maximum },
+    )
+}
+
+fn role_session_name(q: &QueryRequest) -> Result<&str, IamStsError> {
+    let name = q.require("RoleSessionName")?;
+    if !(2..=64).contains(&name.len())
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+=,.@-".contains(&b))
+    {
+        return Err(IamStsError::ValidationError(
+            "Invalid RoleSessionName".into(),
+        ));
+    }
+    Ok(name)
 }
 
 struct SessionRegistration<'a> {
@@ -194,7 +229,11 @@ fn role_name_from_arn(arn: &str) -> &str {
     arn.rsplit('/').next().unwrap_or(arn)
 }
 
-fn resolve_role(store: &IamStore, account: &str, role_arn: &str) -> Result<IamRole, IamStsError> {
+pub(crate) fn resolve_role(
+    store: &IamStore,
+    account: &str,
+    role_arn: &str,
+) -> Result<IamRole, IamStsError> {
     let role = store
         .get_role(account, role_name_from_arn(role_arn))
         .ok_or_else(|| IamStsError::NoSuchEntity(format!("role {role_arn} cannot be found")))?;
@@ -236,8 +275,18 @@ pub fn issue_service_role_credentials(
 }
 
 fn session_policy(q: &QueryRequest) -> Result<Option<&str>, IamStsError> {
+    if q.has_parameter_prefix("PolicyArns") {
+        return Err(IamStsError::ValidationError(
+            "Managed session policies are not supported; use an inline Policy".into(),
+        ));
+    }
     let policy = q.get("Policy");
     if let Some(document) = policy {
+        if document.len() > 2048 {
+            return Err(IamStsError::ValidationError(
+                "Session policy exceeds 2048 characters".into(),
+            ));
+        }
         PolicyDocument::parse(document)?;
     }
     Ok(policy)
@@ -249,10 +298,20 @@ pub fn assume_role(
     account: &str,
     q: &QueryRequest,
 ) -> Result<String, IamStsError> {
+    assume_role_for_caller(store, sessions, account, q, false)
+}
+
+pub(crate) fn assume_role_for_caller(
+    store: &IamStore,
+    sessions: &SessionStore,
+    account: &str,
+    q: &QueryRequest,
+    chained: bool,
+) -> Result<String, IamStsError> {
     let role_arn = q.require("RoleArn")?;
-    let session_name = q.require("RoleSessionName")?;
-    let duration = duration_or(q, ASSUME_ROLE_DEFAULT);
+    let session_name = role_session_name(q)?;
     let role = resolve_role(store, account, role_arn)?;
+    let duration = assume_role_duration(q, &role, chained)?;
     let session_policy = session_policy(q)?;
     let role_name = role_name_from_arn(role_arn);
 
@@ -288,10 +347,10 @@ pub fn assume_role_with_web_identity(
     q: &QueryRequest,
 ) -> Result<String, IamStsError> {
     let role_arn = q.require("RoleArn")?;
-    let session_name = q.require("RoleSessionName")?;
+    let session_name = role_session_name(q)?;
     let _token = q.require("WebIdentityToken")?;
-    let duration = duration_or(q, ASSUME_ROLE_DEFAULT);
     let role = resolve_role(store, account, role_arn)?;
+    let duration = assume_role_duration(q, &role, false)?;
     let session_policy = session_policy(q)?;
     let role_name = role_name_from_arn(role_arn);
     let creds = Credentials::generate(duration);
@@ -331,8 +390,8 @@ pub fn assume_role_with_saml(
     let role_arn = q.require("RoleArn")?;
     let _principal = q.require("PrincipalArn")?;
     let _assertion = q.require("SAMLAssertion")?;
-    let duration = duration_or(q, ASSUME_ROLE_DEFAULT);
     let role = resolve_role(store, account, role_arn)?;
+    let duration = assume_role_duration(q, &role, false)?;
     let session_policy = session_policy(q)?;
     let role_name = role_name_from_arn(role_arn);
     let session_name = "saml";
@@ -448,7 +507,7 @@ pub fn get_federation_token(
     q: &QueryRequest,
 ) -> Result<String, IamStsError> {
     let name = q.require("Name")?;
-    let duration = duration_or(q, SESSION_TOKEN_DEFAULT);
+    let duration = duration_or(q, SESSION_TOKEN_DEFAULT, 129600)?;
     let session_policy = session_policy(q)?;
     let creds = Credentials::generate(duration);
     let federated_arn = format!("arn:aws:sts::{account}:federated-user/{name}");

@@ -62,10 +62,13 @@ For an installed Debian, Arch, or user-only executable, run `locallycloud` inste
 In another terminal:
 
 ```sh
-curl -fsS http://127.0.0.1:4566/_locallycloud/health
+localcloud_ca_file="${LOCALLYCLOUD_STATE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/state.sqlite3}.ca.pem"
+curl --cacert "$localcloud_ca_file" -fsS https://aws.localhost:4566/_locallycloud/health
 ```
 
-The default AWS endpoint is `http://127.0.0.1:4566`. Open the dashboard at [http://127.0.0.1:4566/_locallycloud/ui](http://127.0.0.1:4566/_locallycloud/ui), or inspect registered services at `http://127.0.0.1:4566/_locallycloud/status`.
+The default AWS endpoint is `https://aws.localhost:4566`. Open the dashboard at [https://aws.localhost:4566/_locallycloud/ui](https://aws.localhost:4566/_locallycloud/ui), or inspect registered services at `https://aws.localhost:4566/_locallycloud/status`.
+
+The server generates its local CA automatically and prints the public CA file path. Trust that CA in your browser to open the dashboard. See [HTTPS setup](docs/SETUP.md#https-for-aws-clients) for SDK trust and DNS troubleshooting.
 
 ### 3. Configure the AWS profile once
 
@@ -75,7 +78,8 @@ In that second terminal, save local test credentials, the region, and the endpoi
 aws configure set aws_access_key_id test --profile locallycloud
 aws configure set aws_secret_access_key test --profile locallycloud
 aws configure set region us-east-1 --profile locallycloud
-aws configure set endpoint_url http://127.0.0.1:4566 --profile locallycloud
+aws configure set endpoint_url https://aws.localhost:4566 --profile locallycloud
+aws configure set ca_bundle "$localcloud_ca_file" --profile locallycloud
 aws --profile locallycloud sts get-caller-identity
 ```
 

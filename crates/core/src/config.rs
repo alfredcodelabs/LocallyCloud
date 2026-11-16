@@ -46,8 +46,10 @@ pub struct LocallyCloudConfig {
     pub account_id: String,
     /// Default AWS region applied when a request carries none. Default: `us-east-1`.
     pub default_region: String,
-    /// Optional AWS control-plane TLS identity, separate from API Gateway custom domains.
+    /// Optional explicit AWS TLS identity. None uses the persistent local CA automatically.
     pub tls: Option<ControlPlaneTls>,
+    /// Accept plaintext HTTP in addition to HTTPS. Default: false.
+    pub allow_http: bool,
     /// Serve the embedded dashboard and its `/_locallycloud/explore/*` read path.
     /// `LOCALLYCLOUD_UI=off` removes every dashboard route. Default: on.
     pub ui_enabled: bool,
@@ -176,6 +178,15 @@ const DEFAULT_REGION: &str = "us-east-1";
 impl LocallyCloudConfig {
     /// Resolve configuration from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
+        if matches!(
+            std::env::var("LOCALLYCLOUD_ALLOW_HTTP"),
+            Err(std::env::VarError::NotUnicode(_))
+        ) {
+            return Err(ConfigError::new(
+                "LOCALLYCLOUD_ALLOW_HTTP",
+                "expected UTF-8 true or false",
+            ));
+        }
         for setting in [
             LAMBDA_ACCOUNT_CONCURRENCY,
             LAMBDA_MIN_UNRESERVED,
@@ -327,6 +338,17 @@ impl LocallyCloudConfig {
             }
         };
 
+        let allow_http = match get("LOCALLYCLOUD_ALLOW_HTTP").as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            _ => {
+                return Err(ConfigError::new(
+                    "LOCALLYCLOUD_ALLOW_HTTP",
+                    "expected true or false",
+                ))
+            }
+        };
+
         let ui_enabled = match resolve(get, &["LOCALLYCLOUD_UI"]) {
             Some((v, src)) => parse_ui(&v, src)?,
             None => true,
@@ -344,6 +366,7 @@ impl LocallyCloudConfig {
             account_id,
             default_region,
             tls,
+            allow_http,
             ui_enabled,
             lambda_concurrency: LambdaConcurrencyConfig::resolve(get)?,
             events_retry_second: retry_second(get)?,
@@ -562,6 +585,26 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(config.tls.unwrap().hostname, "localhost");
+    }
+
+    #[test]
+    fn plaintext_http_requires_an_explicit_compatibility_setting() {
+        assert!(!LocallyCloudConfig::resolve(&env(&[])).unwrap().allow_http);
+        assert!(
+            LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_ALLOW_HTTP", "true")]))
+                .unwrap()
+                .allow_http
+        );
+        assert!(
+            !LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_ALLOW_HTTP", "false")]))
+                .unwrap()
+                .allow_http
+        );
+        for invalid in ["", "1", "TRUE", "yes"] {
+            assert!(
+                LocallyCloudConfig::resolve(&env(&[("LOCALLYCLOUD_ALLOW_HTTP", invalid)])).is_err()
+            );
+        }
     }
 
     #[test]

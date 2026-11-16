@@ -41,6 +41,7 @@ impl Server {
         );
         let config = LocallyCloudConfig::resolve(&|name| match name {
             "LOCALLYCLOUD_UI" => Some("off".into()),
+            "LOCALLYCLOUD_ALLOW_HTTP" => Some("true".into()),
             "LOCALLYCLOUD_LEGACY_BACKEND_URL" => Some("http://127.0.0.1:1".into()),
             _ => None,
         })

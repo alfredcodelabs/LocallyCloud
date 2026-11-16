@@ -65,7 +65,7 @@ impl Persistence {
                     let payload = self
                         .cipher
                         .seal(&["ec2", &key.0, &key.1, change.kind, &change.id], clear)?;
-                    transaction.execute("INSERT INTO ec2_records(account,region,kind,id,version,payload) VALUES (?1,?2,?3,?4,1,?5) ON CONFLICT(account,region,kind,id) DO UPDATE SET payload=excluded.payload",params![key.0,key.1,change.kind,change.id,payload])?;
+                    transaction.execute("INSERT INTO ec2_records(account,region,kind,id,version,payload) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(account,region,kind,id) DO UPDATE SET version=excluded.version,payload=excluded.payload",params![key.0,key.1,change.kind,change.id,if change.kind == "sg" { 2 } else { 1 },payload])?;
                 }
                 None => {
                     transaction.execute("DELETE FROM ec2_records WHERE account=?1 AND region=?2 AND kind=?3 AND id=?4",params![key.0,key.1,change.kind,change.id])?;
@@ -87,7 +87,7 @@ impl Persistence {
             let id: String = row.get(3)?;
             let version: u32 = row.get(4)?;
             let payload: Vec<u8> = row.get(5)?;
-            if version != 1 || id.is_empty() {
+            if !(version == 1 || (kind == "sg" && version == 2)) || id.is_empty() {
                 return Err(invalid());
             }
             let clear = self
@@ -115,7 +115,24 @@ impl Persistence {
                     scope.vpc_dns.insert(id, serde_json::from_slice(&clear)?);
                 }
                 "subnet" => restore!(Subnet, subnets),
-                "sg" => restore!(SecurityGroup, security_groups),
+                "sg" => {
+                    let mut group: SecurityGroup = serde_json::from_slice(&clear)?;
+                    if group.id != id {
+                        return Err(invalid());
+                    }
+                    // Version 1 enforced this permission implicitly. Version 2 persists it,
+                    // including its absence after a successful revocation.
+                    if version == 1
+                        && group.is_default
+                        && !group.ingress.iter().any(|rule| {
+                            rule.protocol == "-1"
+                                && matches!(&rule.peer, RulePeer::Group(peer) if peer == &id)
+                        })
+                    {
+                        group.ingress.extend(default_ingress(&id));
+                    }
+                    scope.security_groups.insert(id, group);
+                }
                 "eni" => restore!(NetworkInterface, network_interfaces),
                 "route-table" => restore!(RouteTable, route_tables),
                 "igw" => restore!(InternetGateway, internet_gateways),

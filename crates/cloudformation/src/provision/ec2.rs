@@ -17,17 +17,23 @@ impl Provisioner {
                 "InstanceTenancy",
                 "EnableDnsSupport",
                 "EnableDnsHostnames",
+                "Tags",
             ],
         )?;
         let cidr = required_property(props, "CidrBlock", logical_id)?;
-        let mut fields = vec![("CidrBlock", cidr.as_str())];
+        let mut fields = ec2_tag_fields(logical_id, props, "vpc")?;
+        fields.push(("CidrBlock".into(), cidr.clone()));
         if let Some(tenancy) = props.get("InstanceTenancy") {
             let tenancy = tenancy.as_str().ok_or_else(|| {
                 CfnError::Validation(format!("{logical_id} requires string InstanceTenancy"))
             })?;
-            fields.push(("InstanceTenancy", tenancy));
+            fields.push(("InstanceTenancy".into(), tenancy.to_owned()));
         }
-        let xml = self.call_ec2("CreateVpc", &fields, logical_id).await?;
+        let borrowed: Vec<_> = fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let xml = self.call_ec2("CreateVpc", &borrowed, logical_id).await?;
         let id = ec2_id(&xml, "vpcId", "vpc-", logical_id)?;
         for (name, value) in [
             ("EnableDnsSupport", props.get("EnableDnsSupport")),
@@ -75,11 +81,15 @@ impl Provisioner {
             logical_id,
             "AWS::EC2::Subnet",
             props,
-            &["VpcId", "CidrBlock", "AvailabilityZone"],
+            &["VpcId", "CidrBlock", "AvailabilityZone", "Tags"],
         )?;
         let vpc = required_property(props, "VpcId", logical_id)?;
         let cidr = required_property(props, "CidrBlock", logical_id)?;
-        let mut fields = vec![("VpcId", vpc.as_str()), ("CidrBlock", cidr.as_str())];
+        let mut fields = ec2_tag_fields(logical_id, props, "subnet")?;
+        fields.extend([
+            ("VpcId".into(), vpc.clone()),
+            ("CidrBlock".into(), cidr.clone()),
+        ]);
         if let Some(zone) = props.get("AvailabilityZone") {
             let zone = zone
                 .as_str()
@@ -87,9 +97,13 @@ impl Provisioner {
                 .ok_or_else(|| {
                     CfnError::Validation(format!("{logical_id} requires string AvailabilityZone"))
                 })?;
-            fields.push(("AvailabilityZone", zone));
+            fields.push(("AvailabilityZone".into(), zone.to_owned()));
         }
-        let xml = self.call_ec2("CreateSubnet", &fields, logical_id).await?;
+        let borrowed: Vec<_> = fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let xml = self.call_ec2("CreateSubnet", &borrowed, logical_id).await?;
         let id = ec2_id(&xml, "subnetId", "subnet-", logical_id)?;
         let zone = ec2_tag(&xml, "availabilityZone").ok_or_else(|| {
             CfnError::ResourceFailed(format!("EC2 returned no availabilityZone for {logical_id}"))
@@ -210,7 +224,7 @@ impl Provisioner {
         };
         let ingress = parse_rules("SecurityGroupIngress")?;
         let egress = parse_rules("SecurityGroupEgress")?;
-        let mut create_fields = security_group_tag_fields(logical_id, props)?;
+        let mut create_fields = ec2_tag_fields(logical_id, props, "security-group")?;
         create_fields.extend([
             ("VpcId".into(), vpc.clone()),
             ("GroupName".into(), name),
@@ -833,7 +847,11 @@ pub(crate) fn validate_network_property_names(
     ensure_known_properties(logical_id, kind, props, allowed)
 }
 
-fn security_group_tag_fields(id: &str, props: &Value) -> Result<Vec<(String, String)>, CfnError> {
+fn ec2_tag_fields(
+    id: &str,
+    props: &Value,
+    resource_type: &str,
+) -> Result<Vec<(String, String)>, CfnError> {
     let Some(tags) = props.get("Tags") else {
         return Ok(Vec::new());
     };
@@ -875,7 +893,7 @@ fn security_group_tag_fields(id: &str, props: &Value) -> Result<Vec<(String, Str
     if !fields.is_empty() {
         fields.push((
             "TagSpecification.1.ResourceType".into(),
-            "security-group".into(),
+            resource_type.into(),
         ));
     }
     Ok(fields)
@@ -896,9 +914,24 @@ mod tests {
             "000000000000".into(),
         );
         let vpc = p
-            .ec2_vpc("Vpc", &json!({"CidrBlock":"10.55.0.0/16"}))
+            .ec2_vpc("Vpc", &json!({"CidrBlock":"10.55.0.0/16", "Tags":[{"Key":"Owner","Value":"Accounting&Ops"}]}))
             .await
             .unwrap();
+        let subnet = p.ec2_subnet("Subnet", &json!({"VpcId":vpc.ref_value,"CidrBlock":"10.55.1.0/24", "Tags":[{"Key":"Name","Value":"private"}]})).await.unwrap();
+        let xml = p
+            .call_ec2("DescribeVpcs", &[("VpcId.1", &vpc.ref_value)], "Vpc")
+            .await
+            .unwrap();
+        assert!(xml.contains("<key>Owner</key><value>Accounting&amp;Ops</value>"));
+        let xml = p
+            .call_ec2(
+                "DescribeSubnets",
+                &[("SubnetId.1", &subnet.ref_value)],
+                "Subnet",
+            )
+            .await
+            .unwrap();
+        assert!(xml.contains("<key>Name</key><value>private</value>"));
         let props = json!({"VpcId":vpc.ref_value,"GroupDescription":"tagged group", "Tags":[{"Key":"Owner","Value":"Accounting&Ops"}],"SecurityGroupIngress":[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"CidrIp":"10.55.0.0/16","Description":"SAP delivery"}],"SecurityGroupEgress":[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"CidrIp":"0.0.0.0/0","Description":"SAP outbound"}]});
         let group = p
             .ec2_security_group("Group", "accounting", &props)

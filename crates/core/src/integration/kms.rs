@@ -223,3 +223,121 @@ pub trait KmsInternalApi: Send + Sync {
         request: KmsValidateKeyRequest,
     ) -> Result<KmsValidateKeyOutput, KmsInternalError>;
 }
+
+impl super::InternalDispatcher {
+    /// Resolve the concrete key and preserve the authenticated caller for a native KMS hop.
+    /// Identity permission is evidence for key-policy delegation, never a substitute for it.
+    pub async fn kms_call_context(
+        &self,
+        request: &crate::handler::ServiceRequest,
+        service: &str,
+        action: &str,
+        key_id: &str,
+        encryption: &BTreeMap<String, String>,
+        wait_limit: std::time::Duration,
+    ) -> Result<(KmsCallContext, String), KmsInternalError> {
+        if !matches!(
+            action,
+            "kms:Encrypt" | "kms:Decrypt" | "kms:GenerateDataKey"
+        ) {
+            return Err(KmsInternalError::InvalidRequest);
+        }
+        let identity = super::RequestIdentity {
+            account_id: request.account_id.clone(),
+            access_key_id: request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(super::RequestIdentity::access_key_from_authorization),
+            arn: None,
+        };
+        let delegated_identity = super::identity::trusted_role(request);
+        let service_principal = request
+            .headers
+            .get("x-locallycloud-verified-internal-scope")
+            .filter(|value| *value == "1")
+            .and_then(|_| request.headers.get(super::identity::PRINCIPAL_HEADER))
+            .and_then(|value| value.to_str().ok())
+            .filter(|principal| {
+                principal
+                    .strip_suffix(".amazonaws.com")
+                    .is_some_and(|service| {
+                        !service.is_empty()
+                            && service
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    })
+            });
+        let caller_arn = match &delegated_identity {
+            Some(super::identity::CallerIdentity::AssumedRole { role_arn, .. }) => {
+                Some(role_arn.clone())
+            }
+            _ if service_principal.is_some() => service_principal.map(str::to_owned),
+            _ => self
+                .resolve_caller_arn(&identity)
+                .map_err(|_| KmsInternalError::AccessDenied)?,
+        };
+        let mut call = KmsCallContext {
+            source_service: service.into(),
+            account_id: request.account_id.clone(),
+            region: request.region.clone(),
+            request_id: request.request_id.clone(),
+            caller_arn,
+            iam_policy_allowed: false,
+            iam_policy_denied: false,
+        };
+        let resolved = self
+            .kms_validate_key_bounded(
+                KmsValidateKeyRequest {
+                    call: call.clone(),
+                    key_id: key_id.into(),
+                },
+                wait_limit,
+            )
+            .await?;
+        let mut context = BTreeMap::from([
+            (
+                "kms:viaservice".into(),
+                vec![format!("{service}.{}.amazonaws.com", request.region)],
+            ),
+            ("kms:calleraccount".into(), vec![request.account_id.clone()]),
+            ("aws:requestedregion".into(), vec![request.region.clone()]),
+            (
+                "kms:encryptioncontextkeys".into(),
+                encryption.keys().cloned().collect(),
+            ),
+        ]);
+        for (key, value) in encryption {
+            context
+                .entry(format!(
+                    "kms:encryptioncontext:{}",
+                    key.to_ascii_lowercase()
+                ))
+                .or_insert_with(Vec::new)
+                .push(value.clone());
+        }
+        if let Some(arn) = &call.caller_arn {
+            context.insert("aws:principalarn".into(), vec![arn.clone()]);
+            context.insert(
+                "aws:principalaccount".into(),
+                vec![request.account_id.clone()],
+            );
+        }
+        let authorization = super::authorization::AuthorizationRequest {
+            request_identity: identity,
+            delegated_identity,
+            source_service: service.into(),
+            action: action.into(),
+            resource: resolved.key_arn.clone(),
+            context,
+        };
+        // AWS service principals have no identity policy. Their key-policy grant is still
+        // checked by KMS; only Core-attested internal calls can take this path.
+        if service_principal.is_none() {
+            call.iam_policy_denied = (call.caller_arn.is_some() || self.strict_sigv4_required())
+                && self.identity_policy_denies(authorization.clone());
+            call.iam_policy_allowed = self.identity_policy_allows(authorization);
+        }
+        Ok((call, resolved.key_arn))
+    }
+}

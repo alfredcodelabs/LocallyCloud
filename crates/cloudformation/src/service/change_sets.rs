@@ -186,6 +186,7 @@ mod tests {
 
     fn change(id: &str, stack_id: &str) -> ChangeSet {
         ChangeSet {
+            validated_role_arn: None,
             id: id.into(),
             name: id.into(),
             stack_name: "review".into(),

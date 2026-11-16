@@ -9,6 +9,7 @@ use locallycloud_core::{
         authorization::{
             AuthorizationError, AuthorizationEvaluator, AuthorizationRequest, ResourcePolicyError,
         },
+        identity::{CallerIdentity, IdentityPropagator},
         RequestIdentity,
     },
     registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry},
@@ -572,9 +573,12 @@ async fn delegated_roles_and_service_principals_do_not_bypass_policy() {
         "x-locallycloud-verified-internal-scope",
         HeaderValue::from_static("1"),
     );
-    delegated.headers.insert(
-        "x-locallycloud-caller-principal",
-        HeaderValue::from_static("arn:aws:iam::000000000000:role/worker/execution"),
+    IdentityPropagator::attach(
+        &mut delegated.headers,
+        &CallerIdentity::AssumedRole {
+            role_arn: "arn:aws:iam::000000000000:role/worker".into(),
+            session_name: "execution".into(),
+        },
     );
     assert_eq!(f.s3.handle(delegated.clone()).await.status(), 200);
     let deny = r#"{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-source/*"}}"#;
@@ -609,9 +613,11 @@ async fn delegated_roles_and_service_principals_do_not_bypass_policy() {
     assert_eq!(f.policy("policy-source", deny_source).await.status(), 204);
     assert_eq!(f.s3.handle(delegated.clone()).await.status(), 200);
     let mut service = delegated.clone();
-    service.headers.insert(
-        "x-locallycloud-caller-principal",
-        HeaderValue::from_static("states.amazonaws.com"),
+    IdentityPropagator::attach(
+        &mut service.headers,
+        &CallerIdentity::ServicePrincipal {
+            service: "states".into(),
+        },
     );
     // Without Source context this explicit Allow would pass; the matching Deny proves retention.
     let source_service_policy = r#"{"Statement":[{"Effect":"Allow","Principal":{"Service":"states.amazonaws.com"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-source/*"},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-source/*","Condition":{"Null":{"aws:SourceArn":"false","aws:SourceAccount":"false"}}}]}"#;
@@ -622,9 +628,11 @@ async fn delegated_roles_and_service_principals_do_not_bypass_policy() {
         204
     );
     assert_eq!(f.s3.handle(service).await.status(), 403);
-    delegated.headers.insert(
-        "x-locallycloud-caller-principal",
-        HeaderValue::from_static("states.amazonaws.com"),
+    IdentityPropagator::attach(
+        &mut delegated.headers,
+        &CallerIdentity::ServicePrincipal {
+            service: "states".into(),
+        },
     );
     assert_eq!(f.s3.handle(delegated.clone()).await.status(), 403);
     let service_allow = r#"{"Statement":{"Effect":"Allow","Principal":{"Service":"states.amazonaws.com"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-source/*","Condition":{"Bool":{"aws:PrincipalIsAWSService":"true"}}}}"#;

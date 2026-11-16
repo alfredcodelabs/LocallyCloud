@@ -33,13 +33,15 @@ mod start_instances;
 pub use private_tcp::{PrivateConnectionTarget, PrivateTargetOwner};
 mod security_group_egress;
 use endpoints::VpcEndpoint;
-use security_group_egress::{default_egress, permission_xml};
+use security_group_egress::{default_egress, default_ingress, permission_xml};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Vpc {
     id: String,
     cidr: Ipv4Net,
     owner: String,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -51,6 +53,8 @@ struct Subnet {
     owner: String,
     #[serde(skip)]
     guard: Arc<()>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -71,6 +75,8 @@ impl RulePeer {
         }
     }
 }
+
+const MAX_SECURITY_GROUP_RULES: usize = 60;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct IngressRule {
@@ -844,14 +850,7 @@ impl Ec2Handler {
         let key = (req.account_id.clone(), req.region.clone());
         match action {
             "CreateVpc" => {
-                input.allow(&[
-                    "Action",
-                    "Version",
-                    "CidrBlock",
-                    "DryRun",
-                    "InstanceTenancy",
-                    "AmazonProvidedIpv6CidrBlock",
-                ])?;
+                let tags = input.vpc_tags()?;
                 input.dry_run()?;
                 match input.one("AmazonProvidedIpv6CidrBlock")? {
                     None | Some("false") => {}
@@ -875,6 +874,7 @@ impl Ec2Handler {
                     id: id.clone(),
                     cidr,
                     owner: req.account_id.clone(),
+                    tags,
                 };
                 let mut state = self.scopes.lock().unwrap();
                 let scope = state.entry(key.clone()).or_default();
@@ -896,7 +896,7 @@ impl Ec2Handler {
                     owner: req.account_id.clone(),
                     is_default: true,
                     tags: BTreeMap::new(),
-                    ingress: Vec::new(),
+                    ingress: default_ingress(&default_id),
                     egress: default_egress(),
                     guard: Arc::new(()),
                 };
@@ -919,7 +919,8 @@ impl Ec2Handler {
             "ModifyVpcAttribute" => self.modify_vpc_attribute(key, input),
             "DescribeVpcAttribute" => self.describe_vpc_attribute(key, input),
             "DescribeVpcs" => {
-                input.allow_describe("VpcId", &["vpc-id", "cidr", "state", "owner-id"])?;
+                input
+                    .allow_describe("VpcId", &["vpc-id", "cidr", "state", "owner-id", "tag-key"])?;
                 let ids = input.indexed("VpcId")?;
                 let filters = input.filters()?;
                 let state = self.scopes.lock().unwrap();
@@ -945,7 +946,7 @@ impl Ec2Handler {
                             "cidr" => vals.contains(&vpc.cidr.to_string()),
                             "state" => vals.iter().any(|v| v == "available"),
                             "owner-id" => vals.contains(&vpc.owner),
-                            _ => false,
+                            name => security_group_tags::tag_filter(&vpc.tags, name, vals),
                         })
                     })
                     .map(|vpc| format!("<item>{}</item>", vpc_xml(vpc)))
@@ -1022,14 +1023,7 @@ impl Ec2Handler {
                 Ok("<return>true</return>".into())
             }
             "CreateSubnet" => {
-                input.allow(&[
-                    "Action",
-                    "Version",
-                    "VpcId",
-                    "CidrBlock",
-                    "AvailabilityZone",
-                    "DryRun",
-                ])?;
+                let tags = input.subnet_tags()?;
                 input.dry_run()?;
                 let vpc_id = input.required("VpcId")?;
                 let cidr = parse_cidr(input.required("CidrBlock")?, "CidrBlock")?;
@@ -1078,6 +1072,7 @@ impl Ec2Handler {
                     zone,
                     owner: req.account_id.clone(),
                     guard: Arc::new(()),
+                    tags,
                 };
                 self.persist(&key, &[Change::put("subnet", &id, &subnet)?])?;
                 scope.subnets.insert(id, subnet.clone());
@@ -1095,6 +1090,7 @@ impl Ec2Handler {
                         "cidr-block",
                         "state",
                         "availability-zone",
+                        "tag-key",
                     ],
                 )?;
                 let ids = input.indexed("SubnetId")?;
@@ -1123,7 +1119,7 @@ impl Ec2Handler {
                             "cidr-block" => vals.contains(&subnet.cidr.to_string()),
                             "state" => vals.iter().any(|v| v == "available"),
                             "availability-zone" => vals.contains(&subnet.zone),
-                            _ => false,
+                            name => security_group_tags::tag_filter(&subnet.tags, name, vals),
                         })
                     })
                     .map(|subnet| {
@@ -1300,7 +1296,7 @@ impl Ec2Handler {
     ) -> Result<String, Ec2Error> {
         input.allow_describe(
             "GroupId",
-            &["group-id", "group-name", "vpc-id", "description"],
+            &["group-id", "group-name", "vpc-id", "description", "tag-key"],
         )?;
         let ids = input.indexed("GroupId")?;
         let filters = input.filters()?;
@@ -1333,7 +1329,7 @@ impl Ec2Handler {
                     "group-name" => vals.contains(&group.name),
                     "vpc-id" => vals.contains(&group.vpc_id),
                     "description" => vals.contains(&group.description),
-                    _ => false,
+                    name => security_group_tags::tag_filter(&group.tags, name, vals),
                 })
             })
             .map(|group| format!("<item>{}</item>", group_xml(group)))
@@ -3154,7 +3150,10 @@ impl Input {
         }
         self.dry_run()?;
         for (name, _) in self.filters()? {
-            if !filters.contains(&name.as_str()) {
+            if !filters.contains(&name.as_str())
+                && !(filters.contains(&"tag-key")
+                    && name.strip_prefix("tag:").is_some_and(|key| !key.is_empty()))
+            {
                 return Err(Ec2Error::unsupported(&format!("Filter {name}")));
             }
         }
@@ -3217,7 +3216,7 @@ impl Input {
 }
 
 impl Input {
-    fn allow_ingress(&self) -> Result<(), Ec2Error> {
+    fn ingress_rules(&self) -> Result<Vec<(IngressRule, Option<String>)>, Ec2Error> {
         let flat = [
             "Action",
             "Version",
@@ -3228,22 +3227,107 @@ impl Input {
             "ToPort",
             "CidrIp",
         ];
-        let nested = [
-            "IpPermissions.1.IpProtocol",
-            "IpPermissions.1.FromPort",
-            "IpPermissions.1.ToPort",
-            "IpPermissions.1.IpRanges.1.CidrIp",
-            "IpPermissions.1.IpRanges.1.Description",
-            "IpPermissions.1.Groups.1.Description",
-            "IpPermissions.1.Groups.1.GroupId",
-            "IpPermissions.1.Groups.1.UserId",
-        ];
-        for key in self.fields.keys() {
-            if !flat.contains(&key.as_str()) && !nested.contains(&key.as_str()) {
-                return Err(Ec2Error::unsupported(key));
+        let mut permissions: BTreeMap<usize, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        for (key, values) in &self.fields {
+            if flat.contains(&key.as_str()) {
+                continue;
+            }
+            let (index, field) = key
+                .strip_prefix("IpPermissions.")
+                .and_then(|value| value.split_once('.'))
+                .ok_or_else(|| Ec2Error::unsupported(key))?;
+            let number = list_index(index, MAX_SECURITY_GROUP_RULES)?;
+            permissions
+                .entry(number)
+                .or_default()
+                .insert(field.into(), values.clone());
+        }
+        if permissions.is_empty() {
+            return Ok(vec![(self.ingress_rule()?, None)]);
+        }
+        if ["IpProtocol", "FromPort", "ToPort", "CidrIp"]
+            .iter()
+            .any(|key| self.fields.contains_key(*key))
+        {
+            return Err(Ec2Error::new(
+                "InvalidParameterValue",
+                "Cannot mix flat and IpPermissions rule parameters",
+            ));
+        }
+        let mut rules = Vec::new();
+        for (expected, (index, fields)) in permissions.into_iter().enumerate() {
+            if index != expected + 1 {
+                return Err(Ec2Error::new(
+                    "InvalidParameterValue",
+                    "IpPermissions indexes must be consecutive",
+                ));
+            }
+            let mut common = BTreeMap::new();
+            let mut peers: BTreeMap<&str, BTreeMap<usize, BTreeMap<String, Vec<String>>>> =
+                BTreeMap::new();
+            for (field, values) in &fields {
+                if ["IpProtocol", "FromPort", "ToPort"].contains(&field.as_str()) {
+                    common.insert(format!("IpPermissions.1.{field}"), values.clone());
+                    continue;
+                }
+                let (kind, tail) = field
+                    .split_once('.')
+                    .ok_or_else(|| Ec2Error::unsupported(field))?;
+                let (index, attribute) = tail
+                    .split_once('.')
+                    .ok_or_else(|| Ec2Error::unsupported(field))?;
+                let supported = match kind {
+                    "IpRanges" => matches!(attribute, "CidrIp" | "Description"),
+                    "Groups" => matches!(attribute, "GroupId" | "UserId" | "Description"),
+                    _ => false,
+                };
+                if !supported {
+                    return Err(Ec2Error::unsupported(field));
+                }
+                peers
+                    .entry(kind)
+                    .or_default()
+                    .entry(list_index(index, MAX_SECURITY_GROUP_RULES)?)
+                    .or_default()
+                    .insert(
+                        format!("IpPermissions.1.{kind}.1.{attribute}"),
+                        values.clone(),
+                    );
+            }
+            if peers.is_empty() {
+                return Err(Ec2Error::new(
+                    "InvalidParameterValue",
+                    "Specify a CIDR or security group peer",
+                ));
+            }
+            for entries in peers.into_values() {
+                for (expected, (index, attributes)) in entries.into_iter().enumerate() {
+                    if index != expected + 1 {
+                        return Err(Ec2Error::new(
+                            "InvalidParameterValue",
+                            "Peer indexes must be consecutive",
+                        ));
+                    }
+                    if rules.len() >= MAX_SECURITY_GROUP_RULES {
+                        return Err(Ec2Error::new(
+                            "RulesPerSecurityGroupLimitExceeded",
+                            "Too many security group rules",
+                        ));
+                    }
+                    let mut fields = common.clone();
+                    fields.extend(attributes);
+                    let permission = Input {
+                        fields,
+                        planned_ids: BTreeMap::new(),
+                    };
+                    let owner = permission
+                        .one("IpPermissions.1.Groups.1.UserId")?
+                        .map(str::to_owned);
+                    rules.push((permission.ingress_rule()?, owner));
+                }
             }
         }
-        Ok(())
+        Ok(rules)
     }
 
     fn ingress_rule(&self) -> Result<IngressRule, Ec2Error> {
@@ -3408,19 +3492,11 @@ fn ports_xml(from: Option<u16>, to: Option<u16>) -> String {
 }
 
 fn group_xml(group: &SecurityGroup) -> String {
-    let mut ingress = if group.is_default {
-        format!("<item><ipProtocol>-1</ipProtocol><groups><item><userId>{}</userId><groupId>{}</groupId></item></groups><ipRanges/><ipv6Ranges/><prefixListIds/></item>",
-            escape(&group.owner), escape(&group.id))
-    } else {
-        String::new()
-    };
-    ingress.push_str(
-        &group
-            .ingress
-            .iter()
-            .map(|rule| permission_xml(rule, &group.owner))
-            .collect::<String>(),
-    );
+    let ingress = group
+        .ingress
+        .iter()
+        .map(|rule| permission_xml(rule, &group.owner))
+        .collect::<String>();
     let egress = group
         .egress
         .iter()
@@ -3450,6 +3526,14 @@ fn eni_xml(eni: &NetworkInterface, scope: &ScopeState, _region: &str) -> String 
     };
     format!("<networkInterfaceId>{}</networkInterfaceId><subnetId>{}</subnetId><vpcId>{}</vpcId><availabilityZone>{}</availabilityZone><description>{}</description><ownerId>{}</ownerId><requesterManaged>false</requesterManaged><status>{status}</status><privateIpAddress>{}</privateIpAddress><sourceDestCheck>true</sourceDestCheck><groupSet>{groups}</groupSet><tagSet/><privateIpAddressesSet><item><privateIpAddress>{}</privateIpAddress><primary>true</primary></item></privateIpAddressesSet><ipv6AddressesSet/>",
         escape(&eni.id), escape(&eni.subnet_id), escape(&eni.vpc_id), escape(&eni.zone), escape(&eni.description), escape(&eni.owner), eni.private_ip, eni.private_ip)
+}
+
+fn list_index(value: &str, maximum: usize) -> Result<usize, Ec2Error> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|index| (1..=maximum).contains(index) && index.to_string() == value)
+        .ok_or_else(|| Ec2Error::new("InvalidParameterValue", "Invalid list index"))
 }
 
 fn indexed_key(key: &str, prefix: &str) -> Option<usize> {
@@ -3499,8 +3583,8 @@ fn escape(value: &str) -> String {
 }
 
 fn vpc_xml(vpc: &Vpc) -> String {
-    format!("<vpcId>{}</vpcId><ownerId>{}</ownerId><state>available</state><cidrBlock>{}</cidrBlock><cidrBlockAssociationSet/><ipv6CidrBlockAssociationSet/><instanceTenancy>default</instanceTenancy><isDefault>false</isDefault><tagSet/>",
-        escape(&vpc.id), escape(&vpc.owner), vpc.cidr)
+    format!("<vpcId>{}</vpcId><ownerId>{}</ownerId><state>available</state><cidrBlock>{}</cidrBlock><cidrBlockAssociationSet/><ipv6CidrBlockAssociationSet/><instanceTenancy>default</instanceTenancy><isDefault>false</isDefault>{}",
+        escape(&vpc.id), escape(&vpc.owner), vpc.cidr, tags_xml(&vpc.tags))
 }
 
 fn subnet_xml(subnet: &Subnet, region: &str, scope: &ScopeState) -> String {
@@ -3515,8 +3599,8 @@ fn subnet_xml(subnet: &Subnet, region: &str, scope: &ScopeState) -> String {
             .filter(|nat| nat.subnet_id.as_deref() == Some(&subnet.id))
             .count()) as u32;
     let available = (1_u32 << (32 - subnet.cidr.prefix_len())) - 5 - used;
-    format!("<subnetId>{}</subnetId><subnetArn>arn:aws:ec2:{}:{}:subnet/{}</subnetArn><state>available</state><ownerId>{}</ownerId><vpcId>{}</vpcId><cidrBlock>{}</cidrBlock><availableIpAddressCount>{available}</availableIpAddressCount><availabilityZone>{}</availabilityZone><defaultForAz>false</defaultForAz><mapPublicIpOnLaunch>false</mapPublicIpOnLaunch><assignIpv6AddressOnCreation>false</assignIpv6AddressOnCreation><ipv6CidrBlockAssociationSet/><tagSet/>",
-        escape(&subnet.id), escape(region), escape(&subnet.owner), escape(&subnet.id), escape(&subnet.owner), escape(&subnet.vpc_id), subnet.cidr, escape(&subnet.zone))
+    format!("<subnetId>{}</subnetId><subnetArn>arn:aws:ec2:{}:{}:subnet/{}</subnetArn><state>available</state><ownerId>{}</ownerId><vpcId>{}</vpcId><cidrBlock>{}</cidrBlock><availableIpAddressCount>{available}</availableIpAddressCount><availabilityZone>{}</availabilityZone><defaultForAz>false</defaultForAz><mapPublicIpOnLaunch>false</mapPublicIpOnLaunch><assignIpv6AddressOnCreation>false</assignIpv6AddressOnCreation><ipv6CidrBlockAssociationSet/>{}",
+        escape(&subnet.id), escape(region), escape(&subnet.owner), escape(&subnet.id), escape(&subnet.owner), escape(&subnet.vpc_id), subnet.cidr, escape(&subnet.zone), tags_xml(&subnet.tags))
 }
 
 #[cfg(test)]

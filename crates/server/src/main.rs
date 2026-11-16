@@ -106,6 +106,22 @@ impl locallycloud_region_switch::ExecutionRoleAuthorizer for IamExecutionRoleAut
             "route53-recovery-cluster:UpdateRoutingControlStates",
         ] {
             let auth = ServiceRoleAuthorizationRequest {
+                delegated_caller: match phase {
+                    locallycloud_region_switch::RoleAuthorizationPhase::PlanCreation => {
+                        locallycloud_core::integration::identity::trusted_role(request)
+                    }
+                    locallycloud_region_switch::RoleAuthorizationPhase::Execution => None,
+                },
+                caller_context: match phase {
+                    locallycloud_region_switch::RoleAuthorizationPhase::PlanCreation => {
+                        locallycloud_core::integration::request_context::verified_request_context(
+                            request,
+                        )
+                    }
+                    locallycloud_region_switch::RoleAuthorizationPhase::Execution => {
+                        Default::default()
+                    }
+                },
                 source_arn: None,
                 caller: caller.clone(),
                 role_arn: role_arn.into(),
@@ -403,6 +419,21 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let external_https = config.external_endpoint.as_deref().is_some_and(|endpoint| {
+        endpoint.parse::<http::Uri>().is_ok_and(|uri| {
+            uri.scheme_str()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+                && uri.authority().is_some()
+        })
+    });
+    if config.external_endpoint.is_none() || (!config.allow_http && !external_https) {
+        let hostname = config
+            .tls
+            .as_ref()
+            .map_or("aws.localhost", |tls| tls.hostname.as_str());
+        config.external_endpoint =
+            Some(format!("https://{hostname}:{}", config.listen_addr.port()));
+    }
     let endpoint =
         EndpointResolver::resolve(config.external_endpoint.as_deref(), config.listen_addr);
     tracing::info!(
@@ -498,7 +529,11 @@ async fn main() {
         tracing::error!(%error, "failed to register DynamoDB");
         std::process::exit(4);
     }
-    if let Err(error) = locallycloud_s3::register_with_state(&registry, state.clone()) {
+    if let Err(error) = locallycloud_s3::register_with_state_and_endpoint(
+        &registry,
+        state.clone(),
+        endpoint.guest_endpoint(),
+    ) {
         tracing::error!(%error, "failed to register S3");
         std::process::exit(4);
     }
@@ -556,12 +591,18 @@ async fn main() {
     if let Err(error) = locallycloud_cloudformation::register_with_state_and_endpoint(
         &registry,
         state.clone(),
-        locallycloud_core::tls::GuestCallbackTls::ENDPOINT,
+        endpoint.guest_endpoint(),
     ) {
         tracing::error!(%error, "failed to load durable CloudFormation state");
         std::process::exit(4);
     }
-    let ecr = match locallycloud_ecr::register_with_state(&registry, state.clone()).await {
+    let ecr = match locallycloud_ecr::register_with_state_and_endpoint(
+        &registry,
+        state.clone(),
+        endpoint.guest_endpoint(),
+    )
+    .await
+    {
         Ok(handler) => handler,
         Err(error) => {
             tracing::error!(%error, "failed to restore durable ECR state");
@@ -585,12 +626,15 @@ async fn main() {
     if let Some(handler) = &lambda_handler {
         handler.attach_ec2(ec2.clone());
     }
-    let ecs_runtime = Arc::new(ecs_runtime::EcsOciRuntime::new(
-        Arc::downgrade(&registry),
-        ecr,
-        ec2.clone(),
-        ec2_runtime.clone(),
-    ));
+    let ecs_runtime = Arc::new(
+        ecs_runtime::EcsOciRuntime::new(
+            Arc::downgrade(&registry),
+            ecr,
+            ec2.clone(),
+            ec2_runtime.clone(),
+        )
+        .with_endpoint(endpoint.guest_endpoint().to_owned()),
+    );
     let ecs_recovery = match locallycloud_ecs::register_with_state(
         &registry,
         Some(ecs_runtime.clone()),
@@ -819,6 +863,7 @@ async fn main() {
         certificates: acm,
     };
     let server = LocallyCloudServer::new(config, registry)
+        .with_tls_state(state.clone())
         .with_tls_resolver(Arc::new(domain_tls))
         .with_architecture_source(Arc::new(
             locallycloud_architecture::CloudFormationTopology::default(),

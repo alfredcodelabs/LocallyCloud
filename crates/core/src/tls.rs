@@ -37,6 +37,11 @@ pub struct TlsIdentity {
 #[async_trait::async_trait]
 pub trait TlsIdentityResolver: Send + Sync {
     async fn resolve(&self, server_name: &str) -> Option<TlsIdentity>;
+    /// Isolated guest listeners can serve an IP certificate without SNI.
+    /// Public/domain listeners require SNI unless explicitly overridden.
+    async fn resolve_without_sni(&self) -> Option<TlsIdentity> {
+        None
+    }
 }
 
 pub fn tls_config(identity: &TlsIdentity) -> io::Result<ServerConfig> {
@@ -56,11 +61,30 @@ pub fn tls_config(identity: &TlsIdentity) -> io::Result<ServerConfig> {
 pub struct ConnectionInfo {
     pub peer: SocketAddr,
     pub server_name: Option<String>,
+    pub secure_transport: bool,
+}
+
+/// Names covered by one endpoint certificate and its single-label wildcard SAN.
+pub fn endpoint_hostname_matches(name: &str, endpoint: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let endpoint = endpoint.to_ascii_lowercase();
+    name == endpoint
+        || name == format!("sync-{endpoint}")
+        || name
+            .strip_suffix(&format!(".{endpoint}"))
+            .is_some_and(|label| {
+                !label.is_empty()
+                    && !label.contains('.')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
 }
 
 pub struct DomainListener {
     tcp: TcpListener,
     resolver: Option<Arc<dyn TlsIdentityResolver>>,
+    allow_plain_http: bool,
     pending: JoinSet<()>,
     ready_tx: mpsc::Sender<(DomainIo, ConnectionInfo)>,
     ready_rx: mpsc::Receiver<(DomainIo, ConnectionInfo)>,
@@ -72,10 +96,16 @@ impl DomainListener {
         Self {
             tcp,
             resolver,
+            allow_plain_http: true,
             pending: JoinSet::new(),
             ready_tx,
             ready_rx,
         }
+    }
+
+    pub fn with_plain_http(mut self, allow: bool) -> Self {
+        self.allow_plain_http = allow;
+        self
     }
 }
 
@@ -99,10 +129,11 @@ impl Listener for DomainListener {
                         Ok((tcp, peer)) if self.pending.len() < 64 => {
                             let resolver = self.resolver.clone();
                             let tx = self.ready_tx.clone();
+                            let allow_plain_http = self.allow_plain_http;
                             self.pending.spawn(async move {
                                 // Bound both stalled HTTP peers and TLS handshakes without blocking acceptance.
                                 if let Ok(Ok(connection)) = tokio::time::timeout(
-                                    Duration::from_secs(5), negotiate(tcp, peer, resolver),
+                                    Duration::from_secs(5), negotiate(tcp, peer, resolver, allow_plain_http),
                                 ).await {
                                     let _ = tx.send(connection).await;
                                 }
@@ -123,6 +154,7 @@ impl Listener for DomainListener {
         self.tcp.local_addr().map(|peer| ConnectionInfo {
             peer,
             server_name: None,
+            secure_transport: false,
         })
     }
 }
@@ -131,17 +163,22 @@ async fn negotiate(
     tcp: TcpStream,
     peer: SocketAddr,
     resolver: Option<Arc<dyn TlsIdentityResolver>>,
+    allow_plain_http: bool,
 ) -> io::Result<(DomainIo, ConnectionInfo)> {
     let mut first = [0];
     if tcp.peek(&mut first).await? == 0 {
         return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
     }
     if first[0] != 22 {
+        if !allow_plain_http {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
         return Ok((
             DomainIo::Http(tcp),
             ConnectionInfo {
                 peer,
                 server_name: None,
+                secure_transport: false,
             },
         ));
     }
@@ -151,19 +188,20 @@ async fn negotiate(
     let server_name = start
         .client_hello()
         .server_name()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?
-        .to_ascii_lowercase();
-    let identity = resolver
-        .resolve(&server_name)
-        .await
-        .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
+        .map(str::to_ascii_lowercase);
+    let identity = match &server_name {
+        Some(name) => resolver.resolve(name).await,
+        None => resolver.resolve_without_sni().await,
+    }
+    .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
     let config = tls_config(&identity)?;
     let stream = start.into_stream(Arc::new(config)).await?;
     Ok((
         DomainIo::Https(Box::new(stream)),
         ConnectionInfo {
             peer,
-            server_name: Some(server_name),
+            server_name,
+            secure_transport: true,
         },
     ))
 }

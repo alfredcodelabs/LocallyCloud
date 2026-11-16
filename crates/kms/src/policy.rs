@@ -1,13 +1,14 @@
 //! Deliberately small KMS key-policy evaluator. Unsupported policy constructs fail closed.
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::KmsError;
 
 #[derive(Clone)]
 pub(crate) struct KeyPolicy {
-    raw: String,
-    statements: Vec<Statement>,
+    raw: Arc<str>,
+    statements: Arc<[Statement]>,
 }
 
 #[derive(Clone)]
@@ -71,7 +72,10 @@ impl KeyPolicy {
             if principals.is_empty() {
                 return Err(KmsError::Validation);
             }
-            let actions = strings(entry.get("Action").ok_or(KmsError::Validation)?)?;
+            let actions: Vec<_> = strings(entry.get("Action").ok_or(KmsError::Validation)?)?
+                .into_iter()
+                .map(|action| action.to_ascii_lowercase())
+                .collect();
             let resources = strings(entry.get("Resource").ok_or(KmsError::Validation)?)?;
             if actions.is_empty() || resources.is_empty() || resources.iter().any(|r| r != "*") {
                 return Err(KmsError::Unsupported);
@@ -134,7 +138,10 @@ impl KeyPolicy {
                 conditions: parsed_conditions,
             });
         }
-        Ok(Self { raw, statements })
+        Ok(Self {
+            raw: raw.into(),
+            statements: statements.into(),
+        })
     }
 
     pub(crate) fn raw(&self) -> &str {
@@ -152,6 +159,7 @@ impl KeyPolicy {
         self.allows_with_iam(principal, action, source_arn, source_account, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_with_iam(
         &self,
         principal: Option<&str>,
@@ -187,8 +195,9 @@ impl KeyPolicy {
             arn.starts_with(&format!("arn:aws:iam::{source_account}:"))
                 || arn.starts_with(&format!("arn:aws:sts::{source_account}:"))
         });
+        let action = action.to_ascii_lowercase();
         let mut allowed = false;
-        for statement in &self.statements {
+        for statement in self.statements.iter() {
             let direct = statement
                 .principals
                 .iter()
@@ -198,7 +207,7 @@ impl KeyPolicy {
                 || !statement
                     .actions
                     .iter()
-                    .any(|a| a.eq_ignore_ascii_case("kms:*") || a.eq_ignore_ascii_case(action))
+                    .any(|pattern| wildcard(pattern, &action))
                 || statement.resources.is_empty()
                 || !statement
                     .conditions
@@ -289,6 +298,16 @@ fn strings(value: &Value) -> Result<Vec<String>, KmsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_resource_arns_cannot_be_accepted_then_ignored() {
+        for resource in [
+            "arn:aws:kms:us-east-1:000000000000:key/other",
+            "arn:aws:kms:*:*:key/*",
+        ] {
+            assert!(matches!(KeyPolicy::parse(serde_json::json!({"Statement":{"Effect":"Allow","Principal":"*","Action":"kms:*","Resource":resource}}).to_string()), Err(KmsError::Unsupported)));
+        }
+    }
 
     #[test]
     fn explicit_deny_overrides_allow_and_unknown_principal_fails_closed() {

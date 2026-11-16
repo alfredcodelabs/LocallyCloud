@@ -34,6 +34,8 @@ pub(crate) fn validate_role(
         return Ok(false);
     };
     let request = ServiceRoleAuthorizationRequest {
+        delegated_caller: None,
+        caller_context: Default::default(),
         source_arn: Some(source(arn)),
         caller: RequestIdentity {
             account_id: account.into(),

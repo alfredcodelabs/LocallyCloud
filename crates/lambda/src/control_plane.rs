@@ -32,7 +32,9 @@ pub fn create_function(
             "VpcConfig requires a valid EC2 network selection".into(),
         ));
     }
-    let name = resolve_function_name(require_str(input, "FunctionName")?, region)?;
+    let reference = require_str(input, "FunctionName")?;
+    crate::model::validate_function_scope(reference, region, account)?;
+    let name = resolve_function_name(reference, region)?;
     let role = require_str(input, "Role")?;
 
     let package_type = input
@@ -411,12 +413,55 @@ pub fn list_functions(store: &FunctionStore, region: &str, account: &str) -> OpR
 
 /// `DeleteFunction` — removes the function, returning HTTP 204.
 pub fn delete_function(store: &FunctionStore, region: &str, account: &str, name: &str) -> OpResult {
+    crate::model::validate_function_scope(name, region, account)?;
+    if crate::model::function_qualifier(name).is_some() {
+        return Err(LambdaError::NotImplemented(
+            "Deleting a qualified Lambda function is not supported".into(),
+        ));
+    }
+
     let name = resolve_function_name(name, region)?;
     if store.delete(account, region, &name)? {
         Ok((204, None))
     } else {
         Err(not_found(&name))
     }
+}
+
+fn policy_target(
+    store: &FunctionStore,
+    region: &str,
+    account: &str,
+    reference: &str,
+    qualifier: Option<&str>,
+) -> Result<(String, String), LambdaError> {
+    crate::model::validate_function_scope(reference, region, account)?;
+    let name = resolve_function_name(reference, region)?;
+    let resource = store
+        .function_base_arn(account, region, &name)
+        .ok_or_else(|| not_found(&name))?;
+    let combined = crate::event_invoke::reference(reference, qualifier)?;
+    if qualifier.is_none() && crate::model::function_qualifier(reference).is_none() {
+        return Ok((name, resource));
+    }
+    let qualifier = crate::model::function_qualifier(&combined)
+        .ok_or_else(|| LambdaError::InvalidParameterValue("Invalid policy qualifier".into()))?;
+    if qualifier == "$LATEST" {
+        return Err(LambdaError::InvalidParameterValue(
+            "Policies cannot be attached to version $LATEST".into(),
+        ));
+    }
+    let exists = if qualifier.bytes().all(|byte| byte.is_ascii_digit()) {
+        store.version_exists(account, region, &name, qualifier)
+    } else {
+        store.get_alias(account, region, &name, qualifier).is_some()
+    };
+    if !exists {
+        return Err(LambdaError::ResourceNotFound(format!(
+            "Function qualifier not found: {qualifier}"
+        )));
+    }
+    Ok((name, format!("{resource}:{qualifier}")))
 }
 
 /// `AddPermission` — add one statement to the function resource policy.
@@ -427,13 +472,100 @@ pub fn add_permission(
     name: &str,
     input: &Value,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
+    add_permission_qualified(store, region, account, name, None, input)
+}
+
+pub(crate) fn add_permission_qualified(
+    store: &FunctionStore,
+    region: &str,
+    account: &str,
+    name: &str,
+    qualifier: Option<&str>,
+    input: &Value,
+) -> OpResult {
+    if input.get("Qualifier").is_some() {
+        return Err(LambdaError::InvalidParameterValue(
+            "Qualifier must be supplied in the request URI".into(),
+        ));
+    }
+    let (name, resource) = policy_target(store, region, account, name, qualifier)?;
+    for field in [
+        "PrincipalOrgID",
+        "FunctionUrlAuthType",
+        "InvokedViaFunctionUrl",
+        "EventSourceToken",
+        "RevisionId",
+    ] {
+        if input.get(field).is_some() {
+            return Err(LambdaError::NotImplemented(format!(
+                "AddPermission.{field} is not supported"
+            )));
+        }
+    }
     let statement_id = require_str(input, "StatementId")?;
+    if statement_id.len() > 100
+        || !statement_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    {
+        return Err(LambdaError::InvalidParameterValue(
+            "Invalid StatementId".into(),
+        ));
+    }
     let action = require_str(input, "Action")?;
+    if action != "*"
+        && !action.strip_prefix("lambda:").is_some_and(|verb| {
+            verb == "*" || (!verb.is_empty() && verb.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        })
+    {
+        return Err(LambdaError::InvalidParameterValue(
+            "Invalid Lambda permission action".into(),
+        ));
+    }
     let principal = require_str(input, "Principal")?;
-    let resource = store
-        .function_base_arn(account, region, &name)
-        .ok_or_else(|| not_found(&name))?;
+    if principal.chars().any(char::is_whitespace) {
+        return Err(LambdaError::InvalidParameterValue(
+            "Invalid Principal".into(),
+        ));
+    }
+    let source_arn = input
+        .get("SourceArn")
+        .map(|_| require_str(input, "SourceArn"))
+        .transpose()?;
+    if let Some(source) = source_arn {
+        let arn = locallycloud_core::integration::arn::Arn::parse(source)
+            .map_err(|_| LambdaError::InvalidParameterValue("Invalid SourceArn".into()))?;
+        if source.len() > 1024
+            || source.chars().any(char::is_control)
+            || !arn.partition.starts_with("aws")
+            || !arn
+                .partition
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !arn
+                .service
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || (!arn.account_id.is_empty()
+                && (arn.account_id.len() != 12
+                    || !arn.account_id.bytes().all(|byte| byte.is_ascii_digit())))
+        {
+            return Err(LambdaError::InvalidParameterValue(
+                "Invalid SourceArn".into(),
+            ));
+        }
+    }
+    let source_account = input
+        .get("SourceAccount")
+        .map(|_| require_str(input, "SourceAccount"))
+        .transpose()?;
+    if source_account.is_some_and(|account| {
+        account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        return Err(LambdaError::InvalidParameterValue(
+            "SourceAccount must be a 12-digit account ID".into(),
+        ));
+    }
     let principal = if principal.ends_with(".amazonaws.com") {
         serde_json::json!({ "Service": principal })
     } else {
@@ -447,13 +579,13 @@ pub fn add_permission(
         "Resource": resource,
     });
     let mut condition = serde_json::Map::new();
-    if let Some(source_arn) = input.get("SourceArn").and_then(Value::as_str) {
+    if let Some(source_arn) = source_arn {
         condition.insert(
             "ArnLike".into(),
             serde_json::json!({ "AWS:SourceArn": source_arn }),
         );
     }
-    if let Some(source_account) = input.get("SourceAccount").and_then(Value::as_str) {
+    if let Some(source_account) = source_account {
         condition.insert(
             "StringEquals".into(),
             serde_json::json!({ "AWS:SourceAccount": source_account }),
@@ -473,10 +605,23 @@ pub fn add_permission(
 
 /// `GetPolicy` — return the serialized resource policy for a function.
 pub fn get_policy(store: &FunctionStore, region: &str, account: &str, name: &str) -> OpResult {
-    let name = resolve_function_name(name, region)?;
+    get_policy_qualified(store, region, account, name, None)
+}
+
+pub(crate) fn get_policy_qualified(
+    store: &FunctionStore,
+    region: &str,
+    account: &str,
+    name: &str,
+    qualifier: Option<&str>,
+) -> OpResult {
+    let (name, resource) = policy_target(store, region, account, name, qualifier)?;
     let statements = store
-        .permissions(account, region, &name)
-        .ok_or_else(|| not_found(&name))?;
+        .permissions_for_resource(account, region, &name, &resource)
+        .filter(|statements| !statements.is_empty())
+        .ok_or_else(|| {
+            LambdaError::ResourceNotFound("The resource policy does not exist".into())
+        })?;
     let policy = serde_json::json!({
         "Version": "2012-10-17",
         "Id": "default",
@@ -496,8 +641,19 @@ pub fn remove_permission(
     name: &str,
     statement_id: &str,
 ) -> OpResult {
-    let name = resolve_function_name(name, region)?;
-    match store.remove_permission(account, region, &name, statement_id) {
+    remove_permission_qualified(store, region, account, name, statement_id, None)
+}
+
+pub(crate) fn remove_permission_qualified(
+    store: &FunctionStore,
+    region: &str,
+    account: &str,
+    name: &str,
+    statement_id: &str,
+    qualifier: Option<&str>,
+) -> OpResult {
+    let (name, resource) = policy_target(store, region, account, name, qualifier)?;
+    match store.remove_permission_for_resource(account, region, &name, &resource, statement_id) {
         Some(true) => Ok((204, None)),
         Some(false) => Err(LambdaError::ResourceNotFound(format!(
             "Statement not found: {statement_id}"
@@ -835,6 +991,16 @@ pub fn list_aliases(store: &FunctionStore, region: &str, account: &str, name: &s
 
 // ---- Tags ----
 
+fn tag_function_name(arn: &str, region: &str, account: &str) -> Result<String, LambdaError> {
+    if !arn.starts_with("arn:") {
+        return Err(LambdaError::InvalidParameterValue(
+            "A Lambda function ARN is required".into(),
+        ));
+    }
+    crate::model::validate_function_scope(arn, region, account)?;
+    resolve_function_name(arn, region)
+}
+
 /// `TagResource` — merges tags onto the function named by the resource ARN (HTTP 204).
 pub fn tag_resource(
     store: &FunctionStore,
@@ -843,7 +1009,12 @@ pub fn tag_resource(
     arn: &str,
     input: &Value,
 ) -> OpResult {
-    let name = resolve_function_name(arn, region)?;
+    let name = tag_function_name(arn, region, account)?;
+    if crate::model::function_qualifier(arn).is_some() {
+        return Err(LambdaError::InvalidParameterValue(
+            "Tags apply only to an unqualified function ARN".into(),
+        ));
+    }
     let tags = input
         .get("Tags")
         .and_then(Value::as_object)
@@ -868,7 +1039,12 @@ pub fn untag_resource(
     arn: &str,
     tag_keys: &[String],
 ) -> OpResult {
-    let name = resolve_function_name(arn, region)?;
+    let name = tag_function_name(arn, region, account)?;
+    if crate::model::function_qualifier(arn).is_some() {
+        return Err(LambdaError::InvalidParameterValue(
+            "Tags apply only to an unqualified function ARN".into(),
+        ));
+    }
     if store.remove_tags(account, region, &name, tag_keys) {
         Ok((204, None))
     } else {
@@ -878,7 +1054,12 @@ pub fn untag_resource(
 
 /// `ListTags`.
 pub fn list_tags(store: &FunctionStore, region: &str, account: &str, arn: &str) -> OpResult {
-    let name = resolve_function_name(arn, region)?;
+    let name = tag_function_name(arn, region, account)?;
+    if crate::model::function_qualifier(arn).is_some() {
+        return Err(LambdaError::NotImplemented(
+            "Listing tags for a qualified function ARN is not supported".into(),
+        ));
+    }
     let tags = store
         .get_tags(account, region, &name)
         .ok_or_else(|| not_found(&name))?;
@@ -1460,6 +1641,104 @@ mod tests {
             "Handler": "index.handler",
             "Code": { "ZipFile": zip_base64(b"exports.handler=async()=>({})") }
         })
+    }
+
+    #[test]
+    fn resource_policy_limit_rejects_addition_without_mutating_permissions() {
+        let store = FunctionStore::new();
+        let account = "000000000000";
+        create_function(&store, "us-east-1", account, &create_input("limited"), None).unwrap();
+        for index in 0..100 {
+            let before = store.permissions(account, "us-east-1", "limited").unwrap();
+            let result = add_permission(
+                &store,
+                "us-east-1",
+                account,
+                "limited",
+                &serde_json::json!({
+                    "StatementId":format!("statement-{index}"), "Action":"lambda:InvokeFunction",
+                    "Principal":"events.amazonaws.com",
+                    "SourceArn":format!("arn:aws:events:us-east-1:{account}:rule/{}", "x".repeat(200))
+                }),
+            );
+            if matches!(result, Err(LambdaError::PolicyLengthExceeded(_))) {
+                assert_eq!(
+                    store.permissions(account, "us-east-1", "limited").unwrap(),
+                    before
+                );
+                return;
+            }
+            result.unwrap();
+        }
+        panic!("resource policy exceeded its size limit without a rejection");
+    }
+
+    #[test]
+    fn policy_limit_and_duplicate_ids_are_scoped_to_the_resource_arn() {
+        let store = FunctionStore::new();
+        let account = "000000000000";
+        create_function(&store, "us-east-1", account, &create_input("scoped"), None).unwrap();
+        publish_version(&store, "us-east-1", account, "scoped").unwrap();
+        create_alias(
+            &store,
+            "us-east-1",
+            account,
+            "scoped",
+            &serde_json::json!({"Name":"prod","FunctionVersion":"1"}),
+        )
+        .unwrap();
+        for qualifier in [None, Some("prod")] {
+            let resource = qualifier.map_or_else(
+                || function_arn("us-east-1", account, "scoped"),
+                |q| format!("{}:{q}", function_arn("us-east-1", account, "scoped")),
+            );
+            let mut reached_limit = false;
+            for index in 0..100 {
+                let before = store
+                    .permissions_for_resource(account, "us-east-1", "scoped", &resource)
+                    .unwrap();
+                let result = add_permission_qualified(
+                    &store,
+                    "us-east-1",
+                    account,
+                    "scoped",
+                    qualifier,
+                    &serde_json::json!({"StatementId":format!("same-{index}"),"Action":"lambda:InvokeFunction","Principal":"events.amazonaws.com",
+                        "SourceArn":format!("arn:aws:events:us-east-1:{account}:rule/{}", "x".repeat(900))}),
+                );
+                if matches!(result, Err(LambdaError::PolicyLengthExceeded(_))) {
+                    assert_eq!(
+                        store
+                            .permissions_for_resource(account, "us-east-1", "scoped", &resource)
+                            .unwrap(),
+                        before
+                    );
+                    reached_limit = true;
+                    break;
+                }
+                result.unwrap();
+            }
+            assert!(reached_limit);
+        }
+        assert!(
+            store
+                .permissions(account, "us-east-1", "scoped")
+                .unwrap()
+                .len()
+                > 1
+        );
+        assert!(
+            store
+                .permissions_for_resource(
+                    account,
+                    "us-east-1",
+                    "scoped",
+                    &format!("{}:prod", function_arn("us-east-1", account, "scoped"))
+                )
+                .unwrap()
+                .len()
+                > 1
+        );
     }
 
     #[test]

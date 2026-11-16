@@ -177,6 +177,21 @@ impl IamStore {
             .map(|root| root.account.clone())
     }
 
+    pub(crate) fn user_for_key(&self, account: &str, access_key: &str) -> Option<IamUser> {
+        self.records
+            .read()
+            .unwrap()
+            .users
+            .range(key(account, "")..)
+            .take_while(|((owner, _), _)| owner == account)
+            .find(|(_, user)| {
+                user.access_keys
+                    .iter()
+                    .any(|key| key.access_key_id == access_key && key.status == "Active")
+            })
+            .map(|(_, user)| user.clone())
+    }
+
     pub fn list_users(&self, account: &str) -> Vec<IamUser> {
         self.records
             .read()

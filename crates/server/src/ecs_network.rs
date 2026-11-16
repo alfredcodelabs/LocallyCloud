@@ -126,7 +126,7 @@ impl NetworkEndpoints {
         task_id: &str,
         ec2: Arc<Ec2Handler>,
         source: Arc<TaskNetworkLease>,
-        scope: (String, String),
+        scope: (String, String, String),
         tasks: TaskConnector,
         instances: Arc<dyn InstanceRuntime>,
     ) -> Result<Self, String> {
@@ -142,15 +142,18 @@ impl NetworkEndpoints {
             .bind_isolated_vpc_egress(task_id)
             .await
             .map_err(|error| format!("Task VPC TCP setup failed: {error}"))?;
-        let (account, region) = scope;
-        let mut workers = locallycloud_ec2::guest_dns::serve(
+        let (account, region, hostname) = scope;
+        let mut workers = locallycloud_ec2::guest_dns::serve_local_endpoint(
             udp,
             tcp,
-            upstream,
-            ec2.clone(),
-            account.clone(),
-            region.clone(),
-            source.eni_id.clone(),
+            Some(upstream),
+            hostname,
+            Some(locallycloud_ec2::guest_dns::VpcDnsScope {
+                ec2: ec2.clone(),
+                account: account.clone(),
+                region: region.clone(),
+                eni: source.eni_id.clone(),
+            }),
         )
         .into_iter()
         .collect::<Vec<_>>();

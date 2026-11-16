@@ -4,6 +4,7 @@
 //! account/region scoped and expire after 12 hours. Every Registry v2 request checks Basic
 //! authentication before reaching the shared repository store.
 
+mod authorization;
 #[cfg(test)]
 mod durability_tests;
 mod persistence;
@@ -47,6 +48,10 @@ struct Repository {
     scan_on_push: bool,
     encryption_type: String,
     kms_key: Option<String>,
+    #[serde(default)]
+    policy: Option<String>,
+    #[serde(skip)]
+    effective_policy: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -54,6 +59,8 @@ struct RegistryToken {
     account: String,
     region: String,
     expires_at: Instant,
+    identity: RequestIdentity,
+    delegated_identity: Option<locallycloud_core::integration::identity::CallerIdentity>,
 }
 
 #[derive(Clone)]
@@ -63,6 +70,7 @@ pub struct EcrHandler {
     registry_v2: Arc<registry_v2::RegistryV2Handler>,
     tokens: Arc<DashMap<String, RegistryToken>>,
     registry: Option<Weak<ServiceRegistry>>,
+    endpoint: Option<http::Uri>,
 }
 
 impl EcrHandler {
@@ -72,6 +80,7 @@ impl EcrHandler {
             registry_v2: Arc::new(registry_v2::RegistryV2Handler::new()),
             tokens: Arc::new(DashMap::new()),
             registry: None,
+            endpoint: None,
         }
     }
 
@@ -79,6 +88,31 @@ impl EcrHandler {
         let mut handler = Self::new();
         handler.registry = Some(Arc::downgrade(registry));
         handler
+    }
+
+    fn with_endpoint(mut self, endpoint: &str) -> Result<Self, EcrStateError> {
+        let endpoint = endpoint.parse::<http::Uri>().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid ECR registry endpoint",
+            )
+        })?;
+        if !matches!(endpoint.scheme_str(), Some("https" | "http"))
+            || endpoint.authority().is_none()
+            || endpoint
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'))
+            || !matches!(endpoint.path(), "" | "/")
+            || endpoint.query().is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ECR registry endpoint requires an HTTP or HTTPS origin",
+            )
+            .into());
+        }
+        self.endpoint = Some(endpoint);
+        Ok(self)
     }
 
     fn process(&self, request: &ServiceRequest) -> Result<Value, AwsError> {
@@ -112,43 +146,6 @@ impl EcrHandler {
                 },
             }
         }
-    }
-
-    fn authorize_get_authorization_token(&self, request: &ServiceRequest) -> Result<(), AwsError> {
-        let Some(registry) = &self.registry else {
-            // A standalone handler has no IAM service and retains permissive behavior.
-            return Ok(());
-        };
-        let registry = registry.upgrade().ok_or_else(|| {
-            AwsError::new("ServerException", "ECR authorization is unavailable", 500)
-        })?;
-        let evaluator = registry
-            .authorization_evaluator(&ServiceName::new("iam"))
-            .ok_or_else(|| {
-                AwsError::new("ServerException", "ECR authorization is unavailable", 500)
-            })?;
-        if !evaluator.strict_sigv4_required() {
-            return Ok(());
-        }
-        let authorization = request
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok());
-        evaluator
-            .authorize(AuthorizationRequest {
-                request_identity: RequestIdentity {
-                    account_id: request.account_id.clone(),
-                    access_key_id: authorization
-                        .and_then(RequestIdentity::access_key_from_authorization),
-                    arn: None,
-                },
-                delegated_identity: None,
-                source_service: "ecr".to_owned(),
-                action: "ecr:GetAuthorizationToken".to_owned(),
-                resource: "*".to_owned(),
-                context: Default::default(),
-            })
-            .map_err(|_| AwsError::new("AccessDeniedException", "Access denied", 400))
     }
 
     /// Internal image snapshot for an ECS task in the same account and region.
@@ -201,7 +198,7 @@ impl EcrHandler {
                 403,
             ));
         }
-        self.authorize_get_authorization_token(request)?;
+        self.authorize_token_issuance(request)?;
         if let Some(ids) = body.get("registryIds") {
             let ids = ids
                 .as_array()
@@ -210,7 +207,7 @@ impl EcrHandler {
                 return Err(invalid("registryIds must contain the current account"));
             }
         }
-        let endpoint = local_registry_endpoint(host)
+        let endpoint = local_registry_endpoint(host, self.endpoint.as_ref())
             .ok_or_else(|| invalid("Host is invalid for local ECR registry"))?;
         let now = Instant::now();
         self.tokens.retain(|_, token| token.expires_at > now);
@@ -228,6 +225,8 @@ impl EcrHandler {
                 account: account.to_owned(),
                 region: region.to_owned(),
                 expires_at: now + TOKEN_LIFETIME,
+                identity: Self::request_identity(request),
+                delegated_identity: locallycloud_core::integration::identity::trusted_role(request),
             },
         );
         let encoded = base64::engine::general_purpose::STANDARD.encode(format!("AWS:{password}"));
@@ -238,13 +237,28 @@ impl EcrHandler {
         }]}))
     }
 
-    async fn handle_registry(&self, mut request: ServiceRequest) -> Response {
-        let Some(scope) = self.basic_scope(&request) else {
-            return registry_unauthorized();
-        };
-        request.account_id = scope.account;
-        request.region = scope.region;
-        self.registry_v2.handle(request).await
+    async fn handle_registry(&self, request: ServiceRequest) -> Response {
+        let handler = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(scope) = handler.basic_scope(&request) else {
+                return registry_unauthorized();
+            };
+            let mut request = request;
+            request.account_id = scope.account.clone();
+            request.region = scope.region.clone();
+            if let Err(error) = handler.authorize_registry(&scope, &request) {
+                return error.into_response();
+            }
+            handler.registry_v2.process(&request)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            registry_v2::error(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                "Registry state unavailable",
+            )
+        })
     }
 
     fn basic_scope(&self, request: &ServiceRequest) -> Option<RegistryToken> {
@@ -275,6 +289,7 @@ impl EcrHandler {
         if !registry_host_matches_scope(
             request.headers.get(http::header::HOST)?.to_str().ok()?,
             &scope,
+            self.endpoint.as_ref(),
         ) {
             return None;
         }
@@ -308,6 +323,7 @@ impl EcrHandler {
         operation: &str,
         body: &Map<String, Value>,
     ) -> Result<Value, AwsError> {
+        self.authorize_control_plane(request, operation, body)?;
         let region = request.region.as_str();
         let account = request.account_id.as_str();
         let verified = request
@@ -327,6 +343,11 @@ impl EcrHandler {
             "DeleteRepository" => self.delete_repository(body, region, account),
             "ListImages" => self.list_images(body, region, account),
             "BatchDeleteImage" => self.batch_delete_image(body, region, account),
+            "GetRepositoryPolicy" => self.repository_policy(request, body, "GetRepositoryPolicy"),
+            "SetRepositoryPolicy" => self.repository_policy(request, body, "SetRepositoryPolicy"),
+            "DeleteRepositoryPolicy" => {
+                self.repository_policy(request, body, "DeleteRepositoryPolicy")
+            }
             other => Err(unknown_operation(format!(
                 "operation {other} is not supported"
             ))),
@@ -367,6 +388,8 @@ impl EcrHandler {
             scan_on_push,
             encryption_type: encryption_type.to_owned(),
             kms_key,
+            policy: None,
+            effective_policy: None,
         };
         let key = Self::key(account, region, name);
 
@@ -436,8 +459,8 @@ impl EcrHandler {
         }
 
         let max_results = optional_max_results(body, DEFAULT_PAGE_SIZE)?;
-        let mut repositories = self.repositories_in_scope(account, region);
-        repositories.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut repositories = self.repository_names_in_scope(account, region);
+        repositories.sort();
         let start = match body.get("nextToken") {
             Some(value) => {
                 let token = value
@@ -446,7 +469,7 @@ impl EcrHandler {
                     .ok_or_else(|| invalid("nextToken must be a non-empty string"))?;
                 let cursor = decode_token(token, "DescribeRepositories", account, region, "")?;
                 repositories
-                    .binary_search_by(|repo| repo.name.as_str().cmp(cursor.as_str()))
+                    .binary_search_by(|repo| repo.as_str().cmp(cursor.as_str()))
                     .map_err(|_| invalid("nextToken is invalid or expired"))?
                     + 1
             }
@@ -455,8 +478,13 @@ impl EcrHandler {
         let end = start.saturating_add(max_results).min(repositories.len());
         let page: Vec<Value> = repositories[start..end]
             .iter()
-            .map(|repo| self.repo_json(account, region, repo))
-            .collect();
+            .map(|name| {
+                self.repos
+                    .get(&Self::key(account, region, name))
+                    .map(|repo| self.repo_json(account, region, &repo))
+                    .ok_or_else(|| repository_not_found(name, account))
+            })
+            .collect::<Result<_, _>>()?;
         let mut response = json!({ "repositories": page });
         if end < repositories.len() {
             response["nextToken"] = Value::String(encode_token(
@@ -464,7 +492,7 @@ impl EcrHandler {
                 account,
                 region,
                 "",
-                &repositories[end - 1].name,
+                &repositories[end - 1],
             ));
         }
         Ok(response)
@@ -619,12 +647,12 @@ impl EcrHandler {
         Ok(json!({ "imageIds": [], "failures": failures }))
     }
 
-    fn repositories_in_scope(&self, account: &str, region: &str) -> Vec<Repository> {
+    fn repository_names_in_scope(&self, account: &str, region: &str) -> Vec<String> {
         let prefix = format!("{account}:{region}:");
         self.repos
             .iter()
             .filter(|entry| entry.key().starts_with(&prefix))
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().name.clone())
             .collect()
     }
 
@@ -887,27 +915,46 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn local_registry_endpoint(host: Option<&str>) -> Option<String> {
-    let host = host?;
-    if host
-        .bytes()
-        .any(|b| b.is_ascii_whitespace() || b == b'/' || b == b'\\')
-    {
+fn local_registry_endpoint(host: Option<&str>, configured: Option<&http::Uri>) -> Option<String> {
+    let authority = host?.parse::<http::uri::Authority>().ok()?;
+    if authority.as_str().contains('@') {
         return None;
     }
-    let hostname = host.split(':').next()?.to_ascii_lowercase();
-    if matches!(hostname.as_str(), "localhost" | "127.0.0.1") {
-        Some(format!("http://{host}"))
-    } else {
-        None
+    let hostname = authority.host().to_ascii_lowercase();
+    let local = matches!(
+        hostname.as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+    );
+    let endpoint_host = configured
+        .and_then(http::Uri::host)
+        .unwrap_or("aws.localhost");
+    if !local && !locallycloud_core::tls::endpoint_hostname_matches(&hostname, endpoint_host) {
+        return None;
+    }
+    match configured {
+        Some(endpoint) => Some(endpoint.to_string().trim_end_matches('/').to_owned()),
+        None => Some(format!(
+            "{}://{authority}",
+            if local { "http" } else { "https" }
+        )),
     }
 }
 
-fn registry_host_matches_scope(host: &str, scope: &RegistryToken) -> bool {
-    let hostname = host.split(':').next().unwrap_or("").to_ascii_lowercase();
-    if matches!(hostname.as_str(), "localhost" | "127.0.0.1") {
+fn registry_host_matches_scope(
+    host: &str,
+    scope: &RegistryToken,
+    endpoint: Option<&http::Uri>,
+) -> bool {
+    if local_registry_endpoint(Some(host), endpoint).is_some() {
         return true;
     }
+    let Ok(authority) = host.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    let hostname = authority.host().to_ascii_lowercase();
     hostname == format!("{}.dkr.ecr.{}.amazonaws.com", scope.account, scope.region)
         || hostname == format!("{}.dkr.ecr.{}.localhost", scope.account, scope.region)
 }
@@ -1000,10 +1047,30 @@ pub async fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     database: Arc<StateDb>,
 ) -> Result<Arc<EcrHandler>, EcrStateError> {
+    register_with_state_config(registry, database, None).await
+}
+
+/// Register durable ECR advertising the server's canonical SDK endpoint.
+pub async fn register_with_state_and_endpoint(
+    registry: &Arc<ServiceRegistry>,
+    database: Arc<StateDb>,
+    endpoint: &str,
+) -> Result<Arc<EcrHandler>, EcrStateError> {
+    register_with_state_config(registry, database, Some(endpoint.to_owned())).await
+}
+
+async fn register_with_state_config(
+    registry: &Arc<ServiceRegistry>,
+    database: Arc<StateDb>,
+    endpoint: Option<String>,
+) -> Result<Arc<EcrHandler>, EcrStateError> {
     let registry_for_restore = registry.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        let persistence = Arc::new(Persistence::new(database, StateCipher::from_env()?)?);
         let mut handler = EcrHandler::with_registry(&registry_for_restore);
+        if let Some(endpoint) = endpoint {
+            handler = handler.with_endpoint(&endpoint)?;
+        }
+        let persistence = Arc::new(Persistence::new(database, StateCipher::from_env()?)?);
         handler.registry_v2 = Arc::new(registry_v2::RegistryV2Handler::with_persistence(
             persistence.clone(),
         ));
@@ -1038,6 +1105,15 @@ pub fn register_with_handle(registry: &Arc<ServiceRegistry>) -> Arc<EcrHandler> 
         handler,
     );
     handle
+}
+
+pub fn register_with_handle_and_endpoint(
+    registry: &Arc<ServiceRegistry>,
+    endpoint: &str,
+) -> Result<Arc<EcrHandler>, EcrStateError> {
+    let handle = Arc::new(EcrHandler::with_registry(registry).with_endpoint(endpoint)?);
+    register_handle(registry, handle.clone());
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -1091,6 +1167,99 @@ mod tests {
 
     fn assert_error(body: &Value, kind: &str) {
         assert!(body["__type"].as_str().unwrap().contains(kind), "{body}");
+    }
+
+    #[tokio::test]
+    async fn canonical_tls_registry_tokens_accept_known_endpoint_hosts_and_keep_account_region_scope(
+    ) {
+        let handler = EcrHandler::new()
+            .with_endpoint("https://aws.localhost:4566")
+            .unwrap();
+        let mut issuance = request("GetAuthorizationToken", json!({}));
+        issuance
+            .headers
+            .insert("x-locallycloud-verified-ecr-sigv4", "1".parse().unwrap());
+        issuance
+            .headers
+            .insert(http::header::HOST, "aws.localhost:4566".parse().unwrap());
+        let (status, _, issued) = response(&handler, issuance.clone()).await;
+        assert_eq!(status, 200, "{issued}");
+        assert_eq!(
+            issued["authorizationData"][0]["proxyEndpoint"],
+            "https://aws.localhost:4566"
+        );
+        let token = issued["authorizationData"][0]["authorizationToken"]
+            .as_str()
+            .unwrap();
+        for (host, expected) in [
+            ("aws.localhost:4566", 200),
+            ("ecr.aws.localhost:4566", 200),
+            ("000000000000.dkr.ecr.us-east-1.amazonaws.com", 200),
+            ("111111111111.dkr.ecr.us-east-1.amazonaws.com", 401),
+            ("000000000000.dkr.ecr.us-west-2.amazonaws.com", 401),
+            ("untrusted.invalid", 401),
+            ("user@aws.localhost:4566", 401),
+        ] {
+            let mut request = registry_request(Method::GET, "/v2/", b"", "111111111111", None);
+            request
+                .headers
+                .insert(http::header::HOST, host.parse().unwrap());
+            request.headers.insert(
+                http::header::AUTHORIZATION,
+                format!("Basic {token}").parse().unwrap(),
+            );
+            assert_eq!(handler.handle(request).await.status(), expected, "{host}");
+        }
+        for host in [
+            "untrusted.invalid",
+            "aws.localhost.attacker.invalid",
+            "user@aws.localhost",
+        ] {
+            issuance
+                .headers
+                .insert(http::header::HOST, host.parse().unwrap());
+            let (status, _, body) = response(&handler, issuance.clone()).await;
+            assert_eq!(status, 400, "{host}: {body}");
+        }
+        assert_eq!(handler.tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_registry_endpoint_is_injected_and_never_reflected_from_an_arbitrary_host() {
+        let handler = EcrHandler::new()
+            .with_endpoint("https://development.example:8443")
+            .unwrap();
+        let mut issuance = request("GetAuthorizationToken", json!({}));
+        issuance
+            .headers
+            .insert("x-locallycloud-verified-ecr-sigv4", "1".parse().unwrap());
+        issuance.headers.insert(
+            http::header::HOST,
+            "development.example:8443".parse().unwrap(),
+        );
+        let (status, _, body) = response(&handler, issuance.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["authorizationData"][0]["proxyEndpoint"],
+            "https://development.example:8443"
+        );
+        issuance
+            .headers
+            .insert(http::header::HOST, "foreign.example".parse().unwrap());
+        assert_eq!(response(&handler, issuance).await.0, 400);
+        assert_eq!(handler.tokens.len(), 1);
+        for invalid in [
+            "ftp://development.example",
+            "https://user@development.example",
+            "https://development.example/path",
+            "https://development.example?query=1",
+            "development.example",
+        ] {
+            assert!(
+                EcrHandler::new().with_endpoint(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[tokio::test]

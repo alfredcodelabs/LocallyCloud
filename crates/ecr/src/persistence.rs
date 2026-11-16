@@ -64,8 +64,49 @@ impl Persistence {
         key: &RepoKey,
         value: &[u8],
     ) -> Result<(), EcrStateError> {
-        let payload = self.seal(key, "repository", "", value)?;
-        self.database.connection()?.execute("INSERT INTO ecr_records(account,region,repository,kind,id,version,payload) VALUES (?1,?2,?3,'repository','',1,?4)",params![key.account,key.region,key.name,payload])?;
+        let payload = self.cipher.seal(
+            &[
+                "ecr",
+                &key.account,
+                &key.region,
+                &key.name,
+                "repository",
+                "",
+                "v2",
+            ],
+            value,
+        )?;
+        self.database.connection()?.execute("INSERT INTO ecr_records(account,region,repository,kind,id,version,payload) VALUES (?1,?2,?3,'repository','',2,?4)",params![key.account,key.region,key.name,payload])?;
+        Ok(())
+    }
+
+    pub(crate) fn update_repository(
+        &self,
+        key: &RepoKey,
+        value: &[u8],
+    ) -> Result<(), EcrStateError> {
+        let payload = self.cipher.seal(
+            &[
+                "ecr",
+                &key.account,
+                &key.region,
+                &key.name,
+                "repository",
+                "",
+                "v2",
+            ],
+            value,
+        )?;
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE ecr_records SET version=2,payload=?4 WHERE account=?1 AND region=?2 AND repository=?3 AND kind='repository' AND id='' AND version IN (1,2)",
+            params![key.account, key.region, key.name, payload],
+        )?;
+        if changed != 1 {
+            return Err(invalid());
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -162,16 +203,44 @@ impl Persistence {
                 let id: String = row.get(4)?;
                 let version: u32 = row.get(5)?;
                 let payload: Vec<u8> = row.get(6)?;
-                if version != 1
-                    || crate::validate_repository_name(&key.name).is_err()
+                if !matches!(
+                    (kind.as_str(), version),
+                    ("repository", 1 | 2) | ("blob-index" | "manifest" | "tag", 1)
+                ) || crate::validate_repository_name(&key.name).is_err()
                     || payload.len() > MAX_MANIFEST + 64
                 {
                     return Err(invalid());
                 }
-                let clear = self.open(&key, &kind, &id, &payload)?;
+                let clear = if kind == "repository" && version == 2 {
+                    self.cipher
+                        .open(
+                            &[
+                                "ecr",
+                                &key.account,
+                                &key.region,
+                                &key.name,
+                                "repository",
+                                "",
+                                "v2",
+                            ],
+                            &payload,
+                        )?
+                        .to_vec()
+                } else {
+                    self.open(&key, &kind, &id, &payload)?
+                };
                 match kind.as_str() {
                     "repository" => {
-                        let repo: Repository = serde_json::from_slice(&clear)?;
+                        let mut repo: Repository = serde_json::from_slice(&clear)?;
+                        if version == 1 && repo.policy.is_some() {
+                            return Err(invalid());
+                        }
+                        repo.effective_policy = repo
+                            .policy
+                            .as_deref()
+                            .map(crate::authorization::normalized_repository_policy)
+                            .transpose()
+                            .map_err(|_| invalid())?;
                         if !id.is_empty()
                             || repo.name != key.name
                             || !repo.created_at.is_finite()

@@ -26,6 +26,8 @@ pub struct EcsOciRuntime {
     instances: Arc<dyn locallycloud_ec2::InstanceRuntime>,
     runtime: Arc<Mutex<Option<Arc<YoukiRuntime>>>>,
     roots: Arc<Mutex<HashMap<String, TaskResources>>>,
+    endpoint: String,
+    guest_tls: tokio::sync::OnceCell<Arc<locallycloud_core::tls::GuestCallbackTls>>,
 }
 
 struct TaskResources {
@@ -78,7 +80,7 @@ struct GuestSetup {
     ec2: Arc<locallycloud_ec2::Ec2Handler>,
     network: Arc<locallycloud_ec2::TaskNetworkLease>,
     instances: Arc<dyn locallycloud_ec2::InstanceRuntime>,
-    scope: (String, String),
+    scope: (String, String, String),
 }
 #[async_trait::async_trait]
 impl IsolatedGuestSetup for GuestSetup {
@@ -249,7 +251,16 @@ impl EcsOciRuntime {
             instances,
             runtime: Arc::new(Mutex::new(None)),
             roots: Arc::new(Mutex::new(HashMap::new())),
+            endpoint: format!(
+                "https://aws.localhost:{}",
+                crate::ecs_guest::AWS_GATEWAY_PORT
+            ),
+            guest_tls: tokio::sync::OnceCell::new(),
         }
+    }
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = endpoint;
+        self
     }
     pub async fn shutdown(&self) {
         let ids = match self.roots.lock() {
@@ -310,11 +321,9 @@ impl TaskRuntime for EcsOciRuntime {
         self.ec2
             .network_selection(account, region, subnet, security_groups)
             .ok_or("Subnet or security group is unavailable")?;
-        let (repo, reference) = parse_ecr_image(image, account, region)?;
-        self.ecr
-            .image_blobs_async(account, region, repo, reference)
-            .await?
-            .ok_or("ECR image was not found or has unsupported layer media type")?;
+        // Pull permissions and image bytes are checked together once the execution role
+        // is available in start; admission must not decrypt unauthorized image layers.
+        parse_ecr_image(image, account, region)?;
         Ok(())
     }
     async fn start(&self, task: &TaskLaunch) -> Result<TaskNetworkInfo, String> {
@@ -327,6 +336,29 @@ impl TaskRuntime for EcsOciRuntime {
             )
             .ok_or("Subnet or security group is unavailable")?;
         let (repo, reference) = parse_ecr_image(&task.image, &task.account, &task.region)?;
+        if let Some(role_arn) = &task.execution_role_arn {
+            self.ecr
+                .authorize_image_pull(
+                    &task.account,
+                    &task.region,
+                    repo,
+                    locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                        role_arn: role_arn.clone(),
+                        session_name: "ecs".into(),
+                    },
+                )
+                .await?;
+        } else if self
+            .registry
+            .upgrade()
+            .and_then(|registry| {
+                registry
+                    .authorization_evaluator(&locallycloud_core::registry::ServiceName::new("iam"))
+            })
+            .is_some_and(|evaluator| evaluator.strict_sigv4_required())
+        {
+            return Err("An execution role is required to pull an ECR image in strict mode".into());
+        }
         let (config, layers) = self
             .ecr
             .image_blobs_async(&task.account, &task.region, repo, reference)
@@ -398,13 +430,48 @@ impl TaskRuntime for EcsOciRuntime {
                     .await);
             }
         };
-        let prepared =
-            match PreparedGuest::prepare(self.registry.clone(), self.ec2.clone(), task, &network)
-                .await
-            {
-                Ok(prepared) => prepared,
-                Err(error) => return Err(startup.fail(error).await),
-            };
+        let hostname = match self
+            .endpoint
+            .parse::<http::Uri>()
+            .ok()
+            .and_then(|uri| uri.host().map(str::to_owned))
+        {
+            Some(hostname) => hostname,
+            None => {
+                return Err(startup
+                    .fail("Invalid task SDK endpoint hostname".into())
+                    .await)
+            }
+        };
+        let tls = match self
+            .guest_tls
+            .get_or_try_init(|| async {
+                locallycloud_core::tls::GuestCallbackTls::for_hostname(hostname.clone())
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+        {
+            Ok(tls) => tls.clone(),
+            Err(error) => {
+                return Err(startup
+                    .fail(format!("Task TLS setup failed: {error}"))
+                    .await)
+            }
+        };
+        let prepared = match PreparedGuest::prepare_with_endpoint(
+            self.registry.clone(),
+            self.ec2.clone(),
+            task,
+            &network,
+            self.endpoint.clone(),
+            tls.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(startup.fail(error).await),
+        };
         prepared.inject_env(&mut env);
         let setup = Arc::new(GuestSetup {
             prepared: Mutex::new(Some(prepared)),
@@ -412,23 +479,38 @@ impl TaskRuntime for EcsOciRuntime {
             ec2: self.ec2.clone(),
             network: network.clone(),
             instances: self.instances.clone(),
-            scope: (task.account.clone(), task.region.clone()),
+            scope: (task.account.clone(), task.region.clone(), hostname),
         });
-        let etc = root.join("etc");
-        if let Err(error) = async {
-            tokio::fs::create_dir_all(&etc).await?;
-            tokio::fs::write(
-                etc.join("resolv.conf"),
-                "nameserver 169.254.169.253\noptions timeout:2 attempts:1\n",
+        let root_for_trust = root.clone();
+        let ca = tls.ca_pem().to_owned();
+        env = match tokio::task::spawn_blocking(move || {
+            let configured = ["AWS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"]
+                .iter()
+                .filter_map(|key| env.get(*key).map(String::as_str))
+                .collect::<Vec<_>>();
+            let bundle = locallycloud_compute::runtime_pack::install_guest_ca(
+                &root_for_trust,
+                &configured,
+                &ca,
             )
-            .await
-        }
+            .map_err(|error| format!("Task trust setup failed: {error}"))?;
+            install_resolver(&root_for_trust)
+                .map_err(|error| format!("Task resolver setup failed: {error}"))?;
+            for key in ["AWS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"] {
+                env.insert(key.into(), bundle.into());
+            }
+            Ok::<_, String>(env)
+        })
         .await
         {
-            return Err(startup
-                .fail(format!("Task resolver configuration failed: {error}"))
-                .await);
-        }
+            Ok(Ok(env)) => env,
+            Ok(Err(error)) => return Err(startup.fail(error).await),
+            Err(error) => {
+                return Err(startup
+                    .fail(format!("Task trust worker failed: {error}"))
+                    .await)
+            }
+        };
         let spec = TaskSpec {
             mounts: Vec::new(),
             user: None,
@@ -601,6 +683,35 @@ fn parse_ecr_image<'a>(
         return Err("Invalid ECR image reference".into());
     }
     Ok((repo, reference))
+}
+
+fn install_resolver(root: &Path) -> std::io::Result<()> {
+    let etc = root.join("etc");
+    match fs::symlink_metadata(&etc) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "guest etc must be an owned directory",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&etc)?,
+        Err(error) => return Err(error),
+    }
+    let temporary = etc.join(format!(".locallycloud-resolv-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(b"nameserver 169.254.169.253\noptions timeout:2 attempts:1\n")?;
+        drop(file);
+        fs::rename(&temporary, etc.join("resolv.conf"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn materialize(
@@ -783,6 +894,30 @@ fn extract_layer(root: &Path, layer: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    #[test]
+    fn resolver_overlay_replaces_shared_files_and_rejects_symlink_parent() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("ecs-resolver-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let outside = root.with_extension("shared");
+        fs::write(&outside, b"original resolver").unwrap();
+        fs::hard_link(&outside, root.join("etc/resolv.conf")).unwrap();
+        install_resolver(&root).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"original resolver");
+        fs::remove_file(root.join("etc/resolv.conf")).unwrap();
+        symlink(&outside, root.join("etc/resolv.conf")).unwrap();
+        install_resolver(&root).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"original resolver");
+        fs::remove_dir_all(root.join("etc")).unwrap();
+        symlink(root.parent().unwrap(), root.join("etc")).unwrap();
+        assert_eq!(
+            install_resolver(&root).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(outside).unwrap();
+    }
+
     #[test]
     fn unsupported_image_platform_user_and_workdir_fail_before_extraction() {
         let root = std::env::temp_dir().join(format!("ecs-image-{}", uuid::Uuid::new_v4()));

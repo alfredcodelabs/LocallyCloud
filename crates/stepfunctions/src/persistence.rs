@@ -1,7 +1,7 @@
 //! SQLite journals are injected; execution writes commit while their lock is held.
 use super::*;
 use locallycloud_state::{StateCipher, StateDb};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use std::ops::{Deref, DerefMut};
 
 #[derive(Serialize, Deserialize)]
@@ -27,8 +27,24 @@ impl Persistence {
         let connection = state.connection().map_err(|e| e.to_string())?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS sfn_scopes(account TEXT NOT NULL,region TEXT NOT NULL,version INTEGER NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(account,region));
-             CREATE TABLE IF NOT EXISTS sfn_executions(arn TEXT PRIMARY KEY,version INTEGER NOT NULL,payload BLOB NOT NULL);"
+             CREATE TABLE IF NOT EXISTS sfn_executions(arn TEXT PRIMARY KEY,version INTEGER NOT NULL,payload BLOB NOT NULL,history_count INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS sfn_execution_events(execution_arn TEXT NOT NULL,event_id INTEGER NOT NULL,version INTEGER NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(execution_arn,event_id),FOREIGN KEY(execution_arn) REFERENCES sfn_executions(arn) ON DELETE CASCADE);"
         ).map_err(|e|e.to_string())?;
+        let has_history_count = connection
+            .prepare("PRAGMA table_info(sfn_executions)")
+            .map_err(|e| e.to_string())?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|name| name == "history_count");
+        if !has_history_count {
+            connection.execute_batch("ALTER TABLE sfn_executions ADD COLUMN history_count INTEGER NOT NULL DEFAULT 0;").map_err(|e| e.to_string())?;
+        }
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             state,
             connection: std::sync::Mutex::new(connection),
@@ -45,14 +61,136 @@ impl Persistence {
         let clear = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         self.cipher.seal(context, &clear).map_err(|e| e.to_string())
     }
+    /// Live updates use ExecutionWriteGuard; direct calls are for initial insert or validated recovery.
     pub(crate) fn save_execution(&self, execution: &Execution) -> Result<(), String> {
-        let payload = self.seal(&["stepfunctions", "execution", &execution.arn], execution)?;
-        self.connection()?.execute(
-            "INSERT INTO sfn_executions(arn,version,payload) VALUES(?1,1,?2) ON CONFLICT(arn) DO UPDATE SET version=excluded.version,payload=excluded.payload",
-            params![execution.arn,payload],
+        if execution.arn.is_empty() || execution.state_machine_type != "STANDARD" {
+            return Err("invalid persisted STANDARD execution identity".into());
+        }
+        if execution.history.len() > MAX_HISTORY_EVENTS {
+            return Err("persisted execution exceeds the history limit".into());
+        }
+        let count = execution.history.len();
+        let count_context = count.to_string();
+        let payload = self.seal(
+            &[
+                "stepfunctions",
+                "execution",
+                "2",
+                &execution.arn,
+                &count_context,
+            ],
+            execution,
+        )?;
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let stored: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT version,history_count FROM sfn_executions WHERE arn=?1",
+                [&execution.arn],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let committed = match stored {
+            None | Some((1, _)) => {
+                let existing: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sfn_execution_events WHERE execution_arn=?1)",
+                        [&execution.arn],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if existing {
+                    return Err("unexpected events before execution journal migration".into());
+                }
+                0
+            }
+            Some((2, committed)) => usize::try_from(committed)
+                .ok()
+                .filter(|n| *n <= count)
+                .ok_or_else(|| "execution history is not append-only".to_string())?,
+            Some(_) => return Err("unsupported Step Functions execution schema".into()),
+        };
+        tx.execute(
+            "INSERT INTO sfn_executions(arn,version,payload,history_count) VALUES(?1,2,?2,?3) ON CONFLICT(arn) DO UPDATE SET version=excluded.version,payload=excluded.payload,history_count=excluded.history_count",
+            params![execution.arn,payload,count as i64],
         ).map_err(|e|e.to_string())?;
+        if committed < count {
+            let mut insert = tx.prepare("INSERT INTO sfn_execution_events(execution_arn,event_id,version,payload) VALUES(?1,?2,1,?3)").map_err(|e|e.to_string())?;
+            for (offset, event) in execution.history.iter().enumerate().skip(committed) {
+                validate_event(event, offset + 1)?;
+                let id = event.id.to_string();
+                let payload = self.seal(
+                    &["stepfunctions", "execution-event", "1", &execution.arn, &id],
+                    event.as_ref(),
+                )?;
+                insert
+                    .execute(params![execution.arn, event.id as i64, payload])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    fn restore_history(
+        &self,
+        connection: &rusqlite::Connection,
+        execution: &mut Execution,
+        count: i64,
+    ) -> Result<(), String> {
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|count| *count <= MAX_HISTORY_EVENTS)
+            .ok_or_else(|| "invalid persisted execution history count".to_string())?;
+        if !execution.history.is_empty() {
+            return Err("version 2 execution metadata contains an embedded history".into());
+        }
+        let mut statement = connection.prepare("SELECT event_id,version,payload FROM sfn_execution_events WHERE execution_arn=?1 ORDER BY event_id").map_err(|e|e.to_string())?;
+        let rows = statement
+            .query_map([&execution.arn], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        execution.history.reserve(count);
+        for row in rows {
+            let (id, version, payload) = row.map_err(|e| e.to_string())?;
+            if version != 1
+                || id <= 0
+                || id as usize != execution.history.len() + 1
+                || execution.history.len() >= count
+            {
+                return Err("invalid persisted execution event sequence".into());
+            }
+            let id_context = id.to_string();
+            let clear = self
+                .cipher
+                .open(
+                    &[
+                        "stepfunctions",
+                        "execution-event",
+                        "1",
+                        &execution.arn,
+                        &id_context,
+                    ],
+                    &payload,
+                )
+                .map_err(|e| e.to_string())?;
+            let event: HistoryEvent = serde_json::from_slice(&clear).map_err(|e| e.to_string())?;
+            validate_event(&event, execution.history.len() + 1)?;
+            execution.history.push(Arc::new(event));
+        }
+        if execution.history.len() != count {
+            return Err("persisted execution history is incomplete".into());
+        }
         Ok(())
     }
+
     fn save_scope(
         &self,
         account: &str,
@@ -114,7 +252,7 @@ impl Persistence {
         }
         drop(statement);
         let mut statement = connection
-            .prepare("SELECT arn,version,payload FROM sfn_executions")
+            .prepare("SELECT arn,version,payload,history_count FROM sfn_executions")
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |row| {
@@ -122,30 +260,55 @@ impl Persistence {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
         for row in rows {
-            let (arn, version, payload) = row.map_err(|e| e.to_string())?;
-            if version != 1 {
-                return Err("unsupported Step Functions execution schema".into());
-            }
+            let (arn, version, payload, history_count) = row.map_err(|e| e.to_string())?;
+            let count_context = history_count.to_string();
+            let context = match version {
+                1 => vec!["stepfunctions", "execution", arn.as_str()],
+                2 => vec![
+                    "stepfunctions",
+                    "execution",
+                    "2",
+                    arn.as_str(),
+                    count_context.as_str(),
+                ],
+                _ => return Err("unsupported Step Functions execution schema".into()),
+            };
             let clear = self
                 .cipher
-                .open(&["stepfunctions", "execution", &arn], &payload)
+                .open(&context, &payload)
                 .map_err(|e| e.to_string())?;
             let mut execution: Execution =
                 serde_json::from_slice(&clear).map_err(|e| e.to_string())?;
+            drop(clear);
+            drop(payload);
+            if version == 2 {
+                self.restore_history(&connection, &mut execution, history_count)?;
+            } else {
+                if execution.history.len() > MAX_HISTORY_EVENTS {
+                    return Err("legacy execution exceeds the history limit".into());
+                }
+                for (offset, event) in execution.history.iter().enumerate() {
+                    validate_event(event, offset + 1)?;
+                }
+            }
             if execution.arn != arn || execution.state_machine_type != "STANDARD" {
                 return Err("invalid persisted STANDARD execution identity".into());
             }
-            if execution.status == Status::Running {
+            let interrupted = execution.status == Status::Running;
+            if interrupted {
                 execution.status = Status::Aborted;
                 execution.error = Some("LocallyCloud.ExecutionInterrupted".into());
                 execution.cause=Some("The locallycloud process stopped; external task effects are not replayed automatically".into());
                 execution.stop_date = Some(crate::clock::now_epoch());
                 let details = serde_json::json!({"error":execution.error,"cause":execution.cause});
                 execution.record("ExecutionAborted", details);
+            }
+            if version == 1 || interrupted {
                 self.save_execution(&execution)?;
             }
             let cell = Arc::new(ExecutionCell::new(
@@ -157,6 +320,17 @@ impl Persistence {
         }
         Ok(())
     }
+}
+
+fn validate_event(event: &HistoryEvent, expected_id: usize) -> Result<(), String> {
+    if event.id != expected_id as u64
+        || event
+            .previous_event_id
+            .is_some_and(|previous| previous >= event.id)
+    {
+        return Err("invalid persisted execution event identity".into());
+    }
+    Ok(())
 }
 
 impl SfnStore {
@@ -272,9 +446,21 @@ impl Drop for ExecutionWriteGuard<'_> {
         let Some(persistence) = self.persistence else {
             return;
         };
-        // ponytail: one bounded STANDARD execution snapshot, never the whole service store.
-        // Keep the lock until commit/rollback so readers cannot acknowledge provisional status.
+        // The rollback snapshot shares immutable events. Any prefix edit must fail closed,
+        // rather than leave runtime history different from the append-only journal.
+        let append_only = self.backup.as_ref().is_some_and(|backup| {
+            self.guard.history.len() >= backup.history.len()
+                && self
+                    .guard
+                    .history
+                    .iter()
+                    .zip(&backup.history)
+                    .all(|(current, previous)| Arc::ptr_eq(current, previous))
+                && self.guard.arn == backup.arn
+        });
+        // Keep the lock until commit/rollback so readers never observe provisional status.
         if self.failed.load(Ordering::Acquire)
+            || !append_only
             || blocking_commit(|| persistence.save_execution(&self.guard)).is_err()
         {
             if let Some(backup) = self.backup.take() {
@@ -308,21 +494,29 @@ mod tests {
         use std::time::Instant;
         let root = std::env::temp_dir().join(format!("sfn-history-cost-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
-        let persistence = Persistence::new(state, StateCipher::with_key(&[7; 32])).unwrap();
+        let persistence =
+            Arc::new(Persistence::new(state.clone(), StateCipher::with_key(&[7; 32])).unwrap());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         let mut execution: Execution = serde_json::from_value(serde_json::json!({
             "arn":"arn:aws:states:us-east-1:000000000000:execution:bench:run",
             "name":"run", "state_machine_arn":"arn:aws:states:us-east-1:000000000000:stateMachine:bench",
             "state_machine_type":"STANDARD", "definition":"{}", "role_arn":"role",
-            "status":"Running", "input":{}, "start_date":1.0, "start_time":"time",
+            "status":"Succeeded", "input":{}, "start_date":1.0, "start_time":"time",
             "variables":{}, "redrive_count":0, "history":[]
         })).unwrap();
-        for count in [0, 1_000, MAX_HISTORY_EVENTS] {
+        for count in [0, 1_000, MAX_HISTORY_EVENTS - 1] {
             while execution.history.len() < count {
                 execution.record(
                     "PassStateExited",
                     serde_json::json!({"output":"x".repeat(256)}),
                 );
             }
+            // Initial history population is outside the append/metadata hot-path timing.
+            persistence.save_execution(&execution).unwrap();
             let start = Instant::now();
             for _ in 0..20 {
                 black_box(
@@ -344,7 +538,35 @@ mod tests {
                 persistence.save_execution(&execution).unwrap();
             }
             let commit_us = start.elapsed().as_micros() / 5;
-            eprintln!("history={count} deep_history_clone_us={deep_clone_us} execution_clone_us={clone_us} encrypted_commit_us={commit_us}");
+            let cell = ExecutionCell::new(
+                execution.clone(),
+                Some(persistence.clone()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let start = Instant::now();
+            runtime.block_on(async {
+                let mut guard = cell.write().await;
+                guard.record(
+                    "PassStateExited",
+                    serde_json::json!({"output":"x".repeat(256)}),
+                );
+            });
+            let append_guard_commit_us = start.elapsed().as_micros();
+            execution = runtime.block_on(async { cell.read().await.clone() });
+            let start = Instant::now();
+            let restored =
+                SfnStore::with_state(state.clone(), StateCipher::with_key(&[7; 32])).unwrap();
+            let restore_us = start.elapsed().as_micros();
+            let restored_history = restored
+                .executions
+                .get(&execution.arn)
+                .unwrap()
+                .try_read()
+                .unwrap()
+                .history
+                .len();
+            assert_eq!(restored_history, execution.history.len());
+            eprintln!("history={count} deep_history_clone_us={deep_clone_us} execution_clone_us={clone_us} metadata_commit_us={commit_us} append_guard_commit_us={append_guard_commit_us} restored_history={restored_history} restore_us={restore_us}");
         }
         drop(persistence);
         std::fs::remove_dir_all(root).unwrap();
@@ -450,3 +672,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "journal_tests.rs"]
+mod journal_tests;

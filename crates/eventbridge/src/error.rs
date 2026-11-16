@@ -33,6 +33,7 @@ error_type!(EventsError, AwsProtocol::Json11, {
     ConcurrentModification => ("ConcurrentModificationException", 400),
     LimitExceeded => ("LimitExceededException", 400),
     UnknownOperation => ("UnknownOperationException", 400),
+    NotImplemented => ("NotImplementedException", 501),
     Internal => ("InternalException", 500),
 });
 

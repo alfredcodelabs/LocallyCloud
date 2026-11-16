@@ -516,6 +516,13 @@ async fn authorize_connect(
         uri,
         event,
         29_000,
+        &format!(
+            "arn:aws:execute-api:{}:{}:{api_id}/authorizers/{authorizer_id}",
+            request.region, request.account_id
+        ),
+        authorizer
+            .get("authorizerCredentialsArn")
+            .and_then(Value::as_str),
     )
     .await
     .map_err(|_| UpgradeFailure::new(500, "Authorizer invocation failed"))?;
@@ -613,18 +620,30 @@ async fn invoke_route(
         uri,
         event,
         timeout_millis,
+        &format!(
+            "arn:aws:execute-api:{}:{}:{}/{}/{}",
+            runtime.region,
+            runtime.account,
+            runtime.api_id,
+            runtime.stage,
+            route.get("routeKey").and_then(Value::as_str).ok_or(())?
+        ),
+        integration.get("credentialsArn").and_then(Value::as_str),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn invoke_lambda(
     registry: &Weak<ServiceRegistry>,
-    _account: &str,
+    account: &str,
     region: &str,
     request_id: &str,
     integration_uri: &str,
     event: Value,
     timeout_millis: u64,
+    source_arn: &str,
+    credentials: Option<&str>,
 ) -> Result<LambdaOutput, ()> {
     let registry = registry.upgrade().ok_or(())?;
     let dispatcher = registry.internal_dispatcher().ok_or(())?;
@@ -632,22 +651,26 @@ async fn invoke_lambda(
     let uri: Uri = format!("/2015-03-31/functions/{function}/invocations")
         .parse()
         .map_err(|_| ())?;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&format!(
-            "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/{region}/lambda/aws4_request"
-        ))
-        .map_err(|_| ())?,
-    );
+    let headers = crate::execute::integration_headers(
+        &registry,
+        account,
+        region,
+        "lambda",
+        "lambda:InvokeFunction",
+        function,
+        source_arn,
+        credentials,
+    )?;
     let response = timeout(
         Duration::from_millis(timeout_millis),
-        dispatcher.dispatch(
+        dispatcher.dispatch_scoped(
             &Method::POST,
             &uri,
             &headers,
             Bytes::from(event.to_string()),
             request_id,
+            account,
+            region,
         ),
     )
     .await
@@ -1298,5 +1321,103 @@ mod tests {
             .unwrap();
 
         assert_eq!(receiver.recv().await, Some(payload));
+    }
+}
+
+#[cfg(test)]
+mod strict_dispatch_tests {
+    use super::*;
+    use locallycloud_core::handler::NativeHandler;
+    use locallycloud_core::integration::authorization::{
+        AuthorizationError, AuthorizationEvaluator, AuthorizationRequest,
+    };
+    use locallycloud_core::integration::InternalDispatcher;
+    use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+    use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName};
+
+    struct Strict;
+    impl AuthorizationEvaluator for Strict {
+        fn strict_sigv4_required(&self) -> bool {
+            true
+        }
+        fn authorize(&self, _: AuthorizationRequest) -> Result<(), AuthorizationError> {
+            Err(AuthorizationError::Denied)
+        }
+    }
+    struct Capture;
+    #[async_trait::async_trait]
+    impl NativeHandler for Capture {
+        async fn handle(&self, request: ServiceRequest) -> Response {
+            assert_eq!(
+                request.headers["x-locallycloud-verified-internal-scope"],
+                "1"
+            );
+            assert_eq!(
+                request.headers["x-locallycloud-caller-principal"],
+                "apigateway.amazonaws.com"
+            );
+            assert_eq!(
+                request.headers["x-locallycloud-source-account"],
+                "000000000000"
+            );
+            assert_eq!(
+                request.headers["x-locallycloud-source-arn"],
+                "arn:aws:execute-api:us-east-1:000000000000:ws-api/prod/send"
+            );
+            Response::builder()
+                .status(200)
+                .body(Body::from("{}"))
+                .unwrap()
+        }
+    }
+    #[tokio::test]
+    async fn websocket_route_attests_service_identity_and_specific_route_source() {
+        let registry = ServiceRegistry::with_known_services();
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            Arc::new(Capture),
+            Arc::new(Strict),
+        );
+        registry.register_native(
+            ServiceName::new("lambda"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            Arc::new(Capture),
+        );
+        registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "000000000000".into(),
+        )));
+        let runtime = WebSocketRuntime {
+            store: Arc::new(ApiGwStore::new()),
+            registry: Arc::downgrade(&registry),
+            account: "000000000000".into(),
+            region: "us-east-1".into(),
+            api_id: "ws-api".into(),
+            stage: "prod".into(),
+            domain_name: "ws-api.execute-api.localhost".into(),
+            source_ip: "127.0.0.1".into(),
+            route_selection_expression: "$request.body.action".into(),
+            routes: Vec::new(),
+            integrations: BTreeMap::from([(
+                "target".into(),
+                json!({"integrationType":"AWS_PROXY","integrationUri":"function"}),
+            )]),
+            authorizer_context: None,
+        };
+        let output = invoke_route(
+            &runtime,
+            &json!({"target":"integrations/target","routeKey":"send"}),
+            json!({"hello":"world"}),
+        )
+        .await
+        .unwrap();
+        assert!(!output.function_error);
     }
 }

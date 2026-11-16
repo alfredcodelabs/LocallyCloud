@@ -91,11 +91,18 @@ impl NativeHandler for EventsHandler {
                 return EventsError::Validation(message).into_response(&request.request_id)
             }
         };
-        if let Err(error) =
-            classic_authorization::check(&self.0.registry, &request, operation, &body)
+        let producer = match classic_authorization::check(
+            &self.0.events.store,
+            &self.0.registry,
+            &request,
+            operation,
+            &body,
+        )
+        .await
         {
-            return error.into_response(&request.request_id);
-        }
+            Ok(producer) => producer,
+            Err(error) => return error.into_response(&request.request_id),
+        };
         // Complete the state commit even if the client disconnects mid-request.
         let services = self.0.clone();
         let operation = operation.to_string();
@@ -108,7 +115,10 @@ impl NativeHandler for EventsHandler {
                 region: &region,
                 request_id: &request_id,
             };
-            services.events.dispatch(&operation, &context, &body).await
+            services
+                .events
+                .dispatch_with_producer(&operation, &context, &body, producer)
+                .await
         })
         .await;
         match result {

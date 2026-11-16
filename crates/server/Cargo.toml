@@ -111,6 +111,7 @@ bytes.workspace = true
 thiserror.workspace = true
 tokio-rustls.workspace = true
 pem = "=3.0.6"
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [build-dependencies]
 flate2.workspace = true

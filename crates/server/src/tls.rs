@@ -5,6 +5,9 @@ pub use locallycloud_core::tls::{
 use std::{io, sync::Arc};
 use zeroize::Zeroizing;
 
+#[cfg(feature = "services")]
+mod automatic;
+
 /// Loaded once at startup. Other SNI names remain owned by the existing domain resolver.
 pub(crate) struct ControlPlaneResolver {
     hostname: String,
@@ -13,6 +16,28 @@ pub(crate) struct ControlPlaneResolver {
 }
 
 impl ControlPlaneResolver {
+    #[cfg(feature = "services")]
+    pub async fn automatic(
+        state: Arc<locallycloud_state::StateDb>,
+        domains: Option<Arc<dyn TlsIdentityResolver>>,
+    ) -> io::Result<(Self, std::path::PathBuf)> {
+        let (identity, ca_path) = tokio::task::spawn_blocking(move || {
+            let cipher = locallycloud_state::StateCipher::from_env()
+                .map_err(|_| io::Error::other("automatic TLS requires the state master key"))?;
+            automatic::identity(&state, &cipher)
+        })
+        .await
+        .map_err(|_| io::Error::other("automatic TLS initialization worker failed"))??;
+        Ok((
+            Self {
+                hostname: "aws.localhost".into(),
+                identity,
+                domains,
+            },
+            ca_path,
+        ))
+    }
+
     pub async fn load(
         config: &crate::config::ControlPlaneTls,
         domains: Option<Arc<dyn TlsIdentityResolver>>,
@@ -66,7 +91,7 @@ impl ControlPlaneResolver {
 #[async_trait::async_trait]
 impl TlsIdentityResolver for ControlPlaneResolver {
     async fn resolve(&self, server_name: &str) -> Option<TlsIdentity> {
-        if server_name == self.hostname {
+        if locallycloud_core::tls::endpoint_hostname_matches(server_name, &self.hostname) {
             return Some(TlsIdentity {
                 certificate_der: self.identity.certificate_der.clone(),
                 private_key_der: self.identity.private_key_der.clone(),
@@ -84,123 +109,106 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::net::TcpListener;
-    #[tokio::test]
-    async fn configured_identity_serves_real_tls_and_keeps_http_available() {
-        struct TempDirectory(std::path::PathBuf);
-        impl Drop for TempDirectory {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let directory = TempDirectory(
-            std::env::temp_dir().join(format!("locallycloud-tls-{}", uuid::Uuid::new_v4())),
-        );
-        std::fs::create_dir(&directory.0).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let certificate = directory.0.join("cert.pem");
-        let key = directory.0.join("key.pem");
-        let generated = std::process::Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=localhost",
-                "-addext",
-                "subjectAltName=DNS:localhost",
-                "-addext",
-                "basicConstraints=critical,CA:FALSE",
-                "-addext",
-                "extendedKeyUsage=serverAuth",
-                "-keyout",
-            ])
-            .arg(&key)
-            .arg("-out")
-            .arg(&certificate)
-            .output()
+
+    #[test]
+    fn configured_identity_serves_real_tls_and_explicit_http_compatibility() {
+        use std::os::unix::fs::DirBuilderExt;
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compatibility-tests/.work")
+            .join(format!("tls-override-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
             .unwrap();
-        assert!(
-            generated.status.success(),
-            "openssl certificate generation failed"
-        );
+        let certificate = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&certificate, generated.cert.pem()).unwrap();
+        std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
         let config = crate::config::ControlPlaneTls {
             hostname: "localhost".into(),
             certificate_path: certificate.to_str().unwrap().into(),
             private_key_path: key.to_str().unwrap().into(),
         };
-        let resolver = Arc::new(ControlPlaneResolver::load(&config, None).await.unwrap());
-        assert!(resolver.resolve("other.localhost").await.is_none());
-        // Files can disappear after startup: connections use the bounded in-memory identity.
-        let trusted =
-            reqwest::Certificate::from_pem(&std::fs::read(&certificate).unwrap()).unwrap();
-        std::fs::remove_file(&certificate).unwrap();
-        std::fs::remove_file(&key).unwrap();
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = tcp.local_addr().unwrap();
-        let app =
-            axum::Router::new().route(
-                "/",
-                axum::routing::get(
-                    |axum::extract::ConnectInfo(info): axum::extract::ConnectInfo<
-                        ConnectionInfo,
-                    >| async move {
-                        assert!(info.peer.ip().is_loopback());
-                        info.server_name.unwrap_or_else(|| "plain-http".into())
-                    },
-                ),
-            );
-        let server = tokio::spawn(async move {
-            axum::serve(
-                DomainListener::new(tcp, Some(resolver)),
-                app.into_make_service_with_connect_info::<ConnectionInfo>(),
-            )
-            .await
-            .unwrap();
-        });
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .resolve("localhost", addr)
-            .resolve("other.localhost", addr)
-            .add_root_certificate(trusted)
-            .timeout(Duration::from_secs(2))
+        let trusted = reqwest::Certificate::from_pem(generated.cert.pem().as_bytes()).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .unwrap();
-        assert_eq!(
-            client
-                .get(format!("https://localhost:{}/", addr.port()))
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap(),
-            "localhost"
-        );
-        assert_eq!(
-            client
-                .get(format!("http://{addr}/"))
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap(),
-            "plain-http"
-        );
-        assert!(client
-            .get(format!("https://other.localhost:{}/", addr.port()))
-            .send()
-            .await
-            .is_err());
-        server.abort();
+            .unwrap()
+            .block_on(async {
+                let resolver = Arc::new(ControlPlaneResolver::load(&config, None).await.unwrap());
+                assert!(resolver.resolve("unrelated.invalid").await.is_none());
+                tokio::fs::remove_file(&certificate).await.unwrap();
+                tokio::fs::remove_file(&key).await.unwrap();
+                let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = tcp.local_addr().unwrap();
+                let app = axum::Router::new().route(
+                    "/",
+                    axum::routing::get(
+                        |axum::extract::ConnectInfo(info): axum::extract::ConnectInfo<
+                            ConnectionInfo,
+                        >| async move {
+                            assert!(info.peer.ip().is_loopback());
+                            if info.secure_transport {
+                                info.server_name.unwrap()
+                            } else {
+                                "plain-http".into()
+                            }
+                        },
+                    ),
+                );
+                let server = tokio::spawn(async move {
+                    axum::serve(
+                        DomainListener::new(tcp, Some(resolver)).with_plain_http(true),
+                        app.into_make_service_with_connect_info::<ConnectionInfo>(),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .resolve("localhost", addr)
+                    .resolve("unrelated.invalid", addr)
+                    .add_root_certificate(trusted)
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    client
+                        .get(format!("https://localhost:{}/", addr.port()))
+                        .send()
+                        .await
+                        .unwrap()
+                        .text()
+                        .await
+                        .unwrap(),
+                    "localhost"
+                );
+                assert_eq!(
+                    client
+                        .get(format!("http://{addr}/"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .text()
+                        .await
+                        .unwrap(),
+                    "plain-http"
+                );
+                assert!(client
+                    .get(format!("https://unrelated.invalid:{}/", addr.port()))
+                    .send()
+                    .await
+                    .is_err());
+                assert!(client
+                    .get(format!("https://127.0.0.1:{}/", addr.port()))
+                    .send()
+                    .await
+                    .is_err());
+                server.abort();
+            });
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

@@ -61,6 +61,8 @@ pub struct LocallyCloudServer {
     registry: Arc<ServiceRegistry>,
     readiness: Readiness,
     tls_resolver: Option<Arc<dyn crate::tls::TlsIdentityResolver>>,
+    #[cfg(feature = "services")]
+    tls_state: Option<Arc<locallycloud_state::StateDb>>,
     architecture: Option<Arc<dyn crate::views::architecture::ArchitectureSource>>,
 }
 
@@ -71,8 +73,17 @@ impl LocallyCloudServer {
             registry,
             readiness: Readiness::new(),
             tls_resolver: None,
+            #[cfg(feature = "services")]
+            tls_state: None,
             architecture: None,
         }
+    }
+
+    /// Inject the owned database for automatic TLS without opening implicit user state.
+    #[cfg(feature = "services")]
+    pub fn with_tls_state(mut self, state: Arc<locallycloud_state::StateDb>) -> Self {
+        self.tls_state = Some(state);
+        self
     }
 
     /// Inject the topology builder behind the dashboard's architecture view. Without it the
@@ -122,14 +133,49 @@ impl LocallyCloudServer {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
         startup: impl FnOnce() + Send,
     ) -> Result<(), ServerError> {
-        let tls_resolver: Option<Arc<dyn crate::tls::TlsIdentityResolver>> = match &self.config.tls
-        {
-            Some(config) => Some(Arc::new(
-                crate::tls::ControlPlaneResolver::load(config, self.tls_resolver)
-                    .await
-                    .map_err(ServerError::Tls)?,
-            )),
-            None => self.tls_resolver,
+        let (tls_resolver, control_plane_tls_hostname): (
+            Option<Arc<dyn crate::tls::TlsIdentityResolver>>,
+            Option<String>,
+        ) = match &self.config.tls {
+            Some(config) => (
+                Some(Arc::new(
+                    crate::tls::ControlPlaneResolver::load(config, self.tls_resolver)
+                        .await
+                        .map_err(ServerError::Tls)?,
+                )),
+                Some(config.hostname.clone()),
+            ),
+            None => {
+                #[cfg(feature = "services")]
+                {
+                    match self.tls_state {
+                        Some(state) => {
+                            let (resolver, ca_path) = crate::tls::ControlPlaneResolver::automatic(
+                                state,
+                                self.tls_resolver,
+                            )
+                            .await
+                            .map_err(ServerError::Tls)?;
+                            tracing::info!(path = %ca_path.display(), "local SDK CA bundle");
+                            (Some(Arc::new(resolver)), Some("aws.localhost".into()))
+                        }
+                        None if self.config.allow_http => (self.tls_resolver, None),
+                        None => {
+                            return Err(ServerError::Tls(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "automatic TLS requires an explicitly injected state database",
+                            )))
+                        }
+                    }
+                }
+                #[cfg(not(feature = "services"))]
+                {
+                    if !self.config.allow_http {
+                        return Err(ServerError::Tls(std::io::Error::new(std::io::ErrorKind::InvalidInput, "automatic TLS requires the services feature and an injected state database")));
+                    }
+                    (self.tls_resolver, None)
+                }
+            }
         };
         let addr = listener.local_addr().map_err(|source| ServerError::Bind {
             addr: self.config.listen_addr,
@@ -156,7 +202,12 @@ impl LocallyCloudServer {
                 self.config.default_region.clone(),
                 self.config.account_id.clone(),
             )
-            .with_meter(meter.clone()),
+            .with_meter(meter.clone())
+            .with_endpoint_host(
+                control_plane_tls_hostname
+                    .clone()
+                    .unwrap_or_else(|| "localhost".into()),
+            ),
         );
         self.registry.set_internal_dispatcher(dispatcher.clone());
         startup();
@@ -166,7 +217,7 @@ impl LocallyCloudServer {
             registry: self.registry.clone(),
             meter,
             max_request_body_bytes: self.config.max_request_body_bytes,
-            control_plane_tls_hostname: self.config.tls.as_ref().map(|tls| tls.hostname.clone()),
+            control_plane_tls_hostname,
             ui_enabled: self.config.ui_enabled,
             architecture: self.architecture,
             dashboard: Arc::new(if self.config.ui_enabled {
@@ -205,7 +256,8 @@ impl LocallyCloudServer {
 
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
         let serve = axum::serve(
-            crate::tls::DomainListener::new(listener, tls_resolver),
+            crate::tls::DomainListener::new(listener, tls_resolver)
+                .with_plain_http(self.config.allow_http),
             app.into_make_service_with_connect_info::<crate::tls::ConnectionInfo>(),
         )
         .with_graceful_shutdown(async move {
@@ -585,13 +637,16 @@ fn local_dashboard_headers(headers: &http::HeaderMap) -> bool {
     let Ok(authority) = host.parse::<http::uri::Authority>() else {
         return false;
     };
-    if !matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]") {
+    if !matches!(
+        authority.host(),
+        "localhost" | "aws.localhost" | "127.0.0.1" | "[::1]"
+    ) {
         return false;
     }
     headers.get("origin").is_none_or(|origin| {
         origin
             .to_str()
-            .is_ok_and(|origin| origin == format!("http://{host}"))
+            .is_ok_and(|origin| matches!(origin.strip_suffix(host), Some("http://" | "https://")))
     })
 }
 
@@ -864,6 +919,18 @@ async fn tls_domain_handler(
     req: Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let connection = req
+        .extensions()
+        .get::<ConnectInfo<crate::tls::ConnectionInfo>>();
+    if (req.uri().path().starts_with("/_locallycloud")
+        || req.uri().path().starts_with("/_localstack"))
+        && !dashboard_origin_matches_transport(
+            req.headers(),
+            connection.is_some_and(|info| info.0.secure_transport),
+        )
+    {
+        return dashboard_error("dashboard reads require the local origin", 403);
+    }
     let server_name = req
         .extensions()
         .get::<ConnectInfo<crate::tls::ConnectionInfo>>()
@@ -883,8 +950,17 @@ async fn tls_domain_handler(
     {
         return StatusCode::MISDIRECTED_REQUEST.into_response();
     }
-    if state.control_plane_tls_hostname.as_deref() == Some(server_name) {
-        // AWS control-plane TLS does not expose dashboard routes or reinterpret custom domains.
+    if state
+        .control_plane_tls_hostname
+        .as_deref()
+        .is_some_and(|endpoint| {
+            locallycloud_core::tls::endpoint_hostname_matches(server_name, endpoint)
+        })
+    {
+        if state.control_plane_tls_hostname.as_deref() == Some(server_name) {
+            return next.run(req).await;
+        }
+        // Endpoint subdomains serve AWS protocols without exposing dashboard capabilities.
         if req.uri().path().starts_with("/_locallycloud")
             || req.uri().path().starts_with("/_localstack")
         {
@@ -926,12 +1002,21 @@ async fn tls_domain_handler(
     dispatch_handler(State(state), req).await
 }
 
+fn dashboard_origin_matches_transport(headers: &http::HeaderMap, secure: bool) -> bool {
+    headers.get("origin").is_none_or(|origin| {
+        let scheme = if secure { "https://" } else { "http://" };
+        let host = headers.get("host").and_then(|host| host.to_str().ok());
+        origin
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.strip_prefix(scheme))
+            .zip(host)
+            .is_some_and(|(origin, host)| origin == host)
+    })
+}
+
 async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Response {
-    let tls = req
-        .extensions()
-        .get::<ConnectInfo<crate::tls::ConnectionInfo>>()
-        .is_some_and(|info| info.0.server_name.is_some());
-    if !tls && dashboard_ui_request(req.method(), req.uri(), req.headers()) {
+    if dashboard_ui_request(req.method(), req.uri(), req.headers()) {
         if !state.ui_enabled {
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -951,6 +1036,7 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
                 &parts.headers,
                 upgrade,
                 &request_id,
+                peer.map(|info| info.0),
             )
             .await;
     }
@@ -984,7 +1070,7 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
                     body_bytes,
                     &request_id,
                     addr.peer.ip(),
-                    addr.server_name.is_some(),
+                    addr.secure_transport,
                 )
                 .await
         }
@@ -1086,6 +1172,30 @@ mod dashboard_tests {
         headers.remove("origin");
         headers.insert("host", "untrusted.example:4566".parse().unwrap());
         assert!(!super::local_dashboard_headers(&headers));
+    }
+
+    #[test]
+    fn dashboard_origin_uses_physical_transport() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("host", "aws.localhost:4566".parse().unwrap());
+        for secure in [false, true] {
+            assert!(super::dashboard_origin_matches_transport(&headers, secure));
+            for (origin, expected) in [
+                ("http://aws.localhost:4566", !secure),
+                ("https://aws.localhost:4566", secure),
+                ("https://attacker.example", false),
+                ("https://aws.localhost:4567", false),
+                ("null", false),
+            ] {
+                headers.insert("origin", origin.parse().unwrap());
+                assert_eq!(
+                    super::dashboard_origin_matches_transport(&headers, secure),
+                    expected,
+                    "{origin}, TLS={secure}"
+                );
+            }
+            headers.remove("origin");
+        }
     }
 
     #[test]

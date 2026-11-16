@@ -1,7 +1,7 @@
 //! Bounded AmazonProvidedDNS relay owned by an isolated compute guest.
 //! Upstream DNS uses only the host-configured resolver; application egress has separate policy.
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,29 +99,51 @@ fn valid_reply(query: &[u8], reply: &[u8]) -> bool {
     reply.get(12..query_question.end) == query.get(12..query_question.end)
 }
 
+/// Live VPC DNS policy and private endpoint ownership for one isolated guest.
+#[derive(Clone)]
+pub struct VpcDnsScope {
+    pub ec2: Arc<Ec2Handler>,
+    pub account: String,
+    pub region: String,
+    pub eni: String,
+}
+
 #[derive(Clone)]
 struct Scope {
-    ec2: Arc<Ec2Handler>,
-    account: String,
-    region: String,
-    eni: String,
+    vpc: Option<VpcDnsScope>,
+    local_hostname: Option<Arc<str>>,
 }
 impl Scope {
     fn enabled(&self) -> bool {
-        self.ec2
-            .vpc_dns_enabled(&self.account, &self.region, &self.eni)
+        self.vpc.as_ref().is_none_or(|scope| {
+            scope
+                .ec2
+                .vpc_dns_enabled(&scope.account, &scope.region, &scope.eni)
+        })
     }
     fn managed_reply(&self, query: &[u8]) -> Option<Vec<u8>> {
         let question = question(query)?;
         if question.class != 1 {
             return None;
         }
-        let ip = self
-            .ec2
-            .private_tcp_dns(&self.account, &self.region, &self.eni)
-            .into_iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&question.name))?
-            .1;
+        let local = self.local_hostname.as_deref().is_some_and(|hostname| {
+            question.name == hostname
+                || question
+                    .name
+                    .strip_suffix(hostname)
+                    .is_some_and(|prefix| prefix.ends_with('.') || prefix == "sync-")
+        });
+        let ip = if local {
+            Ipv4Addr::LOCALHOST
+        } else {
+            let scope = self.vpc.as_ref()?;
+            scope
+                .ec2
+                .private_tcp_dns(&scope.account, &scope.region, &scope.eni)
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&question.name))?
+                .1
+        };
         let mut reply = query.get(..question.end)?.to_vec();
         reply[2] = 0x80 | (query[2] & 0x01); // QR and the guest's recursion-desired bit.
         reply[3] = 0x80 | (query[3] & 0x10); // Recursion available; retain checking-disabled.
@@ -133,6 +155,15 @@ impl Scope {
         }
         Some(reply)
     }
+}
+
+fn refused_reply(query: &[u8]) -> io::Result<Vec<u8>> {
+    let question = question(query).ok_or(io::ErrorKind::InvalidData)?;
+    let mut reply = query[..question.end].to_vec();
+    reply[2] = 0x80 | (query[2] & 0x01);
+    reply[3] = 5; // REFUSED: endpoint-only guests must not gain a new upstream DNS channel.
+    reply[6..12].fill(0);
+    Ok(reply)
 }
 
 async fn udp_reply(upstream: SocketAddr, query: &[u8]) -> io::Result<Vec<u8>> {
@@ -169,7 +200,11 @@ async fn write_frame(stream: &mut TcpStream, packet: &[u8]) -> io::Result<()> {
     stream.write_all(&length.to_be_bytes()).await?;
     stream.write_all(packet).await
 }
-async fn tcp_guest(mut guest: TcpStream, upstream: SocketAddr, scope: Scope) -> io::Result<()> {
+async fn tcp_guest(
+    mut guest: TcpStream,
+    upstream: Option<SocketAddr>,
+    scope: Scope,
+) -> io::Result<()> {
     loop {
         let query = timeout(TIMEOUT, read_frame(&mut guest)).await??;
         if !scope.enabled() || question(&query).is_none() {
@@ -178,7 +213,7 @@ async fn tcp_guest(mut guest: TcpStream, upstream: SocketAddr, scope: Scope) -> 
         timeout(TIMEOUT, async {
             let reply = if let Some(reply) = scope.managed_reply(&query) {
                 reply
-            } else {
+            } else if let Some(upstream) = upstream {
                 let mut resolver = TcpStream::connect(upstream).await?;
                 write_frame(&mut resolver, &query).await?;
                 let reply = read_frame(&mut resolver).await?;
@@ -186,6 +221,8 @@ async fn tcp_guest(mut guest: TcpStream, upstream: SocketAddr, scope: Scope) -> 
                     return Err(io::ErrorKind::InvalidData.into());
                 }
                 reply
+            } else {
+                refused_reply(&query)?
             };
             if scope.enabled() {
                 write_frame(&mut guest, &reply).await?;
@@ -210,12 +247,50 @@ pub fn serve(
     region: String,
     eni: String,
 ) -> [JoinHandle<()>; 2] {
-    let scope = Scope {
-        ec2,
-        account,
-        region,
-        eni,
-    };
+    serve_scoped(
+        udp,
+        tcp,
+        Some(upstream),
+        Scope {
+            vpc: Some(VpcDnsScope {
+                ec2,
+                account,
+                region,
+                eni,
+            }),
+            local_hostname: None,
+        },
+    )
+}
+
+/// Resolve the configured HTTPS endpoint only inside its guest network namespace.
+/// Other names retain VPC private DNS and optional host-resolver behavior; no upstream
+/// means REFUSED for unrelated names. VPC DNS support and lease ownership gate all names.
+/// Bind both listeners in the owned namespace before calling; no host DNS is changed.
+pub fn serve_local_endpoint(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    upstream: Option<SocketAddr>,
+    hostname: String,
+    vpc: Option<VpcDnsScope>,
+) -> [JoinHandle<()>; 2] {
+    serve_scoped(
+        udp,
+        tcp,
+        upstream,
+        Scope {
+            vpc,
+            local_hostname: Some(hostname.trim_end_matches('.').to_ascii_lowercase().into()),
+        },
+    )
+}
+
+fn serve_scoped(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    upstream: Option<SocketAddr>,
+    scope: Scope,
+) -> [JoinHandle<()>; 2] {
     let udp_scope = scope.clone();
     let udp = Arc::new(udp);
     let udp_task = tokio::spawn(async move {
@@ -233,7 +308,8 @@ pub fn serve(
                     workers.spawn(async move {
                         let _ = timeout(TIMEOUT, async {
                             let reply = if let Some(reply) = scope.managed_reply(&query) { reply }
-                                else { udp_reply(upstream, &query).await? };
+                                else if let Some(upstream) = upstream { udp_reply(upstream, &query).await? }
+                                else { refused_reply(&query)? };
                             if scope.enabled() { udp.send_to(&reply, peer).await?; }
                             Ok::<_,io::Error>(())
                         }).await;
@@ -386,6 +462,110 @@ mod tests {
             .unwrap();
         packet.truncate(size);
         packet
+    }
+
+    #[tokio::test]
+    async fn endpoint_only_dns_resolves_sdk_names_and_refuses_unrelated_names() {
+        for hostname in ["aws.localhost", "custom.example.test"] {
+            let (udp, tcp, udp_address, tcp_address) = listeners().await;
+            let tasks = serve_local_endpoint(udp, tcp, None, hostname.to_ascii_uppercase(), None);
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.connect(udp_address).await.unwrap();
+            let mut stream = TcpStream::connect(tcp_address).await.unwrap();
+            for name in [
+                hostname.to_owned(),
+                format!("bucket.{hostname}"),
+                format!("sync-{hostname}"),
+            ] {
+                let request = query(&name, 1);
+                client.send(&request).await.unwrap();
+                let reply = receive_udp(&client).await;
+                assert!(valid_reply(&request, &reply));
+                assert_eq!(&reply[reply.len() - 4..], &[127, 0, 0, 1]);
+                write_frame(&mut stream, &request).await.unwrap();
+                assert_eq!(
+                    timeout(Duration::from_secs(1), read_frame(&mut stream))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    reply
+                );
+            }
+            let ipv6 = query(hostname, 28);
+            client.send(&ipv6).await.unwrap();
+            let reply = receive_udp(&client).await;
+            assert_eq!(&reply[6..8], &[0, 0]);
+            assert_eq!(reply[3] & 15, 0);
+            for name in [
+                format!("fake{hostname}"),
+                format!("{hostname}.evil.test"),
+                "public.example.test".into(),
+            ] {
+                let request = query(&name, 1);
+                client.send(&request).await.unwrap();
+                let reply = receive_udp(&client).await;
+                assert_eq!(reply[3] & 15, 5);
+                assert_eq!(&reply[6..8], &[0, 0]);
+                write_frame(&mut stream, &request).await.unwrap();
+                assert_eq!(
+                    timeout(Duration::from_secs(1), read_frame(&mut stream))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    reply
+                );
+            }
+            stop(tasks).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn local_endpoint_follows_vpc_dns_policy_and_source_lease() {
+        let (ec2, vpc, source, _target) = fixture().await;
+        let (udp, tcp, udp_address, _) = listeners().await;
+        let tasks = serve_local_endpoint(
+            udp,
+            tcp,
+            None,
+            "aws.localhost".into(),
+            Some(VpcDnsScope {
+                ec2: ec2.clone(),
+                account: "000000000000".into(),
+                region: "us-east-1".into(),
+                eni: source.eni_id.clone(),
+            }),
+        );
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(udp_address).await.unwrap();
+        let request = query("bucket.aws.localhost", 1);
+        client.send(&request).await.unwrap();
+        assert!(valid_reply(&request, &receive_udp(&client).await));
+        call(
+            &ec2,
+            format!("Action=ModifyVpcAttribute&VpcId={vpc}&EnableDnsSupport.Value=false"),
+        )
+        .await;
+        client.send(&request).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(60), client.recv(&mut [0; MAX_PACKET]))
+                .await
+                .is_err()
+        );
+        call(
+            &ec2,
+            format!("Action=ModifyVpcAttribute&VpcId={vpc}&EnableDnsSupport.Value=true"),
+        )
+        .await;
+        client.send(&request).await.unwrap();
+        assert!(valid_reply(&request, &receive_udp(&client).await));
+        drop(source);
+        client.send(&request).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(60), client.recv(&mut [0; MAX_PACKET]))
+                .await
+                .is_err()
+        );
+        stop(tasks).await;
     }
 
     #[test]

@@ -377,18 +377,6 @@ pub(super) fn describe_value(record: &SecretRecord) -> Value {
     response
 }
 
-pub(super) fn kms_call(request: &ServiceRequest, scope: &Scope) -> KmsCallContext {
-    KmsCallContext {
-        source_service: "secretsmanager".to_owned(),
-        account_id: scope.account_id.clone(),
-        region: scope.region.clone(),
-        request_id: request.request_id.clone(),
-        caller_arn: None,
-        iam_policy_allowed: false,
-        iam_policy_denied: false,
-    }
-}
-
 pub(super) fn encryption_context(arn: &str, version_id: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("SecretARN".to_owned(), arn.to_owned()),

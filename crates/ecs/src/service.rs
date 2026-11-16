@@ -384,6 +384,8 @@ impl EcsHandler {
             };
             evaluator
                 .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                    delegated_caller: None,
+                    caller_context: Default::default(),
                     source_arn: None,
                     caller: RequestIdentity {
                         account_id: scope.account.clone(),
@@ -475,7 +477,13 @@ impl EcsHandler {
         role: Option<&str>,
         image: &str,
     ) -> Result<(), EcsError> {
-        let evaluator = self.registry.upgrade().and_then(|registry| {
+        let registry = self.registry.upgrade();
+        let destination_enforces_pull = registry.as_ref().is_some_and(|registry| {
+            registry
+                .native_handler(&locallycloud_core::registry::ServiceName::new("ecr"))
+                .is_some()
+        });
+        let evaluator = registry.and_then(|registry| {
             registry.authorization_evaluator(&locallycloud_core::registry::ServiceName::new("iam"))
         });
         let Some(role) = role else {
@@ -514,8 +522,13 @@ impl EcsHandler {
             ("ecr:BatchGetImage", resource.as_str()),
             ("ecr:GetDownloadUrlForLayer", resource.as_str()),
         ] {
+            if destination_enforces_pull && action != "ecr:GetAuthorizationToken" {
+                continue;
+            }
             evaluator
                 .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                    delegated_caller: None,
+                    caller_context: Default::default(),
                     source_arn: None,
                     caller: RequestIdentity {
                         account_id: scope.account.clone(),
@@ -552,6 +565,13 @@ impl EcsHandler {
                 .ok_or(EcsError::AccessDenied)?;
             evaluator
                 .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+                    delegated_caller: locallycloud_core::integration::identity::trusted_role(
+                        request,
+                    ),
+                    caller_context:
+                        locallycloud_core::integration::request_context::verified_request_context(
+                            request,
+                        ),
                     source_arn: None,
                     caller: RequestIdentity {
                         account_id: request.account_id.clone(),

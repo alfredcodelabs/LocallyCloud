@@ -45,12 +45,67 @@ IAM defaults to permissive mode. To test permissions, enable `LOCALLYCLOUD_IAM_E
 Strict IAM supports `ForAnyValue`/`ForAllValues` for supported operators and
 `kms:ResourceAliases` in native integrations. Unsupported operators are rejected.
 
+STS `AssumeRole` checks the role's trust policy, caller permissions and conditions,
+including `ExternalId`, before issuing credentials. Session duration respects the
+role limit and the one-hour role-chaining limit. Inline session policies are supported;
+managed session policy ARNs, session tags, source identity and MFA verification are
+not implemented and are rejected. OIDC/SAML assertions are not verified; strict mode
+denies their credential-issuing operations. Organizations SCPs are not evaluated.
+MFA presence is absent for long-term keys and false for verified temporary sessions;
+unverified MFA assertions are rejected. Time conditions use the evaluation clock,
+including `aws:CurrentTime` and `aws:EpochTime`, rather than client-provided values.
+
+SSM and Step Functions evaluate supported resource and request tag conditions,
+including `aws:TagKeys`. SSM also supports `ssm:resourceTag`; Step Functions execution
+authorization uses the current state-machine tags. Creating a tagged state machine
+or activity additionally requires `states:TagResource`.
+
+In strict mode, Lambda and SQS compose supported identity and resource policies;
+service-principal delivery requires a matching resource grant. KMS key policies must
+grant the caller or delegate to IAM. An identity policy alone does not override an
+explicit key policy that excludes the caller.
+Lambda resource policies are scoped to the function, version or alias ARN; existing
+unqualified policies are preserved. Cross-account Lambda references, deleting an
+individual version and unsupported permission restrictions return explicit errors.
+They do not fall back to the unqualified function or silently widen a grant.
+Tags apply to an unqualified function ARN. Qualified tag mutations return an
+invalid-parameter error; listing tags through a version or alias ARN is unsupported.
+
+### EventBridge and ECR authorization
+
+In strict mode, EventBridge applies supported event-bus policies to `PutEvents`.
+Caller-published sources beginning with `aws.` fail per entry; the verified native
+S3 producer can publish its own bucket events. `PutPartnerEvents` is explicitly
+unsupported in strict mode because partner event-source ownership is not modeled.
+Use a full supported policy document for `PutPermission`; its abbreviated
+`Condition` form is unsupported rather than ignored. Cross-account event-bus
+routing remains unsupported.
+
+API destinations do not follow redirects, including OAuth token endpoint redirects.
+Destination requests time out after five seconds. Delivery retries `401`, `407`,
+`409`, `429` and `5xx`; other `3xx` and `4xx` responses are terminal.
+
+ECR registry tokens retain their issuing identity. Registry operations recheck
+repository permissions, identity denies, boundaries and session limits. Repository
+policy APIs support the shared policy evaluator. As a conservative limitation, a
+token is denied once its issuing STS session expires or its credential can no
+longer be resolved, even before the token's advertised twelve-hour expiration.
+Aborting a registry upload has no mapped IAM operation and is unsupported in strict
+mode. These limits prevent a token from bypassing permissions.
+
 ### CloudFormation
 
 Supports Lambda `Architectures`, [logging](LAMBDA.md#logging), Lambda-backed custom
 resources, rollback, live resource progress and paginated `ListChangeSets`.
 Install custom-resource runtimes before deployment; missing callbacks wait until
 `ServiceTimeout`.
+
+A stack's `RoleARN` is persisted and used for creation, updates and deletion.
+Assigning a role requires `iam:PassRole` and trust for `cloudformation.amazonaws.com`.
+An operator allowed to manage an existing stack can reuse its assigned role without
+PassRole; scope stack-management permissions accordingly. Change sets retain the
+validated role assignment. Legacy change sets require assignment validation before
+activating a role that earlier versions ignored.
 
 `Code.ZipFile` accepts Node.js/Python source in `index.js`/`index.py`, with an
 `index.<export>` handler. Source and ZIP are each limited to 4 MiB;
@@ -73,18 +128,26 @@ Use the dashboard's stage link, or these local URL formats:
 
 | API | URL |
 | --- | --- |
-| REST | `http://127.0.0.1:4566/restapis/<api-id>/<stage>/_user_request_/<path>` |
-| HTTP | `http://127.0.0.1:4566/execute-api/<api-id>/<stage>/<path>`; use literal `$default` for the default stage |
+| REST | `https://aws.localhost:4566/restapis/<api-id>/<stage>/_user_request_/<path>` |
+| HTTP | `https://aws.localhost:4566/execute-api/<api-id>/<stage>/<path>`; use literal `$default` for the default stage |
 
 API IDs resolve in the instance account and owning region. AWS-shaped `ApiEndpoint`
 metadata is not a local connection address.
+HTTP proxy integrations preserve the backend's status, headers and body, including
+redirect responses; API Gateway does not fetch the redirect target. HTTP integrations
+generate `Content-Length` from the final outbound body, including mapped REST payloads.
+REST HTTP integrations omit the caller's `Authorization` header when it carries a
+SigV4 signature or the REST method uses `AWS_IAM`; other authorization schemes
+remain available to the configured backend. This rule does not change HTTP API
+or Lambda integration headers. REST `AWS_IAM` invocation itself remains unsupported.
 
 For REGIONAL REST or HTTP custom domains:
 
 1. Import a valid RSA certificate and its unencrypted PKCS#8 private key into ACM
    in the API's region.
 2. Create the domain and base-path/API mapping through the CLI, CloudFormation or
-   supported SAM `HttpApi.Domain` configuration. HTTP and HTTPS share the configured port.
+   supported SAM `HttpApi.Domain` configuration. HTTPS uses the configured port;
+   plain HTTP requires `LOCALLYCLOUD_ALLOW_HTTP=true`.
 3. Create a Route 53 Alias A/AAAA record using the domain's regional target and hosted-zone ID.
    Set `LOCALLYCLOUD_ROUTE53_DNS_BIND=127.0.0.1:1053` and configure your OS resolver
    to send only the development domain to that endpoint.
@@ -125,9 +188,18 @@ application separately.
 
 ## Compute and networking limits
 
+Native IPv4 VPC topology, subnet and security group tags, route tables, NAT gateways
+and endpoint configuration survive restarts. The default security group's self rule
+can be revoked. Security group permission batches are validated before one atomic
+write. Gateway endpoints support S3 and DynamoDB; Interface endpoints support SSM,
+Secrets Manager, Logs, STS, SQS and KMS. Interface access uses the existing subnet and
+security group model, without dedicated endpoint ENIs. NACLs, VPC peering and IPv6 are
+not implemented. Validate the actual guest traffic required by your application.
+
 The ECS/Fargate reference supports one container and one TCP application port per
 task, IPv4 `awsvpc`, service desired count 0–2, and an internal HTTP ALB with IP
 targets. Target registration, health checks, replacement and draining are integrated.
+`RunTask` accepts one private subnet and one task per request.
 HTTPS listeners, host/path rules, multi-container tasks, IPv6 and UDP application
 traffic are outside that reference. Validate additional consumer requirements separately.
 

@@ -915,3 +915,41 @@ fn resource_alias_metadata_tracks_scope_reassignment_and_deletion() {
         "an over-quota alias set must not grant access from a truncated prefix"
     );
 }
+
+#[test]
+fn every_internal_encrypt_caller_requires_customer_key_policy_permission() {
+    let service = test_service();
+    let (key, _) = create_key(&service, ACCOUNT, REGION);
+    let policy = json!({"Statement":{"Effect":"Allow","Principal":{"AWS":format!("arn:aws:iam::{ACCOUNT}:user/owner")},"Action":"kms:*","Resource":"*"}}).to_string();
+    call_ok(
+        &service,
+        "PutKeyPolicy",
+        json!({"KeyId":key,"Policy":policy}),
+    );
+    for source in ["ssm", "secretsmanager", "s3", "dynamodb", "sqs"] {
+        for caller in [
+            None,
+            Some(format!("arn:aws:iam::{ACCOUNT}:user/excluded")),
+            Some(format!("arn:aws:iam::{ACCOUNT}:user/owner")),
+        ] {
+            let allowed = caller
+                .as_ref()
+                .is_some_and(|caller| caller.ends_with("/owner"));
+            let result = service.encrypt_internal(KmsEncryptRequest {
+                call: KmsCallContext {
+                    source_service: source.into(),
+                    caller_arn: caller,
+                    iam_policy_allowed: true,
+                    ..internal_call(ACCOUNT, REGION)
+                },
+                key: KmsKeySelector::Explicit(key.clone()),
+                plaintext: SensitiveBytes::new(b"secret".to_vec()),
+                encryption_context: BTreeMap::new(),
+            });
+            assert_eq!(result.is_ok(), allowed, "source={source}");
+            if !allowed {
+                assert!(matches!(result, Err(KmsError::AccessDenied)));
+            }
+        }
+    }
+}

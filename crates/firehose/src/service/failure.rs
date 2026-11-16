@@ -192,6 +192,8 @@ impl Inner {
             .ok_or(FailureCode::InternalError)?;
         evaluator
             .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 source_arn: None,
                 caller: caller.clone(),
                 role_arn: batch.destination.s3_role_arn.clone(),

@@ -15,9 +15,12 @@ developing and testing applications with the AWS CLI, AWS SDKs, Terraform and
 AWS SAM. It runs as a regular user and does not need Docker.
 .PP
 Without a command, it starts the server on
-.I http://127.0.0.1:4566
+.I https://aws.localhost:4566
 and keeps running until it receives SIGINT or SIGTERM. The dashboard is at
-.IR http://127.0.0.1:4566/_locallycloud/ui .
+.IR https://aws.localhost:4566/_locallycloud/ui .
+The server generates a local CA and exports its public certificate beside the
+state database as state.sqlite3.ca.pem. Configure your SDK's CA bundle or import
+this CA into your browser. The private key stays encrypted in the state database.
 .SH COMMANDS
 .TP
 .B migrate\-s3\-encryption
@@ -53,6 +56,9 @@ Set to
 .B strict
 to evaluate IAM policies. Default: permissive.
 .TP
+.B LOCALLYCLOUD_ALLOW_HTTP
+Set to true to also accept plaintext HTTP for compatibility. Default: false.
+.TP
 .B LOCALLYCLOUD_WORK_DIR
 Lambda work files. Default:
 .IR ${XDG_CACHE_HOME:\-~/.cache}/locallycloud/lambda .
@@ -83,7 +89,8 @@ non\-zero values when startup or migration fails.
 .nf
 export LOCALLYCLOUD_KMS_MASTER_KEY="$(openssl rand \-base64 32)"
 locallycloud
-aws \-\-endpoint\-url http://127.0.0.1:4566 s3 ls
+aws \-\-endpoint\-url https://aws.localhost:4566 \
+  \-\-ca\-bundle ~/.local/share/locallycloud/state.sqlite3.ca.pem s3 ls
 .fi
 .SH SEE ALSO
 .BR aws (1),

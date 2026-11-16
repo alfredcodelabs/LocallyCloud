@@ -47,6 +47,61 @@ impl Drop for TestDb {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+#[test]
+fn legacy_repository_metadata_restores_and_v2_cannot_be_silently_downgraded() {
+    let db = TestDb::new();
+    let cipher = StateCipher::with_key(&[27; 32]);
+    let persistence =
+        Persistence::new(db.database.clone(), StateCipher::with_key(&[27; 32])).unwrap();
+    let metadata = json!({"name":"legacy","created_at":1.0,"image_tag_mutability":"MUTABLE","scan_on_push":false,"encryption_type":"AES256","kms_key":null});
+    let legacy = cipher
+        .seal(
+            &[
+                "ecr",
+                "111111111111",
+                "us-east-1",
+                "legacy",
+                "repository",
+                "",
+            ],
+            metadata.to_string().as_bytes(),
+        )
+        .unwrap();
+    db.database.connection().unwrap().execute(
+        "INSERT INTO ecr_records(account,region,repository,kind,id,version,payload) VALUES ('111111111111','us-east-1','legacy','repository','',1,?1)", [legacy],
+    ).unwrap();
+    let restored = db.handler(27).unwrap();
+    assert!(restored
+        .repos
+        .get("111111111111:us-east-1:legacy")
+        .unwrap()
+        .policy
+        .is_none());
+    let key = registry_v2::RepoKey {
+        account: "111111111111".into(),
+        region: "us-east-1".into(),
+        name: "legacy".into(),
+    };
+    persistence
+        .update_repository(&key, metadata.to_string().as_bytes())
+        .unwrap();
+    let version: u32 = db
+        .database
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT version FROM ecr_records WHERE kind='repository'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 2);
+    assert!(db.handler(27).is_ok());
+    // Version is part of the authenticated envelope, not just a mutable SQLite marker.
+    db.sql("UPDATE ecr_records SET version=1 WHERE kind='repository'");
+    assert!(db.handler(27).is_err());
+}
 fn request(method: Method, path: &str, body: Bytes) -> ServiceRequest {
     ServiceRequest {
         method,

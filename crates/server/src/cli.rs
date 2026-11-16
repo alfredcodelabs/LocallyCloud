@@ -6,7 +6,7 @@ use locallycloud_dynamodb::migration::MigrationPolicy;
 pub const USAGE: &str = "\
 Usage: locallycloud [COMMAND]
 
-Run the LocallyCloud local AWS emulator on one endpoint (default http://127.0.0.1:4566).
+Run the LocallyCloud local AWS emulator on one endpoint (default https://aws.localhost:4566).
 
 Commands:
   (none)                  Start the server

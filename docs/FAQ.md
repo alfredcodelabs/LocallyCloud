@@ -37,7 +37,7 @@ State, master keys and AWS profiles remain until you explicitly remove them.
 
 ### Where is the dashboard?
 
-Open [the dashboard](http://127.0.0.1:4566/_locallycloud/ui) after starting the server.
+Open [the dashboard](https://aws.localhost:4566/_locallycloud/ui) after starting the server.
 The application-menu launcher opens it but does not start the server.
 
 Select an account/profile and region to browse resources and logs. Resource status
@@ -103,7 +103,7 @@ for scope and versions; support is not complete for every tool feature.
 No. Services implement subsets of AWS behavior. Review the [service overview](SERVICES.md) and verify the operations your application needs. Inspect registered services with:
 
 ```sh
-curl -fsS http://127.0.0.1:4566/_locallycloud/status
+curl --cacert "${LOCALLYCLOUD_STATE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/state.sqlite3}.ca.pem" -fsS https://aws.localhost:4566/_locallycloud/status
 ```
 
 The status distinguishes native handlers from proxied services. A proxied service depends on the configured external fallback backend; its name appearing in the registry does not mean LocallyCloud implements it natively.
@@ -198,10 +198,22 @@ Cognito user pools, Route 53, CloudFront, WAF v2, CloudTrail, X-Ray, Athena, ARC
 
 S3 metadata from earlier versions is migrated automatically on startup. Earlier binaries cannot read the upgraded state. This metadata upgrade is separate from the explicit migration of legacy plaintext object bodies.
 
+Legacy EC2 security group records preserve their previous default self permission
+when loaded. Subsequent writes use the updated format so a revoked rule stays
+revoked after restart; older binaries cannot read these updated group records.
+
+Step Functions automatically migrates stored execution histories to individually
+encrypted events. New events and execution state commit together. Keep a backup
+before upgrading: older binaries cannot read the upgraded execution format.
+
+Updated ECR repository metadata also uses a new authenticated format. Legacy
+repositories restore automatically; older binaries cannot read records written
+by the updated emulator and cannot silently ignore their repository policies.
+
 ### How can I tell whether the server is reachable?
 
 ```sh
-curl -fsS http://127.0.0.1:4566/_locallycloud/health
+curl --cacert "${LOCALLYCLOUD_STATE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/state.sqlite3}.ca.pem" -fsS https://aws.localhost:4566/_locallycloud/health
 aws --profile locallycloud sts get-caller-identity
 ```
 

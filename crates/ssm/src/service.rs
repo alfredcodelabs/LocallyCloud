@@ -13,8 +13,7 @@ use base64::Engine;
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::kms::{
-    KmsCallContext, KmsDecryptRequest, KmsEncryptRequest, KmsInternalError, KmsKeySelector,
-    KmsServiceKey, SensitiveBytes,
+    KmsDecryptRequest, KmsEncryptRequest, KmsInternalError, KmsKeySelector, SensitiveBytes,
 };
 use locallycloud_core::registry::{AwsProtocol, ServiceRegistry};
 use serde::de::DeserializeOwned;
@@ -36,6 +35,20 @@ mod batch;
 mod by_path;
 
 const KMS_CALL_LIMIT: Duration = Duration::from_secs(2);
+
+fn request_tag_context(tags: Option<&BTreeMap<String, String>>) -> BTreeMap<String, Vec<String>> {
+    let mut context: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(tags) = tags.filter(|tags| !tags.is_empty()) {
+        context.insert("aws:tagkeys".into(), tags.keys().cloned().collect());
+        for (key, value) in tags {
+            context
+                .entry(format!("aws:requesttag/{}", key.to_ascii_lowercase()))
+                .or_default()
+                .push(value.clone());
+        }
+    }
+    context
+}
 
 pub(crate) struct SsmHandler {
     registry: Weak<ServiceRegistry>,
@@ -94,16 +107,22 @@ impl SsmHandler {
                     .await
             }
             Operation::DescribeParameters => {
-                self.describe_parameters(decode(&request.body)?, &scope)
+                self.describe_parameters(decode(&request.body)?, &scope, request)
             }
             Operation::DeleteParameter => {
-                self.delete_parameter(decode(&request.body)?, &scope).await
+                self.delete_parameter(decode(&request.body)?, &scope, request)
+                    .await
             }
-            Operation::AddTagsToResource => self.add_tags(decode(&request.body)?, &scope).await,
+            Operation::AddTagsToResource => {
+                self.add_tags(decode(&request.body)?, &scope, request).await
+            }
             Operation::RemoveTagsFromResource => {
-                self.remove_tags(decode(&request.body)?, &scope).await
+                self.remove_tags(decode(&request.body)?, &scope, request)
+                    .await
             }
-            Operation::ListTagsForResource => self.list_tags(decode(&request.body)?, &scope),
+            Operation::ListTagsForResource => {
+                self.list_tags(decode(&request.body)?, &scope, request)
+            }
         }
     }
 
@@ -155,21 +174,38 @@ impl SsmHandler {
             return Err(SsmError::Validation);
         }
         let tags = request.tags.map(validate_tags).transpose()?;
+        let mut context = request_tag_context(tags.as_ref());
+        context.insert(
+            "ssm:overwrite".into(),
+            vec![request.overwrite.unwrap_or(false).to_string()],
+        );
+        self.authorize_with_context(
+            service_request,
+            "ssm:PutParameter",
+            &scope.parameter_arn(&request.name),
+            context,
+        )?;
         let value = if parameter_type == "SecureString" {
-            let key = request
-                .key_id
-                .as_deref()
-                .map_or(KmsKeySelector::ServiceDefault(KmsServiceKey::Ssm), |id| {
-                    KmsKeySelector::Explicit(id.to_owned())
-                });
-            let output = self
-                .dispatcher()?
+            let dispatcher = self.dispatcher()?;
+            let context = encryption_context(scope, &request.name);
+            let (call, canonical_key) = dispatcher
+                .kms_call_context(
+                    service_request,
+                    "ssm",
+                    "kms:Encrypt",
+                    request.key_id.as_deref().unwrap_or("alias/aws/ssm"),
+                    &context,
+                    KMS_CALL_LIMIT,
+                )
+                .await
+                .map_err(map_kms_error)?;
+            let output = dispatcher
                 .kms_encrypt_bounded(
                     KmsEncryptRequest {
-                        call: kms_call(service_request, scope),
-                        key,
+                        call,
+                        key: KmsKeySelector::Explicit(canonical_key),
                         plaintext: SensitiveBytes::new(request.value.into_bytes()),
-                        encryption_context: encryption_context(scope, &request.name),
+                        encryption_context: context,
                     },
                     KMS_CALL_LIMIT,
                 )
@@ -212,18 +248,17 @@ impl SsmHandler {
         operation: Operation,
     ) -> Result<Value, SsmError> {
         let (name, selector) = batch::query_name(&request.name, scope)?;
-        locallycloud_core::integration::authorization::authorize_native_read(
-            &self.registry,
-            service_request,
-            "ssm",
-            if operation == Operation::GetParameters {
-                "ssm:GetParameters"
-            } else {
-                "ssm:GetParameter"
-            },
-            &scope.parameter_arn(&name),
-        )
-        .map_err(|_| SsmError::AccessDenied)?;
+        if operation != Operation::GetParametersByPath {
+            self.authorize(
+                service_request,
+                if operation == Operation::GetParameters {
+                    "ssm:GetParameters"
+                } else {
+                    "ssm:GetParameter"
+                },
+                &scope.parameter_arn(&name),
+            )?;
+        }
         let parameter = self.store.get(scope, &name).or_else(|error| {
             if request.name.trim().starts_with("arn:") {
                 self.store.get(scope, name.trim_start_matches('/'))
@@ -247,14 +282,26 @@ impl SsmHandler {
                 key_arn,
             } => {
                 if request.with_decryption.unwrap_or(false) {
-                    let result = self
-                        .dispatcher()?
+                    let dispatcher = self.dispatcher()?;
+                    let context = encryption_context(scope, &parameter.name);
+                    let (call, canonical_key) = dispatcher
+                        .kms_call_context(
+                            service_request,
+                            "ssm",
+                            "kms:Decrypt",
+                            &key_arn,
+                            &context,
+                            KMS_CALL_LIMIT,
+                        )
+                        .await
+                        .map_err(map_kms_error)?;
+                    let result = dispatcher
                         .kms_decrypt_bounded(
                             KmsDecryptRequest {
-                                call: kms_call(service_request, scope),
-                                key_id: Some(key_arn),
+                                call,
+                                key_id: Some(canonical_key),
                                 ciphertext: SensitiveBytes::new(ciphertext),
-                                encryption_context: encryption_context(scope, &parameter.name),
+                                encryption_context: context,
                             },
                             KMS_CALL_LIMIT,
                         )
@@ -289,7 +336,9 @@ impl SsmHandler {
         &self,
         request: DescribeParametersRequest,
         scope: &Scope,
+        service_request: &ServiceRequest,
     ) -> Result<Value, SsmError> {
+        self.authorize(service_request, "ssm:DescribeParameters", "*")?;
         if request.max_results.is_some()
             || request.next_token.is_some()
             || request.shared.unwrap_or(false)
@@ -341,7 +390,13 @@ impl SsmHandler {
         &self,
         request: DeleteParameterRequest,
         scope: &Scope,
+        service_request: &ServiceRequest,
     ) -> Result<Value, SsmError> {
+        self.authorize(
+            service_request,
+            "ssm:DeleteParameter",
+            &scope.parameter_arn(&request.name),
+        )?;
         validate_name(&request.name)?;
         let store = self.store.clone();
         let scope = scope.clone();
@@ -355,12 +410,19 @@ impl SsmHandler {
         &self,
         request: AddTagsToResourceRequest,
         scope: &Scope,
+        service_request: &ServiceRequest,
     ) -> Result<Value, SsmError> {
         validate_resource(&request.resource_type, &request.resource_id)?;
         let tags = validate_tags(request.tags)?;
         if tags.is_empty() {
             return Err(SsmError::Validation);
         }
+        self.authorize_with_context(
+            service_request,
+            "ssm:AddTagsToResource",
+            &scope.parameter_arn(&request.resource_id),
+            request_tag_context(Some(&tags)),
+        )?;
         let store = self.store.clone();
         let scope = scope.clone();
         tokio::task::spawn_blocking(move || store.add_tags(&scope, &request.resource_id, tags))
@@ -373,7 +435,14 @@ impl SsmHandler {
         &self,
         request: RemoveTagsFromResourceRequest,
         scope: &Scope,
+        service_request: &ServiceRequest,
     ) -> Result<Value, SsmError> {
+        self.authorize_with_context(
+            service_request,
+            "ssm:RemoveTagsFromResource",
+            &scope.parameter_arn(&request.resource_id),
+            BTreeMap::from([("aws:tagkeys".into(), request.tag_keys.clone())]),
+        )?;
         validate_resource(&request.resource_type, &request.resource_id)?;
         if request.tag_keys.is_empty() || request.tag_keys.len() > 50 {
             return Err(SsmError::Validation);
@@ -399,7 +468,13 @@ impl SsmHandler {
         &self,
         request: ListTagsForResourceRequest,
         scope: &Scope,
+        service_request: &ServiceRequest,
     ) -> Result<Value, SsmError> {
+        self.authorize(
+            service_request,
+            "ssm:ListTagsForResource",
+            &scope.parameter_arn(&request.resource_id),
+        )?;
         validate_resource(&request.resource_type, &request.resource_id)?;
         let tag_list = self
             .store
@@ -408,6 +483,71 @@ impl SsmHandler {
             .map(|(key, value)| TagOutput { key, value })
             .collect();
         serialize(ListTagsForResourceResponse { tag_list })
+    }
+
+    fn authorize(
+        &self,
+        request: &ServiceRequest,
+        action: &str,
+        resource: &str,
+    ) -> Result<(), SsmError> {
+        self.authorize_with_context(request, action, resource, BTreeMap::new())
+    }
+
+    fn authorize_with_context(
+        &self,
+        request: &ServiceRequest,
+        action: &str,
+        resource: &str,
+        mut context: BTreeMap<String, Vec<String>>,
+    ) -> Result<(), SsmError> {
+        use locallycloud_core::integration::authorization::{
+            verified_caller, AuthorizationRequest,
+        };
+        use locallycloud_core::registry::ServiceName;
+        let Some(evaluator) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+        else {
+            return Ok(());
+        };
+        if !evaluator.strict_sigv4_required() {
+            return Ok(());
+        }
+        let (request_identity, delegated_identity) =
+            verified_caller(evaluator.as_ref(), request).map_err(|_| SsmError::AccessDenied)?;
+        let scope = Scope::new(&request.account_id, &request.region);
+        if let Some(name) = resource.strip_prefix(&scope.parameter_arn("")) {
+            for (key, value) in self.store.authorization_tags(&scope, name) {
+                let key = key.to_ascii_lowercase();
+                context
+                    .entry(format!("aws:resourcetag/{key}"))
+                    .or_default()
+                    .push(value.clone());
+                context
+                    .entry(format!("ssm:resourcetag/{key}"))
+                    .or_default()
+                    .push(value);
+            }
+        }
+        context.extend(
+            locallycloud_core::integration::request_context::verified_request_context(request),
+        );
+        context.insert(
+            "aws:resourceaccount".into(),
+            vec![request.account_id.clone()],
+        );
+        evaluator
+            .authorize(AuthorizationRequest {
+                request_identity,
+                delegated_identity,
+                source_service: "ssm".into(),
+                action: action.into(),
+                resource: resource.into(),
+                context,
+            })
+            .map_err(|_| SsmError::AccessDenied)
     }
 
     fn dispatcher(
@@ -420,18 +560,6 @@ impl SsmHandler {
     }
 }
 
-fn kms_call(request: &ServiceRequest, scope: &Scope) -> KmsCallContext {
-    KmsCallContext {
-        source_service: "ssm".to_owned(),
-        account_id: scope.account_id.clone(),
-        region: scope.region.clone(),
-        request_id: request.request_id.clone(),
-        caller_arn: None,
-        iam_policy_allowed: false,
-        iam_policy_denied: false,
-    }
-}
-
 fn encryption_context(scope: &Scope, name: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("PARAMETER_ARN".to_owned(), scope.parameter_arn(name))])
 }
@@ -439,6 +567,7 @@ fn encryption_context(scope: &Scope, name: &str) -> BTreeMap<String, String> {
 fn map_kms_error(error: KmsInternalError) -> SsmError {
     match error {
         KmsInternalError::Unavailable | KmsInternalError::Internal => SsmError::Internal,
+        KmsInternalError::AccessDenied => SsmError::AccessDenied,
         _ => SsmError::InvalidKeyId,
     }
 }

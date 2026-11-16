@@ -16,6 +16,17 @@ enum Principal {
 }
 
 pub(crate) fn parse(document: &str) -> Result<Vec<ResourceStatement>, ResourcePolicyError> {
+    parse_with_options(document, true)
+}
+
+pub(crate) fn parse_trust(document: &str) -> Result<Vec<ResourceStatement>, ResourcePolicyError> {
+    parse_with_options(document, false)
+}
+
+fn parse_with_options(
+    document: &str,
+    resource_required: bool,
+) -> Result<Vec<ResourceStatement>, ResourcePolicyError> {
     let malformed = |message: String| ResourcePolicyError::Malformed(message);
     let root: Value = serde_json::from_str(document).map_err(|e| malformed(e.to_string()))?;
     let object = root
@@ -53,7 +64,12 @@ pub(crate) fn parse(document: &str) -> Result<Vec<ResourceStatement>, ResourcePo
             "condition operator".into(),
         ));
     }
-    let parsed = PolicyDocument::parse(document).map_err(|e| malformed(e.to_string()))?;
+    let parsed = if resource_required {
+        PolicyDocument::parse(document)
+    } else {
+        PolicyDocument::parse_trust(document)
+    }
+    .map_err(|e| malformed(e.to_string()))?;
     raw.into_iter()
         .zip(parsed.statements)
         .map(|(raw, statement)| {
@@ -137,23 +153,6 @@ pub(crate) fn parse(document: &str) -> Result<Vec<ResourceStatement>, ResourcePo
                     return Err(malformed("Bool and Null require true or false".into()));
                 }
             }
-            for (operator, keys) in &statement.conditions {
-                if matches!(
-                    operator.strip_suffix("IfExists").unwrap_or(operator),
-                    "IpAddress" | "NotIpAddress"
-                ) {
-                    for value in keys.values().flatten() {
-                        let (address, bits) = value.split_once('/').unwrap_or((value, "32"));
-                        if address.parse::<std::net::Ipv4Addr>().is_err()
-                            || !matches!(bits.parse::<u8>(), Ok(0..=32))
-                        {
-                            return Err(ResourcePolicyError::Unsupported(
-                                "non-IPv4 condition address".into(),
-                            ));
-                        }
-                    }
-                }
-            }
             for keys in statement.conditions.values() {
                 for key in keys.keys() {
                     if !matches!(
@@ -162,6 +161,7 @@ pub(crate) fn parse(document: &str) -> Result<Vec<ResourceStatement>, ResourcePo
                             | "aws:principalarn"
                             | "aws:principalaccount"
                             | "aws:principaltype"
+                            | "aws:userid"
                             | "aws:principalisawsservice"
                             | "aws:sourcearn"
                             | "aws:sourceaccount"
@@ -173,7 +173,19 @@ pub(crate) fn parse(document: &str) -> Result<Vec<ResourceStatement>, ResourcePo
                             | "s3:if-none-match"
                             | "s3:if-match"
                             | "s3:objectcreationoperation"
-                    ) {
+                            | "events:source"
+                            | "events:detail-type"
+                    ) && !key
+                        .strip_prefix("aws:principaltag/")
+                        .is_some_and(|tag| !tag.is_empty())
+                        && (resource_required
+                            || !matches!(
+                                key.as_str(),
+                                "sts:externalid"
+                                    | "sts:rolesessionname"
+                                    | "aws:multifactorauthpresent"
+                            ))
+                    {
                         return Err(ResourcePolicyError::Unsupported(format!(
                             "condition key {key}"
                         )));
@@ -312,6 +324,64 @@ impl ResourceStatement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_bus_conditions_accept_source_and_detail_type_but_reject_unknown_keys() {
+        for key in ["events:source", "events:detail-type"] {
+            let document = serde_json::json!({"Statement":{
+                "Effect":"Deny","Principal":"*","Action":"events:PutEvents","Resource":"*",
+                "Condition":{"StringEquals":{key:"blocked"}}
+            }})
+            .to_string();
+            let statements = parse(&document).unwrap();
+            assert_eq!(statements.len(), 1);
+            assert_eq!(
+                crate::policy::evaluate(
+                    &[PolicyDocument {
+                        statements: vec![statements.into_iter().next().unwrap().statement]
+                    }],
+                    None,
+                    None,
+                    &crate::policy::EvalRequest {
+                        action: "events:PutEvents".into(),
+                        resource: "arn:aws:events:us-east-1:000000000000:event-bus/default".into(),
+                        context: std::collections::BTreeMap::from([(
+                            key.into(),
+                            vec!["blocked".into()]
+                        )]),
+                    }
+                ),
+                crate::policy::Decision::ExplicitDeny
+            );
+        }
+        assert!(matches!(
+            parse(
+                &serde_json::json!({"Statement":{
+                    "Effect":"Allow","Principal":"*","Action":"events:PutEvents","Resource":"*",
+                    "Condition":{"StringEquals":{"events:unsupported":"value"}}
+                }})
+                .to_string()
+            ),
+            Err(ResourcePolicyError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn ip_conditions_share_ipv4_and_ipv6_validation_with_identity_policies() {
+        for value in ["2001:db8::/32", "::1", "10.0.0.0/8"] {
+            let document = serde_json::json!({"Statement":{"Effect":"Deny","Principal":"*",
+                "Action":"s3:GetObject","Resource":"*","Condition":{"IpAddress":{"aws:SourceIp":value}}
+            }}).to_string();
+            assert!(parse(&document).is_ok(), "{value}");
+        }
+        let invalid = serde_json::json!({"Statement":{"Effect":"Deny","Principal":"*",
+            "Action":"s3:GetObject","Resource":"*","Condition":{"NotIpAddress":{"aws:SourceIp":"::/129"}}
+        }}).to_string();
+        assert!(matches!(
+            parse(&invalid),
+            Err(ResourcePolicyError::Malformed(_))
+        ));
+    }
+
     #[test]
     fn malformed_policy_metadata_and_principals_are_rejected() {
         let base = serde_json::json!({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"*","Principal":{"AWS":"123456789012"}}});

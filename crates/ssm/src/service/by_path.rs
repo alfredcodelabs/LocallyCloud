@@ -88,6 +88,12 @@ mod tests {
             handler.process(&foreign).await,
             Err(SsmError::InvalidNextToken)
         ));
+        foreign.region = "us-east-1".into();
+        foreign.account_id = "111111111111".into();
+        assert!(matches!(
+            handler.process(&foreign).await,
+            Err(SsmError::InvalidNextToken)
+        ));
         assert!(matches!(
             handler
                 .process(&request(
@@ -161,8 +167,17 @@ impl SsmHandler {
         {
             return Err(SsmError::Validation);
         }
+        self.authorize_with_context(
+            request,
+            "ssm:GetParametersByPath",
+            &scope.parameter_arn(&input.path),
+            BTreeMap::from([("ssm:recursive".into(), vec![input.recursive.to_string()])]),
+        )?;
         let limit = input.max_results.unwrap_or(10);
         if !(1..=10).contains(&limit) {
+            return Err(SsmError::Validation);
+        }
+        if input.parameter_filters.len() > 10 {
             return Err(SsmError::Validation);
         }
         for filter in &input.parameter_filters {
@@ -212,35 +227,28 @@ impl SsmHandler {
         } else {
             format!("{}/", input.path)
         };
-        let names: Vec<_> = self
-            .store
-            .describe(scope, None)
-            .into_iter()
-            .filter(|p| {
-                p.name > last
-                    && p.name.strip_prefix(&prefix).is_some_and(|tail| {
-                        !tail.is_empty() && (input.recursive || !tail.contains('/'))
-                    })
-                    && input.parameter_filters.iter().all(|filter| {
-                        // Label versions are not modeled; no parameter has a label to match.
-                        let value = match filter.key.as_str() {
-                            "Type" => Some(p.parameter_type),
-                            "KeyId" => p.key_id.as_deref(),
-                            _ => None,
-                        };
-                        value.is_some_and(|value| {
-                            filter.values.iter().any(|expected| {
-                                if filter.option.as_deref() == Some("BeginsWith") {
-                                    value.starts_with(expected)
-                                } else {
-                                    value == expected
-                                }
-                            })
+        let names =
+            self.store.page_names(scope, &last, limit + 1, |parameter| {
+                parameter.name.strip_prefix(&prefix).is_some_and(|tail| {
+                    !tail.is_empty() && (input.recursive || !tail.contains('/'))
+                }) && input.parameter_filters.iter().all(|filter| {
+                    // Label versions are not modeled; no parameter has a label to match.
+                    let value = match filter.key.as_str() {
+                        "Type" => Some(parameter.value.parameter_type()),
+                        "KeyId" => parameter.value.key_id(),
+                        _ => None,
+                    };
+                    value.is_some_and(|value| {
+                        filter.values.iter().any(|expected| {
+                            if filter.option.as_deref() == Some("BeginsWith") {
+                                value.starts_with(expected)
+                            } else {
+                                value == expected
+                            }
                         })
                     })
-            })
-            .map(|p| p.name)
-            .collect();
+                })
+            });
         let mut parameters = Vec::new();
         for name in names.iter().take(limit) {
             let value = self
@@ -251,7 +259,7 @@ impl SsmHandler {
                     },
                     scope,
                     request,
-                    Operation::GetParameter,
+                    Operation::GetParametersByPath,
                 )
                 .await?;
             parameters.push(value["Parameter"].clone());

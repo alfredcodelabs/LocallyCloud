@@ -2725,6 +2725,8 @@ impl Interpreter {
             return Ok(());
         }
         let request = ServiceRoleAuthorizationRequest {
+            delegated_caller: None,
+            caller_context: Default::default(),
             source_arn: Some(self.sm_arn.clone()),
             caller: RequestIdentity {
                 account_id: self.account.clone(),
@@ -2736,12 +2738,17 @@ impl Interpreter {
             action: action.into(),
             resource: resource.into(),
         };
-        let authorization = if action.starts_with("s3:")
-            && registry
-                .native_handler(&locallycloud_core::registry::ServiceName::new("s3"))
-                .is_some()
-        {
-            // S3 composes identity and bucket policies; revalidate role trust here.
+        let native_policy_owner = action
+            .split_once(':')
+            .map(|(service, _)| service)
+            .filter(|service| matches!(*service, "s3" | "sqs" | "lambda" | "kms"))
+            .is_some_and(|service| {
+                registry
+                    .native_handler(&locallycloud_core::registry::ServiceName::new(service))
+                    .is_some()
+            });
+        let authorization = if native_policy_owner {
+            // These native destinations compose identity and resource/key policies themselves.
             evaluator.authorize_service_role_trust(request)
         } else {
             evaluator.authorize_service_role_execution(request)

@@ -12,9 +12,9 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::{
-    AuthorizationError, AuthorizationRequest, ServiceRoleAuthorizationRequest,
+    verified_caller, AuthorizationError, AuthorizationRequest, ServiceRoleAuthorizationRequest,
 };
-use locallycloud_core::integration::RequestIdentity;
+use locallycloud_core::integration::{identity::CallerIdentity, RequestIdentity};
 use locallycloud_core::registry::{AwsProtocol, ServiceName, ServiceRegistry};
 use locallycloud_state::StateDb;
 use serde::de::DeserializeOwned;
@@ -556,19 +556,8 @@ impl FirehoseHandler {
         if !evaluator.strict_sigv4_required() {
             return Ok(());
         }
-        if request
-            .headers
-            .get("x-locallycloud-verified-external-sigv4")
-            != Some(&HeaderValue::from_static("1"))
-        {
-            return Err(FirehoseError::AccessDenied);
-        }
-        let access_key_id = request
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(RequestIdentity::access_key_from_authorization)
-            .ok_or(FirehoseError::AccessDenied)?;
+        let (request_identity, delegated_identity) = verified_caller(evaluator.as_ref(), request)
+            .map_err(|_| FirehoseError::AccessDenied)?;
         let body: Value = serde_json::from_slice(&request.body)
             .map_err(|error| FirehoseError::Serialization(error.to_string()))?;
         let resource = if operation == "ListDeliveryStreams" {
@@ -585,12 +574,8 @@ impl FirehoseHandler {
         };
         evaluator
             .authorize(AuthorizationRequest {
-                request_identity: RequestIdentity {
-                    account_id: scope.account_id.clone(),
-                    access_key_id: Some(access_key_id),
-                    arn: None,
-                },
-                delegated_identity: None,
+                request_identity,
+                delegated_identity,
                 source_service: "firehose".into(),
                 action: format!(
                     "firehose:{}",
@@ -601,7 +586,9 @@ impl FirehoseHandler {
                     }
                 ),
                 resource,
-                context: Default::default(),
+                context: locallycloud_core::integration::request_context::verified_request_context(
+                    request,
+                ),
             })
             .map_err(|_| FirehoseError::AccessDenied)
     }
@@ -622,26 +609,20 @@ impl FirehoseHandler {
         if !evaluator.strict_sigv4_required() {
             return Ok(None);
         }
-        if request
-            .headers
-            .get("x-locallycloud-verified-external-sigv4")
-            != Some(&HeaderValue::from_static("1"))
-        {
-            return Err(FirehoseError::AccessDenied);
-        }
-        let access_key_id = request
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(RequestIdentity::access_key_from_authorization)
-            .ok_or(FirehoseError::AccessDenied)?;
-        let caller = RequestIdentity {
-            account_id: scope.account_id.clone(),
-            access_key_id: Some(access_key_id),
-            arn: None,
-        };
-        authorize_roles(&registry, scope, &caller, source, destination, true)
+        let (caller, delegated_caller) = verified_caller(evaluator.as_ref(), request)
             .map_err(|_| FirehoseError::AccessDenied)?;
+        authorize_roles(
+            &registry,
+            scope,
+            &caller,
+            delegated_caller,
+            source,
+            destination,
+            Some(
+                &locallycloud_core::integration::request_context::verified_request_context(request),
+            ),
+        )
+        .map_err(|_| FirehoseError::AccessDenied)?;
         Ok(Some(caller))
     }
 
@@ -995,15 +976,18 @@ fn authorize_roles(
     registry: &ServiceRegistry,
     scope: &Scope,
     caller: &RequestIdentity,
+    delegated_caller: Option<CallerIdentity>,
     source: Option<&KinesisSource>,
     destination: &DestinationConfig,
-    assignment: bool,
+    caller_context: Option<&std::collections::BTreeMap<String, Vec<String>>>,
 ) -> Result<(), FailureCode> {
     let evaluator = registry
         .authorization_evaluator(&ServiceName::new("iam"))
         .ok_or(FailureCode::InternalError)?;
     let authorize = |role_arn: &str, action: &str, resource: &str, denied: FailureCode| {
         let request = ServiceRoleAuthorizationRequest {
+            delegated_caller: delegated_caller.clone(),
+            caller_context: caller_context.cloned().unwrap_or_default(),
             source_arn: None,
             caller: caller.clone(),
             role_arn: role_arn.to_owned(),
@@ -1011,7 +995,7 @@ fn authorize_roles(
             action: action.into(),
             resource: resource.into(),
         };
-        if assignment {
+        if caller_context.is_some() {
             evaluator.authorize_service_role(request)
         } else {
             evaluator.authorize_service_role_execution(request)
@@ -1034,7 +1018,7 @@ fn authorize_roles(
         }
     }
     let objects = format!("{}/*", destination.bucket_arn);
-    if assignment && destination.error_backup.is_some() {
+    if caller_context.is_some() && destination.error_backup.is_some() {
         authorize(
             &destination.s3_role_arn,
             "s3:PutObject",
@@ -1124,9 +1108,10 @@ impl Inner {
             &registry,
             scope,
             caller,
+            None,
             stream.source.as_ref(),
             &stream.destination,
-            false,
+            None,
         )
         .map_err(|_| {
             FirehoseError::ServiceUnavailable("Firehose role authorization is denied".into())
@@ -1199,8 +1184,9 @@ impl Inner {
                                     &batch.key.scope,
                                     caller,
                                     None,
+                                    None,
                                     &batch.destination,
-                                    false,
+                                    None,
                                 )
                             }),
                     };
@@ -1331,9 +1317,10 @@ impl Inner {
                         &registry,
                         &key.scope,
                         caller,
+                        None,
                         Some(&source),
                         &destination,
-                        false,
+                        None,
                     )
                     .is_ok()
                 })

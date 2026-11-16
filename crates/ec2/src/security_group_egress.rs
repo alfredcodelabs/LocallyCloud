@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) fn default_ingress(group_id: &str) -> Vec<IngressRule> {
+    vec![IngressRule {
+        protocol: "-1".into(),
+        description: None,
+        from_port: None,
+        to_port: None,
+        peer: RulePeer::Group(group_id.into()),
+    }]
+}
+
 pub(super) fn default_egress() -> Vec<IngressRule> {
     vec![IngressRule {
         protocol: "-1".into(),
@@ -78,98 +88,89 @@ impl Ec2Handler {
         egress: bool,
         authorize: bool,
     ) -> Result<String, Ec2Error> {
-        input.allow_ingress()?;
         input.dry_run()?;
         let id = input.required("GroupId")?;
-        let IngressRule {
-            protocol,
-            from_port,
-            to_port,
-            peer,
-            description,
-        } = input.ingress_rule()?;
+        let permissions = input.ingress_rules()?;
         let mut state = self.scopes.lock().unwrap();
         let scope = state.entry(key.clone()).or_default();
-        let group = scope.security_groups.get(id).ok_or_else(|| {
-            Ec2Error::new("InvalidGroup.NotFound", "The security group does not exist")
-        })?;
-        if let RulePeer::Group(peer_id) = &peer {
-            let referenced = scope.security_groups.get(peer_id).ok_or_else(|| {
-                Ec2Error::new(
-                    "InvalidGroup.NotFound",
-                    "The referenced security group does not exist",
-                )
-            })?;
-            if referenced.vpc_id != group.vpc_id {
-                return Err(Ec2Error::new(
-                    "InvalidGroup.NotFound",
-                    "The referenced security group is not in this VPC",
-                ));
-            }
-            if input
-                .one("IpPermissions.1.Groups.1.UserId")?
-                .is_some_and(|owner| owner != key.0)
-            {
-                return Err(Ec2Error::new(
-                    "InvalidGroup.NotFound",
-                    "The referenced security group is not in this account",
-                ));
-            }
-        }
         let mut group = scope.security_groups.get(id).cloned().ok_or_else(|| {
             Ec2Error::new("InvalidGroup.NotFound", "The security group does not exist")
         })?;
-        let rules = if egress {
-            &mut group.egress
-        } else {
-            &mut group.ingress
-        };
-        let position = rules.iter().position(|rule| {
-            rule.protocol == protocol
-                && rule.from_port == from_port
-                && rule.to_port == to_port
-                && rule.peer == peer
-        });
-        match (authorize, position) {
-            (true, Some(_)) => {
-                return Err(Ec2Error::new(
-                    "InvalidPermission.Duplicate",
-                    "The specified rule already exists",
-                ))
+        let mut items = String::new();
+        for (rule, owner) in permissions {
+            if let RulePeer::Group(peer_id) = &rule.peer {
+                let referenced = scope.security_groups.get(peer_id).ok_or_else(|| {
+                    Ec2Error::new(
+                        "InvalidGroup.NotFound",
+                        "The referenced security group does not exist",
+                    )
+                })?;
+                if referenced.vpc_id != group.vpc_id
+                    || owner.as_ref().is_some_and(|owner| owner != &key.0)
+                {
+                    return Err(Ec2Error::new(
+                        "InvalidGroup.NotFound",
+                        "The referenced security group is not in this VPC and account",
+                    ));
+                }
             }
-            (false, None) => {
-                return Err(Ec2Error::new(
-                    "InvalidPermission.NotFound",
-                    "The specified rule does not exist",
-                ))
+            let rules = if egress {
+                &mut group.egress
+            } else {
+                &mut group.ingress
+            };
+            let position = rules.iter().position(|existing| {
+                existing.protocol == rule.protocol
+                    && existing.from_port == rule.from_port
+                    && existing.to_port == rule.to_port
+                    && existing.peer == rule.peer
+            });
+            match (authorize, position) {
+                (true, Some(_)) => {
+                    return Err(Ec2Error::new(
+                        "InvalidPermission.Duplicate",
+                        "The specified rule already exists",
+                    ))
+                }
+                (false, None) => {
+                    return Err(Ec2Error::new(
+                        "InvalidPermission.NotFound",
+                        "The specified rule does not exist",
+                    ))
+                }
+                (false, Some(index)) => {
+                    rules.remove(index);
+                }
+                (true, None) => {
+                    if rules.len() >= MAX_SECURITY_GROUP_RULES {
+                        return Err(Ec2Error::new(
+                            "RulesPerSecurityGroupLimitExceeded",
+                            "Too many security group rules",
+                        ));
+                    }
+                    let peer_xml = match &rule.peer {
+                        RulePeer::Cidr(cidr) => format!("<cidrIpv4>{cidr}</cidrIpv4>"),
+                        RulePeer::Group(peer_id) => format!("<referencedGroupInfo><groupId>{}</groupId><userId>{}</userId></referencedGroupInfo>", escape(peer_id), escape(&key.0)),
+                    };
+                    let description_xml = rule
+                        .description
+                        .as_ref()
+                        .map(|value| format!("<description>{}</description>", escape(value)))
+                        .unwrap_or_default();
+                    items.push_str(&format!("<item><groupId>{}</groupId><securityGroupRuleId>{}</securityGroupRuleId><isEgress>{egress}</isEgress><ipProtocol>{}</ipProtocol>{}{peer_xml}{description_xml}</item>", escape(id), resource_id("sgr"), escape(&rule.protocol), ports_xml(rule.from_port,rule.to_port)));
+                    rules.push(rule);
+                }
             }
-            (false, Some(index)) => {
-                rules.remove(index);
-                self.persist(&key, &[Change::put("sg", id, &group)?])?;
-                scope.security_groups.insert(id.into(), group);
-                return Ok("<return>true</return>".into());
-            }
-            (true, None) => {}
         }
-        let peer_xml = match &peer {
-            RulePeer::Cidr(cidr) => format!("<cidrIpv4>{cidr}</cidrIpv4>"),
-            RulePeer::Group(peer_id) => format!("<referencedGroupInfo><groupId>{}</groupId><userId>{}</userId></referencedGroupInfo>", escape(peer_id), escape(&key.0)),
-        };
-        let description_xml = description
-            .as_ref()
-            .map(|value| format!("<description>{}</description>", escape(value)))
-            .unwrap_or_default();
-        let response = format!("<return>true</return><securityGroupRuleSet><item><groupId>{}</groupId><securityGroupRuleId>{}</securityGroupRuleId><isEgress>{egress}</isEgress><ipProtocol>{}</ipProtocol>{}{peer_xml}{description_xml}</item></securityGroupRuleSet>", escape(id), resource_id("sgr"), escape(&protocol), ports_xml(from_port,to_port));
-        rules.push(IngressRule {
-            protocol,
-            from_port,
-            to_port,
-            peer,
-            description,
-        });
         self.persist(&key, &[Change::put("sg", id, &group)?])?;
         scope.security_groups.insert(id.into(), group);
-        Ok(response)
+        if authorize {
+            Ok(format!(
+                "<return>true</return><securityGroupRuleSet>{items}</securityGroupRuleSet>"
+            ))
+        } else {
+            Ok("<return>true</return>".into())
+        }
     }
 }
 

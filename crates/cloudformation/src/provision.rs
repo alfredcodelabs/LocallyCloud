@@ -127,6 +127,8 @@ pub struct Provisioner {
     region: String,
     account: String,
     caller_access_key: Option<String>,
+    execution_role: Option<String>,
+    source_stack_arn: Option<String>,
     stack_id: Option<String>,
     response_endpoint: String,
 }
@@ -138,6 +140,8 @@ impl Provisioner {
             region,
             account,
             caller_access_key: None,
+            execution_role: None,
+            source_stack_arn: None,
             stack_id: None,
             response_endpoint: "http://127.0.0.1:4566".into(),
         }
@@ -151,6 +155,16 @@ impl Provisioner {
 
     pub(crate) fn with_caller_access_key(mut self, caller_access_key: Option<String>) -> Self {
         self.caller_access_key = caller_access_key;
+        self
+    }
+
+    pub(crate) fn with_execution_role(
+        mut self,
+        role: Option<String>,
+        source: Option<String>,
+    ) -> Self {
+        self.execution_role = role;
+        self.source_stack_arn = source;
         self
     }
 
@@ -6080,7 +6094,11 @@ impl Provisioner {
         };
         let response = if let Some(dispatcher) = registry.internal_dispatcher() {
             let mut headers = request.headers;
-            let caller = self.caller_access_key.as_deref().unwrap_or("locallycloud");
+            let caller = if self.execution_role.is_some() {
+                "locallycloud-cloudformation"
+            } else {
+                self.caller_access_key.as_deref().unwrap_or("locallycloud")
+            };
             headers.insert(
                 http::header::AUTHORIZATION,
                 HeaderValue::from_str(&format!(
@@ -6089,7 +6107,57 @@ impl Provisioner {
                 ))
                 .map_err(|_| CfnError::Internal)?,
             );
-            if let Some(access_key) = &self.caller_access_key {
+            if let Some(role) = &self.execution_role {
+                use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
+                use locallycloud_core::integration::identity::{
+                    CallerIdentity, IdentityPropagator,
+                };
+                use locallycloud_core::integration::RequestIdentity;
+                let evaluator = registry
+                    .authorization_evaluator(&ServiceName::new("iam"))
+                    .ok_or_else(|| {
+                        CfnError::ResourceFailed(
+                            "IAM is required to use a CloudFormation execution role".into(),
+                        )
+                    })?;
+                let source = self.source_stack_arn.as_ref().ok_or(CfnError::Internal)?;
+                evaluator
+                    .authorize_service_role_trust(ServiceRoleAuthorizationRequest {
+                        delegated_caller: None,
+                        caller_context: Default::default(),
+                        source_arn: Some(source.clone()),
+                        caller: RequestIdentity {
+                            account_id: self.account.clone(),
+                            access_key_id: None,
+                            arn: None,
+                        },
+                        role_arn: role.clone(),
+                        service_principal: "cloudformation.amazonaws.com".into(),
+                        action: "sts:AssumeRole".into(),
+                        resource: role.clone(),
+                    })
+                    .map_err(|_| {
+                        CfnError::ResourceFailed(
+                            "The CloudFormation execution role does not exist or cannot be assumed"
+                                .into(),
+                        )
+                    })?;
+                IdentityPropagator::attach(
+                    &mut headers,
+                    &CallerIdentity::AssumedRole {
+                        role_arn: role.clone(),
+                        session_name: "cloudformation".into(),
+                    },
+                );
+                headers.insert(
+                    "x-locallycloud-source-arn",
+                    HeaderValue::from_str(source).map_err(|_| CfnError::Internal)?,
+                );
+                headers.insert(
+                    "x-locallycloud-source-account",
+                    HeaderValue::from_str(&self.account).map_err(|_| CfnError::Internal)?,
+                );
+            } else if let Some(access_key) = &self.caller_access_key {
                 let identity = locallycloud_core::integration::RequestIdentity {
                     account_id: self.account.clone(),
                     access_key_id: Some(access_key.clone()),
@@ -6131,6 +6199,11 @@ impl Provisioner {
                 )
                 .await
         } else {
+            if self.execution_role.is_some() {
+                return Err(CfnError::ResourceFailed(
+                    "Internal dispatch is required to use a CloudFormation execution role".into(),
+                ));
+            }
             handler.handle(request).await
         };
         let status = response.status().as_u16();

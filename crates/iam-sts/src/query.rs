@@ -50,6 +50,13 @@ impl QueryRequest {
             .filter(|v| !v.is_empty())
     }
 
+    pub(crate) fn has_parameter_prefix(&self, prefix: &str) -> bool {
+        self.params
+            .range(prefix.to_owned()..)
+            .next()
+            .is_some_and(|(key, _)| key.starts_with(prefix))
+    }
+
     /// A required parameter; `ValidationError` when missing or empty.
     pub fn require(&self, key: &str) -> Result<&str, IamStsError> {
         self.get(key).ok_or_else(|| {

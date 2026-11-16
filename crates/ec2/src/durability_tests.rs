@@ -463,61 +463,63 @@ async fn interrupted_instance_restores_stopped_without_runtime_or_endpoint() {
 }
 
 #[tokio::test]
-async fn logs_interface_endpoint_enforces_live_security_groups_after_restore() {
-    let db = TestDb::new();
-    let handler = db.handler(7).unwrap();
-    let (vpc, subnets, groups) = base(&handler).await;
-    ok(
-        &handler,
-        &format!("Action=ModifyVpcAttribute&VpcId={vpc}&EnableDnsHostnames.Value=true"),
-    )
-    .await;
-    ok(&handler,&format!("Action=CreateVpcEndpoint&VpcId={vpc}&ServiceName=com.amazonaws.us-east-1.logs&VpcEndpointType=Interface&SubnetId.1={}&SecurityGroupId.1={}&PrivateDnsEnabled=true",subnets[0],groups[1])).await;
-    let source_ip = "10.80.2.4".parse().unwrap();
-    let access = |handler: &Ec2Handler| {
-        handler.vpc_endpoint_access(
+async fn interface_endpoints_enforce_live_security_groups_after_restore() {
+    for service in ["logs", "ssm", "secretsmanager", "sts", "sqs", "kms"] {
+        let db = TestDb::new();
+        let handler = db.handler(7).unwrap();
+        let (vpc, subnets, groups) = base(&handler).await;
+        ok(
+            &handler,
+            &format!("Action=ModifyVpcAttribute&VpcId={vpc}&EnableDnsHostnames.Value=true"),
+        )
+        .await;
+        ok(&handler,&format!("Action=CreateVpcEndpoint&VpcId={vpc}&ServiceName=com.amazonaws.us-east-1.{service}&VpcEndpointType=Interface&SubnetId.1={}&SecurityGroupId.1={}&PrivateDnsEnabled=true",subnets[0],groups[1])).await;
+        let source_ip = "10.80.2.4".parse().unwrap();
+        let access = |handler: &Ec2Handler| {
+            handler.vpc_endpoint_access(
+                "111",
+                "us-east-1",
+                &subnets[1],
+                source_ip,
+                &groups[..1],
+                service,
+            )
+        };
+        assert!(!access(&handler));
+        let ingress=format!("GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=443&IpPermissions.1.ToPort=443&IpPermissions.1.Groups.1.GroupId={}",groups[1],groups[0]);
+        ok(
+            &handler,
+            &format!("Action=AuthorizeSecurityGroupIngress&{ingress}"),
+        )
+        .await;
+        assert!(access(&handler));
+        ok(
+            &handler,
+            &format!("Action=RevokeSecurityGroupIngress&{ingress}"),
+        )
+        .await;
+        assert!(!access(&handler));
+        ok(
+            &handler,
+            &format!("Action=AuthorizeSecurityGroupIngress&{ingress}"),
+        )
+        .await;
+        drop(handler);
+        let handler = db.handler(7).unwrap();
+        assert!(access(&handler));
+        assert!(!handler.vpc_endpoint_access(
             "111",
-            "us-east-1",
+            "us-west-2",
             &subnets[1],
             source_ip,
             &groups[..1],
-            "logs",
-        )
-    };
-    assert!(!access(&handler));
-    let ingress=format!("GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=443&IpPermissions.1.ToPort=443&IpPermissions.1.Groups.1.GroupId={}",groups[1],groups[0]);
-    ok(
-        &handler,
-        &format!("Action=AuthorizeSecurityGroupIngress&{ingress}"),
-    )
-    .await;
-    assert!(access(&handler));
-    ok(
-        &handler,
-        &format!("Action=RevokeSecurityGroupIngress&{ingress}"),
-    )
-    .await;
-    assert!(!access(&handler));
-    ok(
-        &handler,
-        &format!("Action=AuthorizeSecurityGroupIngress&{ingress}"),
-    )
-    .await;
-    drop(handler);
-    let handler = db.handler(7).unwrap();
-    assert!(access(&handler));
-    assert!(!handler.vpc_endpoint_access(
-        "111",
-        "us-west-2",
-        &subnets[1],
-        source_ip,
-        &groups[..1],
-        "logs"
-    ));
-    ok(&handler,&format!("Action=RevokeSecurityGroupEgress&GroupId={}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0",groups[0])).await;
-    assert!(!access(&handler));
-    ok(&handler,&format!("Action=AuthorizeSecurityGroupEgress&GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=443&IpPermissions.1.ToPort=443&IpPermissions.1.Groups.1.GroupId={}",groups[0],groups[1])).await;
-    assert!(access(&handler));
+            service
+        ));
+        ok(&handler,&format!("Action=RevokeSecurityGroupEgress&GroupId={}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0",groups[0])).await;
+        assert!(!access(&handler));
+        ok(&handler,&format!("Action=AuthorizeSecurityGroupEgress&GroupId={}&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=443&IpPermissions.1.ToPort=443&IpPermissions.1.Groups.1.GroupId={}",groups[0],groups[1])).await;
+        assert!(access(&handler));
+    }
 }
 
 async fn stopped_fixture(runtime: Arc<dyn InstanceRuntime>) -> (TestDb, Ec2Handler, InstanceSpec) {
@@ -1047,4 +1049,236 @@ async fn security_group_tags_and_rule_descriptions_restore_atomically() {
         .await
         .contains("<groupName>failed</groupName>"));
     assert_eq!(db.count(), before);
+}
+
+#[tokio::test]
+async fn default_group_self_permission_is_revocable_and_legacy_migration_is_one_way() {
+    let db = TestDb::new();
+    let handler = db.handler(7).unwrap();
+    let vpc = id(
+        &ok(&handler, "Action=CreateVpc&CidrBlock=10.92.0.0%2F16").await,
+        "vpcId",
+    );
+    let subnet = id(
+        &ok(
+            &handler,
+            &format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.92.1.0%2F24"),
+        )
+        .await,
+        "subnetId",
+    );
+    let sg = id(
+        &ok(
+            &handler,
+            &format!("Action=DescribeSecurityGroups&Filter.1.Name=vpc-id&Filter.1.Value.1={vpc}"),
+        )
+        .await,
+        "groupId",
+    );
+    let source = handler
+        .reserve_task_network(
+            "111",
+            "us-east-1",
+            &subnet,
+            std::slice::from_ref(&sg),
+            "source",
+        )
+        .unwrap();
+    let target = handler
+        .reserve_task_network(
+            "111",
+            "us-east-1",
+            &subnet,
+            std::slice::from_ref(&sg),
+            "target",
+        )
+        .unwrap();
+    let endpoint = "127.0.0.1:15432".parse().unwrap();
+    assert!(target.set_endpoint(5432, endpoint));
+    assert!(handler
+        .private_tcp_access("111", "us-east-1", &source.eni_id, target.private_ip, 5432)
+        .is_some());
+    let rule =
+        format!("GroupId={sg}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.Groups.1.GroupId={sg}");
+    let (status, body) = call(
+        &handler,
+        "111",
+        "us-east-1",
+        &format!("Action=AuthorizeSecurityGroupIngress&{rule}"),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(body.contains("InvalidPermission.Duplicate"));
+    ok(
+        &handler,
+        &format!("Action=RevokeSecurityGroupIngress&{rule}"),
+    )
+    .await;
+    assert!(handler
+        .private_tcp_access("111", "us-east-1", &source.eni_id, target.private_ip, 5432)
+        .is_none());
+    drop(source);
+    drop(target);
+    drop(handler);
+    let handler = db.handler(7).unwrap();
+    let describe = format!("Action=DescribeSecurityGroups&GroupId.1={sg}");
+    assert!(ok(&handler, &describe)
+        .await
+        .contains("<ipPermissions></ipPermissions>"));
+    drop(handler);
+    db.sql("UPDATE ec2_records SET version=1 WHERE kind='sg'");
+    let handler = db.handler(7).unwrap();
+    assert!(ok(&handler, &describe)
+        .await
+        .contains(&format!("<groupId>{sg}</groupId></item></groups>")));
+    ok(
+        &handler,
+        &format!("Action=RevokeSecurityGroupIngress&{rule}"),
+    )
+    .await;
+    drop(handler);
+    let handler = db.handler(7).unwrap();
+    assert!(ok(&handler, &describe)
+        .await
+        .contains("<ipPermissions></ipPermissions>"));
+}
+
+#[tokio::test]
+async fn security_group_permission_batches_are_atomic_and_support_multiple_peers() {
+    let db = TestDb::new();
+    let handler = db.handler(7).unwrap();
+    let (vpc, _, groups) = base(&handler).await;
+    let sg = &groups[0];
+    let first = "IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=80&IpPermissions.1.ToPort=80&IpPermissions.1.IpRanges.1.CidrIp=10.80.1.0%2F24&IpPermissions.1.IpRanges.2.CidrIp=10.80.2.0%2F24";
+    let second = "IpPermissions.2.IpProtocol=tcp&IpPermissions.2.FromPort=443&IpPermissions.2.ToPort=443&IpPermissions.2.Groups.1.GroupId=".to_string() + &groups[1];
+    let batch = format!("GroupId={sg}&{first}&{second}");
+    for direction in ["Ingress", "Egress"] {
+        ok(
+            &handler,
+            &format!("Action=AuthorizeSecurityGroup{direction}&{batch}"),
+        )
+        .await;
+        let before = ok(
+            &handler,
+            &format!("Action=DescribeSecurityGroups&GroupId.1={sg}"),
+        )
+        .await;
+        let invalid = batch.replace(
+            "IpPermissions.2.FromPort=443",
+            "IpPermissions.2.FromPort=444",
+        );
+        assert_eq!(
+            call(
+                &handler,
+                "111",
+                "us-east-1",
+                &format!("Action=RevokeSecurityGroup{direction}&{invalid}")
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            ok(
+                &handler,
+                &format!("Action=DescribeSecurityGroups&GroupId.1={sg}")
+            )
+            .await,
+            before
+        );
+        let missing = batch.replace(
+            &format!("Groups.1.GroupId={}", groups[1]),
+            "Groups.1.GroupId=sg-missing",
+        );
+        assert_eq!(
+            call(
+                &handler,
+                "111",
+                "us-east-1",
+                &format!("Action=RevokeSecurityGroup{direction}&{missing}")
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            ok(
+                &handler,
+                &format!("Action=DescribeSecurityGroups&GroupId.1={sg}")
+            )
+            .await,
+            before
+        );
+        db.sql("CREATE TRIGGER fail_batch BEFORE UPDATE ON ec2_records WHEN OLD.kind='sg' BEGIN SELECT RAISE(ABORT,'fixture'); END;");
+        assert_eq!(
+            call(
+                &handler,
+                "111",
+                "us-east-1",
+                &format!("Action=RevokeSecurityGroup{direction}&{batch}")
+            )
+            .await
+            .0,
+            500
+        );
+        assert_eq!(
+            ok(
+                &handler,
+                &format!("Action=DescribeSecurityGroups&GroupId.1={sg}")
+            )
+            .await,
+            before
+        );
+        db.sql("DROP TRIGGER fail_batch;");
+        ok(
+            &handler,
+            &format!("Action=RevokeSecurityGroup{direction}&{batch}"),
+        )
+        .await;
+    }
+    drop(handler);
+    let restored = db.handler(7).unwrap();
+    assert!(ok(
+        &restored,
+        &format!("Action=DescribeSecurityGroups&GroupId.1={sg}")
+    )
+    .await
+    .contains("<ipPermissions></ipPermissions>"));
+    assert!(ok(&restored, &format!("Action=DescribeVpcs&VpcId.1={vpc}"))
+        .await
+        .contains(&vpc));
+}
+
+#[tokio::test]
+async fn vpc_subnet_tags_restore_and_filter_without_retagging_default_resources() {
+    let db = TestDb::new();
+    let handler = db.handler(7).unwrap();
+    let vpc = id(&ok(&handler, "Action=CreateVpc&CidrBlock=10.93.0.0%2F16&TagSpecification.1.ResourceType=vpc&TagSpecification.1.Tag.1.Key=Name&TagSpecification.1.Tag.1.Value=tagged-vpc").await, "vpcId");
+    let subnet = id(&ok(&handler, &format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.93.1.0%2F24&TagSpecification.1.ResourceType=subnet&TagSpecification.1.Tag.1.Key=Name&TagSpecification.1.Tag.1.Value=tagged-subnet")).await, "subnetId");
+    drop(handler);
+    let handler = db.handler(7).unwrap();
+    for (operation, resource, name) in [
+        ("DescribeVpcs", &vpc, "tagged-vpc"),
+        ("DescribeSubnets", &subnet, "tagged-subnet"),
+    ] {
+        let result = ok(
+            &handler,
+            &format!("Action={operation}&Filter.1.Name=tag:Name&Filter.1.Value.1={name}"),
+        )
+        .await;
+        assert!(result.contains(resource));
+        assert!(result.contains(&format!("<key>Name</key><value>{name}</value>")));
+        assert!(!ok(
+            &handler,
+            &format!("Action={operation}&Filter.1.Name=tag:Name&Filter.1.Value.1=other")
+        )
+        .await
+        .contains(resource));
+    }
+    assert!(!ok(
+        &handler,
+        &format!("Action=DescribeSecurityGroups&Filter.1.Name=vpc-id&Filter.1.Value.1={vpc}")
+    )
+    .await
+    .contains("<key>Name</key>"));
 }

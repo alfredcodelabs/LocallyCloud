@@ -49,6 +49,119 @@ pub(crate) struct CallerContext {
     pub(crate) identity: Vec<PolicyDocument>,
     pub(crate) boundary: Option<Vec<PolicyDocument>>,
     pub(crate) session: Option<Vec<PolicyDocument>>,
+    attributes: BTreeMap<String, Vec<String>>,
+    mfa_present: Option<bool>,
+}
+
+impl CallerContext {
+    pub(crate) fn attribute(&self, name: &str) -> Option<&str> {
+        self.attributes
+            .get(name)
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
+
+    pub(crate) fn allows(
+        &self,
+        action: &str,
+        resource: &str,
+        context: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let mut context = context.clone();
+        self.apply_attributes(&mut context);
+        evaluate(
+            &self.identity,
+            self.boundary.as_deref(),
+            self.session.as_deref(),
+            &EvalRequest {
+                action: action.into(),
+                resource: resource.into(),
+                context,
+            },
+        ) == Decision::Allowed
+    }
+
+    pub(crate) fn denies(
+        &self,
+        action: &str,
+        resource: &str,
+        context: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let mut context = context.clone();
+        self.apply_attributes(&mut context);
+        context_denies(
+            self,
+            &EvalRequest {
+                action: action.into(),
+                resource: resource.into(),
+                context,
+            },
+        )
+    }
+
+    pub(crate) fn apply_attributes(&self, context: &mut BTreeMap<String, Vec<String>>) {
+        strip_principal_attributes(context);
+        apply_time_attributes(context);
+        if let Some(present) = self.mfa_present {
+            context.insert(
+                "aws:multifactorauthpresent".into(),
+                vec![present.to_string()],
+            );
+        }
+        context.extend(
+            self.attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+}
+
+/// One trusted instant supplies both global time keys; caller-provided aliases are removed.
+pub(crate) fn apply_time_attributes(context: &mut BTreeMap<String, Vec<String>>) {
+    context.retain(|key, _| {
+        !key.eq_ignore_ascii_case("aws:currenttime") && !key.eq_ignore_ascii_case("aws:epochtime")
+    });
+    let now = time::OffsetDateTime::now_utc();
+    let epoch = now.unix_timestamp().to_string();
+    let current = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| epoch.clone());
+    context.insert("aws:currenttime".into(), vec![current]);
+    context.insert("aws:epochtime".into(), vec![epoch]);
+}
+
+pub(crate) fn strip_principal_attributes(context: &mut BTreeMap<String, Vec<String>>) {
+    context.retain(|key, _| {
+        !key.get(..13)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aws:principal"))
+            && !key.eq_ignore_ascii_case("aws:userid")
+            && !key.eq_ignore_ascii_case("aws:multifactorauthpresent")
+    });
+}
+
+fn principal_attributes(
+    account: &str,
+    arn: &str,
+    kind: &str,
+    user_id: Option<&str>,
+    tags: &BTreeMap<String, String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut attributes = BTreeMap::from([
+        ("aws:principalarn".into(), vec![arn.into()]),
+        ("aws:principalaccount".into(), vec![account.into()]),
+        ("aws:principaltype".into(), vec![kind.into()]),
+        ("aws:principalisawsservice".into(), vec!["false".into()]),
+    ]);
+    if let Some(user_id) = user_id {
+        attributes.insert("aws:userid".into(), vec![user_id.into()]);
+    }
+    for (key, value) in tags {
+        attributes
+            .entry(format!("aws:principaltag/{}", key.to_ascii_lowercase()))
+            .or_default()
+            .push(value.clone());
+    }
+    attributes
 }
 
 /// Evaluates a request against the resolved caller's policies under the active mode.
@@ -99,10 +212,12 @@ impl EnforcementFilter {
             return Err(IamStsError::AccessDenied("session credentials cannot perform this IAM/STS operation without supported MFA context".into()));
         }
         let caller = self.resolve_caller(&identity.account_id, access_key_id)?;
+        let mut context = context.clone();
+        caller.apply_attributes(&mut context);
         let req = EvalRequest {
             action: action.to_string(),
             resource: resource.to_string(),
-            context: context.clone(),
+            context,
         };
         match evaluate(
             &caller.identity,
@@ -131,10 +246,12 @@ impl EnforcementFilter {
         let Ok(caller) = self.resolve_caller(&identity.account_id, key) else {
             return true;
         };
+        let mut context = context.clone();
+        caller.apply_attributes(&mut context);
         let request = EvalRequest {
             action: action.into(),
             resource: resource.into(),
-            context: context.clone(),
+            context,
         };
         context_denies(&caller, &request)
     }
@@ -158,17 +275,15 @@ impl EnforcementFilter {
         resource: &str,
         context: &BTreeMap<String, Vec<String>>,
     ) -> Result<(), IamStsError> {
-        let caller = self.role_context(account, role_arn)?;
-        let request = EvalRequest {
-            action: action.into(),
-            resource: resource.into(),
-            context: context.clone(),
-        };
-        match evaluate(&caller.identity, caller.boundary.as_deref(), None, &request) {
-            Decision::Allowed => Ok(()),
-            Decision::ImplicitDeny | Decision::ExplicitDeny => Err(IamStsError::AccessDenied(
-                format!("role is not authorized for {action} on {resource}"),
-            )),
+        if self
+            .role_context(account, role_arn)?
+            .allows(action, resource, context)
+        {
+            Ok(())
+        } else {
+            Err(IamStsError::AccessDenied(format!(
+                "role is not authorized for {action} on {resource}"
+            )))
         }
     }
 
@@ -183,18 +298,36 @@ impl EnforcementFilter {
         let Ok(caller) = self.role_context(account, role_arn) else {
             return true;
         };
-        let request = EvalRequest {
-            action: action.into(),
-            resource: resource.into(),
-            context: context.clone(),
-        };
-        context_denies(&caller, &request)
+        caller.denies(action, resource, context)
     }
 
     pub(crate) fn role_context(
         &self,
         account: &str,
         role_arn: &str,
+    ) -> Result<CallerContext, IamStsError> {
+        self.role_context_with_session(account, role_arn, None)
+    }
+
+    pub(crate) fn role_session_context(
+        &self,
+        account: &str,
+        role_arn: &str,
+        session_name: &str,
+    ) -> Result<CallerContext, IamStsError> {
+        if session_name.is_empty() {
+            return Err(IamStsError::AccessDenied(
+                "service role session is unavailable".into(),
+            ));
+        }
+        self.role_context_with_session(account, role_arn, Some(session_name))
+    }
+
+    fn role_context_with_session(
+        &self,
+        account: &str,
+        role_arn: &str,
+        session_name: Option<&str>,
     ) -> Result<CallerContext, IamStsError> {
         let name = role_arn.rsplit('/').next().unwrap_or(role_arn);
         let role = self
@@ -209,10 +342,19 @@ impl EnforcementFilter {
             .map(|arn| self.policy_doc(account, arn))
             .transpose()?
             .map(|policy| vec![policy]);
+        let user_id = session_name.map(|session| format!("{}:{session}", role.role_id));
         Ok(CallerContext {
             identity,
             boundary,
             session: None,
+            mfa_present: session_name.map(|_| false),
+            attributes: principal_attributes(
+                account,
+                &role.arn,
+                "AssumedRole",
+                user_id.as_deref(),
+                &role.tags,
+            ),
         })
     }
 
@@ -222,7 +364,7 @@ impl EnforcementFilter {
         access_key_id: &str,
     ) -> Result<CallerContext, IamStsError> {
         if self.store.root_for_key(account, access_key_id).is_some() {
-            return Ok(root_context());
+            return Ok(root_context(account, None));
         }
         if let Some(session) = self.sessions.resolve(access_key_id) {
             if session.account != account {
@@ -232,7 +374,7 @@ impl EnforcementFilter {
                 .root_provenance(account, &self.store)
                 .map_err(|_| unresolvable_caller(access_key_id))?
             {
-                return Ok(root_context());
+                return Ok(root_context(account, Some(false)));
             }
             let session_policy = session
                 .session_policy
@@ -245,6 +387,18 @@ impl EnforcementFilter {
                     identity: Vec::new(),
                     boundary: None,
                     session: session_policy,
+                    mfa_present: Some(false),
+                    attributes: principal_attributes(
+                        account,
+                        &session.arn,
+                        if session.arn.contains(":federated-user/") {
+                            "FederatedUser"
+                        } else {
+                            "User"
+                        },
+                        Some(&session.user_id),
+                        &BTreeMap::new(),
+                    ),
                 });
             };
             let role_name = role_arn.rsplit('/').next().unwrap_or(role_arn);
@@ -265,18 +419,20 @@ impl EnforcementFilter {
                 identity,
                 boundary,
                 session: session_policy,
+                mfa_present: Some(false),
+                attributes: principal_attributes(
+                    account,
+                    &role.arn,
+                    "AssumedRole",
+                    Some(&session.user_id),
+                    &role.tags,
+                ),
             });
         }
 
         let user = self
             .store
-            .list_users(account)
-            .into_iter()
-            .find(|user| {
-                user.access_keys
-                    .iter()
-                    .any(|key| key.access_key_id == access_key_id && key.status == "Active")
-            })
+            .user_for_key(account, access_key_id)
             .ok_or_else(|| unresolvable_caller(access_key_id))?;
         let mut identity =
             self.gather_docs(account, &user.inline_policies, &user.attached_policies)?;
@@ -301,6 +457,14 @@ impl EnforcementFilter {
             identity,
             boundary,
             session: None,
+            mfa_present: None,
+            attributes: principal_attributes(
+                account,
+                &user.arn,
+                "User",
+                Some(&user.user_id),
+                &user.tags,
+            ),
         })
     }
 
@@ -362,7 +526,7 @@ fn unresolvable_caller(access_key_id: &str) -> IamStsError {
     ))
 }
 
-fn root_context() -> CallerContext {
+fn root_context(account: &str, mfa_present: Option<bool>) -> CallerContext {
     CallerContext {
         identity: vec![PolicyDocument::parse(
             r#"{"Statement":{"Effect":"Allow","Action":"*","Resource":"*"}}"#,
@@ -370,6 +534,14 @@ fn root_context() -> CallerContext {
         .expect("static root policy is valid")],
         boundary: None,
         session: None,
+        mfa_present,
+        attributes: principal_attributes(
+            account,
+            &format!("arn:aws:iam::{account}:root"),
+            "Account",
+            Some(account),
+            &BTreeMap::new(),
+        ),
     }
 }
 
@@ -457,6 +629,156 @@ mod tests {
             "*",
             &context
         ));
+    }
+
+    #[test]
+    fn verified_user_attributes_replace_claims_and_preserve_network_conditions() {
+        let (filter, store) = filter();
+        let account = "000000000000";
+        let key = "AKIAATTRIBUTES";
+        let mut user = user_with_key("alice", key);
+        user.user_id = "AIDAALICE".into();
+        user.tags.insert("Team".into(), "platform".into());
+        user.inline_policies.insert("conditional".into(), serde_json::json!({"Statement":{
+            "Effect":"Allow","Action":"iam:PassRole","Resource":"*","Condition":{
+                "StringEquals":{"aws:PrincipalArn":user.arn,"aws:PrincipalAccount":account,"aws:PrincipalType":"User","aws:userid":"AIDAALICE","aws:PrincipalTag/team":"platform","iam:PassedToService":"lambda.amazonaws.com"},
+                "Bool":{"aws:PrincipalIsAWSService":"false","aws:SecureTransport":"true"},
+                "IpAddress":{"aws:SourceIp":"2001:db8::/32"}
+            }
+        }}).to_string());
+        store.create_user(account, user);
+        let context = BTreeMap::from([
+            (
+                "AWS:PrincipalArn".into(),
+                vec![format!("arn:aws:iam::{account}:root")],
+            ),
+            ("aws:userid".into(), vec!["FORGED".into()]),
+            ("aws:principaltag/team".into(), vec!["attacker".into()]),
+            ("aws:principaltag/admin".into(), vec!["true".into()]),
+            ("aws:securetransport".into(), vec!["true".into()]),
+            ("aws:sourceip".into(), vec!["2001:db8::42".into()]),
+            (
+                "iam:passedtoservice".into(),
+                vec!["lambda.amazonaws.com".into()],
+            ),
+        ]);
+        let mut claimed = identity(key);
+        claimed.arn = Some(format!("arn:aws:iam::{account}:root"));
+        assert!(filter
+            .check_with_context(
+                EnforcementMode::Strict,
+                &claimed,
+                "iam:PassRole",
+                "*",
+                &context
+            )
+            .is_ok());
+        for (attribute, value) in [
+            (
+                "aws:PrincipalArn",
+                format!("arn:aws:iam::{account}:user/alice"),
+            ),
+            ("aws:userid", "AIDAALICE".into()),
+        ] {
+            store.update_user(account, "alice", |user| { user.inline_policies.insert("deny".into(), serde_json::json!({"Statement":{
+                "Effect":"Deny","Action":"iam:PassRole","Resource":"*","Condition":{"StringEquals":{attribute:value}}
+            }}).to_string()); });
+            assert!(filter
+                .check_with_context(
+                    EnforcementMode::Strict,
+                    &claimed,
+                    "iam:PassRole",
+                    "*",
+                    &context
+                )
+                .is_err());
+            assert!(filter.identity_policy_denies(&claimed, "iam:PassRole", "*", &context));
+        }
+        let mut actual = context;
+        filter
+            .resolve_caller(account, key)
+            .unwrap()
+            .apply_attributes(&mut actual);
+        assert!(!actual.contains_key("AWS:PrincipalArn"));
+        assert!(!actual.contains_key("aws:principaltag/admin"));
+        assert_eq!(
+            actual["aws:principalarn"],
+            [format!("arn:aws:iam::{account}:user/alice")]
+        );
+    }
+
+    #[test]
+    fn known_session_userid_is_available_but_delegated_roles_cannot_forge_one() {
+        let (filter, store, sessions) = filter_with_sessions();
+        let account = "000000000000";
+        let role_arn = build_iam_arn(account, "role", "/", "worker");
+        store.create_role(account, IamRole {
+            role_name:"worker".into(),role_id:"AROAWORKER".into(),arn:role_arn.clone(),path:"/".into(),create_date:"2026-01-01T00:00:00Z".into(),
+            assume_role_policy_document:"{}".into(),description:None,max_session_duration:3600,tags:BTreeMap::from([("Team".into(),"platform".into())]),
+            attached_policies:Vec::new(),permission_boundary:None,inline_policies:BTreeMap::from([("allow".into(),serde_json::json!({"Statement":{
+                "Effect":"Allow","Action":"iam:PassRole","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalArn":role_arn,"aws:PrincipalType":"AssumedRole","aws:PrincipalTag/team":"platform"}}
+            }}).to_string())]),
+        });
+        let credentials =
+            crate::sts::issue_service_role_credentials(&store, &sessions, account, &role_arn)
+                .unwrap();
+        let session = sessions.resolve(&credentials.access_key_id).unwrap();
+        let spoofed = BTreeMap::from([("aws:userid".into(), vec!["AROAWORKER:forged".into()])]);
+        let caller = filter
+            .resolve_caller(account, &credentials.access_key_id)
+            .unwrap();
+        assert_eq!(
+            caller.attribute("aws:principalarn"),
+            Some(role_arn.as_str())
+        );
+        assert_eq!(
+            caller.attribute("aws:userid"),
+            Some(session.user_id.as_str())
+        );
+        assert_eq!(
+            filter
+                .role_context(account, &role_arn)
+                .unwrap()
+                .attribute("aws:userid"),
+            None
+        );
+        assert!(filter
+            .check_with_context(
+                EnforcementMode::Strict,
+                &identity(&credentials.access_key_id),
+                "iam:PassRole",
+                "*",
+                &spoofed
+            )
+            .is_ok());
+        assert!(filter
+            .check_role_with_context(account, &role_arn, "iam:PassRole", "*", &spoofed)
+            .is_ok());
+        store.update_role(account, "worker", |role| { role.inline_policies.insert("deny".into(), serde_json::json!({"Statement":{
+            "Effect":"Deny","Action":"iam:PassRole","Resource":"*","Condition":{"StringEquals":{"aws:userid":session.user_id}}
+        }}).to_string()); });
+        assert!(filter.identity_policy_denies(
+            &identity(&credentials.access_key_id),
+            "iam:PassRole",
+            "*",
+            &spoofed
+        ));
+        assert!(!filter.role_policy_denies(account, &role_arn, "iam:PassRole", "*", &spoofed));
+        store.update_role(account, "worker", |role| { role.inline_policies.remove("deny"); role.inline_policies.insert("allow".into(), serde_json::json!({"Statement":{
+            "Effect":"Allow","Action":"iam:PassRole","Resource":"*","Condition":{"StringEquals":{"aws:userid":session.user_id}}
+        }}).to_string()); });
+        assert!(filter
+            .check_with_context(
+                EnforcementMode::Strict,
+                &identity(&credentials.access_key_id),
+                "iam:PassRole",
+                "*",
+                &spoofed
+            )
+            .is_ok());
+        assert!(filter
+            .check_role_with_context(account, &role_arn, "iam:PassRole", "*", &spoofed)
+            .is_err());
     }
 
     #[test]
@@ -654,5 +976,52 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, IamStsError::AccessDenied(_)));
+    }
+    #[test]
+    fn global_time_uses_one_live_instant_and_cannot_be_forged() {
+        let mut context = BTreeMap::from([
+            (
+                "AWS:CurrentTime".into(),
+                vec!["1900-01-01T00:00:00Z".into()],
+            ),
+            ("AWS:EpochTime".into(), vec!["0".into()]),
+        ]);
+        let before = time::OffsetDateTime::now_utc().unix_timestamp();
+        apply_time_attributes(&mut context);
+        let after = time::OffsetDateTime::now_utc().unix_timestamp();
+        let current = time::OffsetDateTime::parse(
+            &context["aws:currenttime"][0],
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let epoch = context["aws:epochtime"][0].parse::<i64>().unwrap();
+        assert_eq!(current.unix_timestamp(), epoch);
+        assert!((before..=after).contains(&epoch));
+        assert!(!context.contains_key("AWS:CurrentTime"));
+        assert!(!context.contains_key("AWS:EpochTime"));
+        for condition in [
+            serde_json::json!({"DateGreaterThan":{"aws:CurrentTime":"2000-01-01T00:00:00Z"}}),
+            serde_json::json!({"NumericGreaterThan":{"aws:EpochTime":1}}),
+        ] {
+            let caller = CallerContext {
+                identity: vec![PolicyDocument::parse(&serde_json::json!({"Statement":[
+                    {"Effect":"Allow","Action":"s3:GetObject","Resource":"*"},
+                    {"Effect":"Deny","Action":"s3:GetObject","Resource":"*","Condition":condition}
+                ]}).to_string()).unwrap()],
+                boundary: None,
+                session: None,
+                attributes: BTreeMap::new(),
+                mfa_present: None,
+            };
+            let forged = BTreeMap::from([
+                (
+                    "aws:currenttime".into(),
+                    vec!["1900-01-01T00:00:00Z".into()],
+                ),
+                ("aws:epochtime".into(), vec!["0".into()]),
+            ]);
+            assert!(!caller.allows("s3:GetObject", "arn:aws:s3:::bucket/key", &forged));
+            assert!(caller.denies("s3:GetObject", "arn:aws:s3:::bucket/key", &forged));
+        }
     }
 }

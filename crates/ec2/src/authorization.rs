@@ -81,10 +81,11 @@ impl Ec2Handler {
             )
         };
         let mut context = BTreeMap::from([("ec2:Region".into(), vec![request.region.clone()])]);
-        let tags = if action == "CreateSecurityGroup" {
-            input.security_group_tags()?
-        } else {
-            BTreeMap::new()
+        let tags = match action {
+            "CreateVpc" => input.vpc_tags()?,
+            "CreateSubnet" => input.subnet_tags()?,
+            "CreateSecurityGroup" => input.security_group_tags()?,
+            _ => BTreeMap::new(),
         };
         if !tags.is_empty() {
             context.insert("aws:TagKeys".into(), tags.keys().cloned().collect());
@@ -104,12 +105,6 @@ impl Ec2Handler {
             vpc = vpc.or_else(|| scope?.subnets.get(subnet).map(|value| value.vpc_id.clone()));
         }
         if let Some(group) = input.one("GroupId")? {
-            if let Some(group) = scope.and_then(|scope| scope.security_groups.get(group)) {
-                for (tag, value) in &group.tags {
-                    context.insert(format!("aws:ResourceTag/{tag}"), vec![value.clone()]);
-                    context.insert(format!("ec2:ResourceTag/{tag}"), vec![value.clone()]);
-                }
-            }
             vpc = vpc.or_else(|| {
                 scope?
                     .security_groups
@@ -275,28 +270,59 @@ impl Ec2Handler {
         if let Some(vpc) = vpc {
             context.insert("ec2:Vpc".into(), vec![arn("vpc", &vpc)]);
         }
-        drop(state);
+        context.extend(
+            locallycloud_core::integration::request_context::verified_request_context(request),
+        );
         if resources.is_empty() {
             resources.push("*".into());
         }
+        let resources = resources
+            .into_iter()
+            .map(|resource| {
+                let mut resource_context = context.clone();
+                let resource_tags = resource
+                    .rsplit(':')
+                    .next()
+                    .and_then(|tail| tail.split_once('/'))
+                    .and_then(|(kind, id)| {
+                        let scope = scope?;
+                        match kind {
+                            "vpc" => scope.vpcs.get(id).map(|value| &value.tags),
+                            "subnet" => scope.subnets.get(id).map(|value| &value.tags),
+                            "security-group" => {
+                                scope.security_groups.get(id).map(|value| &value.tags)
+                            }
+                            _ => None,
+                        }
+                    });
+                for (key, value) in resource_tags.into_iter().flatten() {
+                    resource_context.insert(format!("aws:ResourceTag/{key}"), vec![value.clone()]);
+                    resource_context.insert(format!("ec2:ResourceTag/{key}"), vec![value.clone()]);
+                }
+                (resource, resource_context)
+            })
+            .collect::<Vec<_>>();
+        drop(state);
         if !tags.is_empty() {
             let mut tag_context = context.clone();
-            tag_context.insert(
-                "ec2:CreateAction".into(),
-                vec!["CreateSecurityGroup".into()],
-            );
+            tag_context.insert("ec2:CreateAction".into(), vec![action.into()]);
+            let (resource_kind, id_kind) = match action {
+                "CreateVpc" => ("vpc", "vpc"),
+                "CreateSubnet" => ("subnet", "subnet"),
+                _ => ("security-group", "sg"),
+            };
             evaluator
                 .authorize(AuthorizationRequest {
                     request_identity: caller.clone(),
                     delegated_identity: delegated.clone(),
                     source_service: "ec2".into(),
                     action: "ec2:CreateTags".into(),
-                    resource: arn("security-group", &input.resource_id("sg")),
+                    resource: arn(resource_kind, &input.resource_id(id_kind)),
                     context: tag_context,
                 })
                 .map_err(|_| denied())?;
         }
-        for resource in resources {
+        for (resource, context) in resources {
             evaluator
                 .authorize(AuthorizationRequest {
                     request_identity: caller.clone(),
@@ -304,7 +330,7 @@ impl Ec2Handler {
                     source_service: "ec2".into(),
                     action: format!("ec2:{action}"),
                     resource,
-                    context: context.clone(),
+                    context,
                 })
                 .map_err(|_| denied())?;
         }
@@ -510,6 +536,13 @@ mod tests {
             "x-locallycloud-verified-internal-scope",
             http::HeaderValue::from_static("1"),
         );
+        locallycloud_core::integration::identity::IdentityPropagator::attach(
+            &mut delegated.headers,
+            &CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::111:role/operator".into(),
+                session_name: "session".into(),
+            },
+        );
         assert_eq!(response(&handler, delegated.clone()).await.0, 200);
         assert!(matches!(
             policy
@@ -647,5 +680,105 @@ mod tests {
             Some(&vec!["Accounting".into()])
         );
         assert_eq!(tags.context.get("aws:TagKeys"), Some(&vec!["Owner".into()]));
+    }
+    #[tokio::test]
+    async fn vpc_and_subnet_tag_on_create_require_create_tags_before_mutation() {
+        for (action, resource_type, id_kind) in [
+            ("CreateVpc", "vpc", "vpcId"),
+            ("CreateSubnet", "subnet", "subnetId"),
+        ] {
+            let registry = Arc::new(ServiceRegistry::new());
+            let handler = register(&registry);
+            let (_, base) = crate::tests::call(
+                &handler,
+                "111",
+                "us-east-1",
+                "Action=CreateVpc&CidrBlock=10.94.0.0%2F16",
+            )
+            .await;
+            let vpc = crate::tests::id(&base, "vpcId");
+            let policy = policy(&registry, handler.clone());
+            policy.allowed.lock().unwrap().extend([
+                (
+                    format!("ec2:{action}"),
+                    format!("arn:aws:ec2:us-east-1:111:{resource_type}/*"),
+                ),
+                (
+                    format!("ec2:{action}"),
+                    format!("arn:aws:ec2:us-east-1:111:vpc/{vpc}"),
+                ),
+            ]);
+            let params = if action == "CreateSubnet" {
+                format!("VpcId={vpc}&CidrBlock=10.94.1.0%2F24")
+            } else {
+                "CidrBlock=10.95.0.0%2F16".into()
+            };
+            let form = format!("Action={action}&{params}&TagSpecification.1.ResourceType={resource_type}&TagSpecification.1.Tag.1.Key=Owner&TagSpecification.1.Tag.1.Value=Accounting");
+            let (status, body) = response(&handler, request(&form)).await;
+            assert_eq!(status, 403, "{body}");
+            {
+                let state = handler.scopes.lock().unwrap();
+                let scope = &state[&("111".into(), "us-east-1".into())];
+                assert_eq!(scope.vpcs.len(), 1);
+                assert!(scope.subnets.is_empty());
+            }
+            policy.allowed.lock().unwrap().push((
+                "ec2:CreateTags".into(),
+                format!("arn:aws:ec2:us-east-1:111:{resource_type}/*"),
+            ));
+            let (status, body) = response(&handler, request(&form)).await;
+            assert_eq!(status, 200, "{body}");
+            let id = crate::tests::id(&body, id_kind);
+            {
+                let calls = policy.calls.lock().unwrap();
+                let tag_call = calls
+                    .iter()
+                    .rev()
+                    .find(|call| call.action == "ec2:CreateTags")
+                    .unwrap();
+                assert_eq!(
+                    tag_call.resource,
+                    format!("arn:aws:ec2:us-east-1:111:{resource_type}/{id}")
+                );
+                assert_eq!(
+                    tag_call.context["ec2:CreateAction"],
+                    vec![action.to_string()]
+                );
+                assert!(!calls
+                    .iter()
+                    .filter(|call| call.resource.ends_with(&id))
+                    .any(|call| call.context.contains_key("aws:ResourceTag/Owner")));
+            }
+            let delete_action = action.replace("Create", "Delete");
+            policy.allowed.lock().unwrap().push((
+                format!("ec2:{delete_action}"),
+                format!("arn:aws:ec2:us-east-1:111:{resource_type}/{id}"),
+            ));
+            let parameter = if resource_type == "vpc" {
+                "VpcId"
+            } else {
+                "SubnetId"
+            };
+            let (status, body) = response(
+                &handler,
+                request(&format!("Action={delete_action}&{parameter}={id}")),
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let calls = policy.calls.lock().unwrap();
+            let deletion = calls
+                .iter()
+                .rev()
+                .find(|call| call.action == format!("ec2:{delete_action}"))
+                .unwrap();
+            assert_eq!(
+                deletion.context["aws:ResourceTag/Owner"],
+                vec!["Accounting".to_string()]
+            );
+            assert_eq!(
+                deletion.context["ec2:ResourceTag/Owner"],
+                vec!["Accounting".to_string()]
+            );
+        }
     }
 }

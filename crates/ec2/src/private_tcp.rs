@@ -50,14 +50,13 @@ impl ScopeState {
                 } else {
                     &group.ingress
                 };
-                (!egress && group.is_default && peer.group_ids.contains(id))
-                    || rules.iter().any(|rule| {
-                        rule.peer.matches(peer.private_ip, &peer.group_ids)
-                            && (rule.protocol == "-1"
-                                || (rule.protocol == "tcp"
-                                    && rule.from_port.is_some_and(|from| from <= port)
-                                    && rule.to_port.is_some_and(|to| port <= to)))
-                    })
+                rules.iter().any(|rule| {
+                    rule.peer.matches(peer.private_ip, &peer.group_ids)
+                        && (rule.protocol == "-1"
+                            || (rule.protocol == "tcp"
+                                && rule.from_port.is_some_and(|from| from <= port)
+                                && rule.to_port.is_some_and(|to| port <= to)))
+                })
             })
     }
 
@@ -373,6 +372,7 @@ mod tests {
             id: "vpc-one".into(),
             cidr: "10.7.0.0/16".parse().unwrap(),
             owner: "111".into(),
+            tags: BTreeMap::new(),
         });
         scope.vpcs.insert(vpc.id.clone(), vpc);
         scope.subnets.insert(
@@ -380,6 +380,7 @@ mod tests {
             Subnet {
                 id: "subnet-one".into(),
                 vpc_id: "vpc-one".into(),
+                tags: BTreeMap::new(),
                 cidr: "10.7.1.0/24".parse().unwrap(),
                 zone: "us-east-1a".into(),
                 owner: "111".into(),

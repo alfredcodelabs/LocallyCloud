@@ -246,6 +246,31 @@ impl RegistryV2Handler {
         repos.remove(&key);
         Ok(())
     }
+
+    pub(super) fn save_repository_metadata(
+        &self,
+        account: &str,
+        region: &str,
+        name: &str,
+        metadata: &[u8],
+    ) -> Result<(), EcrStateError> {
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| std::io::Error::other("ECR registry state unavailable"))?;
+        let key = RepoKey {
+            account: account.into(),
+            region: region.into(),
+            name: name.into(),
+        };
+        if !repos.contains_key(&key) {
+            return Err(std::io::Error::other("ECR repository missing").into());
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.update_repository(&key, metadata)?;
+        }
+        Ok(())
+    }
     pub(crate) fn image_ids(&self, account: &str, region: &str, name: &str) -> Option<Vec<Value>> {
         let repos = self.repos.lock().ok()?;
         let key = RepoKey {
@@ -335,37 +360,14 @@ impl RegistryV2Handler {
             .collect::<Option<Vec<_>>>()?;
         Some((config, layers))
     }
-    fn process(&self, request: &ServiceRequest) -> Response {
+    pub(super) fn process(&self, request: &ServiceRequest) -> Response {
         if request.uri.path() == "/v2/" && request.method == Method::GET {
             return response(StatusCode::OK, Bytes::new(), None, None, None);
         }
-        let Some(path) = request.uri.path().strip_prefix("/v2/") else {
-            return error(
-                StatusCode::NOT_FOUND,
-                "UNSUPPORTED",
-                "Unsupported registry path",
-            );
+        let (name, action) = match route(request.uri.path()) {
+            Ok(route) => route,
+            Err(error) => return error.into_response(),
         };
-        let (name, action) = if let Some((name, rest)) = path.split_once("/blobs/uploads/") {
-            (name, Action::Upload(rest))
-        } else if let Some((name, digest)) = path.split_once("/blobs/") {
-            (name, Action::Blob(digest))
-        } else if let Some((name, reference)) = path.split_once("/manifests/") {
-            (name, Action::Manifest(reference))
-        } else {
-            return error(
-                StatusCode::NOT_FOUND,
-                "UNSUPPORTED",
-                "Unsupported registry path",
-            );
-        };
-        if !valid_repo(name) {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "NAME_INVALID",
-                "Invalid repository name",
-            );
-        }
         let Ok(mut repos) = self.repos.lock() else {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -689,11 +691,106 @@ pub(crate) enum DeleteRepositoryError {
     Unavailable,
 }
 
+pub(super) enum RegistryError {
+    Denied,
+    UnsupportedPath,
+    InvalidName,
+    UnsupportedOperation,
+    UnsupportedCancellation,
+}
+
+impl RegistryError {
+    pub(super) fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::Denied => (
+                StatusCode::FORBIDDEN,
+                "DENIED",
+                "requested access to the resource is denied",
+            ),
+            Self::UnsupportedPath => (
+                StatusCode::NOT_FOUND,
+                "UNSUPPORTED",
+                "Unsupported registry path",
+            ),
+            Self::InvalidName => (
+                StatusCode::BAD_REQUEST,
+                "NAME_INVALID",
+                "Invalid repository name",
+            ),
+            Self::UnsupportedOperation => (
+                StatusCode::METHOD_NOT_ALLOWED,
+                "UNSUPPORTED",
+                "Registry operation is unsupported",
+            ),
+            Self::UnsupportedCancellation => (
+                StatusCode::NOT_IMPLEMENTED,
+                "UNSUPPORTED",
+                "upload cancellation is not implemented with strict IAM",
+            ),
+        };
+        error(status, code, message)
+    }
+}
+
+fn route(path: &str) -> Result<(&str, Action<'_>), RegistryError> {
+    let Some(path) = path.strip_prefix("/v2/") else {
+        return Err(RegistryError::UnsupportedPath);
+    };
+    let (name, action) = if let Some((name, rest)) = path.split_once("/blobs/uploads/") {
+        (name, Action::Upload(rest))
+    } else if let Some((name, digest)) = path.split_once("/blobs/") {
+        (name, Action::Blob(digest))
+    } else if let Some((name, reference)) = path.split_once("/manifests/") {
+        (name, Action::Manifest(reference))
+    } else {
+        return Err(RegistryError::UnsupportedPath);
+    };
+    if !valid_repo(name) {
+        return Err(RegistryError::InvalidName);
+    }
+    Ok((name, action))
+}
+
 enum Action<'a> {
     Upload(&'a str),
     Blob(&'a str),
     Manifest(&'a str),
 }
+
+pub(super) struct RegistryPermission<'a> {
+    pub repository: &'a str,
+    pub actions: &'static [&'static str],
+}
+
+pub(super) fn authorization(
+    request: &ServiceRequest,
+) -> Result<Option<RegistryPermission<'_>>, RegistryError> {
+    if request.uri.path() == "/v2/" && request.method == Method::GET {
+        return Ok(None);
+    }
+    let (repository, action) = route(request.uri.path())?;
+    let actions: &'static [&'static str] = match (action, &request.method) {
+        (Action::Upload(""), &Method::POST) => &["InitiateLayerUpload"],
+        (Action::Upload(_), &Method::PATCH) => &["UploadLayerPart"],
+        (Action::Upload(_), &Method::PUT) if request.body.is_empty() => &["CompleteLayerUpload"],
+        (Action::Upload(_), &Method::PUT) => &["UploadLayerPart", "CompleteLayerUpload"],
+        (Action::Upload(_), &Method::DELETE) => {
+            return Err(RegistryError::UnsupportedCancellation);
+        }
+        (Action::Blob(_), &Method::HEAD) => &["BatchCheckLayerAvailability"],
+        (Action::Blob(_), &Method::GET) => &["GetDownloadUrlForLayer"],
+        (Action::Manifest(_), &Method::GET | &Method::HEAD) => &["BatchGetImage"],
+        (Action::Manifest(_), &Method::PUT) => &["PutImage"],
+        _ => {
+            return Err(RegistryError::UnsupportedOperation);
+        }
+    };
+    Ok(Some(RegistryPermission {
+        repository,
+        actions,
+    }))
+}
+
 fn valid_repo(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 256
@@ -789,7 +886,7 @@ fn response(
     }
     builder.body(Body::from(body)).expect("registry response")
 }
-fn error(status: StatusCode, code: &str, message: &str) -> Response {
+pub(super) fn error(status: StatusCode, code: &str, message: &str) -> Response {
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "application/json")

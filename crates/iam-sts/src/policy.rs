@@ -6,7 +6,7 @@
 //! unmatched). Shared by the `Simulate*` APIs and by strict-mode enforcement.
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use serde_json::Value;
 
@@ -165,15 +165,22 @@ pub fn service_trust_allows(
         let principal = statement.get("Principal");
         let principal_matches = match principal {
             Some(Value::String(value)) if value == "*" => true,
-            Some(Value::Object(map)) if map.len() == 1 => map
-                .get("Service")
-                .and_then(|value| parse_string_set("Service", Some(value)).ok())
-                .is_some_and(|services| {
-                    any_glob(&services, service)
-                        || regional_service
-                            .as_ref()
-                            .is_some_and(|regional| any_glob(&services, regional))
-                }),
+            Some(Value::Object(map)) => {
+                if map.iter().any(|(kind, values)| {
+                    !matches!(kind.as_str(), "AWS" | "Service")
+                        || parse_string_set(kind, Some(values)).is_err()
+                }) {
+                    return false;
+                }
+                map.get("Service")
+                    .and_then(|value| parse_string_set("Service", Some(value)).ok())
+                    .is_some_and(|services| {
+                        any_glob(&services, service)
+                            || regional_service
+                                .as_ref()
+                                .is_some_and(|regional| any_glob(&services, regional))
+                    })
+            }
             _ => false,
         };
         let request = EvalRequest {
@@ -274,7 +281,23 @@ fn parse_conditions(
         })?;
         let mut key_map = BTreeMap::new();
         for (key, value) in keys {
-            key_map.insert(key.to_ascii_lowercase(), condition_values(value)?);
+            let values = condition_values(value)?;
+            if condition_operator(operator)
+                .is_some_and(|(_, base, _)| matches!(base, "IpAddress" | "NotIpAddress"))
+                && values.iter().any(|value| parse_cidr(value).is_none())
+            {
+                return Err(IamStsError::MalformedPolicyDocument(
+                    "IP conditions require valid IPv4 or IPv6 CIDRs".into(),
+                ));
+            }
+            if condition_operator(operator).is_some_and(|(_, base, _)| base.starts_with("Date"))
+                && values.iter().any(|value| date_value(value).is_none())
+            {
+                return Err(IamStsError::MalformedPolicyDocument(
+                    "Date conditions require a valid RFC3339 timestamp or Unix epoch".into(),
+                ));
+            }
+            key_map.insert(key.to_ascii_lowercase(), values);
         }
         out.insert(operator.clone(), key_map);
     }
@@ -446,6 +469,7 @@ fn condition_operator(operator: &str) -> Option<(ConditionSet, &str, bool)> {
     };
     let supported = match base {
         "Null" => matches!(set, ConditionSet::Default) && !if_exists,
+        "IpAddress" | "NotIpAddress" => true,
         _ => apply_operator(base, "", "").is_some(),
     };
     supported.then_some((set, base, if_exists))
@@ -460,9 +484,15 @@ fn eval_condition(
     let Some((set, base, if_exists)) = condition_operator(operator) else {
         return false;
     };
+    let actual = context.get(key).or_else(|| {
+        context
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, values)| values)
+    });
     if base == "Null" {
         // {"Null": {"key": "true"}} ⇒ matches iff the key is absent.
-        let present = context.get(key).map(|v| !v.is_empty()).unwrap_or(false);
+        let present = actual.is_some_and(|values| !values.is_empty());
         return values.iter().any(|v| (v == "true") != present);
     }
     let negated = matches!(
@@ -476,7 +506,7 @@ fn eval_condition(
             | "DateNotEquals"
             | "NotIpAddress"
     );
-    let ctx_values = match context.get(key) {
+    let ctx_values = match actual {
         Some(v) if !v.is_empty() => v,
         _ => {
             return match set {
@@ -526,15 +556,26 @@ fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> Option<bool>
         "NumericLessThanEquals" => num(ctx_value) <= num(policy_value),
         "NumericGreaterThan" => num(ctx_value) > num(policy_value),
         "NumericGreaterThanEquals" => num(ctx_value) >= num(policy_value),
-        // ISO-8601 UTC (`Z`) timestamps compare correctly lexicographically.
-        "DateEquals" => policy_value == ctx_value,
-        "DateNotEquals" => policy_value != ctx_value,
-        "DateLessThan" => ctx_value < policy_value,
-        "DateLessThanEquals" => ctx_value <= policy_value,
-        "DateGreaterThan" => ctx_value > policy_value,
-        "DateGreaterThanEquals" => ctx_value >= policy_value,
-        "IpAddress" => ip_in_cidr(ctx_value, policy_value),
-        "NotIpAddress" => !ip_in_cidr(ctx_value, policy_value),
+        "DateEquals" => date_matches(policy_value, ctx_value, |actual, expected| {
+            actual == expected
+        }),
+        "DateNotEquals" => date_matches(policy_value, ctx_value, |actual, expected| {
+            actual != expected
+        }),
+        "DateLessThan" => date_matches(policy_value, ctx_value, |actual, expected| {
+            actual < expected
+        }),
+        "DateLessThanEquals" => date_matches(policy_value, ctx_value, |actual, expected| {
+            actual <= expected
+        }),
+        "DateGreaterThan" => date_matches(policy_value, ctx_value, |actual, expected| {
+            actual > expected
+        }),
+        "DateGreaterThanEquals" => date_matches(policy_value, ctx_value, |actual, expected| {
+            actual >= expected
+        }),
+        "IpAddress" => return ip_in_cidr(ctx_value, policy_value),
+        "NotIpAddress" => return ip_in_cidr(ctx_value, policy_value).map(|matches| !matches),
         _ => return None,
     };
     Some(
@@ -544,31 +585,79 @@ fn apply_operator(op: &str, policy_value: &str, ctx_value: &str) -> Option<bool>
     )
 }
 
+fn date_matches(policy: &str, actual: &str, compare: impl FnOnce(i128, i128) -> bool) -> bool {
+    match (date_value(policy), date_value(actual)) {
+        (Some(expected), Some(actual)) => compare(actual, expected),
+        _ => false,
+    }
+}
+
+fn date_value(value: &str) -> Option<i128> {
+    if let Ok(date) =
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+    {
+        return Some(date.unix_timestamp_nanos());
+    }
+    let (seconds, fraction) = match value.split_once('.') {
+        Some((seconds, fraction)) if !fraction.is_empty() => (seconds, fraction),
+        Some(_) => return None,
+        None => (value, ""),
+    };
+    if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = i128::from(seconds.parse::<i64>().ok()?);
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i128>().ok()? * 10_i128.pow(9 - fraction.len() as u32)
+    };
+    let epoch = seconds * 1_000_000_000
+        + if value.starts_with('-') {
+            -nanos
+        } else {
+            nanos
+        };
+    time::OffsetDateTime::from_unix_timestamp_nanos(epoch)
+        .ok()
+        .map(|date| date.unix_timestamp_nanos())
+}
+
 fn num(s: &str) -> Option<f64> {
     s.parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
-/// Whether `ip` (IPv4) falls within `cidr` (`a.b.c.d/n` or an exact address).
-fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
-    let Ok(addr) = ip.parse::<Ipv4Addr>() else {
-        return false;
+fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (address, prefix) = cidr
+        .split_once('/')
+        .map_or((cidr, None), |(address, prefix)| (address, Some(prefix)));
+    let address = address.parse::<IpAddr>().ok()?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix {
+        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            value.parse::<u8>().ok()?
+        }
+        Some(_) => return None,
+        None => 32,
     };
-    let (net, bits) = match cidr.split_once('/') {
-        Some((n, b)) => (n, b.parse::<u32>().unwrap_or(32)),
-        None => (cidr, 32),
-    };
-    let Ok(net_addr) = net.parse::<Ipv4Addr>() else {
-        return false;
-    };
-    if bits > 32 {
-        return false;
-    }
-    let mask: u32 = if bits == 0 {
-        0
-    } else {
-        u32::MAX << (32 - bits)
-    };
-    (u32::from(addr) & mask) == (u32::from(net_addr) & mask)
+    (prefix <= maximum).then_some((address, prefix))
+}
+
+/// Compare matching address families; malformed values never satisfy a condition.
+fn ip_in_cidr(ip: &str, cidr: &str) -> Option<bool> {
+    let address = ip.parse::<IpAddr>().ok()?;
+    let (network, prefix) = parse_cidr(cidr)?;
+    Some(match (address, network) {
+        (IpAddr::V4(address), IpAddr::V4(network)) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            (u32::from(address) & mask) == (u32::from(network) & mask)
+        }
+        (IpAddr::V6(address), IpAddr::V6(network)) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            (u128::from(address) & mask) == (u128::from(network) & mask)
+        }
+        _ => false,
+    })
 }
 
 /// Evaluate the AWS order of precedence across identity policies, with optional permission
@@ -580,15 +669,12 @@ pub fn evaluate(
     req: &EvalRequest,
 ) -> Decision {
     // Explicit Deny anywhere overrides everything.
-    let mut all = Vec::new();
-    all.extend(identity.iter());
-    if let Some(b) = boundary {
-        all.extend(b.iter());
-    }
-    if let Some(s) = session {
-        all.extend(s.iter());
-    }
-    if all.iter().any(|doc| has_matching(doc, Effect::Deny, req)) {
+    if identity
+        .iter()
+        .chain(boundary.into_iter().flatten())
+        .chain(session.into_iter().flatten())
+        .any(|doc| has_matching(doc, Effect::Deny, req))
+    {
         return Decision::ExplicitDeny;
     }
     let identity_allows = identity
@@ -614,6 +700,37 @@ fn has_matching(doc: &PolicyDocument, effect: Effect, req: &EvalRequest) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn condition_context_keys_are_case_insensitive_without_folding_values() {
+        let deny = PolicyDocument::parse(r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"},{"Effect":"Deny","Action":"iam:PassRole","Resource":"*","Condition":{"StringEquals":{"iam:PassedToService":"lambda.amazonaws.com"}}}]}"#).unwrap();
+        for key in [
+            "iam:passedtoservice",
+            "iam:PassedToService",
+            "IAM:PASSEDtoSERVICE",
+        ] {
+            let mut req = EvalRequest {
+                action: "iam:PassRole".into(),
+                resource: "*".into(),
+                context: BTreeMap::from([(key.into(), vec!["lambda.amazonaws.com".into()])]),
+            };
+            assert_eq!(
+                evaluate(std::slice::from_ref(&deny), None, None, &req),
+                Decision::ExplicitDeny
+            );
+            assert!(!eval_condition(
+                "Null",
+                "iam:passedtoservice",
+                &["true".into()],
+                &req.context
+            ));
+            req.context.get_mut(key).unwrap()[0] = "Lambda.amazonaws.com".into();
+            assert_eq!(
+                evaluate(std::slice::from_ref(&deny), None, None, &req),
+                Decision::Allowed
+            );
+        }
+    }
 
     #[test]
     fn regional_states_trust_is_bound_to_source_region_and_preserves_explicit_deny() {
@@ -676,6 +793,50 @@ mod tests {
             resource: resource.to_string(),
             context: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn service_trust_matches_its_principal_in_a_mixed_principal_statement_and_keeps_deny() {
+        let role = "arn:aws:iam::000000000000:role/mixed";
+        let mixed = serde_json::json!({"Effect":"Allow","Action":"sts:AssumeRole","Principal":{
+            "Service":["lambda.amazonaws.com","cloudformation.amazonaws.com"],
+            "AWS":"arn:aws:iam::000000000000:user/creator"
+        }});
+        let document = serde_json::json!({"Statement":[mixed.clone()]}).to_string();
+        assert!(service_trust_allows(
+            &document,
+            "lambda.amazonaws.com",
+            role,
+            &BTreeMap::new()
+        ));
+        assert!(service_trust_allows(
+            &document,
+            "cloudformation.amazonaws.com",
+            role,
+            &BTreeMap::new()
+        ));
+        assert!(!service_trust_allows(
+            &document,
+            "events.amazonaws.com",
+            role,
+            &BTreeMap::new()
+        ));
+        let mut denied = mixed.clone();
+        denied["Effect"] = serde_json::json!("Deny");
+        let document = serde_json::json!({"Statement":[mixed, denied]}).to_string();
+        assert!(!service_trust_allows(
+            &document,
+            "lambda.amazonaws.com",
+            role,
+            &BTreeMap::new()
+        ));
+        let aws_only = serde_json::json!({"Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Principal":{"AWS":"*"}}}).to_string();
+        assert!(!service_trust_allows(
+            &aws_only,
+            "lambda.amazonaws.com",
+            role,
+            &BTreeMap::new()
+        ));
     }
 
     #[test]
@@ -867,9 +1028,108 @@ mod tests {
 
     #[test]
     fn ip_cidr_matching() {
-        assert!(ip_in_cidr("10.0.0.5", "10.0.0.0/24"));
-        assert!(!ip_in_cidr("10.0.1.5", "10.0.0.0/24"));
-        assert!(ip_in_cidr("192.168.1.1", "192.168.1.1"));
+        for (address, cidr, expected) in [
+            ("10.0.0.5", "10.0.0.0/24", true),
+            ("10.0.1.5", "10.0.0.0/24", false),
+            ("192.168.1.1", "192.168.1.1", true),
+            ("192.168.1.1", "0.0.0.0/0", true),
+            ("192.168.1.1", "192.168.1.1/32", true),
+            ("::1", "::/0", true),
+            ("::1", "::1/128", true),
+            ("2001:db8:ffff::5", "2001:db8::1", true),
+            ("::2", "::1/128", false),
+            ("2001:db8:1::1234", "2001:db8:1::/64", true),
+            ("2001:db8:2::1234", "2001:db8:1::/64", false),
+            ("::1", "0.0.0.0/0", false),
+            ("127.0.0.1", "::/0", false),
+        ] {
+            assert_eq!(
+                ip_in_cidr(address, cidr),
+                Some(expected),
+                "{address} in {cidr}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_ip_conditions_preserve_explicit_deny_and_negation() {
+        let allow = PolicyDocument::parse(
+            r#"{"Statement":{"Effect":"Allow","Action":"*","Resource":"*"}}"#,
+        )
+        .unwrap();
+        for operator in ["IpAddress", "NotIpAddress"] {
+            let deny = PolicyDocument::parse(
+                &serde_json::json!({"Statement":{
+                    "Effect":"Deny","Action":"kms:Encrypt","Resource":"*",
+                    "Condition":{operator:{"aws:SourceIp":"2001:db8:1::/64"}}
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            for (address, inside) in [
+                ("2001:db8:1::42", true),
+                ("2001:db8:2::42", false),
+                ("127.0.0.1", false),
+            ] {
+                let mut request = req("kms:Encrypt", "*");
+                request
+                    .context
+                    .insert("aws:sourceip".into(), vec![address.into()]);
+                let denied = if operator == "IpAddress" {
+                    inside
+                } else {
+                    !inside
+                };
+                assert_eq!(
+                    evaluate(&[allow.clone(), deny.clone()], None, None, &request),
+                    if denied {
+                        Decision::ExplicitDeny
+                    } else {
+                        Decision::Allowed
+                    },
+                    "{operator} {address}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_ip_prefixes_are_rejected_instead_of_defaulting_to_host_masks() {
+        for operator in ["IpAddress", "NotIpAddress", "ForAnyValue:IpAddressIfExists"] {
+            for value in [
+                "10.0.0.1/33",
+                "::/129",
+                "10.0.0.1/no-prefix",
+                "::/no-prefix",
+                "::/-1",
+                "::/+1",
+                "::/256",
+                "::/64/1",
+                "[::1]/128",
+                "bad-address",
+                "::/",
+            ] {
+                let document = serde_json::json!({"Statement":{
+                    "Effect":"Allow","Action":"*","Resource":"*","Condition":{operator:{"aws:SourceIp":value}}
+                }}).to_string();
+                assert!(
+                    matches!(
+                        PolicyDocument::parse(&document),
+                        Err(IamStsError::MalformedPolicyDocument(_))
+                    ),
+                    "{operator} {value}"
+                );
+                assert_eq!(apply_operator("NotIpAddress", value, "::1"), None);
+            }
+        }
+        assert_eq!(
+            apply_operator("IpAddress", "::/0", "bad-context-address"),
+            None
+        );
+        assert_eq!(
+            apply_operator("NotIpAddress", "::/0", "bad-context-address"),
+            None
+        );
     }
 
     #[test]
@@ -937,5 +1197,52 @@ mod set_operator_tests {
             evaluate(&[allow, deny], None, None, &request),
             Decision::ExplicitDeny
         );
+    }
+    #[test]
+    fn date_conditions_normalize_offsets_epochs_and_fractional_instants() {
+        for (expected, actual) in [
+            ("2020-01-01T00:00:00Z", "2019-12-31T19:00:00-05:00"),
+            ("0", "1970-01-01T01:00:00+01:00"),
+            ("1.25", "1970-01-01T00:00:01.250Z"),
+            ("-0.5", "1969-12-31T23:59:59.500Z"),
+        ] {
+            assert_eq!(apply_operator("DateEquals", expected, actual), Some(true));
+            assert_eq!(
+                apply_operator("DateNotEquals", expected, actual),
+                Some(false)
+            );
+        }
+        assert_eq!(
+            apply_operator(
+                "DateGreaterThan",
+                "2020-01-01T00:00:00Z",
+                "2019-12-31T23:30:00-01:00"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            apply_operator(
+                "DateLessThan",
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:30:00+01:00"
+            ),
+            Some(true)
+        );
+        assert_eq!(apply_operator("DateNotEquals", "0", "invalid"), Some(false));
+        for value in [
+            "invalid",
+            "2020-13-01T00:00:00Z",
+            "NaN",
+            "Infinity",
+            "1.",
+            "1.1234567890",
+        ] {
+            let policy = serde_json::json!({"Statement":{"Effect":"Deny","Action":"*","Resource":"*","Condition":{"ForAnyValue:DateGreaterThanIfExists":{"aws:CurrentTime":value}}}});
+            assert!(
+                PolicyDocument::parse(&policy.to_string()).is_err(),
+                "{value}"
+            );
+        }
+        assert!(PolicyDocument::parse(r#"{"Statement":{"Effect":"Deny","Action":"*","Resource":"*","Condition":{"DateGreaterThan":{"aws:CurrentTime":946684800}}}}"#).is_ok());
     }
 }

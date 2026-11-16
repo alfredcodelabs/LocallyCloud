@@ -149,6 +149,7 @@ def main():
     env.update({'HOME': str(work / 'home'), 'XDG_CACHE_HOME': str(work / 'cache'),
                 'XDG_DATA_HOME': str(work / 'data'), 'XDG_CONFIG_HOME': str(work / 'config'),
                 'LOCALLYCLOUD_HOST': '127.0.0.1', 'LOCALLYCLOUD_PORT': '0',
+                'LOCALLYCLOUD_ALLOW_HTTP': 'true',
                 'LOCALLYCLOUD_STATE_DB': str(work / 'state.sqlite3'),
                 'LOCALLYCLOUD_WORK_DIR': str(work / 'lambda'),
                 'LOCALLYCLOUD_KMS_MASTER_KEY': key,

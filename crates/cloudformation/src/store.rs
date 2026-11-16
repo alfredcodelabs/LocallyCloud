@@ -59,6 +59,8 @@ pub struct ChangeSetChange {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChangeSet {
+    #[serde(default)]
+    pub(crate) validated_role_arn: Option<String>,
     pub id: String,
     pub name: String,
     pub stack_name: String,
@@ -583,6 +585,7 @@ mod tests {
         let reopen = || CfnStore::with_cipher(&db, StateCipher::with_key(&[47; 32])).unwrap();
         let store = reopen();
         let stack = Stack {
+            role_arn: None,
             stack_id: "arn:stack:progress".into(),
             stack_name: "progress".into(),
             status: crate::model::StackStatus::CreateInProgress,
@@ -697,6 +700,7 @@ mod tests {
                 "owner",
                 "us-east-1",
                 Stack {
+                    role_arn: None,
                     status: crate::model::StackStatus::DeleteInProgress,
                     ..recovered
                 },
@@ -773,6 +777,7 @@ mod tests {
         let reopen = || CfnStore::with_cipher(&db, StateCipher::with_key(&[31; 32])).unwrap();
         let store = reopen();
         let stack = Stack {
+            role_arn: None,
             stack_id: "arn:stack:original".into(),
             stack_name: "orders".into(),
             status: crate::model::StackStatus::CreateComplete,
@@ -821,6 +826,7 @@ mod tests {
             )
             .unwrap();
         let change = ChangeSet {
+            validated_role_arn: None,
             id: "change-id".into(),
             name: "update".into(),
             stack_name: "orders".into(),
@@ -1023,6 +1029,7 @@ mod tests {
     fn deleted_history_is_scoped_expires_and_does_not_occupy_the_name() {
         let store = CfnStore::new();
         let mut stack = Stack {
+            role_arn: None,
             stack_id: "arn:stack:old".into(),
             stack_name: "stack".into(),
             status: crate::model::StackStatus::DeleteComplete,
@@ -1062,6 +1069,7 @@ mod tests {
     fn change_set_is_claimed_once_under_contention() {
         let store = CfnStore::new();
         let change = ChangeSet {
+            validated_role_arn: None,
             id: "id".into(),
             name: "change".into(),
             stack_name: "stack".into(),

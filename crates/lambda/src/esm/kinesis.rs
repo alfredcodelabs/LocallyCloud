@@ -80,6 +80,8 @@ impl KinesisBatchSource {
             .ok_or("IAM unavailable")?;
         evaluator
             .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 source_arn: None,
                 caller: RequestIdentity {
                     account_id: self.account.clone(),

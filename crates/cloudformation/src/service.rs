@@ -67,11 +67,16 @@ fn failure_action(q: &Query, creating: bool) -> Result<FailureAction, CfnError> 
     })
 }
 
+#[derive(Clone)]
 pub struct CfnHandler {
     store: Arc<CfnStore>,
     registry: Weak<ServiceRegistry>,
     caller_access_key: Option<String>,
     response_endpoint: String,
+    execution_role: Option<String>,
+    source_stack_arn: Option<String>,
+    caller_context: BTreeMap<String, Vec<String>>,
+    delegated_caller: Option<locallycloud_core::integration::identity::CallerIdentity>,
 }
 
 impl CfnHandler {
@@ -80,6 +85,10 @@ impl CfnHandler {
             store: CfnStore::new(),
             registry,
             caller_access_key: None,
+            execution_role: None,
+            source_stack_arn: None,
+            caller_context: BTreeMap::new(),
+            delegated_caller: None,
             response_endpoint: "http://127.0.0.1:4566".into(),
         }
     }
@@ -91,6 +100,86 @@ impl CfnHandler {
             account.to_string(),
         )
         .with_caller_access_key(self.caller_access_key.clone())
+        .with_execution_role(self.execution_role.clone(), self.source_stack_arn.clone())
+    }
+
+    fn stack_execution(
+        &self,
+        q: &Query,
+        region: &str,
+        account: &str,
+        stack_arn: &str,
+        current_role: Option<&str>,
+    ) -> Result<Self, CfnError> {
+        use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
+        use locallycloud_core::integration::RequestIdentity;
+        let requested = q.params.get("RoleARN");
+        let role = requested.map(String::as_str).or(current_role);
+        let mut execution = self.clone();
+        execution.execution_role = role.map(str::to_owned);
+        execution.source_stack_arn = Some(stack_arn.into());
+        let Some(role) = role else {
+            return Ok(execution);
+        };
+        let arn = locallycloud_core::integration::arn::Arn::parse(role).map_err(|_| {
+            CfnError::Validation("RoleARN must be an IAM role in this account".into())
+        })?;
+        if arn.service != "iam"
+            || !arn.region.is_empty()
+            || arn.account_id != account
+            || !arn.resource.starts_with("role/")
+            || arn.resource.len() <= 5
+            || arn.resource.contains('*')
+            || arn.resource.contains('?')
+            || arn.partition != "aws"
+            || role.len() > 2048
+            || role
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(CfnError::Validation(
+                "RoleARN must be an IAM role in this account".into(),
+            ));
+        }
+        let registry = self.registry.upgrade().ok_or(CfnError::Internal)?;
+        let evaluator = registry
+            .authorization_evaluator(&ServiceName::new("iam"))
+            .ok_or_else(|| {
+                CfnError::ResourceFailed(
+                    "IAM is required to use a CloudFormation execution role".into(),
+                )
+            })?;
+        let authorization = ServiceRoleAuthorizationRequest {
+            delegated_caller: self.delegated_caller.clone(),
+            caller_context: self.caller_context.clone(),
+            source_arn: Some(stack_arn.into()),
+            caller: RequestIdentity {
+                account_id: account.into(),
+                access_key_id: self.caller_access_key.clone(),
+                arn: None,
+            },
+            role_arn: role.into(),
+            service_principal: "cloudformation.amazonaws.com".into(),
+            action: "iam:PassRole".into(),
+            resource: role.into(),
+        };
+        if requested.is_some() && current_role != Some(role) {
+            evaluator.authorize_service_role_assignment(authorization)
+                .map_err(|_| CfnError::AccessDenied("Not authorized to pass the CloudFormation execution role, or the role cannot be assumed".into()))?;
+        } else {
+            evaluator
+                .authorize_service_role_trust(authorization)
+                .map_err(|_| {
+                    CfnError::Validation(
+                        "The CloudFormation execution role does not exist or cannot be assumed"
+                            .into(),
+                    )
+                })?;
+        }
+        if !stack_arn.starts_with(&format!("arn:aws:cloudformation:{region}:{account}:stack/")) {
+            return Err(CfnError::Validation("Invalid stack execution scope".into()));
+        }
+        Ok(execution)
     }
 
     async fn dispatch(
@@ -100,15 +189,38 @@ impl CfnHandler {
         region: &str,
         account: &str,
     ) -> Result<String, CfnError> {
+        let scoped;
+        let handler = if matches!(op, "CreateStack" | "UpdateStack" | "DeleteStack") {
+            let name = q
+                .get("StackName")
+                .ok_or_else(|| CfnError::Validation("StackName is required".into()))?;
+            let existing = self.store.find(account, region, &name);
+            let stack_arn = existing
+                .as_ref()
+                .map(|stack| stack.stack_id.clone())
+                .unwrap_or_else(|| make_stack_id(region, account, &name));
+            scoped = self.stack_execution(
+                q,
+                region,
+                account,
+                &stack_arn,
+                existing
+                    .as_ref()
+                    .and_then(|stack| stack.role_arn.as_deref()),
+            )?;
+            &scoped
+        } else {
+            self
+        };
         match op {
-            "CreateStack" => self.create_stack(q, region, account, None).await,
+            "CreateStack" => handler.create_stack(q, region, account, None).await,
             "CreateChangeSet" => self.create_change_set(q, region, account).await,
             "DescribeChangeSet" => self.describe_change_set(q, region, account),
             "ListChangeSets" => self.list_change_sets(q, region, account),
             "ExecuteChangeSet" => self.execute_change_set(q, region, account).await,
             "DeleteChangeSet" => self.delete_change_set(q, region, account),
-            "UpdateStack" => self.update_stack(q, region, account).await,
-            "DeleteStack" => self.delete_stack(q, region, account).await,
+            "UpdateStack" => handler.update_stack(q, region, account).await,
+            "DeleteStack" => handler.delete_stack(q, region, account).await,
             "DescribeStacks" => self.describe_stacks(q, region, account),
             "DescribeStackEvents" => self.describe_stack_events(q, region, account),
             "DescribeStackResources" => self.describe_stack_resources(q, region, account),
@@ -126,7 +238,7 @@ impl CfnHandler {
 
     /// Public lifecycle requests acknowledge durable admission, not backend completion.
     async fn admit_public(
-        self,
+        mut self,
         op: &str,
         q: &Query,
         region: &str,
@@ -147,6 +259,9 @@ impl CfnHandler {
             .map(|cs| cs.request.clone())
             .unwrap_or_else(|| q.clone());
         if op == "ExecuteChangeSet" {
+            if q.params.contains_key("RoleARN") {
+                return Err(CfnError::Validation("ExecuteChangeSet does not accept RoleARN; specify it when creating the change set".into()));
+            }
             if let Some(value) = q.params.get("DisableRollback") {
                 request
                     .params
@@ -225,6 +340,7 @@ impl CfnHandler {
         }
         let mut stack = if operation == "CreateStack" {
             Stack {
+                role_arn: None,
                 stack_id: change
                     .as_ref()
                     .map(|cs| cs.stack_id.clone())
@@ -244,6 +360,24 @@ impl CfnHandler {
         } else {
             existing.clone().unwrap()
         };
+        let current_role = change
+            .as_ref()
+            .and_then(|change| {
+                change
+                    .validated_role_arn
+                    .as_ref()
+                    .filter(|role| change.request.params.get("RoleARN") == Some(*role))
+                    .cloned()
+            })
+            .or_else(|| existing.as_ref().and_then(|stack| stack.role_arn.clone()));
+        self = self.stack_execution(
+            &request,
+            region,
+            account,
+            &stack.stack_id,
+            current_role.as_deref(),
+        )?;
+        stack.role_arn = self.execution_role.clone();
         if operation != "DeleteStack" {
             let body = self
                 .resolve_template_body(&request, region, account)
@@ -259,6 +393,9 @@ impl CfnHandler {
                     stack.status,
                     StackStatus::CreateFailed | StackStatus::UpdateFailed
                 )
+                && existing
+                    .as_ref()
+                    .is_some_and(|old| old.role_arn == stack.role_arn)
                 && stack.template_body == body
                 && stack.parameters == parameters
                 && (request.tags().is_empty() || stack.tags == request.tags())
@@ -450,20 +587,6 @@ impl CfnHandler {
                 "Stack state does not permit a change set".into(),
             ));
         }
-        let body = self.resolve_template_body(q, region, account).await?;
-        let template = Template::parse(&body)?;
-        check_capabilities(q, &template)?;
-        let params = effective_parameters(q, &template, existing.as_ref())?;
-        let conditions = template.evaluate_conditions(region, account, &params)?;
-        let active = template.active_resources(&conditions)?;
-        let changes = change_set_changes(existing.as_ref(), &active, region, account, &params)?;
-        let unchanged = existing
-            .as_ref()
-            .is_some_and(|old| old.template_body == body && old.parameters == params);
-        let id = format!(
-            "arn:aws:cloudformation:{region}:{account}:changeSet/{name}/{}",
-            uuid::Uuid::new_v4()
-        );
         let stack_id = existing
             .as_ref()
             .map(|old| old.stack_id.clone())
@@ -473,7 +596,35 @@ impl CfnHandler {
                     .map(|change| change.stack_id)
             })
             .unwrap_or_else(|| make_stack_id(region, account, &stack));
+        let execution = self.stack_execution(
+            q,
+            region,
+            account,
+            &stack_id,
+            existing
+                .as_ref()
+                .and_then(|stack| stack.role_arn.as_deref()),
+        )?;
+        let body = execution.resolve_template_body(q, region, account).await?;
+        let template = Template::parse(&body)?;
+        check_capabilities(q, &template)?;
+        let params = effective_parameters(q, &template, existing.as_ref())?;
+        let conditions = template.evaluate_conditions(region, account, &params)?;
+        let active = template.active_resources(&conditions)?;
+        let changes = change_set_changes(existing.as_ref(), &active, region, account, &params)?;
+        let unchanged = existing.as_ref().is_some_and(|old| {
+            old.template_body == body
+                && old.parameters == params
+                && old.role_arn == execution.execution_role
+        });
+        let id = format!(
+            "arn:aws:cloudformation:{region}:{account}:changeSet/{name}/{}",
+            uuid::Uuid::new_v4()
+        );
         let mut request = q.clone();
+        if let Some(role) = &execution.execution_role {
+            request.params.insert("RoleARN".into(), role.clone());
+        }
         request.params.insert("StackName".into(), stack.clone());
         request.params.insert("TemplateBody".into(), body);
         request.params.remove("TemplateURL");
@@ -494,6 +645,7 @@ impl CfnHandler {
             account,
             region,
             ChangeSet {
+                validated_role_arn: execution.execution_role.clone(),
                 id: id.clone(),
                 name: name.clone(),
                 stack_name: stack,
@@ -585,7 +737,26 @@ impl CfnHandler {
         region: &str,
         account: &str,
     ) -> Result<String, CfnError> {
+        if q.params.contains_key("RoleARN") {
+            return Err(CfnError::Validation(
+                "ExecuteChangeSet does not accept RoleARN".into(),
+            ));
+        }
         let cs = self.lookup_change_set(q, region, account)?;
+        let current = self.store.find(account, region, &cs.stack_id);
+        let saved_role = cs
+            .validated_role_arn
+            .as_ref()
+            .filter(|role| cs.request.params.get("RoleARN") == Some(*role))
+            .cloned()
+            .or_else(|| current.as_ref().and_then(|stack| stack.role_arn.clone()));
+        let execution = self.stack_execution(
+            &cs.request,
+            region,
+            account,
+            &cs.stack_id,
+            saved_role.as_deref(),
+        )?;
         if !self.store.claim_change_set(account, region, &cs)? {
             return Err(CfnError::Validation(format!(
                 "ChangeSet [{}] is not executable",
@@ -593,10 +764,11 @@ impl CfnHandler {
             )));
         }
         if cs.change_type == "CREATE" {
-            self.create_stack(&cs.request, region, account, Some(&cs.stack_id))
+            execution
+                .create_stack(&cs.request, region, account, Some(&cs.stack_id))
                 .await?;
         } else {
-            self.update_stack(&cs.request, region, account).await?;
+            execution.update_stack(&cs.request, region, account).await?;
         }
         Ok(String::new())
     }
@@ -641,6 +813,7 @@ impl CfnHandler {
         let outputs = template.active_outputs(&conditions, &active)?;
         let stack_id = change_set_stack_id
             .map(str::to_string)
+            .or_else(|| self.source_stack_arn.clone())
             .unwrap_or_else(|| make_stack_id(region, account, &name));
 
         let now = admission
@@ -677,6 +850,7 @@ impl CfnHandler {
             events = recorded;
         }
         let stack = Stack {
+            role_arn: self.execution_role.clone(),
             stack_id: stack_id.clone(),
             stack_name: name.clone(),
             status,
@@ -788,6 +962,7 @@ impl CfnHandler {
                     | StackStatus::UpdateRollbackFailed
             );
         let stack = Stack {
+            role_arn: self.execution_role.clone(),
             stack_id: existing.stack_id.clone(),
             stack_name: name.clone(),
             status,
@@ -2278,7 +2453,14 @@ impl NativeHandler for CfnHandler {
         };
         if matches!(
             op.as_str(),
-            "ListStacks"
+            "CreateStack"
+                | "UpdateStack"
+                | "DeleteStack"
+                | "CreateChangeSet"
+                | "ExecuteChangeSet"
+                | "DeleteChangeSet"
+                | "ValidateTemplate"
+                | "ListStacks"
                 | "DescribeStacks"
                 | "DescribeStackEvents"
                 | "DescribeStackResources"
@@ -2290,7 +2472,10 @@ impl NativeHandler for CfnHandler {
                 | "ListChangeSets"
         ) {
             let stack_name = q.get("StackName");
-            let resource = if op == "DescribeChangeSet" {
+            let resource = if matches!(
+                op.as_str(),
+                "DescribeChangeSet" | "ExecuteChangeSet" | "DeleteChangeSet"
+            ) {
                 self.lookup_change_set(&q, &request.region, &request.account_id)
                     .ok()
                     .map(|change| change.stack_id)
@@ -2308,6 +2493,17 @@ impl NativeHandler for CfnHandler {
                     })
                     .map(|stack| stack.stack_id)
             }
+            .or_else(|| {
+                stack_name
+                    .as_ref()
+                    .filter(|_| matches!(op.as_str(), "CreateStack" | "CreateChangeSet"))
+                    .map(|name| {
+                        format!(
+                            "arn:aws:cloudformation:{}:{}:stack/{name}/*",
+                            request.region, request.account_id
+                        )
+                    })
+            })
             .unwrap_or_else(|| "*".into());
             let allowed = locallycloud_core::integration::authorization::authorize_native_read(
                 &self.registry,
@@ -2330,7 +2526,7 @@ impl NativeHandler for CfnHandler {
             if !allowed || !list_allowed {
                 return locallycloud_core::error_mapping::AwsError::new(
                     "AccessDenied",
-                    "Not authorized to read CloudFormation resources",
+                    "Not authorized to perform this CloudFormation operation",
                     403,
                 )
                 .with_request_id(request.request_id.clone())
@@ -2343,6 +2539,11 @@ impl NativeHandler for CfnHandler {
             store: self.store.clone(),
             registry: self.registry.clone(),
             response_endpoint: self.response_endpoint.clone(),
+            execution_role: None,
+            source_stack_arn: None,
+            caller_context:
+                locallycloud_core::integration::request_context::verified_request_context(&request),
+            delegated_caller: locallycloud_core::integration::identity::trusted_role(&request),
             caller_access_key: request
                 .headers
                 .get(http::header::AUTHORIZATION)
@@ -2413,6 +2614,10 @@ pub fn register_with_state_and_endpoint(
             store,
             registry: Arc::downgrade(registry),
             caller_access_key: None,
+            execution_role: None,
+            source_stack_arn: None,
+            caller_context: BTreeMap::new(),
+            delegated_caller: None,
             response_endpoint: response_endpoint.into(),
         }),
     );
@@ -2703,6 +2908,7 @@ fn change_set_changes(
 
 fn review_stack(cs: &ChangeSet) -> Stack {
     Stack {
+        role_arn: cs.request.get("RoleARN"),
         stack_id: cs.stack_id.clone(),
         stack_name: cs.stack_name.clone(),
         status: StackStatus::ReviewInProgress,
@@ -2788,8 +2994,13 @@ fn render_stack(stack: &Stack) -> String {
         .as_ref()
         .map(|t| text_el("LastUpdatedTime", t))
         .unwrap_or_default();
+    let role = stack
+        .role_arn
+        .as_deref()
+        .map(|role| text_el("RoleARN", role))
+        .unwrap_or_default();
     format!(
-        "<member>{}{}{}<CreationTime>{}</CreationTime>{}{}<Outputs>{}</Outputs><Parameters>{}</Parameters><Tags>{}</Tags><DisableRollback>{}</DisableRollback><EnableTerminationProtection>false</EnableTerminationProtection></member>",
+        "<member>{}{}{}<CreationTime>{}</CreationTime>{}{}{role}<Outputs>{}</Outputs><Parameters>{}</Parameters><Tags>{}</Tags><DisableRollback>{}</DisableRollback><EnableTerminationProtection>false</EnableTerminationProtection></member>",
         text_el("StackId", &stack.stack_id),
         text_el("StackName", &stack.stack_name),
         text_el("StackStatus", stack.status.as_str()),
@@ -3171,6 +3382,7 @@ mod tests {
     #[test]
     fn pending_resources_are_read_views_without_physical_ownership_or_stale_epochs() {
         let mut stack = Stack {
+            role_arn: None,
             stack_id: "arn:stack:view".into(),
             stack_name: "view".into(),
             status: StackStatus::CreateInProgress,
@@ -3591,6 +3803,10 @@ mod tests {
                 store: CfnStore::with_cipher(&db, StateCipher::with_key(&[31; 32])).unwrap(),
                 registry: Arc::downgrade(&registry),
                 caller_access_key: None,
+                execution_role: None,
+                source_stack_arn: None,
+                caller_context: BTreeMap::new(),
+                delegated_caller: None,
                 response_endpoint: "http://127.0.0.1:4566".into(),
             };
             (registry, handler)
@@ -3818,6 +4034,10 @@ mod tests {
                     .collect();
                 let mut headers = http::HeaderMap::new();
                 headers.insert(http::header::AUTHORIZATION,"AWS4-HMAC-SHA256 Credential=OPERATOR/20261006/us-east-1/cloudformation/aws4_request".parse().unwrap());
+                headers.insert(
+                    "x-locallycloud-verified-external-sigv4",
+                    "1".parse().unwrap(),
+                );
                 let response = handler
                     .handle(ServiceRequest {
                         method: Method::POST,
@@ -4426,6 +4646,7 @@ mod tests {
                 "000000000000",
                 "us-east-1",
                 Stack {
+                    role_arn: None,
                     stack_id: "stack-id".into(),
                     stack_name: "stack".into(),
                     status: StackStatus::CreateComplete,
@@ -4929,6 +5150,7 @@ mod tests {
                 "000000000000",
                 "us-east-1",
                 Stack {
+                    role_arn: None,
                     stack_id: "drain-stack-id".into(),
                     stack_name: "drain-stack".into(),
                     status: StackStatus::CreateComplete,
@@ -5012,6 +5234,7 @@ mod tests {
                 "000000000000",
                 "us-east-1",
                 Stack {
+                    role_arn: None,
                     stack_id: "stack-id".into(),
                     stack_name: "stack".into(),
                     status: StackStatus::CreateComplete,
@@ -5527,6 +5750,7 @@ mod tests {
                 "000000000000",
                 "us-east-1",
                 Stack {
+                    role_arn: None,
                     stack_id:
                         "arn:aws:cloudformation:us-east-1:000000000000:stack/replacement-stack/id"
                             .into(),
@@ -5605,6 +5829,10 @@ mod interrupted_progress_tests {
             store,
             registry: Arc::downgrade(registry),
             caller_access_key: None,
+            execution_role: None,
+            source_stack_arn: None,
+            caller_context: BTreeMap::new(),
+            delegated_caller: None,
             response_endpoint: "http://127.0.0.1:4566".into(),
         }
     }
@@ -5714,6 +5942,7 @@ mod interrupted_progress_tests {
             let mut admission = store
                 .get("000000000000", "us-east-1", name)
                 .unwrap_or_else(|| Stack {
+                    role_arn: None,
                     stack_id: make_stack_id("us-east-1", "000000000000", name),
                     stack_name: name.into(),
                     status: StackStatus::CreateInProgress,

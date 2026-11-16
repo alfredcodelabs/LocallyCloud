@@ -27,13 +27,14 @@ use axum::{
 use dashmap::DashMap;
 use http::{StatusCode, Uri};
 use locallycloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec, TaskState};
+use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::integration::correlation::CorrelationContext;
 use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::logs::{
     GroupRef, LogScope, ProducerContext, ProducerGroupSpec, ProducerLogEvent, ProducerStreamSpec,
 };
 use locallycloud_core::proxy::{forward_to_legacy, ProxyConfig};
-use locallycloud_core::registry::{ServiceName, ServiceRegistry};
+use locallycloud_core::registry::{AwsProtocol, ServiceName, ServiceRegistry};
 use locallycloud_core::router::extract_service_from_credential_scope;
 use locallycloud_ec2::{Ec2Handler, TaskNetworkLease};
 use uuid::Uuid;
@@ -60,8 +61,12 @@ fn loopback_port(url: &str) -> Result<u16, String> {
     let uri: Uri = url
         .parse()
         .map_err(|_| format!("invalid guest URL: {url}"))?;
-    if uri.scheme_str() != Some("http") || !matches!(uri.host(), Some("127.0.0.1" | "localhost")) {
-        return Err(format!("VPC guest URL must be HTTP on loopback: {url}"));
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri
+            .host()
+            .is_none_or(|host| host.is_empty() || host.contains('@'))
+    {
+        return Err("guest endpoint must be an HTTP or HTTPS URL with a hostname".into());
     }
     uri.port_u16()
         .ok_or_else(|| format!("VPC guest URL needs an explicit port: {url}"))
@@ -73,7 +78,7 @@ fn proxy_listener(
     policy: Option<VpcProxyPolicy>,
     runtime_prefix: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
-    let app = proxy_router(backend_url, policy, runtime_prefix);
+    let app = proxy_router(backend_url, policy, runtime_prefix, None);
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::warn!(%error, "Lambda guest proxy stopped");
@@ -81,95 +86,128 @@ fn proxy_listener(
     })
 }
 
+fn vpc_endpoint_error(
+    registry: Option<&ServiceRegistry>,
+    service: Option<&ServiceName>,
+) -> http::Response<Body> {
+    let protocol = service
+        .and_then(|service| registry?.lookup(service))
+        .map(|entry| entry.metadata.protocol)
+        .unwrap_or(AwsProtocol::Json11);
+    let code = match protocol {
+        AwsProtocol::Query | AwsProtocol::RestXml => "VpcEndpointUnavailable",
+        _ => "VpcEndpointUnavailableException",
+    };
+    let name = service.map(ServiceName::as_str).unwrap_or("unknown");
+    AwsError::new(
+        code,
+        format!("VPC endpoint or security group egress unavailable for AWS service {name}"),
+        503,
+    )
+    .render(protocol)
+    .into_response()
+}
+
 fn proxy_router(
     backend_url: String,
     policy: Option<VpcProxyPolicy>,
     runtime_prefix: Option<String>,
+    registry: Option<Weak<ServiceRegistry>>,
 ) -> Router {
     Router::new().fallback(any(move |request: Request| {
-            let backend_url = backend_url.clone();
-            let policy = policy.clone();
-            let runtime_prefix = runtime_prefix.clone();
-            async move {
-                let (parts, body) = request.into_parts();
-                if let Some(prefix) = &runtime_prefix {
-                    if !parts.uri.path().starts_with(prefix) {
-                        return http::Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Body::empty())
-                            .unwrap();
-                    }
+        let backend_url = backend_url.clone();
+        let policy = policy.clone();
+        let runtime_prefix = runtime_prefix.clone();
+        let registry = registry.as_ref().and_then(Weak::upgrade);
+        let dispatcher = registry
+            .as_ref()
+            .and_then(|registry| registry.internal_dispatcher());
+        async move {
+            let (parts, body) = request.into_parts();
+            if let Some(prefix) = &runtime_prefix {
+                if !parts.uri.path().starts_with(prefix) {
+                    return http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .unwrap();
                 }
-                if let Some(policy) = &policy {
-                    let query_credential = locallycloud_core::integration::extract_x_amz_credential(parts.uri.query().unwrap_or_default());
-                    let service = parts
-                        .headers
-                        .get(http::header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|auth| extract_service_from_credential_scope(Some(auth), None))
-                        .or_else(|| extract_service_from_credential_scope(None, query_credential.as_deref()));
-                    if !service.as_ref().is_some_and(|service| {
-                        policy.ec2.vpc_endpoint_access(
-                            &policy.account,
-                            &policy.region,
-                            &policy.subnet_id,
-                            policy.source_ip,
-                            &policy.source_group_ids,
-                            service.as_str(),
-                        )
-                    }) {
-                        // Keep the guest SDK error parseable. AWS would normally
-                        // surface a connection failure when there is no route;
-                        // this explicit local error identifies the missing endpoint.
-                        let name = service.as_ref().map(|name| name.as_str()).unwrap_or("unknown");
-                        let message = format!("VPC endpoint or security group egress unavailable for AWS service {name}");
-                        if name == "s3" {
-                            // S3 uses REST-XML; its SDK would reject a JSON error.
-                            return http::Response::builder()
-                                .status(StatusCode::SERVICE_UNAVAILABLE)
-                                .header(http::header::CONTENT_TYPE, "application/xml")
-                                .body(Body::from(format!(
-                                    "<Error><Code>VpcEndpointUnavailable</Code><Message>{message}</Message></Error>"
-                                )))
-                                .unwrap();
-                        }
-                        let payload = serde_json::json!({
-                            "__type": "VpcEndpointUnavailableException",
-                            "message": message,
-                        });
-                        return http::Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .header(http::header::CONTENT_TYPE, "application/x-amz-json-1.1")
-                            .header("x-amzn-errortype", "VpcEndpointUnavailableException")
-                            .body(Body::from(payload.to_string()))
-                            .unwrap();
-                    }
-                }
-                // A guest is untrusted input to the host proxy. Bound buffering until
-                // the shared proxy supports streaming bodies end to end.
-                let body = match to_bytes(body, 32 * 1024 * 1024).await {
-                    Ok(body) => body,
-                    Err(_) => {
-                        return http::Response::builder()
-                            .status(StatusCode::PAYLOAD_TOO_LARGE)
-                            .body(Body::empty())
-                            .unwrap();
-                    }
-                };
-                let config = ProxyConfig {
-                    backend_url,
-                    upstream_timeout: Duration::from_secs(30),
-                };
-                forward_to_legacy(&parts.method, &parts.uri, &parts.headers, body, &config)
-                    .await
-                    .unwrap_or_else(|error| {
-                        http::Response::builder()
-                            .status(error.http_status())
-                            .body(Body::from(error.to_string()))
-                            .unwrap()
-                    })
             }
-        }))
+            if let Some(policy) = &policy {
+                let query_credential = locallycloud_core::integration::extract_x_amz_credential(
+                    parts.uri.query().unwrap_or_default(),
+                );
+                let service = parts
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|auth| extract_service_from_credential_scope(Some(auth), None))
+                    .or_else(|| {
+                        extract_service_from_credential_scope(None, query_credential.as_deref())
+                    });
+                if !service.as_ref().is_some_and(|service| {
+                    policy.ec2.vpc_endpoint_access(
+                        &policy.account,
+                        &policy.region,
+                        &policy.subnet_id,
+                        policy.source_ip,
+                        &policy.source_group_ids,
+                        service.as_str(),
+                    )
+                }) {
+                    // Keep the guest SDK error parseable. AWS would normally
+                    // surface a connection failure when there is no route;
+                    // this explicit local error identifies the missing endpoint.
+                    return vpc_endpoint_error(registry.as_deref(), service.as_ref());
+                }
+            }
+            // A guest is untrusted input to the host proxy. Bound buffering until
+            // the shared proxy supports streaming bodies end to end.
+            let body = match to_bytes(body, 32 * 1024 * 1024).await {
+                Ok(body) => body,
+                Err(_) => {
+                    return http::Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+            };
+            if let Some(dispatcher) = dispatcher {
+                let Some(axum::extract::ConnectInfo(connection)) = parts
+                    .extensions
+                    .get::<axum::extract::ConnectInfo<
+                    locallycloud_core::tls::ConnectionInfo,
+                >>() else {
+                    return http::Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Body::empty())
+                        .unwrap();
+                };
+                return dispatcher
+                    .dispatch_verified_connection(
+                        &parts.method,
+                        &parts.uri,
+                        &parts.headers,
+                        body,
+                        &uuid::Uuid::new_v4().to_string(),
+                        connection.peer.ip(),
+                        connection.secure_transport,
+                    )
+                    .await;
+            }
+            let config = ProxyConfig {
+                backend_url,
+                upstream_timeout: Duration::from_secs(30),
+            };
+            forward_to_legacy(&parts.method, &parts.uri, &parts.headers, body, &config)
+                .await
+                .unwrap_or_else(|error| {
+                    http::Response::builder()
+                        .status(error.http_status())
+                        .body(Body::from(error.to_string()))
+                        .unwrap()
+                })
+        }
+    }))
 }
 
 fn private_tcp_listener(
@@ -2210,18 +2248,30 @@ impl Executor {
             let tls = self
                 .guest_tls
                 .get_or_try_init(|| async {
-                    locallycloud_core::tls::GuestCallbackTls::new()
-                        .await
-                        .map(Arc::new)
+                    locallycloud_core::tls::GuestCallbackTls::for_hostname(
+                        self.aws_endpoint_url
+                            .parse::<Uri>()
+                            .ok()
+                            .and_then(|uri| uri.host().map(str::to_owned))
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "invalid guest endpoint hostname",
+                                )
+                            })?,
+                    )
+                    .await
+                    .map(Arc::new)
                 })
                 .await
                 .map_err(|e| format!("guest callback TLS unavailable: {e}"))?
                 .clone();
             let path = rootfs.path.clone();
             let ca = tls.ca_pem().to_owned();
+            let endpoint = self.aws_endpoint_url.clone();
             env_map = self
                 .rootfs_worker(&env_key, move || {
-                    crate::runtime_pack::install_guest_trust(&path, &mut env_map, &ca)?;
+                    crate::runtime_pack::install_guest_trust(&path, &mut env_map, &ca, &endpoint)?;
                     Ok::<_, String>(env_map)
                 })
                 .await??;
@@ -2301,15 +2351,7 @@ impl Executor {
         if let Some((ec2, lease, runtime_port, aws_port, destinations)) = vpc_launch {
             let (handle, mut listeners) = match self
                 .runtime
-                .start_task_isolated_with_loopback(
-                    &env_key,
-                    &spec,
-                    &if pack.is_some() {
-                        vec![runtime_port, aws_port, 443]
-                    } else {
-                        vec![runtime_port, aws_port]
-                    },
-                )
+                .start_task_isolated_with_loopback(&env_key, &spec, &[runtime_port, aws_port])
                 .await
             {
                 Ok(result) => result,
@@ -2324,11 +2366,6 @@ impl Executor {
             );
             let runtime_listener = listeners.remove(0);
             let aws_listener = listeners.remove(0);
-            let callback_listener = if pack.is_some() {
-                Some(listeners.remove(0))
-            } else {
-                None
-            };
             let mut private_listeners = Vec::with_capacity(destinations.len());
             for (address, port) in destinations {
                 match self
@@ -2418,14 +2455,23 @@ impl Executor {
                     lease.eni_id.clone(),
                 ));
             }
-            proxies.extend(crate::vpc_dns::serve(
+            let hostname = self
+                .aws_endpoint_url
+                .parse::<Uri>()
+                .ok()
+                .and_then(|uri| uri.host().map(str::to_owned))
+                .ok_or("invalid guest endpoint hostname")?;
+            proxies.extend(crate::vpc_dns::serve_local_endpoint(
                 dns_udp,
                 dns_tcp,
-                upstream,
-                ec2.clone(),
-                account.to_string(),
-                region.to_string(),
-                lease.eni_id.clone(),
+                Some(upstream),
+                hostname,
+                Some(crate::vpc_dns::VpcDnsScope {
+                    ec2: ec2.clone(),
+                    account: account.to_string(),
+                    region: region.to_string(),
+                    eni: lease.eni_id.clone(),
+                }),
             ));
             let policy = VpcProxyPolicy {
                 ec2,
@@ -2451,18 +2497,25 @@ impl Executor {
                     Some(format!("/e/{env_key}/")),
                 ));
             }
-            if let (Some(listener), Some(tls)) = (callback_listener, guest_tls) {
+            if let Some(tls) = guest_tls {
                 proxies.push(tls.spawn(
-                    listener,
-                    proxy_router(self.aws_endpoint_url.clone(), Some(policy.clone()), None),
+                    aws_listener,
+                    proxy_router(
+                        self.aws_endpoint_url.clone(),
+                        Some(policy.clone()),
+                        None,
+                        Some(self.registry.clone()),
+                    ),
+                    self.aws_endpoint_url.starts_with("http://"),
+                ));
+            } else {
+                proxies.push(proxy_listener(
+                    aws_listener,
+                    self.aws_endpoint_url.clone(),
+                    Some(policy),
+                    None,
                 ));
             }
-            proxies.push(proxy_listener(
-                aws_listener,
-                self.aws_endpoint_url.clone(),
-                Some(policy),
-                None,
-            ));
             if let Err(error) =
                 std::fs::write(rootfs.path.join("tmp/locallycloud-vpc-ready"), b"ready")
             {
@@ -2479,13 +2532,13 @@ impl Executor {
         } else if let Some(tls) = guest_tls {
             let runtime_port = loopback_port(&format!("http://{}", self.runtime_api_base))?;
             let aws_port = loopback_port(&self.aws_endpoint_url)?;
-            if runtime_port == aws_port || [runtime_port, aws_port].contains(&443) {
+            if runtime_port == aws_port {
                 self.cleanup_owned_rootfs(&env_key);
                 return Err("official runtime guest listener ports must be distinct".into());
             }
             let (_, mut listeners) = match self
                 .runtime
-                .start_task_isolated_with_loopback(&env_key, &spec, &[runtime_port, aws_port, 443])
+                .start_task_isolated_with_loopback(&env_key, &spec, &[runtime_port, aws_port])
                 .await
             {
                 Ok(value) => value,
@@ -2494,7 +2547,6 @@ impl Executor {
                     return Err(format!("official runtime guest start failed: {error}"));
                 }
             };
-            let callback_listener = listeners.pop().ok_or("guest callback listener missing")?;
             let aws_listener = listeners.pop().ok_or("guest AWS listener missing")?;
             let runtime_listener = listeners
                 .pop()
@@ -2507,13 +2559,36 @@ impl Executor {
                     tokio::spawn(async move {
                         let _ = axum::serve(runtime_listener, app).await;
                     }),
-                    proxy_listener(aws_listener, self.aws_endpoint_url.clone(), None, None),
                     tls.spawn(
-                        callback_listener,
-                        proxy_router(self.aws_endpoint_url.clone(), None, None),
+                        aws_listener,
+                        proxy_router(
+                            self.aws_endpoint_url.clone(),
+                            None,
+                            None,
+                            Some(self.registry.clone()),
+                        ),
+                        self.aws_endpoint_url.starts_with("http://"),
                     ),
                 ],
             );
+            let (dns_udp, dns_tcp) = match self.runtime.bind_isolated_dns(&env_key).await {
+                Ok(sockets) => sockets,
+                Err(error) => {
+                    self.cleanup_failed_start(&env_key, None).await;
+                    return Err(format!("guest DNS setup failed: {error}"));
+                }
+            };
+            let hostname = self
+                .aws_endpoint_url
+                .parse::<Uri>()
+                .ok()
+                .and_then(|uri| uri.host().map(str::to_owned))
+                .ok_or("invalid guest endpoint hostname")?;
+            let dns_tasks =
+                crate::vpc_dns::serve_local_endpoint(dns_udp, dns_tcp, None, hostname, None);
+            if let Some(mut proxies) = self.vpc_proxies.get_mut(&env_key) {
+                proxies.extend(dns_tasks);
+            }
             match self
                 .runtime
                 .bind_isolated_udp(&env_key, *VPC_XRAY_DAEMON.ip(), VPC_XRAY_DAEMON.port())
@@ -3197,6 +3272,139 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn vpc_endpoint_errors_follow_registered_service_protocol() {
+        let registry = ServiceRegistry::with_known_services();
+        for (service, code, content_type, fragment) in [
+            ("s3", "VpcEndpointUnavailable", "application/xml", "<Error>"),
+            (
+                "sts",
+                "VpcEndpointUnavailable",
+                "application/xml",
+                "<ErrorResponse>",
+            ),
+            (
+                "sqs",
+                "VpcEndpointUnavailableException",
+                "application/x-amz-json-1.0",
+                "__type",
+            ),
+            (
+                "lambda",
+                "VpcEndpointUnavailableException",
+                "application/json",
+                "message",
+            ),
+        ] {
+            let response = vpc_endpoint_error(Some(&registry), Some(&ServiceName::new(service)));
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(content_type),
+                "{service}"
+            );
+            if service == "lambda" {
+                assert_eq!(response.headers()["x-amzn-errortype"], code);
+            }
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            assert!(body.contains(fragment), "{service}: {body}");
+            if service != "lambda" {
+                assert!(body.contains(code), "{service}: {body}");
+            }
+            if matches!(service, "s3" | "sts") {
+                assert!(!body.starts_with('{'));
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_callback_preserves_socket_tls_and_rejects_forwarded_attestation() {
+        use locallycloud_core::handler::{NativeHandler, ServiceRequest};
+        use locallycloud_core::proxy::LegacyHealth;
+        use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName};
+        struct Transport;
+        #[async_trait]
+        impl NativeHandler for Transport {
+            async fn handle(&self, request: ServiceRequest) -> http::Response<Body> {
+                http::Response::new(Body::from(
+                    request
+                        .headers
+                        .get("x-locallycloud-verified-secure-transport")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ))
+            }
+        }
+        let registry = ServiceRegistry::with_known_services();
+        registry.register_native(
+            ServiceName::new("s3"),
+            ServiceMetadata::new(AwsProtocol::RestXml, None),
+            Arc::new(Transport),
+        );
+        let dispatcher = Arc::new(
+            locallycloud_core::integration::InternalDispatcher::new_shared(
+                &registry,
+                ProxyConfig {
+                    backend_url: "http://127.0.0.1:1".into(),
+                    upstream_timeout: Duration::from_secs(1),
+                },
+                LegacyHealth::new(false),
+                "us-east-1".into(),
+                "000000000000".into(),
+            ),
+        );
+        registry.set_internal_dispatcher(dispatcher);
+        let tls = Arc::new(
+            locallycloud_core::tls::GuestCallbackTls::new()
+                .await
+                .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tls.clone().spawn(
+            listener,
+            proxy_router(
+                "http://127.0.0.1:1".into(),
+                None,
+                None,
+                Some(Arc::downgrade(&registry)),
+            ),
+            true,
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(reqwest::Certificate::from_pem(tls.ca_pem().as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        for (scheme, host, expected, spoofed) in [
+            ("https", "localhost", "true", "false"),
+            ("http", "localhost", "false", "true"),
+            ("https", "127.0.0.1", "true", "false"),
+        ] {
+            let response = client
+                .get(format!("{scheme}://{host}:{port}/bucket/object"))
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20261116/us-east-1/s3/aws4_request",
+                )
+                .header("x-locallycloud-verified-secure-transport", spoofed)
+                .header("x-forwarded-proto", "https")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.text().await.unwrap(), expected);
+        }
+        server.abort();
+    }
 
     /// A test `ComputeRuntime` that launches a real in-process guest: it reads the injected
     /// `AWS_LAMBDA_RUNTIME_API`, polls `next` over HTTP, and posts a transformed response —

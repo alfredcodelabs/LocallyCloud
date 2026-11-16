@@ -93,13 +93,50 @@ impl StageResolver for ApiGatewayWafBinding {
 }
 
 impl ApiGwHandler {
-    fn authorize_account_role(
+    fn authorize_roles(
         &self,
         request: &ServiceRequest,
         segments: &[&str],
         body: &Value,
     ) -> Result<(), ApiGwError> {
-        if segments != ["account"] || request.method != Method::PATCH {
+        if !matches!(request.method, Method::POST | Method::PUT | Method::PATCH) {
+            return Ok(());
+        }
+        let mut roles = [
+            "credentials",
+            "credentialsArn",
+            "authorizerCredentials",
+            "authorizerCredentialsArn",
+        ]
+        .into_iter()
+        .filter_map(|key| body.get(key).and_then(Value::as_str))
+        .collect::<Vec<_>>();
+        for patch in body
+            .get("patchOperations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let field = patch.get("path").and_then(Value::as_str);
+            if patch.get("op").and_then(Value::as_str) == Some("remove") {
+                continue;
+            }
+            if matches!(
+                field,
+                Some(
+                    "/credentials"
+                        | "/credentialsArn"
+                        | "/authorizerCredentials"
+                        | "/authorizerCredentialsArn"
+                )
+            ) || (segments == ["account"] && field == Some("/cloudwatchRoleArn"))
+            {
+                if let Some(role) = patch.get("value").and_then(Value::as_str) {
+                    roles.push(role);
+                }
+            }
+        }
+        if roles.is_empty() {
             return Ok(());
         }
         let Some(evaluator) = self
@@ -124,7 +161,7 @@ impl ApiGwHandler {
                 .is_some_and(|value| value == "1")
         }) {
             return Err(ApiGwError::Forbidden(
-                "A verified identity is required to assign the logging role".into(),
+                "A verified identity is required to assign an API Gateway role".into(),
             ));
         }
         let caller = locallycloud_core::integration::RequestIdentity {
@@ -138,33 +175,59 @@ impl ApiGwHandler {
                 ),
             arn: None,
         };
-        for patch in body
-            .get("patchOperations")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if patch.get("path").and_then(Value::as_str) != Some("/cloudwatchRoleArn")
-                || patch.get("op").and_then(Value::as_str) == Some("remove")
+        roles.sort_unstable();
+        roles.dedup();
+        for role in roles.into_iter().filter(|role| !role.is_empty()) {
+            let prefix = format!("arn:aws:iam::{}:role/", request.account_id);
+            if !role
+                .strip_prefix(&prefix)
+                .is_some_and(|name| !name.is_empty())
             {
+                return Err(ApiGwError::Forbidden(
+                    "API Gateway roles must belong to the caller account".into(),
+                ));
+            }
+            if segments == ["account"] {
+                evaluator.authorize_service_role_assignment(locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest {
+delegated_caller: locallycloud_core::integration::identity::trusted_role(request),
+caller_context: locallycloud_core::integration::request_context::verified_request_context(request),
+                    caller: caller.clone(), role_arn: role.into(), service_principal: "apigateway.amazonaws.com".into(),
+                    source_arn: None, action: "logs:PutLogEvents".into(), resource: "*".into(),
+                }).map_err(|_| ApiGwError::Forbidden("Not authorized to assign the API Gateway logging role".into()))?;
                 continue;
             }
-            let Some(role) = patch.get("value").and_then(Value::as_str) else {
-                continue;
-            };
-            evaluator.authorize_service_role_assignment(locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest {
-                caller: caller.clone(), role_arn: role.into(), service_principal: "apigateway.amazonaws.com".into(),
-                source_arn: None, action: "logs:PutLogEvents".into(), resource: "*".into(),
-            }).map_err(|_| ApiGwError::Forbidden("Not authorized to assign the API Gateway logging role".into()))?;
+            evaluator
+                .authorize(
+                    locallycloud_core::integration::authorization::AuthorizationRequest {
+                        request_identity: caller.clone(),
+                        delegated_identity: locallycloud_core::integration::identity::trusted_role(
+                            request,
+                        ),
+                        source_service: "apigateway".into(),
+                        action: "iam:PassRole".into(),
+                        resource: role.into(),
+                        context: {
+                            let mut context = locallycloud_core::integration::request_context::verified_request_context(request);
+                            context.insert("iam:passedtoservice".into(), vec!["apigateway.amazonaws.com".into()]);
+                            context
+                        },
+                    },
+                )
+                .map_err(|_| {
+                    ApiGwError::Forbidden("Not authorized to assign the API Gateway role".into())
+                })?;
         }
         Ok(())
     }
 
     pub(crate) fn new(registry: Weak<ServiceRegistry>) -> Self {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("HTTP integration client initialization failed");
         ApiGwHandler {
             store: Arc::new(ApiGwStore::new()),
-            validator: JwtValidator::with_client(http.clone()),
+            validator: JwtValidator::new(),
             http,
             registry,
             waf: RwLock::new(None),
@@ -238,6 +301,9 @@ async fn route_v1(
         }
         (&Method::PUT, ["restapis", id, "resources", rid, "methods", m]) => {
             v1::put_method(ctx, id, rid, m, body).await
+        }
+        (&Method::PATCH, ["restapis", id, "resources", rid, "methods", m]) => {
+            v1::update_method(ctx, id, rid, m, body).await
         }
         (&Method::GET, ["restapis", id, "resources", rid, "methods", m]) => {
             v1::get_method(ctx, id, rid, m).await
@@ -891,10 +957,10 @@ impl NativeHandler for ApiGwHandler {
                 }
             }
         };
-        if let Err(error) = self.authorize_account_role(&request, &segs, &body) {
+        if let Err(error) = self.authorize_roles(&request, &segs, &body) {
             return error.into_response(&request.request_id);
         }
-        if request.method == Method::GET || segs.first() == Some(&"tags") {
+        {
             let resource = format!("arn:aws:apigateway:{}::{}", request.region, path);
             if locallycloud_core::integration::authorization::authorize_native_read(
                 &self.registry,
@@ -906,7 +972,7 @@ impl NativeHandler for ApiGwHandler {
             .is_err()
             {
                 return ApiGwError::Forbidden(
-                    "Not authorized to read API Gateway resources".into(),
+                    "Not authorized to access API Gateway resources".into(),
                 )
                 .into_response(&request.request_id);
             }
@@ -1214,12 +1280,18 @@ mod tests {
             request.headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20261112/us-east-1/apigateway/aws4_request, SignedHeaders=host, Signature=test".parse().unwrap());
             assert_eq!(handler.handle(request).await.status(), expected);
         }
-        assert_eq!(
-            call(&handler, Method::DELETE, &encoded, Value::Null)
-                .await
-                .0,
-            204
+        let mut deletion = req(Method::DELETE, &encoded, Value::Null);
+        deletion.headers.insert(
+            "x-locallycloud-verified-external-sigv4",
+            "1".parse().unwrap(),
         );
+        deletion.headers.insert(
+            http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=test/20261112/us-east-1/apigateway/aws4_request"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(handler.handle(deletion).await.status(), 204);
         assert!(!handler
             .store
             .v2("000000000000", "us-east-1", id)
@@ -4114,3 +4186,11 @@ mod aws_proxy_e2e {
         assert_eq!(resp.headers().get("x-route").unwrap(), "GET /thing2");
     }
 }
+
+#[cfg(test)]
+#[path = "service/http_redirect_tests.rs"]
+mod http_redirect_tests;
+
+#[cfg(test)]
+#[path = "service/http_body_tests.rs"]
+mod http_body_tests;

@@ -151,7 +151,8 @@ In `~/.aws/config`:
 ```ini
 [profile locallycloud]
 region = us-east-1
-endpoint_url = http://127.0.0.1:4566
+endpoint_url = https://aws.localhost:4566
+ca_bundle = /absolute/path/to/state.sqlite3.ca.pem
 ```
 
 In `~/.aws/credentials`:
@@ -209,7 +210,7 @@ See [AWS options for other SDKs](https://docs.aws.amazon.com/sdkref/latest/guide
 | `LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB` | Shared Lambda environment budget in MiB; see [memory accounting](LAMBDA.md#memory-budget) | `4096` |
 | `LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY` | Independent Lambda execution quota for each account/region; integer from 1 to 2147483647 | `1000` |
 | `LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE` | Classic EventBridge rules: multiply retry delays and maximum event age by this factor; finite number from 0.000001 to 1 | `1` (real time) |
-| `LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY` | Shape of returned SQS queue URLs: `path` (`http://127.0.0.1:4566/<account>/<queue>`, on the endpoint advertised to Lambda as `AWS_ENDPOINT_URL`, so SDKs that call the queue URL host stay local) or `aws` (`https://sqs.<region>.amazonaws.com/<account>/<queue>`). Both forms are accepted as input | `path` |
+| `LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY` | Shape of returned SQS queue URLs: `path` (`https://aws.localhost:4566/<account>/<queue>`, on the endpoint advertised to Lambda as `AWS_ENDPOINT_URL`, so SDKs that call the queue URL host stay local) or `aws` (`https://sqs.<region>.amazonaws.com/<account>/<queue>`). Both forms are accepted as input | `path` |
 | `LOCALLYCLOUD_SQS_ESM_MAX_POLLERS` | Local ceiling for SQS event source mapping workers; integer from 2 to 1000, independent of Lambda reserved concurrency | `10` |
 | `LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate controlled table write limits; reads and hot partitions are not modeled | Disabled |
 | `LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate provisioned shard write limits | Disabled |
@@ -221,7 +222,8 @@ See [AWS options for other SDKs](https://docs.aws.amazon.com/sdkref/latest/guide
 | `LOCALLYCLOUD_LEGACY_BACKEND_URL` | Optional external backend for services without a native handler | `http://localhost:4567` |
 | `LOCALLYCLOUD_MAX_REQUEST_BODY_BYTES` | Maximum request body size in bytes | `134217728` (128 MiB) |
 | `LOCALLYCLOUD_SHUTDOWN_GRACE_PERIOD_SECS` | Seconds to finish in-flight requests on shutdown | `5` |
-| `LOCALLYCLOUD_TLS_HOSTNAME`, `LOCALLYCLOUD_TLS_CERT_PATH`, `LOCALLYCLOUD_TLS_KEY_PATH` | Serve HTTPS for this DNS hostname on the same port, with a PEM certificate and PKCS#8 key. Set all three or none | Disabled |
+| `LOCALLYCLOUD_TLS_HOSTNAME`, `LOCALLYCLOUD_TLS_CERT_PATH`, `LOCALLYCLOUD_TLS_KEY_PATH` | Override automatic HTTPS with a DNS hostname, PEM certificate and PKCS#8 key. Set all three or none | Automatic local CA and `aws.localhost` certificate |
+| `LOCALLYCLOUD_ALLOW_HTTP` | Also accept plaintext HTTP. Explicit compatibility mode; IAM observes it as insecure transport | `false` |
 | `LOCALLYCLOUD_ROUTE53_DNS_BIND` | Address for the Route 53 DNS server, for example `127.0.0.1:5353`. An invalid or busy address stops startup | Disabled |
 | `LOCALLYCLOUD_RDS_DATA_DIR` | Absolute directory for local RDS databases | `${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/rds` |
 | `LOCALLYCLOUD_EC2_IMAGE_ROOTFS` | Root filesystem directory for the `ami-locallycloud-http` image; required to run EC2 instances | None |
@@ -253,6 +255,55 @@ and must not reuse the bootstrap access key ID. Both are optional in permissive
 mode.
 
 For scaled concurrency and retry experiments, see the [throttling guide](THROTTLING.md).
+
+### HTTPS for AWS clients
+
+HTTPS is enabled by default at `https://aws.localhost:4566`. The server creates a
+local CA automatically and stores its private key encrypted in the state database.
+The public CA is exported alongside the database as `<state-db>.ca.pem`; startup
+logs print its path. The CA survives restarts with the same database and master key.
+No system trust store or `/etc/hosts` file is modified.
+
+Configure the endpoint and trust file once for your local SDK or CLI profile:
+
+```sh
+export AWS_ENDPOINT_URL=https://aws.localhost:4566
+export AWS_CA_BUNDLE="${LOCALLYCLOUD_STATE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/state.sqlite3}.ca.pem"
+# Node.js uses its TLS trust setting:
+export NODE_EXTRA_CA_CERTS="$AWS_CA_BUNDLE"
+aws sts get-caller-identity
+```
+
+Other clients must load that CA through their TLS trust configuration. Browsers
+need the CA imported into their own trust store before opening the HTTPS dashboard.
+Keep the default public trust anchors when adding it; never disable certificate
+verification. A custom `LOCALLYCLOUD_STATE_DB` changes the exported CA path.
+
+The endpoint certificate covers `aws.localhost`, one subdomain label (for example
+`bucket.aws.localhost`) and `sync-aws.localhost`. These support normal SDK endpoint
+prefixes without service-specific endpoint overrides. Guests receive a private CA,
+the canonical endpoint and local DNS automatically. Their CA private key stays in
+the host process. VPC route, endpoint and security-group checks still apply.
+Guests reserve the canonical endpoint port; choose a different ECS application port.
+
+On the host, check `getent hosts aws.localhost bucket.aws.localhost sync-aws.localhost`
+if DNS fails. Some Linux resolvers already map `.localhost` to loopback; others need
+local resolver configuration. `/etc/hosts` supports exact names, not wildcards, so
+it is unsuitable for arbitrary S3 bucket names. Guest DNS is handled internally.
+
+Set `LOCALLYCLOUD_ALLOW_HTTP=true` only for HTTP compatibility. It adds HTTP on
+the same port; a policy denying `aws:SecureTransport=false` still rejects those
+requests. By default, HTTP connections are closed rather than redirected, preserving
+SigV4 and the real transport semantics. The advertised endpoint stays HTTPS unless
+an HTTP endpoint override is explicitly supplied in compatibility mode.
+
+To provide your own identity, set `LOCALLYCLOUD_TLS_HOSTNAME`,
+`LOCALLYCLOUD_TLS_CERT_PATH` and `LOCALLYCLOUD_TLS_KEY_PATH` together. Use a PEM
+certificate matching that hostname and a PKCS#8 PEM private key. SDKs that add host
+prefixes need matching certificate names and DNS resolution as well.
+
+When starting isolated tests, remove inherited `AWS_ENDPOINT_URL` and
+service-specific endpoint overrides so calls cannot reach another instance.
 
 ## Uninstallation
 

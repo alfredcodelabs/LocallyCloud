@@ -265,8 +265,8 @@ jobs:
             export LOCALLYCLOUD_KMS_MASTER_KEY="$(openssl rand -base64 32)"
             locallycloud > /tmp/locallycloud.log 2>&1 &
             pid=$!
-            for _ in $(seq 1 200); do curl -fs http://127.0.0.1:4566/_locallycloud/health && break; sleep 0.1; done
-            curl -fs http://127.0.0.1:4566/_locallycloud/status | grep -q "\"ready\":true" || { cat /tmp/locallycloud.log; exit 1; }
+            for _ in $(seq 1 200); do curl --noproxy aws.localhost --resolve aws.localhost:4566:127.0.0.1 --cacert "$HOME/.local/share/locallycloud/state.sqlite3.ca.pem" -fs https://aws.localhost:4566/_locallycloud/health && break; sleep 0.1; done
+            curl --noproxy aws.localhost --resolve aws.localhost:4566:127.0.0.1 --cacert "$HOME/.local/share/locallycloud/state.sqlite3.ca.pem" -fs https://aws.localhost:4566/_locallycloud/status | grep -q "\"ready\":true" || { cat /tmp/locallycloud.log; exit 1; }
             kill "$pid"'
       - name: Install and exercise the downloaded component as an unprivileged user
         env:

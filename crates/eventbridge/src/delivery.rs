@@ -77,20 +77,27 @@ pub(crate) fn authorize_role_execution(
                 "lambda:InvokeFunction" | "sqs:SendMessage" | "sns:Publish"
             );
     };
-    evaluator
-        .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
-            source_arn: source_arn.map(str::to_string),
-            caller: RequestIdentity {
-                account_id: account.into(),
-                access_key_id: None,
-                arn: None,
-            },
-            role_arn: role_arn.into(),
-            service_principal: format!("{source_service}.amazonaws.com"),
-            action: action.into(),
-            resource: resource.into(),
-        })
-        .is_ok()
+    let request = ServiceRoleAuthorizationRequest {
+        delegated_caller: None,
+        caller_context: Default::default(),
+        source_arn: source_arn.map(str::to_string),
+        caller: RequestIdentity {
+            account_id: account.into(),
+            access_key_id: None,
+            arn: None,
+        },
+        role_arn: role_arn.into(),
+        service_principal: format!("{source_service}.amazonaws.com"),
+        action: action.into(),
+        resource: resource.into(),
+    };
+    match action {
+        "lambda:InvokeFunction" | "sqs:SendMessage" => {
+            evaluator.authorize_service_role_trust(request)
+        }
+        _ => evaluator.authorize_service_role_execution(request),
+    }
+    .is_ok()
 }
 
 fn authorize_target(

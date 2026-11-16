@@ -438,6 +438,8 @@ async fn producer_context(
             .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
         {
             evaluator.authorize_service_role_trust(locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest {
+delegated_caller: None,
+caller_context: Default::default(),
                 caller: locallycloud_core::integration::RequestIdentity { account_id: account.into(), access_key_id: None, arn: None },
                 role_arn: role_arn.clone(), service_principal: "apigateway.amazonaws.com".into(),
                 source_arn: None, action: "logs:PutLogEvents".into(), resource: "*".into(),

@@ -28,6 +28,26 @@ use crate::schemas;
 use crate::store::{EbStore, PendingFanout};
 use crate::transform::{self, Context, InputMode};
 
+#[derive(Clone, Copy, Default)]
+pub(crate) enum ProducerScope {
+    #[default]
+    Untrusted,
+    S3,
+}
+
+pub(crate) fn event_entries(body: &Value) -> Result<&[Value], EventsError> {
+    let entries = body
+        .get("Entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| EventsError::Validation("Entries is required".into()))?;
+    if !(1..=10).contains(&entries.len()) {
+        return Err(EventsError::Validation(
+            "Entries must contain between 1 and 10 events".into(),
+        ));
+    }
+    Ok(entries)
+}
+
 #[derive(Clone)]
 pub struct RequestContext<'a> {
     pub account: &'a str,
@@ -82,6 +102,17 @@ impl EventsService {
         ctx: &RequestContext<'_>,
         body: &Value,
     ) -> Result<Value, EventsError> {
+        self.dispatch_with_producer(operation, ctx, body, ProducerScope::Untrusted)
+            .await
+    }
+
+    pub(crate) async fn dispatch_with_producer(
+        &self,
+        operation: &str,
+        ctx: &RequestContext<'_>,
+        body: &Value,
+        producer: ProducerScope,
+    ) -> Result<Value, EventsError> {
         let mutation = durable_bus_mutation(operation);
         let _write = if mutation {
             Some(self.control_plane_gate.write().await)
@@ -117,8 +148,8 @@ impl EventsService {
             "PutTargets" => self.put_targets(ctx, body).await,
             "RemoveTargets" => self.remove_targets(ctx, body).await,
             "ListTargetsByRule" => self.list_targets(ctx, body).await,
-            "PutEvents" => self.put_events(ctx, body, false).await,
-            "PutPartnerEvents" => self.put_events(ctx, body, true).await,
+            "PutEvents" => self.put_events(ctx, body, false, producer).await,
+            "PutPartnerEvents" => self.put_events(ctx, body, true, producer).await,
             "TestEventPattern" => test_event_pattern(body),
             "TagResource" => self.tag_resource(ctx, body).await,
             "UntagResource" => self.untag_resource(ctx, body).await,
@@ -473,25 +504,63 @@ impl EventsService {
         let bus = state.buses.get_mut(&name).ok_or_else(|| {
             EventsError::ResourceNotFound(format!("Event bus {name} does not exist"))
         })?;
-        if let Some(raw) = optional(body, "Policy") {
-            bus.policy = Some(
-                serde_json::from_str(&raw)
-                    .map_err(|_| EventsError::Validation("Policy must be valid JSON".into()))?,
-            );
-            return Ok(json!({}));
+        let policy = if let Some(raw) = optional(body, "Policy") {
+            if ["StatementId", "Action", "Principal", "Condition"]
+                .iter()
+                .any(|field| body.get(field).is_some())
+            {
+                return Err(EventsError::Validation(
+                    "Policy cannot be combined with StatementId, Action, Principal or Condition"
+                        .into(),
+                ));
+            }
+            serde_json::from_str::<Value>(&raw)
+                .map_err(|_| EventsError::Validation("Policy must be valid JSON".into()))?
+        } else {
+            if body.get("Condition").is_some() {
+                return Err(EventsError::Validation(
+                    "PutPermission.Condition is not supported; use a supported policy condition"
+                        .into(),
+                ));
+            }
+            let sid = required(body, "StatementId")?;
+            let action = required(body, "Action")?;
+            let principal = required(body, "Principal")?;
+            let mut policy = bus
+                .policy
+                .clone()
+                .unwrap_or_else(|| json!({"Version":"2012-10-17","Statement":[]}));
+            let statements = policy
+                .get_mut("Statement")
+                .ok_or_else(|| EventsError::Validation("stored policy is invalid".into()))?;
+            if statements.is_object() {
+                *statements = Value::Array(vec![statements.clone()]);
+            }
+            let statements = statements
+                .as_array_mut()
+                .ok_or_else(|| EventsError::Validation("stored policy is invalid".into()))?;
+            statements
+                .retain(|statement| statement.get("Sid").and_then(Value::as_str) != Some(sid));
+            statements.push(json!({"Sid":sid,"Effect":"Allow","Principal":{"AWS":principal},"Action":action,"Resource":bus.arn}));
+            policy
+        };
+        let document = policy.to_string();
+        if document.len() > 10 * 1024 {
+            return Err(EventsError::LimitExceeded(
+                "Event bus policy exceeds 10 KB".into(),
+            ));
         }
-        let sid = required(body, "StatementId")?;
-        let action = required(body, "Action")?;
-        let principal = required(body, "Principal")?;
-        let policy = bus
-            .policy
-            .get_or_insert_with(|| json!({"Version":"2012-10-17","Statement":[]}));
-        let statements = policy
-            .get_mut("Statement")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| EventsError::Validation("stored policy is invalid".into()))?;
-        statements.retain(|statement| statement.get("Sid").and_then(Value::as_str) != Some(sid));
-        statements.push(json!({"Sid":sid,"Effect":"Allow","Principal":{"AWS":principal},"Action":action,"Resource":bus.arn}));
+        let evaluator = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+            .ok_or_else(|| {
+                EventsError::Validation("Resource policy validation is unavailable".into())
+            })?;
+        evaluator
+            .validate_resource_policy(&document)
+            .map_err(|error| EventsError::Validation(error.to_string()))?;
+        bus.policy = Some(policy);
         Ok(json!({}))
     }
 
@@ -1099,14 +1168,21 @@ impl EventsService {
         ctx: &RequestContext<'_>,
         body: &Value,
         partner: bool,
+        producer: ProducerScope,
     ) -> Result<Value, EventsError> {
-        let entries = body
-            .get("Entries")
-            .and_then(Value::as_array)
-            .ok_or_else(|| EventsError::Validation("Entries is required".into()))?;
+        let entries = event_entries(body)?;
         let mut output = Vec::with_capacity(entries.len());
         let mut failed = 0usize;
         for entry in entries {
+            let source = entry.get("Source").and_then(Value::as_str).unwrap_or("");
+            if source.starts_with("aws.")
+                && !(matches!(producer, ProducerScope::S3) && source == "aws.s3")
+                && !(partner && source.starts_with("aws.partner/"))
+            {
+                failed += 1;
+                output.push(json!({"ErrorCode":"NotAuthorizedForSourceException","ErrorMessage":"The aws. source prefix is reserved for AWS service producers"}));
+                continue;
+            }
             match self.process_entry(ctx, entry, partner).await {
                 Ok(id) => output.push(json!({"EventId":id})),
                 Err(error) => {
@@ -3014,7 +3090,10 @@ pub(crate) async fn invoke_api_destination(
         return ApiDelivery::TerminalFailure;
     }
     request.body = payload.to_string();
-    match http.send(request).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), http.send(request))
+        .await
+        .unwrap_or(Err(HttpError))
+    {
         Ok(response) if (200..300).contains(&response.status) => {
             let value = if response.body.is_empty() {
                 Value::Null
@@ -3025,7 +3104,7 @@ pub(crate) async fn invoke_api_destination(
             };
             ApiDelivery::Success(value)
         }
-        Ok(response) if response.status == 429 || response.status >= 500 => {
+        Ok(response) if matches!(response.status, 401 | 407 | 409 | 429 | 500..=599) => {
             ApiDelivery::RetriableFailure
         }
         Ok(_) => ApiDelivery::TerminalFailure,
@@ -3193,6 +3272,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_destination_deadline_cancels_pending_request_after_five_seconds() {
+        use crate::http_client::HttpResponse;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct Pending {
+            dropped: Arc<AtomicBool>,
+        }
+        struct Cancellation(Arc<AtomicBool>);
+        impl Drop for Cancellation {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl HttpClient for Pending {
+            async fn send(&self, _: HttpRequest) -> Result<HttpResponse, HttpError> {
+                let _cancellation = Cancellation(self.dropped.clone());
+                std::future::pending().await
+            }
+        }
+        let http = Pending {
+            dropped: Arc::new(AtomicBool::new(false)),
+        };
+        let destination = ApiDestination {
+            name: "deadline".into(),
+            arn: "arn:aws:events:us-east-1:000000000000:api-destination/deadline".into(),
+            connection_arn: "arn:aws:events:us-east-1:000000000000:connection/deadline".into(),
+            endpoint: "https://example.invalid/invoke".into(),
+            method: "POST".into(),
+            rate_limit: None,
+            tags: BTreeMap::new(),
+        };
+        let connection = Connection {
+            name: "deadline".into(),
+            arn: destination.connection_arn.clone(),
+            auth_type: "API_KEY".into(),
+            auth_parameters: json!({"ApiKeyAuthParameters":{"ApiKeyName":"x-api-key","ApiKeyValue":"fictional-key"}}),
+            tags: BTreeMap::new(),
+        };
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                invoke_api_destination(&http, &destination, &connection, "{}"),
+            )
+            .await
+            .expect("the destination deadline must cancel a pending request"),
+            ApiDelivery::RetriableFailure
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(http.dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn injectable_http_client_records_api_key_basic_and_oauth() {
         use std::collections::VecDeque;
 
@@ -3287,6 +3421,49 @@ mod tests {
             invoke_api_destination(&http, &destination, &basic, "{}").await,
             ApiDelivery::Success(_)
         ));
+
+        for status in [401, 407, 409, 429, 500, 503, 599] {
+            http.responses.lock().unwrap().push_back(HttpResponse {
+                status,
+                body: Vec::new(),
+            });
+            assert_eq!(
+                invoke_api_destination(&http, &destination, &api_key, "{}").await,
+                ApiDelivery::RetriableFailure,
+                "HTTP {status}"
+            );
+        }
+        for status in [100, 300, 400, 403, 404, 408, 410, 422, 499] {
+            http.responses.lock().unwrap().push_back(HttpResponse {
+                status,
+                body: Vec::new(),
+            });
+            assert_eq!(
+                invoke_api_destination(&http, &destination, &api_key, "{}").await,
+                ApiDelivery::TerminalFailure,
+                "HTTP {status}"
+            );
+        }
+        for status in [301, 302, 303, 307, 308] {
+            http.responses.lock().unwrap().push_back(HttpResponse {
+                status,
+                body: Vec::new(),
+            });
+            assert_eq!(
+                invoke_api_destination(&http, &destination, &api_key, "{}").await,
+                ApiDelivery::TerminalFailure
+            );
+            let count = http.requests.lock().unwrap().len();
+            http.responses.lock().unwrap().push_back(HttpResponse {
+                status,
+                body: br#"{"access_token":"must-not-be-used"}"#.to_vec(),
+            });
+            assert_eq!(
+                invoke_api_destination(&http, &destination, &oauth, "{}").await,
+                ApiDelivery::RetriableFailure
+            );
+            assert_eq!(http.requests.lock().unwrap().len(), count + 1);
+        }
 
         let requests = http.requests.lock().unwrap();
         assert!(requests[0].body.contains("client_secret=secret"));

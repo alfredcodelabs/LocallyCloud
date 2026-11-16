@@ -82,6 +82,8 @@ impl DynamoDbBatchSource {
             .authorization_evaluator(&ServiceName::new("iam"))
             .ok_or("IAM unavailable")?
             .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 source_arn: None,
                 caller: RequestIdentity {
                     account_id: self.account.clone(),

@@ -285,39 +285,81 @@ pub fn is_supported_runtime(runtime: &str) -> bool {
 /// short name. A full ARN whose region differs from the request region is rejected. Any
 /// qualifier suffix is ignored (control-plane operations target the function).
 pub fn resolve_function_name(reference: &str, region: &str) -> Result<String, LambdaError> {
-    let parts: Vec<&str> = reference.split(':').collect();
-    if let Some(pos) = parts.iter().position(|&p| p == "function") {
-        if reference.starts_with("arn:") {
-            // arn : aws : lambda : <region> : <account> : function : <name> [: qualifier]
-            if parts.len() < 7 {
+    let parts: Vec<_> = reference.split(':').collect();
+    let invalid = || LambdaError::InvalidParameterValue("Invalid Lambda function reference".into());
+    let name = match parts.as_slice() {
+        ["arn", "aws", "lambda", target_region, account, "function", name, rest @ ..]
+            if rest.len() <= 1 && valid_account(account) =>
+        {
+            if *target_region != region {
                 return Err(LambdaError::InvalidParameterValue(format!(
-                    "invalid function ARN: {reference}"
+                    "function ARN region {target_region} does not match request region {region}"
                 )));
             }
-            if parts[3] != region {
-                return Err(LambdaError::InvalidParameterValue(format!(
-                    "function ARN region {} does not match request region {region}",
-                    parts[3]
-                )));
-            }
+            *name
         }
-        return parts
-            .get(pos + 1)
-            .copied()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                LambdaError::InvalidParameterValue(format!("missing function name in {reference}"))
-            });
+        [account, "function", name, rest @ ..] if rest.len() <= 1 && valid_account(account) => {
+            *name
+        }
+        [name] | [name, _] => *name,
+        _ => return Err(invalid()),
+    };
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+    {
+        return Err(invalid());
     }
-    // Bare name, with an optional `:qualifier` suffix.
-    let name = parts[0];
-    if name.is_empty() {
-        return Err(LambdaError::InvalidParameterValue(
-            "function name is empty".into(),
+    let qualifier = function_qualifier(reference);
+    if qualifier.is_some_and(|value| {
+        value != "$LATEST"
+            && (value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)))
+    }) {
+        return Err(invalid());
+    }
+    Ok(name.into())
+}
+
+pub(crate) fn function_qualifier(reference: &str) -> Option<&str> {
+    let index = if reference.starts_with("arn:") {
+        7
+    } else if reference.contains(":function:") {
+        3
+    } else {
+        1
+    };
+    reference.split(':').nth(index)
+}
+
+fn valid_account(account: &str) -> bool {
+    account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Cross-account Lambda dispatch must not reinterpret an ARN as a local short name.
+pub(crate) fn validate_function_scope(
+    reference: &str,
+    region: &str,
+    account: &str,
+) -> Result<(), LambdaError> {
+    resolve_function_name(reference, region)?;
+    let parts: Vec<_> = reference.split(':').collect();
+    let target = match parts.as_slice() {
+        ["arn", _, _, _, owner, ..] => Some(*owner),
+        [owner, "function", _, ..] => Some(*owner),
+        _ => None,
+    };
+    if target.is_some_and(|owner| owner != account) {
+        return Err(LambdaError::NotImplemented(
+            "Cross-account Lambda references are not supported".into(),
         ));
     }
-    Ok(name.to_string())
+    Ok(())
 }
 
 /// Decode an inline base64 zip package and compute its `CodeSha256` (base64-encoded
@@ -743,8 +785,16 @@ impl FunctionStore {
         self.records
             .get_mut(&Self::key(account_id, region, name))
             .and_then(|mut r| {
+                let removed = r.aliases.remove(alias)?;
                 r.event_invoke_configs.remove(alias);
-                r.aliases.remove(alias)
+                let resource = format!("{}:{alias}", r.latest.function_arn);
+                r.policy.retain(|_, statement| {
+                    statement
+                        .get("Resource")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(resource.as_str())
+                });
+                Some(removed)
             })
     }
 
@@ -761,24 +811,94 @@ impl FunctionStore {
             .map(|r| r.latest.function_arn.clone())
     }
 
-    /// Add a resource-policy statement. Duplicate statement ids are rejected.
+    /// Add one statement; statement IDs and the 20 KB limit are local to its ARN policy.
     pub fn add_permission(
         &self,
         account_id: &str,
         region: &str,
         name: &str,
         statement_id: &str,
-        statement: serde_json::Value,
+        mut statement: serde_json::Value,
     ) -> Result<bool, LambdaError> {
+        let object = statement.as_object_mut().ok_or_else(|| {
+            LambdaError::InvalidParameterValue("A permission must be an object".into())
+        })?;
+        match object.entry("Sid") {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::Value::String(statement_id.into()));
+            }
+            serde_json::map::Entry::Occupied(entry)
+                if entry.get().as_str() == Some(statement_id) => {}
+            _ => {
+                return Err(LambdaError::InvalidParameterValue(
+                    "Permission statement ID does not match".into(),
+                ))
+            }
+        }
         let Some(mut record) = self.records.get_mut(&Self::key(account_id, region, name)) else {
             return Ok(false);
         };
-        if record.policy.contains_key(statement_id) {
+        let resource = statement
+            .get("Resource")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                LambdaError::InvalidParameterValue("A permission must target a function ARN".into())
+            })?;
+        let base = &record.latest.function_arn;
+        if resource != base
+            && !resource
+                .strip_prefix(base)
+                .is_some_and(|suffix| suffix.starts_with(':') && suffix.len() > 1)
+        {
+            return Err(LambdaError::InvalidParameterValue(
+                "Permission resource does not match the function".into(),
+            ));
+        }
+        if record.policy.iter().any(|(key, statement)| {
+            statement
+                .get("Resource")
+                .and_then(serde_json::Value::as_str)
+                == Some(resource)
+                && statement
+                    .get("Sid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(key)
+                    == statement_id
+        }) {
             return Err(LambdaError::ResourceConflict(format!(
                 "The statement id ({statement_id}) provided already exists"
             )));
         }
-        record.policy.insert(statement_id.to_string(), statement);
+        let statements: Vec<_> = record
+            .policy
+            .values()
+            .filter(|statement| {
+                statement
+                    .get("Resource")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(resource)
+            })
+            .chain(std::iter::once(&statement))
+            .collect();
+        let document =
+            serde_json::json!({"Version":"2012-10-17", "Id":"default", "Statement":statements});
+        if document.to_string().len() > 20 * 1024 {
+            return Err(LambdaError::PolicyLengthExceeded(
+                "The function resource policy exceeds the 20 KB limit".into(),
+            ));
+        }
+        let mut key = if resource == base {
+            statement_id.to_owned()
+        } else {
+            serde_json::to_string(&(resource, statement_id)).map_err(|_| {
+                LambdaError::InternalError("Could not encode permission identity".into())
+            })?
+        };
+        // Legacy keys were unqualified SIDs; retain even nonconforming old keys without overwriting them.
+        while record.policy.contains_key(&key) {
+            key.push('\0');
+        }
+        record.policy.insert(key, statement);
         Ok(true)
     }
 
@@ -788,9 +908,32 @@ impl FunctionStore {
         region: &str,
         name: &str,
     ) -> Option<Vec<serde_json::Value>> {
+        let resource = function_arn(region, account_id, name);
+        self.permissions_for_resource(account_id, region, name, &resource)
+    }
+
+    pub fn permissions_for_resource(
+        &self,
+        account_id: &str,
+        region: &str,
+        name: &str,
+        resource: &str,
+    ) -> Option<Vec<serde_json::Value>> {
         self.records
             .get(&Self::key(account_id, region, name))
-            .map(|record| record.policy.values().cloned().collect())
+            .map(|record| {
+                record
+                    .policy
+                    .values()
+                    .filter(|statement| {
+                        statement
+                            .get("Resource")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(resource)
+                    })
+                    .cloned()
+                    .collect()
+            })
     }
 
     pub fn remove_permission(
@@ -800,9 +943,38 @@ impl FunctionStore {
         name: &str,
         statement_id: &str,
     ) -> Option<bool> {
+        let resource = function_arn(region, account_id, name);
+        self.remove_permission_for_resource(account_id, region, name, &resource, statement_id)
+    }
+
+    pub fn remove_permission_for_resource(
+        &self,
+        account_id: &str,
+        region: &str,
+        name: &str,
+        resource: &str,
+        statement_id: &str,
+    ) -> Option<bool> {
         self.records
             .get_mut(&Self::key(account_id, region, name))
-            .map(|mut record| record.policy.remove(statement_id).is_some())
+            .map(|mut record| {
+                let key = record
+                    .policy
+                    .iter()
+                    .find(|(key, statement)| {
+                        statement
+                            .get("Resource")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(resource)
+                            && statement
+                                .get("Sid")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(key)
+                                == statement_id
+                    })
+                    .map(|(key, _)| key.clone());
+                key.is_some_and(|key| record.policy.remove(&key).is_some())
+            })
     }
 
     /// Merge tags into the function. Returns `false` if the function does not exist.
@@ -1381,6 +1553,51 @@ mod tests {
     #[test]
     fn compute_zip_code_rejects_invalid_base64() {
         assert!(compute_zip_code("not base64!!!").is_err());
+    }
+
+    #[test]
+    fn qualified_permission_namespace_does_not_overwrite_legacy_keys() {
+        let store = FunctionStore::new();
+        let account = "000000000000";
+        let region = "us-east-1";
+        crate::control_plane::create_function(&store, region, account, &serde_json::json!({
+            "FunctionName":"policies","Runtime":"nodejs22.x","Role":"arn:aws:iam::000000000000:role/r",
+            "Handler":"index.handler","Code":{"ZipFile":valid_zip().0}
+        }), None).unwrap();
+        let base = function_arn(region, account, "policies");
+        let alias = format!("{base}:prod");
+        let legacy_key = serde_json::to_string(&(&alias, "same")).unwrap();
+        store.records.get_mut(&FunctionStore::key(account, region, "policies")).unwrap().policy.insert(legacy_key.clone(), serde_json::json!({
+            "Sid":legacy_key,"Resource":base,"Effect":"Allow","Principal":"*","Action":"lambda:InvokeFunction"
+        }));
+        store.add_permission(account, region, "policies", "same", serde_json::json!({
+            "Sid":"same","Resource":alias,"Effect":"Allow","Principal":"*","Action":"lambda:InvokeFunction"
+        })).unwrap();
+        assert_eq!(
+            store
+                .permissions(account, region, "policies")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .permissions_for_resource(account, region, "policies", &alias)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.remove_permission(account, region, "policies", &legacy_key),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .permissions_for_resource(account, region, "policies", &alias)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

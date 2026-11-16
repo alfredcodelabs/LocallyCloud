@@ -216,10 +216,15 @@ impl KmsStore {
         alias_name: &str,
         target_key_id: String,
         last_updated_date: f64,
+        expected_target: Option<&str>,
     ) -> Result<bool, KmsError> {
         let Some(mut record) = self.aliases.get_mut(&AliasKey::new(scope, alias_name)) else {
             return Ok(false);
         };
+        if expected_target.is_some_and(|target| record.target_key_id != target) {
+            // A concurrent retarget invalidated the authorization snapshot; retry the request.
+            return Err(KmsError::Internal);
+        }
         let mut staged = record.clone();
         staged.target_key_id = target_key_id;
         staged.last_updated_date = last_updated_date;

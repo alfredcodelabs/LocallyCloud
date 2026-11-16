@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::identity::{trusted_role, CallerIdentity};
 use locallycloud_core::integration::{InternalDispatcher, RequestIdentity};
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 
@@ -111,15 +112,33 @@ impl SqsHandler {
         };
         let strict = dispatcher.is_some_and(|d| d.strict_sigv4_required());
         let (resource, arn) = self.queue_resource(op, body, request)?;
-        let policy = if let Some(arn) = &arn {
-            if let Some(queue) = self.store.get(arn) {
-                queue.state.lock().await.attributes.get("Policy").cloned()
+        let (policy, encrypted) =
+            if let Some(queue) = arn.as_ref().and_then(|arn| self.store.get(arn)) {
+                let state = queue.state.lock().await;
+                (
+                    state.attributes.get("Policy").cloned(),
+                    state
+                        .attributes
+                        .get("KmsMasterKeyId")
+                        .is_some_and(|key| !key.is_empty())
+                        || state
+                            .attributes
+                            .get("SqsManagedSseEnabled")
+                            .is_some_and(|value| value == "true"),
+                )
             } else {
-                None
-            }
-        } else {
-            None
-        };
+                (None, false)
+            };
+        let requests_encryption = body.get("Attributes").is_some_and(|attributes| {
+            attributes
+                .get("KmsMasterKeyId")
+                .and_then(Value::as_str)
+                .is_some_and(|key| !key.is_empty())
+                || attributes
+                    .get("SqsManagedSseEnabled")
+                    .and_then(Value::as_str)
+                    == Some("true")
+        });
         let external = request
             .headers
             .get("x-locallycloud-verified-external-sigv4")
@@ -128,6 +147,17 @@ impl SqsHandler {
             .headers
             .get("x-locallycloud-verified-internal-scope")
             .is_some_and(|value| value == "1");
+        if strict
+            && !internal
+            && (encrypted || requests_encryption)
+            && (!external
+                || request
+                    .headers
+                    .get("x-locallycloud-verified-secure-transport")
+                    .is_none_or(|value| value != "true"))
+        {
+            return Err(SqsError::InvalidSecurity);
+        }
         if !strict && policy.is_none() {
             return Ok(());
         }
@@ -178,16 +208,18 @@ impl SqsHandler {
                 access_key_id: Some(access_key_id),
                 arn: None,
             };
-            dispatcher
-                .authorize(AuthorizationRequest {
-                    request_identity: identity.clone(),
-                    delegated_identity: None,
-                    source_service: "sqs".into(),
-                    action: action.into(),
-                    resource: resource.clone(),
-                    context: BTreeMap::new(),
-                })
-                .map_err(|_| SqsError::AccessDenied)?;
+            if !strict {
+                dispatcher
+                    .authorize(AuthorizationRequest {
+                        request_identity: identity.clone(),
+                        delegated_identity: None,
+                        source_service: "sqs".into(),
+                        action: action.into(),
+                        resource: resource.clone(),
+                        context: BTreeMap::new(),
+                    })
+                    .map_err(|_| SqsError::AccessDenied)?;
+            }
             dispatcher
                 .resolve_caller_arn(&identity)
                 .map_err(|_| SqsError::AccessDenied)?
@@ -204,6 +236,132 @@ impl SqsHandler {
             // an anonymous wildcard principal, never a client-supplied internal header.
             "anonymous".to_string()
         };
+        // Core removes these headers at external ingress and creates the internal
+        // attestation only for trusted in-process scoped dispatch.
+        let source = if internal
+            && !external
+            && matches!(
+                principal.as_str(),
+                "sns.amazonaws.com" | "events.amazonaws.com" | "s3.amazonaws.com"
+            ) {
+            let arn = request
+                .headers
+                .get("x-locallycloud-source-arn")
+                .and_then(|value| value.to_str().ok());
+            let account = request
+                .headers
+                .get("x-locallycloud-source-account")
+                .and_then(|value| value.to_str().ok());
+            let valid = arn.zip(account).is_some_and(|(arn, source_account)| {
+                let components = arn.splitn(6, ':').collect::<Vec<_>>();
+                components.len() == 6
+                    && components[0] == "arn"
+                    && match principal.as_str() {
+                        "s3.amazonaws.com" => {
+                            components[2] == "s3"
+                                && components[3].is_empty()
+                                && components[4].is_empty()
+                                && !components[5].contains('/')
+                        }
+                        "sns.amazonaws.com" => {
+                            components[2] == "sns"
+                                && components[3] == request.region
+                                && components[4] == source_account
+                        }
+                        "events.amazonaws.com" => {
+                            components[2] == "events"
+                                && components[3] == request.region
+                                && components[4] == source_account
+                                && components[5]
+                                    .strip_prefix("rule/")
+                                    .is_some_and(|name| !name.is_empty())
+                        }
+                        _ => false,
+                    }
+                    && source_account == request.account_id
+                    && !components[5].is_empty()
+            });
+            if valid {
+                policy::SourceContext {
+                    arn,
+                    account,
+                    ..Default::default()
+                }
+            } else {
+                policy::SourceContext::default()
+            }
+        } else {
+            policy::SourceContext::default()
+        };
+        let source = policy::SourceContext {
+            secure_transport: request
+                .headers
+                .get("x-locallycloud-verified-secure-transport")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| match value {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }),
+            ..source
+        };
+        if strict {
+            let evaluator = self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+                .ok_or(SqsError::AccessDenied)?;
+            let mut context =
+                locallycloud_core::integration::request_context::verified_request_context(request);
+            for (key, value) in [
+                ("aws:sourcearn", source.arn),
+                ("aws:sourceaccount", source.account),
+                (
+                    "aws:securetransport",
+                    source
+                        .secure_transport
+                        .map(|secure| if secure { "true" } else { "false" }),
+                ),
+            ] {
+                if let Some(value) = value {
+                    context.insert(key.into(), vec![value.into()]);
+                }
+            }
+            let delegated_identity = if internal && !external && !authenticated_operator {
+                trusted_role(request).or_else(|| {
+                    principal.ends_with(".amazonaws.com").then(|| {
+                        CallerIdentity::ServicePrincipal {
+                            service: principal.clone(),
+                        }
+                    })
+                })
+            } else {
+                None
+            };
+            return evaluator
+                .authorize_resource_policy(
+                    AuthorizationRequest {
+                        request_identity: RequestIdentity {
+                            account_id: request.account_id.clone(),
+                            access_key_id: request
+                                .headers
+                                .get(http::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(RequestIdentity::access_key_from_authorization),
+                            arn: None,
+                        },
+                        delegated_identity,
+                        source_service: "sqs".into(),
+                        action: action.into(),
+                        resource,
+                        context,
+                    },
+                    policy.as_deref(),
+                    arn.as_ref()
+                        .map_or(request.account_id.as_str(), |queue| queue.account.as_str()),
+                )
+                .map_err(|_| SqsError::AccessDenied);
+        }
         let same_account_iam = arn.as_ref().is_some_and(|queue| {
             if external || internal {
                 principal.starts_with(&format!("arn:aws:iam::{}:", queue.account))
@@ -223,67 +381,6 @@ impl SqsHandler {
             }
         });
         if let Some(raw) = policy {
-            // Core removes these headers at external ingress and creates the internal
-            // attestation only for trusted in-process scoped dispatch.
-            let source = if internal
-                && !external
-                && matches!(
-                    principal.as_str(),
-                    "sns.amazonaws.com" | "events.amazonaws.com"
-                ) {
-                let arn = request
-                    .headers
-                    .get("x-locallycloud-source-arn")
-                    .and_then(|value| value.to_str().ok());
-                let account = request
-                    .headers
-                    .get("x-locallycloud-source-account")
-                    .and_then(|value| value.to_str().ok());
-                let valid = arn.zip(account).is_some_and(|(arn, source_account)| {
-                    let components = arn.splitn(6, ':').collect::<Vec<_>>();
-                    components.len() == 6
-                        && components[0] == "arn"
-                        && match principal.as_str() {
-                            "sns.amazonaws.com" => {
-                                components[2] == "sns" && !components[5].is_empty()
-                            }
-                            "events.amazonaws.com" => {
-                                components[2] == "events"
-                                    && components[5]
-                                        .strip_prefix("rule/")
-                                        .is_some_and(|name| !name.is_empty())
-                            }
-                            _ => false,
-                        }
-                        && components[3] == request.region
-                        && components[4] == source_account
-                        && source_account == request.account_id
-                        && !components[5].is_empty()
-                });
-                if valid {
-                    policy::SourceContext {
-                        arn,
-                        account,
-                        ..Default::default()
-                    }
-                } else {
-                    policy::SourceContext::default()
-                }
-            } else {
-                policy::SourceContext::default()
-            };
-            let source = policy::SourceContext {
-                secure_transport: request
-                    .headers
-                    .get("x-locallycloud-verified-secure-transport")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| match value {
-                        "true" => Some(true),
-                        "false" => Some(false),
-                        _ => None,
-                    }),
-                ..source
-            };
             match policy::evaluate(
                 &raw,
                 &principal,
@@ -376,11 +473,7 @@ impl NativeHandler for SqsHandler {
                 .registry
                 .upgrade()
                 .and_then(|r| r.internal_dispatcher()),
-            authorization: request
-                .headers
-                .get(http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
+            request: &request,
             metrics: self.metrics.recorder(),
             queue_urls: &self.queue_urls,
             trace_header: ops::request_trace_header(request.headers.get("x-amzn-trace-id")),
@@ -847,6 +940,427 @@ mod tests {
         drop(handler);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct StrictQueueFixture {
+        _registry: Arc<ServiceRegistry>,
+        handler: SqsHandler,
+        iam: Arc<locallycloud_iam_sts::store::IamStore>,
+        credentials: locallycloud_iam_sts::sts::Credentials,
+        sessions: Arc<locallycloud_iam_sts::sts::SessionStore>,
+        queue: QueueArn,
+        url: Value,
+    }
+
+    impl StrictQueueFixture {
+        async fn new() -> Self {
+            use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
+            use locallycloud_iam_sts::{
+                enforcement::EnforcementMode, model::IamRole, sts::SessionStore,
+            };
+            let registry = ServiceRegistry::with_known_services();
+            let handler = SqsHandler::with_registry(&registry);
+            let (status, created) =
+                call(&handler, "CreateQueue", json!({"QueueName":"strict-queue"})).await;
+            assert_eq!(status, 200);
+            let iam = Arc::new(locallycloud_iam_sts::store::IamStore::new());
+            let sessions = Arc::new(SessionStore::new());
+            iam.create_role("000000000000", IamRole {
+                role_name: "producer".into(), role_id: "AROAPRODUCER".into(),
+                arn: "arn:aws:iam::000000000000:role/producer".into(), path: "/".into(),
+                create_date: "2026-01-01T00:00:00Z".into(),
+                assume_role_policy_document: json!({"Statement":{"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},"Action":"sts:AssumeRole"}}).to_string(),
+                description: None, max_session_duration: 3600, tags: BTreeMap::new(),
+                attached_policies: Vec::new(), inline_policies: BTreeMap::new(), permission_boundary: None,
+            });
+            let credentials = locallycloud_iam_sts::sts::issue_service_role_credentials(
+                &iam,
+                &sessions,
+                "000000000000",
+                "arn:aws:iam::000000000000:role/producer",
+            )
+            .unwrap();
+            locallycloud_iam_sts::register_with_store_and_mode(
+                &registry,
+                iam.clone(),
+                sessions.clone(),
+                EnforcementMode::Strict,
+            );
+            registry.set_internal_dispatcher(Arc::new(InternalDispatcher::new_shared(
+                &registry,
+                ProxyConfig {
+                    backend_url: "http://127.0.0.1:1".into(),
+                    upstream_timeout: Duration::from_secs(1),
+                },
+                LegacyHealth::new(false),
+                "us-east-1".into(),
+                "000000000000".into(),
+            )));
+            Self {
+                _registry: registry,
+                handler,
+                iam,
+                credentials,
+                sessions,
+                queue: QueueArn::new("us-east-1", "000000000000", "strict-queue"),
+                url: created["QueueUrl"].clone(),
+            }
+        }
+
+        async fn policy(&self, policy: Value) {
+            self.handler
+                .store
+                .get(&self.queue)
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .attributes
+                .insert("Policy".into(), policy.to_string());
+        }
+
+        fn send(&self) -> ServiceRequest {
+            request(
+                "SendMessage",
+                json!({"QueueUrl": self.url, "MessageBody":"message"}),
+            )
+        }
+
+        fn role_send(&self) -> ServiceRequest {
+            let mut request = self.send();
+            request.headers.insert(
+                "x-locallycloud-verified-external-sigv4",
+                "1".parse().unwrap(),
+            );
+            request.headers.insert(http::header::AUTHORIZATION, format!("AWS4-HMAC-SHA256 Credential={}/20261116/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=test", self.credentials.access_key_id).parse().unwrap());
+            request
+        }
+
+        async fn message_count(&self) -> usize {
+            self.handler
+                .store
+                .get(&self.queue)
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .messages
+                .len()
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_queue_urls_stay_canonical_across_host_and_transport_changes() {
+        let canonical = "https://aws.localhost:4566";
+        let handler =
+            SqsHandler::new().with_queue_url_style(QueueUrlStyle::Endpoint(canonical.into()));
+        let expected = format!("{canonical}/000000000000/canonical");
+        for (operation, body, field) in [
+            (
+                "CreateQueue",
+                json!({"QueueName":"canonical","Attributes":{"SqsManagedSseEnabled":"false"}}),
+                "QueueUrl",
+            ),
+            ("GetQueueUrl", json!({"QueueName":"canonical"}), "QueueUrl"),
+            ("ListQueues", json!({}), "QueueUrls"),
+        ] {
+            for (host, transport) in [
+                ("127.0.0.1:4566", "false"),
+                ("alias.aws.localhost:4566", "true"),
+                ("untrusted.invalid:9000", "true"),
+            ] {
+                let mut request = request(operation, body.clone());
+                request
+                    .headers
+                    .insert(http::header::HOST, host.parse().unwrap());
+                request.headers.insert(
+                    "x-locallycloud-verified-secure-transport",
+                    transport.parse().unwrap(),
+                );
+                request
+                    .headers
+                    .insert("x-forwarded-proto", "http".parse().unwrap());
+                let response = handler.handle(request).await;
+                assert_eq!(response.status(), 200);
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                let actual = if field == "QueueUrls" {
+                    &value[field][0]
+                } else {
+                    &value[field]
+                };
+                assert_eq!(actual, &json!(expected));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_encryption_default_tracks_authenticated_tls_and_trusted_internal_creation() {
+        let fixture = StrictQueueFixture::new().await;
+        fixture.iam.update_role("000000000000", "producer", |role| {
+            role.inline_policies.insert(
+                "queues".into(),
+                json!({"Statement":{"Effect":"Allow","Action":"sqs:*","Resource":"*"}}).to_string(),
+            );
+        });
+        for (name, transport, explicit, internal, expected_status, expected_encrypted) in [
+            ("tls-default", Some("true"), None, false, 200, true),
+            ("http-default", Some("false"), None, false, 200, false),
+            ("unknown-default", None, None, false, 200, false),
+            (
+                "tls-disabled",
+                Some("true"),
+                Some("false"),
+                false,
+                200,
+                false,
+            ),
+            (
+                "http-explicit",
+                Some("false"),
+                Some("true"),
+                false,
+                400,
+                false,
+            ),
+            ("internal-default", None, None, true, 200, true),
+        ] {
+            let mut request = fixture.role_send();
+            request
+                .headers
+                .insert("x-amz-target", "AmazonSQS.CreateQueue".parse().unwrap());
+            let attributes = explicit
+                .map(|value| json!({"SqsManagedSseEnabled":value}))
+                .unwrap_or(json!({}));
+            request.body = json!({"QueueName":name,"Attributes":attributes})
+                .to_string()
+                .into();
+            if let Some(transport) = transport {
+                request.headers.insert(
+                    "x-locallycloud-verified-secure-transport",
+                    transport.parse().unwrap(),
+                );
+            }
+            if internal {
+                request
+                    .headers
+                    .remove("x-locallycloud-verified-external-sigv4");
+                request.headers.remove(http::header::AUTHORIZATION);
+                request.headers.insert(
+                    "x-locallycloud-verified-internal-scope",
+                    "1".parse().unwrap(),
+                );
+                locallycloud_core::integration::identity::IdentityPropagator::attach(
+                    &mut request.headers,
+                    &locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                        role_arn: "arn:aws:iam::000000000000:role/producer".into(),
+                        session_name: "eventbridge".into(),
+                    },
+                );
+            }
+            assert_eq!(
+                fixture.handler.handle(request).await.status(),
+                expected_status,
+                "{name}"
+            );
+            let queue =
+                fixture
+                    .handler
+                    .store
+                    .get(&QueueArn::new("us-east-1", "000000000000", name));
+            if expected_status == 400 {
+                assert!(queue.is_none());
+                continue;
+            }
+            assert_eq!(
+                queue
+                    .unwrap()
+                    .state
+                    .lock()
+                    .await
+                    .attributes
+                    .get("SqsManagedSseEnabled")
+                    .is_some_and(|value| value == "true"),
+                expected_encrypted,
+                "{name}"
+            );
+        }
+        let permissive = SqsHandler::new();
+        let mut request = request("CreateQueue", json!({"QueueName":"signed-development"}));
+        request.headers.insert(
+            "x-locallycloud-verified-secure-transport",
+            "true".parse().unwrap(),
+        );
+        request.headers.insert(
+            http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=test/20261116/us-east-1/sqs/aws4_request"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(permissive.handle(request).await.status(), 200);
+        assert_eq!(
+            permissive
+                .store
+                .get(&QueueArn::new(
+                    "us-east-1",
+                    "000000000000",
+                    "signed-development"
+                ))
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .attributes["SqsManagedSseEnabled"],
+            "true"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_encrypted_queue_requires_physical_tls_and_verified_signature() {
+        let fixture = StrictQueueFixture::new().await;
+        fixture.iam.update_role("000000000000", "producer", |role| {
+            role.inline_policies.insert(
+                "send".into(),
+                json!({"Statement":{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"*"}})
+                    .to_string(),
+            );
+        });
+        fixture
+            .handler
+            .store
+            .get(&fixture.queue)
+            .unwrap()
+            .state
+            .lock()
+            .await
+            .attributes
+            .insert("SqsManagedSseEnabled".into(), "true".into());
+        for transport in [None, Some("false")] {
+            let mut request = fixture.role_send();
+            if let Some(transport) = transport {
+                request.headers.insert(
+                    "x-locallycloud-verified-secure-transport",
+                    transport.parse().unwrap(),
+                );
+            }
+            request
+                .headers
+                .insert("x-forwarded-proto", "https".parse().unwrap());
+            let response = fixture.handler.handle(request).await;
+            assert_eq!(response.status(), 400);
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert!(serde_json::from_slice::<Value>(&body).unwrap()["__type"]
+                .as_str()
+                .unwrap()
+                .ends_with("InvalidSecurity"));
+        }
+        let mut request = fixture.role_send();
+        request.headers.insert(
+            "x-locallycloud-verified-secure-transport",
+            "true".parse().unwrap(),
+        );
+        request
+            .headers
+            .remove("x-locallycloud-verified-external-sigv4");
+        assert_eq!(fixture.handler.handle(request.clone()).await.status(), 400);
+        assert_eq!(fixture.message_count().await, 0);
+        request.headers.insert(
+            "x-locallycloud-verified-external-sigv4",
+            "1".parse().unwrap(),
+        );
+        assert_eq!(fixture.handler.handle(request).await.status(), 200);
+        assert_eq!(fixture.message_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_service_delivery_requires_queue_grant_before_enqueue() {
+        let fixture = StrictQueueFixture::new().await;
+        for (principal, source) in [
+            (
+                "events.amazonaws.com",
+                "arn:aws:events:us-east-1:000000000000:rule/orders",
+            ),
+            (
+                "sns.amazonaws.com",
+                "arn:aws:sns:us-east-1:000000000000:orders",
+            ),
+        ] {
+            fixture
+                .handler
+                .store
+                .get(&fixture.queue)
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .attributes
+                .remove("Policy");
+            let mut request = fixture.send();
+            for (key, value) in [
+                ("x-locallycloud-verified-internal-scope", "1"),
+                ("x-locallycloud-caller-principal", principal),
+                ("x-locallycloud-source-arn", source),
+                ("x-locallycloud-source-account", "000000000000"),
+            ] {
+                request.headers.insert(key, value.parse().unwrap());
+            }
+            let count = fixture.message_count().await;
+            assert_eq!(fixture.handler.handle(request.clone()).await.status(), 403);
+            assert_eq!(fixture.message_count().await, count);
+            fixture.policy(json!({"Statement":{"Effect":"Allow","Principal":{"Service":principal},"Action":"sqs:SendMessage","Resource":fixture.queue.to_arn(),"Condition":{"ArnEquals":{"aws:SourceArn":source},"StringEquals":{"aws:SourceAccount":"000000000000"}}}})).await;
+            let mut wrong_source = request.clone();
+            wrong_source.headers.insert(
+                "x-locallycloud-source-arn",
+                format!("{source}-other").parse().unwrap(),
+            );
+            assert_eq!(fixture.handler.handle(wrong_source).await.status(), 403);
+            assert_eq!(fixture.message_count().await, count);
+            assert_eq!(fixture.handler.handle(request).await.status(), 200);
+            assert_eq!(fixture.message_count().await, count + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_queue_role_grants_compose_with_identity_denies_and_session_limits() {
+        let fixture = StrictQueueFixture::new().await;
+        let request = fixture.role_send();
+        assert_eq!(fixture.handler.handle(request.clone()).await.status(), 403);
+        fixture.policy(json!({"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:role/producer"},"Action":"sqs:SendMessage","Resource":fixture.queue.to_arn()}})).await;
+        assert_eq!(fixture.handler.handle(request.clone()).await.status(), 200);
+        let session_policy =
+            json!({"Statement":{"Effect":"Allow","Action":"sqs:ReceiveMessage","Resource":"*"}})
+                .to_string();
+        let query = locallycloud_iam_sts::query::QueryRequest::parse(format!("RoleArn=arn:aws:iam::000000000000:role/producer&RoleSessionName=restricted&Policy={}", locallycloud_iam_sts::model::urlencode_doc(&session_policy)).as_bytes());
+        let session = locallycloud_iam_sts::sts::assume_role(
+            &fixture.iam,
+            &fixture.sessions,
+            "000000000000",
+            &query,
+        )
+        .unwrap();
+        let access_key = session
+            .split("<AccessKeyId>")
+            .nth(1)
+            .unwrap()
+            .split("</AccessKeyId>")
+            .next()
+            .unwrap();
+        let mut restricted = request.clone();
+        restricted.headers.insert(http::header::AUTHORIZATION, format!("AWS4-HMAC-SHA256 Credential={access_key}/20261116/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=test").parse().unwrap());
+        assert_eq!(fixture.handler.handle(restricted).await.status(), 403);
+        fixture.iam.update_role("000000000000", "producer", |role| {
+            role.inline_policies.insert(
+                "deny".into(),
+                json!({"Statement":{"Effect":"Deny","Action":"sqs:SendMessage","Resource":"*"}})
+                    .to_string(),
+            );
+        });
+        assert_eq!(fixture.handler.handle(request).await.status(), 403);
+        assert_eq!(fixture.message_count().await, 1);
     }
 
     #[tokio::test]

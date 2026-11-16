@@ -1580,10 +1580,14 @@ pub async fn describe_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnEr
         "stateMachineArn": e.state_machine_arn,
         "name": e.name,
         "status": e.status.as_str(),
+        "redriveCount": e.redrive_count,
         "startDate": e.start_date,
         "input": e.input.to_string(),
     });
     let obj = out.as_object_mut().unwrap();
+    if let Some(redrive_date) = e.redrive_date {
+        obj.insert("redriveDate".into(), json!(redrive_date));
+    }
     if let Some(stop) = e.stop_date {
         obj.insert("stopDate".into(), json!(stop));
     }
@@ -2252,7 +2256,7 @@ pub async fn list_tags_for_resource(ctx: &Ctx<'_>, v: &Value) -> Result<Value, S
     }))
 }
 
-fn parse_tags(v: &Value) -> BTreeMap<String, String> {
+pub(crate) fn parse_tags(v: &Value) -> BTreeMap<String, String> {
     v.get("tags")
         .and_then(Value::as_array)
         .map(|a| {

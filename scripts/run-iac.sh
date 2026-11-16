@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Deploys the same Terraform / SAM / Serverless projects against an already running emulator.
-#   ./run-iac.sh lc     [terraform sam serverless]     # LocallyCloud on http://127.0.0.1:4566
+#   ./run-iac.sh lc     [terraform sam serverless]     # LocallyCloud on https://aws.localhost:4566
 #   ./run-iac.sh awsemu [terraform sam serverless]     # AWS Emulator on https://127.0.0.1:9297
-# Env overrides: LC_ENDPOINT, EMU_ENDPOINT, EMU_HOME (HOME the aws-emulator was started with).
+# Env overrides: LC_ENDPOINT, LC_CA_BUNDLE, EMU_ENDPOINT, EMU_HOME (HOME the aws-emulator was started with).
 # Results: results/<target>.tsv; compare with ./compare-iac.sh
 set -uo pipefail
 here="${IAC_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
@@ -29,11 +29,16 @@ CURL=(curl -fsS --max-time "${IAC_HTTP_TIMEOUT:-30}")
 configure_target() {
 case "$target" in
   lc)
-    export AWS_ENDPOINT_URL="${LC_ENDPOINT:-http://127.0.0.1:4566}"
+    export AWS_ENDPOINT_URL="${LC_ENDPOINT:-https://aws.localhost:4566}"
     printf '[default]\nregion = us-east-1\n' > "$work/config"
     (umask 077; printf '[default]\naws_access_key_id = test\naws_secret_access_key = test\n' > "$work/credentials")
     export AWS_CONFIG_FILE="$work/config" AWS_SHARED_CREDENTIALS_FILE="$work/credentials"
-    export IAC_SLS_HOST=http://127.0.0.1 IAC_SLS_PORT="${AWS_ENDPOINT_URL##*:}" ;;
+    if [[ "$AWS_ENDPOINT_URL" == https://* ]]; then
+      export AWS_CA_BUNDLE="${LC_CA_BUNDLE:-${LOCALLYCLOUD_STATE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/locallycloud/state.sqlite3}.ca.pem}"
+      export NODE_EXTRA_CA_CERTS="$AWS_CA_BUNDLE"
+      CURL+=(--cacert "$AWS_CA_BUNDLE")
+    fi
+    export IAC_SLS_HOST="${AWS_ENDPOINT_URL%:*}" IAC_SLS_PORT="${AWS_ENDPOINT_URL##*:}" ;;
   awsemu)
     emu="${EMU_HOME:-$here/../awsemu/home}/.aws/emulator/9297"
     [ -f "$emu/ca.pem" ] || { echo "aws-emulator not running with HOME=${EMU_HOME:-$here/../awsemu/home}" >&2; return 1; }

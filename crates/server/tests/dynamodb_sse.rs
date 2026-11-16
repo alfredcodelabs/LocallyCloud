@@ -87,6 +87,7 @@ async fn start(dir: &Path) -> Server {
         .env("LOCALLYCLOUD_KMS_MASTER_KEY", TEST_MASTER_KEY)
         .env("LOCALLYCLOUD_DYNAMODB_ENGINE", "extenddb")
         .env("LOCALLYCLOUD_IAM_ENFORCEMENT", "permissive")
+        .env("LOCALLYCLOUD_ALLOW_HTTP", "true")
         .env("LOCALLYCLOUD_HOST", "127.0.0.1")
         .env("LOCALLYCLOUD_PORT", "0")
         .env(

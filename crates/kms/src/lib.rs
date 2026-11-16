@@ -16,11 +16,13 @@ use axum::response::Response;
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::identity::{trusted_role, CallerIdentity};
 use locallycloud_core::integration::kms::{
     KmsDecryptOutput, KmsDecryptRequest, KmsEncryptOutput, KmsEncryptRequest,
     KmsGenerateDataKeyOutput, KmsGenerateDataKeyRequest, KmsInternalApi, KmsInternalError,
     KmsValidateKeyOutput, KmsValidateKeyRequest,
 };
+use locallycloud_core::integration::request_context::verified_request_context;
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use locallycloud_state::StateDb;
@@ -66,16 +68,147 @@ impl KmsHandler {
         Ok(handler)
     }
 
-    fn authorize_key_admin(
+    fn before_internal_call(&self) -> Result<(), KmsInternalError> {
+        let call = self.internal_call_count.fetch_add(1, Ordering::Relaxed);
+        match &self.internal_fault {
+            Some(InternalFault::Unavailable { after_calls }) if call >= *after_calls => {
+                Err(KmsInternalError::Unavailable)
+            }
+            Some(InternalFault::Delay {
+                after_calls,
+                duration,
+            }) if call >= *after_calls => {
+                std::thread::sleep(*duration);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn request_identity(request: &ServiceRequest) -> RequestIdentity {
+    RequestIdentity {
+        account_id: request.account_id.clone(),
+        access_key_id: request
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(RequestIdentity::access_key_from_authorization),
+        arn: None,
+    }
+}
+
+impl KmsService {
+    fn authorize_request(
         &self,
+        registry: &Weak<ServiceRegistry>,
         request: &ServiceRequest,
-        body: &serde_json::Map<String, Value>,
+        body: &mut serde_json::Map<String, Value>,
+        operation: &str,
+        planned_key_id: Option<&str>,
+    ) -> Result<Option<String>, KmsError> {
+        let scope = crate::model::Scope::new(&request.account_id, &request.region);
+        match operation {
+            "CreateKey" => {
+                self.authorize_iam(registry, request, operation, "*".into())?;
+                if body
+                    .get("Tags")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tags| !tags.is_empty())
+                {
+                    let resource = scope.key_arn(planned_key_id.ok_or(KmsError::Internal)?);
+                    self.authorize_key_policy(
+                        registry,
+                        request,
+                        "TagResource",
+                        (
+                            resource,
+                            crate::policy::KeyPolicy::default_for(&request.account_id),
+                            false,
+                        ),
+                        body,
+                    )?;
+                }
+                Ok(None)
+            }
+            "ListKeys" | "ListAliases" => self
+                .authorize_iam(registry, request, operation, "*".into())
+                .map(|()| None),
+            "CreateAlias" | "UpdateAlias" | "DeleteAlias" => {
+                let alias = self.request_alias_name(body)?;
+                self.authorize_iam(registry, request, operation, scope.alias_arn(alias))?;
+                if operation == "DeleteAlias" {
+                    return Ok(None);
+                }
+                let old_target = if operation == "UpdateAlias" {
+                    let policy =
+                        self.key_admin_policy(alias, &request.account_id, &request.region)?;
+                    let target = policy.0.clone();
+                    self.authorize_key_policy(registry, request, operation, policy, body)?;
+                    Some(target)
+                } else {
+                    None
+                };
+                let policy = self.key_admin_policy(
+                    self.request_alias_target(body)?,
+                    &request.account_id,
+                    &request.region,
+                )?;
+                self.authorize_key_policy(registry, request, operation, policy, body)?;
+                Ok(old_target)
+            }
+            "DescribeKey"
+            | "Encrypt"
+            | "Decrypt"
+            | "GenerateDataKey"
+            | "GetKeyPolicy"
+            | "PutKeyPolicy"
+            | "DisableKey"
+            | "EnableKey"
+            | "ScheduleKeyDeletion"
+            | "TagResource"
+            | "UntagResource"
+            | "ListResourceTags"
+            | "EnableKeyRotation"
+            | "DisableKeyRotation"
+            | "GetKeyRotationStatus"
+            | "RotateKeyOnDemand" => self
+                .authorize_key_operation(registry, request, body, operation)
+                .map(|()| None),
+            _ => Err(KmsError::Unsupported),
+        }
+    }
+
+    fn authorize_iam(
+        &self,
+        registry: &Weak<ServiceRegistry>,
+        request: &ServiceRequest,
+        operation: &str,
+        resource: String,
+    ) -> Result<(), KmsError> {
+        registry
+            .upgrade()
+            .and_then(|registry| registry.internal_dispatcher())
+            .ok_or(KmsError::AccessDenied)?
+            .authorize(AuthorizationRequest {
+                request_identity: request_identity(request),
+                delegated_identity: trusted_role(request),
+                source_service: "kms".into(),
+                action: format!("kms:{operation}"),
+                resource,
+                context: verified_request_context(request),
+            })
+            .map_err(|_| KmsError::AccessDenied)
+    }
+
+    fn authorize_key_operation(
+        &self,
+        registry: &Weak<ServiceRegistry>,
+        request: &ServiceRequest,
+        body: &mut serde_json::Map<String, Value>,
         operation: &str,
     ) -> Result<(), KmsError> {
-        let key_id = body
-            .get("KeyId")
-            .and_then(Value::as_str)
-            .ok_or(KmsError::Validation)?;
+        let key_id = self.request_key_id(operation, body, &request.account_id, &request.region)?;
         if matches!(
             operation,
             "EnableKey"
@@ -93,36 +226,40 @@ impl KmsHandler {
             return Err(KmsError::Validation);
         }
         let (resource, policy, explicit_policy) =
-            self.service
-                .key_admin_policy(key_id, &request.account_id, &request.region)?;
-        self.authorize_key_policy(request, operation, resource, policy, explicit_policy, body)
+            self.key_admin_policy(&key_id, &request.account_id, &request.region)?;
+        let canonical_key = resource.clone();
+        self.authorize_key_policy(
+            registry,
+            request,
+            operation,
+            (resource, policy, explicit_policy),
+            body,
+        )?;
+        body.insert("KeyId".into(), Value::String(canonical_key));
+        Ok(())
     }
 
     fn authorize_key_policy(
         &self,
+        registry: &Weak<ServiceRegistry>,
         request: &ServiceRequest,
         operation: &str,
-        resource: String,
-        policy: crate::policy::KeyPolicy,
-        explicit_policy: bool,
+        key_policy: (String, crate::policy::KeyPolicy, bool),
         body: &serde_json::Map<String, Value>,
     ) -> Result<(), KmsError> {
-        let registry = self.registry.upgrade().ok_or(KmsError::AccessDenied)?;
+        let (resource, policy, explicit_policy) = key_policy;
+        let registry = registry.upgrade().ok_or(KmsError::AccessDenied)?;
         let dispatcher = registry
             .internal_dispatcher()
             .ok_or(KmsError::AccessDenied)?;
-        let authorization = request
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|header| header.to_str().ok());
-        let identity = RequestIdentity {
-            account_id: request.account_id.clone(),
-            access_key_id: authorization.and_then(RequestIdentity::access_key_from_authorization),
-            arn: None,
+        let identity = request_identity(request);
+        let delegated_identity = trusted_role(request);
+        let principal = match &delegated_identity {
+            Some(CallerIdentity::AssumedRole { role_arn, .. }) => Some(role_arn.clone()),
+            _ => dispatcher
+                .resolve_caller_arn(&identity)
+                .map_err(|_| KmsError::AccessDenied)?,
         };
-        let principal = dispatcher
-            .resolve_caller_arn(&identity)
-            .map_err(|_| KmsError::AccessDenied)?;
         // Permissive mode treats an unregistered caller as the account root, as STS
         // GetCallerIdentity does; otherwise every explicit key policy denies it and CreateKey
         // reports a lockout for the standard root-delegation policy.
@@ -132,10 +269,11 @@ impl KmsHandler {
             }
             resolved => resolved,
         };
-        let mut context = std::collections::BTreeMap::from([(
-            "kms:calleraccount".into(),
-            vec![request.account_id.clone()],
-        )]);
+        let mut context = verified_request_context(request);
+        context.insert("kms:calleraccount".into(), vec![request.account_id.clone()]);
+        if matches!(operation, "Encrypt" | "Decrypt" | "GenerateDataKey") {
+            context.extend(self.public_encryption_context(body)?);
+        }
         if operation == "EnableKeyRotation" {
             let period = match body.get("RotationPeriodInDays") {
                 Some(value) => value.as_u64().ok_or(KmsError::Validation)?,
@@ -152,7 +290,7 @@ impl KmsHandler {
         }
         let authorization = AuthorizationRequest {
             request_identity: identity,
-            delegated_identity: None,
+            delegated_identity,
             source_service: "kms".into(),
             action: format!("kms:{operation}"),
             resource,
@@ -184,6 +322,7 @@ impl KmsHandler {
 
     fn validate_policy_change(
         &self,
+        registry: &Weak<ServiceRegistry>,
         request: &ServiceRequest,
         body: &serde_json::Map<String, Value>,
         operation: &str,
@@ -216,31 +355,19 @@ impl KmsHandler {
                     .get("KeyId")
                     .and_then(Value::as_str)
                     .ok_or(KmsError::Validation)?;
-                self.service
-                    .key_admin_policy(key_id, &request.account_id, &request.region)?
+                self.key_admin_policy(key_id, &request.account_id, &request.region)?
                     .0
             }
         };
-        match self.authorize_key_policy(request, "PutKeyPolicy", resource, policy, true, body) {
+        match self.authorize_key_policy(
+            registry,
+            request,
+            "PutKeyPolicy",
+            (resource, policy, true),
+            body,
+        ) {
             Err(KmsError::AccessDenied) => Err(KmsError::PolicyLockout),
             result => result,
-        }
-    }
-
-    fn before_internal_call(&self) -> Result<(), KmsInternalError> {
-        let call = self.internal_call_count.fetch_add(1, Ordering::Relaxed);
-        match &self.internal_fault {
-            Some(InternalFault::Unavailable { after_calls }) if call >= *after_calls => {
-                Err(KmsInternalError::Unavailable)
-            }
-            Some(InternalFault::Delay {
-                after_calls,
-                duration,
-            }) if call >= *after_calls => {
-                std::thread::sleep(*duration);
-                Ok(())
-            }
-            _ => Ok(()),
         }
     }
 }
@@ -338,69 +465,51 @@ impl NativeHandler for KmsHandler {
                 None => Err(unknown_operation()),
                 Some(operation) => match serde_json::from_slice::<Value>(&request.body) {
                     Err(_) => Err(KmsError::Serialization.into_aws()),
-                    Ok(Value::Object(body)) => {
+                    Ok(Value::Object(mut body)) => {
                         let planned_key_id =
                             (operation == "CreateKey").then(|| uuid::Uuid::new_v4().to_string());
-                        let tagged_create_key = planned_key_id.as_deref().filter(|_| {
-                            body.get("Tags")
-                                .and_then(Value::as_array)
-                                .is_some_and(|tags| !tags.is_empty())
-                        });
-                        let authorization = match (operation, tagged_create_key) {
-                            ("CreateKey", Some(id)) => self.authorize_key_policy(
+                        let service = self.service.clone();
+                        let registry = self.registry.clone();
+                        let request = request.clone();
+                        let operation = operation.to_owned();
+                        match tokio::task::spawn_blocking(move || {
+                            let old_alias_target = service.authorize_request(
+                                &registry,
                                 &request,
-                                "TagResource",
-                                crate::model::Scope::new(&request.account_id, &request.region)
-                                    .key_arn(id),
-                                crate::policy::KeyPolicy::default_for(&request.account_id),
-                                false,
-                                &body,
-                            ),
-                            (
-                                "PutKeyPolicy"
-                                | "DisableKey"
-                                | "EnableKey"
-                                | "ScheduleKeyDeletion"
-                                | "TagResource"
-                                | "UntagResource"
-                                | "ListResourceTags"
-                                | "EnableKeyRotation"
-                                | "DisableKeyRotation"
-                                | "GetKeyRotationStatus"
-                                | "RotateKeyOnDemand",
-                                _,
-                            ) => self.authorize_key_admin(&request, &body, operation),
-                            _ => Ok(()),
-                        };
-                        let authorization = authorization.and_then(|()| {
-                            self.validate_policy_change(
-                                &request,
-                                &body,
-                                operation,
+                                &mut body,
+                                &operation,
                                 planned_key_id.as_deref(),
-                            )
-                        });
-                        match authorization {
-                            Err(error) => Err(error.into_aws()),
-                            Ok(()) => {
-                                let service = self.service.clone();
-                                let operation = operation.to_owned();
-                                let account = request.account_id.clone();
-                                let region = request.region.clone();
-                                match tokio::task::spawn_blocking(move || match planned_key_id {
-                                    Some(id) => service.create_key(
-                                        &body,
-                                        &crate::model::Scope::new(&account, &region),
-                                        Some(id),
-                                    ),
-                                    None => service.dispatch(&operation, &body, &account, &region),
-                                })
-                                .await
-                                {
-                                    Ok(result) => result.map_err(KmsError::into_aws),
-                                    Err(_) => Err(KmsError::Internal.into_aws()),
-                                }
+                            )?;
+                            service.validate_policy_change(
+                                &registry,
+                                &request,
+                                &body,
+                                &operation,
+                                planned_key_id.as_deref(),
+                            )?;
+                            match planned_key_id {
+                                Some(id) => service.create_key(
+                                    &body,
+                                    &crate::model::Scope::new(&request.account_id, &request.region),
+                                    Some(id),
+                                ),
+                                None if old_alias_target.is_some() => service.update_alias_checked(
+                                    &body,
+                                    &crate::model::Scope::new(&request.account_id, &request.region),
+                                    old_alias_target.as_deref(),
+                                ),
+                                None => service.dispatch(
+                                    &operation,
+                                    &body,
+                                    &request.account_id,
+                                    &request.region,
+                                ),
                             }
+                        })
+                        .await
+                        {
+                            Ok(result) => result.map_err(KmsError::into_aws),
+                            Err(_) => Err(KmsError::Internal.into_aws()),
                         }
                     }
                     Ok(_) => Err(KmsError::Serialization.into_aws()),

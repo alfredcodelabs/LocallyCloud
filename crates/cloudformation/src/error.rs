@@ -7,6 +7,8 @@ pub const CFN_XMLNS: &str = "http://cloudformation.amazonaws.com/doc/2010-05-15/
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CfnError {
+    #[error("{0}")]
+    AccessDenied(String),
     /// Client validation failure (missing/invalid parameters, stack-does-not-exist, …).
     #[error("{0}")]
     Validation(String),
@@ -31,6 +33,7 @@ pub enum CfnError {
 impl CfnError {
     pub fn code(&self) -> &'static str {
         match self {
+            CfnError::AccessDenied(_) => "AccessDenied",
             CfnError::Validation(_) => "ValidationError",
             CfnError::AlreadyExists(_) => "AlreadyExistsException",
             CfnError::ResourceFailed(_) => "ResourceFailed",
@@ -43,6 +46,7 @@ impl CfnError {
 
     pub fn http_status(&self) -> u16 {
         match self {
+            CfnError::AccessDenied(_) => 403,
             CfnError::AlreadyExists(_) => 400,
             CfnError::Validation(_) => 400,
             CfnError::Unsupported(_) => 400,

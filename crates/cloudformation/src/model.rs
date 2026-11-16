@@ -137,6 +137,8 @@ pub struct Output {
 /// A CloudFormation stack.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Stack {
+    #[serde(default)]
+    pub role_arn: Option<String>,
     pub stack_id: String,
     pub stack_name: String,
     pub status: StackStatus,
@@ -155,5 +157,20 @@ pub struct Stack {
 impl Stack {
     pub fn resource(&self, logical_id: &str) -> Option<&StackResource> {
         self.resources.iter().find(|r| r.logical_id == logical_id)
+    }
+}
+
+#[cfg(test)]
+mod role_persistence_tests {
+    #[test]
+    fn stacks_written_before_execution_roles_restore_without_a_role() {
+        let legacy = serde_json::json!({
+            "stack_id":"arn:aws:cloudformation:us-east-1:000000000000:stack/old/id",
+            "stack_name":"old", "status":"CreateComplete", "template_body":"{}",
+            "parameters":{}, "resources":[], "outputs":[], "events":[], "tags":[],
+            "creation_time":"2026-01-01T00:00:00Z", "last_updated_time":null
+        });
+        let stack: super::Stack = serde_json::from_value(legacy).unwrap();
+        assert!(stack.role_arn.is_none());
     }
 }

@@ -28,4 +28,5 @@ time.workspace = true
 md-5 = "0.10"
 
 [dev-dependencies]
+locallycloud-iam-sts.workspace = true
 proptest = "1"

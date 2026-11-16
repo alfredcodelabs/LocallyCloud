@@ -56,7 +56,12 @@ impl Ec2Handler {
             })?;
         let kind = match input.one("VpcEndpointType")?.unwrap_or("Gateway") {
             "Gateway" if matches!(service, "s3" | "dynamodb") => EndpointKind::Gateway,
-            "Interface" if matches!(service, "ssm" | "secretsmanager" | "logs") => {
+            "Interface"
+                if matches!(
+                    service,
+                    "ssm" | "secretsmanager" | "logs" | "sts" | "sqs" | "kms"
+                ) =>
+            {
                 EndpointKind::Interface
             }
             _ => {

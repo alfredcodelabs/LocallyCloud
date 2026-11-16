@@ -3645,9 +3645,18 @@ mod tests {
                 format!("{role}/session").parse().unwrap(),
             );
             if trusted {
+                req.headers.remove("x-locallycloud-verified-external-sigv4");
+                req.headers.remove(http::header::AUTHORIZATION);
                 req.headers.insert(
                     "x-locallycloud-verified-internal-scope",
                     http::HeaderValue::from_static("1"),
+                );
+                locallycloud_core::integration::identity::IdentityPropagator::attach(
+                    &mut req.headers,
+                    &locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                        role_arn: role.into(),
+                        session_name: "session".into(),
+                    },
                 );
             }
         }

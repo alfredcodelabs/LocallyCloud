@@ -20,6 +20,8 @@ pub enum LambdaError {
     #[error("{0}")]
     CodeStorageExceeded(String),
     #[error("{0}")]
+    PolicyLengthExceeded(String),
+    #[error("{0}")]
     RequestTooLarge(String),
     #[error("{0}")]
     TooManyRequests(String),
@@ -40,6 +42,7 @@ impl LambdaError {
             LambdaError::InvalidParameterValue(_) => "InvalidParameterValueException",
             LambdaError::InvalidRequestContent(_) => "InvalidRequestContentException",
             LambdaError::CodeStorageExceeded(_) => "CodeStorageExceededException",
+            LambdaError::PolicyLengthExceeded(_) => "PolicyLengthExceededException",
             LambdaError::RequestTooLarge(_) => "RequestTooLargeException",
             LambdaError::TooManyRequests(_) => "TooManyRequestsException",
             LambdaError::InternalError(_) => "InternalServerError",
@@ -56,6 +59,7 @@ impl LambdaError {
             LambdaError::InvalidParameterValue(_) => 400,
             LambdaError::InvalidRequestContent(_) => 400,
             LambdaError::CodeStorageExceeded(_) => 400,
+            LambdaError::PolicyLengthExceeded(_) => 400,
             LambdaError::RequestTooLarge(_) => 413,
             LambdaError::TooManyRequests(_) => 429,
             LambdaError::InternalError(_) => 500,

@@ -17,7 +17,12 @@ pub enum Shape {
 /// virtual-hosted-style (`<bucket>.s3...`, `<bucket>.localhost`) and path-style
 /// (`/<bucket>/<key>`). The key is returned percent-decoded as opaque UTF-8.
 pub fn resolve(host: Option<&str>, path: &str) -> Shape {
-    if let Some(bucket) = virtual_hosted_bucket(host) {
+    resolve_with_endpoint(host, path, "aws.localhost")
+}
+
+/// The configured base host is never a bucket; its subdomain is a virtual-hosted bucket.
+pub fn resolve_with_endpoint(host: Option<&str>, path: &str, endpoint: &str) -> Shape {
+    if let Some(bucket) = virtual_hosted_bucket(host, endpoint) {
         let key = path.trim_start_matches('/');
         return if key.is_empty() {
             Shape::Bucket(bucket)
@@ -39,10 +44,20 @@ pub fn resolve(host: Option<&str>, path: &str) -> Shape {
 }
 
 /// Return the virtual-hosted bucket label if the host is virtual-hosted-style.
-fn virtual_hosted_bucket(host: Option<&str>) -> Option<String> {
+fn virtual_hosted_bucket(host: Option<&str>, endpoint: &str) -> Option<String> {
     let host = host?;
     let host = host.split(':').next().unwrap_or(host); // strip port
     let host = host.to_ascii_lowercase();
+    if host.eq_ignore_ascii_case(endpoint) {
+        return None;
+    }
+    if let Some(bucket) = host
+        .strip_suffix(endpoint)
+        .and_then(|prefix| prefix.strip_suffix('.'))
+        .filter(|bucket| !bucket.is_empty())
+    {
+        return Some(bucket.into());
+    }
     // <bucket>.s3.<...> or <bucket>.s3-<...>
     if let Some(idx) = host.find(".s3.").or_else(|| host.find(".s3-")) {
         let bucket = &host[..idx];
@@ -158,6 +173,28 @@ mod tests {
         assert_eq!(
             resolve(Some("mybucket.localhost:4566"), "/key"),
             Shape::Object("mybucket".into(), "key".into())
+        );
+    }
+
+    #[test]
+    fn canonical_endpoint_distinguishes_base_path_style_and_bucket_hosts() {
+        for endpoint in ["aws.localhost", "emulator.example.test"] {
+            assert_eq!(
+                resolve_with_endpoint(Some(&format!("{endpoint}:4566")), "/", endpoint),
+                Shape::Service
+            );
+            assert_eq!(
+                resolve_with_endpoint(Some(&format!("{endpoint}:4566")), "/bucket/key", endpoint),
+                Shape::Object("bucket".into(), "key".into())
+            );
+            assert_eq!(
+                resolve_with_endpoint(Some(&format!("bucket.{endpoint}:4566")), "/key", endpoint),
+                Shape::Object("bucket".into(), "key".into())
+            );
+        }
+        assert_eq!(
+            resolve(Some("aws.localhost:4566"), "/bucket"),
+            Shape::Bucket("bucket".into())
         );
     }
 

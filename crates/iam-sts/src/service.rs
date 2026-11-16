@@ -38,6 +38,31 @@ struct IamStsState {
     mode: EnforcementMode,
 }
 
+fn pass_role_context(request: &ServiceRoleAuthorizationRequest) -> BTreeMap<String, Vec<String>> {
+    let mut context = BTreeMap::new();
+    for (key, values) in &request.caller_context {
+        let [value] = values.as_slice() else {
+            continue;
+        };
+        let key = key.to_ascii_lowercase();
+        let value = match key.as_str() {
+            "aws:requestedregion" if !value.is_empty() => value.clone(),
+            "aws:securetransport" if matches!(value.as_str(), "true" | "false") => value.clone(),
+            "aws:sourceip" => match value.parse::<std::net::IpAddr>() {
+                Ok(address) => address.to_string(),
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        context.insert(key, vec![value]);
+    }
+    context.insert(
+        "iam:passedtoservice".into(),
+        vec![request.service_principal.clone()],
+    );
+    context
+}
+
 impl IamStsState {
     fn new(store: Arc<IamStore>, sessions: Arc<SessionStore>) -> Self {
         Self::with_mode(store, sessions, EnforcementMode::from_env())
@@ -97,6 +122,8 @@ impl IamStsState {
                 "events.amazonaws.com" => ("events", "rule/"),
                 "pipes.amazonaws.com" => ("pipes", "pipe/"),
                 "scheduler.amazonaws.com" => ("scheduler", "schedule-group/"),
+                "apigateway.amazonaws.com" => ("execute-api", ""),
+                "cloudformation.amazonaws.com" => ("cloudformation", "stack/"),
                 _ => return Err(AuthorizationError::InvalidRequest),
             };
             if parts.len() != 6
@@ -107,12 +134,15 @@ impl IamStsState {
                 || parts[3].is_empty()
                 || !parts[5].starts_with(resource_prefix)
                 || parts[5].len() == resource_prefix.len()
+                || (expected_service == "execute-api"
+                    && (parts[5].split('/').count() < 3 || parts[5].starts_with('/')))
             {
                 return Err(AuthorizationError::InvalidRequest);
             }
             context.insert("aws:sourcearn".into(), vec![source.clone()]);
             context.insert("aws:sourceaccount".into(), vec![account.clone()]);
         }
+        crate::enforcement::apply_time_attributes(&mut context);
         if !service_trust_allows(
             &role.assume_role_policy_document,
             &request.service_principal,
@@ -122,6 +152,138 @@ impl IamStsState {
             return Err(AuthorizationError::Denied);
         }
         Ok(())
+    }
+
+    fn authorize_assume_role(
+        &self,
+        request: &ServiceRequest,
+        query: &QueryRequest,
+    ) -> Result<(), IamStsError> {
+        use crate::policy::{evaluate, Decision, EvalRequest, PolicyDocument};
+        if self.mode == EnforcementMode::Permissive {
+            return Ok(());
+        }
+        if [
+            "Tags",
+            "TransitiveTagKeys",
+            "SourceIdentity",
+            "ProvidedContexts",
+        ]
+        .iter()
+        .any(|prefix| query.has_parameter_prefix(prefix))
+        {
+            return Err(IamStsError::ValidationError(
+                "Session tags, source identity and trusted context assertions are not supported"
+                    .into(),
+            ));
+        }
+        let denied =
+            || IamStsError::AccessDenied("The caller is not trusted to assume this role".into());
+        let identity = RequestIdentity {
+            account_id: request.account_id.clone(),
+            access_key_id: access_key_id_from_auth(request),
+            arn: None,
+        };
+        let key = identity.access_key_id.as_deref().ok_or_else(denied)?;
+        // User/federated sessions currently lack inherited user policy context.
+        if !self.root_caller(&identity)
+            && self
+                .sessions
+                .resolve(key)
+                .is_some_and(|session| session.role_arn.is_none())
+        {
+            return Err(denied());
+        }
+        let role = sts::resolve_role(&self.store, &request.account_id, query.require("RoleArn")?)?;
+        let caller = self.enforcement.resolve_caller(&request.account_id, key)?;
+        let principal = caller
+            .attribute("aws:principalarn")
+            .ok_or_else(denied)?
+            .to_owned();
+        if query.get("SerialNumber").is_some() || query.get("TokenCode").is_some() {
+            return Err(IamStsError::AccessDenied(
+                "MFA assertions are not verified by this emulator".into(),
+            ));
+        }
+        let mut context = BTreeMap::from([
+            ("aws:principalarn".into(), vec![principal.clone()]),
+            (
+                "aws:principalaccount".into(),
+                vec![request.account_id.clone()],
+            ),
+            ("aws:requestedregion".into(), vec![request.region.clone()]),
+            (
+                "sts:rolesessionname".into(),
+                vec![query.require("RoleSessionName")?.into()],
+            ),
+        ]);
+        let principal_type = if self.root_caller(&identity) {
+            "Account"
+        } else if principal.contains(":role/") {
+            "AssumedRole"
+        } else {
+            "User"
+        };
+        context.insert("aws:principaltype".into(), vec![principal_type.into()]);
+        context.insert("aws:principalisawsservice".into(), vec!["false".into()]);
+        context.extend(
+            locallycloud_core::integration::request_context::verified_request_context(request),
+        );
+        if let Some(external_id) = query.get("ExternalId") {
+            context.insert("sts:externalid".into(), vec![external_id.into()]);
+        }
+        caller.apply_attributes(&mut context);
+        let evaluation = EvalRequest {
+            action: "sts:AssumeRole".into(),
+            resource: role.arn,
+            context,
+        };
+        let mut trusted = false;
+        let mut direct = false;
+        for item in crate::resource_policy::parse_trust(&role.assume_role_policy_document)
+            .map_err(|_| denied())?
+        {
+            let Some(grant) = item.principal_match(&request.account_id, Some(&principal), None)
+            else {
+                continue;
+            };
+            match evaluate(
+                &[PolicyDocument {
+                    statements: vec![item.statement],
+                }],
+                None,
+                None,
+                &evaluation,
+            ) {
+                Decision::ExplicitDeny => return Err(denied()),
+                Decision::Allowed => {
+                    trusted = true;
+                    direct |= grant;
+                }
+                Decision::ImplicitDeny => {}
+            }
+        }
+        let decision = evaluate(
+            &caller.identity,
+            caller.boundary.as_deref(),
+            caller.session.as_deref(),
+            &evaluation,
+        );
+        if !trusted || decision == Decision::ExplicitDeny {
+            return Err(denied());
+        }
+        let limits_allow = caller.boundary.as_ref().is_none_or(|policies| {
+            evaluate(policies, None, None, &evaluation) == Decision::Allowed
+        }) && caller.session.as_ref().is_none_or(|policies| {
+            evaluate(policies, None, None, &evaluation) == Decision::Allowed
+        });
+        if decision == Decision::Allowed
+            || (direct && (principal.contains(":user/") || limits_allow))
+        {
+            Ok(())
+        } else {
+            Err(denied())
+        }
     }
 
     /// Resolve the caller identity from the request and apply strict-mode enforcement.
@@ -172,12 +334,40 @@ impl IamStsState {
                 )),
             };
         }
-        let result = self.enforcement.check(
-            self.mode,
-            &identity,
-            &format!("{service}:{action}"),
-            resource,
-        );
+        let context =
+            locallycloud_core::integration::request_context::verified_request_context(request);
+        let delegated = if self.mode == EnforcementMode::Strict && service == "iam" {
+            locallycloud_core::integration::identity::trusted_role(request)
+        } else {
+            None
+        };
+        let result = match delegated {
+            Some(role) => self
+                .authorize(AuthorizationRequest {
+                    request_identity: RequestIdentity {
+                        account_id: request.account_id.clone(),
+                        access_key_id: None,
+                        arn: None,
+                    },
+                    delegated_identity: Some(role),
+                    source_service: service.into(),
+                    action: format!("{service}:{action}"),
+                    resource: resource.into(),
+                    context,
+                })
+                .map_err(|_| {
+                    IamStsError::AccessDenied(format!(
+                        "service role is not authorized for {service}:{action} on {resource}"
+                    ))
+                }),
+            None => self.enforcement.check_with_context(
+                self.mode,
+                &identity,
+                &format!("{service}:{action}"),
+                resource,
+                &context,
+            ),
+        };
         if let Err(IamStsError::AccessDenied(_)) = &result {
             tracing::info!(
                 request_id = %request.request_id,
@@ -247,16 +437,18 @@ impl IamStsState {
                 session_token: Some(session.session_token),
             });
         }
-        self.store.list_users(account).into_iter().find_map(|user| {
-            user.access_keys.into_iter().find_map(|key| {
-                (key.access_key_id == access_key && key.status == "Active").then_some(
-                    SigningCredentials {
-                        secret_access_key: key.secret_access_key,
-                        session_token: None,
-                    },
-                )
+        self.store
+            .user_for_key(account, access_key)
+            .and_then(|user| {
+                user.access_keys.into_iter().find_map(|key| {
+                    (key.access_key_id == access_key && key.status == "Active").then_some(
+                        SigningCredentials {
+                            secret_access_key: key.secret_access_key,
+                            session_token: None,
+                        },
+                    )
+                })
             })
-        })
     }
 }
 
@@ -318,24 +510,18 @@ impl AuthorizationEvaluator for IamStsState {
         if request.action.is_empty() || request.resource.is_empty() || owner_account.is_empty() {
             return Err(AuthorizationError::InvalidRequest);
         }
-        // These attributes describe the resolved caller, never supplied condition values.
-        request.context.retain(|key, _| {
-            !matches!(
-                key.to_ascii_lowercase().as_str(),
-                "aws:principalarn"
-                    | "aws:principalaccount"
-                    | "aws:principaltype"
-                    | "aws:principalisawsservice"
-            )
-        });
+        crate::enforcement::strip_principal_attributes(&mut request.context);
         let account = request.request_identity.account_id.clone();
         let (arn, service, caller, principal_type) = match &request.delegated_identity {
-            Some(CallerIdentity::AssumedRole { role_arn, .. }) => (
+            Some(CallerIdentity::AssumedRole {
+                role_arn,
+                session_name,
+            }) => (
                 Some(role_arn.clone()),
                 None,
                 Some(
                     self.enforcement
-                        .role_context(&account, role_arn)
+                        .role_session_context(&account, role_arn, session_name)
                         .map_err(|_| AuthorizationError::Denied)?,
                 ),
                 "AssumedRole",
@@ -367,12 +553,13 @@ impl AuthorizationEvaluator for IamStsState {
                         .enforcement
                         .resolve_caller(&account, key)
                         .map_err(|_| AuthorizationError::Denied)?;
-                    let arn = self
-                        .resolve_caller_arn(&request.request_identity)?
-                        .ok_or(AuthorizationError::Denied)?;
-                    let kind = if self.root_caller(&request.request_identity) {
+                    let arn = caller
+                        .attribute("aws:principalarn")
+                        .ok_or(AuthorizationError::Denied)?
+                        .to_owned();
+                    let kind = if caller.attribute("aws:principaltype") == Some("Account") {
                         "Account"
-                    } else if arn.contains(":role/") {
+                    } else if caller.attribute("aws:principaltype") == Some("AssumedRole") {
                         "AssumedRole"
                     } else {
                         "User"
@@ -397,6 +584,11 @@ impl AuthorizationEvaluator for IamStsState {
             "aws:principalisawsservice".into(),
             vec![service.is_some().to_string()],
         );
+        if let Some(caller) = &caller {
+            caller.apply_attributes(&mut request.context);
+        } else {
+            crate::enforcement::apply_time_attributes(&mut request.context);
+        }
         let evaluation = EvalRequest {
             action: request.action,
             resource: request.resource,
@@ -477,6 +669,8 @@ impl AuthorizationEvaluator for IamStsState {
         service_principal: &str,
     ) -> Result<ServiceRoleCredentials, AuthorizationError> {
         self.validate_service_role(&ServiceRoleAuthorizationRequest {
+            delegated_caller: None,
+            caller_context: Default::default(),
             source_arn: None,
             caller: RequestIdentity {
                 account_id: account.to_string(),
@@ -561,19 +755,14 @@ impl AuthorizationEvaluator for IamStsState {
         if self.mode != EnforcementMode::Strict {
             return Ok(());
         }
-        let pass_context = BTreeMap::from([(
-            "iam:passedtoservice".into(),
-            vec![request.service_principal.clone()],
-        )]);
-        self.enforcement
-            .check_with_context(
-                EnforcementMode::Strict,
-                &request.caller,
-                "iam:PassRole",
-                &request.role_arn,
-                &pass_context,
-            )
-            .map_err(|_| AuthorizationError::Denied)?;
+        self.authorize(AuthorizationRequest {
+            request_identity: request.caller.clone(),
+            delegated_identity: request.delegated_caller.clone(),
+            source_service: "iam".into(),
+            action: "iam:PassRole".into(),
+            resource: request.role_arn.clone(),
+            context: pass_role_context(&request),
+        })?;
         self.enforcement
             .check_role(
                 &request.caller.account_id,
@@ -592,19 +781,14 @@ impl AuthorizationEvaluator for IamStsState {
         if self.mode != EnforcementMode::Strict {
             return Ok(());
         }
-        let pass_context = BTreeMap::from([(
-            "iam:passedtoservice".into(),
-            vec![request.service_principal.clone()],
-        )]);
-        self.enforcement
-            .check_with_context(
-                EnforcementMode::Strict,
-                &request.caller,
-                "iam:PassRole",
-                &request.role_arn,
-                &pass_context,
-            )
-            .map_err(|_| AuthorizationError::Denied)
+        self.authorize(AuthorizationRequest {
+            request_identity: request.caller.clone(),
+            delegated_identity: request.delegated_caller.clone(),
+            source_service: "iam".into(),
+            action: "iam:PassRole".into(),
+            resource: request.role_arn.clone(),
+            context: pass_role_context(&request),
+        })
     }
 
     fn authorize_service_role_trust(
@@ -654,29 +838,26 @@ impl AuthorizationEvaluator for IamStsState {
         }
         Ok(self
             .store
-            .list_users(&identity.account_id)
-            .into_iter()
-            .find(|user| {
-                user.access_keys
-                    .iter()
-                    .any(|key| key.access_key_id == access_key_id && key.status == "Active")
-            })
+            .user_for_key(&identity.account_id, access_key_id)
             .map(|user| user.arn))
     }
 
     fn identity_policy_denies(&self, request: AuthorizationRequest) -> bool {
         if let Some(locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
             role_arn,
-            ..
+            session_name,
         }) = request.delegated_identity
         {
-            return self.enforcement.role_policy_denies(
-                &request.request_identity.account_id,
-                &role_arn,
-                &request.action,
-                &request.resource,
-                &request.context,
-            );
+            return self
+                .enforcement
+                .role_session_context(
+                    &request.request_identity.account_id,
+                    &role_arn,
+                    &session_name,
+                )
+                .map_or(true, |caller| {
+                    caller.denies(&request.action, &request.resource, &request.context)
+                });
         }
         if self.mode == EnforcementMode::Permissive
             && matches!(self.resolve_caller_arn(&request.request_identity), Ok(None))
@@ -694,19 +875,19 @@ impl AuthorizationEvaluator for IamStsState {
     fn identity_policy_allows(&self, request: AuthorizationRequest) -> bool {
         if let Some(locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
             role_arn,
-            ..
+            session_name,
         }) = request.delegated_identity
         {
             return self
                 .enforcement
-                .check_role_with_context(
+                .role_session_context(
                     &request.request_identity.account_id,
                     &role_arn,
-                    &request.action,
-                    &request.resource,
-                    &request.context,
+                    &session_name,
                 )
-                .is_ok();
+                .is_ok_and(|caller| {
+                    caller.allows(&request.action, &request.resource, &request.context)
+                });
         }
         self.enforcement
             .check_with_context(
@@ -797,7 +978,20 @@ impl NativeHandler for StsHandler {
         };
         let caller_key = access_key_id_from_auth(&request);
         tracing::info!(request_id = %request.request_id, service = "sts", %action, "sts request");
-        if let Err(e) = self.state.enforce(&request, "sts", &action, "*") {
+        let authorization = match action.as_str() {
+            "GetSessionToken" if self.state.mode == EnforcementMode::Strict
+                && (q.get("SerialNumber").is_some() || q.get("TokenCode").is_some()) => {
+                Err(IamStsError::AccessDenied("MFA assertions are not verified by this emulator".into()))
+            }
+            "AssumeRole" => self.state.authorize_assume_role(&request, &q),
+            "AssumeRoleWithWebIdentity" | "AssumeRoleWithSAML"
+                if self.state.mode == EnforcementMode::Strict =>
+            {
+                Err(IamStsError::AccessDenied("Federated STS credentials require verified identity-provider assertions, which are not supported".into()))
+            }
+            _ => self.state.enforce(&request, "sts", &action, "*"),
+        };
+        if let Err(e) = authorization {
             return e.into_response(&request.request_id, STS_XMLNS);
         }
         let state = self.state.clone();
@@ -939,7 +1133,15 @@ fn dispatch_sts(
     let store = &state.store;
     let sessions = &state.sessions;
     match action {
-        "AssumeRole" => sts::assume_role(store, sessions, account, q),
+        "AssumeRole" => sts::assume_role_for_caller(
+            store,
+            sessions,
+            account,
+            q,
+            caller_key
+                .and_then(|key| sessions.resolve(key))
+                .is_some_and(|session| session.role_arn.is_some()),
+        ),
         "AssumeRoleWithWebIdentity" => {
             sts::assume_role_with_web_identity(store, sessions, account, q)
         }
@@ -954,13 +1156,7 @@ fn dispatch_sts(
             if let Some(root) = caller_key.and_then(|key| store.root_for_key(account, key)) {
                 return Ok(sts::get_caller_identity(&root.account, None));
             }
-            if let Some(user) = caller_key.and_then(|key| {
-                store.list_users(account).into_iter().find(|user| {
-                    user.access_keys.iter().any(|access_key| {
-                        access_key.access_key_id == key && access_key.status == "Active"
-                    })
-                })
-            }) {
+            if let Some(user) = caller_key.and_then(|key| store.user_for_key(account, key)) {
                 return Ok(sts::get_iam_caller_identity(account, &user));
             }
             // Permissive local mode has always returned root for an unresolved caller.
@@ -984,11 +1180,7 @@ fn dispatch_sts(
                         true,
                     );
                 }
-                if let Some(user) = store.list_users(account).into_iter().find(|user| {
-                    user.access_keys.iter().any(|access_key| {
-                        access_key.access_key_id == key && access_key.status == "Active"
-                    })
-                }) {
+                if let Some(user) = store.user_for_key(account, key) {
                     return sts::get_session_token_for_issuer(
                         sessions,
                         account,
@@ -2099,6 +2291,8 @@ mod tests {
         let mut state = IamStsState::new(store.clone(), Arc::new(SessionStore::new()));
         state.mode = EnforcementMode::Strict;
         let request = ServiceRoleAuthorizationRequest {
+            delegated_caller: None,
+            caller_context: Default::default(),
             source_arn: None,
             caller: RequestIdentity {
                 account_id: account.into(),
@@ -2171,6 +2365,8 @@ mod tests {
 
         assert_eq!(
             state.authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 action: "iam:PassRole".into(),
                 resource: role_arn.clone(),
                 ..request.clone()
@@ -2179,6 +2375,8 @@ mod tests {
         );
         assert_eq!(
             state.authorize_service_role(ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 resource: format!("arn:aws:kinesis:us-east-1:{account}:stream/other"),
                 ..request.clone()
             }),
@@ -2216,6 +2414,8 @@ mod tests {
         assert_eq!(state.authorize_service_role(request.clone()), Ok(()));
         assert_eq!(
             state.authorize_service_role(ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 service_principal: "lambda.amazonaws.com".into(),
                 ..request.clone()
             }),
@@ -2226,6 +2426,8 @@ mod tests {
         });
         assert_eq!(
             state.authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 action: "iam:PassRole".into(),
                 resource: role_arn.clone(),
                 ..request.clone()
@@ -2242,6 +2444,8 @@ mod tests {
         );
         let source_arn = format!("arn:aws:events:us-east-1:{account}:rule/Orders");
         let scoped = ServiceRoleAuthorizationRequest {
+            delegated_caller: None,
+            caller_context: Default::default(),
             source_arn: Some(source_arn.clone()),
             service_principal: "events.amazonaws.com".into(),
             ..request.clone()
@@ -2273,6 +2477,8 @@ mod tests {
         ] {
             assert_eq!(
                 state.authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                    delegated_caller: None,
+                    caller_context: Default::default(),
                     source_arn: source,
                     ..scoped.clone()
                 }),
@@ -2285,6 +2491,8 @@ mod tests {
         ] {
             assert_eq!(
                 state.authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                    delegated_caller: None,
+                    caller_context: Default::default(),
                     source_arn: Some(source),
                     ..scoped.clone()
                 }),
@@ -2314,6 +2522,8 @@ mod tests {
             assert_eq!(
                 state
                     .authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                        delegated_caller: None,
+                        caller_context: Default::default(),
                         source_arn: None,
                         ..scoped.clone()
                     })
@@ -2367,6 +2577,8 @@ mod tests {
                 .to_string(),
             );
             let call = ServiceRoleAuthorizationRequest {
+                delegated_caller: None,
+                caller_context: Default::default(),
                 source_arn: Some(source),
                 service_principal: format!("{service}.amazonaws.com"),
                 ..request.clone()
@@ -2374,6 +2586,8 @@ mod tests {
             assert_eq!(state.authorize_service_role_execution(call.clone()), Ok(()));
             assert_eq!(
                 state.authorize_service_role_execution(ServiceRoleAuthorizationRequest {
+                    delegated_caller: None,
+                    caller_context: Default::default(),
                     source_arn: None,
                     ..call
                 }),
@@ -2805,4 +3019,74 @@ mod durability_tests {
         assert!(store.get_user("000000000000", "tentative").is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn live_time_denies_identity_and_direct_resource_grants_despite_forged_claims() {
+        let account = "000000000000";
+        let store = Arc::new(IamStore::new());
+        seed_bootstrap_user(
+            &store,
+            account,
+            BootstrapCredentials {
+                access_key_id: "time-key".into(),
+                secret_access_key: "secret".into(),
+            },
+        );
+        let state = IamStsState::with_mode(
+            store.clone(),
+            Arc::new(SessionStore::new()),
+            EnforcementMode::Strict,
+        );
+        let grant=serde_json::json!({"Statement":{"Effect":"Allow","Principal":{"AWS":format!("arn:aws:iam::{account}:user/locallycloud-bootstrap")},"Action":"s3:GetObject","Resource":"*"}}).to_string();
+        let request = AuthorizationRequest {
+            request_identity: RequestIdentity {
+                account_id: account.into(),
+                access_key_id: Some("time-key".into()),
+                arn: None,
+            },
+            delegated_identity: None,
+            source_service: "s3".into(),
+            action: "s3:GetObject".into(),
+            resource: "arn:aws:s3:::bucket/key".into(),
+            context: BTreeMap::from([
+                (
+                    "AWS:CurrentTime".into(),
+                    vec!["1900-01-01T00:00:00Z".into()],
+                ),
+                ("AWS:EpochTime".into(), vec!["0".into()]),
+            ]),
+        };
+        for condition in [
+            serde_json::json!({"DateGreaterThan":{"aws:CurrentTime":"2000-01-01T00:00:00Z"}}),
+            serde_json::json!({"NumericGreaterThan":{"aws:EpochTime":1}}),
+        ] {
+            store.update_user(account, "locallycloud-bootstrap", |user| {
+                user.inline_policies=BTreeMap::from([("time".into(),serde_json::json!({"Statement":[
+                {"Effect":"Allow","Action":"*","Resource":"*"},
+                {"Effect":"Deny","Action":"s3:GetObject","Resource":"*","Condition":condition}
+            ]}).to_string())])
+            });
+            assert_eq!(
+                state.authorize(request.clone()),
+                Err(AuthorizationError::Denied)
+            );
+            assert_eq!(
+                state.authorize_resource_policy(request.clone(), Some(&grant), account),
+                Err(AuthorizationError::Denied)
+            );
+        }
+        store.update_user(account, "locallycloud-bootstrap", |user| {
+            user.inline_policies.clear()
+        });
+        assert!(state
+            .authorize_resource_policy(request, Some(&grant), account)
+            .is_ok());
+    }
 }
+
+#[cfg(test)]
+#[path = "assume_role_tests.rs"]
+mod assume_role_tests;
+
+#[cfg(test)]
+#[path = "principal_attributes_tests.rs"]
+mod principal_attributes_tests;

@@ -54,6 +54,16 @@ pub fn resolve(
     registry: &ServiceRegistry,
     input: &RouteInput,
 ) -> Result<RoutingDecision, Unresolved> {
+    resolve_with_endpoint(registry, input, None)
+}
+
+/// Route configured endpoint aliases without accepting arbitrary registry hosts.
+/// `endpoint_hostname` is a constructor-injected DNS hostname without a port.
+pub fn resolve_with_endpoint(
+    registry: &ServiceRegistry,
+    input: &RouteInput,
+    endpoint_hostname: Option<&str>,
+) -> Result<RoutingDecision, Unresolved> {
     // 1. Credential scope is authoritative when it names a registered service.
     let scope_name =
         extract_service_from_credential_scope(input.authorization, input.x_amz_credential);
@@ -79,10 +89,14 @@ pub fn resolve(
         }
     }
 
+    let endpoint_bucket = resolve_s3_endpoint_host(input.host, endpoint_hostname);
     // 2. Docker Registry requests use Basic authentication and have no SigV4 scope.
     // Route only to a registered native ECR handler, which validates Basic before touching state.
     if (input.path == "/v2" || input.path.starts_with("/v2/"))
-        && input.host.is_some_and(ecr_registry_host)
+        && endpoint_bucket.is_none()
+        && input
+            .host
+            .is_some_and(|host| ecr_registry_host_for_endpoint(host, endpoint_hostname))
     {
         let name = ServiceName::new("ecr");
         if registry.native_handler(&name).is_some() {
@@ -96,7 +110,7 @@ pub fn resolve(
             return Ok(decide(registry, name, ResolutionSource::XAmzTarget));
         }
     }
-    if let Some(name) = resolve_s3_from_host_path(input.host, input.path) {
+    if let Some(name) = resolve_s3_from_host_path(input.host, input.path).or(endpoint_bucket) {
         if registry.lookup(&name).is_some() {
             return Ok(decide(registry, name, ResolutionSource::HostPath));
         }
@@ -229,9 +243,26 @@ fn scope_parts(scope: &str) -> Option<(ServiceName, String)> {
     Some((ServiceName::new(service), region.to_string()))
 }
 
+#[cfg(test)]
 fn ecr_registry_host(host: &str) -> bool {
-    let hostname = host.split(':').next().unwrap_or("").to_ascii_lowercase();
-    if matches!(hostname.as_str(), "localhost" | "127.0.0.1") {
+    ecr_registry_host_for_endpoint(host, None)
+}
+
+fn ecr_registry_host_for_endpoint(host: &str, endpoint: Option<&str>) -> bool {
+    let Ok(authority) = host.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    let hostname = authority.host().to_ascii_lowercase();
+    if crate::tls::endpoint_hostname_matches(&hostname, endpoint.unwrap_or("aws.localhost")) {
+        return true;
+    }
+    if matches!(
+        hostname.as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+    ) {
         return true;
     }
     let Some((account, rest)) = hostname.split_once(".dkr.ecr.") else {
@@ -253,6 +284,17 @@ fn ecr_registry_host(host: &str) -> bool {
 }
 
 /// Detect S3 from a virtual-hosted or `s3.`-prefixed host, or a path-style `/s3/` prefix.
+fn resolve_s3_endpoint_host(host: Option<&str>, endpoint: Option<&str>) -> Option<ServiceName> {
+    let authority = host?.parse::<http::uri::Authority>().ok()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let hostname = authority.host().to_ascii_lowercase();
+    let endpoint = endpoint.unwrap_or("aws.localhost").to_ascii_lowercase();
+    let bucket = hostname.strip_suffix(&format!(".{endpoint}"))?;
+    (!bucket.is_empty() && !bucket.contains('.')).then(|| ServiceName::new("s3"))
+}
+
 fn resolve_s3_from_host_path(host: Option<&str>, path: &str) -> Option<ServiceName> {
     if let Some(host) = host {
         let h = host.to_ascii_lowercase();
@@ -413,6 +455,71 @@ mod tests {
         assert!(!ecr_registry_host(
             "000000000000.dkr.ecr.us-east-1.amazonaws.com.attacker.example"
         ));
+    }
+
+    #[test]
+    fn canonical_and_custom_endpoint_registry_routing_preserves_s3_buckets_and_scope_priority() {
+        let registry = ServiceRegistry::with_known_services();
+        registry.register_native(
+            ServiceName::new("ecr"),
+            ServiceMetadata::new(
+                AwsProtocol::Json11,
+                Some("AmazonEC2ContainerRegistry_V20150921"),
+            ),
+            Arc::new(TestHandler),
+        );
+        let mut input = RouteInput {
+            authorization: Some("Basic token"),
+            x_amz_credential: None,
+            x_amz_target: None,
+            host: Some("aws.localhost:4566"),
+            path: "/v2/",
+            body: b"",
+        };
+        assert_eq!(
+            resolve(&registry, &input).unwrap().service_name.as_str(),
+            "ecr"
+        );
+        input.host = Some("development.example:8443");
+        assert!(resolve(&registry, &input).is_err());
+        assert_eq!(
+            resolve_with_endpoint(&registry, &input, Some("development.example"))
+                .unwrap()
+                .service_name
+                .as_str(),
+            "ecr"
+        );
+        input.host = Some("bucket.development.example:8443");
+        input.authorization = None;
+        assert_eq!(
+            resolve_with_endpoint(&registry, &input, Some("development.example"))
+                .unwrap()
+                .service_name
+                .as_str(),
+            "s3"
+        );
+        input.host = Some("bucket.aws.localhost:4566");
+        assert_eq!(
+            resolve(&registry, &input).unwrap().service_name.as_str(),
+            "s3"
+        );
+        input.authorization =
+            Some("AWS4-HMAC-SHA256 Credential=TEST/20261116/us-east-1/sqs/aws4_request");
+        assert_eq!(
+            resolve(&registry, &input).unwrap().service_name.as_str(),
+            "sqs"
+        );
+        input.authorization = None;
+        for host in [
+            "aws.localhost",
+            "development.example",
+            "bucket.aws.localhost.attacker.invalid",
+            "user@bucket.aws.localhost",
+        ] {
+            input.host = Some(host);
+            input.path = "/object";
+            assert!(resolve(&registry, &input).is_err(), "{host}");
+        }
     }
 
     #[test]

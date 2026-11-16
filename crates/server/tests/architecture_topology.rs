@@ -48,6 +48,7 @@ async fn start(dir: &Path) -> Server {
         .env("LOCALLYCLOUD_STATE_DB", dir.join("state.sqlite3"))
         .env("LOCALLYCLOUD_WORK_DIR", dir.join("work"))
         .env("LOCALLYCLOUD_KMS_MASTER_KEY", TEST_MASTER_KEY)
+        .env("LOCALLYCLOUD_ALLOW_HTTP", "true")
         .env("LOCALLYCLOUD_HOST", "127.0.0.1")
         .env("LOCALLYCLOUD_PORT", "0")
         .env(

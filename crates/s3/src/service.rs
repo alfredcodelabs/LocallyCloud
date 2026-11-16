@@ -26,7 +26,7 @@ use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, Ser
 use locallycloud_state::StateDb;
 use serde::{Deserialize, Serialize};
 
-use crate::addr::{resolve, Shape};
+use crate::addr::{resolve_with_endpoint, Shape};
 use crate::error::S3Error;
 use crate::notifications::{self, DeliveryTarget, EventType};
 use crate::ops::{self, Ctx};
@@ -61,6 +61,7 @@ enum BucketRead {
 
 /// The natively-implemented S3 service.
 pub struct S3Handler {
+    endpoint_hostname: String,
     store: Arc<AccountStore>,
     registry: Weak<ServiceRegistry>,
     notification_tx: mpsc::Sender<NotificationJob>,
@@ -297,6 +298,7 @@ impl S3Handler {
     fn with_registry(registry: Weak<ServiceRegistry>) -> Self {
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_QUEUE_CAPACITY);
         S3Handler {
+            endpoint_hostname: "aws.localhost".into(),
             store: Arc::new(AccountStore::new()),
             registry,
             notification_tx,
@@ -482,7 +484,7 @@ impl S3Handler {
         if is_s3_control(req, host) {
             return self.persist_bucket(&control_account(req, host), None, notifications);
         }
-        match resolve(host, req.uri.path()) {
+        match resolve_with_endpoint(host, req.uri.path(), &self.endpoint_hostname) {
             Shape::Bucket(name) | Shape::Object(name, _) => {
                 self.persist_bucket(storage_account, Some(&name), notifications)
             }
@@ -686,17 +688,18 @@ impl S3Handler {
             .headers
             .get("host")
             .and_then(|value| value.to_str().ok());
-        let (bucket_name, event_count) = match resolve(host, req.uri.path()) {
-            Shape::Object(bucket, _) => (bucket, 1_usize),
-            Shape::Bucket(bucket)
-                if req.method == Method::POST
-                    && QueryParams::parse(req.uri.query()).has("delete") =>
-            {
-                let (objects, _) = ops::parse_delete_request(&req.body)?;
-                (bucket, objects.len().min(1000))
-            }
-            _ => return Ok(0),
-        };
+        let (bucket_name, event_count) =
+            match resolve_with_endpoint(host, req.uri.path(), &self.endpoint_hostname) {
+                Shape::Object(bucket, _) => (bucket, 1_usize),
+                Shape::Bucket(bucket)
+                    if req.method == Method::POST
+                        && QueryParams::parse(req.uri.query()).has("delete") =>
+                {
+                    let (objects, _) = ops::parse_delete_request(&req.body)?;
+                    (bucket, objects.len().min(1000))
+                }
+                _ => return Ok(0),
+            };
         let Some(bucket) = self.store.get(storage_account, &bucket_name) else {
             return Ok(0);
         };
@@ -1342,7 +1345,7 @@ impl S3Handler {
             }
         }
 
-        let shape = resolve(host, req.uri.path());
+        let shape = resolve_with_endpoint(host, req.uri.path(), &self.endpoint_hostname);
         if let Shape::Bucket(bucket) | Shape::Object(bucket, _) = &shape {
             self.check_expected_owner(req, bucket, "x-amz-expected-bucket-owner")?;
             if req.method == Method::PUT && q.has("acl") {
@@ -1886,7 +1889,7 @@ impl NativeHandler for S3Handler {
 
     async fn handle(&self, request: ServiceRequest) -> Response {
         let host = request.headers.get("host").and_then(|v| v.to_str().ok());
-        let shape = resolve(host, request.uri.path());
+        let shape = resolve_with_endpoint(host, request.uri.path(), &self.endpoint_hostname);
         let q = QueryParams::parse(request.uri.query());
         let unsigned_trailer = request
             .headers
@@ -1984,7 +1987,7 @@ impl NativeHandler for S3Handler {
             .get("host")
             .and_then(|value| value.to_str().ok());
         if request.method != Method::OPTIONS && !is_s3_control(&request, host) {
-            let shape = resolve(host, request.uri.path());
+            let shape = resolve_with_endpoint(host, request.uri.path(), &self.endpoint_hostname);
             let bucket = match &shape {
                 Shape::Bucket(bucket) | Shape::Object(bucket, _) => Some(bucket.as_str()),
                 Shape::Service => None,
@@ -2021,7 +2024,22 @@ pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
 ) -> Result<Arc<S3Handler>, String> {
-    let handler = Arc::new(S3Handler::with_state(Arc::downgrade(registry), state)?);
+    register_with_state_and_endpoint(registry, state, "https://aws.localhost:4566")
+}
+
+pub fn register_with_state_and_endpoint(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    endpoint: &str,
+) -> Result<Arc<S3Handler>, String> {
+    let hostname = endpoint
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_ascii_lowercase))
+        .ok_or("S3 endpoint must include a hostname")?;
+    let mut handler = S3Handler::with_state(Arc::downgrade(registry), state)?;
+    handler.endpoint_hostname = hostname;
+    let handler = Arc::new(handler);
     registry.register_native(
         ServiceName::new("s3"),
         ServiceMetadata::new(AwsProtocol::RestXml, None),
@@ -2995,31 +3013,36 @@ mod tests {
             "legacy-plaintext"
         );
         assert_eq!(body_string(ordinary).await.1, "legacy secret");
-        for headers in [
-            VERIFIED_WRITE_HEADERS,
-            &[
-                ("x-locallycloud-verified-internal-scope", "1"),
-                (
-                    "x-locallycloud-caller-principal",
-                    "arn:aws:iam::000000000000:role/path/worker/session",
-                ),
-            ][..],
+        let mut delegated = req(
+            Method::GET,
+            "/bucket/source",
+            "",
+            &[("x-locallycloud-verified-internal-scope", "1")],
+        );
+        locallycloud_core::integration::identity::IdentityPropagator::attach(
+            &mut delegated.headers,
+            &CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/path/worker".into(),
+                session_name: "session".into(),
+            },
+        );
+        for request in [
+            req(Method::GET, "/bucket/source", "", VERIFIED_WRITE_HEADERS),
+            delegated,
         ] {
-            let denied = h
-                .handle(req(Method::GET, "/bucket/source", "", headers))
-                .await;
+            let denied = h.handle(request.clone()).await;
             let (status, body) = body_string(denied).await;
             assert_eq!(status, 403);
             assert!(body.contains("migrate-s3-encryption"));
             assert!(!body.contains("legacy secret"));
-            let mut copy_headers = headers.to_vec();
-            copy_headers.push(("x-amz-copy-source", "/bucket/source"));
-            assert_eq!(
-                h.handle(req(Method::PUT, "/bucket/copy", "", &copy_headers))
-                    .await
-                    .status(),
-                403
+            let mut copy = request;
+            copy.method = Method::PUT;
+            copy.uri = "/bucket/copy".parse().unwrap();
+            copy.headers.insert(
+                "x-amz-copy-source",
+                HeaderValue::from_static("/bucket/source"),
             );
+            assert_eq!(h.handle(copy).await.status(), 403);
         }
         let initiated = h
             .handle(req(Method::POST, "/bucket/final?uploads", "", &[]))

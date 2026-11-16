@@ -112,6 +112,59 @@ impl KmsService {
         })
     }
 
+    pub(crate) fn request_key_id(
+        &self,
+        operation: &str,
+        body: &Map<String, Value>,
+        account: &str,
+        region: &str,
+    ) -> Result<String, KmsError> {
+        if operation != "Decrypt" || body.contains_key("KeyId") {
+            return required_string(body, "KeyId").map(str::to_owned);
+        }
+        let envelope =
+            crypto::parse_envelope(&decode_blob(body, "CiphertextBlob", crypto::MAX_ENVELOPE)?)?;
+        if envelope.scope != Scope::new(account, region) {
+            return Err(KmsError::InvalidCiphertext);
+        }
+        Ok(envelope.key_id)
+    }
+
+    pub(crate) fn request_alias_name<'a>(
+        &self,
+        body: &'a Map<String, Value>,
+    ) -> Result<&'a str, KmsError> {
+        required_alias_name(body, "AliasName")
+    }
+
+    pub(crate) fn request_alias_target<'a>(
+        &self,
+        body: &'a Map<String, Value>,
+    ) -> Result<&'a str, KmsError> {
+        required_string(body, "TargetKeyId")
+    }
+
+    pub(crate) fn public_encryption_context(
+        &self,
+        body: &Map<String, Value>,
+    ) -> Result<BTreeMap<String, Vec<String>>, KmsError> {
+        let encryption = encryption_context(body)?;
+        let mut context = BTreeMap::from([(
+            "kms:encryptioncontextkeys".into(),
+            encryption.keys().cloned().collect(),
+        )]);
+        for (key, value) in encryption {
+            context
+                .entry(format!(
+                    "kms:encryptioncontext:{}",
+                    key.to_ascii_lowercase()
+                ))
+                .or_insert_with(Vec::new)
+                .push(value);
+        }
+        Ok(context)
+    }
+
     pub(crate) fn dispatch(
         &self,
         operation: &str,
@@ -249,9 +302,7 @@ impl KmsService {
                 if !key.is_enabled() {
                     return Err(inactive_key_error(key));
                 }
-                if call.source_service == "s3"
-                    && !internal_policy_allows(key, &call, "kms:Encrypt", &encryption_context)
-                {
+                if !internal_policy_allows(key, &call, "kms:Encrypt", &encryption_context) {
                     return Err(KmsError::AccessDenied);
                 }
                 crypto::seal(
@@ -482,9 +533,6 @@ impl KmsService {
                 if !key.is_enabled() {
                     return Err(inactive_key_error(key));
                 }
-                if !policy_allows(key, None, "kms:Decrypt", None, scope, false) {
-                    return Err(KmsError::AccessDenied);
-                }
                 let material = key
                     .material_for(envelope.material_version)
                     .ok_or(KmsError::InvalidCiphertext)?;
@@ -538,9 +586,6 @@ impl KmsService {
             .with_key(scope, &key_id, |key| {
                 if !key.is_enabled() {
                     return Err(inactive_key_error(key));
-                }
-                if !policy_allows(key, None, "kms:GenerateDataKey", None, scope, false) {
-                    return Err(KmsError::AccessDenied);
                 }
                 crypto::seal(
                     &key.material,
@@ -647,7 +692,10 @@ fn internal_policy_allows(
         return false;
     }
     if !key.explicit_policy
-        && (!matches!(call.source_service.as_str(), "s3" | "dynamodb") || call.caller_arn.is_none())
+        && (call.caller_arn.is_none()
+            || (key.manager == KeyManager::Aws
+                && matches!(call.source_service.as_str(), "ssm" | "secretsmanager")
+                && key.owner_service.as_deref() == Some(call.source_service.as_str())))
     {
         // Unknown development identities retain permissive-mode behavior. The strict IAM
         // capability sets iam_policy_denied for unresolved identities before reaching here.
@@ -689,24 +737,6 @@ fn internal_policy_allows(
         call.iam_policy_allowed,
         &context,
     )
-}
-
-fn policy_allows(
-    key: &KeyRecord,
-    principal: Option<&str>,
-    action: &str,
-    source_arn: Option<&str>,
-    scope: &Scope,
-    iam_policy_allowed: bool,
-) -> bool {
-    !key.explicit_policy
-        || key.policy.allows_with_iam(
-            principal,
-            action,
-            source_arn,
-            &scope.account_id,
-            iam_policy_allowed,
-        )
 }
 
 fn policy_name(body: &Map<String, Value>) -> Result<(), KmsError> {

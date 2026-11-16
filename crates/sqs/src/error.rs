@@ -52,6 +52,8 @@ pub enum SqsError {
     OverLimit(String),
     #[error("Access to the specified resource is denied.")]
     AccessDenied,
+    #[error("The request must use HTTPS and Signature Version 4.")]
+    InvalidSecurity,
     #[error("The caller does not have the required AWS KMS access for this queue.")]
     KmsAccessDenied,
 }
@@ -80,6 +82,7 @@ impl SqsError {
             SqsError::UnsupportedOperation(_) => "UnsupportedOperation",
             SqsError::OverLimit(_) => "OverLimit",
             SqsError::AccessDenied => "AccessDenied",
+            SqsError::InvalidSecurity => "InvalidSecurity",
             SqsError::KmsAccessDenied => "KMS.AccessDeniedException",
         }
     }
@@ -121,6 +124,7 @@ impl SqsError {
             SqsError::InvalidMessageContents => "InvalidMessageContents",
             SqsError::OverLimit(_) => "OverLimit",
             SqsError::AccessDenied => "AccessDenied",
+            SqsError::InvalidSecurity => "InvalidSecurity",
             SqsError::KmsAccessDenied => "KMS.AccessDeniedException",
         }
     }

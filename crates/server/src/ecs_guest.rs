@@ -1,6 +1,6 @@
 //! Task-owned credential, native SDK and awslogs bridges. No host endpoint is exposed.
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
 use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
@@ -29,11 +29,14 @@ use locallycloud_core::router::{
     extract_region_from_credential_scope, extract_service_from_credential_scope, resolve,
     RouteDisposition, RouteInput,
 };
+use locallycloud_core::tls::{ConnectionInfo, DomainListener, GuestCallbackTls};
 use locallycloud_ec2::{Ec2Handler, TaskNetworkLease};
 use locallycloud_ecs::TaskLaunch;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
+#[cfg(test)]
+use tokio::net::TcpStream;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
@@ -70,6 +73,9 @@ pub struct PreparedGuest {
     state: Arc<GuestState>,
     task_id: String,
     logs: Option<PreparedLogs>,
+    tls: Arc<GuestCallbackTls>,
+    endpoint: String,
+    aws_port: u16,
 }
 
 struct PreparedLogs {
@@ -88,15 +94,57 @@ pub struct GuestEndpoints {
     closed: Arc<AtomicBool>,
 }
 
+fn task_endpoint_port(endpoint: &str) -> Result<u16, String> {
+    let uri: http::Uri = endpoint.parse().map_err(|_| "Invalid task SDK endpoint")?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
+        return Err("Task SDK endpoint must use HTTP or HTTPS".into());
+    }
+    Ok(uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }))
+}
+
 impl PreparedGuest {
     /// Prepare before image execution. Issued task credentials never include execution credentials.
+    #[cfg(test)]
     pub async fn prepare(
         registry: Weak<ServiceRegistry>,
         ec2: Arc<Ec2Handler>,
         task: &TaskLaunch,
         network: &TaskNetworkLease,
     ) -> Result<Self, String> {
-        if [CREDENTIALS_PORT, AWS_GATEWAY_PORT, VPC_EGRESS_PORT].contains(&task.port) {
+        let tls = Arc::new(
+            GuestCallbackTls::for_hostname("aws.localhost".into())
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        Self::prepare_with_endpoint(
+            registry,
+            ec2,
+            task,
+            network,
+            format!("https://aws.localhost:{AWS_GATEWAY_PORT}"),
+            tls,
+        )
+        .await
+    }
+
+    pub async fn prepare_with_endpoint(
+        registry: Weak<ServiceRegistry>,
+        ec2: Arc<Ec2Handler>,
+        task: &TaskLaunch,
+        network: &TaskNetworkLease,
+        endpoint: String,
+        tls: Arc<GuestCallbackTls>,
+    ) -> Result<Self, String> {
+        let aws_port = task_endpoint_port(&endpoint)?;
+        if [CREDENTIALS_PORT, VPC_EGRESS_PORT].contains(&aws_port)
+            || [CREDENTIALS_PORT, aws_port, VPC_EGRESS_PORT].contains(&task.port)
+        {
             return Err("Application port conflicts with a reserved task networking port".into());
         }
         let state = Arc::new(GuestState {
@@ -198,11 +246,14 @@ impl PreparedGuest {
             state,
             task_id: task.task_id.clone(),
             logs,
+            tls,
+            endpoint,
+            aws_port,
         })
     }
 
     pub fn ports(&self) -> Vec<u16> {
-        let mut ports = vec![AWS_GATEWAY_PORT];
+        let mut ports = vec![self.aws_port];
         if self.state.task_role.is_some() {
             ports.push(CREDENTIALS_PORT);
         }
@@ -235,10 +286,7 @@ impl PreparedGuest {
         }
         environment.insert("AWS_SHARED_CREDENTIALS_FILE".into(), "/dev/null".into());
         environment.insert("AWS_CONFIG_FILE".into(), "/dev/null".into());
-        environment.insert(
-            "AWS_ENDPOINT_URL".into(),
-            format!("http://127.0.0.1:{AWS_GATEWAY_PORT}"),
-        );
+        environment.insert("AWS_ENDPOINT_URL".into(), self.endpoint.clone());
         environment.insert("AWS_REGION".into(), self.state.region.clone());
         environment.insert("AWS_DEFAULT_REGION".into(), self.state.region.clone());
         environment.insert("AWS_EC2_METADATA_DISABLED".into(), "true".into());
@@ -331,13 +379,28 @@ impl PreparedGuest {
             }));
             let mut server_stop = stop.clone();
             let connection_stop = closed.clone();
-            servers.push(tokio::spawn(async move {
-                let _ = axum::serve(LimitedListener::new(listener, 8, connection_stop), router)
+            if credentials {
+                servers.push(tokio::spawn(async move {
+                    let _ = axum::serve(LimitedListener::new(listener, 8, connection_stop), router)
+                        .with_graceful_shutdown(async move {
+                            let _ = server_stop.changed().await;
+                        })
+                        .await;
+                }));
+            } else {
+                let listener = DomainListener::new(listener, Some(self.tls.clone()))
+                    .with_plain_http(self.endpoint.starts_with("http://"));
+                servers.push(tokio::spawn(async move {
+                    let _ = axum::serve(
+                        LimitedListener::new(listener, 8, connection_stop),
+                        router.into_make_service_with_connect_info::<GuestConnection>(),
+                    )
                     .with_graceful_shutdown(async move {
                         let _ = server_stop.changed().await;
                     })
                     .await;
-            }));
+                }));
+            }
         }
         let dropped_log_bytes = Arc::new(AtomicU64::new(0));
         let logs = self.logs.map(|logs| {
@@ -680,16 +743,26 @@ impl GuestState {
                 protocol,
             );
         };
+        let Some(ConnectInfo(GuestConnection(connection))) =
+            parts.extensions.get::<ConnectInfo<GuestConnection>>()
+        else {
+            return error(
+                "ServiceUnavailableException",
+                "Task connection metadata is unavailable",
+                503,
+                protocol,
+            );
+        };
         let dispatched = timeout(
             Duration::from_secs(15),
-            dispatcher.dispatch_scoped(
+            dispatcher.dispatch_verified_connection(
                 &parts.method,
                 &parts.uri,
                 &parts.headers,
                 bytes,
                 &Uuid::new_v4().to_string(),
-                &self.account,
-                &self.region,
+                connection.peer.ip(),
+                connection.secure_transport,
             ),
         )
         .await;
@@ -886,14 +959,28 @@ async fn forward_logs(
     }
 }
 
+#[derive(Clone)]
+struct GuestConnection(ConnectionInfo);
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, LimitedListener<DomainListener>>,
+    > for GuestConnection
+{
+    fn connect_info(
+        stream: axum::serve::IncomingStream<'_, LimitedListener<DomainListener>>,
+    ) -> Self {
+        Self(stream.remote_addr().clone())
+    }
+}
+
 /// Limit complete HTTP connections, including slow response consumers and keepalive.
-struct LimitedListener {
-    inner: TcpListener,
+struct LimitedListener<L> {
+    inner: L,
     slots: Arc<Semaphore>,
     closed: Arc<AtomicBool>,
 }
-impl LimitedListener {
-    fn new(inner: TcpListener, slots: usize, closed: Arc<AtomicBool>) -> Self {
+impl<L> LimitedListener<L> {
+    fn new(inner: L, slots: usize, closed: Arc<AtomicBool>) -> Self {
         Self {
             inner,
             slots: Arc::new(Semaphore::new(slots)),
@@ -901,25 +988,19 @@ impl LimitedListener {
         }
     }
 }
-struct LimitedStream {
-    inner: TcpStream,
+struct LimitedStream<S> {
+    inner: S,
     _permit: OwnedSemaphorePermit,
     deadline: Pin<Box<tokio::time::Sleep>>,
     stop_tick: Pin<Box<tokio::time::Sleep>>,
     closed: Arc<AtomicBool>,
 }
-impl axum::serve::Listener for LimitedListener {
-    type Io = LimitedStream;
-    type Addr = SocketAddr;
+impl<L: axum::serve::Listener> axum::serve::Listener for LimitedListener<L> {
+    type Io = LimitedStream<L::Io>;
+    type Addr = L::Addr;
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, address) = match self.inner.accept().await {
-                Ok(value) => value,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    continue;
-                }
-            };
+            let (stream, address) = self.inner.accept().await;
             let Ok(permit) = self.slots.clone().try_acquire_owned() else {
                 drop(stream);
                 continue;
@@ -940,7 +1021,7 @@ impl axum::serve::Listener for LimitedListener {
         self.inner.local_addr()
     }
 }
-impl LimitedStream {
+impl<S> LimitedStream<S> {
     fn closing(&mut self, context: &mut Context<'_>) -> bool {
         if self.closed.load(Ordering::Acquire)
             || std::future::Future::poll(self.deadline.as_mut(), context).is_ready()
@@ -956,7 +1037,7 @@ impl LimitedStream {
         false
     }
 }
-impl AsyncRead for LimitedStream {
+impl<S: AsyncRead + Unpin> AsyncRead for LimitedStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -968,7 +1049,7 @@ impl AsyncRead for LimitedStream {
         Pin::new(&mut self.inner).poll_read(context, buffer)
     }
 }
-impl AsyncWrite for LimitedStream {
+impl<S: AsyncWrite + Unpin> AsyncWrite for LimitedStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -1079,6 +1160,21 @@ mod tests {
         (registry, state, issuer)
     }
 
+    #[test]
+    fn task_sdk_endpoint_admits_explicit_http_compatibility_and_https() {
+        for (endpoint, port) in [
+            ("http://127.0.0.1", 80),
+            ("https://aws.localhost", 443),
+            ("https://aws.localhost:4566", 4566),
+            ("http://localhost:4566", 4566),
+        ] {
+            assert_eq!(task_endpoint_port(endpoint).unwrap(), port);
+        }
+        for endpoint in ["ftp://aws.localhost", "file:///tmp/server", "/relative", ""] {
+            assert!(task_endpoint_port(endpoint).is_err(), "{endpoint}");
+        }
+    }
+
     #[tokio::test]
     async fn task_credentials_are_cached_expiring_and_never_injected_as_static_keys() {
         let (_registry, state, issuer) = state();
@@ -1119,6 +1215,13 @@ mod tests {
             state,
             task_id: "task".into(),
             logs: None,
+            tls: Arc::new(
+                GuestCallbackTls::for_hostname("aws.localhost".into())
+                    .await
+                    .unwrap(),
+            ),
+            endpoint: format!("https://aws.localhost:{AWS_GATEWAY_PORT}"),
+            aws_port: AWS_GATEWAY_PORT,
         };
         let mut env = HashMap::from([
             ("AWS_ACCESS_KEY_ID".into(), "admin".into()),
@@ -1138,6 +1241,7 @@ mod tests {
         assert!(!env.contains_key("AWS_WEB_IDENTITY_TOKEN_FILE"));
         assert_eq!(env["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
         assert_eq!(env["AWS_CONFIG_FILE"], "/dev/null");
+        assert_eq!(env["AWS_ENDPOINT_URL"], "https://aws.localhost:18082");
         assert_eq!(
             env["AWS_CONTAINER_CREDENTIALS_FULL_URI"],
             "http://127.0.0.1:18081/v2/credentials/task"
@@ -1173,6 +1277,74 @@ mod tests {
             String::from_utf8_lossy(&to_bytes(response.into_body(), 4096).await.unwrap())
                 .contains("VpcEndpointUnavailableException")
         );
+    }
+
+    #[tokio::test]
+    async fn sdk_tls_listener_keeps_physical_context_and_connection_cancellation() {
+        let tls = Arc::new(
+            GuestCallbackTls::for_hostname("aws.localhost".into())
+                .await
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let listener = LimitedListener::new(
+            DomainListener::new(listener, Some(tls.clone())).with_plain_http(false),
+            8,
+            closed.clone(),
+        );
+        let router = Router::new().fallback(any(
+            |ConnectInfo(GuestConnection(connection)): ConnectInfo<GuestConnection>| async move {
+                assert!(connection.peer.ip().is_loopback());
+                format!(
+                    "{}:{}",
+                    connection.secure_transport,
+                    connection.server_name.unwrap_or_default()
+                )
+            },
+        ));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<GuestConnection>(),
+            )
+            .await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(reqwest::Certificate::from_pem(tls.ca_pem().as_bytes()).unwrap())
+            .resolve("aws.localhost", address)
+            .resolve("bucket.aws.localhost", address)
+            .resolve("sync-aws.localhost", address)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        for hostname in [
+            "aws.localhost",
+            "bucket.aws.localhost",
+            "sync-aws.localhost",
+        ] {
+            let response = client
+                .get(format!("https://{hostname}:{}/", address.port()))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), format!("true:{hostname}"));
+        }
+        assert!(client
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .is_err());
+        closed.store(true, Ordering::Release);
+        assert!(client
+            .get(format!("https://aws.localhost:{}/", address.port()))
+            .send()
+            .await
+            .is_err());
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -1274,9 +1446,12 @@ mod tests {
             "x-locallycloud-verified-internal-scope",
             http::HeaderValue::from_static("1"),
         );
-        headers.insert(
-            "x-locallycloud-caller-principal",
-            http::HeaderValue::from_static("arn:aws:iam::000000000000:role/operator/setup"),
+        locallycloud_core::integration::identity::IdentityPropagator::attach(
+            &mut headers,
+            &CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/operator".into(),
+                session_name: "setup".into(),
+            },
         );
         if let Some(target) = target {
             headers.insert("x-amz-target", target.parse().unwrap());
@@ -1389,6 +1564,14 @@ mod tests {
         *request.method_mut() = Method::POST;
         *request.uri_mut() = "/".parse().unwrap();
         *request.headers_mut() = headers;
+        // In-process requests model a completed guest TLS connection; wire tests exercise the listener.
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(GuestConnection(ConnectionInfo {
+                peer: (Ipv4Addr::LOCALHOST, 40000).into(),
+                server_name: Some("aws.localhost".into()),
+                secure_transport: true,
+            })));
         request
     }
     async fn external(registry: &ServiceRegistry, request: Request) -> Response {
@@ -1476,10 +1659,10 @@ mod tests {
         ));
         let trust = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}}"#;
         for role in ["task", "execution", "operator"] {
-            let actions = match role {
-                "task" => "dynamodb:*",
-                "execution" => "logs:*",
-                "operator" => "ec2:*",
+            let actions: &[&str] = match role {
+                "task" => &["dynamodb:*"],
+                "execution" => &["logs:*"],
+                "operator" => &["ec2:*", "ssm:PutParameter"],
                 _ => unreachable!(),
             };
             let policy = serde_json::json!({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":actions,"Resource":"*"}}).to_string();

@@ -43,11 +43,28 @@ pub struct IdentityPropagator;
 
 /// Internal header carrying the propagated cross-service principal (audit/enforcement only).
 pub const PRINCIPAL_HEADER: &str = "x-locallycloud-caller-principal";
+pub const ROLE_ARN_HEADER: &str = "x-locallycloud-caller-role-arn";
+pub const SESSION_NAME_HEADER: &str = "x-locallycloud-caller-session-name";
 
 impl IdentityPropagator {
     /// Attach the identity's principal to the outbound headers. Returns the principal string
     /// written, for correlation. Never writes secrets or tokens.
     pub fn attach(headers: &mut http::HeaderMap, identity: &CallerIdentity) -> String {
+        headers.remove(ROLE_ARN_HEADER);
+        headers.remove(SESSION_NAME_HEADER);
+        if let CallerIdentity::AssumedRole {
+            role_arn,
+            session_name,
+        } = identity
+        {
+            if let (Ok(role), Ok(session)) = (
+                http::HeaderValue::from_str(role_arn),
+                http::HeaderValue::from_str(session_name),
+            ) {
+                headers.insert(ROLE_ARN_HEADER, role);
+                headers.insert(SESSION_NAME_HEADER, session);
+            }
+        }
         let principal = identity.principal();
         if let Ok(value) = http::HeaderValue::from_str(&principal) {
             headers.insert(PRINCIPAL_HEADER, value);
@@ -66,9 +83,14 @@ pub fn trusted_role(request: &crate::handler::ServiceRequest) -> Option<CallerId
         return None;
     }
     let principal = request.headers.get(PRINCIPAL_HEADER)?.to_str().ok()?;
-    let (role_arn, session_name) = principal.rsplit_once('/')?;
+    let role_arn = request.headers.get(ROLE_ARN_HEADER)?.to_str().ok()?;
+    let session_name = request.headers.get(SESSION_NAME_HEADER)?.to_str().ok()?;
     let prefix = format!("arn:aws:iam::{}:role/", request.account_id);
-    if !role_arn.starts_with(&prefix) || role_arn.len() <= prefix.len() || session_name.is_empty() {
+    if !role_arn.starts_with(&prefix)
+        || role_arn.len() <= prefix.len()
+        || session_name.is_empty()
+        || principal != format!("{role_arn}/{session_name}")
+    {
         return None;
     }
     Some(CallerIdentity::AssumedRole {
@@ -103,6 +125,25 @@ mod tests {
             http::HeaderValue::from_static("1"),
         );
         assert_eq!(trusted_role(&request), Some(role));
+        request.headers.insert(
+            PRINCIPAL_HEADER,
+            http::HeaderValue::from_static("arn:aws:iam::000000000000:role/path/worker/other"),
+        );
+        assert_eq!(trusted_role(&request), None);
+        request.headers.remove(ROLE_ARN_HEADER);
+        request.headers.remove(SESSION_NAME_HEADER);
+        request.headers.insert(
+            PRINCIPAL_HEADER,
+            http::HeaderValue::from_static("arn:aws:iam::000000000000:role/path/worker"),
+        );
+        assert_eq!(trusted_role(&request), None);
+        IdentityPropagator::attach(
+            &mut request.headers,
+            &CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/path/worker".into(),
+                session_name: "sfn".into(),
+            },
+        );
         request.account_id = "999999999999".into();
         assert_eq!(trusted_role(&request), None);
     }

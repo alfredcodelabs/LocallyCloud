@@ -59,16 +59,17 @@ pub struct ReqwestHttpClient;
 // Keep the old exported name for crate-internal test constructors outside this audited file set.
 pub use ReqwestHttpClient as CurlHttpClient;
 
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+}
+
 fn client() -> Result<&'static reqwest::Client, HttpError> {
     static CLIENT: OnceLock<Result<reqwest::Client, HttpError>> = OnceLock::new();
     CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(30))
-                .build()
-                .map_err(|_| HttpError)
-        })
+        .get_or_init(|| client_builder().build().map_err(|_| HttpError))
         .as_ref()
         .map_err(|_| HttpError)
 }
@@ -119,6 +120,89 @@ mod tests {
     async fn rejects_non_https_without_external_process() {
         let request = HttpRequest::new(Method::GET, "http://example.invalid");
         assert_eq!(ReqwestHttpClient.send(request).await, Err(HttpError));
+    }
+
+    #[tokio::test]
+    async fn outbound_client_preserves_redirect_status_without_forwarding_credentials() {
+        use axum::{extract::Request, routing::any, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let client = client_builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_url = format!("http://{}", sink.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let sink_hits = hits.clone();
+        let sink_task = tokio::spawn(async move {
+            axum::serve(
+                sink,
+                Router::new().fallback(any(move || {
+                    let hits = sink_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        "ok"
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}", source.local_addr().unwrap());
+        let location = sink_url.clone();
+        let source_task = tokio::spawn(async move {
+            axum::serve(
+                source,
+                Router::new().fallback(any(move |request: Request| {
+                    let location = location.clone();
+                    async move {
+                        let status = request
+                            .uri()
+                            .path()
+                            .trim_start_matches('/')
+                            .parse::<u16>()
+                            .unwrap();
+                        http::Response::builder()
+                            .status(status)
+                            .header("location", location)
+                            .body(axum::body::Body::from("ok"))
+                            .unwrap()
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        for status in [301, 302, 303, 307, 308] {
+            let response = client
+                .post(format!("{source_url}/{status}"))
+                .header("x-api-key", "fictional-key")
+                .body("client_secret=fictional-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client
+                .post(format!("{source_url}/200"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(client.post(sink_url).send().await.unwrap().status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        source_task.abort();
+        sink_task.abort();
+        let _ = source_task.await;
+        let _ = sink_task.await;
     }
 
     #[test]

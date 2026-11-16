@@ -993,6 +993,7 @@ mod tests {
                 Subnet {
                     id: id.into(),
                     vpc_id: "vpc-1".into(),
+                    tags: BTreeMap::new(),
                     cidr,
                     zone: "us-east-1a".into(),
                     owner: "111".into(),

@@ -794,9 +794,12 @@ mod tests {
             "x-locallycloud-verified-internal-scope",
             HeaderValue::from_static("1"),
         );
-        delegated.headers.insert(
-            "x-locallycloud-caller-principal",
-            HeaderValue::from_static("arn:aws:iam::000000000000:role/worker/sfn"),
+        locallycloud_core::integration::identity::IdentityPropagator::attach(
+            &mut delegated.headers,
+            &locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/worker".into(),
+                session_name: "sfn".into(),
+            },
         );
         assert_eq!(handler.handle(delegated).await.status(), 400);
         assert!(engine.calls.lock().unwrap().is_empty());

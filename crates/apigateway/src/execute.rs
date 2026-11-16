@@ -1,7 +1,7 @@
 //! REST API v1 and HTTP API v2 execute paths.
 
 use std::collections::BTreeMap;
-use std::sync::Weak;
+use std::sync::{OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -12,7 +12,10 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 use tokio::time::timeout;
 
+use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
+use locallycloud_core::integration::identity::{CallerIdentity, IdentityPropagator};
 use locallycloud_core::integration::lambda::MAX_TRACE_HEADER_LEN;
+use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::ServiceRegistry;
 use locallycloud_wafv2::{WafDecision, WafEvaluator, WafRequest};
 
@@ -796,6 +799,7 @@ async fn invoke_rest_inner(
         host,
         uri,
         headers,
+        rest_authorization_type: Some(auth_type),
         body,
         api_id: target.api_id,
         stage: &stage,
@@ -814,6 +818,7 @@ struct IntegrationRequest<'a> {
     host: &'a str,
     uri: &'a Uri,
     headers: &'a HeaderMap,
+    rest_authorization_type: Option<&'a str>,
     body: Bytes,
     api_id: &'a str,
     stage: &'a str,
@@ -1274,6 +1279,7 @@ async fn invoke_http_inner(
         host,
         uri,
         headers,
+        rest_authorization_type: None,
         body,
         api_id: target.api_id,
         stage: &stage,
@@ -1558,9 +1564,23 @@ async fn lambda_authorize(
         .or_else(|| authorizer.get("authorizerURI"))
         .and_then(Value::as_str)
         .ok_or(500u16)?;
-    let output = invoke_lambda(ctx, function, Bytes::from(event.to_string()), 29_000)
-        .await
-        .map_err(|_| 500u16)?;
+    let source_arn = format!(
+        "arn:aws:execute-api:{}:{}:{api_id}/authorizers/{authorizer_id}",
+        ctx.region, ctx.account
+    );
+    let output = invoke_lambda(
+        ctx,
+        function,
+        Bytes::from(event.to_string()),
+        29_000,
+        &source_arn,
+        authorizer
+            .get("authorizerCredentials")
+            .or_else(|| authorizer.get("authorizerCredentialsArn"))
+            .and_then(Value::as_str),
+    )
+    .await
+    .map_err(|_| 500u16)?;
     if output.function_error {
         return Err(500);
     }
@@ -1841,6 +1861,11 @@ async fn execute_http_integration(
                 &function,
                 Bytes::from(event.to_string()),
                 timeout_ms(integration),
+                &integration_source_arn(ctx, &request),
+                integration
+                    .get("credentials")
+                    .or_else(|| integration.get("credentialsArn"))
+                    .and_then(Value::as_str),
             )
             .await
             {
@@ -1891,6 +1916,11 @@ async fn execute_rest_integration(
                 &function,
                 Bytes::from(event.to_string()),
                 timeout_ms(integration),
+                &integration_source_arn(ctx, &request),
+                integration
+                    .get("credentials")
+                    .or_else(|| integration.get("credentialsArn"))
+                    .and_then(Value::as_str),
             )
             .await
             {
@@ -1950,23 +1980,28 @@ async fn execute_rest_integration(
                 }
             };
             let response = match target.operation {
-                AwsIntegrationOperation::Lambda => {
-                    invoke_lambda(ctx, &uri, mapped, timeout_ms(integration))
-                        .await
-                        .map(|output| {
-                            let selection = if output.function_error {
-                                String::from_utf8_lossy(&output.body).into_owned()
-                            } else {
-                                output.status.to_string()
-                            };
-                            RawIntegrationResponse {
-                                status: output.status,
-                                headers: output.headers,
-                                body: output.body,
-                                selection,
-                            }
-                        })
-                }
+                AwsIntegrationOperation::Lambda => invoke_lambda(
+                    ctx,
+                    &uri,
+                    mapped,
+                    timeout_ms(integration),
+                    &integration_source_arn(ctx, &request),
+                    integration.get("credentials").and_then(Value::as_str),
+                )
+                .await
+                .map(|output| {
+                    let selection = if output.function_error {
+                        String::from_utf8_lossy(&output.body).into_owned()
+                    } else {
+                        output.status.to_string()
+                    };
+                    RawIntegrationResponse {
+                        status: output.status,
+                        headers: output.headers,
+                        body: output.body,
+                        selection,
+                    }
+                }),
                 AwsIntegrationOperation::Action(_) | AwsIntegrationOperation::Path(_) => {
                     invoke_aws_native(ctx, integration, &request, target, mapped).await
                 }
@@ -2141,7 +2176,24 @@ async fn invoke_aws_native(
         .unwrap_or_else(|| request.method.clone());
     let mut headers = request.headers.clone();
     headers.remove(http::header::HOST);
-    set_dispatch_authorization(&mut headers, target.region, target.service)?;
+    headers.remove("x-amz-target");
+    let action = match target.operation {
+        AwsIntegrationOperation::Action(operation) => format!("{}:{operation}", target.service),
+        AwsIntegrationOperation::Path(_) => format!("{}:{}", target.service, method),
+        AwsIntegrationOperation::Lambda => return Err(InvokeFailure::Configuration),
+    };
+    let attested = integration_headers(
+        &registry,
+        ctx.account,
+        target.region,
+        target.service,
+        &action,
+        "*",
+        &integration_source_arn(ctx, request),
+        integration.get("credentials").and_then(Value::as_str),
+    )
+    .map_err(|_| InvokeFailure::Configuration)?;
+    headers.extend(attested);
     let uri = match target.operation {
         AwsIntegrationOperation::Action(operation) => {
             headers.insert(
@@ -2163,7 +2215,15 @@ async fn invoke_aws_native(
     };
     let response = timeout(
         Duration::from_millis(timeout_ms(integration)),
-        dispatcher.dispatch(&method, &uri, &headers, body, ctx.request_id),
+        dispatcher.dispatch_scoped(
+            &method,
+            &uri,
+            &headers,
+            body,
+            ctx.request_id,
+            ctx.account,
+            target.region,
+        ),
     )
     .await
     .map_err(|_| InvokeFailure::Timeout)?;
@@ -2235,16 +2295,30 @@ async fn forward_http_raw(
         .http
         .request(method, uri)
         .timeout(Duration::from_millis(timeout_ms(integration)));
+    let drop_authorization = match request.rest_authorization_type {
+        Some("AWS_IAM") => true,
+        Some(_) => request
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split_ascii_whitespace().next())
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("AWS4-HMAC-SHA256")),
+        None => false,
+    };
     for (name, value) in request.headers.iter() {
-        if name != http::header::HOST {
-            builder = builder.header(name, value);
+        if name == http::header::HOST
+            || name == http::header::CONTENT_LENGTH
+            || (drop_authorization && name == http::header::AUTHORIZATION)
+        {
+            continue;
         }
+        builder = builder.header(name, value);
     }
-    let response = builder.body(body.to_vec()).send().await.map_err(|error| {
+    let response = builder.body(body).send().await.map_err(|error| {
         if error.is_timeout() {
             InvokeFailure::Timeout
         } else {
-            tracing::warn!(request_id = ctx.request_id, cause = %error, "HTTP integration failed");
+            tracing::warn!(request_id = ctx.request_id, cause = %error.without_url(), "HTTP integration failed");
             InvokeFailure::Dispatch
         }
     })?;
@@ -2509,8 +2583,11 @@ pub(crate) fn substitute_uri(
     variables: &BTreeMap<String, String>,
     path: &BTreeMap<String, String>,
 ) -> String {
-    let stage_variable = Regex::new(r"\$\{stageVariables\.([A-Za-z0-9_]+)\}")
-        .expect("stage-variable pattern is valid");
+    static STAGE_VARIABLE: OnceLock<Regex> = OnceLock::new();
+    let stage_variable = STAGE_VARIABLE.get_or_init(|| {
+        Regex::new(r"\$\{stageVariables\.([A-Za-z0-9_]+)\}")
+            .expect("stage-variable pattern is valid")
+    });
     let mut output = stage_variable
         .replace_all(uri, |captures: &regex::Captures<'_>| {
             variables
@@ -2540,11 +2617,81 @@ fn set_dispatch_authorization(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn integration_headers(
+    registry: &ServiceRegistry,
+    account: &str,
+    region: &str,
+    service: &str,
+    action: &str,
+    resource: &str,
+    source_arn: &str,
+    credentials: Option<&str>,
+) -> Result<HeaderMap, ()> {
+    let mut headers = HeaderMap::new();
+    set_dispatch_authorization(&mut headers, region, service).map_err(|_| ())?;
+    headers.insert(
+        "x-locallycloud-source-arn",
+        source_arn.parse().map_err(|_| ())?,
+    );
+    headers.insert(
+        "x-locallycloud-source-account",
+        account.parse().map_err(|_| ())?,
+    );
+    let identity = match credentials {
+        Some(role) => {
+            if !role.starts_with(&format!("arn:aws:iam::{account}:role/")) {
+                return Err(());
+            }
+            if let Some(evaluator) = registry
+                .authorization_evaluator(&locallycloud_core::registry::ServiceName::new("iam"))
+            {
+                if evaluator.strict_sigv4_required() {
+                    evaluator
+                        .authorize_service_role_trust(ServiceRoleAuthorizationRequest {
+                            delegated_caller: None,
+                            caller_context: Default::default(),
+                            caller: RequestIdentity {
+                                account_id: account.into(),
+                                access_key_id: None,
+                                arn: None,
+                            },
+                            role_arn: role.into(),
+                            service_principal: "apigateway.amazonaws.com".into(),
+                            source_arn: Some(source_arn.into()),
+                            action: action.into(),
+                            resource: resource.into(),
+                        })
+                        .map_err(|_| ())?;
+                }
+            }
+            CallerIdentity::AssumedRole {
+                role_arn: role.into(),
+                session_name: "apigateway".into(),
+            }
+        }
+        None => CallerIdentity::ServicePrincipal {
+            service: "apigateway".into(),
+        },
+    };
+    IdentityPropagator::attach(&mut headers, &identity);
+    Ok(headers)
+}
+
+fn integration_source_arn(ctx: &ExecuteCtx<'_>, request: &IntegrationRequest<'_>) -> String {
+    format!(
+        "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
+        ctx.region, ctx.account, request.api_id, request.stage, request.method, request.path
+    )
+}
+
 async fn invoke_lambda(
     ctx: &ExecuteCtx<'_>,
     integration_uri: &str,
     body: Bytes,
     timeout_millis: u64,
+    source_arn: &str,
+    credentials: Option<&str>,
 ) -> Result<LambdaOutput, InvokeFailure> {
     let registry = ctx.registry.upgrade().ok_or(InvokeFailure::Configuration)?;
     let dispatcher = registry
@@ -2557,8 +2704,17 @@ async fn invoke_lambda(
     let region = parse_aws_integration_uri(integration_uri)
         .map(|target| target.region)
         .unwrap_or(ctx.region);
-    let mut headers = HeaderMap::new();
-    set_dispatch_authorization(&mut headers, region, "lambda")?;
+    let mut headers = integration_headers(
+        &registry,
+        ctx.account,
+        region,
+        "lambda",
+        "lambda:InvokeFunction",
+        function,
+        source_arn,
+        credentials,
+    )
+    .map_err(|_| InvokeFailure::Configuration)?;
     // A traced stage hands Lambda its own context; otherwise the client's header passes.
     let mut subsegment = None;
     if let Some(trace) = ctx.stage_trace {
@@ -2573,7 +2729,15 @@ async fn invoke_lambda(
     }
     let response = timeout(
         Duration::from_millis(timeout_millis),
-        dispatcher.dispatch(&Method::POST, &uri, &headers, body, ctx.request_id),
+        dispatcher.dispatch_scoped(
+            &Method::POST,
+            &uri,
+            &headers,
+            body,
+            ctx.request_id,
+            ctx.account,
+            region,
+        ),
     )
     .await;
     if let Some((trace, id, start)) = subsegment {
@@ -2826,6 +2990,7 @@ mod tests {
             host: "api.example",
             uri: &uri,
             headers: &headers,
+            rest_authorization_type: None,
             body: Bytes::from_static(br#"{"original":true}"#),
             api_id: "api",
             stage: "prod",
@@ -2934,3 +3099,7 @@ mod tests {
         assert_eq!(route.value["httpMethod"], "GET");
     }
 }
+
+#[cfg(test)]
+#[path = "execute/http_header_tests.rs"]
+mod http_header_tests;

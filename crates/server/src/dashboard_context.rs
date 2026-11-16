@@ -135,12 +135,20 @@ fn local_endpoint(endpoint: &str, addr: SocketAddr) -> bool {
     let Ok(uri) = endpoint.parse::<http::Uri>() else {
         return false;
     };
-    uri.scheme_str() == Some("http")
-        && uri.port_u16().unwrap_or(80) == addr.port()
+    matches!(uri.scheme_str(), Some("http" | "https"))
+        && uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            })
+            == addr.port()
         && uri.path() == "/"
         && uri.query().is_none()
         && uri.host().is_some_and(|host| {
-            host == "localhost"
+            host == "aws.localhost"
+                || host == "localhost"
                 || host == "127.0.0.1"
                 || host == "[::1]"
                 || host == addr.ip().to_string()

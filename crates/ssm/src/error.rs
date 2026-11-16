@@ -26,7 +26,7 @@ impl From<SsmError> for AwsError {
         let (code, message, status) = match error {
             SsmError::AccessDenied => (
                 "AccessDeniedException",
-                "Not authorized to read the parameter",
+                "Not authorized to access the parameter",
                 403,
             ),
             SsmError::InvalidNextToken => {

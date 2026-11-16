@@ -23,8 +23,8 @@ use crate::observability::log_routing_decision;
 use crate::proxy::{forward_to_legacy, LegacyHealth, ProxyConfig};
 use crate::registry::{AwsProtocol, ServiceName, ServiceRegistry};
 use crate::router::{
-    cognito_public_region, extract_region_from_credential_scope, resolve, RouteDisposition,
-    RouteInput,
+    cognito_public_region, extract_region_from_credential_scope, resolve_with_endpoint,
+    RouteDisposition, RouteInput,
 };
 
 pub mod arn;
@@ -39,6 +39,7 @@ pub mod lambda;
 pub mod logs;
 pub mod metrics;
 pub mod pattern;
+pub mod request_context;
 pub mod sigv4;
 
 pub struct InternalDispatcher {
@@ -46,6 +47,7 @@ pub struct InternalDispatcher {
     // Standalone dispatchers retain their registry. Registry-installed dispatchers omit this
     // owner so ServiceRegistry -> InternalDispatcher -> ServiceRegistry cannot form an Arc cycle.
     _registry_owner: Option<Arc<ServiceRegistry>>,
+    endpoint_host: Option<String>,
     proxy_config: ProxyConfig,
     legacy_health: LegacyHealth,
     default_region: String,
@@ -92,6 +94,7 @@ impl InternalDispatcher {
         InternalDispatcher {
             registry: Arc::downgrade(&registry),
             _registry_owner: Some(registry),
+            endpoint_host: None,
             proxy_config,
             legacy_health,
             default_region,
@@ -112,6 +115,7 @@ impl InternalDispatcher {
         InternalDispatcher {
             registry: Arc::downgrade(registry),
             _registry_owner: None,
+            endpoint_host: None,
             proxy_config,
             legacy_health,
             default_region,
@@ -119,6 +123,12 @@ impl InternalDispatcher {
             meter: None,
             kms_blocking_slots: Arc::new(Semaphore::new(32)),
         }
+    }
+
+    /// Configure the advertised endpoint host used by native wire-protocol addressing.
+    pub fn with_endpoint_host(mut self, hostname: String) -> Self {
+        self.endpoint_host = Some(hostname.to_ascii_lowercase());
+        self
     }
 
     /// Attach a usage [`Meter`](crate::metering::Meter); every dispatched request to a resolved
@@ -462,6 +472,7 @@ impl InternalDispatcher {
         let regional = Self {
             registry: self.registry.clone(),
             _registry_owner: self._registry_owner.clone(),
+            endpoint_host: self.endpoint_host.clone(),
             proxy_config: self.proxy_config.clone(),
             legacy_health: self.legacy_health.clone(),
             default_region: region.to_owned(),
@@ -692,7 +703,9 @@ impl InternalDispatcher {
                         disposition: RouteDisposition::HandledNatively,
                     })
             })
-            .or_else(|| resolve(&registry, &input).ok())
+            .or_else(|| {
+                resolve_with_endpoint(&registry, &input, self.endpoint_host.as_deref()).ok()
+            })
             .filter(|decision| crate::router::permits_method(decision, method))
         else {
             tracing::warn!(request_id, path = %path, "unresolved request");
@@ -855,6 +868,8 @@ impl InternalDispatcher {
                             native_headers.remove("x-locallycloud-verified-internal-scope");
                             if scope.is_none() {
                                 native_headers.remove(identity::PRINCIPAL_HEADER);
+                                native_headers.remove(identity::ROLE_ARN_HEADER);
+                                native_headers.remove(identity::SESSION_NAME_HEADER);
                                 native_headers.remove("x-locallycloud-source-arn");
                                 native_headers.remove("x-locallycloud-source-account");
                             }
@@ -956,6 +971,7 @@ impl InternalDispatcher {
     }
 
     /// Resolve and dispatch a WebSocket upgrade without reading its request body.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_websocket(
         &self,
         method: &Method,
@@ -963,6 +979,7 @@ impl InternalDispatcher {
         headers: &HeaderMap,
         upgrade: WebSocketUpgrade,
         request_id: &str,
+        connection: Option<crate::tls::ConnectionInfo>,
     ) -> Response {
         let authorization = header_str(headers, "authorization");
         let x_amz_target = header_str(headers, "x-amz-target");
@@ -1011,7 +1028,9 @@ impl InternalDispatcher {
                 disposition: RouteDisposition::HandledNatively,
             })
             .map(Ok)
-            .unwrap_or_else(|| resolve(&registry, &input));
+            .unwrap_or_else(|| {
+                resolve_with_endpoint(&registry, &input, self.endpoint_host.as_deref())
+            });
         match decision {
             Ok(decision) => {
                 log_routing_decision(&decision, request_id);
@@ -1076,10 +1095,46 @@ impl InternalDispatcher {
                     RouteDisposition::HandledNatively => {
                         match registry.native_handler(&decision.service_name) {
                             Some(handler) => {
+                                let mut native_headers = headers.clone();
+                                for header in [
+                                    identity::PRINCIPAL_HEADER,
+                                    identity::ROLE_ARN_HEADER,
+                                    identity::SESSION_NAME_HEADER,
+                                    "x-locallycloud-source-arn",
+                                    "x-locallycloud-source-account",
+                                    "x-locallycloud-verified-internal-scope",
+                                    "x-locallycloud-verified-external-sigv4",
+                                    "x-locallycloud-verified-secure-transport",
+                                    "x-locallycloud-trusted-peer-ip",
+                                ] {
+                                    native_headers.remove(header);
+                                }
+                                if strict {
+                                    native_headers.insert(
+                                        "x-locallycloud-verified-external-sigv4",
+                                        HeaderValue::from_static("1"),
+                                    );
+                                }
+                                if let Some(connection) = &connection {
+                                    native_headers.insert(
+                                        "x-locallycloud-verified-secure-transport",
+                                        HeaderValue::from_static(if connection.secure_transport {
+                                            "true"
+                                        } else {
+                                            "false"
+                                        }),
+                                    );
+                                    if let Ok(peer) =
+                                        HeaderValue::from_str(&connection.peer.ip().to_string())
+                                    {
+                                        native_headers
+                                            .insert("x-locallycloud-trusted-peer-ip", peer);
+                                    }
+                                }
                                 let request = ServiceRequest {
                                     method: method.clone(),
                                     uri: uri.clone(),
-                                    headers: headers.clone(),
+                                    headers: native_headers,
                                     body,
                                     region,
                                     account_id,

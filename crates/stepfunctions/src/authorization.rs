@@ -3,9 +3,8 @@ use std::collections::BTreeMap;
 
 use locallycloud_core::handler::ServiceRequest;
 use locallycloud_core::integration::authorization::{
-    AuthorizationEvaluator, AuthorizationRequest, ServiceRoleAuthorizationRequest,
+    verified_caller, AuthorizationRequest, ServiceRoleAuthorizationRequest,
 };
-use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 
 use crate::error::SfnError;
@@ -94,7 +93,7 @@ fn policy_resource(
     resource: String,
     request: &ServiceRequest,
 ) -> (String, BTreeMap<String, Vec<String>>) {
-    let mut context = BTreeMap::new();
+    let mut context: BTreeMap<String, Vec<String>> = BTreeMap::new();
     if matches!(
         op,
         "CreateStateMachineAlias"
@@ -125,60 +124,97 @@ fn policy_resource(
     (resource, context)
 }
 
-// Operators retain IAM checks through Core's scoped dispatcher. Delegated service
-// calls have already been authorized by their source adapter.
-fn authenticated_caller(
-    evaluator: &dyn AuthorizationEvaluator,
+pub async fn authorize_with_tags(
+    registry: &ServiceRegistry,
+    store: &crate::store::SfnStore,
     request: &ServiceRequest,
-) -> Result<Option<RequestIdentity>, SfnError> {
-    let internal = request
-        .headers
-        .get("x-locallycloud-verified-internal-scope")
-        .is_some_and(|v| v == "1");
-    let external = request
-        .headers
-        .get("x-locallycloud-verified-external-sigv4")
-        .is_some_and(|v| v == "1");
-    if internal == external {
-        return Err(SfnError::AccessDenied);
+    op: &str,
+    body: &Value,
+) -> Result<(), SfnError> {
+    if !registry
+        .authorization_evaluator(&ServiceName::new("iam"))
+        .is_some_and(|evaluator| evaluator.strict_sigv4_required())
+    {
+        return Ok(());
     }
-    let identity = RequestIdentity {
-        account_id: request.account_id.clone(),
-        access_key_id: request
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(RequestIdentity::access_key_from_authorization),
-        arn: None,
-    };
-    if external {
-        if identity.access_key_id.is_none() {
-            return Err(SfnError::AccessDenied);
-        }
-        return Ok(Some(identity));
-    }
-    let principal = request
-        .headers
-        .get(locallycloud_core::integration::identity::PRINCIPAL_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(SfnError::AccessDenied)?;
-    match evaluator.resolve_caller_arn(&identity) {
-        Ok(Some(resolved)) if resolved == principal => Ok(Some(identity)),
-        Ok(Some(_)) => Err(SfnError::AccessDenied),
-        _ if locallycloud_core::integration::identity::trusted_role(request).is_some()
-            || principal.ends_with(".amazonaws.com") =>
+    let mut context: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(resource) = resource(op, body, request)? {
+        let (resource, _) = policy_resource(op, resource, request);
+        let prefix = format!("arn:aws:states:{}:{}:", request.region, request.account_id);
+        if let Some((kind, suffix)) = resource
+            .strip_prefix(&prefix)
+            .and_then(|r| r.split_once(':'))
         {
-            Ok(None)
+            let name = suffix.split(':').next().unwrap_or_default();
+            let tags = match kind {
+                "activity" => {
+                    match store.get_activity(&request.account_id, &request.region, name) {
+                        Some(activity) => activity.tags.read().await.clone(),
+                        None => BTreeMap::new(),
+                    }
+                }
+                // Execution authorization inherits the current state-machine tags in AWS.
+                "stateMachine" | "execution" => {
+                    match store.get_machine(&request.account_id, &request.region, name) {
+                        Some(machine) => machine.read().await.tags.clone(),
+                        None => BTreeMap::new(),
+                    }
+                }
+                _ => BTreeMap::new(),
+            };
+            for (key, value) in tags {
+                context
+                    .entry(format!("aws:resourcetag/{}", key.to_ascii_lowercase()))
+                    .or_default()
+                    .push(value);
+            }
         }
-        _ => Err(SfnError::AccessDenied),
     }
+    match op {
+        "CreateStateMachine" | "CreateActivity" | "TagResource" => {
+            let tags = crate::ops::parse_tags(body);
+            if !tags.is_empty() {
+                context.insert("aws:tagkeys".into(), tags.keys().cloned().collect());
+                for (key, value) in tags {
+                    context
+                        .entry(format!("aws:requesttag/{}", key.to_ascii_lowercase()))
+                        .or_default()
+                        .push(value);
+                }
+            }
+        }
+        "UntagResource" => {
+            if let Some(keys) = body.get("tagKeys").and_then(Value::as_array) {
+                context.insert(
+                    "aws:tagkeys".into(),
+                    keys.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect(),
+                );
+            }
+        }
+        _ => {}
+    }
+    authorize_with_context(registry, request, op, body, context)
 }
 
+#[cfg(test)]
 pub fn authorize(
     registry: &ServiceRegistry,
     request: &ServiceRequest,
     op: &str,
     body: &Value,
+) -> Result<(), SfnError> {
+    authorize_with_context(registry, request, op, body, BTreeMap::new())
+}
+
+fn authorize_with_context(
+    registry: &ServiceRegistry,
+    request: &ServiceRequest,
+    op: &str,
+    body: &Value,
+    mut tag_context: BTreeMap<String, Vec<String>>,
 ) -> Result<(), SfnError> {
     let Some(evaluator) = registry.authorization_evaluator(&ServiceName::new("iam")) else {
         return Ok(());
@@ -189,19 +225,43 @@ pub fn authorize(
     let Some(resource) = resource(op, body, request)? else {
         return Ok(());
     };
-    let (resource, context) = policy_resource(op, resource, request);
-    let Some(identity) = authenticated_caller(evaluator.as_ref(), request)? else {
-        return Ok(());
+    let (resource, mut context) = policy_resource(op, resource, request);
+    context.append(&mut tag_context);
+    context
+        .extend(locallycloud_core::integration::request_context::verified_request_context(request));
+    let (identity, delegated_identity) =
+        verified_caller(evaluator.as_ref(), request).map_err(|_| SfnError::AccessDenied)?;
+    let authorization = AuthorizationRequest {
+        request_identity: identity,
+        delegated_identity,
+        source_service: "states".into(),
+        action: format!("states:{op}"),
+        resource,
+        context,
     };
+    if matches!(op, "CreateStateMachine" | "CreateActivity")
+        && body
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| !tags.is_empty())
+    {
+        let mut tagging = authorization.clone();
+        tagging.action = "states:TagResource".into();
+        evaluator
+            .authorize(tagging)
+            .map_err(|_| SfnError::AccessDenied)?;
+    }
+    if matches!(op, "CreateStateMachine" | "UpdateStateMachine")
+        && body.get("publish").and_then(Value::as_bool) == Some(true)
+    {
+        let mut publication = authorization.clone();
+        publication.action = "states:PublishStateMachineVersion".into();
+        evaluator
+            .authorize(publication)
+            .map_err(|_| SfnError::AccessDenied)?;
+    }
     evaluator
-        .authorize(AuthorizationRequest {
-            request_identity: identity,
-            delegated_identity: None,
-            source_service: "states".into(),
-            action: format!("states:{op}"),
-            resource,
-            context,
-        })
+        .authorize(authorization)
         .map_err(|_| SfnError::AccessDenied)
 }
 
@@ -223,10 +283,13 @@ pub fn authorize_role_assignment(
     if !evaluator.strict_sigv4_required() {
         return Ok(());
     }
-    let caller =
-        authenticated_caller(evaluator.as_ref(), request)?.ok_or(SfnError::AccessDenied)?;
+    let (caller, delegated_caller) =
+        verified_caller(evaluator.as_ref(), request).map_err(|_| SfnError::AccessDenied)?;
     evaluator
         .authorize_service_role_assignment(ServiceRoleAuthorizationRequest {
+            delegated_caller,
+            caller_context:
+                locallycloud_core::integration::request_context::verified_request_context(request),
             source_arn: resource(op, body, request)?,
             caller,
             role_arn: role_arn.into(),
@@ -242,6 +305,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::{HeaderMap, Method};
+    use locallycloud_core::integration::{authorization::AuthorizationEvaluator, RequestIdentity};
     use serde_json::json;
 
     fn request() -> ServiceRequest {
@@ -276,12 +340,22 @@ mod tests {
                     .then(|| "arn:aws:iam::000000000000:user/operator".into()))
             }
             fn authorize(&self, req: AuthorizationRequest) -> Result<(), AuthorizationError> {
-                assert_eq!(
-                    req.request_identity.access_key_id.as_deref(),
-                    Some("OPERATOR")
-                );
+                if let Some(
+                    locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                        role_arn,
+                        ..
+                    },
+                ) = &req.delegated_identity
+                {
+                    assert_eq!(role_arn, "arn:aws:iam::000000000000:role/worker");
+                    assert!(req.request_identity.access_key_id.is_none());
+                } else {
+                    assert_eq!(
+                        req.request_identity.access_key_id.as_deref(),
+                        Some("OPERATOR")
+                    );
+                }
                 assert_eq!(req.action, "states:CreateStateMachine");
-                assert!(req.delegated_identity.is_none());
                 if *self.0.lock().unwrap() == Some("states") {
                     Err(AuthorizationError::Denied)
                 } else {
@@ -292,7 +366,11 @@ mod tests {
                 &self,
                 req: ServiceRoleAuthorizationRequest,
             ) -> Result<(), AuthorizationError> {
-                assert_eq!(req.caller.access_key_id.as_deref(), Some("OPERATOR"));
+                if req.delegated_caller.is_some() {
+                    assert!(req.caller.access_key_id.is_none());
+                } else {
+                    assert_eq!(req.caller.access_key_id.as_deref(), Some("OPERATOR"));
+                }
                 assert_eq!(req.action, "iam:PassRole");
                 assert_eq!(req.service_principal, "states.amazonaws.com");
                 assert_eq!(req.role_arn, "arn:aws:iam::000000000000:role/workflow");
@@ -364,7 +442,7 @@ mod tests {
         req.headers.remove("x-locallycloud-verified-internal-scope");
         assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_ok());
         assert!(authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_ok());
-        // Source-authorized service/role invocations keep their existing delegation path.
+        // Delegated roles need action permission; service principals cannot bypass IAM.
         req.headers.remove("x-locallycloud-verified-external-sigv4");
         req.headers.insert(
             "x-locallycloud-verified-internal-scope",
@@ -376,6 +454,13 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
+        locallycloud_core::integration::identity::IdentityPropagator::attach(
+            &mut req.headers,
+            &locallycloud_core::integration::identity::CallerIdentity::AssumedRole {
+                role_arn: "arn:aws:iam::000000000000:role/worker".into(),
+                session_name: "session".into(),
+            },
+        );
         for principal in [
             "scheduler.amazonaws.com",
             "arn:aws:iam::000000000000:role/worker/session",
@@ -384,11 +469,23 @@ mod tests {
                 locallycloud_core::integration::identity::PRINCIPAL_HEADER,
                 principal.parse().unwrap(),
             );
-            assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_ok());
-            // Delegation does not authorize assigning a new execution role.
+            assert_eq!(
+                authorize(&registry, &req, "CreateStateMachine", &body).is_ok(),
+                principal.contains(":role/")
+            );
+            *evaluator.0.lock().unwrap() = Some("states");
+            assert!(authorize(&registry, &req, "CreateStateMachine", &body).is_err());
+            *evaluator.0.lock().unwrap() = None;
+            // A delegated role still needs PassRole when assigning another role.
+            assert_eq!(
+                authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_ok(),
+                principal.contains(":role/")
+            );
+            *evaluator.0.lock().unwrap() = Some("pass-role");
             assert!(
                 authorize_role_assignment(&registry, &req, "CreateStateMachine", &body).is_err()
             );
+            *evaluator.0.lock().unwrap() = None;
         }
     }
 

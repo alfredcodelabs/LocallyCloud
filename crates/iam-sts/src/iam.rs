@@ -300,15 +300,23 @@ pub fn delete_group(store: &IamStore, account: &str, q: &QueryRequest) -> OpResu
 
 // ============================ Roles ============================================
 
+fn max_session_duration(q: &QueryRequest) -> Result<Option<u32>, IamStsError> {
+    q.get("MaxSessionDuration")
+        .map(|value| match value.parse::<u32>() {
+            Ok(duration @ 3600..=43200) => Ok(duration),
+            _ => Err(IamStsError::ValidationError(
+                "MaxSessionDuration must be between 3600 and 43200".into(),
+            )),
+        })
+        .transpose()
+}
+
 pub fn create_role(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
     let name = q.require("RoleName")?;
     let trust = q.require("AssumeRolePolicyDocument")?;
     PolicyDocument::parse_trust(trust)?;
     let path = normalize_path(q.get("Path").unwrap_or("/"));
-    let max_session = q
-        .get("MaxSessionDuration")
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_MAX_SESSION_DURATION);
+    let max_session = max_session_duration(q)?.unwrap_or(DEFAULT_MAX_SESSION_DURATION);
     let role = IamRole {
         role_name: name.to_string(),
         role_id: ids::unique_id(ids::ROLE),
@@ -356,9 +364,7 @@ pub fn list_roles(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult
 pub fn update_role(store: &IamStore, account: &str, q: &QueryRequest) -> OpResult {
     let name = q.require("RoleName")?;
     let description = q.get("Description").map(str::to_string);
-    let max_session = q
-        .get("MaxSessionDuration")
-        .and_then(|v| v.parse::<u32>().ok());
+    let max_session = max_session_duration(q)?;
     if !store.update_role(account, name, |r| {
         if let Some(d) = description {
             r.description = Some(d);
