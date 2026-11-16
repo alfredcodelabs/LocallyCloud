@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
+use crate::component_manager::ComponentOperationGuard;
 use crate::dynamodb_engine::WorkerPool;
 
 #[derive(Serialize, Deserialize)]
@@ -207,7 +208,7 @@ struct Prepared {
     journal: Journal,
     state: StateDb,
     _lock: File,
-    _component: (PathBuf, File, File),
+    _component: Option<(PathBuf, File, ComponentOperationGuard)>,
     completed: bool,
     published: bool,
 }
@@ -243,7 +244,7 @@ struct SourceGuard {
     source: PathBuf,
     cipher: StateCipher,
     lock: File,
-    component: (PathBuf, File, File),
+    component: (PathBuf, File, ComponentOperationGuard),
 }
 
 fn source_guard() -> Result<SourceGuard, String> {
@@ -290,7 +291,9 @@ fn supports_migration(bytes: &[u8]) -> bool {
             })
 }
 
-async fn require_migration_support(component: &(PathBuf, File, File)) -> Result<(), String> {
+async fn require_migration_support(
+    component: &(PathBuf, File, ComponentOperationGuard),
+) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     // Execute the checksum-verified inode while its shared installation lease remains held.
     let executable = format!(
@@ -394,7 +397,7 @@ fn prepare(guard: SourceGuard, policy: MigrationPolicy) -> Result<Prepared, Stri
             journal,
             state,
             _lock: lock,
-            _component: component,
+            _component: Some(component),
             completed,
             published,
         });
@@ -439,7 +442,7 @@ fn prepare(guard: SourceGuard, policy: MigrationPolicy) -> Result<Prepared, Stri
         journal,
         state,
         _lock: lock,
-        _component: component,
+        _component: Some(component),
         completed,
         published,
     })
@@ -1038,7 +1041,7 @@ mod tests {
             journal,
             state,
             _lock: lock,
-            _component: (PathBuf::new(), fake.try_clone().unwrap(), fake),
+            _component: None,
             completed: false,
             published: false,
         }

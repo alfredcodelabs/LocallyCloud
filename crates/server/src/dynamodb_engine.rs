@@ -651,7 +651,7 @@ impl locallycloud_dynamodb::DynamoEngine for ExtendDb {
 struct Worker {
     child: Child,
     output: Option<BufReader<ChildStdout>>,
-    _lease: std::fs::File,
+    _lease: Option<component_manager::ComponentOperationGuard>,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -793,7 +793,7 @@ impl Worker {
         Ok(Self {
             child,
             output: None,
-            _lease: lease,
+            _lease: Some(lease),
             _slot: slot,
         })
     }
@@ -1364,15 +1364,10 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
-            let lease = tokio::fs::File::open("/dev/null")
-                .await
-                .unwrap()
-                .into_std()
-                .await;
             let mut worker = Worker {
                 child,
                 output: None,
-                _lease: lease,
+                _lease: None,
                 _slot: budget.acquire().await.unwrap(),
             };
             let timeout = if times_out {

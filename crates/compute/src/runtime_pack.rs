@@ -67,10 +67,19 @@ pub struct RuntimePack {
     entries: Vec<Entry>,
     pub environment: BTreeMap<String, String>,
     entrypoint: Vec<String>,
-    _lease: fs::File,
+    _lease: SharedLease,
 }
 
-fn shared_lock(directory: &Path, name: &str) -> io::Result<fs::File> {
+struct SharedLease(fs::File);
+
+impl Drop for SharedLease {
+    fn drop(&mut self) {
+        // Closing alone can retain the lock in a descriptor inherited by a concurrent fork.
+        let _ = self.0.unlock();
+    }
+}
+
+fn shared_lock(directory: &Path, name: &str) -> io::Result<SharedLease> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -89,7 +98,7 @@ fn shared_lock(directory: &Path, name: &str) -> io::Result<fs::File> {
     loop {
         // SAFETY: file owns this descriptor throughout the call and the shared lease.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0 {
-            return Ok(file);
+            return Ok(SharedLease(file));
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -224,7 +233,7 @@ impl RuntimePack {
         directory: &Path,
         runtime: &str,
         architecture: &str,
-        lease: fs::File,
+        lease: SharedLease,
     ) -> io::Result<Self> {
         let manifest: Manifest =
             serde_json::from_slice(&bounded(&directory.join("manifest.json"), 65536)?)?;
@@ -510,10 +519,103 @@ pub fn read_guest_file(root: &Path, path: &Path, limit: u64) -> io::Result<Vec<u
     bounded(&guest_path(root, path)?, limit)
 }
 
+/// Install a private trust overlay without modifying shared image inodes.
+/// Call from a blocking rootfs setup worker, before the guest starts.
+pub fn install_guest_ca(root: &Path, configured: &[&str], ca: &str) -> io::Result<&'static str> {
+    const BUNDLE: &str = "/locallycloud-ca.pem";
+    const MAX_BUNDLE: u64 = 4 * 1024 * 1024;
+    if configured.len() > 3 || ca.len() > 32 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest CA overlay limits exceeded",
+        ));
+    }
+    let mut bundle = Vec::new();
+    for candidate in [
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem",
+    ] {
+        match read_guest_file(root, Path::new(candidate), MAX_BUNDLE) {
+            Ok(value) => {
+                bundle = value;
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for path in configured {
+        if !path.starts_with('/') || path.len() > 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CA path must be absolute inside the guest",
+            ));
+        }
+        bundle.push(b'\n');
+        bundle.extend(read_guest_file(root, Path::new(path), MAX_BUNDLE)?);
+    }
+    bundle.push(b'\n');
+    bundle.extend(ca.as_bytes());
+    let temporary = root.join(format!(".locallycloud-ca-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&temporary)?;
+        file.write_all(&bundle)?;
+        drop(file);
+        fs::rename(&temporary, root.join(BUNDLE.trim_start_matches('/')))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(BUNDLE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn guest_ca_overlay_preserves_shared_inodes_and_unrelated_host_paths() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let root =
+            std::env::temp_dir().join(format!("locallycloud-guest-ca-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("etc/ssl/certs")).unwrap();
+        fs::write(root.join("etc/ssl/certs/ca-certificates.crt"), b"distro").unwrap();
+        let shared = root.with_extension("shared");
+        fs::write(&shared, b"shared trust").unwrap();
+        let inode = fs::metadata(&shared).unwrap().ino();
+        fs::hard_link(&shared, root.join("locallycloud-ca.pem")).unwrap();
+        assert_eq!(
+            install_guest_ca(&root, &[], "private CA").unwrap(),
+            "/locallycloud-ca.pem"
+        );
+        assert_eq!(
+            fs::read(root.join("locallycloud-ca.pem")).unwrap(),
+            b"distro\nprivate CA"
+        );
+        assert_eq!(fs::read(&shared).unwrap(), b"shared trust");
+        assert_eq!(fs::metadata(&shared).unwrap().ino(), inode);
+        fs::remove_file(root.join("locallycloud-ca.pem")).unwrap();
+        symlink(&shared, root.join("locallycloud-ca.pem")).unwrap();
+        install_guest_ca(&root, &[], "next CA").unwrap();
+        assert_eq!(fs::read(&shared).unwrap(), b"shared trust");
+        assert!(!fs::symlink_metadata(root.join("locallycloud-ca.pem"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(install_guest_ca(&root, &["relative"], "CA").is_err());
+        assert!(install_guest_ca(&root, &[], &"x".repeat(32769)).is_err());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(shared).unwrap();
+    }
 
     #[test]
     fn official_images_map_managed_families_and_reject_invalid_names() {
@@ -620,6 +722,31 @@ mod tests {
         assert!(guest_path(&root, Path::new("/opt/escape")).is_err());
     }
 
+    #[test]
+    fn shared_leases_release_with_inherited_descriptors() {
+        let fixture = Fixture::new();
+        for name in [".catalog.lock", ".lease"] {
+            let lease = shared_lock(&fixture.0, name).unwrap();
+            let inherited = lease.0.try_clone().unwrap();
+            let exclusive = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(fixture.0.join(name))
+                .unwrap();
+            assert!(exclusive.try_lock().is_err(), "{name}");
+            drop(lease);
+            exclusive.try_lock().unwrap();
+            drop(inherited);
+            let contender = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(fixture.0.join(name))
+                .unwrap();
+            assert!(contender.try_lock().is_err(), "{name}");
+            exclusive.unlock().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn active_version_changes_preserve_existing_leases_and_weak_cache_releases_them() {
         let fixture = Fixture::new();
@@ -642,6 +769,7 @@ mod tests {
         let first = loader.load("python3.13", "x86_64").await.unwrap();
         assert_eq!(first.root, first_directory.join("rootfs"));
         let first_weak = Arc::downgrade(&first);
+        let inherited_lease = first._lease.0.try_clone().unwrap();
         let exclusive = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -668,6 +796,7 @@ mod tests {
             unsafe { libc::flock(exclusive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
+        drop(inherited_lease);
     }
 
     #[tokio::test]

@@ -162,7 +162,17 @@ pub fn active(root: &Path) -> io::Result<(PathBuf, String)> {
     Ok((version_path(root, &manifest.sha256), manifest.sha256))
 }
 
-fn installation_lock(root: &Path) -> io::Result<std::fs::File> {
+#[derive(Debug)]
+pub struct ComponentOperationGuard(std::fs::File);
+
+impl Drop for ComponentOperationGuard {
+    fn drop(&mut self) {
+        // Closing alone leaves a flock held by descriptors inherited during a concurrent fork.
+        let _ = self.0.unlock();
+    }
+}
+
+fn installation_lock(root: &Path) -> io::Result<ComponentOperationGuard> {
     private_directory(root)?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -174,10 +184,10 @@ fn installation_lock(root: &Path) -> io::Result<std::fs::File> {
         .open(root.join(".extenddb-install.lock"))?;
     lock.try_lock()
         .map_err(|_| io::Error::other("another ExtendDB component operation is running"))?;
-    Ok(lock)
+    Ok(ComponentOperationGuard(lock))
 }
 
-fn usage_lock(root: &Path, exclusive: bool) -> io::Result<std::fs::File> {
+fn usage_lock(root: &Path, exclusive: bool) -> io::Result<ComponentOperationGuard> {
     let lease = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -197,10 +207,10 @@ fn usage_lock(root: &Path, exclusive: bool) -> io::Result<std::fs::File> {
             .try_lock_shared()
             .map_err(|_| io::Error::other("ExtendDB component is being changed or removed"))?;
     }
-    Ok(lease)
+    Ok(ComponentOperationGuard(lease))
 }
 
-pub fn verified(root: &Path) -> io::Result<(PathBuf, std::fs::File, std::fs::File)> {
+pub fn verified(root: &Path) -> io::Result<(PathBuf, std::fs::File, ComponentOperationGuard)> {
     let lease = usage_lock(root, false).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             io::Error::other(MISSING_COMPONENT)
@@ -562,6 +572,33 @@ mod tests {
         assert!(rollback(&root).is_err());
         drop(guard);
         remove(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn component_locks_release_even_with_inherited_descriptors() {
+        let root =
+            std::env::temp_dir().join(format!("component-inherited-{}", uuid::Uuid::new_v4()));
+        let installation = installation_lock(&root).unwrap();
+        let inherited_installation = installation.0.try_clone().unwrap();
+        assert!(installation_lock(&root).is_err());
+        drop(installation);
+        let next_installation = installation_lock(&root).unwrap();
+        assert!(installation_lock(&root).is_err());
+        drop(inherited_installation);
+        assert!(installation_lock(&root).is_err());
+        drop(next_installation);
+
+        for exclusive in [true, false] {
+            let usage = usage_lock(&root, exclusive).unwrap();
+            let inherited_usage = usage.0.try_clone().unwrap();
+            assert!(usage_lock(&root, true).is_err());
+            drop(usage);
+            let next_usage = usage_lock(&root, true).unwrap();
+            drop(inherited_usage);
+            assert!(usage_lock(&root, true).is_err());
+            drop(next_usage);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
