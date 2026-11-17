@@ -1580,7 +1580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ttl_reaps_expired_items_on_read() {
+    async fn ttl_expired_items_stay_readable_until_reaped() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../compatibility-tests/.work")
             .join(format!("ddb-read-expiry-{}", uuid::Uuid::new_v4()));
@@ -1620,7 +1620,15 @@ mod tests {
             .as_f64()
             .unwrap();
 
-        // GetItem on the expired item reaps it → no Item.
+        // As in AWS, an expired item stays readable until the reaper deletes it.
+        let (_, v) = call_json(
+            &h,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"old"}}}"#,
+        )
+        .await;
+        assert_eq!(v["Item"]["id"]["S"], "old");
+        ops::sweep_expired(&h.store).await;
         let (_, v) = call_json(
             &h,
             "GetItem",

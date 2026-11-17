@@ -1541,8 +1541,8 @@ pub async fn get_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let name = req_str(req, "TableName")?;
     let key_item = parse_key(req)?;
     let table = get_table(ctx, name).await?;
-    let mut guard = table.write().await;
-    reap_expired(&mut guard, now_epoch_secs());
+    // Expired items stay readable until the TTL reaper deletes them, as in AWS.
+    let guard = table.read().await;
     let key = guard.key_of(&key_item)?;
     match guard.items.get(&key) {
         Some(item) => Ok(json!({ "Item": item_to_json(&maybe_project(req, item)?) })),
@@ -1843,8 +1843,8 @@ fn stored_key_for(item: &Item, hash: &str, range: Option<&str>) -> Option<Stored
 pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let name = req_str(req, "TableName")?;
     let table = get_table(ctx, name).await?;
-    let mut guard = table.write().await;
-    reap_expired(&mut guard, now_epoch_secs());
+    // Expired items stay readable until the TTL reaper deletes them, as in AWS.
+    let guard = table.read().await;
 
     // Resolve the key schema for the base table or the requested index.
     let (hash, range, index_name, allowed) = match req.get("IndexName").and_then(Value::as_str) {
@@ -1928,8 +1928,8 @@ pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
 pub async fn scan(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let name = req_str(req, "TableName")?;
     let table = get_table(ctx, name).await?;
-    let mut guard = table.write().await;
-    reap_expired(&mut guard, now_epoch_secs());
+    // Expired items stay readable until the TTL reaper deletes them, as in AWS.
+    let guard = table.read().await;
 
     let (hash, range, allowed) = match req.get("IndexName").and_then(Value::as_str) {
         Some(idx_name) => {
