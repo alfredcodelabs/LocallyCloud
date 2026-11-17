@@ -91,7 +91,7 @@ fn cached_authorizer_policy_is_recombined_with_the_current_resource_decision() {
         "subject".into(),
         json!({"expiresAt":now_secs()+60,"result":response(ResourcePolicyDecision::ImplicitDeny)}),
     )]);
-    let cached = cached_authorizer(&cache, "subject").unwrap();
+    let cached = crate::store::cached_authorizer(&cache, "subject").unwrap();
     assert!(interpret_authorizer(
         ApiKind::Rest,
         &json!({}),

@@ -518,19 +518,9 @@ async fn authorize_connect(
         identities.join("\u{1f}")
     );
     if ttl > 0 {
-        let shared = store.shared(&request.account_id, &request.region);
-        let cached = {
-            let mut guard = shared.write().await;
-            let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-            guard.authorizer_cache.retain(|_, value| {
-                value.get("expiresAt").and_then(Value::as_u64).unwrap_or(0) > now
-            });
-            guard
-                .authorizer_cache
-                .get(&cache_key)
-                .and_then(|value| value.get("result"))
-                .cloned()
-        };
+        let cached = store
+            .cached_authorizer(&request.account_id, &request.region, &cache_key)
+            .await;
         if let Some(result) = cached {
             return websocket_authorizer_context(authorizer, &result, &route_arn);
         }

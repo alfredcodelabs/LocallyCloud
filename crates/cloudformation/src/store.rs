@@ -292,11 +292,13 @@ impl CfnStore {
         if let Some(s) = self.get(account, region, name_or_id) {
             return Some(s);
         }
-        let prefix = format!("{account}:{region}:");
-        self.stacks
-            .iter()
-            .find(|e| e.key().starts_with(&prefix) && e.value().stack_id == name_or_id)
-            .map(|e| e.value().clone())
+        let arn_prefix = format!("arn:aws:cloudformation:{region}:{account}:stack/");
+        name_or_id
+            .strip_prefix(&arn_prefix)
+            .and_then(|resource| resource.split_once('/'))
+            .and_then(|(name, _)| self.stacks.get(&Self::key(account, region, name)))
+            .filter(|entry| entry.stack_id == name_or_id)
+            .map(|entry| entry.value().clone())
             .or_else(|| {
                 self.expire_deleted();
                 self.deleted
@@ -595,6 +597,82 @@ fn apply_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_arn_lookup_is_exact_scoped_and_preserves_deleted_generations() {
+        let store = CfnStore::new();
+        let mut stack = Stack {
+            role_arn: None,
+            stack_id: "arn:aws:cloudformation:us-east-1:111:stack/orders/first".into(),
+            stack_name: "orders".into(),
+            status: crate::model::StackStatus::CreateComplete,
+            template_body: "{}".into(),
+            parameters: Default::default(),
+            resources: Vec::new(),
+            outputs: Vec::new(),
+            events: Vec::new(),
+            tags: Vec::new(),
+            creation_time: String::new(),
+            last_updated_time: None,
+            disable_rollback: false,
+        };
+        for index in 0..512 {
+            let mut other = stack.clone();
+            other.stack_name = format!("other-{index}");
+            other.stack_id = format!("arn:aws:cloudformation:us-east-1:111:stack/other-{index}/id");
+            store.put("111", "us-east-1", other).unwrap();
+        }
+        store.put("111", "us-east-1", stack.clone()).unwrap();
+        assert_eq!(
+            store.find("111", "us-east-1", "orders").unwrap().stack_id,
+            stack.stack_id
+        );
+        assert_eq!(
+            store
+                .find("111", "us-east-1", &stack.stack_id)
+                .unwrap()
+                .stack_id,
+            stack.stack_id
+        );
+        assert!(store.find("222", "us-east-1", &stack.stack_id).is_none());
+        assert!(store.find("111", "us-west-2", &stack.stack_id).is_none());
+        for arn in [
+            "arn:aws:cloudformation:us-east-1:111:stack/orders/wrong",
+            "arn:aws:cloudformation:us-east-1:111:stack/orders/first/extra",
+            "arn:aws:cloudformation:us-east-1:222:stack/orders/first",
+            "arn:aws:cloudformation:us-west-2:111:stack/orders/first",
+            "arn:aws:cloudformation:us-east-1:111:stack/orders",
+        ] {
+            assert!(store.find("111", "us-east-1", arn).is_none());
+        }
+        let old_arn = stack.stack_id.clone();
+        stack.status = crate::model::StackStatus::DeleteComplete;
+        store.archive("111", "us-east-1", stack.clone()).unwrap();
+        stack.status = crate::model::StackStatus::CreateComplete;
+        stack.stack_id = "arn:aws:cloudformation:us-east-1:111:stack/orders/second".into();
+        store.put("111", "us-east-1", stack.clone()).unwrap();
+        assert_eq!(
+            store.find("111", "us-east-1", "orders").unwrap().stack_id,
+            stack.stack_id
+        );
+        assert_eq!(
+            store
+                .find("111", "us-east-1", &stack.stack_id)
+                .unwrap()
+                .status,
+            crate::model::StackStatus::CreateComplete
+        );
+        assert_eq!(
+            store.find("111", "us-east-1", &old_arn).unwrap().status,
+            crate::model::StackStatus::DeleteComplete
+        );
+        store
+            .deleted
+            .get_mut(&CfnStore::key("111", "us-east-1", &old_arn))
+            .unwrap()
+            .0 = now() - RETENTION_SECONDS - 1;
+        assert!(store.find("111", "us-east-1", &old_arn).is_none());
+    }
 
     #[test]
     fn configured_stack_operation_capacity_is_enforced_and_released() {

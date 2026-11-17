@@ -134,6 +134,20 @@ fn key(account: &str, region: &str, id: &str) -> Key {
     (account.to_string(), region.to_string(), id.to_string())
 }
 
+pub(crate) fn cached_authorizer(cache: &BTreeMap<String, Value>, key: &str) -> Option<Value> {
+    let value = cache.get(key)?;
+    (value.get("expiresAt")?.as_u64()? > cache_now_secs())
+        .then(|| value.get("result").cloned())
+        .flatten()
+}
+
+pub(crate) fn cache_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl ApiGwStore {
     pub(crate) async fn public_invoke_region(
         &self,
@@ -225,6 +239,17 @@ impl ApiGwStore {
         })
     }
 
+    pub(crate) async fn cached_authorizer(
+        &self,
+        account: &str,
+        region: &str,
+        key: &str,
+    ) -> Option<Value> {
+        let shared = self.shared(account, region);
+        let guard = shared.read().await;
+        cached_authorizer(&guard.authorizer_cache, key)
+    }
+
     pub(crate) async fn cache_authorizer(
         &self,
         account: &str,
@@ -234,6 +259,10 @@ impl ApiGwStore {
     ) {
         let shared = self.shared(account, region);
         let mut guard = shared.write().await;
+        let now = cache_now_secs();
+        guard
+            .authorizer_cache
+            .retain(|_, value| value.get("expiresAt").and_then(Value::as_u64).unwrap_or(0) > now);
         while guard.authorizer_cache.len() >= self.config.authorizer_cache_capacity {
             let Some(oldest) = guard.authorizer_cache.keys().next().cloned() else {
                 break;
@@ -413,6 +442,157 @@ mod operational_config_tests {
             .await
             .authorizer_cache
             .contains_key("other"));
+    }
+
+    #[tokio::test]
+    async fn cache_lookup_checks_only_its_key_without_removing_other_entries() {
+        let store = ApiGwStore::new();
+        let shared = store.shared("account", "east");
+        {
+            let mut guard = shared.write().await;
+            guard.authorizer_cache.insert(
+                "valid".into(),
+                serde_json::json!({"expiresAt":u64::MAX,"result":{"principalId":"owned"}}),
+            );
+            guard.authorizer_cache.insert(
+                "expired".into(),
+                serde_json::json!({"expiresAt":0,"result":"old"}),
+            );
+            guard
+                .authorizer_cache
+                .insert("malformed".into(), serde_json::json!({"result":"old"}));
+        }
+        assert_eq!(
+            store.cached_authorizer("account", "east", "valid").await,
+            Some(serde_json::json!({"principalId":"owned"}))
+        );
+        assert!(store
+            .cached_authorizer("account", "east", "expired")
+            .await
+            .is_none());
+        assert!(store
+            .cached_authorizer("account", "east", "malformed")
+            .await
+            .is_none());
+        assert!(store
+            .cached_authorizer("account", "east", "missing")
+            .await
+            .is_none());
+        let guard = shared.read().await;
+        assert_eq!(guard.authorizer_cache.len(), 3);
+        assert!(guard.authorizer_cache.contains_key("expired"));
+        assert!(guard.authorizer_cache.contains_key("malformed"));
+    }
+
+    #[tokio::test]
+    async fn cache_insert_prunes_expired_entries_before_evicting_live_entries_in_its_scope() {
+        let store = ApiGwStore::with_config(crate::ApiGatewayConfig {
+            authorizer_cache_capacity: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        for (account, region) in [("account", "east"), ("account", "west"), ("other", "east")] {
+            let shared = store.shared(account, region);
+            let mut guard = shared.write().await;
+            guard.authorizer_cache.insert(
+                "a-live".into(),
+                serde_json::json!({"expiresAt":u64::MAX,"result":"live"}),
+            );
+            guard.authorizer_cache.insert(
+                "z-expired".into(),
+                serde_json::json!({"expiresAt":0,"result":"old"}),
+            );
+        }
+        store
+            .cache_authorizer(
+                "account",
+                "east",
+                "new".into(),
+                serde_json::json!({"expiresAt":u64::MAX,"result":"new"}),
+            )
+            .await;
+        assert_eq!(
+            store.cached_authorizer("account", "east", "a-live").await,
+            Some(serde_json::json!("live"))
+        );
+        assert_eq!(
+            store.cached_authorizer("account", "east", "new").await,
+            Some(serde_json::json!("new"))
+        );
+        let east = store.shared("account", "east");
+        let east = east.read().await;
+        assert_eq!(east.authorizer_cache.len(), 2);
+        assert!(!east.authorizer_cache.contains_key("z-expired"));
+        drop(east);
+        for (account, region) in [("account", "west"), ("other", "east")] {
+            let shared = store.shared(account, region);
+            let guard = shared.read().await;
+            assert!(guard.authorizer_cache.contains_key("z-expired"));
+            assert!(!guard.authorizer_cache.contains_key("new"));
+        }
+        assert!(store
+            .cached_authorizer("account", "west", "new")
+            .await
+            .is_none());
+        assert!(store
+            .cached_authorizer("other", "east", "new")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "Synthetic before/after authorizer-cache hit scaling benchmark"]
+    async fn authorizer_cache_hit_scaling_benchmark() {
+        const HITS: u32 = 1000;
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        for entries in [100, 1000, 10_000] {
+            let store = ApiGwStore::with_config(crate::ApiGatewayConfig {
+                authorizer_cache_capacity: entries,
+                ..Default::default()
+            })
+            .unwrap();
+            let shared = store.shared("benchmark", "region");
+            let target = format!("key-{:05}", entries - 1);
+            {
+                let mut guard = shared.write().await;
+                for index in 0..entries {
+                    guard.authorizer_cache.insert(format!("key-{index:05}"), serde_json::json!({"expiresAt":u64::MAX,"result":{"principalId":"synthetic"}}));
+                }
+            }
+            let mut old_samples = Vec::new();
+            let mut new_samples = Vec::new();
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                for _ in 0..HITS {
+                    let scoped = store.shared("benchmark", "region");
+                    let mut guard = scoped.write().await;
+                    let now = cache_now_secs();
+                    guard.authorizer_cache.retain(|_, value| {
+                        value.get("expiresAt").and_then(Value::as_u64).unwrap_or(0) > now
+                    });
+                    let result = cached_authorizer(&guard.authorizer_cache, &target);
+                    std::hint::black_box(result);
+                }
+                old_samples.push(start.elapsed());
+                let start = std::time::Instant::now();
+                for _ in 0..HITS {
+                    std::hint::black_box(
+                        store
+                            .cached_authorizer("benchmark", "region", &target)
+                            .await,
+                    );
+                }
+                new_samples.push(start.elapsed());
+            }
+            old_samples.sort();
+            new_samples.sort();
+            eprintln!("authorizer-cache build={profile} entries={entries} hits={HITS} samples=3 median_before_ns_per_hit={} median_after_ns_per_hit={}", old_samples[1].as_nanos() / u128::from(HITS), new_samples[1].as_nanos() / u128::from(HITS));
+            assert_eq!(shared.read().await.authorizer_cache.len(), entries);
+        }
     }
 
     #[test]

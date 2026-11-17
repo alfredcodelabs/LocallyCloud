@@ -542,16 +542,14 @@ impl Ec2Handler {
         {
             return None;
         }
-        let base = u32::from(subnet.cidr.network());
-        let size = 1_u32 << (32 - subnet.cidr.prefix_len());
-        let private_ip = (4..size - 1)
-            .map(|offset| Ipv4Addr::from(base + offset))
-            .find(|ip| {
-                !scope
-                    .network_interfaces
-                    .values()
-                    .any(|eni| eni.subnet_id == subnet_id && eni.private_ip == *ip)
-            })?;
+        let private_ip = first_available_private_ip(
+            subnet.cidr,
+            scope
+                .network_interfaces
+                .values()
+                .filter(|eni| eni.subnet_id == subnet_id)
+                .map(|eni| eni.private_ip),
+        )?;
         let eni_id = resource_id("eni");
         scope.network_interfaces.insert(
             eni_id.clone(),
@@ -783,16 +781,14 @@ impl Ec2Handler {
             .iter()
             .map(|id| {
                 let subnet = scope.subnets.get(id)?;
-                let base = u32::from(subnet.cidr.network());
-                let size = 1_u32 << (32 - subnet.cidr.prefix_len());
-                let ip = (4..size - 1)
-                    .map(|offset| Ipv4Addr::from(base + offset))
-                    .find(|ip| {
-                        !scope
-                            .network_interfaces
-                            .values()
-                            .any(|eni| eni.private_ip == *ip && eni.vpc_id == vpc_id)
-                    })?;
+                let ip = first_available_private_ip(
+                    subnet.cidr,
+                    scope
+                        .network_interfaces
+                        .values()
+                        .filter(|eni| eni.vpc_id == vpc_id)
+                        .map(|eni| eni.private_ip),
+                )?;
                 Some((subnet.clone(), ip))
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1528,15 +1524,20 @@ impl Ec2Handler {
                 ))
             }
             Some(ip) => ip,
-            None => (4..size - 1)
-                .map(|offset| Ipv4Addr::from(base + offset))
-                .find(|ip| is_free(*ip))
-                .ok_or_else(|| {
-                    Ec2Error::new(
-                        "InsufficientFreeAddressesInSubnet",
-                        "No private IP addresses available",
-                    )
-                })?,
+            None => first_available_private_ip(
+                subnet.cidr,
+                scope
+                    .network_interfaces
+                    .values()
+                    .filter(|eni| eni.subnet_id == subnet_id)
+                    .map(|eni| eni.private_ip),
+            )
+            .ok_or_else(|| {
+                Ec2Error::new(
+                    "InsufficientFreeAddressesInSubnet",
+                    "No private IP addresses available",
+                )
+            })?,
         };
         let id = input.resource_id("eni");
         let eni = NetworkInterface {
@@ -2232,22 +2233,20 @@ impl Ec2Handler {
                     ));
                 }
             }
-            let base = u32::from(subnet.cidr.network());
-            let size = 1_u32 << (32 - subnet.cidr.prefix_len());
-            let private_ip = (4..size - 1)
-                .map(|offset| Ipv4Addr::from(base + offset))
-                .find(|ip| {
-                    !scope
-                        .network_interfaces
-                        .values()
-                        .any(|eni| eni.subnet_id == subnet_id && eni.private_ip == *ip)
-                })
-                .ok_or_else(|| {
-                    Ec2Error::new(
-                        "InsufficientFreeAddressesInSubnet",
-                        "No private IP addresses available",
-                    )
-                })?;
+            let private_ip = first_available_private_ip(
+                subnet.cidr,
+                scope
+                    .network_interfaces
+                    .values()
+                    .filter(|eni| eni.subnet_id == subnet_id)
+                    .map(|eni| eni.private_ip),
+            )
+            .ok_or_else(|| {
+                Ec2Error::new(
+                    "InsufficientFreeAddressesInSubnet",
+                    "No private IP addresses available",
+                )
+            })?;
             let spec = InstanceSpec {
                 instance_id: input.resource_id("i"),
                 image_id: image.into(),
@@ -3559,6 +3558,64 @@ fn eni_xml(eni: &NetworkInterface, scope: &ScopeState, _region: &str) -> String 
         escape(&eni.id), escape(&eni.subnet_id), escape(&eni.vpc_id), escape(&eni.zone), escape(&eni.description), escape(&eni.owner), eni.private_ip, eni.private_ip)
 }
 
+// Small scopes keep the cheaper scan; larger occupied scopes use a bounded bitmap.
+// The cutoff comes from the fixed-fixture benchmark. Callers retain the scope lock.
+fn first_available_private_ip(
+    cidr: Ipv4Net,
+    occupied: impl Iterator<Item = Ipv4Addr> + Clone,
+) -> Option<Ipv4Addr> {
+    const MIN_SUBNET_PREFIX: u8 = 16;
+    const MAX_SUBNET_PREFIX: u8 = 28;
+    const BITMAP_WORDS: usize = (1 << (32 - MIN_SUBNET_PREFIX)) / u64::BITS as usize;
+    const SMALL_SCOPE_LIMIT: usize = 16;
+    if !(MIN_SUBNET_PREFIX..=MAX_SUBNET_PREFIX).contains(&cidr.prefix_len()) {
+        return None;
+    }
+    let base = u32::from(cidr.network());
+    let size = 1_u32 << (32 - cidr.prefix_len());
+    let is_occupied = |ip| occupied.clone().any(|existing| existing == ip);
+    if occupied
+        .size_hint()
+        .1
+        .is_some_and(|upper| upper <= SMALL_SCOPE_LIMIT)
+    {
+        return (4..size - 1)
+            .map(|offset| Ipv4Addr::from(base + offset))
+            .find(|ip| !is_occupied(*ip));
+    }
+    let first = Ipv4Addr::from(base + 4);
+    if !is_occupied(first) {
+        return Some(first);
+    }
+    // No heap allocation: at most 8 KiB for the largest supported AWS subnet (/16).
+    let mut bitmap = [0_u64; BITMAP_WORDS];
+    *bitmap.first_mut()? = 0b1111;
+    *bitmap.get_mut(((size - 1) / u64::BITS) as usize)? |= 1 << ((size - 1) % u64::BITS);
+    for ip in occupied {
+        let Some(offset) = u32::from(ip)
+            .checked_sub(base)
+            .filter(|offset| *offset < size)
+        else {
+            continue;
+        };
+        *bitmap.get_mut((offset / u64::BITS) as usize)? |= 1 << (offset % u64::BITS);
+    }
+    for (index, word) in bitmap
+        .get(..size.div_ceil(u64::BITS) as usize)?
+        .iter()
+        .enumerate()
+    {
+        if *word == u64::MAX {
+            continue;
+        }
+        let offset = index as u32 * u64::BITS + (!word).trailing_zeros();
+        if offset < size - 1 {
+            return Some(Ipv4Addr::from(base + offset));
+        }
+    }
+    None
+}
+
 fn list_index(value: &str, maximum: usize) -> Result<usize, Ec2Error> {
     value
         .parse::<usize>()
@@ -3638,6 +3695,181 @@ fn subnet_xml(subnet: &Subnet, region: &str, scope: &ScopeState) -> String {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    #[test]
+    fn private_ip_allocator_matches_reference_with_linear_occupancy_visits() {
+        use std::cell::Cell;
+        let cidr: Ipv4Net = "10.10.0.0/16".parse().unwrap();
+        let base = u32::from(cidr.network());
+        for count in [128_u32, 512, 2048] {
+            let occupied: Vec<_> = (4..4 + count).map(|n| Ipv4Addr::from(base + n)).collect();
+            let reference_visits = Cell::new(0_usize);
+            let reference = (4..65535).map(|n| Ipv4Addr::from(base + n)).find(|ip| {
+                !occupied.iter().any(|existing| {
+                    reference_visits.set(reference_visits.get() + 1);
+                    existing == ip
+                })
+            });
+            let input_visits = Cell::new(0_usize);
+            let actual = first_available_private_ip(
+                cidr,
+                occupied.iter().copied().inspect(|_| {
+                    input_visits.set(input_visits.get() + 1);
+                }),
+            );
+            assert_eq!(actual, reference);
+            assert_eq!(actual, Some(Ipv4Addr::from(base + 4 + count)));
+            // The first-IP probe stops at its first match; bitmap construction visits E once.
+            assert_eq!(input_visits.get(), count as usize + 1);
+            assert_eq!(
+                reference_visits.get(),
+                (count * (count + 1) / 2 + count) as usize
+            );
+            eprintln!(
+                "IP allocation E={count}: reference_eni_visits={} bitmap_input_visits={}",
+                reference_visits.get(),
+                input_visits.get()
+            );
+        }
+        let small: Ipv4Net = "10.10.0.0/28".parse().unwrap();
+        let occupied: Vec<_> = (4..15).map(|n| Ipv4Addr::from(base + n)).collect();
+        assert_eq!(
+            first_available_private_ip(small, occupied.iter().copied()),
+            None
+        );
+        assert_eq!(
+            first_available_private_ip(
+                small,
+                occupied
+                    .into_iter()
+                    .filter(|ip| *ip != Ipv4Addr::from(base + 7))
+            ),
+            Some(Ipv4Addr::from(base + 7))
+        );
+    }
+
+    #[test]
+    fn private_ip_allocator_covers_supported_masks_holes_duplicates_and_foreign_addresses() {
+        for prefix in 16..=28 {
+            let cidr: Ipv4Net = format!("10.30.0.0/{prefix}").parse().unwrap();
+            let base = u32::from(cidr.network());
+            let size = 1_u32 << (32 - prefix);
+            let all: Vec<_> = (4..size - 1)
+                .map(|offset| Ipv4Addr::from(base + offset))
+                .collect();
+            assert_eq!(first_available_private_ip(cidr, all.iter().copied()), None);
+            for hole in [4, size / 2, size - 2] {
+                let occupied = all
+                    .iter()
+                    .copied()
+                    .filter(|ip| u32::from(*ip) != base + hole)
+                    .chain([
+                        Ipv4Addr::from(base - 1),
+                        Ipv4Addr::from(base + size),
+                        Ipv4Addr::from(base),
+                        Ipv4Addr::from(base + size - 1),
+                    ])
+                    .chain(
+                        all.iter()
+                            .copied()
+                            .filter(|ip| u32::from(*ip) != base + hole),
+                    );
+                assert_eq!(
+                    first_available_private_ip(cidr, occupied),
+                    Some(Ipv4Addr::from(base + hole))
+                );
+            }
+            assert_eq!(
+                first_available_private_ip(cidr, std::iter::empty()),
+                Some(Ipv4Addr::from(base + 4))
+            );
+        }
+        for cidr in ["10.0.0.0/15", "10.0.0.0/29", "10.0.0.0/32"] {
+            assert_eq!(
+                first_available_private_ip(cidr.parse().unwrap(), std::iter::empty()),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn eni_allocation_preserves_reserved_explicit_exhausted_and_reused_addresses() {
+        let handler = Ec2Handler::default();
+        let (_, body) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            "Action=CreateVpc&CidrBlock=10.20.0.0%2F16",
+        )
+        .await;
+        let vpc = id(&body, "vpcId");
+        let (_, body) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            &format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.20.0.0%2F28"),
+        )
+        .await;
+        let subnet = id(&body, "subnetId");
+        let create = format!("Action=CreateNetworkInterface&SubnetId={subnet}");
+        for offset in [0, 1, 2, 3, 15, 16] {
+            let (status, body) = call(
+                &handler,
+                "111",
+                "us-east-1",
+                &format!("{create}&PrivateIpAddress=10.20.0.{offset}"),
+            )
+            .await;
+            assert_eq!(status, 400, "{body}");
+            assert!(body.contains("InvalidIPAddress.InUse"));
+        }
+        assert_eq!(
+            call(
+                &handler,
+                "111",
+                "us-east-1",
+                &format!("{create}&PrivateIpAddress=10.20.0.8")
+            )
+            .await
+            .0,
+            200
+        );
+        let (status, body) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            &format!("{create}&PrivateIpAddress=10.20.0.8"),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(body.contains("InvalidIPAddress.InUse"));
+        let mut first_eni = String::new();
+        for offset in (4..15).filter(|offset| *offset != 8) {
+            let (status, body) = call(&handler, "111", "us-east-1", &create).await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(id(&body, "privateIpAddress"), format!("10.20.0.{offset}"));
+            if offset == 4 {
+                first_eni = id(&body, "networkInterfaceId");
+            }
+        }
+        let (status, body) = call(&handler, "111", "us-east-1", &create).await;
+        assert_eq!(status, 400);
+        assert!(body.contains("InsufficientFreeAddressesInSubnet"));
+        assert_eq!(
+            call(
+                &handler,
+                "111",
+                "us-east-1",
+                &format!("Action=DeleteNetworkInterface&NetworkInterfaceId={first_eni}")
+            )
+            .await
+            .0,
+            200
+        );
+        let (status, body) = call(&handler, "111", "us-east-1", &create).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(id(&body, "privateIpAddress"), "10.20.0.4");
+    }
 
     pub(super) fn request(account: &str, region: &str, form: &str) -> ServiceRequest {
         ServiceRequest {

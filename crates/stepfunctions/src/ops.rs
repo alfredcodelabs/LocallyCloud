@@ -1739,20 +1739,15 @@ pub async fn get_execution_history(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sf
         .get("includeExecutionData")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let mut events: Vec<_> = execution.history.iter().collect();
-    if v.get("reverseOrder")
+    let reverse = v
+        .get("reverseOrder")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        events.reverse();
-    }
+        .unwrap_or(false);
     let offset = pagination_offset(v)?;
     let maximum = max_results(v, 100, 1000);
-    let total = events.len();
-    let page: Vec<Value> = events
-        .into_iter()
-        .skip(offset)
-        .take(maximum)
+    let total = execution.history.len();
+    let mut page: Vec<Value> = history_page(&execution.history, offset, maximum, reverse)
+        .iter()
         .map(|event| {
             let mut details = event.details.clone();
             if let Some(object) = details.as_object_mut() {
@@ -1788,6 +1783,9 @@ pub async fn get_execution_history(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sf
             rendered
         })
         .collect();
+    if reverse {
+        page.reverse();
+    }
     let consumed = offset + page.len();
     let mut response = json!({ "events": page });
     if consumed < total {
@@ -1797,6 +1795,18 @@ pub async fn get_execution_history(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sf
             .insert("nextToken".into(), json!(consumed.to_string()));
     }
     Ok(response)
+}
+
+// Slice selection is O(1); rendering and reversing visit only the returned page.
+fn history_page<T>(history: &[T], offset: usize, maximum: usize, reverse: bool) -> &[T] {
+    let start = offset.min(history.len());
+    let end = start.saturating_add(maximum).min(history.len());
+    let range = if reverse {
+        history.len() - end..history.len() - start
+    } else {
+        start..end
+    };
+    history.get(range).unwrap_or_default()
 }
 
 fn history_details_key(event_type: &str) -> String {
@@ -2271,3 +2281,6 @@ pub(crate) fn parse_tags(v: &Value) -> BTreeMap<String, String> {
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod history_tests;

@@ -453,3 +453,60 @@ async fn list_v2_counts_common_prefixes_and_echoes_continuation_token() {
     assert!(third.contains("<IsTruncated>false</IsTruncated>"));
     assert!(!third.contains("<NextContinuationToken>"));
 }
+
+#[tokio::test]
+async fn list_v1_and_v2_echo_requested_max_keys_but_bound_results_and_zero_pages() {
+    let handler = setup().await;
+    for index in 0..1001 {
+        assert_eq!(
+            request(
+                &handler,
+                Method::PUT,
+                &format!("/copy-bucket/bounded/{index:04}"),
+                "data",
+                &[],
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+    for version in ["", "list-type=2&"] {
+        let response = request(
+            &handler,
+            Method::GET,
+            &format!("/copy-bucket?{version}prefix=bounded%2F&max-keys=1001"),
+            "",
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let xml = body(response).await;
+        assert!(xml.contains("<MaxKeys>1001</MaxKeys>"));
+        assert_eq!(xml.matches("<Contents>").count(), 1000);
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<Key>bounded/0999</Key>"));
+        assert!(!xml.contains("<Key>bounded/1000</Key>"));
+        if !version.is_empty() {
+            assert!(xml.contains("<KeyCount>1000</KeyCount>"));
+        }
+        for delimiter in ["", "&delimiter=%2F"] {
+            let response = request(
+                &handler,
+                Method::GET,
+                &format!("/copy-bucket?{version}prefix=bounded%2F&max-keys=0{delimiter}"),
+                "",
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let xml = body(response).await;
+            assert!(xml.contains("<MaxKeys>0</MaxKeys>"));
+            assert!(!xml.contains("<Contents>"));
+            assert!(!xml.contains("<CommonPrefixes>"));
+            assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+            assert!(!xml.contains("<NextContinuationToken>"));
+            assert!(!xml.contains("<NextMarker>"));
+        }
+    }
+}

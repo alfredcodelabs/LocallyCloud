@@ -34,7 +34,7 @@ use crate::logging::{
 use crate::proxy_event::{
     build_event, interpret_response, percent_decode, EventInput, ProxyResponse,
 };
-use crate::store::ApiGwStore;
+use crate::store::{cache_now_secs as now_secs, ApiGwStore};
 use crate::vtl::{ContextBinding, InputBinding, UtilBinding, VtlContext, VtlEngine, VtlError};
 use crate::xray::{CallOutcome, Sampler, StageTrace, TracedStage};
 
@@ -1602,15 +1602,10 @@ async fn lambda_authorize(
         .and_then(Value::as_u64)
         .unwrap_or(300);
     if ttl > 0 {
-        let shared = ctx.store.shared(ctx.account, ctx.region);
-        let cached = {
-            let mut guard = shared.write().await;
-            let now = now_secs();
-            guard.authorizer_cache.retain(|_, value| {
-                value.get("expiresAt").and_then(Value::as_u64).unwrap_or(0) > now
-            });
-            cached_authorizer(&guard.authorizer_cache, &cache_key)
-        };
+        let cached = ctx
+            .store
+            .cached_authorizer(ctx.account, ctx.region, &cache_key)
+            .await;
         if let Some(result) = cached {
             return interpret_authorizer(kind, authorizer, &result, &method_arn, resource_decision);
         }
@@ -1731,20 +1726,6 @@ fn kind_name(kind: ApiKind) -> &'static str {
         ApiKind::Rest => "v1",
         ApiKind::Http => "v2",
     }
-}
-
-pub(crate) fn cached_authorizer(cache: &BTreeMap<String, Value>, key: &str) -> Option<Value> {
-    let value = cache.get(key)?;
-    (value.get("expiresAt")?.as_u64()? > now_secs())
-        .then(|| value.get("result").cloned())
-        .flatten()
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn interpret_authorizer(

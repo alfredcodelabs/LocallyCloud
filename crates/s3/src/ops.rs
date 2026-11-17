@@ -1,6 +1,7 @@
 //! S3 operation handlers. Each builds an `axum` `Response` or returns an `S3Error`.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::encryption::{EncryptedBody, INLINE_PLAINTEXT_LIMIT};
@@ -2633,6 +2634,7 @@ use crate::query::QueryParams;
 
 const DEFAULT_MAX_KEYS: usize = 1000;
 
+#[derive(Default)]
 struct ListResult {
     keys: Vec<(String, StoredObject)>,
     common_prefixes: Vec<String>,
@@ -2648,27 +2650,30 @@ fn compute_listing(
     start_after: Option<&str>,
     max_keys: usize,
 ) -> ListResult {
+    let max_keys = max_keys.min(DEFAULT_MAX_KEYS);
+    if max_keys == 0 {
+        return ListResult::default();
+    }
     let mut keys = Vec::new();
     let mut common_prefixes: Vec<String> = Vec::new();
     let mut is_truncated = false;
     let mut next_token = None;
     let mut last_consumed_key = None;
 
-    for (key, obj) in objects.iter() {
-        if !key.starts_with(prefix) {
-            continue;
-        }
-        if let Some(sa) = start_after {
-            if key.as_str() <= sa {
-                continue;
-            }
-        }
+    let lower = match start_after {
+        Some(after) if after >= prefix => Bound::Excluded(after),
+        _ => Bound::Included(prefix),
+    };
+    for (key, obj) in objects
+        .range::<str, _>((lower, Bound::Unbounded))
+        .take_while(|(key, _)| key.starts_with(prefix))
+    {
         // Delimiter rollup into common prefixes.
         if let Some(delim) = delimiter {
             let rest = &key[prefix.len()..];
             if let Some(idx) = rest.find(delim) {
                 let cp = format!("{prefix}{}", &rest[..idx + delim.len()]);
-                if !common_prefixes.contains(&cp) {
+                if common_prefixes.last() != Some(&cp) {
                     if keys.len() + common_prefixes.len() >= max_keys {
                         is_truncated = true;
                         next_token = last_consumed_key;
@@ -2695,6 +2700,10 @@ fn compute_listing(
         next_token,
     }
 }
+
+#[cfg(test)]
+#[path = "listing_tests.rs"]
+mod listing_tests;
 
 pub async fn list_objects_v2(
     ctx: &Ctx<'_>,
