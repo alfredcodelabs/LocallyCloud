@@ -24,13 +24,11 @@ use crate::model::{
     AttributeValue, EncryptedBody, Message, MessageAttribute, QueueArn, QueueUrlStyle,
 };
 use crate::store::{
-    GuardedQueue, InsertResult, QueueState, ReceiveAttempt, SqsStore, DEFAULT_DELAY_SECONDS,
-    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_RETENTION_PERIOD, DEFAULT_VISIBILITY_TIMEOUT,
-    DEFAULT_WAIT_TIME_SECONDS, MAX_RECEIVE_WAIT_SECONDS,
+    DedupEntry, GuardedQueue, InsertResult, QueueState, ReceiveAttempt, SqsStore,
+    DEFAULT_DELAY_SECONDS, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_RETENTION_PERIOD,
+    DEFAULT_VISIBILITY_TIMEOUT, DEFAULT_WAIT_TIME_SECONDS, MAX_RECEIVE_WAIT_SECONDS,
 };
 
-/// FIFO deduplication window.
-const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 /// Maximum batch entries per request.
 const MAX_BATCH: usize = 10;
 const MAX_BATCH_PAYLOAD: usize = DEFAULT_MAX_MESSAGE_SIZE as usize;
@@ -1114,14 +1112,11 @@ fn enqueue(
         }
     });
     if let Some(dedup) = &dedup_key {
-        let now = Instant::now();
-        state
-            .dedup
-            .retain(|_, (at, _, _)| now.duration_since(*at) < DEDUP_WINDOW);
-        if let Some((_, original_id, original_sequence)) = state.dedup.get(dedup) {
+        state.dedup.prune(Instant::now());
+        if let Some(original) = state.dedup.get(dedup) {
             return Ok(SendResult {
-                id: original_id.clone(),
-                sequence_number: Some(*original_sequence),
+                id: original.message_id.clone(),
+                sequence_number: Some(original.sequence),
                 md5_body,
                 md5_attributes,
                 size: total,
@@ -1184,11 +1179,11 @@ fn enqueue(
     if let Some(dedup) = dedup_key {
         state.dedup.insert(
             dedup,
-            (
-                Instant::now(),
-                id.clone(),
-                sequence_number.expect("FIFO messages have sequence numbers"),
-            ),
+            DedupEntry {
+                at: Instant::now(),
+                message_id: id.clone(),
+                sequence: sequence_number.expect("FIFO messages have sequence numbers"),
+            },
         );
     }
     state.push_message(message);

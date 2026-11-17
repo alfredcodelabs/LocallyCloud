@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -24,6 +24,63 @@ pub const DEFAULT_WAIT_TIME_SECONDS: i64 = 0;
 pub const MAX_RECEIVE_WAIT_SECONDS: i64 = 20;
 /// Window after deletion during which re-create with the same name is rejected.
 pub const DELETED_RECENTLY_SECS: u64 = 60;
+/// FIFO deduplication window.
+pub const DEDUP_WINDOW: Duration = Duration::from_secs(300);
+
+pub struct DedupEntry {
+    pub at: Instant,
+    pub message_id: String,
+    pub sequence: u128,
+}
+
+/// FIFO deduplication keys still inside [`DEDUP_WINDOW`]. `order` keeps keys sorted by
+/// insertion instant, so expiry pops from the front instead of scanning every key.
+#[derive(Default)]
+pub struct DedupWindow {
+    entries: BTreeMap<String, DedupEntry>,
+    order: VecDeque<(Instant, String)>,
+}
+
+impl DedupWindow {
+    pub fn prune(&mut self, now: Instant) {
+        while self
+            .order
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= DEDUP_WINDOW)
+        {
+            let Some((at, key)) = self.order.pop_front() else {
+                break;
+            };
+            if self.entries.get(&key).is_some_and(|entry| entry.at == at) {
+                self.entries.remove(&key);
+            }
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&DedupEntry> {
+        self.entries.get(key)
+    }
+
+    /// Restored keys may arrive in any order; sends always append at the back.
+    pub fn insert(&mut self, key: String, entry: DedupEntry) {
+        let position = self.order.partition_point(|(at, _)| *at <= entry.at);
+        self.order.insert(position, (entry.at, key.clone()));
+        self.entries.insert(key, entry);
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 pub struct ReceiveAttempt {
     pub expires_at: Instant,
@@ -37,8 +94,7 @@ pub struct QueueState {
     pub messages: VecDeque<Message>,
     /// Lower bound used to avoid repeated full retention scans on fresh backlog.
     pub oldest_sent_timestamp_ms: Option<i64>,
-    /// dedup id → (inserted instant, original message id, original sequence number).
-    pub dedup: BTreeMap<String, (Instant, String, u128)>,
+    pub dedup: DedupWindow,
     pub receive_attempts: BTreeMap<String, ReceiveAttempt>,
     pub sequence: u128,
     pub last_purge: Option<Instant>,
@@ -54,7 +110,7 @@ impl QueueState {
             tags,
             messages: VecDeque::new(),
             oldest_sent_timestamp_ms: None,
-            dedup: BTreeMap::new(),
+            dedup: DedupWindow::default(),
             receive_attempts: BTreeMap::new(),
             sequence: 0,
             last_purge: None,
@@ -367,6 +423,44 @@ impl SqsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(at: Instant, id: &str) -> DedupEntry {
+        DedupEntry {
+            at,
+            message_id: id.to_owned(),
+            sequence: 1,
+        }
+    }
+
+    #[test]
+    fn dedup_window_expires_oldest_keys_first_and_keeps_reinserted_keys() {
+        let now = Instant::now();
+        let old = now - DEDUP_WINDOW - Duration::from_secs(1);
+        let mut window = DedupWindow::default();
+        // Restored keys arrive unordered; the window keeps them by instant.
+        window.insert("fresh".into(), entry(now - Duration::from_secs(10), "m2"));
+        window.insert("stale".into(), entry(old, "m1"));
+        window.insert("again".into(), entry(old, "m0"));
+        window.prune(now);
+        assert!(window.get("stale").is_none() && window.get("again").is_none());
+        assert_eq!(
+            window.get("fresh").map(|e| e.message_id.as_str()),
+            Some("m2")
+        );
+        assert_eq!(window.len(), 1);
+
+        // A key sent again after expiry is not dropped by its older queue position.
+        let mut window = DedupWindow::default();
+        window.insert("k".into(), entry(old, "first"));
+        window.insert("k".into(), entry(now, "second"));
+        window.prune(now);
+        assert_eq!(
+            window.get("k").map(|e| e.message_id.as_str()),
+            Some("second")
+        );
+        window.clear();
+        assert!(window.is_empty());
+    }
 
     fn arn(name: &str) -> QueueArn {
         QueueArn::new("us-east-1", "000000000000", name)

@@ -11,7 +11,9 @@ use time::OffsetDateTime;
 
 use crate::error::SqsError;
 use crate::model::{EncryptedBody, Message, MessageAttribute, QueueArn};
-use crate::store::{GuardedQueue, MoveTask, QueueState, ReceiveAttempt, SqsStore};
+use crate::store::{
+    DedupEntry, GuardedQueue, MoveTask, QueueState, ReceiveAttempt, SqsStore, DEDUP_WINDOW,
+};
 
 fn storage_error(_: impl std::fmt::Display) -> SqsError {
     SqsError::StorageUnavailable
@@ -164,6 +166,7 @@ impl SqsPersistence {
                  PRIMARY KEY (arn, dedup_key),
                  FOREIGN KEY (arn) REFERENCES sqs_queues(arn) ON DELETE CASCADE
              );
+             CREATE INDEX IF NOT EXISTS sqs_dedup_expiry ON sqs_dedup(arn, expires_ms);
              CREATE TABLE IF NOT EXISTS sqs_receive_attempts (
                  arn TEXT NOT NULL, attempt_id TEXT NOT NULL, payload TEXT NOT NULL,
                  PRIMARY KEY (arn, attempt_id),
@@ -258,7 +261,11 @@ impl SqsPersistence {
                     let sequence = sequence.parse().map_err(storage_error)?;
                     state.dedup.insert(
                         dedup_key,
-                        (instant(expires_ms) - Duration::from_secs(300), id, sequence),
+                        DedupEntry {
+                            at: instant(expires_ms) - DEDUP_WINDOW,
+                            message_id: id,
+                            sequence,
+                        },
                     );
                 }
             }
@@ -426,7 +433,7 @@ impl SqsPersistence {
                     params![queue.arn.to_arn(), now_ms()],
                 )
                 .map_err(storage_error)?;
-            transaction.execute("INSERT INTO sqs_dedup(arn,dedup_key,expires_ms,message_id,sequence) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(arn,dedup_key) DO UPDATE SET expires_ms=excluded.expires_ms,message_id=excluded.message_id,sequence=excluded.sequence", params![queue.arn.to_arn(),key,now_ms()+300_000,id,number.to_string()]).map_err(storage_error)?;
+            transaction.execute("INSERT INTO sqs_dedup(arn,dedup_key,expires_ms,message_id,sequence) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(arn,dedup_key) DO UPDATE SET expires_ms=excluded.expires_ms,message_id=excluded.message_id,sequence=excluded.sequence", params![queue.arn.to_arn(),key,now_ms()+DEDUP_WINDOW.as_millis() as i64,id,number.to_string()]).map_err(storage_error)?;
         }
         if message.sequence_number.is_some() {
             let json = serde_json::to_string(&StoredQueue::from(state)).map_err(storage_error)?;
