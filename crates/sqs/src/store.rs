@@ -72,14 +72,6 @@ impl DedupWindow {
         self.entries.clear();
         self.order.clear();
     }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 pub struct ReceiveAttempt {
@@ -447,7 +439,7 @@ mod tests {
             window.get("fresh").map(|e| e.message_id.as_str()),
             Some("m2")
         );
-        assert_eq!(window.len(), 1);
+        assert_eq!(window.entries.len(), 1);
 
         // A key sent again after expiry is not dropped by its older queue position.
         let mut window = DedupWindow::default();
@@ -459,7 +451,7 @@ mod tests {
             Some("second")
         );
         window.clear();
-        assert!(window.is_empty());
+        assert!(window.entries.is_empty() && window.order.is_empty());
     }
 
     fn arn(name: &str) -> QueueArn {

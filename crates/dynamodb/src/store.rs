@@ -240,7 +240,8 @@ fn ttl_instant(deadline_secs: f64) -> tokio::time::Instant {
     if wait <= 0.0 {
         return now;
     }
-    now + Duration::from_secs_f64(wait).min(TTL_MAX_SLEEP)
+    // Clamp before converting: a client TTL such as 1e100 would overflow `Duration`.
+    now + Duration::from_secs_f64(wait.min(TTL_MAX_SLEEP.as_secs_f64()))
 }
 
 /// Live table state behind a per-table lock.
@@ -1115,15 +1116,25 @@ impl TableStore {
         self.ttl_deadlines.insert(key.clone(), next);
     }
 
-    /// Tables whose earliest expiry is at or before `now_secs`.
+    /// Tables whose earliest expiry is at or before `now_secs`. A due entry whose table no
+    /// longer exists is dropped, so it cannot keep the worker waking up.
     pub(crate) fn due_ttl_tables(&self, now_secs: f64) -> Vec<(ScopedKey, Arc<StoredTable>)> {
-        self.ttl_deadlines
+        let due: Vec<ScopedKey> = self
+            .ttl_deadlines
             .iter()
             .filter(|deadline| *deadline.value() <= now_secs)
-            .filter_map(|deadline| {
-                let table = self.tables.get(deadline.key())?.value().clone();
-                Some((deadline.key().clone(), table))
-            })
+            .map(|deadline| deadline.key().clone())
+            .collect();
+        due.into_iter()
+            .filter_map(
+                |key| match self.tables.get(&key).map(|t| t.value().clone()) {
+                    Some(table) => Some((key, table)),
+                    None => {
+                        self.ttl_deadlines.remove(&key);
+                        None
+                    }
+                },
+            )
             .collect()
     }
 
@@ -1675,6 +1686,35 @@ mod tests {
             .unwrap()
             .duration_since(tokio::time::Instant::now());
         assert!(wait > Duration::from_secs(3590) && wait <= TTL_MAX_SLEEP);
+    }
+
+    #[tokio::test]
+    async fn huge_ttl_values_do_not_overflow_the_maintenance_deadline() {
+        let store = TableStore::new();
+        let mut ttl = data(simple_def("expires"));
+        ttl.ttl_attribute = Some("exp".into());
+        let mut item = Item::new();
+        item.insert("pk".into(), AttributeValue::S("far".into()));
+        item.insert("exp".into(), AttributeValue::N("1e100".into()));
+        ttl.emit_stream(None, Some(&item));
+        ttl.items.insert(ttl.key_of(&item).unwrap(), item);
+        store.create("0", "us-east-1", ttl).unwrap();
+        store.persist().await.unwrap();
+        let deadline = store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .unwrap();
+        assert!(deadline <= tokio::time::Instant::now() + TTL_MAX_SLEEP);
+
+        // A due deadline left behind by a vanished table is dropped by the next sweep.
+        store
+            .ttl_deadlines
+            .insert(("0".into(), "us-east-1".into(), "gone".into()), 1.0);
+        crate::ops::sweep_expired(&store).await;
+        assert!(!store.ttl_deadlines.contains_key(&(
+            "0".into(),
+            "us-east-1".into(),
+            "gone".into()
+        )));
     }
 
     #[tokio::test]
