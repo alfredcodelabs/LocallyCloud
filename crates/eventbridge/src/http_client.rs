@@ -1,8 +1,9 @@
-use std::sync::OnceLock;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue, Method};
+use locallycloud_core::egress::{EgressClient, EgressError, EgressSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum HttpError {
@@ -12,6 +13,8 @@ pub enum HttpError {
     Transport,
     #[error("EventBridge HTTP response exceeded the local body budget")]
     ResponseTooLarge,
+    #[error("EventBridge HTTP destination is not permitted")]
+    DestinationDenied,
 }
 
 impl From<()> for HttpError {
@@ -57,6 +60,19 @@ impl HttpRequest {
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Signed delta-seconds from `Retry-After`. HTTP-date values are not interpreted.
+    pub retry_after: Option<i64>,
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<i64> {
+    response
+        .headers()
+        .get(http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[async_trait]
@@ -66,29 +82,55 @@ pub trait HttpClient: Send + Sync {
     async fn send_for_status(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
         let response = self.send(request).await?;
         Ok(HttpResponse {
-            status: response.status,
             body: Vec::new(),
+            ..response
         })
     }
 }
 
 pub struct ReqwestHttpClient {
-    config: crate::EventBridgeConfig,
-    client: OnceLock<Result<reqwest::Client, HttpError>>,
+    response_body_limit: usize,
+    client: EgressClient,
 }
 
 impl Default for ReqwestHttpClient {
     fn default() -> Self {
-        Self::with_config(crate::EventBridgeConfig::default())
+        Self::with_config(&crate::EventBridgeConfig::default(), &[])
+            .expect("default EventBridge HTTP policy is valid")
     }
 }
 
 impl ReqwestHttpClient {
-    pub(crate) fn with_config(config: crate::EventBridgeConfig) -> Self {
-        Self {
-            config,
-            client: OnceLock::new(),
-        }
+    /// `listeners` are LocallyCloud's own addresses, which destinations can never reach.
+    /// Per-origin connections are still opened only on first delivery.
+    pub(crate) fn with_config(
+        config: &crate::EventBridgeConfig,
+        listeners: &[SocketAddr],
+    ) -> Result<Self, String> {
+        Self::with_roots(config, listeners, Vec::new())
+    }
+
+    fn with_roots(
+        config: &crate::EventBridgeConfig,
+        listeners: &[SocketAddr],
+        root_certificates: Vec<reqwest::Certificate>,
+    ) -> Result<Self, String> {
+        let client = EgressClient::new(
+            EgressSettings {
+                local_origins: config.http_local_origins.clone(),
+                client_capacity: config.http_client_cache_capacity,
+                connect_timeout: Some(Duration::from_secs(config.http_connect_timeout_secs)),
+                request_timeout: Some(Duration::from_secs(config.http_request_timeout_secs)),
+                root_certificates,
+                ..Default::default()
+            },
+            listeners,
+        )
+        .map_err(|error| format!("eventbridge.http_local_origins: {error}"))?;
+        Ok(Self {
+            response_body_limit: config.http_response_body_limit_bytes,
+            client,
+        })
     }
 
     async fn send_request(&self, request: HttpRequest) -> Result<reqwest::Response, HttpError> {
@@ -101,45 +143,60 @@ impl ReqwestHttpClient {
         if !url.starts_with("https://") {
             return Err(HttpError::InvalidRequest);
         }
-        let mut outbound = self.client()?.request(method, url);
+        let mut outbound = self
+            .client
+            .request(method, &url)
+            .map_err(destination_failure)?;
         for (name, value) in headers {
             outbound = outbound.header(name.as_str(), value.as_str());
         }
         if !body.is_empty() {
             outbound = outbound.body(body);
         }
-        outbound.send().await.map_err(|_| HttpError::Transport)
+        outbound
+            .send()
+            .await
+            .map_err(|error| destination_failure(EgressError::from_request(&error)))
     }
+}
 
-    fn client(&self) -> Result<&reqwest::Client, HttpError> {
-        self.client
-            .get_or_init(|| {
-                client_builder(&self.config)
-                    .build()
-                    .map_err(|_| HttpError::Transport)
-            })
-            .as_ref()
-            .map_err(|_| HttpError::Transport)
+// The URL can carry query parameters from the connection, so only the cause is logged.
+fn destination_failure(error: EgressError) -> HttpError {
+    match error {
+        EgressError::InvalidUrl | EgressError::InvalidOrigin(_) => HttpError::InvalidRequest,
+        EgressError::DestinationDenied | EgressError::HostProbe | EgressError::DnsAnswers => {
+            tracing::warn!(
+                service = "events",
+                operation = "InvokeApiDestination",
+                cause_code = "destination_denied",
+                "API destination address is not permitted; allow it with eventbridge.http_local_origins"
+            );
+            HttpError::DestinationDenied
+        }
+        EgressError::DnsResolution
+        | EgressError::CacheUnavailable
+        | EgressError::ClientInitialization
+        | EgressError::TlsConfiguration
+        | EgressError::Connection
+        | EgressError::Timeout => HttpError::Transport,
     }
 }
 
 // Keep the old exported name for crate-internal test constructors outside this audited file set.
 pub use ReqwestHttpClient as CurlHttpClient;
 
-fn client_builder(config: &crate::EventBridgeConfig) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(config.http_connect_timeout_secs))
-        .timeout(Duration::from_secs(config.http_request_timeout_secs))
-}
-
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
         let response = self.send_request(request).await?;
         let status = response.status().as_u16();
-        let body = read_response_body(response, self.config.http_response_body_limit_bytes).await?;
-        Ok(HttpResponse { status, body })
+        let retry_after = retry_after(&response);
+        let body = read_response_body(response, self.response_body_limit).await?;
+        Ok(HttpResponse {
+            status,
+            body,
+            retry_after,
+        })
     }
 
     async fn send_for_status(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
@@ -147,6 +204,7 @@ impl HttpClient for ReqwestHttpClient {
         Ok(HttpResponse {
             status: response.status().as_u16(),
             body: Vec::new(),
+            retry_after: retry_after(&response),
         })
     }
 }
@@ -236,7 +294,11 @@ mod tests {
                         } else {
                             body
                         };
-                        http::Response::builder().status(202).body(body).unwrap()
+                        http::Response::builder()
+                            .status(202)
+                            .header("retry-after", "-3")
+                            .body(body)
+                            .unwrap()
                     }
                 }),
             ),
@@ -245,24 +307,22 @@ mod tests {
         let config = crate::EventBridgeConfig {
             http_request_timeout_secs: 1,
             http_response_body_limit_bytes: 16,
+            http_local_origins: vec![origin.clone()],
             ..Default::default()
         };
         config.validate().unwrap();
-        let client = ReqwestHttpClient::with_config(config);
-        assert!(client.client.get().is_none());
-        let trusted = client_builder(&config)
-            .no_proxy()
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(identity.ca_pem().as_bytes()).unwrap(),
-            )
-            .build()
-            .unwrap();
-        assert!(client.client.set(Ok(trusted)).is_ok());
+        let client = ReqwestHttpClient::with_roots(
+            &config,
+            &[],
+            vec![reqwest::Certificate::from_pem(identity.ca_pem().as_bytes()).unwrap()],
+        )
+        .unwrap();
         let exact = client
             .send(HttpRequest::new(Method::GET, format!("{origin}/exact")))
             .await
             .unwrap();
         assert_eq!((exact.status, exact.body.len()), (202, 16));
+        assert_eq!(exact.retry_after, Some(-3));
         assert_eq!(
             client
                 .send(HttpRequest::new(Method::GET, format!("{origin}/oversize")))
@@ -274,12 +334,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((status_only.status, status_only.body.len()), (202, 0));
+        assert_eq!(status_only.retry_after, Some(-3));
         assert_eq!(status_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         let chunked = client
-            .client()
+            .client
+            .request(Method::GET, &format!("{origin}/chunked"))
             .unwrap()
-            .get(format!("{origin}/chunked"))
             .send()
             .await
             .unwrap();
@@ -304,11 +365,6 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let client = client_builder(&crate::EventBridgeConfig::default())
-            .no_proxy()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
         let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sink_url = format!("http://{}", sink.local_addr().unwrap());
         let hits = Arc::new(AtomicUsize::new(0));
@@ -329,6 +385,16 @@ mod tests {
         });
         let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let source_url = format!("http://{}", source.local_addr().unwrap());
+        let client = ReqwestHttpClient::with_config(
+            &crate::EventBridgeConfig {
+                http_request_timeout_secs: 2,
+                http_local_origins: vec![source_url.clone(), sink_url.clone()],
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap()
+        .client;
         let location = sink_url.clone();
         let source_task = tokio::spawn(async move {
             axum::serve(
@@ -355,7 +421,8 @@ mod tests {
         });
         for status in [301, 302, 303, 307, 308] {
             let response = client
-                .post(format!("{source_url}/{status}"))
+                .request(Method::POST, &format!("{source_url}/{status}"))
+                .unwrap()
                 .header("x-api-key", "fictional-key")
                 .body("client_secret=fictional-secret")
                 .send()
@@ -366,19 +433,79 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(
             client
-                .post(format!("{source_url}/200"))
+                .request(Method::POST, &format!("{source_url}/200"))
+                .unwrap()
                 .send()
                 .await
                 .unwrap()
                 .status(),
             200
         );
-        assert_eq!(client.post(sink_url).send().await.unwrap().status(), 200);
+        assert_eq!(
+            client
+                .request(Method::POST, &sink_url)
+                .unwrap()
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         source_task.abort();
         sink_task.abort();
         let _ = source_task.await;
         let _ = sink_task.await;
+    }
+
+    #[tokio::test]
+    async fn local_and_metadata_destinations_are_denied_without_contacting_them() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let observed = accepted.clone();
+        let server = tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let client = ReqwestHttpClient::default();
+        for url in [
+            format!("https://{address}/hook"),
+            format!("https://localhost:{}/hook", address.port()),
+            "https://169.254.169.254/latest/meta-data".to_string(),
+            "https://[fd00:ec2::254]/".to_string(),
+        ] {
+            assert_eq!(
+                client
+                    .send(HttpRequest::new(Method::POST, url.clone()))
+                    .await,
+                Err(HttpError::DestinationDenied),
+                "{url}"
+            );
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        let local = crate::EventBridgeConfig {
+            http_local_origins: vec![format!("https://{address}")],
+            http_request_timeout_secs: 2,
+            ..Default::default()
+        };
+        assert!(ReqwestHttpClient::with_config(&local, &[address]).is_err());
+        let allowed = ReqwestHttpClient::with_config(&local, &[]).unwrap();
+        // The plain TCP listener cannot complete TLS, but the connection is permitted.
+        assert_eq!(
+            allowed
+                .send(HttpRequest::new(
+                    Method::POST,
+                    format!("https://{address}/")
+                ))
+                .await,
+            Err(HttpError::Transport)
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[test]

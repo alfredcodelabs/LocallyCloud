@@ -634,11 +634,19 @@ async fn main() {
     {
         let registry = registry.clone();
         let state = state.clone();
+        let listeners = [config.listen_addr];
+        if let Err(error) =
+            locallycloud_eventbridge::validate_network(&startup.eventbridge, &listeners)
+        {
+            eprintln!("ERROR [Startup] invalid startup configuration: {error}");
+            std::process::exit(2);
+        }
         initialize_persistent_service("events", move || {
-            locallycloud_eventbridge::service::register_with_state_and_config(
+            locallycloud_eventbridge::service::register_with_state_config_and_network(
                 &registry,
                 state.clone(),
                 startup.eventbridge,
+                &listeners,
             )?;
             locallycloud_eventbridge::schemas::register(&registry, state)
         })

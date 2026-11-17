@@ -2984,14 +2984,16 @@ async fn deliver_event_target(
                         break;
                     }
                     ApiDelivery::TerminalFailure => break,
-                    ApiDelivery::RetriableFailure if attempt < target.retry.maximum_attempts => {
-                        let delay = delivery::retry_backoff(&request).delay(attempt + 1).min(
+                    ApiDelivery::RetriableFailure | ApiDelivery::RetryAfter(_)
+                        if attempt < target.retry.maximum_attempts =>
+                    {
+                        let delay = api_retry_delay(&request, attempt + 1, &outcome).min(
                             delivery::remaining_age(&request)
                                 .unwrap_or(std::time::Duration::from_secs(86400)),
                         );
                         tokio::time::sleep(delay).await;
                     }
-                    ApiDelivery::RetriableFailure => break,
+                    ApiDelivery::RetriableFailure | ApiDelivery::RetryAfter(_) => break,
                 }
             }
         }
@@ -3024,6 +3026,24 @@ async fn deliver_event_target(
         .await
         .is_ok()
         || target.dead_letter_arn.is_none()
+}
+
+/// Event buses wait for the longer of the retry policy backoff and `Retry-After`.
+/// The header is capped at the 24-hour maximum event age and scaled like other retry time.
+fn api_retry_delay(
+    request: &DeliveryRequest,
+    attempt: u32,
+    outcome: &ApiDelivery,
+) -> std::time::Duration {
+    let backoff = delivery::retry_backoff(request).delay(attempt);
+    let ApiDelivery::RetryAfter(seconds) = outcome else {
+        return backoff;
+    };
+    let requested = request
+        .retry_second
+        .unwrap_or(std::time::Duration::from_secs(1))
+        .saturating_mul(u32::try_from((*seconds).min(86_400)).unwrap_or(86_400));
+    backoff.max(requested)
 }
 
 fn validate_connection_auth(auth_type: &str, parameters: &Value) -> Result<(), EventsError> {
@@ -3098,6 +3118,8 @@ fn validate_api_method(method: &str) -> Result<(), EventsError> {
 pub(crate) enum ApiDelivery {
     Success(Value),
     RetriableFailure,
+    /// A retriable response whose `Retry-After` asks for at least this many seconds.
+    RetryAfter(u64),
     TerminalFailure,
 }
 
@@ -3210,11 +3232,21 @@ async fn invoke_api_destination_with_response(
             };
             ApiDelivery::Success(value)
         }
+        // https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-api-destinations.html
+        // documents the retried statuses and that a negative Retry-After stops retrying.
         Ok(response) if matches!(response.status, 401 | 407 | 409 | 429 | 500..=599) => {
-            ApiDelivery::RetriableFailure
+            match response.retry_after {
+                Some(seconds) if seconds < 0 => ApiDelivery::TerminalFailure,
+                Some(seconds) => ApiDelivery::RetryAfter(seconds.unsigned_abs()),
+                None => ApiDelivery::RetriableFailure,
+            }
         }
         Ok(_) => ApiDelivery::TerminalFailure,
-        Err(_) => ApiDelivery::RetriableFailure,
+        // A local policy denial cannot succeed on retry; the event goes to the DLQ.
+        Err(HttpError::DestinationDenied | HttpError::InvalidRequest) => {
+            ApiDelivery::TerminalFailure
+        }
+        Err(HttpError::Transport | HttpError::ResponseTooLarge) => ApiDelivery::RetriableFailure,
     }
 }
 
@@ -3451,6 +3483,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: 202,
                     body: Vec::new(),
+                    retry_after: None,
                 })
             }
         }
@@ -3488,6 +3521,39 @@ mod tests {
         assert_eq!(client.body_reads.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn retry_after_extends_but_never_shortens_the_policy_backoff() {
+        let request = DeliveryRequest {
+            source_service: "events",
+            source_arn: None,
+            arn: "arn:aws:events:us-east-1:000000000000:api-destination/owned".into(),
+            payload: "{}".into(),
+            role_arn: None,
+            sqs_parameters: None,
+            target_parameters: None,
+            retry: RetryPolicy {
+                maximum_attempts: 3,
+                maximum_age_seconds: None,
+            },
+            dead_letter_arn: None,
+            scheduled_at: None,
+            retry_second: Some(std::time::Duration::from_millis(1)),
+        };
+        let ms = std::time::Duration::from_millis;
+        for _ in 0..32 {
+            assert!(api_retry_delay(&request, 1, &ApiDelivery::RetriableFailure) < ms(30));
+            assert!(api_retry_delay(&request, 1, &ApiDelivery::RetryAfter(0)) < ms(30));
+            assert_eq!(
+                api_retry_delay(&request, 1, &ApiDelivery::RetryAfter(30)),
+                ms(30)
+            );
+        }
+        assert_eq!(
+            api_retry_delay(&request, 1, &ApiDelivery::RetryAfter(u64::MAX)),
+            std::time::Duration::from_millis(86_400)
+        );
+    }
+
     #[tokio::test]
     async fn local_body_budget_failure_retains_existing_destination_retry_classification() {
         use crate::http_client::HttpResponse;
@@ -3519,10 +3585,41 @@ mod tests {
                 Err(HttpError::ResponseTooLarge),
                 ApiDelivery::RetriableFailure,
             ),
+            (Err(HttpError::Transport), ApiDelivery::RetriableFailure),
+            (
+                Err(HttpError::DestinationDenied),
+                ApiDelivery::TerminalFailure,
+            ),
+            (Err(HttpError::InvalidRequest), ApiDelivery::TerminalFailure),
+            (
+                Ok(HttpResponse {
+                    status: 429,
+                    body: Vec::new(),
+                    retry_after: Some(7),
+                }),
+                ApiDelivery::RetryAfter(7),
+            ),
             (
                 Ok(HttpResponse {
                     status: 503,
                     body: Vec::new(),
+                    retry_after: Some(-1),
+                }),
+                ApiDelivery::TerminalFailure,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 400,
+                    body: Vec::new(),
+                    retry_after: Some(5),
+                }),
+                ApiDelivery::TerminalFailure,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 503,
+                    body: Vec::new(),
+                    retry_after: None,
                 }),
                 ApiDelivery::RetriableFailure,
             ),
@@ -3530,6 +3627,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: 429,
                     body: Vec::new(),
+                    retry_after: None,
                 }),
                 ApiDelivery::RetriableFailure,
             ),
@@ -3537,6 +3635,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: 403,
                     body: Vec::new(),
+                    retry_after: None,
                 }),
                 ApiDelivery::TerminalFailure,
             ),
@@ -3544,6 +3643,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: 201,
                     body: b"{}".to_vec(),
+                    retry_after: None,
                 }),
                 ApiDelivery::Success(json!({})),
             ),
@@ -3587,18 +3687,22 @@ mod tests {
                 HttpResponse {
                     status: 200,
                     body: br#"{"access_token":"test-token"}"#.to_vec(),
+                    retry_after: None,
                 },
                 HttpResponse {
                     status: 200,
                     body: br#"{"auth":"oauth"}"#.to_vec(),
+                    retry_after: None,
                 },
                 HttpResponse {
                     status: 200,
                     body: br#"{"auth":"api-key"}"#.to_vec(),
+                    retry_after: None,
                 },
                 HttpResponse {
                     status: 200,
                     body: br#"{"auth":"basic"}"#.to_vec(),
+                    retry_after: None,
                 },
             ])),
         };
@@ -3655,6 +3759,7 @@ mod tests {
             http.responses.lock().unwrap().push_back(HttpResponse {
                 status,
                 body: Vec::new(),
+                retry_after: None,
             });
             assert_eq!(
                 invoke_api_destination(&http, &destination, &api_key, "{}").await,
@@ -3666,6 +3771,7 @@ mod tests {
             http.responses.lock().unwrap().push_back(HttpResponse {
                 status,
                 body: Vec::new(),
+                retry_after: None,
             });
             assert_eq!(
                 invoke_api_destination(&http, &destination, &api_key, "{}").await,
@@ -3677,6 +3783,7 @@ mod tests {
             http.responses.lock().unwrap().push_back(HttpResponse {
                 status,
                 body: Vec::new(),
+                retry_after: None,
             });
             assert_eq!(
                 invoke_api_destination(&http, &destination, &api_key, "{}").await,
@@ -3686,6 +3793,7 @@ mod tests {
             http.responses.lock().unwrap().push_back(HttpResponse {
                 status,
                 body: br#"{"access_token":"must-not-be-used"}"#.to_vec(),
+                retry_after: None,
             });
             assert_eq!(
                 invoke_api_destination(&http, &destination, &oauth, "{}").await,

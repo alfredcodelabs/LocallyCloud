@@ -19,7 +19,7 @@ pub mod transform;
 pub use config::EventBridgeConfig;
 pub use service::{
     register, register_with_clock, register_with_config, register_with_state,
-    register_with_state_and_config,
+    register_with_state_and_config, register_with_state_config_and_network, validate_network,
 };
 
 #[cfg(test)]

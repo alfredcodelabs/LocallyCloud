@@ -6,6 +6,7 @@
 //! - [`registry`]: concurrent service registry (Native / Proxied disposition)
 //! - [`error_mapping`]: AWS-faithful per-protocol error shapes
 //! - [`config`]: environment-driven configuration with compatibility aliases
+//! - [`egress`]: destination policy for outbound HTTP to user-configured endpoints
 //! - [`endpoint`]: inter-service endpoint resolution (cross-service communication)
 //! - [`health`]: health / readiness endpoints
 //! - [`observability`]: structured tracing and per-request correlation
@@ -17,6 +18,7 @@ pub mod activity;
 pub mod audit;
 pub mod config;
 pub mod cost;
+pub mod egress;
 pub mod endpoint;
 pub mod error_mapping;
 pub mod handler;

@@ -35,15 +35,20 @@ struct Services {
 
 impl Services {
     fn new(registry: Weak<ServiceRegistry>, clock: Arc<dyn Clock>) -> Self {
-        Self::with_store(registry, clock, Arc::new(EbStore::new()))
+        Self::with_store(
+            registry,
+            clock,
+            Arc::new(EbStore::new()),
+            Arc::new(CurlHttpClient::default()),
+        )
     }
 
     fn with_store(
         registry: Weak<ServiceRegistry>,
         clock: Arc<dyn Clock>,
         store: Arc<EbStore>,
+        http: Arc<dyn HttpClient>,
     ) -> Self {
-        let http: Arc<dyn HttpClient> = Arc::new(CurlHttpClient::with_config(store.config));
         Self {
             registry: registry.clone(),
             events: EventsService::new(
@@ -495,6 +500,7 @@ pub fn register_with_config(
     config: crate::EventBridgeConfig,
 ) -> Result<(), String> {
     config.validate()?;
+    let http = Arc::new(CurlHttpClient::with_config(&config, &[])?);
     ensure_dispatcher(registry);
     let mut store = EbStore::new();
     store.retry_second = Some(config.retry_second());
@@ -503,6 +509,7 @@ pub fn register_with_config(
         Arc::downgrade(registry),
         Arc::new(SystemClock),
         Arc::new(store),
+        http,
     ));
     register_services(registry, services);
     Ok(())
@@ -535,7 +542,27 @@ pub fn register_with_state_and_config(
     state: Arc<StateDb>,
     config: crate::EventBridgeConfig,
 ) -> Result<(), String> {
+    register_with_state_config_and_network(registry, state, config, &[])
+}
+
+/// Checks `http_local_origins` against LocallyCloud's own listeners before startup.
+pub fn validate_network(
+    config: &crate::EventBridgeConfig,
+    listeners: &[std::net::SocketAddr],
+) -> Result<(), String> {
+    CurlHttpClient::with_config(config, listeners).map(|_| ())
+}
+
+/// The composition root supplies its listener addresses so API destinations cannot
+/// loop back into LocallyCloud.
+pub fn register_with_state_config_and_network(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    config: crate::EventBridgeConfig,
+    listeners: &[std::net::SocketAddr],
+) -> Result<(), String> {
     config.validate()?;
+    let http = Arc::new(CurlHttpClient::with_config(&config, listeners)?);
     ensure_dispatcher(registry);
     let mut store = EbStore::with_state(state)?;
     store.retry_second = Some(config.retry_second());
@@ -545,6 +572,7 @@ pub fn register_with_state_and_config(
         Arc::downgrade(registry),
         Arc::new(SystemClock),
         store,
+        http,
     ));
     services.pipes.restore()?;
     register_services(registry, services.clone());
@@ -860,6 +888,7 @@ mod tests {
             Arc::downgrade(&registry),
             Arc::new(SystemClock),
             Arc::new(store),
+            Arc::new(CurlHttpClient::default()),
         ));
         let eventbridge: Arc<dyn NativeHandler> = Arc::new(EventsHandler(services));
         let sqs = registry.native_handler(&ServiceName::new("sqs")).unwrap();
