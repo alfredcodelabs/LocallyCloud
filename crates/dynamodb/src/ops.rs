@@ -1899,11 +1899,12 @@ pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let key_cond = ConditionExpression::parse(key_expr, &names, &values)?;
 
     // Candidate items with the index/table keys present, matching the key condition, sorted.
-    let mut candidates: Vec<(StoredKey, Item)> = guard
+    // Items are borrowed; only the returned page is copied.
+    let mut candidates: Vec<(StoredKey, &Item)> = guard
         .items
         .values()
         .filter(|item| key_cond.matches(item))
-        .filter_map(|item| stored_key_for(item, &hash, range.as_deref()).map(|k| (k, item.clone())))
+        .filter_map(|item| stored_key_for(item, &hash, range.as_deref()).map(|k| (k, item)))
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
     let forward = req
@@ -1965,10 +1966,10 @@ pub async fn scan(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
         ));
     }
 
-    let mut candidates: Vec<(StoredKey, Item)> = guard
+    let mut candidates: Vec<(StoredKey, &Item)> = guard
         .items
         .values()
-        .filter_map(|item| stored_key_for(item, &hash, range.as_deref()).map(|k| (k, item.clone())))
+        .filter_map(|item| stored_key_for(item, &hash, range.as_deref()).map(|k| (k, item)))
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -2033,7 +2034,7 @@ fn filter_item(item: &Item, allowed: &std::collections::HashSet<String>) -> Item
 fn paginate_and_respond(
     req: &Value,
     def: &TableDefinition,
-    mut candidates: Vec<(StoredKey, Item)>,
+    mut candidates: Vec<(StoredKey, &Item)>,
     hash: &str,
     range: Option<&str>,
     allowed: Option<std::collections::HashSet<String>>,
@@ -2053,17 +2054,17 @@ fn paginate_and_respond(
         Some(l) => Some(l as usize),
         None => None,
     };
-    let mut last_evaluated: Option<Item> = None;
+    let mut last_evaluated: Option<&Item> = None;
     if let Some(limit) = limit {
         if candidates.len() > limit {
-            last_evaluated = Some(candidates[limit - 1].1.clone());
+            last_evaluated = Some(candidates[limit - 1].1);
             candidates.truncate(limit);
         }
     }
     let scanned_count = candidates.len();
 
     // FilterExpression after the read set.
-    let filtered: Vec<Item> = match req.get("FilterExpression").and_then(Value::as_str) {
+    let filtered: Vec<&Item> = match req.get("FilterExpression").and_then(Value::as_str) {
         Some(expr) => {
             let names = parse_names(req);
             let values = parse_values(req)?;
@@ -2088,11 +2089,11 @@ fn paginate_and_respond(
         for item in &filtered {
             // Restrict to the index projection (if querying a secondary index), then apply any
             // explicit ProjectionExpression.
-            let base = match &allowed {
-                Some(set) => filter_item(item, set),
-                None => item.clone(),
+            let projected = match &allowed {
+                Some(set) => maybe_project(req, &filter_item(item, set))?,
+                None => maybe_project(req, item)?,
             };
-            items.push(item_to_json(&maybe_project(req, &base)?));
+            items.push(item_to_json(&projected));
         }
         out.insert("Items".into(), Value::Array(items));
     }
@@ -2105,7 +2106,7 @@ fn paginate_and_respond(
         }
         attr_names.sort();
         attr_names.dedup();
-        out.insert("LastEvaluatedKey".into(), key_json(&last, &attr_names));
+        out.insert("LastEvaluatedKey".into(), key_json(last, &attr_names));
     }
     Ok(Value::Object(out))
 }

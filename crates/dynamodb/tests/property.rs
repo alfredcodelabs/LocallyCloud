@@ -478,3 +478,88 @@ async fn errors_render_type_shape() {
         .unwrap()
         .contains("ResourceNotFoundException"));
 }
+
+/// Scan pages apply Limit before the filter, project each returned item and respect a
+/// KEYS_ONLY index projection, while every matching item is returned exactly once.
+#[test]
+fn scan_pages_filter_project_and_respect_index_projection() {
+    let h = DynamoHandler::new();
+    rt().block_on(async {
+        let (status, _) = call(
+            &h,
+            "CreateTable",
+            json!({
+                "TableName": "pages",
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "g", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "BillingMode": "PAY_PER_REQUEST",
+                "GlobalSecondaryIndexes": [{"IndexName": "byG",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"}}]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        for i in 0..9 {
+            call(
+                &h,
+                "PutItem",
+                json!({"TableName": "pages", "Item": {
+                "pk": {"S": format!("p{i}")}, "g": {"S": "x"},
+                "v": {"N": (i % 3).to_string()}, "extra": {"S": "hidden"}}}),
+            )
+            .await;
+        }
+        let mut seen = BTreeSet::new();
+        let mut scanned = 0;
+        let mut start: Option<Value> = None;
+        loop {
+            let mut scan = json!({"TableName": "pages", "Limit": 2,
+                "FilterExpression": "v > :z", "ProjectionExpression": "pk, v",
+                "ExpressionAttributeValues": {":z": {"N": "0"}}});
+            if let Some(s) = &start {
+                scan["ExclusiveStartKey"] = s.clone();
+            }
+            let (status, page) = call(&h, "Scan", scan).await;
+            assert_eq!(status, 200);
+            scanned += page["ScannedCount"].as_u64().unwrap();
+            assert!(page["Count"].as_u64() <= page["ScannedCount"].as_u64());
+            for item in page["Items"].as_array().unwrap() {
+                let keys: Vec<&str> = item
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(keys, ["pk", "v"]);
+                assert!(seen.insert(item["pk"]["S"].as_str().unwrap().to_owned()));
+            }
+            match page.get("LastEvaluatedKey") {
+                Some(key) => start = Some(key.clone()),
+                None => break,
+            }
+        }
+        assert_eq!(scanned, 9);
+        assert_eq!(seen.len(), 6);
+
+        let (status, index) = call(
+            &h,
+            "Scan",
+            json!({"TableName": "pages", "IndexName": "byG"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(index["Count"], 9);
+        for item in index["Items"].as_array().unwrap() {
+            let keys: Vec<&str> = item
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, ["g", "pk"]);
+        }
+    });
+}
