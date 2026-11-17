@@ -28,8 +28,8 @@ use crate::auth::{
     JwtValidator,
 };
 use crate::logging::{
-    emit as emit_logs, http_stage_logging, request_source_ip, request_user_agent,
-    rest_stage_logging, RequestLogValues, StageLogging,
+    emit as emit_logs, http_stage_logging, request_user_agent, rest_stage_logging,
+    RequestLogValues, StageLogging,
 };
 use crate::proxy_event::{
     build_event, interpret_response, percent_decode, EventInput, ProxyResponse,
@@ -633,7 +633,7 @@ async fn invoke_rest(
                     .next()
                     .unwrap_or(incoming.host)
                     .to_string(),
-                source_ip: request_source_ip(incoming.headers).map(str::to_string),
+                source_ip: Some(source_ip(ctx)).filter(|ip| !ip.is_empty()),
                 user_agent: request_user_agent(incoming.headers).map(str::to_string),
                 cors: None,
                 request_headers: incoming.headers.clone(),
@@ -1017,6 +1017,7 @@ async fn invoke_rest_inner(
         stage: &stage,
         path: &path,
         route_template: &route.template,
+        route_key: None,
         resource_id: &route.resource_id,
         path_params: &route.params,
         variables: &variables,
@@ -1036,6 +1037,7 @@ struct IntegrationRequest<'a> {
     stage: &'a str,
     path: &'a str,
     route_template: &'a str,
+    route_key: Option<&'a str>,
     resource_id: &'a str,
     path_params: &'a BTreeMap<String, String>,
     variables: &'a BTreeMap<String, String>,
@@ -1287,13 +1289,9 @@ async fn invoke_http(
             let cors = snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.api.get("corsConfiguration").cloned());
-            let route = if incoming.method == Method::OPTIONS && cors.is_some() {
-                None
-            } else {
-                snapshot
-                    .as_ref()
-                    .and_then(|snapshot| http_route(&snapshot.routes, incoming.method, &path))
-            };
+            let route = snapshot
+                .as_ref()
+                .and_then(|snapshot| http_route(&snapshot.routes, incoming.method, &path));
             Ok::<_, crate::error::ApiGwError>(InvocationLogContext {
                 request_time: time::OffsetDateTime::now_utc(),
                 settings,
@@ -1314,7 +1312,7 @@ async fn invoke_http(
                     .next()
                     .unwrap_or(incoming.host)
                     .to_string(),
-                source_ip: request_source_ip(incoming.headers).map(str::to_string),
+                source_ip: Some(source_ip(ctx)).filter(|ip| !ip.is_empty()),
                 user_agent: request_user_agent(incoming.headers).map(str::to_string),
                 cors,
                 request_headers: incoming.headers.clone(),
@@ -1380,12 +1378,25 @@ async fn invoke_http_inner(
     };
     drop(guard);
     let cors = snapshot.api.get("corsConfiguration").cloned();
-    if method == Method::OPTIONS {
+    let preflight = method == Method::OPTIONS
+        && headers.contains_key(http::header::ORIGIN)
+        && headers.contains_key(http::header::ACCESS_CONTROL_REQUEST_METHOD);
+    let route = http_route(&snapshot.routes, method, &path);
+    if preflight
+        && route.as_ref().is_none_or(|route| {
+            route
+                .value
+                .get("authorizationType")
+                .and_then(Value::as_str)
+                .unwrap_or("NONE")
+                == "NONE"
+        })
+    {
         if let Some(cors) = cors.as_ref() {
             return cors_preflight(cors, headers);
         }
     }
-    let route = match http_route(&snapshot.routes, method, &path) {
+    let route = match route {
         Some(route) => route,
         None => return with_cors(plain(404, "Not Found"), cors.as_ref(), headers),
     };
@@ -1408,24 +1419,58 @@ async fn invoke_http_inner(
                 .get(id)
                 .map(|value| (id.to_string(), value.clone()))
         });
-    let target_name = route
-        .value
-        .get("target")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let integration_id = target_name.strip_prefix("integrations/").unwrap_or("");
-    let integration = match snapshot.integrations.get(integration_id) {
-        Some(value) => value.clone(),
-        None => return with_cors(plain(500, "Internal Server Error"), cors.as_ref(), headers),
-    };
-
     let auth_type = route
         .value
         .get("authorizationType")
         .and_then(Value::as_str)
         .unwrap_or("NONE");
-    let auth = if auth_type == "JWT" {
-        match authorizer {
+    let auth = match auth_type {
+        "AWS_IAM" => {
+            let Some(original) = ctx.original_request else {
+                return with_cors(plain(500, "Internal Server Error"), cors.as_ref(), headers);
+            };
+            let resource = invocation_arn(
+                ctx,
+                target.api_id,
+                &stage,
+                method,
+                &path,
+                route.value.get("routeKey").and_then(Value::as_str),
+            );
+            match crate::auth::authorize_iam_invoke(
+                ctx.registry,
+                original,
+                resource,
+                None,
+                ctx.account,
+                ctx.policy_context,
+            ) {
+                Ok(iam) => AuthContext {
+                    iam,
+                    ..AuthContext::default()
+                },
+                Err(error) => {
+                    use locallycloud_core::integration::authorization::AuthorizationError;
+                    let status = match error {
+                        AuthorizationError::Denied | AuthorizationError::InvalidRequest => 403,
+                        _ => 500,
+                    };
+                    return with_cors(
+                        plain(
+                            status,
+                            if status == 403 {
+                                "Forbidden"
+                            } else {
+                                "Internal Server Error"
+                            },
+                        ),
+                        cors.as_ref(),
+                        headers,
+                    );
+                }
+            }
+        }
+        "JWT" => match authorizer {
             Some((_, authorizer)) => {
                 match jwt_authorize(ctx, &route.value, &authorizer, headers).await {
                     Ok(auth) => auth,
@@ -1446,9 +1491,8 @@ async fn invoke_http_inner(
                 }
             }
             None => return with_cors(plain(500, "Internal Server Error"), cors.as_ref(), headers),
-        }
-    } else if auth_type == "CUSTOM" {
-        match authorizer {
+        },
+        "CUSTOM" => match authorizer {
             Some((id, authorizer)) => match lambda_authorize(
                 ctx,
                 ApiKind::Http,
@@ -1486,11 +1530,25 @@ async fn invoke_http_inner(
                 }
             },
             None => return with_cors(plain(500, "Internal Server Error"), cors.as_ref(), headers),
+        },
+        "NONE" => AuthContext::default(),
+        _ => return with_cors(plain(403, "Forbidden"), cors.as_ref(), headers),
+    };
+
+    if preflight {
+        if let Some(cors) = cors.as_ref() {
+            return cors_preflight(cors, headers);
         }
-    } else if auth_type == "NONE" {
-        AuthContext::default()
-    } else {
-        return with_cors(plain(403, "Forbidden"), cors.as_ref(), headers);
+    }
+    let target_name = route
+        .value
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let integration_id = target_name.strip_prefix("integrations/").unwrap_or("");
+    let integration = match snapshot.integrations.get(integration_id) {
+        Some(value) => value.clone(),
+        None => return with_cors(plain(500, "Internal Server Error"), cors.as_ref(), headers),
     };
 
     let request = IntegrationRequest {
@@ -1504,6 +1562,7 @@ async fn invoke_http_inner(
         stage: &stage,
         path: &path,
         route_template: &route.template,
+        route_key: route.value.get("routeKey").and_then(Value::as_str),
         resource_id: &route.resource_id,
         path_params: &route.params,
         variables: &variables,
@@ -1747,7 +1806,7 @@ async fn lambda_authorize(
                 "accountId": ctx.account,
                 "apiId": api_id,
                 "httpMethod": method.as_str(),
-                "identity": { "sourceIp": source_ip(headers) },
+                "identity": { "sourceIp": source_ip(ctx) },
                 "path": path,
                 "requestId": ctx.request_id,
                 "resourcePath": route_template,
@@ -1775,6 +1834,7 @@ async fn lambda_authorize(
                 account: ctx.account,
                 api_id,
                 request_id: ctx.request_id,
+                source_ip: &source_ip(ctx),
                 jwt: None,
             },
         );
@@ -2004,13 +2064,14 @@ fn string_object(values: &BTreeMap<String, String>) -> Value {
     }
 }
 
-fn source_ip(headers: &HeaderMap) -> &str {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .unwrap_or("")
+fn source_ip(ctx: &ExecuteCtx<'_>) -> String {
+    ctx.trusted_peer_ip
+        .map(str::to_string)
+        .or_else(|| {
+            ctx.private_ingress
+                .map(|ingress| ingress.endpoint_ip.to_string())
+        })
+        .unwrap_or_default()
 }
 
 fn integration_event(
@@ -2018,11 +2079,12 @@ fn integration_event(
     request: &IntegrationRequest<'_>,
     format: &str,
 ) -> Value {
-    let route_key = if request.route_template == "$default" {
-        format!("{} {}", request.method, request.path)
-    } else {
-        format!("{} {}", request.method, request.route_template)
-    };
+    let route_key = request
+        .route_key
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|| {
+            std::borrow::Cow::Owned(format!("{} {}", request.method, request.route_template))
+        });
     let mut event = build_event(
         format,
         &EventInput {
@@ -2038,6 +2100,7 @@ fn integration_event(
             account: ctx.account,
             api_id: request.api_id,
             request_id: ctx.request_id,
+            source_ip: &source_ip(ctx),
             jwt: request.auth.jwt.clone(),
         },
     );
@@ -2045,8 +2108,18 @@ fn integration_event(
         event["requestContext"]["resourceId"] = Value::String(request.resource_id.to_string());
     }
     if let Some(identity) = request.auth.iam.as_ref().and_then(Value::as_object) {
-        if let Some(target) = event["requestContext"]["identity"].as_object_mut() {
-            target.extend(identity.clone());
+        if format == "1.0" {
+            if let Some(target) = event["requestContext"]["identity"].as_object_mut() {
+                target.extend(identity.clone());
+            }
+        } else {
+            event["requestContext"]["authorizer"]["iam"] = json!({
+                "accountId": identity.get("accountId"),
+                "accessKey": identity.get("accessKey"),
+                "callerId": identity.get("caller"),
+                "userId": identity.get("user"),
+                "userArn": identity.get("userArn"),
+            });
         }
     }
     event["stageVariables"] = string_object(request.variables);
@@ -2656,7 +2729,7 @@ fn evaluate_vtl(
         ("authorizer".into(), authorizer),
         ("identity".into(), {
             let mut identity = json!({
-                "sourceIp": ctx.trusted_peer_ip.unwrap_or(""),
+                "sourceIp": source_ip(ctx),
                 "userAgent": request_user_agent(request.headers).unwrap_or_default(),
             });
             if let (Some(target), Some(fields)) = (
@@ -2923,10 +2996,34 @@ pub(crate) fn integration_headers(
     Ok(headers)
 }
 
+fn invocation_arn(
+    ctx: &ExecuteCtx<'_>,
+    api_id: &str,
+    stage: &str,
+    method: &Method,
+    path: &str,
+    route_key: Option<&str>,
+) -> String {
+    match route_key {
+        Some("$default") => format!(
+            "arn:aws:execute-api:{}:{}:{api_id}/{stage}/$default",
+            ctx.region, ctx.account
+        ),
+        _ => format!(
+            "arn:aws:execute-api:{}:{}:{api_id}/{stage}/{method}{path}",
+            ctx.region, ctx.account
+        ),
+    }
+}
+
 fn integration_source_arn(ctx: &ExecuteCtx<'_>, request: &IntegrationRequest<'_>) -> String {
-    format!(
-        "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
-        ctx.region, ctx.account, request.api_id, request.stage, request.method, request.path
+    invocation_arn(
+        ctx,
+        request.api_id,
+        request.stage,
+        request.method,
+        request.path,
+        request.route_key,
     )
 }
 
@@ -3247,6 +3344,7 @@ mod tests {
             stage: "prod",
             path: "/source",
             route_template: "/source",
+            route_key: None,
             resource_id: "resource",
             path_params: &path_params,
             variables: &variables,
@@ -3382,6 +3480,7 @@ mod tests {
                 stage: "prod",
                 path: "/source",
                 route_template: "/source",
+                route_key: None,
                 resource_id: "resource",
                 path_params: &params,
                 variables: &params,

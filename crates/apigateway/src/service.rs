@@ -4361,7 +4361,7 @@ mod aws_proxy_e2e {
         };
         let resp = h.handle(invoke).await;
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("x-route").unwrap(), "GET /thing");
+        assert_eq!(resp.headers().get("x-route").unwrap(), "$default");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -4392,7 +4392,7 @@ mod aws_proxy_e2e {
         };
         let resp = h.handle(invoke).await;
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("x-route").unwrap(), "GET /thing2");
+        assert_eq!(resp.headers().get("x-route").unwrap(), "$default");
     }
 }
 

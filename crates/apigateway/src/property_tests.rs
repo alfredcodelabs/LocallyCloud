@@ -267,7 +267,7 @@ proptest! {
         let event = build_event("1.0", &EventInput {
             method: "GET", host: "api.execute-api.local", stage: "prod", raw_path: "/prod/items",
             resource_path: "/items", raw_query: &raw_query, route_key: "GET /items", headers: &headers,
-            body: &[], account: ACCOUNT, api_id: "api", request_id: "request", jwt: None,
+            body: &[], account: ACCOUNT, api_id: "api", request_id: "request", source_ip: "", jwt: None,
         });
         prop_assert_eq!(event["headers"]["x-property"].as_str(), values.last().map(String::as_str));
         prop_assert_eq!(event["multiValueHeaders"]["x-property"].clone(), json!(values));
@@ -289,7 +289,7 @@ proptest! {
             method: "POST", host: "api.execute-api.local", stage: "prod", raw_path: "/prod/items",
             resource_path: "/items", raw_query: "tag=one&tag=two", route_key: "POST /items",
             headers: &headers, body: body.as_bytes(), account: ACCOUNT, api_id: "api",
-            request_id: "request", jwt: None,
+            request_id: "request", source_ip: "", jwt: None,
         };
         let v1 = build_event("1.0", &input);
         let v2 = build_event("2.0", &input);
@@ -310,7 +310,7 @@ proptest! {
         let event = build_event("1.0", &EventInput {
             method: "POST", host: "api.execute-api.local", stage: "prod", raw_path: "/prod/items",
             resource_path: "/items", raw_query: "", route_key: "POST /items", headers: &headers,
-            body: &body, account: ACCOUNT, api_id: "api", request_id: "request", jwt: None,
+            body: &body, account: ACCOUNT, api_id: "api", request_id: "request", source_ip: "", jwt: None,
         });
         if body.is_empty() {
             prop_assert!(event["body"].is_null());

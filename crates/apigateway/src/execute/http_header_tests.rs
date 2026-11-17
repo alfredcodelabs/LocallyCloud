@@ -72,6 +72,7 @@ async fn iam_method_outbound_rule_drops_authorization_without_mutating_caller_he
         stage: "prod",
         path: "/",
         route_template: "/",
+        route_key: None,
         resource_id: "root",
         path_params: &params,
         variables: &params,

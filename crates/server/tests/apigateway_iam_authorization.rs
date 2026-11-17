@@ -72,8 +72,9 @@ fn signature(
 ) -> [(String, String); 2] {
     let (stamp, day) = timestamp();
     let scope = format!("{day}/us-east-1/{service}/aws4_request");
+    let canonical_path = path.split('/').map(encode).collect::<Vec<_>>().join("/");
     let canonical = format!(
-        "{method}\n{path}\n{query}\nhost:{host}\nx-amz-date:{stamp}\n\nhost;x-amz-date\n{}",
+        "{method}\n{canonical_path}\n{query}\nhost:{host}\nx-amz-date:{stamp}\n\nhost;x-amz-date\n{}",
         hex(&Sha256::digest(body))
     );
     let signing = format!(
@@ -111,6 +112,7 @@ struct Fixture {
     backend: String,
     client: reqwest::Client,
     iam: Arc<IamStore>,
+    registry: Arc<ServiceRegistry>,
     hits: Arc<AtomicUsize>,
     redirect_hits: Arc<AtomicUsize>,
     workers: Vec<JoinHandle<()>>,
@@ -210,8 +212,9 @@ impl Fixture {
             sqs_esm_max_pollers: 2,
         };
         let (ready, started) = tokio::sync::oneshot::channel();
+        let server_registry = registry.clone();
         let task = tokio::spawn(async move {
-            LocallyCloudServer::new(config, registry)
+            LocallyCloudServer::new(config, server_registry)
                 .run_on_listener(listener, std::future::pending::<()>(), move || {
                     let _ = ready.send(());
                 })
@@ -233,6 +236,7 @@ impl Fixture {
                 .build()
                 .unwrap(),
             iam,
+            registry,
             hits,
             redirect_hits,
             workers: vec![backend_task, task],
@@ -494,54 +498,67 @@ fn encode(value: &str) -> String {
 async fn execute_api_presigned_get_and_post_check_signature_body_and_expiration() {
     let f = Fixture::new(EnforcementMode::Permissive).await;
     let api = f.rest("AWS_IAM", None).await;
-    let path = format!("/restapis/{api}/dev/_user_request_/");
-    for (method, payload) in [(Method::GET, ""), (Method::POST, "owned-body")] {
-        for (expires, expected) in [("60", 200), ("0", 403), ("604801", 403)] {
-            let (stamp, day) = timestamp();
-            let scope = format!("{day}/us-east-1/execute-api/aws4_request");
-            let query = BTreeMap::from([
-                ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
-                ("X-Amz-Credential", format!("{ACTOR}/{scope}")),
-                ("X-Amz-Date", stamp.clone()),
-                ("X-Amz-Expires", expires.to_owned()),
-                ("X-Amz-SignedHeaders", "host".to_owned()),
-            ])
-            .iter()
-            .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
-            .collect::<Vec<_>>()
-            .join("&");
-            let canonical = format!(
-                "{}\n{path}\n{query}\nhost:{}\n\nhost\n{}",
-                method.as_str(),
-                f.host,
-                hex(&Sha256::digest(payload.as_bytes()))
-            );
-            let string = format!(
-                "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
-                hex(&Sha256::digest(canonical.as_bytes()))
-            );
-            let signature = hex(&digest(&signing_key(SECRET, &day, "execute-api"), &string));
-            let before = f.hits.load(Ordering::SeqCst);
-            let response = f
-                .client
-                .request(
-                    method.clone(),
-                    format!("{}{path}?{query}&X-Amz-Signature={signature}", f.base),
-                )
-                .body(payload)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status().as_u16(),
-                expected,
-                "{}",
-                response.text().await.unwrap()
-            );
-            assert_eq!(
-                f.hits.load(Ordering::SeqCst) - before,
-                usize::from(expected == 200)
-            );
+    let (http_api, _) =
+        http_api::create_http_api(&f, "ANY /items/{id}", "AWS_IAM", "dev", None).await;
+    for (path, host) in [
+        (
+            format!("/restapis/{api}/dev/_user_request_/"),
+            f.host.clone(),
+        ),
+        (
+            "/dev/items/42".into(),
+            format!("{http_api}.execute-api.us-east-1.amazonaws.com"),
+        ),
+    ] {
+        for (method, payload) in [(Method::GET, ""), (Method::POST, "owned-body")] {
+            for (expires, expected) in [("60", 200), ("0", 403), ("604801", 403)] {
+                let (stamp, day) = timestamp();
+                let scope = format!("{day}/us-east-1/execute-api/aws4_request");
+                let query = BTreeMap::from([
+                    ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
+                    ("X-Amz-Credential", format!("{ACTOR}/{scope}")),
+                    ("X-Amz-Date", stamp.clone()),
+                    ("X-Amz-Expires", expires.to_owned()),
+                    ("X-Amz-SignedHeaders", "host".to_owned()),
+                ])
+                .iter()
+                .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
+                .collect::<Vec<_>>()
+                .join("&");
+                let canonical = format!(
+                    "{}\n{path}\n{query}\nhost:{}\n\nhost\n{}",
+                    method.as_str(),
+                    host,
+                    hex(&Sha256::digest(payload.as_bytes()))
+                );
+                let string = format!(
+                    "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+                    hex(&Sha256::digest(canonical.as_bytes()))
+                );
+                let signature = hex(&digest(&signing_key(SECRET, &day, "execute-api"), &string));
+                let before = f.hits.load(Ordering::SeqCst);
+                let response = f
+                    .client
+                    .request(
+                        method.clone(),
+                        format!("{}{path}?{query}&X-Amz-Signature={signature}", f.base),
+                    )
+                    .header(http::header::HOST, &host)
+                    .body(payload)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    expected,
+                    "{}",
+                    response.text().await.unwrap()
+                );
+                assert_eq!(
+                    f.hits.load(Ordering::SeqCst) - before,
+                    usize::from(expected == 200)
+                );
+            }
         }
     }
 }
@@ -731,3 +748,6 @@ async fn allowed_http_integration_returns_redirect_without_following_it() {
     assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.redirect_hits.load(Ordering::SeqCst), 0);
 }
+
+#[path = "apigateway_iam_authorization/http_api.rs"]
+mod http_api;

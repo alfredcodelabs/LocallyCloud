@@ -22,6 +22,8 @@ pub struct EventInput<'a> {
     pub account: &'a str,
     pub api_id: &'a str,
     pub request_id: &'a str,
+    /// Peer supplied by the trusted transport, never a forwarding header.
+    pub source_ip: &'a str,
     /// `(claims, scopes)` from a JWT authorizer, when the route is JWT-protected.
     pub jwt: Option<(Value, Vec<String>)>,
 }
@@ -261,7 +263,7 @@ fn build_v2(input: &EventInput) -> Value {
             "method": input.method,
             "path": input.raw_path,
             "protocol": "HTTP/1.1",
-            "sourceIp": source_ip(input.headers),
+            "sourceIp": input.source_ip,
             "userAgent": header_str(input.headers, "user-agent"),
         },
         "requestId": input.request_id,
@@ -308,7 +310,7 @@ fn build_v1(input: &EventInput) -> Value {
         "requestId": input.request_id,
         "requestTimeEpoch": request_time_epoch,
         "identity": {
-            "sourceIp": source_ip(input.headers),
+            "sourceIp": input.source_ip,
         },
     });
     if let Some(authorizer) = authorizer_context(&input.jwt) {
@@ -344,16 +346,6 @@ fn header_str(headers: &HeaderMap, name: &str) -> String {
         .get(name)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
-        .to_string()
-}
-
-fn source_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .unwrap_or("")
-        .trim()
         .to_string()
 }
 
@@ -492,6 +484,7 @@ mod tests {
             account: "000000000000",
             api_id: "abc",
             request_id: "rid",
+            source_ip: "192.0.2.1",
             jwt,
         }
     }

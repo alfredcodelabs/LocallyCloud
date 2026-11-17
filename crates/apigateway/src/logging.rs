@@ -664,15 +664,6 @@ pub async fn emit(
     Ok(())
 }
 
-pub fn request_source_ip(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
 pub fn request_user_agent(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("user-agent")
