@@ -27,6 +27,7 @@ use axum::{
 use dashmap::DashMap;
 use http::{StatusCode, Uri};
 use locallycloud_compute::runtime::{ComputeRuntime, RuntimeError, TaskSpec, TaskState};
+use locallycloud_compute::youki::original_tcp_destination;
 use locallycloud_core::error_mapping::AwsError;
 use locallycloud_core::integration::correlation::CorrelationContext;
 use locallycloud_core::integration::identity::CallerIdentity;
@@ -36,7 +37,7 @@ use locallycloud_core::integration::logs::{
 use locallycloud_core::proxy::{forward_to_legacy, ProxyConfig};
 use locallycloud_core::registry::{AwsProtocol, ServiceName, ServiceRegistry};
 use locallycloud_core::router::extract_service_from_credential_scope;
-use locallycloud_ec2::{Ec2Handler, TaskNetworkLease};
+use locallycloud_ec2::{Ec2Handler, PrivateConnectionTarget, PrivateTargetOwner, TaskNetworkLease};
 use uuid::Uuid;
 
 use crate::code_store::CodeStore;
@@ -210,78 +211,156 @@ fn proxy_router(
     }))
 }
 
-fn private_tcp_listener(
+/// Connect only after the EC2 topology has authorized the exact source and target.
+#[async_trait::async_trait]
+pub trait PrivateConnectionRuntime: Send + Sync {
+    async fn connect(
+        &self,
+        target: &PrivateConnectionTarget,
+        address: SocketAddrV4,
+    ) -> io::Result<tokio::net::TcpStream>;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum VpcTcpDestination {
+    Private(PrivateConnectionTarget),
+    Public(SocketAddrV4),
+}
+
+async fn connect_private_target(
+    runtime: Option<&Arc<dyn PrivateConnectionRuntime>>,
+    target: &PrivateConnectionTarget,
+    address: SocketAddrV4,
+) -> io::Result<tokio::net::TcpStream> {
+    if let Some(runtime) = runtime {
+        return runtime.connect(target, address).await;
+    }
+    match &target.owner {
+        PrivateTargetOwner::HostSocket => tokio::net::TcpStream::connect(target.endpoint).await,
+        PrivateTargetOwner::Task(_) | PrivateTargetOwner::Instance(_) => {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn private_connections_use_owner_runtime_and_reject_missing_owned_transport() {
+    struct Connector {
+        endpoint: SocketAddr,
+        calls: Mutex<Vec<(PrivateConnectionTarget, SocketAddrV4)>>,
+    }
+    #[async_trait::async_trait]
+    impl PrivateConnectionRuntime for Connector {
+        async fn connect(
+            &self,
+            target: &PrivateConnectionTarget,
+            address: SocketAddrV4,
+        ) -> io::Result<tokio::net::TcpStream> {
+            self.calls.lock().unwrap().push((target.clone(), address));
+            tokio::net::TcpStream::connect(self.endpoint).await
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let connector = Arc::new(Connector {
+        endpoint: listener.local_addr().unwrap(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let runtime: Arc<dyn PrivateConnectionRuntime> = connector.clone();
+    let destination = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 8080);
+    for owner in [
+        PrivateTargetOwner::Task("task".into()),
+        PrivateTargetOwner::Instance("instance".into()),
+        PrivateTargetOwner::HostSocket,
+    ] {
+        let target = PrivateConnectionTarget {
+            endpoint: "127.0.0.1:0".parse().unwrap(),
+            owner,
+        };
+        if !matches!(&target.owner, PrivateTargetOwner::HostSocket) {
+            assert_eq!(
+                connect_private_target(None, &target, destination)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        let stream = connect_private_target(Some(&runtime), &target, destination)
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), connector.endpoint);
+        assert_eq!(
+            connector.calls.lock().unwrap().last(),
+            Some(&(target, destination))
+        );
+    }
+    assert_eq!(connector.calls.lock().unwrap().len(), 3);
+}
+
+fn vpc_tcp_listener(
     listener: tokio::net::TcpListener,
     ec2: Arc<Ec2Handler>,
     account: String,
     region: String,
-    source_eni_id: String,
-    target_ip: Ipv4Addr,
-    port: u16,
+    source: Arc<TaskNetworkLease>,
+    private_api: Option<locallycloud_ec2::private_api::PrivateApiTransport>,
+    private_connections: Option<Arc<dyn PrivateConnectionRuntime>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let slots = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (mut guest, _) = match listener.accept().await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    tracing::warn!(%error, %target_ip, port, "private TCP listener stopped");
-                    break;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((mut guest, _)) = accepted else { break; };
+                    if connections.len() >= 64 { continue; }
+                    let Ok(destination) = original_tcp_destination(&guest) else { continue; };
+                    let ec2 = ec2.clone();
+                    let account = account.clone();
+                    let region = region.clone();
+                    let source = source.clone();
+                    let private_api = private_api.clone();
+                    let private_connections = private_connections.clone();
+                    connections.spawn(async move {
+                        let transfer = async {
+                            if let Some(transport) = private_api.filter(|t| t.permits(destination)) {
+                                let _ = transport.serve(guest, destination).await;
+                                return;
+                            }
+                            let resolve = || {
+                                ec2.private_connection_target(&account, &region, &source, *destination.ip(), destination.port())
+                                    .map(VpcTcpDestination::Private)
+                                    .or_else(|| ec2.public_tcp_access(&account, &region, &source.eni_id, *destination.ip(), destination.port()).then_some(VpcTcpDestination::Public(destination)))
+                            };
+                            let Some(endpoint) = resolve() else { return; };
+                            let connect = async {
+                                match &endpoint {
+                                    VpcTcpDestination::Private(target) => connect_private_target(private_connections.as_ref(), target, destination).await,
+                                    VpcTcpDestination::Public(address) => tokio::net::TcpStream::connect(*address).await,
+                                }
+                            };
+                            let Ok(Ok(mut backend)) = tokio::time::timeout(Duration::from_secs(5), connect).await else { return; };
+                            if resolve().as_ref() != Some(&endpoint) { return; }
+                            let copy = tokio::io::copy_bidirectional(&mut guest, &mut backend);
+                            tokio::pin!(copy);
+                            let mut tick = tokio::time::interval(Duration::from_millis(250));
+                            loop {
+                                tokio::select! {
+                                    _ = &mut copy => break,
+                                    _ = tick.tick() => { if resolve().as_ref() != Some(&endpoint) { break; } }
+                                }
+                            }
+                        };
+                        let _ = tokio::time::timeout(Duration::from_secs(30), transfer).await;
+                    });
                 }
-            };
-            let Some(backend) =
-                ec2.private_tcp_access(&account, &region, &source_eni_id, target_ip, port)
-            else {
-                continue;
-            };
-            let Ok(slot) = slots.clone().try_acquire_owned() else {
-                continue;
-            };
-            tokio::spawn(async move {
-                let _slot = slot;
-                if let Ok(mut server) = tokio::net::TcpStream::connect(backend).await {
-                    let _ = tokio::io::copy_bidirectional(&mut guest, &mut server).await;
-                }
-            });
+                _ = connections.join_next(), if !connections.is_empty() => {}
+            }
         }
     })
 }
 
-fn public_egress_tools_available() -> bool {
-    [("ip", "-Version"), ("nft", "--version")]
-        .into_iter()
-        .all(|(program, version)| {
-            std::process::Command::new(program)
-                .arg(version)
-                .output()
-                .is_ok_and(|output| output.status.success())
-        })
-}
-
-fn original_tcp_destination(stream: &tokio::net::TcpStream) -> io::Result<std::net::SocketAddrV4> {
-    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    // SAFETY: getsockopt writes no more than the provided sockaddr_in buffer.
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_IP,
-            80, // SO_ORIGINAL_DST
-            (&mut address as *mut libc::sockaddr_in).cast(),
-            &mut size,
-        )
-    } != 0
-        || size as usize != std::mem::size_of::<libc::sockaddr_in>()
-        || address.sin_family != libc::AF_INET as u16
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(std::net::SocketAddrV4::new(
-        Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
-        u16::from_be(address.sin_port),
-    ))
-}
-
+#[cfg(test)]
 fn public_tcp_listener(
     listener: tokio::net::TcpListener,
     ec2: Arc<Ec2Handler>,
@@ -427,7 +506,8 @@ pub struct Executor {
     rootfs_root: PathBuf,
     runtime: Arc<dyn ComputeRuntime>,
     ec2: Mutex<Option<Arc<Ec2Handler>>>,
-    vpc_networks: DashMap<String, TaskNetworkLease>,
+    private_connections: Mutex<Option<Arc<dyn PrivateConnectionRuntime>>>,
+    vpc_networks: DashMap<String, Arc<TaskNetworkLease>>,
     vpc_public_egress: DashMap<String, bool>,
     vpc_proxies: DashMap<String, Vec<tokio::task::JoinHandle<()>>>,
     /// Host `host:port[/prefix]` a guest reaches the Runtime API on (no scheme).
@@ -770,6 +850,7 @@ impl Executor {
             rootfs_root: rootfs_root.into(),
             runtime,
             ec2: Mutex::new(None),
+            private_connections: Mutex::new(None),
             vpc_networks: DashMap::new(),
             vpc_public_egress: DashMap::new(),
             vpc_proxies: DashMap::new(),
@@ -809,6 +890,13 @@ impl Executor {
     /// Attach the EC2 control plane used for real VPC ENI and endpoint policy.
     pub fn attach_ec2(&self, ec2: Arc<Ec2Handler>) {
         *self.ec2.lock().unwrap() = Some(ec2);
+    }
+
+    pub fn attach_private_connections(&self, runtime: Arc<dyn PrivateConnectionRuntime>) {
+        *self
+            .private_connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
     }
 
     pub(crate) fn attach_concurrency(
@@ -2099,8 +2187,8 @@ impl Executor {
                         &vpc.security_group_ids,
                         &env_key,
                     )
+                    .map(Arc::new)
                     .ok_or("Lambda VPC could not reserve a private network interface")?;
-                let destinations = ec2.private_tcp_destinations(account, region, &lease.eni_id);
                 let dns = ec2.private_tcp_dns(account, region, &lease.eni_id);
                 let mut hosts = String::from("127.0.0.1 localhost\n");
                 for (hostname, address) in dns {
@@ -2156,7 +2244,7 @@ impl Executor {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                     .map_err(|e| format!("setting VPC bootstrap permissions: {e}"))?;
-                Ok((ec2, lease, runtime_port, aws_port, destinations))
+                Ok((ec2, lease, runtime_port, aws_port))
             })();
             match prepared {
                 Ok(value) => Some(value),
@@ -2313,7 +2401,7 @@ impl Executor {
                 .map_err(|e| e.to_string())?;
             command.splice(0..0, ["/bin/bash".into(), "/var/runtime/vpc-wait".into()]);
         }
-        if let Some((_, _, runtime_port, aws_port, _)) = &vpc_launch {
+        if let Some((_, _, runtime_port, aws_port)) = &vpc_launch {
             env_map.insert(
                 "LOCALLYCLOUD_VPC_RUNTIME_PORT".into(),
                 runtime_port.to_string(),
@@ -2335,7 +2423,7 @@ impl Executor {
             self.cleanup_owned_rootfs(&env_key);
             return Err(format!("rootfs ownership transition failed: {error}"));
         }
-        if let Some((ec2, lease, runtime_port, aws_port, destinations)) = vpc_launch {
+        if let Some((ec2, lease, runtime_port, aws_port)) = vpc_launch {
             let (handle, mut listeners) = match self
                 .runtime
                 .start_task_isolated_with_loopback(&env_key, &spec, &[runtime_port, aws_port])
@@ -2353,41 +2441,14 @@ impl Executor {
             );
             let runtime_listener = listeners.remove(0);
             let aws_listener = listeners.remove(0);
-            let mut private_listeners = Vec::with_capacity(destinations.len());
-            for (address, port) in destinations {
-                match self
-                    .runtime
-                    .bind_isolated_private_tcp(&env_key, address, port)
-                    .await
-                {
-                    Ok(listener) => private_listeners.push((listener, address, port)),
-                    Err(error) => {
-                        self.cleanup_failed_start(&env_key, Some(lease)).await;
-                        return Err(format!("private VPC listener failed: {error}"));
-                    }
+            let public_tcp = match self.runtime.bind_isolated_vpc_egress(&env_key).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    self.cleanup_failed_start(&env_key, Some(lease)).await;
+                    return Err(format!(
+                        "VPC TCP capture setup failed (host ip/nft required): {error}"
+                    ));
                 }
-            }
-            let public_tcp = if public_egress_tools_available() {
-                let private_addresses = private_listeners
-                    .iter()
-                    .map(|(_, address, _)| *address)
-                    .collect::<Vec<_>>();
-                match self
-                    .runtime
-                    .bind_isolated_public_egress(&env_key, &private_addresses)
-                    .await
-                {
-                    Ok(listener) => Some(listener),
-                    Err(error) => {
-                        self.cleanup_failed_start(&env_key, Some(lease)).await;
-                        return Err(format!("public VPC egress setup failed: {error}"));
-                    }
-                }
-            } else if ec2.public_nat_route(account, region, &lease.eni_id) {
-                self.cleanup_failed_start(&env_key, Some(lease)).await;
-                return Err("public VPC egress requires host ip and nft".into());
-            } else {
-                None
             };
             let resolver = tokio::task::spawn_blocking(crate::vpc_dns::system_resolver)
                 .await
@@ -2418,30 +2479,28 @@ impl Executor {
                     return Err(format!("VPC X-Ray daemon endpoint failed: {error}"));
                 }
             }
-            let public_egress_enabled = public_tcp.is_some();
-            let mut proxies = private_listeners
-                .into_iter()
-                .map(|(listener, address, port)| {
-                    private_tcp_listener(
-                        listener,
-                        ec2.clone(),
-                        account.to_string(),
-                        region.to_string(),
-                        lease.eni_id.clone(),
-                        address,
-                        port,
-                    )
-                })
-                .collect::<Vec<_>>();
-            if let Some(listener) = public_tcp {
-                proxies.push(public_tcp_listener(
-                    listener,
+            let public_egress_enabled = true;
+            let private_api = guest_tls.as_ref().map(|tls| {
+                locallycloud_ec2::private_api::PrivateApiTransport::new(
                     ec2.clone(),
-                    account.to_string(),
-                    region.to_string(),
-                    lease.eni_id.clone(),
-                ));
-            }
+                    lease.clone(),
+                    (account.to_string(), region.to_string()),
+                    self.registry.clone(),
+                    tls.clone(),
+                )
+            });
+            let mut proxies = vec![vpc_tcp_listener(
+                public_tcp,
+                ec2.clone(),
+                account.to_string(),
+                region.to_string(),
+                lease.clone(),
+                private_api,
+                self.private_connections
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )];
             let hostname = self
                 .aws_endpoint_url
                 .parse::<Uri>()
@@ -2886,7 +2945,7 @@ impl Executor {
         self.metrics.recorder().tick();
     }
 
-    async fn cleanup_failed_start(&self, env_key: &str, lease: Option<TaskNetworkLease>) {
+    async fn cleanup_failed_start(&self, env_key: &str, lease: Option<Arc<TaskNetworkLease>>) {
         if let Some(lease) = lease {
             self.vpc_networks.insert(env_key.to_owned(), lease);
         }

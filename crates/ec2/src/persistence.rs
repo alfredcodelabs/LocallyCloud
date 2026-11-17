@@ -238,6 +238,60 @@ impl Persistence {
             }
         }
         for scope in state.values() {
+            let mut endpoint_enis = std::collections::HashSet::new();
+            let mut private_dns = std::collections::HashSet::new();
+            for endpoint in scope.vpc_endpoints.values() {
+                if !scope.vpcs.contains_key(&endpoint.vpc_id)
+                    || super::endpoints::endpoint_policy(Some(&endpoint.policy_document)).is_err()
+                    || endpoint.group_ids.iter().any(|id| {
+                        scope
+                            .security_groups
+                            .get(id)
+                            .is_none_or(|group| group.vpc_id != endpoint.vpc_id)
+                    })
+                    || endpoint.route_table_ids.iter().any(|id| {
+                        scope
+                            .route_tables
+                            .get(id)
+                            .is_none_or(|table| table.vpc_id != endpoint.vpc_id)
+                    })
+                {
+                    return Err(invalid());
+                }
+                if endpoint.kind == super::endpoints::EndpointKind::Interface {
+                    if endpoint.network_interface_ids.len() != endpoint.subnet_ids.len()
+                        || endpoint.subnet_ids.is_empty()
+                        || endpoint.group_ids.is_empty()
+                    {
+                        return Err(invalid());
+                    }
+                    let mut subnets = std::collections::HashSet::new();
+                    let mut zones = std::collections::HashSet::new();
+                    for id in &endpoint.network_interface_ids {
+                        let eni = scope.network_interfaces.get(id).ok_or_else(invalid)?;
+                        let subnet = scope.subnets.get(&eni.subnet_id).ok_or_else(invalid)?;
+                        if !endpoint_enis.insert(id)
+                            || !subnets.insert(&eni.subnet_id)
+                            || !zones.insert(&subnet.zone)
+                            || !endpoint.subnet_ids.contains(&eni.subnet_id)
+                            || eni.vpc_id != endpoint.vpc_id
+                            || eni.group_ids != endpoint.group_ids
+                            || !subnet.cidr.contains(&eni.private_ip)
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                    if endpoint.private_dns
+                        && !private_dns.insert((&endpoint.vpc_id, &endpoint.service))
+                    {
+                        return Err(invalid());
+                    }
+                } else if !endpoint.network_interface_ids.is_empty() {
+                    return Err(invalid());
+                }
+            }
+        }
+        for scope in state.values() {
             if scope.subnets.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))
                 || scope.security_groups.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))
                 || scope.route_tables.values().any(|value|!scope.vpcs.contains_key(&value.vpc_id))

@@ -1,6 +1,8 @@
 //! IAM and STS service handlers: Query-protocol dispatch, registered `Native` in the Core
 //! registry. Both services share one [`IamStore`] and [`SessionStore`].
 
+#[cfg(test)]
+mod endpoint_policy_tests;
 mod iam_authorization;
 #[cfg(test)]
 mod iam_authorization_tests;
@@ -512,6 +514,58 @@ impl AuthorizationEvaluator for IamStsState {
         request
             .context
             .insert("aws:userid".into(), vec!["anonymous".into()]);
+        let evaluation = EvalRequest {
+            action: request.action,
+            resource: request.resource,
+            context: request.context,
+        };
+        Ok(
+            match evaluate(&[PolicyDocument { statements }], None, None, &evaluation) {
+                Decision::Allowed => ResourcePolicyDecision::Allow,
+                Decision::ExplicitDeny => ResourcePolicyDecision::ExplicitDeny,
+                Decision::ImplicitDeny => ResourcePolicyDecision::ImplicitDeny,
+            },
+        )
+    }
+
+    fn evaluate_endpoint_policy(
+        &self,
+        mut request: ResourcePolicyEvaluationRequest,
+        identity: Option<RequestIdentity>,
+        document: &str,
+    ) -> Result<ResourcePolicyDecision, AuthorizationError> {
+        use crate::policy::{evaluate, Decision, EvalRequest, PolicyDocument};
+        let Some(identity) = identity else {
+            return self
+                .evaluate_anonymous_resource_policy(request, document)
+                .map_err(|_| AuthorizationError::Denied);
+        };
+        if request.action.is_empty() || request.resource.is_empty() {
+            return Err(AuthorizationError::InvalidRequest);
+        }
+        let key = identity
+            .access_key_id
+            .as_deref()
+            .ok_or(AuthorizationError::Denied)?;
+        let caller = self
+            .enforcement
+            .resolve_caller(&identity.account_id, key)
+            .map_err(|_| AuthorizationError::Denied)?;
+        let arn = caller
+            .attribute("aws:principalarn")
+            .ok_or(AuthorizationError::Denied)?;
+        let statements = crate::resource_policy::parse(document)
+            .map_err(|_| AuthorizationError::Denied)?
+            .into_iter()
+            .filter(|statement| {
+                statement
+                    .principal_match(&identity.account_id, Some(arn), None)
+                    .is_some()
+            })
+            .map(|statement| statement.statement)
+            .collect();
+        // The endpoint is an independent resource-policy gate, never an identity-policy union.
+        caller.apply_attributes(&mut request.context);
         let evaluation = EvalRequest {
             action: request.action,
             resource: request.resource,

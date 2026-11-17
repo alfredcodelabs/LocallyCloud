@@ -28,10 +28,12 @@ use security_group_tags::tags_xml;
 mod endpoints;
 pub mod guest_dns;
 mod nat;
+pub mod private_api;
 mod private_tcp;
 mod start_instances;
 pub use private_tcp::{PrivateConnectionTarget, PrivateTargetOwner};
 mod security_group_egress;
+pub use endpoints::InterfaceEndpointContext;
 use endpoints::VpcEndpoint;
 use security_group_egress::{default_egress, default_ingress, permission_xml};
 
@@ -1214,6 +1216,7 @@ impl Ec2Handler {
             "DisassociateRouteTable" => self.disassociate_route_table(key, input),
             "CreateVpcEndpoint" => self.create_vpc_endpoint(key, &req.region, input),
             "DescribeVpcEndpoints" => self.describe_vpc_endpoints(key, input),
+            "ModifyVpcEndpoint" => self.modify_vpc_endpoint(key, input),
             "DescribePrefixLists" => self.describe_prefix_lists(&req.region, input),
             "DeleteVpcEndpoints" => self.delete_vpc_endpoints(key, input),
             _ => Err(Ec2Error::new(
@@ -1666,7 +1669,11 @@ impl Ec2Handler {
                 format!("The network interface '{id}' does not exist"),
             ));
         }
-        if scope.task_networks.contains_key(id)
+        if scope
+            .vpc_endpoints
+            .values()
+            .any(|endpoint| endpoint.network_interface_ids.iter().any(|eni| eni == id))
+            || scope.task_networks.contains_key(id)
             || scope.instances.values().any(|instance| {
                 instance.eni_id == id && instance.state != InstanceState::Terminated
             })
@@ -3037,6 +3044,7 @@ fn register_handler(registry: &ServiceRegistry, handler: Arc<Ec2Handler>) -> Arc
         "DisassociateRouteTable",
         "CreateVpcEndpoint",
         "DescribeVpcEndpoints",
+        "ModifyVpcEndpoint",
         "DescribePrefixLists",
         "DeleteVpcEndpoints",
     ]
@@ -3549,13 +3557,17 @@ fn eni_xml(eni: &NetworkInterface, scope: &ScopeState, _region: &str) -> String 
             )
         })
         .collect::<String>();
-    let status = if scope.task_networks.contains_key(&eni.id) {
+    let endpoint_owned = scope
+        .vpc_endpoints
+        .values()
+        .any(|endpoint| endpoint.network_interface_ids.contains(&eni.id));
+    let status = if endpoint_owned || scope.task_networks.contains_key(&eni.id) {
         "in-use"
     } else {
         "available"
     };
-    format!("<networkInterfaceId>{}</networkInterfaceId><subnetId>{}</subnetId><vpcId>{}</vpcId><availabilityZone>{}</availabilityZone><description>{}</description><ownerId>{}</ownerId><requesterManaged>false</requesterManaged><status>{status}</status><privateIpAddress>{}</privateIpAddress><sourceDestCheck>true</sourceDestCheck><groupSet>{groups}</groupSet><tagSet/><privateIpAddressesSet><item><privateIpAddress>{}</privateIpAddress><primary>true</primary></item></privateIpAddressesSet><ipv6AddressesSet/>",
-        escape(&eni.id), escape(&eni.subnet_id), escape(&eni.vpc_id), escape(&eni.zone), escape(&eni.description), escape(&eni.owner), eni.private_ip, eni.private_ip)
+    format!("<networkInterfaceId>{}</networkInterfaceId><subnetId>{}</subnetId><vpcId>{}</vpcId><availabilityZone>{}</availabilityZone><description>{}</description><ownerId>{}</ownerId><requesterManaged>{endpoint_owned}</requesterManaged><interfaceType>{}</interfaceType><status>{status}</status><privateIpAddress>{}</privateIpAddress><sourceDestCheck>true</sourceDestCheck><groupSet>{groups}</groupSet><tagSet/><privateIpAddressesSet><item><privateIpAddress>{}</privateIpAddress><primary>true</primary></item></privateIpAddressesSet><ipv6AddressesSet/>",
+        escape(&eni.id), escape(&eni.subnet_id), escape(&eni.vpc_id), escape(&eni.zone), escape(&eni.description), escape(&eni.owner), if endpoint_owned { "vpc_endpoint" } else { "interface" }, eni.private_ip, eni.private_ip)
 }
 
 // Small scopes keep the cheaper scan; larger occupied scopes use a bounded bitmap.

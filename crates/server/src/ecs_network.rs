@@ -27,6 +27,7 @@ struct NetworkContext {
     source: Arc<TaskNetworkLease>,
     tasks: TaskConnector,
     instances: Arc<dyn InstanceRuntime>,
+    private_api: locallycloud_ec2::private_api::PrivateApiTransport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +91,10 @@ impl NetworkContext {
     }
 
     async fn forward(&self, mut guest: TcpStream, address: SocketAddrV4) {
+        if self.private_api.permits(address) {
+            let _ = timeout(CONNECTION_LIFETIME, self.private_api.serve(guest, address)).await;
+            return;
+        }
         let Some(destination) = self.destination(address) else {
             return;
         };
@@ -127,9 +132,10 @@ impl NetworkEndpoints {
         ec2: Arc<Ec2Handler>,
         source: Arc<TaskNetworkLease>,
         scope: (String, String, String),
-        tasks: TaskConnector,
-        instances: Arc<dyn InstanceRuntime>,
+        connectors: (TaskConnector, Arc<dyn InstanceRuntime>),
+        private_api: locallycloud_ec2::private_api::PrivateApiTransport,
     ) -> Result<Self, String> {
+        let (tasks, instances) = connectors;
         let upstream = tokio::task::spawn_blocking(locallycloud_ec2::guest_dns::system_resolver)
             .await
             .map_err(|error| format!("Task DNS resolver worker failed: {error}"))?
@@ -164,6 +170,7 @@ impl NetworkEndpoints {
             source,
             tasks,
             instances,
+            private_api,
         });
         workers.push(tokio::spawn(serve_tcp(listener, context)));
         Ok(Self { workers })

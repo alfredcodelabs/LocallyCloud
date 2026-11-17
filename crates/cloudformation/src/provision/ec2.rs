@@ -436,6 +436,7 @@ impl Provisioner {
                 "SubnetIds",
                 "SecurityGroupIds",
                 "PrivateDnsEnabled",
+                "PolicyDocument",
             ],
         )?;
         let vpc = required_property(props, "VpcId", logical_id)?;
@@ -461,6 +462,14 @@ impl Provisioner {
             ("ServiceName".into(), service),
             ("VpcEndpointType".into(), kind),
         ];
+        if let Some(policy) = props.get("PolicyDocument") {
+            if !policy.is_object() {
+                return Err(CfnError::Validation(format!(
+                    "{logical_id} requires an object PolicyDocument"
+                )));
+            }
+            fields.push(("PolicyDocument".into(), policy.to_string()));
+        }
         if let Some(enabled) = private_dns {
             fields.push(("PrivateDnsEnabled".into(), enabled.to_string()));
         }

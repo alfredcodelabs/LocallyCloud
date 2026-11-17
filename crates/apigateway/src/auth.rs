@@ -68,6 +68,57 @@ pub(crate) fn authorize_iam_invoke(
     })))
 }
 
+pub(crate) fn authorize_private_endpoint(
+    registry: &Weak<locallycloud_core::registry::ServiceRegistry>,
+    original: &locallycloud_core::handler::ServiceRequest,
+    ingress: &locallycloud_core::handler::PrivateApiIngress,
+    resource: String,
+    context: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<
+    Option<locallycloud_core::integration::RequestIdentity>,
+    locallycloud_core::integration::authorization::AuthorizationError,
+> {
+    use locallycloud_core::integration::authorization::{
+        authenticate_request, AuthorizationError, ResourcePolicyEvaluationRequest,
+    };
+    let evaluator = registry
+        .upgrade()
+        .and_then(|registry| {
+            registry.authorization_evaluator(&locallycloud_core::registry::ServiceName::new("iam"))
+        })
+        .ok_or(AuthorizationError::Unavailable)?;
+    let scheme = original
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_ascii_whitespace().next());
+    let identity = if matches!(scheme, Some("AWS4-HMAC-SHA256" | "AWS4-ECDSA-P256-SHA256")) {
+        let (identity, delegated) =
+            authenticate_request(evaluator.as_ref(), original, "execute-api")?;
+        if delegated.is_some() || identity.account_id != ingress.endpoint_account {
+            return Err(AuthorizationError::Denied);
+        }
+        Some(identity)
+    } else {
+        None
+    };
+    let decision = evaluator.evaluate_endpoint_policy(
+        ResourcePolicyEvaluationRequest {
+            action: "execute-api:Invoke".into(),
+            resource,
+            context: context.clone(),
+        },
+        identity.clone(),
+        &ingress.endpoint_policy,
+    )?;
+    match decision {
+        ResourcePolicyDecision::Allow => Ok(identity),
+        ResourcePolicyDecision::ExplicitDeny | ResourcePolicyDecision::ImplicitDeny => {
+            Err(AuthorizationError::Denied)
+        }
+    }
+}
+
 /// Evaluate an IAM-style Lambda authorizer policy for the current execute-api ARN.
 /// Only statements whose Action and Resource apply participate; an applicable Deny wins.
 pub(crate) fn policy_allows(result: &Value, route_arn: &str) -> bool {

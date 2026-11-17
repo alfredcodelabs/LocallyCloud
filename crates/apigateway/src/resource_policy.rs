@@ -103,6 +103,33 @@ pub(crate) fn evaluate(
         .map_err(|_| ())
 }
 
+/// A private API always has an explicit deployed resource policy, in both modes.
+pub(crate) fn evaluate_private(
+    registry: &Weak<ServiceRegistry>,
+    policy: &Value,
+    resource: String,
+    context: &BTreeMap<String, Vec<String>>,
+    identity: Option<locallycloud_core::integration::RequestIdentity>,
+) -> Result<Option<ResourcePolicyDecision>, ()> {
+    let document = policy.as_str().ok_or(())?;
+    let evaluator = registry
+        .upgrade()
+        .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+        .ok_or(())?;
+    evaluator
+        .evaluate_endpoint_policy(
+            ResourcePolicyEvaluationRequest {
+                action: "execute-api:Invoke".into(),
+                resource,
+                context: context.clone(),
+            },
+            identity,
+            document,
+        )
+        .map(Some)
+        .map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

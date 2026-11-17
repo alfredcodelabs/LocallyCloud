@@ -1128,6 +1128,13 @@ impl ComputeRuntime for YoukiRuntime {
         YoukiRuntime::bind_isolated_public_egress(self, task_id, private_addresses).await
     }
 
+    async fn bind_isolated_vpc_egress(
+        &self,
+        task_id: &str,
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        YoukiRuntime::bind_isolated_vpc_egress(self, task_id).await
+    }
+
     async fn bind_isolated_dns(
         &self,
         task_id: &str,

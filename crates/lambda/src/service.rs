@@ -176,6 +176,15 @@ impl LambdaHandler {
         *self.ec2.lock().unwrap() = Some(ec2);
     }
 
+    pub fn attach_private_connections(
+        &self,
+        runtime: Arc<dyn crate::executor::PrivateConnectionRuntime>,
+    ) {
+        if let Some(executor) = &self.executor {
+            executor.attach_private_connections(runtime);
+        }
+    }
+
     fn validate_vpc_config(
         &self,
         account: &str,

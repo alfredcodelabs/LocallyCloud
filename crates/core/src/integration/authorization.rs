@@ -109,6 +109,16 @@ pub enum ResourcePolicyError {
 }
 
 pub trait AuthorizationEvaluator: Send + Sync {
+    /// Filter access through this endpoint document alone, independent of identity grants.
+    fn evaluate_endpoint_policy(
+        &self,
+        _request: ResourcePolicyEvaluationRequest,
+        _identity: Option<RequestIdentity>,
+        _document: &str,
+    ) -> Result<ResourcePolicyDecision, AuthorizationError> {
+        Err(AuthorizationError::Denied)
+    }
+
     fn presign_s3_put(&self, _request: S3PutPresignRequest) -> Result<String, AuthorizationError> {
         Err(AuthorizationError::Unavailable)
     }

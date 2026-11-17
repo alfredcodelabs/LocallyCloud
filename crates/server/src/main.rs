@@ -740,6 +740,9 @@ async fn main() {
         )
         .with_endpoint(endpoint.guest_endpoint().to_owned()),
     );
+    if let Some(handler) = &lambda_handler {
+        handler.attach_private_connections(ecs_runtime.clone());
+    }
     let ecs_recovery = match locallycloud_ecs::register_with_state(
         &registry,
         Some(ecs_runtime.clone()),

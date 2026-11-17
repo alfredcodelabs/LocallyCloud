@@ -40,6 +40,7 @@ use crate::xray::{CallOutcome, Sampler, StageTrace, TracedStage};
 
 pub struct ExecuteCtx<'a> {
     pub store: &'a ApiGwStore,
+    pub(crate) private_ingress: Option<&'a locallycloud_core::handler::PrivateApiIngress>,
     pub original_request: Option<&'a locallycloud_core::handler::ServiceRequest>,
     pub validator: &'a JwtValidator,
     pub(crate) http: &'a crate::http_integration::HttpIntegrationClient,
@@ -71,6 +72,7 @@ struct InvokeTarget<'a> {
     stage: Option<&'a str>,
     path: String,
     kind: Option<ApiKind>,
+    vpce_alias: bool,
 }
 
 struct IncomingRequest<'a> {
@@ -205,6 +207,7 @@ fn invocation_target<'a>(host: &'a str, path: &'a str) -> Option<InvokeTarget<'a
             stage: Some(segments[2]),
             path: resource_path(&segments[offset..]),
             kind: Some(ApiKind::Rest),
+            vpce_alias: false,
         });
     }
     if segments.first() == Some(&"execute-api") && segments.len() >= 3 {
@@ -213,6 +216,7 @@ fn invocation_target<'a>(host: &'a str, path: &'a str) -> Option<InvokeTarget<'a
             stage: Some(segments[2]),
             path: resource_path(&segments[3..]),
             kind: Some(ApiKind::Http),
+            vpce_alias: false,
         });
     }
     api_id_from_host(host).map(|api_id| InvokeTarget {
@@ -220,7 +224,58 @@ fn invocation_target<'a>(host: &'a str, path: &'a str) -> Option<InvokeTarget<'a
         stage: None,
         path: path.to_string(),
         kind: None,
+        vpce_alias: false,
     })
+}
+
+fn private_invocation_target<'a>(
+    ingress: &locallycloud_core::handler::PrivateApiIngress,
+    host: &'a str,
+    path: &'a str,
+    headers: &'a HeaderMap,
+) -> Option<InvokeTarget<'a>> {
+    if let Some((_, suffix)) = host.split_once(".execute-api.") {
+        let region = suffix.split('.').next()?;
+        if region != "localhost" && region != ingress.endpoint_region {
+            return None;
+        }
+    }
+    let label = api_id_from_host(host);
+    if host.to_ascii_lowercase().contains(".vpce.") {
+        let suffix = label?.strip_prefix(&ingress.vpce_id)?;
+        if !suffix.is_empty() && !suffix.starts_with('-') {
+            return None;
+        }
+        let api_id = headers.get("x-apigw-api-id")?.to_str().ok()?;
+        if api_id.is_empty()
+            || api_id.len() > 128
+            || !api_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        return Some(InvokeTarget {
+            api_id,
+            stage: None,
+            path: path.into(),
+            kind: Some(ApiKind::Rest),
+            vpce_alias: false,
+        });
+    }
+    if let Some(api_id) =
+        label.and_then(|label| label.strip_suffix(&format!("-{}", ingress.vpce_id)))
+    {
+        if api_id.is_empty() {
+            return None;
+        }
+        return Some(InvokeTarget {
+            api_id,
+            stage: None,
+            path: path.into(),
+            kind: Some(ApiKind::Rest),
+            vpce_alias: true,
+        });
+    }
+    invocation_target(host, path)
 }
 
 pub(crate) fn invocation_api_id<'a>(host: &'a str, path: &'a str) -> Option<&'a str> {
@@ -438,7 +493,11 @@ async fn invoke_inner(
     body: Bytes,
     custom_domain: bool,
 ) -> Response {
-    let target = match invocation_target(host, uri.path()) {
+    let target = match ctx.private_ingress {
+        Some(ingress) => private_invocation_target(ingress, host, uri.path(), headers),
+        None => invocation_target(host, uri.path()),
+    };
+    let target = match target {
         Some(target) => target,
         None => return plain(404, "Not Found"),
     };
@@ -454,7 +513,7 @@ async fn invoke_inner(
             return invoke_rest(ctx, &target, record, incoming, custom_domain).await;
         }
     }
-    if target.kind != Some(ApiKind::Rest) {
+    if target.kind != Some(ApiKind::Rest) && ctx.private_ingress.is_none() {
         if let Some(record) = ctx.store.v2(ctx.account, ctx.region, target.api_id) {
             return invoke_http(ctx, &target, record, incoming, custom_domain).await;
         }
@@ -678,6 +737,21 @@ async fn invoke_rest_inner(
     {
         return plain(403, "Forbidden");
     }
+    if target.vpce_alias
+        && ctx.private_ingress.is_none_or(|ingress| {
+            !guard
+                .api
+                .get("endpointConfiguration")
+                .and_then(|configuration| configuration.get("vpcEndpointIds"))
+                .and_then(Value::as_array)
+                .is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| id.as_str() == Some(ingress.vpce_id.as_str()))
+                })
+        })
+    {
+        return plain(403, "Forbidden");
+    }
     let (stage, path, stage_value) = match split_stage(target, &guard.stages) {
         Some(value) => value,
         None => {
@@ -688,6 +762,44 @@ async fn invoke_rest_inner(
                 "Missing Authentication Token",
             )
         }
+    };
+    let variables = stage_vars(stage_value);
+    let snapshot = match stage_value.get("deploymentId").and_then(Value::as_str) {
+        Some(deployment_id) => match guard.deployment_snapshots.get(deployment_id) {
+            Some(snapshot) => snapshot.clone(),
+            None => return plain(500, "Internal server error"),
+        },
+        None => guard.snapshot(),
+    };
+    drop(guard);
+    let endpoint_identity = match (
+        crate::endpoint::is_private(&snapshot.endpoint_configuration),
+        ctx.private_ingress,
+    ) {
+        (Ok(true), Some(ingress)) => {
+            let Some(original) = ctx.original_request else {
+                return plain(403, "Forbidden");
+            };
+            let resource = format!(
+                "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
+                ctx.region, ctx.account, target.api_id, stage, method, path
+            );
+            if !snapshot.policy.is_string() {
+                return plain(403, "Forbidden");
+            }
+            match crate::auth::authorize_private_endpoint(
+                ctx.registry,
+                original,
+                ingress,
+                resource,
+                ctx.policy_context,
+            ) {
+                Ok(identity) => identity,
+                Err(_) => return plain(403, "Forbidden"),
+            }
+        }
+        (Ok(false), None) => None,
+        _ => return plain(403, "Forbidden"),
     };
     if let Some(waf) = ctx.waf.as_ref() {
         let resource_arn = format!(
@@ -707,23 +819,6 @@ async fn invoke_rest_inner(
             return plain(403, "Forbidden");
         }
     }
-    let variables = stage_vars(stage_value);
-    let snapshot = match stage_value.get("deploymentId").and_then(Value::as_str) {
-        Some(deployment_id) => match guard.deployment_snapshots.get(deployment_id) {
-            Some(snapshot) => snapshot.clone(),
-            None => return plain(500, "Internal server error"),
-        },
-        None => guard.snapshot(),
-    };
-    drop(guard);
-    // There is no execute-api VPC endpoint data plane yet. An external front door,
-    // including the guest callback, must never stand in for a private endpoint.
-    if !matches!(
-        crate::endpoint::is_private(&snapshot.endpoint_configuration),
-        Ok(false)
-    ) {
-        return plain(403, "Forbidden");
-    }
     let route = match rest_route(&snapshot.resources, method, &path) {
         Some(route) => route,
         None => {
@@ -741,15 +836,27 @@ async fn invoke_rest_inner(
     {
         None
     } else {
-        match crate::resource_policy::evaluate(
-            ctx.registry,
-            &snapshot.policy,
-            format!(
-                "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
-                ctx.region, ctx.account, target.api_id, stage, method, path
-            ),
-            ctx.policy_context,
-        ) {
+        let resource = format!(
+            "arn:aws:execute-api:{}:{}:{}/{}/{}{}",
+            ctx.region, ctx.account, target.api_id, stage, method, path
+        );
+        let evaluation = if ctx.private_ingress.is_some() {
+            crate::resource_policy::evaluate_private(
+                ctx.registry,
+                &snapshot.policy,
+                resource,
+                ctx.policy_context,
+                endpoint_identity,
+            )
+        } else {
+            crate::resource_policy::evaluate(
+                ctx.registry,
+                &snapshot.policy,
+                resource,
+                ctx.policy_context,
+            )
+        };
+        match evaluation {
             Ok(decision) => decision,
             Err(()) => return rest_error(&gateway_responses, "ACCESS_DENIED", 403, "Forbidden"),
         }
@@ -3105,6 +3212,7 @@ mod tests {
         let http = crate::http_integration::HttpIntegrationClient::new(&[], &[]).unwrap();
         let ctx = ExecuteCtx {
             original_request: None,
+            private_ingress: None,
             store: &store,
             validator: &validator,
             http: &http,
@@ -3244,6 +3352,7 @@ mod tests {
             let http = crate::http_integration::HttpIntegrationClient::new(&[], &[]).unwrap();
             let ctx = ExecuteCtx {
                 original_request: None,
+                private_ingress: None,
                 store: &store,
                 validator: &validator,
                 http: &http,
@@ -3329,6 +3438,7 @@ mod tests {
         let http = crate::http_integration::HttpIntegrationClient::new(&[], &[]).unwrap();
         let ctx = ExecuteCtx {
             original_request: None,
+            private_ingress: None,
             store: &store,
             validator: &validator,
             http: &http,

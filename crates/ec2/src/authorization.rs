@@ -217,6 +217,9 @@ impl Ec2Handler {
                 "DeleteNatGateway" => {
                     resources.push(arn("natgateway", input.required("NatGatewayId")?))
                 }
+                "ModifyVpcEndpoint" => {
+                    resources.push(arn("vpc-endpoint", input.required("VpcEndpointId")?))
+                }
                 "DeleteVpcEndpoints" => {
                     for id in input.indexed("VpcEndpointId")? {
                         resources.push(arn("vpc-endpoint", &id));

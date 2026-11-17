@@ -30,6 +30,30 @@ pub struct EcsOciRuntime {
     guest_tls: tokio::sync::OnceCell<Arc<locallycloud_core::tls::GuestCallbackTls>>,
 }
 
+#[async_trait::async_trait]
+impl locallycloud_lambda::executor::PrivateConnectionRuntime for EcsOciRuntime {
+    async fn connect(
+        &self,
+        target: &locallycloud_ec2::PrivateConnectionTarget,
+        address: std::net::SocketAddrV4,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        match &target.owner {
+            locallycloud_ec2::PrivateTargetOwner::Task(id) => {
+                self.connect_registered_task(id, *address.ip(), address.port())
+                    .await
+            }
+            locallycloud_ec2::PrivateTargetOwner::Instance(id) => self
+                .instances
+                .connect_instance(id, address.port())
+                .await
+                .map_err(std::io::Error::other),
+            locallycloud_ec2::PrivateTargetOwner::HostSocket => {
+                tokio::net::TcpStream::connect(target.endpoint).await
+            }
+        }
+    }
+}
+
 struct TaskResources {
     root: PathBuf,
     network: Option<Arc<locallycloud_ec2::TaskNetworkLease>>,
@@ -81,6 +105,7 @@ struct GuestSetup {
     network: Arc<locallycloud_ec2::TaskNetworkLease>,
     instances: Arc<dyn locallycloud_ec2::InstanceRuntime>,
     scope: (String, String, String),
+    private_api: locallycloud_ec2::private_api::PrivateApiTransport,
 }
 #[async_trait::async_trait]
 impl IsolatedGuestSetup for GuestSetup {
@@ -91,11 +116,14 @@ impl IsolatedGuestSetup for GuestSetup {
             self.ec2.clone(),
             self.network.clone(),
             self.scope.clone(),
-            TaskConnector {
-                roots: Arc::downgrade(&self.roots),
-                runtime: runtime.clone(),
-            },
-            self.instances.clone(),
+            (
+                TaskConnector {
+                    roots: Arc::downgrade(&self.roots),
+                    runtime: runtime.clone(),
+                },
+                self.instances.clone(),
+            ),
+            self.private_api.clone(),
         )
         .await
         .map_err(|reason| RuntimeError::ExecutionFailed { reason })?;
@@ -480,6 +508,13 @@ impl TaskRuntime for EcsOciRuntime {
             network: network.clone(),
             instances: self.instances.clone(),
             scope: (task.account.clone(), task.region.clone(), hostname),
+            private_api: locallycloud_ec2::private_api::PrivateApiTransport::new(
+                self.ec2.clone(),
+                network.clone(),
+                (task.account.clone(), task.region.clone()),
+                self.registry.clone(),
+                tls.clone(),
+            ),
         });
         let root_for_trust = root.clone();
         let ca = tls.ca_pem().to_owned();

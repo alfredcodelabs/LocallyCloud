@@ -11,6 +11,19 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 
+/// Host-attested interface endpoint ingress. Never reconstructed from HTTP headers.
+#[derive(Debug, Clone)]
+pub struct PrivateApiIngress {
+    pub endpoint_account: String,
+    pub endpoint_region: String,
+    pub vpc_id: String,
+    pub vpce_id: String,
+    pub original_source_ip: std::net::IpAddr,
+    pub endpoint_ip: std::net::IpAddr,
+    pub secure_transport: bool,
+    pub endpoint_policy: String,
+}
+
 /// A decomposed in-process request handed to a native service handler.
 #[derive(Debug, Clone)]
 pub struct ServiceRequest {
@@ -30,6 +43,16 @@ pub struct ServiceRequest {
 #[async_trait]
 pub trait NativeHandler: Send + Sync {
     async fn handle(&self, request: ServiceRequest) -> Response;
+
+    async fn handle_private(
+        &self,
+        _request: ServiceRequest,
+        _ingress: PrivateApiIngress,
+    ) -> Response {
+        crate::error_mapping::AwsError::new("ForbiddenException", "Forbidden", 403)
+            .render(crate::registry::AwsProtocol::RestJson)
+            .into_response()
+    }
 
     /// Resolve a public invocation from stored resources in the configured account.
     /// This selects routing only; the handler still enforces invocation authorization.

@@ -133,25 +133,44 @@ impl Scope {
                     .strip_suffix(hostname)
                     .is_some_and(|prefix| prefix.ends_with('.') || prefix == "sync-")
         });
-        let ip = if local {
-            Ipv4Addr::LOCALHOST
+        let addresses = if local {
+            vec![Ipv4Addr::LOCALHOST]
         } else {
             let scope = self.vpc.as_ref()?;
-            scope
-                .ec2
-                .private_tcp_dns(&scope.account, &scope.region, &scope.eni)
-                .into_iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(&question.name))?
-                .1
+            let mut addresses = scope.ec2.private_endpoint_dns_addresses(
+                &scope.account,
+                &scope.region,
+                &scope.eni,
+                &question.name,
+            );
+            if addresses.is_empty() {
+                addresses.extend(
+                    scope
+                        .ec2
+                        .private_tcp_dns(&scope.account, &scope.region, &scope.eni)
+                        .into_iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case(&question.name))
+                        .map(|(_, ip)| ip),
+                );
+            }
+            if addresses.is_empty() {
+                return None;
+            }
+            addresses
         };
         let mut reply = query.get(..question.end)?.to_vec();
         reply[2] = 0x80 | (query[2] & 0x01); // QR and the guest's recursion-desired bit.
         reply[3] = 0x80 | (query[3] & 0x10); // Recursion available; retain checking-disabled.
         reply[6..12].fill(0);
         if question.kind == 1 {
-            reply[7] = 1;
-            reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4]); // TTL zero: never cache managed lease ownership.
-            reply.extend_from_slice(&ip.octets());
+            // Bound answers by the same packet budget; TTL zero keeps topology live.
+            let maximum = (MAX_PACKET - reply.len()) / 16;
+            let addresses = &addresses[..addresses.len().min(maximum)];
+            reply[6..8].copy_from_slice(&(addresses.len() as u16).to_be_bytes());
+            for ip in addresses {
+                reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4]);
+                reply.extend_from_slice(&ip.octets());
+            }
         }
         Some(reply)
     }

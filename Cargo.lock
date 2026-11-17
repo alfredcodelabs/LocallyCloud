@@ -2339,6 +2339,7 @@ dependencies = [
  "locallycloud-acm",
  "locallycloud-cognito",
  "locallycloud-core",
+ "locallycloud-iam-sts",
  "locallycloud-state",
  "locallycloud-stepfunctions",
  "locallycloud-wafv2",

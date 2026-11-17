@@ -29,7 +29,7 @@ impl ScopeState {
             })
     }
 
-    fn groups_allow_tcp(
+    pub(super) fn groups_allow_tcp(
         &self,
         group_ids: &[String],
         peer: &NetworkInterface,
@@ -60,7 +60,11 @@ impl ScopeState {
             })
     }
 
-    fn direct_route(&self, source: &NetworkInterface, target: &NetworkInterface) -> bool {
+    pub(super) fn direct_route(
+        &self,
+        source: &NetworkInterface,
+        target: &NetworkInterface,
+    ) -> bool {
         let table = self
             .route_tables
             .values()

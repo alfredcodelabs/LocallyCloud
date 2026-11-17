@@ -36,6 +36,7 @@ async fn iam_method_outbound_rule_drops_authorization_without_mutating_caller_he
     let sampler = Sampler::default();
     let ctx = ExecuteCtx {
         original_request: None,
+        private_ingress: None,
         store: &store,
         validator: &validator,
         http: &http,

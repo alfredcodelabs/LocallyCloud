@@ -14,7 +14,7 @@ use http::Method;
 use serde_json::Value;
 
 use locallycloud_cognito::CognitoHandler;
-use locallycloud_core::handler::{NativeHandler, ServiceRequest};
+use locallycloud_core::handler::{NativeHandler, PrivateApiIngress, ServiceRequest};
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use locallycloud_wafv2::{StageResolver, WafEvaluator};
 
@@ -832,8 +832,118 @@ impl NativeHandler for ApiGwHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        let policy_context =
-            locallycloud_core::integration::request_context::verified_request_context(&request);
+        self.handle_request(request, None).await
+    }
+
+    async fn handle_private(
+        &self,
+        request: ServiceRequest,
+        ingress: PrivateApiIngress,
+    ) -> Response {
+        self.handle_request(request, Some(ingress)).await
+    }
+
+    async fn handle_websocket(
+        &self,
+        mut request: ServiceRequest,
+        upgrade: WebSocketUpgrade,
+    ) -> Response {
+        let host = request
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if domain_host_is_private(&self.store, &request.account_id, &request.region, &host).await
+            == Some(true)
+        {
+            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
+        }
+        let direct = host.to_ascii_lowercase().contains(".execute-api.");
+        let mut custom_domain = None;
+        let mut original_request = None;
+        if !direct {
+            if let Some((target_host, target_uri)) = custom_domain_target(
+                &self.store,
+                &request.account_id,
+                &request.region,
+                &host,
+                &request.uri,
+            )
+            .await
+            {
+                let segments = target_uri
+                    .path()
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>();
+                if let ["execute-api", _, stage, remainder @ ..] = segments.as_slice() {
+                    let mut path = format!("/{stage}");
+                    if !remainder.is_empty() {
+                        path.push('/');
+                        path.push_str(&remainder.join("/"));
+                    }
+                    if let Some(query) = target_uri.query() {
+                        path.push('?');
+                        path.push_str(query);
+                    }
+                    if let (Ok(uri), Ok(parsed_host)) = (path.parse(), target_host.parse()) {
+                        original_request = Some(request.clone());
+                        request.uri = uri;
+                        request.headers.insert(http::header::HOST, parsed_host);
+                        custom_domain = Some(host.clone());
+                    }
+                }
+            }
+        }
+        websocket::handle_websocket(
+            self.store.clone(),
+            self.registry.clone(),
+            request,
+            upgrade,
+            custom_domain,
+            original_request.as_ref(),
+        )
+        .await
+    }
+}
+
+impl ApiGwHandler {
+    async fn handle_request(
+        &self,
+        request: ServiceRequest,
+        private_ingress: Option<PrivateApiIngress>,
+    ) -> Response {
+        let policy_context = match private_ingress.as_ref() {
+            Some(ingress) => {
+                if ingress.endpoint_account != request.account_id
+                    || ingress.endpoint_region != request.region
+                    || !ingress.secure_transport
+                {
+                    return ApiGwError::Forbidden("Forbidden".into())
+                        .into_response(&request.request_id);
+                }
+                std::collections::BTreeMap::from([
+                    (
+                        "aws:requestedregion".into(),
+                        vec![ingress.endpoint_region.clone()],
+                    ),
+                    (
+                        "aws:securetransport".into(),
+                        vec![ingress.secure_transport.to_string()],
+                    ),
+                    ("aws:sourcevpc".into(), vec![ingress.vpc_id.clone()]),
+                    ("aws:sourcevpce".into(), vec![ingress.vpce_id.clone()]),
+                    (
+                        "aws:vpcsourceip".into(),
+                        vec![ingress.original_source_ip.to_string()],
+                    ),
+                ])
+            }
+            None => {
+                locallycloud_core::integration::request_context::verified_request_context(&request)
+            }
+        };
         let mut request = request;
         let trusted_peer_ip = request
             .headers
@@ -847,6 +957,9 @@ impl NativeHandler for ApiGwHandler {
         let domain_kind =
             domain_host_is_private(&self.store, &request.account_id, &request.region, host).await;
         if domain_kind == Some(true) {
+            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
+        }
+        if private_ingress.is_some() && management_target(host, request.uri.path()).is_some() {
             return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
         }
         if let Some((stage, connection_id, api_id)) = management_target(host, request.uri.path()) {
@@ -968,6 +1081,7 @@ impl NativeHandler for ApiGwHandler {
                 .unwrap_or((host, &request.uri));
             let ctx = ExecuteCtx {
                 original_request: Some(&request),
+                private_ingress: private_ingress.as_ref(),
                 store: &self.store,
                 validator: &self.validator,
                 http: &self.http,
@@ -994,6 +1108,9 @@ impl NativeHandler for ApiGwHandler {
             .await;
         }
 
+        if private_ingress.is_some() {
+            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
+        }
         let path = match control_stage_path(request.uri.path()) {
             Ok(path) => path,
             Err(error) => return error.into_response(&request.request_id),
@@ -1141,70 +1258,6 @@ impl NativeHandler for ApiGwHandler {
             }
             Err(err) => err.into_response(&request.request_id),
         }
-    }
-
-    async fn handle_websocket(
-        &self,
-        mut request: ServiceRequest,
-        upgrade: WebSocketUpgrade,
-    ) -> Response {
-        let host = request
-            .headers
-            .get("host")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        if domain_host_is_private(&self.store, &request.account_id, &request.region, &host).await
-            == Some(true)
-        {
-            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
-        }
-        let direct = host.to_ascii_lowercase().contains(".execute-api.");
-        let mut custom_domain = None;
-        let mut original_request = None;
-        if !direct {
-            if let Some((target_host, target_uri)) = custom_domain_target(
-                &self.store,
-                &request.account_id,
-                &request.region,
-                &host,
-                &request.uri,
-            )
-            .await
-            {
-                let segments = target_uri
-                    .path()
-                    .split('/')
-                    .filter(|segment| !segment.is_empty())
-                    .collect::<Vec<_>>();
-                if let ["execute-api", _, stage, remainder @ ..] = segments.as_slice() {
-                    let mut path = format!("/{stage}");
-                    if !remainder.is_empty() {
-                        path.push('/');
-                        path.push_str(&remainder.join("/"));
-                    }
-                    if let Some(query) = target_uri.query() {
-                        path.push('?');
-                        path.push_str(query);
-                    }
-                    if let (Ok(uri), Ok(parsed_host)) = (path.parse(), target_host.parse()) {
-                        original_request = Some(request.clone());
-                        request.uri = uri;
-                        request.headers.insert(http::header::HOST, parsed_host);
-                        custom_domain = Some(host.clone());
-                    }
-                }
-            }
-        }
-        websocket::handle_websocket(
-            self.store.clone(),
-            self.registry.clone(),
-            request,
-            upgrade,
-            custom_domain,
-            original_request.as_ref(),
-        )
-        .await
     }
 }
 

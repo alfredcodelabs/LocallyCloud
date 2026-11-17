@@ -11,6 +11,8 @@ pub(super) struct VpcEndpoint {
     pub(super) subnet_ids: Vec<String>,
     pub(super) group_ids: Vec<String>,
     pub(super) private_dns: bool,
+    pub(super) network_interface_ids: Vec<String>,
+    pub(super) policy_document: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -19,7 +21,281 @@ pub(super) enum EndpointKind {
     Interface,
 }
 
+const DEFAULT_ENDPOINT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}"#;
+
+pub(super) fn endpoint_policy(document: Option<&str>) -> Result<String, Ec2Error> {
+    let document = document.unwrap_or(DEFAULT_ENDPOINT_POLICY);
+    if document.len() > 20_480 {
+        return Err(Ec2Error::new(
+            "InvalidPolicyDocument",
+            "Endpoint policy exceeds 20480 bytes",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(document).map_err(|_| {
+        Ec2Error::new(
+            "InvalidPolicyDocument",
+            "Endpoint policy must be valid JSON",
+        )
+    })?;
+    let statements = value
+        .get("Statement")
+        .filter(|statements| statements.is_object() || statements.is_array());
+    if !value.is_object() || statements.is_none() {
+        return Err(Ec2Error::new(
+            "InvalidPolicyDocument",
+            "Endpoint policy requires Statement",
+        ));
+    }
+    Ok(document.into())
+}
+
+fn endpoint_enis(
+    scope: &ScopeState,
+    account: &str,
+    vpc_id: &str,
+    subnet_ids: &[String],
+    groups: &[String],
+) -> Result<Vec<NetworkInterface>, Ec2Error> {
+    let mut zones = std::collections::HashSet::new();
+    let mut enis = Vec::with_capacity(subnet_ids.len());
+    for subnet_id in subnet_ids {
+        let subnet = scope
+            .subnets
+            .get(subnet_id)
+            .filter(|subnet| subnet.vpc_id == vpc_id)
+            .ok_or_else(|| {
+                Ec2Error::new(
+                    "InvalidSubnetID.NotFound",
+                    "Endpoint subnet is outside the VPC",
+                )
+            })?;
+        if !zones.insert(subnet.zone.as_str()) {
+            return Err(Ec2Error::new(
+                "InvalidParameterValue",
+                "An interface endpoint supports one subnet per Availability Zone",
+            ));
+        }
+        let ip = first_available_private_ip(
+            subnet.cidr,
+            scope
+                .network_interfaces
+                .values()
+                .filter(|eni| eni.vpc_id == vpc_id)
+                .map(|eni| eni.private_ip),
+        )
+        .ok_or_else(|| {
+            Ec2Error::new(
+                "InsufficientFreeAddressesInSubnet",
+                "Endpoint subnet has no available private addresses",
+            )
+        })?;
+        enis.push(NetworkInterface {
+            id: resource_id("eni"),
+            subnet_id: subnet.id.clone(),
+            vpc_id: vpc_id.into(),
+            zone: subnet.zone.clone(),
+            private_ip: ip,
+            description: "VPC Endpoint Interface".into(),
+            owner: account.into(),
+            group_ids: groups.to_vec(),
+        });
+    }
+    Ok(enis)
+}
+
+fn endpoint_dns_name(endpoint: &VpcEndpoint, zone: Option<&str>) -> String {
+    let region = endpoint
+        .service_name
+        .strip_prefix("com.amazonaws.")
+        .and_then(|value| value.split_once('.'))
+        .map(|(region, _)| region)
+        .unwrap_or_default();
+    let opaque = endpoint.id.strip_prefix("vpce-").unwrap_or(&endpoint.id);
+    let suffix = match zone {
+        Some(zone) => format!("-{zone}"),
+        None => String::new(),
+    };
+    format!(
+        "{}-{}{suffix}.{}.{region}.vpce.amazonaws.com",
+        endpoint.id, opaque, endpoint.service
+    )
+}
+
+fn updated_ids(
+    current: &[String],
+    add: &[String],
+    remove: &[String],
+) -> Result<Vec<String>, Ec2Error> {
+    let unique =
+        |ids: &[String]| ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len();
+    if !unique(add)
+        || !unique(remove)
+        || add.iter().any(|id| remove.contains(id))
+        || remove.iter().any(|id| !current.contains(id))
+    {
+        return Err(Ec2Error::new(
+            "InvalidParameterValue",
+            "Invalid endpoint resource changes",
+        ));
+    }
+    let mut result: Vec<_> = current
+        .iter()
+        .filter(|id| !remove.contains(id))
+        .cloned()
+        .collect();
+    for id in add {
+        if !result.contains(id) {
+            result.push(id.clone());
+        }
+    }
+    Ok(result)
+}
+
+/// Verified topology of the exact interface endpoint reached by a retained source lease.
+#[derive(Clone)]
+pub struct InterfaceEndpointContext {
+    pub endpoint_id: String,
+    pub vpc_id: String,
+    pub endpoint_eni_id: String,
+    pub source_private_ip: Ipv4Addr,
+    pub service: String,
+    pub policy_document: String,
+    pub endpoint_account: String,
+    pub endpoint_region: String,
+}
+
 impl Ec2Handler {
+    fn validated_endpoint_policy(&self, document: Option<&str>) -> Result<String, Ec2Error> {
+        let policy = endpoint_policy(document)?;
+        if document.is_some() {
+            if let Some(evaluator) = self
+                .registry
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .and_then(|registry| registry.authorization_evaluator(&ServiceName::new("iam")))
+            {
+                evaluator.validate_resource_policy(&policy).map_err(|_| {
+                    Ec2Error::new(
+                        "InvalidPolicyDocument",
+                        "Endpoint policy is invalid or unsupported",
+                    )
+                })?;
+            }
+        }
+        Ok(policy)
+    }
+
+    pub fn interface_endpoint_access(
+        &self,
+        account: &str,
+        region: &str,
+        source: &TaskNetworkLease,
+        target_ip: Ipv4Addr,
+        port: u16,
+    ) -> Option<InterfaceEndpointContext> {
+        let key = (account.to_owned(), region.to_owned());
+        if port != 443 || source.key != key || !Arc::ptr_eq(&source.scopes, &self.scopes) {
+            return None;
+        }
+        let state = self.scopes.lock().ok()?;
+        let scope = state.get(&key)?;
+        if scope.task_networks.get(&source.eni_id) != Some(&source.task_id) {
+            return None;
+        }
+        let source_eni = scope.network_interfaces.get(&source.eni_id)?;
+        let (endpoint, target) = scope
+            .vpc_endpoints
+            .values()
+            .filter(|endpoint| {
+                endpoint.kind == EndpointKind::Interface && endpoint.vpc_id == source_eni.vpc_id
+            })
+            .find_map(|endpoint| {
+                endpoint.network_interface_ids.iter().find_map(|id| {
+                    let eni = scope.network_interfaces.get(id)?;
+                    (eni.private_ip == target_ip && eni.vpc_id == endpoint.vpc_id)
+                        .then_some((endpoint, eni))
+                })
+            })?;
+        if !scope.direct_route(source_eni, target)
+            || !scope.groups_allow_tcp(
+                &source_eni.group_ids,
+                target,
+                port,
+                true,
+                &source_eni.vpc_id,
+            )
+            || !scope.groups_allow_tcp(
+                &target.group_ids,
+                source_eni,
+                port,
+                false,
+                &source_eni.vpc_id,
+            )
+        {
+            return None;
+        }
+        Some(InterfaceEndpointContext {
+            endpoint_id: endpoint.id.clone(),
+            vpc_id: endpoint.vpc_id.clone(),
+            endpoint_eni_id: target.id.clone(),
+            source_private_ip: source_eni.private_ip,
+            service: endpoint.service.clone(),
+            policy_document: endpoint.policy_document.clone(),
+            endpoint_account: account.into(),
+            endpoint_region: region.into(),
+        })
+    }
+
+    /// Live managed DNS records; no host cache and no runtime socket ownership required.
+    pub fn private_endpoint_dns_addresses(
+        &self,
+        account: &str,
+        region: &str,
+        source_eni_id: &str,
+        name: &str,
+    ) -> Vec<Ipv4Addr> {
+        let Ok(state) = self.scopes.lock() else {
+            return Vec::new();
+        };
+        let Some(scope) = state.get(&(account.into(), region.into())) else {
+            return Vec::new();
+        };
+        let Some(source) = scope.network_interfaces.get(source_eni_id) else {
+            return Vec::new();
+        };
+        let mut addresses = Vec::new();
+        for endpoint in scope.vpc_endpoints.values().filter(|endpoint| {
+            endpoint.kind == EndpointKind::Interface && endpoint.vpc_id == source.vpc_id
+        }) {
+            let regional = endpoint_dns_name(endpoint, None);
+            let service_host = format!("{}.{}.amazonaws.com", endpoint.service, region);
+            let private_name = endpoint.private_dns
+                && scope
+                    .vpc_dns
+                    .get(&endpoint.vpc_id)
+                    .is_some_and(|dns| dns.0 && dns.1)
+                && (name.eq_ignore_ascii_case(&service_host)
+                    || (endpoint.service == "execute-api"
+                        && name
+                            .to_ascii_lowercase()
+                            .strip_suffix(&format!(".{service_host}"))
+                            .is_some_and(|api| !api.is_empty() && !api.contains('.'))));
+            for id in &endpoint.network_interface_ids {
+                if let Some(eni) = scope.network_interfaces.get(id) {
+                    if private_name
+                        || name.eq_ignore_ascii_case(&regional)
+                        || name.eq_ignore_ascii_case(&endpoint_dns_name(endpoint, Some(&eni.zone)))
+                    {
+                        addresses.push(eni.private_ip);
+                    }
+                }
+            }
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    }
+
     pub(super) fn create_vpc_endpoint(
         &self,
         key: (String, String),
@@ -36,6 +312,7 @@ impl Ec2Handler {
                 "VpcEndpointType",
                 "PrivateDnsEnabled",
                 "ClientToken",
+                "PolicyDocument",
             ]
             .contains(&name.as_str())
                 || indexed_key(name, "RouteTableId").is_some()
@@ -59,7 +336,7 @@ impl Ec2Handler {
             "Interface"
                 if matches!(
                     service,
-                    "ssm" | "secretsmanager" | "logs" | "sts" | "sqs" | "kms"
+                    "ssm" | "secretsmanager" | "logs" | "sts" | "sqs" | "kms" | "execute-api"
                 ) =>
             {
                 EndpointKind::Interface
@@ -71,9 +348,10 @@ impl Ec2Handler {
                 ))
             }
         };
+        let policy_document = self.validated_endpoint_policy(input.one("PolicyDocument")?)?;
         let route_table_ids = input.indexed("RouteTableId")?;
         let subnet_ids = input.indexed("SubnetId")?;
-        let group_ids = input.indexed("SecurityGroupId")?;
+        let mut group_ids = input.indexed("SecurityGroupId")?;
         let token = input.one("ClientToken")?;
         if token.is_some_and(|value| value.is_empty() || value.len() > 64 || !value.is_ascii()) {
             return Err(Ec2Error::new(
@@ -120,9 +398,7 @@ impl Ec2Handler {
                     "Gateway endpoint requires route tables only",
                 ));
             }
-            EndpointKind::Interface
-                if !route_table_ids.is_empty() || subnet_ids.is_empty() || group_ids.is_empty() =>
-            {
+            EndpointKind::Interface if !route_table_ids.is_empty() || subnet_ids.is_empty() => {
                 return Err(Ec2Error::new(
                     "InvalidParameterValue",
                     "Interface endpoint requires subnets and security groups",
@@ -143,7 +419,7 @@ impl Ec2Handler {
                 if let Some(endpoint) = scope.vpc_endpoints.get(id) {
                     return Ok(format!(
                         "<vpcEndpoint>{}</vpcEndpoint>",
-                        endpoint_xml(endpoint)
+                        endpoint_xml(endpoint, scope)
                     ));
                 }
             }
@@ -163,11 +439,12 @@ impl Ec2Handler {
                 "Private DNS requires VPC DNS support and hostnames",
             ));
         }
-        if scope
-            .vpc_endpoints
-            .values()
-            .any(|ep| ep.vpc_id == vpc_id && ep.service_name == service_name && ep.kind == kind)
-        {
+        if scope.vpc_endpoints.values().any(|ep| {
+            ep.vpc_id == vpc_id
+                && ep.service_name == service_name
+                && ep.kind == kind
+                && (kind == EndpointKind::Gateway || (private_dns && ep.private_dns))
+        }) {
             return Err(Ec2Error::new(
                 "InvalidVpcEndpoint.Duplicate",
                 "The endpoint already exists",
@@ -194,6 +471,22 @@ impl Ec2Handler {
                 "Endpoint subnet is outside the VPC",
             ));
         }
+        if kind == EndpointKind::Interface && group_ids.is_empty() {
+            group_ids.push(
+                scope
+                    .security_groups
+                    .values()
+                    .find(|group| group.vpc_id == vpc_id && group.is_default)
+                    .ok_or_else(|| {
+                        Ec2Error::new(
+                            "InvalidGroup.NotFound",
+                            "Default security group is unavailable",
+                        )
+                    })?
+                    .id
+                    .clone(),
+            );
+        }
         if group_ids.iter().any(|id| {
             scope
                 .security_groups
@@ -206,6 +499,7 @@ impl Ec2Handler {
             ));
         }
         let id = input.resource_id("vpce");
+        let enis = endpoint_enis(scope, &key.0, vpc_id, &subnet_ids, &group_ids)?;
         let endpoint = VpcEndpoint {
             id: id.clone(),
             vpc_id: vpc_id.into(),
@@ -216,8 +510,13 @@ impl Ec2Handler {
             subnet_ids,
             group_ids,
             private_dns,
+            network_interface_ids: enis.iter().map(|eni| eni.id.clone()).collect(),
+            policy_document,
         };
         let mut changes = vec![Change::put("endpoint", &id, &endpoint)?];
+        for eni in &enis {
+            changes.push(Change::put("eni", &eni.id, eni)?);
+        }
         let mut tables = Vec::new();
         for table_id in &endpoint.route_table_ids {
             let mut table = scope
@@ -240,7 +539,10 @@ impl Ec2Handler {
         for table in tables {
             scope.route_tables.insert(table.id.clone(), table);
         }
-        let xml = endpoint_xml(&endpoint);
+        for eni in enis {
+            scope.network_interfaces.insert(eni.id.clone(), eni);
+        }
+        let xml = endpoint_xml(&endpoint, scope);
         scope.vpc_endpoints.insert(id.clone(), endpoint);
         if let Some(token) = token {
             scope
@@ -248,6 +550,273 @@ impl Ec2Handler {
                 .insert(token.into(), (signature, id));
         }
         Ok(format!("<vpcEndpoint>{xml}</vpcEndpoint>"))
+    }
+
+    pub(super) fn modify_vpc_endpoint(
+        &self,
+        key: (String, String),
+        input: &Input,
+    ) -> Result<String, Ec2Error> {
+        for name in input.fields.keys() {
+            if [
+                "Action",
+                "Version",
+                "DryRun",
+                "VpcEndpointId",
+                "PolicyDocument",
+                "PrivateDnsEnabled",
+                "ResetPolicy",
+            ]
+            .contains(&name.as_str())
+                || [
+                    "AddSubnetId",
+                    "RemoveSubnetId",
+                    "AddSecurityGroupId",
+                    "RemoveSecurityGroupId",
+                    "AddRouteTableId",
+                    "RemoveRouteTableId",
+                ]
+                .iter()
+                .any(|prefix| indexed_key(name, prefix).is_some())
+            {
+                continue;
+            }
+            return Err(Ec2Error::unsupported(name));
+        }
+        input.dry_run()?;
+        let id = input.required("VpcEndpointId")?;
+        let mut state = self
+            .scopes
+            .lock()
+            .map_err(|_| Ec2Error::new("InternalError", "EC2 topology unavailable"))?;
+        let scope = state.get_mut(&key).ok_or_else(|| {
+            Ec2Error::new(
+                "InvalidVpcEndpointId.NotFound",
+                "The VPC endpoint does not exist",
+            )
+        })?;
+        let mut endpoint = scope.vpc_endpoints.get(id).cloned().ok_or_else(|| {
+            Ec2Error::new(
+                "InvalidVpcEndpointId.NotFound",
+                "The VPC endpoint does not exist",
+            )
+        })?;
+        let add_subnets = input.indexed("AddSubnetId")?;
+        let remove_subnets = input.indexed("RemoveSubnetId")?;
+        let add_groups = input.indexed("AddSecurityGroupId")?;
+        let remove_groups = input.indexed("RemoveSecurityGroupId")?;
+        let add_routes = input.indexed("AddRouteTableId")?;
+        let remove_routes = input.indexed("RemoveRouteTableId")?;
+        let final_subnets = updated_ids(&endpoint.subnet_ids, &add_subnets, &remove_subnets)?;
+        let final_groups = updated_ids(&endpoint.group_ids, &add_groups, &remove_groups)?;
+        let final_routes = updated_ids(&endpoint.route_table_ids, &add_routes, &remove_routes)?;
+        if let Some(value) = input.one("PolicyDocument")? {
+            endpoint.policy_document = self.validated_endpoint_policy(Some(value))?;
+        }
+        match input.one("ResetPolicy")? {
+            Some("true") if endpoint.kind == EndpointKind::Gateway => {
+                if input.one("PolicyDocument")?.is_some() {
+                    return Err(Ec2Error::new(
+                        "InvalidParameterCombination",
+                        "PolicyDocument and ResetPolicy are mutually exclusive",
+                    ));
+                }
+                endpoint.policy_document = DEFAULT_ENDPOINT_POLICY.into();
+            }
+            None | Some("false") => {}
+            Some("true") => {
+                return Err(Ec2Error::unsupported("ResetPolicy for interface endpoints"))
+            }
+            _ => {
+                return Err(Ec2Error::new(
+                    "InvalidParameterValue",
+                    "ResetPolicy must be boolean",
+                ))
+            }
+        }
+        if let Some(value) = input.one("PrivateDnsEnabled")? {
+            if endpoint.kind != EndpointKind::Interface {
+                return Err(Ec2Error::unsupported(
+                    "PrivateDnsEnabled for gateway endpoints",
+                ));
+            }
+            endpoint.private_dns = match value {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(Ec2Error::new(
+                        "InvalidParameterValue",
+                        "PrivateDnsEnabled must be boolean",
+                    ))
+                }
+            };
+        }
+        let mut enis = Vec::new();
+        let mut removed_enis = Vec::new();
+        let mut tables = Vec::new();
+        match endpoint.kind {
+            EndpointKind::Interface => {
+                if !add_routes.is_empty()
+                    || !remove_routes.is_empty()
+                    || final_subnets.is_empty()
+                    || final_groups.is_empty()
+                {
+                    return Err(Ec2Error::new("InvalidParameterValue", "Interface endpoint requires subnets and security groups, without route tables"));
+                }
+                let mut zones = std::collections::HashSet::new();
+                for subnet_id in &final_subnets {
+                    let subnet = scope
+                        .subnets
+                        .get(subnet_id)
+                        .filter(|subnet| subnet.vpc_id == endpoint.vpc_id)
+                        .ok_or_else(|| {
+                            Ec2Error::new(
+                                "InvalidSubnetID.NotFound",
+                                "Endpoint subnet is outside the VPC",
+                            )
+                        })?;
+                    if !zones.insert(&subnet.zone) {
+                        return Err(Ec2Error::new(
+                            "InvalidParameterValue",
+                            "An interface endpoint supports one subnet per Availability Zone",
+                        ));
+                    }
+                }
+                if final_groups.iter().any(|id| {
+                    scope
+                        .security_groups
+                        .get(id)
+                        .is_none_or(|group| group.vpc_id != endpoint.vpc_id)
+                }) {
+                    return Err(Ec2Error::new(
+                        "InvalidGroup.NotFound",
+                        "Endpoint security group is outside the VPC",
+                    ));
+                }
+                if endpoint.private_dns
+                    && (!scope
+                        .vpc_dns
+                        .get(&endpoint.vpc_id)
+                        .is_some_and(|dns| dns.0 && dns.1)
+                        || scope.vpc_endpoints.values().any(|other| {
+                            other.id != endpoint.id
+                                && other.vpc_id == endpoint.vpc_id
+                                && other.service == endpoint.service
+                                && other.private_dns
+                        }))
+                {
+                    return Err(Ec2Error::new(
+                        "InvalidParameterValue",
+                        "Private DNS is unavailable or already associated with another endpoint",
+                    ));
+                }
+                for eni_id in &endpoint.network_interface_ids {
+                    let mut eni =
+                        scope
+                            .network_interfaces
+                            .get(eni_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Ec2Error::new(
+                                    "InternalError",
+                                    "Endpoint network interface is unavailable",
+                                )
+                            })?;
+                    if final_subnets.contains(&eni.subnet_id) {
+                        eni.group_ids = final_groups.clone();
+                        enis.push(eni);
+                    } else {
+                        removed_enis.push(eni_id.clone());
+                    }
+                }
+                let new_subnets: Vec<_> = final_subnets
+                    .iter()
+                    .filter(|id| !endpoint.subnet_ids.contains(id))
+                    .cloned()
+                    .collect();
+                enis.extend(endpoint_enis(
+                    scope,
+                    &key.0,
+                    &endpoint.vpc_id,
+                    &new_subnets,
+                    &final_groups,
+                )?);
+                endpoint.network_interface_ids = enis.iter().map(|eni| eni.id.clone()).collect();
+            }
+            EndpointKind::Gateway => {
+                if !add_subnets.is_empty()
+                    || !remove_subnets.is_empty()
+                    || !add_groups.is_empty()
+                    || !remove_groups.is_empty()
+                {
+                    return Err(Ec2Error::new(
+                        "InvalidParameterValue",
+                        "Gateway endpoints support route tables only",
+                    ));
+                }
+                for route_id in endpoint
+                    .route_table_ids
+                    .iter()
+                    .chain(final_routes.iter())
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    let mut table = scope
+                        .route_tables
+                        .get(route_id)
+                        .filter(|table| table.vpc_id == endpoint.vpc_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Ec2Error::new(
+                                "InvalidRouteTableID.NotFound",
+                                "Endpoint route table is outside the VPC",
+                            )
+                        })?;
+                    if final_routes.contains(route_id) {
+                        if table
+                            .endpoint_routes
+                            .get(&endpoint.service)
+                            .is_some_and(|owner| owner != id)
+                        {
+                            return Err(Ec2Error::new(
+                                "InvalidParameterValue",
+                                "Route table already has a different endpoint",
+                            ));
+                        }
+                        table
+                            .endpoint_routes
+                            .insert(endpoint.service.clone(), id.into());
+                    } else {
+                        table.endpoint_routes.remove(&endpoint.service);
+                    }
+                    tables.push(table);
+                }
+            }
+        }
+        endpoint.subnet_ids = final_subnets;
+        endpoint.group_ids = final_groups;
+        endpoint.route_table_ids = final_routes;
+        let mut changes = vec![Change::put("endpoint", id, &endpoint)?];
+        for eni in &enis {
+            changes.push(Change::put("eni", &eni.id, eni)?);
+        }
+        for eni in &removed_enis {
+            changes.push(Change::delete("eni", eni));
+        }
+        for table in &tables {
+            changes.push(Change::put("route-table", &table.id, table)?);
+        }
+        self.persist(&key, &changes)?;
+        for eni in enis {
+            scope.network_interfaces.insert(eni.id.clone(), eni);
+        }
+        for eni in removed_enis {
+            scope.network_interfaces.remove(&eni);
+        }
+        for table in tables {
+            scope.route_tables.insert(table.id.clone(), table);
+        }
+        scope.vpc_endpoints.insert(id.into(), endpoint);
+        Ok("<return>true</return>".into())
     }
 
     pub(super) fn describe_vpc_endpoints(
@@ -285,6 +854,7 @@ impl Ec2Handler {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let empty_scope = ScopeState::default();
         let body = endpoints
             .into_iter()
             .filter(|ep| {
@@ -298,7 +868,12 @@ impl Ec2Handler {
                     _ => false,
                 })
             })
-            .map(|ep| format!("<item>{}</item>", endpoint_xml(ep)))
+            .map(|ep| {
+                format!(
+                    "<item>{}</item>",
+                    endpoint_xml(ep, scope.unwrap_or(&empty_scope))
+                )
+            })
             .collect::<String>();
         Ok(format!("<vpcEndpointSet>{body}</vpcEndpointSet>"))
     }
@@ -339,6 +914,12 @@ impl Ec2Handler {
             let endpoint = scope.vpc_endpoints.get(id).expect("validated endpoint");
             changes.push(Change::delete("endpoint", id));
             changes.extend(
+                endpoint
+                    .network_interface_ids
+                    .iter()
+                    .map(|eni| Change::delete("eni", eni)),
+            );
+            changes.extend(
                 scope
                     .vpc_endpoint_tokens
                     .iter()
@@ -362,7 +943,11 @@ impl Ec2Handler {
             scope.route_tables.insert(id, table);
         }
         for id in ids {
-            scope.vpc_endpoints.remove(&id);
+            if let Some(endpoint) = scope.vpc_endpoints.remove(&id) {
+                for eni in endpoint.network_interface_ids {
+                    scope.network_interfaces.remove(&eni);
+                }
+            }
             scope
                 .vpc_endpoint_tokens
                 .retain(|_, (_, endpoint_id)| endpoint_id != &id);
@@ -414,9 +999,10 @@ impl Ec2Handler {
                     vec![Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("valid IPv4 default route")]
                 }
                 EndpointKind::Interface => ep
-                    .subnet_ids
+                    .network_interface_ids
                     .iter()
-                    .filter_map(|id| scope.subnets.get(id).map(|subnet| subnet.cidr))
+                    .filter_map(|id| scope.network_interfaces.get(id))
+                    .filter_map(|eni| Ipv4Net::new(eni.private_ip, 32).ok())
                     .collect(),
             };
             if !source_groups.iter().any(|group| {
@@ -515,7 +1101,7 @@ fn endpoint_kind(kind: EndpointKind) -> &'static str {
     }
 }
 
-fn endpoint_xml(ep: &VpcEndpoint) -> String {
+fn endpoint_xml(ep: &VpcEndpoint, scope: &ScopeState) -> String {
     let routes = ep
         .route_table_ids
         .iter()
@@ -531,7 +1117,31 @@ fn endpoint_xml(ep: &VpcEndpoint) -> String {
         .iter()
         .map(|id| format!("<item><groupId>{}</groupId></item>", escape(id)))
         .collect::<String>();
-    format!("<vpcEndpointId>{}</vpcEndpointId><vpcEndpointType>{}</vpcEndpointType><vpcId>{}</vpcId><serviceName>{}</serviceName><state>available</state><routeTableIdSet>{routes}</routeTableIdSet><subnetIdSet>{subnets}</subnetIdSet><groupSet>{groups}</groupSet><privateDnsEnabled>{}</privateDnsEnabled>", escape(&ep.id), endpoint_kind(ep.kind), escape(&ep.vpc_id), escape(&ep.service_name), ep.private_dns)
+    let enis = ep
+        .network_interface_ids
+        .iter()
+        .map(|id| format!("<item>{}</item>", escape(id)))
+        .collect::<String>();
+    let mut dns = String::new();
+    if ep.kind == EndpointKind::Interface {
+        let zone_id = format!(
+            "Z{}",
+            ep.id.trim_start_matches("vpce-").to_ascii_uppercase()
+        );
+        for name in std::iter::once(endpoint_dns_name(ep, None)).chain(
+            ep.network_interface_ids
+                .iter()
+                .filter_map(|id| scope.network_interfaces.get(id))
+                .map(|eni| endpoint_dns_name(ep, Some(&eni.zone))),
+        ) {
+            dns.push_str(&format!(
+                "<item><dnsName>{}</dnsName><hostedZoneId>{}</hostedZoneId></item>",
+                escape(&name),
+                escape(&zone_id)
+            ));
+        }
+    }
+    format!("<vpcEndpointId>{}</vpcEndpointId><vpcEndpointType>{}</vpcEndpointType><vpcId>{}</vpcId><serviceName>{}</serviceName><state>available</state><routeTableIdSet>{routes}</routeTableIdSet><subnetIdSet>{subnets}</subnetIdSet><groupSet>{groups}</groupSet><networkInterfaceIdSet>{enis}</networkInterfaceIdSet><dnsEntrySet>{dns}</dnsEntrySet><policyDocument>{}</policyDocument><privateDnsEnabled>{}</privateDnsEnabled>", escape(&ep.id), endpoint_kind(ep.kind), escape(&ep.vpc_id), escape(&ep.service_name), escape(&ep.policy_document), ep.private_dns)
 }
 
 impl Ec2Handler {
@@ -639,6 +1249,230 @@ impl Ec2Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interface_endpoints_own_persistent_enis_and_resolve_exact_live_policy() {
+        use crate::tests::{call, id};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compatibility-tests/.work/ec2-interface-endpoints")
+            .join(Uuid::new_v4().to_string());
+        let database = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let persistence =
+            Arc::new(Persistence::new(database.clone(), StateCipher::with_key(&[91; 32])).unwrap());
+        let handler = Ec2Handler {
+            persistence: Some(persistence.clone()),
+            ..Ec2Handler::default()
+        };
+        async fn ok(handler: &Ec2Handler, form: &str) -> String {
+            let (status, body) = crate::tests::call(handler, "111", "us-east-1", form).await;
+            assert_eq!(status, 200, "{body}");
+            body
+        }
+        let vpc = id(
+            &ok(&handler, "Action=CreateVpc&CidrBlock=10.8.0.0%2F16").await,
+            "vpcId",
+        );
+        ok(
+            &handler,
+            &format!("Action=ModifyVpcAttribute&VpcId={vpc}&EnableDnsHostnames.Value=true"),
+        )
+        .await;
+        let mut subnets = Vec::new();
+        for (index, zone) in ["us-east-1a", "us-east-1b", "us-east-1c"]
+            .iter()
+            .enumerate()
+        {
+            subnets.push(id(&ok(&handler, &format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.8.{index}.0%2F24&AvailabilityZone={zone}")).await, "subnetId"));
+        }
+        let group = id(&ok(&handler, &format!("Action=CreateSecurityGroup&VpcId={vpc}&GroupName=endpoint&GroupDescription=endpoint")).await, "groupId");
+        ok(&handler, &format!("Action=AuthorizeSecurityGroupIngress&GroupId={group}&IpProtocol=tcp&FromPort=443&ToPort=443&CidrIp=10.8.0.0%2F16")).await;
+        let source_group = {
+            let state = handler.scopes.lock().unwrap();
+            state[&("111".into(), "us-east-1".into())]
+                .security_groups
+                .values()
+                .find(|group| group.is_default)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let source = handler
+            .reserve_task_network(
+                "111",
+                "us-east-1",
+                &subnets[0],
+                std::slice::from_ref(&source_group),
+                "source",
+            )
+            .unwrap();
+        let create = format!("Action=CreateVpcEndpoint&VpcId={vpc}&ServiceName=com.amazonaws.us-east-1.execute-api&VpcEndpointType=Interface&SubnetId.1={}&SubnetId.2={}&SecurityGroupId.1={group}", subnets[0], subnets[1]);
+        let first_xml = ok(&handler, &create).await;
+        assert!(first_xml.contains("<networkInterfaceIdSet><item>eni-"));
+        assert!(first_xml.contains("<dnsEntrySet><item><dnsName>vpce-"));
+        let first = id(&first_xml, "vpcEndpointId");
+        let second = id(&ok(&handler, &create).await, "vpcEndpointId");
+        let snapshot = |id: &str| {
+            let state = handler.scopes.lock().unwrap();
+            let scope = &state[&("111".into(), "us-east-1".into())];
+            let endpoint = scope.vpc_endpoints[id].clone();
+            let enis: Vec<_> = endpoint
+                .network_interface_ids
+                .iter()
+                .map(|id| scope.network_interfaces[id].clone())
+                .collect();
+            (endpoint, enis)
+        };
+        let (first_ep, first_enis) = snapshot(&first);
+        let (_, second_enis) = snapshot(&second);
+        assert_ne!(first_enis[0].private_ip, second_enis[0].private_ip);
+        for (id, enis) in [(&first, &first_enis), (&second, &second_enis)] {
+            let context = handler
+                .interface_endpoint_access("111", "us-east-1", &source, enis[0].private_ip, 443)
+                .unwrap();
+            assert_eq!(&context.endpoint_id, id);
+            assert_eq!(context.source_private_ip, source.private_ip);
+            assert_eq!(context.service, "execute-api");
+            assert!(handler
+                .interface_endpoint_access("111", "us-east-1", &source, enis[0].private_ip, 80)
+                .is_none());
+            assert!(handler
+                .interface_endpoint_access("222", "us-east-1", &source, enis[0].private_ip, 443)
+                .is_none());
+        }
+        ok(&handler, &format!("Action=RevokeSecurityGroupEgress&GroupId={source_group}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0")).await;
+        ok(&handler, &format!("Action=AuthorizeSecurityGroupEgress&GroupId={source_group}&IpProtocol=tcp&FromPort=443&ToPort=443&CidrIp={}%2F32", first_enis[0].private_ip)).await;
+        assert!(handler
+            .interface_endpoint_access("111", "us-east-1", &source, first_enis[0].private_ip, 443)
+            .is_some());
+        assert!(handler
+            .interface_endpoint_access("111", "us-east-1", &source, second_enis[0].private_ip, 443)
+            .is_none());
+        ok(&handler, &format!("Action=AuthorizeSecurityGroupEgress&GroupId={source_group}&IpPermissions.1.IpProtocol=-1&IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0")).await;
+        let before_enis = handler.scopes.lock().unwrap()[&("111".into(), "us-east-1".into())]
+            .network_interfaces
+            .len();
+        database.connection().unwrap().execute_batch("CREATE TRIGGER reject_interface BEFORE INSERT ON ec2_records WHEN NEW.kind='endpoint' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert_eq!(call(&handler, "111", "us-east-1", &create).await.0, 500);
+        database
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_interface;")
+            .unwrap();
+        assert_eq!(
+            handler.scopes.lock().unwrap()[&("111".into(), "us-east-1".into())]
+                .network_interfaces
+                .len(),
+            before_enis
+        );
+        let deny = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"execute-api:Invoke","Resource":"*"}]}"#;
+        let encoded: String = form_urlencoded::byte_serialize(deny.as_bytes()).collect();
+        ok(&handler, &format!("Action=ModifyVpcEndpoint&VpcEndpointId={first}&PolicyDocument={encoded}&PrivateDnsEnabled=true")).await;
+        assert_eq!(
+            handler
+                .interface_endpoint_access(
+                    "111",
+                    "us-east-1",
+                    &source,
+                    first_enis[0].private_ip,
+                    443
+                )
+                .unwrap()
+                .policy_document,
+            deny
+        );
+        assert_eq!(
+            handler
+                .interface_endpoint_access(
+                    "111",
+                    "us-east-1",
+                    &source,
+                    second_enis[0].private_ip,
+                    443
+                )
+                .unwrap()
+                .policy_document,
+            DEFAULT_ENDPOINT_POLICY
+        );
+        let addresses = handler.private_endpoint_dns_addresses(
+            "111",
+            "us-east-1",
+            &source.eni_id,
+            "owned.execute-api.us-east-1.amazonaws.com",
+        );
+        assert_eq!(addresses.len(), 2);
+        assert!(first_enis
+            .iter()
+            .all(|eni| addresses.contains(&eni.private_ip)));
+        let (status, _) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            &format!("Action=ModifyVpcEndpoint&VpcEndpointId={second}&PrivateDnsEnabled=true"),
+        )
+        .await;
+        assert_eq!(status, 400);
+        let (status, _) = call(
+            &handler,
+            "111",
+            "us-east-1",
+            &format!(
+                "Action=DeleteNetworkInterface&NetworkInterfaceId={}",
+                first_enis[0].id
+            ),
+        )
+        .await;
+        assert_eq!(status, 400);
+        ok(&handler, &format!("Action=RevokeSecurityGroupIngress&GroupId={group}&IpProtocol=tcp&FromPort=443&ToPort=443&CidrIp=10.8.0.0%2F16")).await;
+        assert!(handler
+            .interface_endpoint_access("111", "us-east-1", &source, first_enis[0].private_ip, 443)
+            .is_none());
+        ok(&handler, &format!("Action=AuthorizeSecurityGroupIngress&GroupId={group}&IpProtocol=tcp&FromPort=443&ToPort=443&CidrIp=10.8.0.0%2F16")).await;
+        ok(&handler, &format!("Action=ModifyVpcEndpoint&VpcEndpointId={first}&RemoveSubnetId.1={}&AddSubnetId.1={}", subnets[0], subnets[2])).await;
+        assert!(handler
+            .interface_endpoint_access("111", "us-east-1", &source, first_enis[0].private_ip, 443)
+            .is_none());
+        let (modified, modified_enis) = snapshot(&first);
+        assert!(modified.network_interface_ids.contains(&first_enis[1].id));
+        assert!(modified_enis.iter().any(|eni| eni.subnet_id == subnets[2]));
+        let restored = Ec2Handler {
+            persistence: Some(persistence.clone()),
+            ..Ec2Handler::default()
+        };
+        persistence.restore(&restored).unwrap();
+        {
+            let state = restored.scopes.lock().unwrap();
+            let scope = &state[&("111".into(), "us-east-1".into())];
+            assert_eq!(
+                scope.vpc_endpoints[&first].network_interface_ids,
+                modified.network_interface_ids
+            );
+            assert_eq!(scope.vpc_endpoints[&first].policy_document, deny);
+            assert!(modified_enis
+                .iter()
+                .all(|eni| scope.network_interfaces[&eni.id].private_ip == eni.private_ip));
+        }
+        ok(
+            &handler,
+            &format!("Action=DeleteVpcEndpoints&VpcEndpointId.1={first}&VpcEndpointId.2={second}"),
+        )
+        .await;
+        {
+            let state = handler.scopes.lock().unwrap();
+            let scope = &state[&("111".into(), "us-east-1".into())];
+            assert!(modified
+                .network_interface_ids
+                .iter()
+                .chain(first_ep.network_interface_ids.iter())
+                .chain(second_enis.iter().map(|eni| &eni.id))
+                .all(|id| !scope.network_interfaces.contains_key(id)));
+        }
+        drop(source);
+        drop(restored);
+        drop(handler);
+        drop(persistence);
+        drop(database);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[tokio::test]
     async fn endpoint_access_tracks_routes_private_dns_and_ingress() {

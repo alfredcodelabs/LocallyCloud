@@ -18,7 +18,7 @@ use tokio::sync::Semaphore;
 
 use crate::audit::DispatchOutcome;
 use crate::error_mapping::{AwsError, RenderedError};
-use crate::handler::ServiceRequest;
+use crate::handler::{PrivateApiIngress, ServiceRequest};
 use crate::observability::log_routing_decision;
 use crate::proxy::{forward_to_legacy, LegacyHealth, ProxyConfig};
 use crate::registry::{AwsProtocol, ServiceName, ServiceRegistry};
@@ -454,7 +454,7 @@ impl InternalDispatcher {
         request_id: &str,
     ) -> Response {
         self.dispatch_in_scope(
-            method, uri, headers, body, request_id, None, false, None, None,
+            method, uri, headers, body, request_id, None, false, None, None, None,
         )
         .await
     }
@@ -491,6 +491,7 @@ impl InternalDispatcher {
                 false,
                 None,
                 Some(service),
+                None,
             )
             .await
     }
@@ -532,6 +533,33 @@ impl InternalDispatcher {
             false,
             Some((peer_ip, secure_transport)),
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Only the modeled interface endpoint transport supplies this typed context.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_private_api(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: Bytes,
+        request_id: &str,
+        ingress: PrivateApiIngress,
+    ) -> Response {
+        self.dispatch_in_scope(
+            method,
+            uri,
+            headers,
+            body,
+            request_id,
+            None,
+            false,
+            None,
+            None,
+            Some(ingress),
         )
         .await
     }
@@ -556,6 +584,7 @@ impl InternalDispatcher {
             request_id,
             Some((account_id, region)),
             false,
+            None,
             None,
             None,
         )
@@ -584,6 +613,7 @@ impl InternalDispatcher {
             true,
             None,
             None,
+            None,
         )
         .await
     }
@@ -600,6 +630,7 @@ impl InternalDispatcher {
         suppressed: bool,
         peer_ip: Option<(IpAddr, bool)>,
         dashboard_service: Option<&str>,
+        private_ingress: Option<PrivateApiIngress>,
     ) -> Response {
         let response = self
             .dispatch_in_scope_inner(
@@ -612,6 +643,7 @@ impl InternalDispatcher {
                 suppressed,
                 peer_ip,
                 dashboard_service,
+                private_ingress,
             )
             .await;
         if crate::error_mapping::cloudwatch_cbor_request(uri, headers) {
@@ -633,6 +665,7 @@ impl InternalDispatcher {
         suppressed: bool,
         peer_ip: Option<(IpAddr, bool)>,
         dashboard_service: Option<&str>,
+        private_ingress: Option<PrivateApiIngress>,
     ) -> Response {
         let started_at = SystemTime::now();
         let authorization = header_str(headers, "authorization");
@@ -640,8 +673,10 @@ impl InternalDispatcher {
         let host = header_str(headers, "host");
         let path = uri.path().to_string();
         let x_amz_credential = uri.query().and_then(extract_x_amz_credential);
-        let scope_region = scope
-            .map(|(_, region)| region.to_owned())
+        let scope_region = private_ingress
+            .as_ref()
+            .map(|ingress| ingress.endpoint_region.clone())
+            .or_else(|| scope.map(|(_, region)| region.to_owned()))
             .unwrap_or_else(|| {
                 extract_region_from_credential_scope(
                     authorization.as_deref(),
@@ -650,8 +685,10 @@ impl InternalDispatcher {
                 .or_else(|| cognito_public_region(&path).map(str::to_string))
                 .unwrap_or_else(|| self.default_region.clone())
             });
-        let scope_account = scope
-            .map(|(account, _)| account.to_owned())
+        let scope_account = private_ingress
+            .as_ref()
+            .map(|ingress| ingress.endpoint_account.clone())
+            .or_else(|| scope.map(|(account, _)| account.to_owned()))
             .unwrap_or_else(|| self.account_id.clone());
         let input = RouteInput {
             authorization: authorization.as_deref(),
@@ -666,20 +703,34 @@ impl InternalDispatcher {
                 .with_request_id(request_id.to_string());
             return render(err.render(AwsProtocol::RestJson));
         };
+        if private_ingress.is_some()
+            && registry
+                .native_handler(&ServiceName::new("execute-api"))
+                .is_none()
+        {
+            return render(
+                AwsError::new("ForbiddenException", "Forbidden", 403).render(AwsProtocol::RestJson),
+            );
+        }
         // The read allowlist already selected a service. Unsigned instance reads may
         // lack an AWS routing hint or share paths (ECR/API Gateway). Selecting a
         // destination never supplies an IAM scope or skips signature verification.
-        let selected = dashboard_service.and_then(|service| {
-            let service_name = ServiceName::new(service);
-            registry.native_handler(&service_name)?;
-            Some(crate::router::RoutingDecision {
-                service_name,
-                resolution_source: crate::router::ResolutionSource::DashboardSelection,
-                disposition: RouteDisposition::HandledNatively,
-            })
-        });
+        let selected = private_ingress
+            .as_ref()
+            .map(|_| "execute-api")
+            .or(dashboard_service)
+            .and_then(|service| {
+                let service_name = ServiceName::new(service);
+                registry.native_handler(&service_name)?;
+                Some(crate::router::RoutingDecision {
+                    service_name,
+                    resolution_source: crate::router::ResolutionSource::DashboardSelection,
+                    disposition: RouteDisposition::HandledNatively,
+                })
+            });
         let public_invoke_region = if scope.is_none()
             && dashboard_service.is_none()
+            && private_ingress.is_none()
             && !claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref())
         {
             match registry.native_handler(&ServiceName::new("execute-api")) {
@@ -756,7 +807,8 @@ impl InternalDispatcher {
             && evaluator
                 .as_ref()
                 .is_some_and(|evaluator| evaluator.strict_sigv4_required());
-        let public_request = (public_invoke
+        let public_request = (private_ingress.is_some()
+            || public_invoke
             || unsigned_public_request(
                 decision.service_name.as_str(),
                 method,
@@ -769,7 +821,10 @@ impl InternalDispatcher {
                     .as_deref()
                     .is_some_and(|host| host.to_ascii_lowercase().contains(".execute-api."))
                 && execute_api_management_path(uri.path()));
+        // Private ingress authenticates the exact Authorization scheme at its mandatory
+        // endpoint-policy gate, including in permissive mode. Bearer tokens stay anonymous.
         let verify_external = strict_external
+            && private_ingress.is_none()
             && (!public_request
                 || claims_sigv4_identity(authorization.as_deref(), x_amz_credential.as_deref()));
         let admitted_account = if ecr_token_request || verify_external {
@@ -903,17 +958,19 @@ impl InternalDispatcher {
                                     HeaderValue::from_static("1"),
                                 );
                             }
-                            handler
-                                .handle(ServiceRequest {
-                                    method: method.clone(),
-                                    uri: uri.clone(),
-                                    headers: native_headers,
-                                    body,
-                                    region: region.clone(),
-                                    account_id: account_id.clone(),
-                                    request_id: request_id.to_string(),
-                                })
-                                .await
+                            let request = ServiceRequest {
+                                method: method.clone(),
+                                uri: uri.clone(),
+                                headers: native_headers,
+                                body,
+                                region: region.clone(),
+                                account_id: account_id.clone(),
+                                request_id: request_id.to_string(),
+                            };
+                            match private_ingress {
+                                Some(ingress) => handler.handle_private(request, ingress).await,
+                                None => handler.handle(request).await,
+                            }
                         }
                         None => render(
                             AwsError::new(

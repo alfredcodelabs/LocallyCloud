@@ -123,6 +123,17 @@ pub trait ComputeRuntime: Send + Sync {
     }
 
     /// Capture outbound IPv4 TCP in a rootless network namespace.
+    /// Includes private targets, resolved dynamically by the owning service.
+    async fn bind_isolated_vpc_egress(
+        &self,
+        _task_id: &str,
+    ) -> Result<tokio::net::TcpListener, RuntimeError> {
+        Err(RuntimeError::ExecutionFailed {
+            reason: "isolated VPC egress is unavailable for this backend".into(),
+        })
+    }
+
+    /// Capture outbound IPv4 TCP in a rootless network namespace.
     /// The caller must check each original destination before forwarding.
     async fn bind_isolated_public_egress(
         &self,
