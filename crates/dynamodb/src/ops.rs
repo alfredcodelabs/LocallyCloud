@@ -1559,10 +1559,7 @@ fn reap_expired(data: &mut TableData, now_secs: f64) {
     let expired: Vec<StoredKey> = data
         .items
         .iter()
-        .filter(|(_, item)| match item.get(&attr) {
-            Some(AttributeValue::N(n)) => n.parse::<f64>().map(|t| t <= now_secs).unwrap_or(false),
-            _ => false,
-        })
+        .filter(|(_, item)| crate::store::ttl_of(item, &attr).is_some_and(|t| t <= now_secs))
         .map(|(k, _)| k.clone())
         .collect();
     for key in expired {
@@ -1572,16 +1569,15 @@ fn reap_expired(data: &mut TableData, now_secs: f64) {
     }
 }
 
-/// Periodic TTL sweep across every account/region scope. The handler owns the timer; this
-/// function owns only one deterministic pass and therefore remains directly testable.
+/// TTL sweep of the tables whose earliest expiry is due, across every account/region scope.
+/// The handler owns the timer; this function owns only one deterministic pass and therefore
+/// remains directly testable.
 pub async fn sweep_expired(store: &TableStore) {
     let now = now_epoch_secs();
-    for (_, _, table) in store.all_tables() {
-        if table.read().await.ttl_attribute.is_none() {
-            continue;
-        }
+    for (key, table) in store.due_ttl_tables(now) {
         let mut guard = table.write().await;
         reap_expired(&mut guard, now);
+        store.reset_ttl_deadline(&key, &guard);
     }
 }
 

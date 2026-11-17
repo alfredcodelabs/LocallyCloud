@@ -436,7 +436,7 @@ impl NativeHandler for DynamoHandler {
         } else {
             Some(MaintenanceWake(&self.store.maintenance_changed))
         };
-        let may_mutate = !read_only || matches!(op.as_str(), "GetItem" | "Query" | "Scan");
+        let may_mutate = !read_only;
         if may_mutate {
             self.store.mark_uncommitted();
         }

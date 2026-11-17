@@ -218,6 +218,31 @@ pub struct ExportJob {
     pub s3_bucket: Option<String>,
 }
 
+/// Longest sleep before re-checking a far TTL deadline; also bounds `Instant` arithmetic.
+const TTL_MAX_SLEEP: Duration = Duration::from_secs(3600);
+
+/// An item's TTL in epoch seconds, when its TTL attribute is a finite number.
+pub(crate) fn ttl_of(item: &Item, attribute: &str) -> Option<f64> {
+    match item.get(attribute) {
+        Some(AttributeValue::N(number)) => number.parse::<f64>().ok().filter(|t| t.is_finite()),
+        _ => None,
+    }
+}
+
+/// The monotonic instant at which an epoch-second deadline falls due, capped at one hour.
+fn ttl_instant(deadline_secs: f64) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_secs_f64())
+        .unwrap_or(0.0);
+    let wait = deadline_secs - now_secs;
+    if wait <= 0.0 {
+        return now;
+    }
+    now + Duration::from_secs_f64(wait).min(TTL_MAX_SLEEP)
+}
+
 /// Live table state behind a per-table lock.
 pub struct TableData {
     pub def: TableDefinition,
@@ -309,6 +334,15 @@ impl TableData {
 
     /// Record a committed item change for DynamoDB Streams and every active Kinesis
     /// destination. Kinesis always receives both images; the table stream honors its view type.
+    /// The earliest TTL among the items, when TTL is enabled and any item carries one.
+    pub(crate) fn next_expiry(&self) -> Option<f64> {
+        let attribute = self.ttl_attribute.as_deref()?;
+        self.items
+            .values()
+            .filter_map(|item| ttl_of(item, attribute))
+            .min_by(f64::total_cmp)
+    }
+
     pub fn emit_stream(&mut self, old: Option<&Item>, new: Option<&Item>) {
         self.emit_change(old, new, true);
     }
@@ -470,6 +504,9 @@ pub struct TableStore {
     tables: DashMap<ScopedKey, Arc<StoredTable>>,
     pending_tables: Arc<DashSet<ScopedKey>>,
     maintenance_tables: DashSet<ScopedKey>,
+    /// Earliest TTL (epoch seconds) per table with TTL enabled and items; infinity when no
+    /// item carries a numeric TTL. It may be early, never late: the sweep recomputes it.
+    ttl_deadlines: DashMap<ScopedKey, f64>,
     txn_tokens: DashMap<TxnTokenKey, Arc<Mutex<Option<TxnOutcome>>>>,
     pub replica_topology: Mutex<()>,
     pub operation_gate: Mutex<()>,
@@ -806,7 +843,7 @@ impl TableStore {
             locked.push((account, region, table.data.write().await));
         }
         let Some(connection) = &self.connection else {
-            for (account, region, table) in &locked {
+            for (account, region, table) in &mut locked {
                 self.track_maintenance(
                     &(
                         account.to_string(),
@@ -815,10 +852,12 @@ impl TableStore {
                     ),
                     table,
                 );
+                table.dirty_keys.clear();
             }
             for key in &pending {
                 if !self.tables.contains_key(key) {
                     self.maintenance_tables.remove(key);
+                    self.ttl_deadlines.remove(key);
                 }
             }
             self.clear_uncommitted();
@@ -952,6 +991,7 @@ impl TableStore {
         for key in &pending {
             if !self.tables.contains_key(key) {
                 self.maintenance_tables.remove(key);
+                self.ttl_deadlines.remove(key);
             }
         }
         self.clear_uncommitted();
@@ -1043,14 +1083,54 @@ impl TableStore {
     }
 
     fn track_maintenance(&self, key: &ScopedKey, data: &TableData) {
-        if (data.ttl_attribute.is_some() && !data.items.is_empty())
-            || !data.replica_pending.is_empty()
-            || !data.kinesis_pending.is_empty()
-        {
+        if !data.replica_pending.is_empty() || !data.kinesis_pending.is_empty() {
             self.maintenance_tables.insert(key.clone());
         } else {
             self.maintenance_tables.remove(key);
         }
+        self.track_ttl(key, data);
+    }
+
+    /// Keeps the table's earliest expiry current after a commit. Changed items can only
+    /// bring it forward; a later or deleted item leaves an early wakeup the sweep corrects.
+    fn track_ttl(&self, key: &ScopedKey, data: &TableData) {
+        let Some(attribute) = data.ttl_attribute.as_deref() else {
+            self.ttl_deadlines.remove(key);
+            return;
+        };
+        if data.items.is_empty() {
+            self.ttl_deadlines.remove(key);
+            return;
+        }
+        let current = self.ttl_deadlines.get(key).map(|deadline| *deadline);
+        let next = match current {
+            Some(current) => data
+                .dirty_keys
+                .iter()
+                .filter_map(|changed| data.items.get(changed))
+                .filter_map(|item| ttl_of(item, attribute))
+                .fold(current, f64::min),
+            None => data.next_expiry().unwrap_or(f64::INFINITY),
+        };
+        self.ttl_deadlines.insert(key.clone(), next);
+    }
+
+    /// Tables whose earliest expiry is at or before `now_secs`.
+    pub(crate) fn due_ttl_tables(&self, now_secs: f64) -> Vec<(ScopedKey, Arc<StoredTable>)> {
+        self.ttl_deadlines
+            .iter()
+            .filter(|deadline| *deadline.value() <= now_secs)
+            .filter_map(|deadline| {
+                let table = self.tables.get(deadline.key())?.value().clone();
+                Some((deadline.key().clone(), table))
+            })
+            .collect()
+    }
+
+    /// Recomputes the exact earliest expiry after a sweep.
+    pub(crate) fn reset_ttl_deadline(&self, key: &ScopedKey, data: &TableData) {
+        self.ttl_deadlines.remove(key);
+        self.track_ttl(key, data);
     }
 
     pub(crate) fn maintenance_deadline(
@@ -1064,7 +1144,15 @@ impl TableStore {
         if !self.maintenance_tables.is_empty() {
             return Some(retry);
         }
-        self.txn_tokens
+        let ttl = self
+            .ttl_deadlines
+            .iter()
+            .map(|deadline| *deadline.value())
+            .filter(|deadline| deadline.is_finite())
+            .min_by(f64::total_cmp)
+            .map(ttl_instant);
+        let tokens = self
+            .txn_tokens
             .iter()
             .map(|entry| {
                 let outcome = match entry.value().try_lock() {
@@ -1080,7 +1168,8 @@ impl TableStore {
                     _ => retry,
                 }
             })
-            .min()
+            .min();
+        tokens.into_iter().chain(ttl).min()
     }
 
     pub fn purge_expired_txn_tokens(&self) {
@@ -1483,10 +1572,8 @@ mod tests {
         ttl.items.insert(key, item);
         store.create("0", "us-east-1", ttl).unwrap();
         store.persist().await.unwrap();
-        assert_eq!(
-            store.maintenance_deadline(last),
-            Some(last + Duration::from_millis(100))
-        );
+        // An already expired item is due now, not on the 100 ms retry cadence.
+        assert!(store.maintenance_deadline(last).unwrap() <= tokio::time::Instant::now());
         drop(store);
         let store = TableStore::with_state(state).unwrap();
         assert!(store.maintenance_deadline(last).is_some());
@@ -1516,6 +1603,78 @@ mod tests {
         store.purge_expired_txn_tokens();
         assert!(store.maintenance_deadline(last).is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ttl_deadline_waits_for_the_earliest_expiry_and_is_capped() {
+        let store = TableStore::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut ttl = data(simple_def("expires"));
+        ttl.ttl_attribute = Some("exp".into());
+        for (id, expiry) in [("far", now + 864_000), ("none", 0), ("soon", now + 120)] {
+            let mut item = Item::new();
+            item.insert("pk".into(), AttributeValue::S(id.into()));
+            if expiry > 0 {
+                item.insert("exp".into(), AttributeValue::N(expiry.to_string()));
+            }
+            ttl.emit_stream(None, Some(&item));
+            ttl.items.insert(ttl.key_of(&item).unwrap(), item);
+        }
+        store.create("0", "us-east-1", ttl).unwrap();
+        store.persist().await.unwrap();
+        let wait = store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .unwrap()
+            .duration_since(tokio::time::Instant::now());
+        assert!(wait > Duration::from_secs(110) && wait <= Duration::from_secs(121));
+        assert!(store.due_ttl_tables(now as f64).is_empty());
+
+        // A write that expires sooner brings the deadline forward without a full rescan.
+        let table = store.get("0", "us-east-1", "expires").unwrap();
+        {
+            let mut guard = table.write().await;
+            let mut item = Item::new();
+            item.insert("pk".into(), AttributeValue::S("now".into()));
+            item.insert("exp".into(), AttributeValue::N("1".into()));
+            guard.emit_stream(None, Some(&item));
+            let key = guard.key_of(&item).unwrap();
+            guard.items.insert(key, item);
+        }
+        store.persist().await.unwrap();
+        assert_eq!(store.due_ttl_tables(now as f64).len(), 1);
+        crate::ops::sweep_expired(&store).await;
+        let wait = store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .unwrap()
+            .duration_since(tokio::time::Instant::now());
+        assert!(
+            wait > Duration::from_secs(110),
+            "the sweep restores the exact deadline"
+        );
+
+        // Only far expiries left: the worker re-checks within the one-hour cap.
+        {
+            let mut guard = table.write().await;
+            let soon = guard
+                .items
+                .keys()
+                .find(|key| key.partition == KeyScalar::S("soon".into()))
+                .cloned()
+                .unwrap();
+            guard.items.remove(&soon);
+        }
+        store.reset_ttl_deadline(
+            &("0".into(), "us-east-1".into(), "expires".into()),
+            &*table.read().await,
+        );
+        let wait = store
+            .maintenance_deadline(tokio::time::Instant::now())
+            .unwrap()
+            .duration_since(tokio::time::Instant::now());
+        assert!(wait > Duration::from_secs(3590) && wait <= TTL_MAX_SLEEP);
     }
 
     #[tokio::test]
