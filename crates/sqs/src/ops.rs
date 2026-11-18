@@ -711,14 +711,20 @@ fn is_read_only(name: &str) -> bool {
 }
 
 pub async fn delete_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
-    let _lifecycle = ctx.store.lifecycle_write().await;
+    let lifecycle = ctx.store.lifecycle_write().await;
     let q = resolve_queue(ctx, v)?;
-    if let Some(db) = ctx.store.persistence() {
-        db.delete_queue(&q.arn)?;
-    }
-    ctx.store.remove(&q.arn);
-    q.notify.notify_waiters();
-    Ok(json!({}))
+    let store = ctx.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let _lifecycle = lifecycle;
+        if let Some(db) = store.persistence() {
+            db.delete_queue(&q.arn)?;
+        }
+        store.remove(&q.arn);
+        q.notify.notify_waiters();
+        Ok(json!({}))
+    })
+    .await
+    .map_err(|_| SqsError::StorageUnavailable)?
 }
 
 fn page_token(operation: &str, ctx: &Ctx<'_>, filter: &str, last_name: &str) -> String {
@@ -905,8 +911,6 @@ fn computed_attributes(q: &GuardedQueue, state: &QueueState) -> BTreeMap<String,
 
 pub async fn get_queue_attributes(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
-    let mut state = q.state.lock().await;
-    expire_messages(&ctx.store, &q, &mut state)?;
     let requested: Vec<String> = v
         .get("AttributeNames")
         .and_then(Value::as_array)
@@ -916,16 +920,21 @@ pub async fn get_queue_attributes(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sqs
                 .collect()
         })
         .unwrap_or_else(|| vec!["All".to_string()]);
-    let all = computed_attributes(&q, &state);
-    let selected: Map<String, Value> = if requested.iter().any(|n| n == "All") {
-        all.into_iter().map(|(k, v)| (k, json!(v))).collect()
-    } else {
-        all.into_iter()
-            .filter(|(k, _)| requested.contains(k))
-            .map(|(k, v)| (k, json!(v)))
-            .collect()
-    };
-    Ok(json!({ "Attributes": selected }))
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            expire_messages(store, q, state)?;
+            let all = computed_attributes(q, state);
+            let selected: Map<String, Value> = if requested.iter().any(|n| n == "All") {
+                all.into_iter().map(|(k, v)| (k, json!(v))).collect()
+            } else {
+                all.into_iter()
+                    .filter(|(k, _)| requested.contains(k))
+                    .map(|(k, v)| (k, json!(v)))
+                    .collect()
+            };
+            Ok(json!({ "Attributes": selected }))
+        })
+        .await
 }
 
 pub async fn set_queue_attributes(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
@@ -933,30 +942,36 @@ pub async fn set_queue_attributes(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sqs
     if updates.is_empty() {
         return Err(SqsError::MissingParameter("Attributes is required".into()));
     }
-    let _lifecycle = ctx.store.lifecycle_read().await;
+    let lifecycle = ctx.store.lifecycle_read().await;
     let q = resolve_queue(ctx, v)?;
     validate_attributes(ctx, &q.arn, q.fifo, &updates, false)?;
     ensure_redrive_allowed(ctx, &q.arn, &updates).await?;
 
-    let mut state = q.state.lock().await;
-    let original = state.attributes.clone();
-    let last_modified = state.last_modified;
-    for (name, value) in updates {
-        if value.is_empty() {
-            state.attributes.remove(&name);
-        } else {
-            state.attributes.insert(name, value);
+    let store = ctx.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let _lifecycle = lifecycle;
+        let mut state = q.state.blocking_lock();
+        let original = state.attributes.clone();
+        let last_modified = state.last_modified;
+        for (name, value) in updates {
+            if value.is_empty() {
+                state.attributes.remove(&name);
+            } else {
+                state.attributes.insert(name, value);
+            }
         }
-    }
-    state.touch();
-    if let Some(db) = ctx.store.persistence() {
-        if let Err(error) = db.save_queue(&q, &state) {
-            state.attributes = original;
-            state.last_modified = last_modified;
-            return Err(error);
+        state.touch();
+        if let Some(db) = store.persistence() {
+            if let Err(error) = db.save_queue(&q, &state) {
+                state.attributes = original;
+                state.last_modified = last_modified;
+                return Err(error);
+            }
         }
-    }
-    Ok(json!({}))
+        Ok(json!({}))
+    })
+    .await
+    .map_err(|_| SqsError::StorageUnavailable)?
 }
 
 // ============================ send =============================================
@@ -1394,22 +1409,26 @@ pub async fn send_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
         Some(key) => Some(encrypt_body(ctx, &q.arn.to_arn(), key, &input.body).await?),
         None => None,
     };
-    let mut state = q.state.lock().await;
-    if state
-        .attributes
-        .get("KmsMasterKeyId")
-        .filter(|key| !key.is_empty())
-        != key_id.as_ref()
-    {
-        return Err(SqsError::KmsAccessDenied);
-    }
-    let result = enqueue(&q, ctx.store.persistence(), &mut state, input, encrypted)?;
-    drop(state);
-    q.notify.notify_one();
-    if result.added {
-        ctx.metrics.record_sent(&q.arn, result.size);
-    }
-    Ok(send_result_json(&result))
+    let metrics = ctx.metrics.clone();
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            if state
+                .attributes
+                .get("KmsMasterKeyId")
+                .filter(|key| !key.is_empty())
+                != key_id.as_ref()
+            {
+                return Err(SqsError::KmsAccessDenied);
+            }
+            let result = enqueue(q, store.persistence(), state, input, encrypted)?;
+
+            q.notify.notify_one();
+            if result.added {
+                metrics.record_sent(&q.arn, result.size);
+            }
+            Ok(send_result_json(&result))
+        })
+        .await
 }
 
 pub async fn send_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
@@ -1477,9 +1496,20 @@ pub async fn send_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsEr
         prepared.push(item);
     }
 
+    let ids: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .get("Id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let metrics = ctx.metrics.clone();
+    ctx.store.with_queue_state(&q, move |store, q, state| {
     let mut successful = Vec::new();
     let mut failed = Vec::new();
-    let mut state = q.state.lock().await;
     if state
         .attributes
         .get("KmsMasterKeyId")
@@ -1488,18 +1518,13 @@ pub async fn send_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsEr
     {
         return Err(SqsError::KmsAccessDenied);
     }
-    for (entry, item) in entries.iter().zip(prepared) {
-        let id = entry
-            .get("Id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+    for (id, item) in ids.into_iter().zip(prepared) {
         match item.and_then(|(input, encrypted)| {
-            enqueue(&q, ctx.store.persistence(), &mut state, input, encrypted)
+            enqueue(q, store.persistence(), state, input, encrypted)
         }) {
             Ok(result) => {
                 if result.added {
-                    ctx.metrics.record_sent(&q.arn, result.size);
+                    metrics.record_sent(&q.arn, result.size);
                 }
                 let mut success = send_result_json(&result);
                 success
@@ -1513,9 +1538,9 @@ pub async fn send_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsEr
             })),
         }
     }
-    drop(state);
     q.notify.notify_waiters();
     Ok(json!({ "Successful": successful, "Failed": failed }))
+    }).await
 }
 
 // ============================ receive ==========================================
@@ -1819,90 +1844,100 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
     let want_attr = matcher(attr_names);
     let want_msg_attr = matcher(string_list(v, "MessageAttributeNames"));
 
-    let wait_secs = {
-        let mut state = q.state.lock().await;
-        expire_messages(&ctx.store, &q, &mut state)?;
-        let wait = optional_i64(v, "WaitTimeSeconds")?.unwrap_or_else(|| state.wait_time_seconds());
-        if !(0..=MAX_RECEIVE_WAIT_SECONDS).contains(&wait) {
-            return Err(SqsError::InvalidParameterValue(format!(
-                "WaitTimeSeconds must be between 0 and {MAX_RECEIVE_WAIT_SECONDS}"
-            )));
-        }
-        if let Some(id) = &attempt_id {
-            if let Some(attempt) = state.receive_attempts.get(id) {
-                let selected = attempt.messages.clone();
-                drop(state);
-                let messages =
-                    messages_json(ctx, &q.arn.to_arn(), &selected, &want_attr, &want_msg_attr)
-                        .await?;
-                ctx.metrics.record_received(&q.arn, messages.len());
-                return Ok(json!({ "Messages": messages }));
+    let wait_override = optional_i64(v, "WaitTimeSeconds")?;
+    let cached_attempt = attempt_id.clone();
+    let (wait_secs, cached) = ctx
+        .store
+        .with_queue_state(&q, move |store, q, state| {
+            expire_messages(store, q, state)?;
+            let wait = wait_override.unwrap_or_else(|| state.wait_time_seconds());
+            if !(0..=MAX_RECEIVE_WAIT_SECONDS).contains(&wait) {
+                return Err(SqsError::InvalidParameterValue(format!(
+                    "WaitTimeSeconds must be between 0 and {MAX_RECEIVE_WAIT_SECONDS}"
+                )));
             }
-        }
-        wait
-    };
+            let cached = cached_attempt
+                .as_ref()
+                .and_then(|id| state.receive_attempts.get(id))
+                .map(|attempt| attempt.messages.clone());
+            Ok((wait, cached))
+        })
+        .await?;
+    if let Some(selected) = cached {
+        let messages =
+            messages_json(ctx, &q.arn.to_arn(), &selected, &want_attr, &want_msg_attr).await?;
+        ctx.metrics.record_received(&q.arn, messages.len());
+        return Ok(json!({"Messages":messages}));
+    }
 
     let start = Instant::now();
     loop {
+        // Register before yielding to the worker: batch sends use notify_waiters.
+        let notified = q.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         redrive_expired(ctx, &q).await?;
-        let (selected, next_visibility) = {
-            let mut state = q.state.lock().await;
-            expire_messages(&ctx.store, &q, &mut state)?;
-            let visibility = vis_override.unwrap_or_else(|| state.visibility_timeout());
-            let mut selected = select_messages(&mut state, q.fifo, max, visibility);
-            if let Some(db) = ctx.store.persistence() {
-                let hydrated = selected
-                    .iter()
-                    .map(|message| db.hydrate_message(&q, message))
-                    .collect::<Result<Vec<_>, _>>();
-                match hydrated {
-                    Ok(messages) => selected = messages,
-                    Err(error) => {
-                        restore_selection(&mut state, &selected);
-                        return Err(error);
-                    }
-                }
-            }
-            if !selected.is_empty() {
-                if let Some(id) = &attempt_id {
-                    state.receive_attempts.insert(
-                        id.clone(),
-                        ReceiveAttempt {
-                            expires_at: Instant::now() + RECEIVE_ATTEMPT_WINDOW,
-                            messages: selected.clone(),
-                        },
-                    );
-                }
-            }
-            if !selected.is_empty() {
-                if let Some(db) = ctx.store.persistence() {
-                    let attempt = attempt_id.as_ref().and_then(|id| {
-                        state
-                            .receive_attempts
-                            .get(id)
-                            .map(|entry| (id.as_str(), entry))
-                    });
-                    if let Err(error) = db.update_messages(&q, &selected, attempt) {
-                        restore_selection(&mut state, &selected);
-                        if let Some(id) = &attempt_id {
-                            state.receive_attempts.remove(id);
+        let receive_attempt = attempt_id.clone();
+        let (selected, next_visibility) = ctx
+            .store
+            .with_queue_state(&q, move |store, q, state| {
+                expire_messages(store, q, state)?;
+                let visibility = vis_override.unwrap_or_else(|| state.visibility_timeout());
+                let mut selected = select_messages(state, q.fifo, max, visibility);
+                if let Some(db) = store.persistence() {
+                    let hydrated = selected
+                        .iter()
+                        .map(|message| db.hydrate_message(q, message))
+                        .collect::<Result<Vec<_>, _>>();
+                    match hydrated {
+                        Ok(messages) => selected = messages,
+                        Err(error) => {
+                            restore_selection(state, &selected);
+                            return Err(error);
                         }
-                        return Err(error);
                     }
                 }
-            }
-            let now = Instant::now();
-            let next_visibility = if selected.is_empty() {
-                state
-                    .messages
-                    .iter()
-                    .filter_map(|message| message.visible_at.checked_duration_since(now))
-                    .min()
-            } else {
-                None
-            };
-            (selected, next_visibility)
-        };
+                if !selected.is_empty() {
+                    if let Some(id) = &receive_attempt {
+                        state.receive_attempts.insert(
+                            id.clone(),
+                            ReceiveAttempt {
+                                expires_at: Instant::now() + RECEIVE_ATTEMPT_WINDOW,
+                                messages: selected.clone(),
+                            },
+                        );
+                    }
+                }
+                if !selected.is_empty() {
+                    if let Some(db) = store.persistence() {
+                        let attempt = receive_attempt.as_ref().and_then(|id| {
+                            state
+                                .receive_attempts
+                                .get(id)
+                                .map(|entry| (id.as_str(), entry))
+                        });
+                        if let Err(error) = db.update_messages(q, &selected, attempt) {
+                            restore_selection(state, &selected);
+                            if let Some(id) = &receive_attempt {
+                                state.receive_attempts.remove(id);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                let now = Instant::now();
+                let next_visibility = if selected.is_empty() {
+                    state
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.visible_at.checked_duration_since(now))
+                        .min()
+                } else {
+                    None
+                };
+                Ok((selected, next_visibility))
+            })
+            .await?;
         if !selected.is_empty() {
             match messages_json(ctx, &q.arn.to_arn(), &selected, &want_attr, &want_msg_attr).await {
                 Ok(messages) => {
@@ -1910,20 +1945,43 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
                     return Ok(json!({ "Messages": messages }));
                 }
                 Err(error) => {
-                    let mut state = q.state.lock().await;
-                    restore_selection(&mut state, &selected);
-                    if let Some(db) = ctx.store.persistence() {
-                        let restored: Vec<_> = state
-                            .messages
-                            .iter()
-                            .filter(|m| selected.iter().any(|s| s.id == m.id))
-                            .cloned()
-                            .collect();
-                        db.restore_receive(&q, &restored, attempt_id.as_deref())?;
-                    }
-                    if let Some(id) = &attempt_id {
-                        state.receive_attempts.remove(id);
-                    }
+                    let rollback_attempt = attempt_id.clone();
+                    ctx.store
+                        .with_queue_state(&q, move |store, q, state| {
+                            let original: Vec<_> = state
+                                .messages
+                                .iter()
+                                .filter(|m| selected.iter().any(|s| s.id == m.id))
+                                .cloned()
+                                .collect();
+                            restore_selection(state, &selected);
+                            if let Some(db) = store.persistence() {
+                                let restored: Vec<_> = state
+                                    .messages
+                                    .iter()
+                                    .filter(|m| selected.iter().any(|s| s.id == m.id))
+                                    .cloned()
+                                    .collect();
+                                if let Err(error) =
+                                    db.restore_receive(q, &restored, rollback_attempt.as_deref())
+                                {
+                                    for saved in original {
+                                        if let Some(message) =
+                                            state.messages.iter_mut().find(|m| m.id == saved.id)
+                                        {
+                                            *message = saved;
+                                        }
+                                    }
+                                    return Err(error);
+                                }
+                            }
+                            if let Some(id) = &rollback_attempt {
+                                state.receive_attempts.remove(id);
+                            }
+                            q.notify.notify_waiters();
+                            Ok(())
+                        })
+                        .await?;
                     return Err(error);
                 }
             }
@@ -1936,7 +1994,7 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
         let remaining = Duration::from_secs((wait_secs - elapsed) as u64);
         let sleep_for = next_visibility.map_or(remaining, |next| next.min(remaining));
         tokio::select! {
-            _ = q.notify.notified() => {}
+            _ = &mut notified => {}
             _ = tokio::time::sleep(sleep_for) => {}
         }
     }
@@ -1978,38 +2036,45 @@ fn delete_by_handle(
 
 pub async fn delete_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
-    let handle = req_str(v, "ReceiptHandle")?;
-    let mut state = q.state.lock().await;
-    delete_by_handle(&q, ctx.store.persistence(), &mut state, handle)?;
-    drop(state);
-    ctx.metrics.record_deleted(&q.arn, 1);
-    Ok(json!({}))
+    let handle = req_str(v, "ReceiptHandle")?.to_owned();
+    let metrics = ctx.metrics.clone();
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            delete_by_handle(q, store.persistence(), state, &handle)?;
+
+            metrics.record_deleted(&q.arn, 1);
+            Ok(json!({}))
+        })
+        .await
 }
 
 pub async fn delete_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
     let entries = batch_entries(v)?;
-    let mut state = q.state.lock().await;
-    let mut successful = Vec::new();
-    let mut failed = Vec::new();
-    for e in &entries {
-        let id = e
-            .get("Id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        match e.get("ReceiptHandle").and_then(Value::as_str) {
-            Some(handle) => match delete_by_handle(&q, ctx.store.persistence(), &mut state, handle)
-            {
-                Ok(()) => successful.push(json!({ "Id": id })),
-                Err(err) => failed.push(batch_error(&id, &err)),
-            },
-            None => failed.push(batch_error(&id, &SqsError::ReceiptHandleIsInvalid)),
-        }
-    }
-    drop(state);
-    ctx.metrics.record_deleted(&q.arn, successful.len());
-    Ok(json!({ "Successful": successful, "Failed": failed }))
+    let metrics = ctx.metrics.clone();
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            let mut successful = Vec::new();
+            let mut failed = Vec::new();
+            for e in &entries {
+                let id = e
+                    .get("Id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                match e.get("ReceiptHandle").and_then(Value::as_str) {
+                    Some(handle) => match delete_by_handle(q, store.persistence(), state, handle) {
+                        Ok(()) => successful.push(json!({ "Id": id })),
+                        Err(err) => failed.push(batch_error(&id, &err)),
+                    },
+                    None => failed.push(batch_error(&id, &SqsError::ReceiptHandleIsInvalid)),
+                }
+            }
+
+            metrics.record_deleted(&q.arn, successful.len());
+            Ok(json!({ "Successful": successful, "Failed": failed }))
+        })
+        .await
 }
 
 /// Adjust a message's visibility deadline by its receipt handle.
@@ -2043,7 +2108,7 @@ fn change_visibility(
 
 pub async fn change_message_visibility(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
-    let handle = req_str(v, "ReceiptHandle")?;
+    let handle = req_str(v, "ReceiptHandle")?.to_owned();
     let timeout = optional_i64(v, "VisibilityTimeout")?
         .ok_or_else(|| SqsError::MissingParameter("VisibilityTimeout is required".into()))?;
     if !(0..=43_200).contains(&timeout) {
@@ -2051,69 +2116,78 @@ pub async fn change_message_visibility(ctx: &Ctx<'_>, v: &Value) -> Result<Value
             "VisibilityTimeout must be between 0 and 43200".into(),
         ));
     }
-    let mut state = q.state.lock().await;
-    change_visibility(&q, ctx.store.persistence(), &mut state, handle, timeout)?;
-    drop(state);
-    if timeout <= 0 {
-        q.notify.notify_waiters();
-    }
-    Ok(json!({}))
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            change_visibility(q, store.persistence(), state, &handle, timeout)?;
+
+            if timeout <= 0 {
+                q.notify.notify_waiters();
+            }
+            Ok(json!({}))
+        })
+        .await
 }
 
 pub async fn change_message_visibility_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
     let entries = batch_entries(v)?;
-    let mut state = q.state.lock().await;
-    let mut successful = Vec::new();
-    let mut failed = Vec::new();
-    for e in &entries {
-        let id = e
-            .get("Id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let handle = e.get("ReceiptHandle").and_then(Value::as_str).unwrap_or("");
-        let result = optional_i64(e, "VisibilityTimeout").and_then(|timeout| {
-            let timeout = timeout.ok_or_else(|| {
-                SqsError::MissingParameter("VisibilityTimeout is required".into())
-            })?;
-            if !(0..=43_200).contains(&timeout) {
-                return Err(SqsError::InvalidParameterValue(
-                    "VisibilityTimeout must be between 0 and 43200".into(),
-                ));
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            let mut successful = Vec::new();
+            let mut failed = Vec::new();
+            for e in &entries {
+                let id = e
+                    .get("Id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let handle = e.get("ReceiptHandle").and_then(Value::as_str).unwrap_or("");
+                let result = optional_i64(e, "VisibilityTimeout").and_then(|timeout| {
+                    let timeout = timeout.ok_or_else(|| {
+                        SqsError::MissingParameter("VisibilityTimeout is required".into())
+                    })?;
+                    if !(0..=43_200).contains(&timeout) {
+                        return Err(SqsError::InvalidParameterValue(
+                            "VisibilityTimeout must be between 0 and 43200".into(),
+                        ));
+                    }
+                    change_visibility(q, store.persistence(), state, handle, timeout)
+                });
+                match result {
+                    Ok(()) => successful.push(json!({ "Id": id })),
+                    Err(err) => failed.push(batch_error(&id, &err)),
+                }
             }
-            change_visibility(&q, ctx.store.persistence(), &mut state, handle, timeout)
-        });
-        match result {
-            Ok(()) => successful.push(json!({ "Id": id })),
-            Err(err) => failed.push(batch_error(&id, &err)),
-        }
-    }
-    Ok(json!({ "Successful": successful, "Failed": failed }))
+            Ok(json!({ "Successful": successful, "Failed": failed }))
+        })
+        .await
 }
 
 pub async fn purge_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
-    let mut state = q.state.lock().await;
-    if state
-        .last_purge
-        .is_some_and(|last_purge| last_purge.elapsed() < Duration::from_secs(60))
-    {
-        return Err(SqsError::PurgeQueueInProgress);
-    }
-    let previous_purge = state.last_purge;
-    state.last_purge = Some(Instant::now());
-    if let Some(db) = ctx.store.persistence() {
-        if let Err(error) = db.purge(&q, &state) {
-            state.last_purge = previous_purge;
-            return Err(error);
-        }
-    }
-    state.messages.clear();
-    state.oldest_sent_timestamp_ms = None;
-    state.dedup.clear();
-    state.receive_attempts.clear();
-    Ok(json!({}))
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            if state
+                .last_purge
+                .is_some_and(|last_purge| last_purge.elapsed() < Duration::from_secs(60))
+            {
+                return Err(SqsError::PurgeQueueInProgress);
+            }
+            let previous_purge = state.last_purge;
+            state.last_purge = Some(Instant::now());
+            if let Some(db) = store.persistence() {
+                if let Err(error) = db.purge(q, state) {
+                    state.last_purge = previous_purge;
+                    return Err(error);
+                }
+            }
+            state.messages.clear();
+            state.oldest_sent_timestamp_ms = None;
+            state.dedup.clear();
+            state.receive_attempts.clear();
+            Ok(json!({}))
+        })
+        .await
 }
 
 /// Validate and return batch entries (1..=10, ids present and distinct).
@@ -2159,28 +2233,31 @@ pub async fn tag_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     if tags.is_empty() {
         return Err(SqsError::MissingParameter("Tags is required".into()));
     }
-    let mut state = q.state.lock().await;
-    let original = state.tags.clone();
-    let last_modified = state.last_modified;
-    let new_keys = tags
-        .keys()
-        .filter(|key| !state.tags.contains_key(*key))
-        .count();
-    if state.tags.len() + new_keys > MAX_TAGS {
-        return Err(SqsError::InvalidParameterValue(format!(
-            "a queue can have at most {MAX_TAGS} tags"
-        )));
-    }
-    state.tags.extend(tags);
-    state.touch();
-    if let Some(db) = ctx.store.persistence() {
-        if let Err(error) = db.save_queue(&q, &state) {
-            state.tags = original;
-            state.last_modified = last_modified;
-            return Err(error);
-        }
-    }
-    Ok(json!({}))
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            let original = state.tags.clone();
+            let last_modified = state.last_modified;
+            let new_keys = tags
+                .keys()
+                .filter(|key| !state.tags.contains_key(*key))
+                .count();
+            if state.tags.len() + new_keys > MAX_TAGS {
+                return Err(SqsError::InvalidParameterValue(format!(
+                    "a queue can have at most {MAX_TAGS} tags"
+                )));
+            }
+            state.tags.extend(tags);
+            state.touch();
+            if let Some(db) = store.persistence() {
+                if let Err(error) = db.save_queue(q, state) {
+                    state.tags = original;
+                    state.last_modified = last_modified;
+                    return Err(error);
+                }
+            }
+            Ok(json!({}))
+        })
+        .await
 }
 
 pub async fn untag_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
@@ -2203,19 +2280,22 @@ pub async fn untag_queue(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
             "TagKeys contains an invalid tag key".into(),
         ));
     }
-    let mut state = q.state.lock().await;
-    let original = state.tags.clone();
-    let last_modified = state.last_modified;
-    state.tags.retain(|k, _| !keys.contains(k));
-    state.touch();
-    if let Some(db) = ctx.store.persistence() {
-        if let Err(error) = db.save_queue(&q, &state) {
-            state.tags = original;
-            state.last_modified = last_modified;
-            return Err(error);
-        }
-    }
-    Ok(json!({}))
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            let original = state.tags.clone();
+            let last_modified = state.last_modified;
+            state.tags.retain(|k, _| !keys.contains(k));
+            state.touch();
+            if let Some(db) = store.persistence() {
+                if let Err(error) = db.save_queue(q, state) {
+                    state.tags = original;
+                    state.last_modified = last_modified;
+                    return Err(error);
+                }
+            }
+            Ok(json!({}))
+        })
+        .await
 }
 
 pub async fn list_queue_tags(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
@@ -2283,7 +2363,7 @@ pub async fn add_permission(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError>
             "Actions contains an unsupported SQS action".into(),
         ));
     }
-    let mut state = q.state.lock().await;
+    ctx.store.with_queue_state(&q, move |store, q, state| {
     let original = state.attributes.clone();
     let last_modified = state.last_modified;
     let mut policy = state
@@ -2323,61 +2403,67 @@ pub async fn add_permission(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError>
     }));
     state.attributes.insert("Policy".into(), policy.to_string());
     state.touch();
-    if let Some(db) = ctx.store.persistence() {
-        if let Err(error) = db.save_queue(&q, &state) {
+    if let Some(db) = store.persistence() {
+        if let Err(error) = db.save_queue(q, state) {
             state.attributes = original;
             state.last_modified = last_modified;
             return Err(error);
         }
     }
     Ok(json!({}))
+    }).await
 }
 
 pub async fn remove_permission(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
     let label = str_field(v, "Label")
-        .ok_or_else(|| SqsError::InvalidParameterValue("Label is required".into()))?;
-    let mut state = q.state.lock().await;
-    let original = state.attributes.clone();
-    let last_modified = state.last_modified;
-    let raw =
-        state.attributes.get("Policy").cloned().ok_or_else(|| {
-            SqsError::InvalidParameterValue(format!("permission {label} not found"))
-        })?;
-    let mut policy = serde_json::from_str::<Value>(&raw)
-        .map_err(|_| SqsError::InvalidAttributeValue("malformed stored Policy".into()))?;
-    if policy.get("Statement").is_some_and(Value::is_object) {
-        let statement = policy
-            .get_mut("Statement")
-            .map(Value::take)
-            .expect("Statement was present");
-        policy["Statement"] = Value::Array(vec![statement]);
-    }
-    let statements = policy
-        .get_mut("Statement")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| SqsError::InvalidAttributeValue("malformed stored Policy".into()))?;
-    let previous_len = statements.len();
-    statements.retain(|statement| statement.get("Sid").and_then(Value::as_str) != Some(label));
-    if statements.len() == previous_len {
-        return Err(SqsError::InvalidParameterValue(format!(
-            "permission {label} not found"
-        )));
-    }
-    if statements.is_empty() {
-        state.attributes.remove("Policy");
-    } else {
-        state.attributes.insert("Policy".into(), policy.to_string());
-    }
-    state.touch();
-    if let Some(db) = ctx.store.persistence() {
-        if let Err(error) = db.save_queue(&q, &state) {
-            state.attributes = original;
-            state.last_modified = last_modified;
-            return Err(error);
-        }
-    }
-    Ok(json!({}))
+        .ok_or_else(|| SqsError::InvalidParameterValue("Label is required".into()))?
+        .to_owned();
+    ctx.store
+        .with_queue_state(&q, move |store, q, state| {
+            let original = state.attributes.clone();
+            let last_modified = state.last_modified;
+            let raw = state.attributes.get("Policy").cloned().ok_or_else(|| {
+                SqsError::InvalidParameterValue(format!("permission {label} not found"))
+            })?;
+            let mut policy = serde_json::from_str::<Value>(&raw)
+                .map_err(|_| SqsError::InvalidAttributeValue("malformed stored Policy".into()))?;
+            if policy.get("Statement").is_some_and(Value::is_object) {
+                let statement = policy
+                    .get_mut("Statement")
+                    .map(Value::take)
+                    .expect("Statement was present");
+                policy["Statement"] = Value::Array(vec![statement]);
+            }
+            let statements = policy
+                .get_mut("Statement")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| SqsError::InvalidAttributeValue("malformed stored Policy".into()))?;
+            let previous_len = statements.len();
+            statements.retain(|statement| {
+                statement.get("Sid").and_then(Value::as_str) != Some(label.as_str())
+            });
+            if statements.len() == previous_len {
+                return Err(SqsError::InvalidParameterValue(format!(
+                    "permission {label} not found"
+                )));
+            }
+            if statements.is_empty() {
+                state.attributes.remove("Policy");
+            } else {
+                state.attributes.insert("Policy".into(), policy.to_string());
+            }
+            state.touch();
+            if let Some(db) = store.persistence() {
+                if let Err(error) = db.save_queue(q, state) {
+                    state.attributes = original;
+                    state.last_modified = last_modified;
+                    return Err(error);
+                }
+            }
+            Ok(json!({}))
+        })
+        .await
 }
 
 // ============================ redrive / move tasks =============================

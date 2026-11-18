@@ -979,6 +979,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    mod state_worker_tests {
+        include!("service/state_worker_tests.rs");
+    }
+
     mod redrive_writer_tests {
         include!("service/redrive_writer_tests.rs");
     }

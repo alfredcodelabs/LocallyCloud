@@ -315,10 +315,34 @@ impl schedule::Clock for RecordingClock {
     }
 }
 
-async fn queue_message_count(sqs: &Arc<dyn NativeHandler>, queue: &str) -> usize {
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+async fn queue_message_count(sqs: &Arc<dyn NativeHandler>, queue: &str, minimum: usize) -> usize {
+    // Delivery may yield to another executor (for example SQS persistence workers).
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let attributes = call_ok(
+                sqs,
+                sqs_request(
+                    "GetQueueAttributes",
+                    json!({
+                        "QueueUrl":format!("https://sqs.{REGION}.amazonaws.com/{ACCOUNT}/{queue}"),
+                        "AttributeNames":["ApproximateNumberOfMessages"]
+                    }),
+                ),
+            )
+            .await;
+            let available = attributes["Attributes"]["ApproximateNumberOfMessages"]
+                .as_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            if available >= minimum {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("scheduled messages did not reach SQS");
     let received = call_ok(
         sqs,
         sqs_request(
@@ -767,7 +791,7 @@ proptest! {
                     "RoleArn":format!("arn:aws:iam::{ACCOUNT}:role/scheduler")
                 }
             }))).await;
-            prop_assert_eq!(queue_message_count(&sqs, "one-time").await, 1);
+            prop_assert_eq!(queue_message_count(&sqs, "one-time", 1).await, 1);
             let sleeps = clock.sleeps.lock().unwrap().clone();
             prop_assert_eq!(sleeps.as_slice(), &[expected_fire]);
             prop_assert!(expected_fire >= scheduled);
@@ -792,7 +816,7 @@ proptest! {
                     "RoleArn":format!("arn:aws:iam::{ACCOUNT}:role/scheduler")
                 }
             }))).await;
-            prop_assert_eq!(queue_message_count(&sqs, "recurring").await, occurrences);
+            prop_assert_eq!(queue_message_count(&sqs, "recurring", occurrences).await, occurrences);
             let sleeps = clock.sleeps.lock().unwrap().clone();
             prop_assert_eq!(sleeps.len(), occurrences);
             for (index, actual) in sleeps.iter().enumerate() {

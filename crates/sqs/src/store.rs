@@ -236,6 +236,33 @@ impl SqsStore {
         self.lifecycle.clone().write_owned().await
     }
 
+    /// Keep queue identity, its lifecycle lease and the commit on the same worker.
+    /// Dropping the request cannot interrupt persistence or its in-memory publication.
+    pub(crate) async fn with_queue_state<T: Send + 'static>(
+        self: &Arc<Self>,
+        queue: &Arc<GuardedQueue>,
+        operation: impl FnOnce(&SqsStore, &GuardedQueue, &mut QueueState) -> Result<T, SqsError>
+            + Send
+            + 'static,
+    ) -> Result<T, SqsError> {
+        let lifecycle = self.lifecycle_read().await;
+        let store = self.clone();
+        let queue = queue.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lifecycle = lifecycle;
+            if !store
+                .get(&queue.arn)
+                .is_some_and(|current| Arc::ptr_eq(&current, &queue))
+            {
+                return Err(SqsError::QueueDoesNotExist);
+            }
+            let mut state = queue.state.blocking_lock();
+            operation(&store, &queue, &mut state)
+        })
+        .await
+        .map_err(|_| SqsError::StorageUnavailable)?
+    }
+
     /// Atomically create a queue without ever replacing an existing queue or its state.
     pub fn insert_if_absent(
         &self,

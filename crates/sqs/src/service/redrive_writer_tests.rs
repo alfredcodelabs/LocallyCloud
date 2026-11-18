@@ -1,6 +1,6 @@
 use super::*;
 
-async fn hold_writer(
+pub(super) async fn hold_writer(
     db: Arc<StateDb>,
 ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let (ready_send, ready_receive) = tokio::sync::oneshot::channel();
