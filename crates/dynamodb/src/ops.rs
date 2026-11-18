@@ -1583,15 +1583,20 @@ pub async fn sweep_expired(store: &TableStore) {
 
 /// Periodic maintenance pass: reap TTL and forward queued Kinesis records through the same
 /// Core dispatcher used by external requests. Failed/unavailable deliveries remain queued.
-pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry>) {
-    let _gate = store.operation_gate.lock().await;
-    if store.has_uncommitted() && store.persist().await.is_err() {
-        error!(
-            service = "dynamodb",
-            cause_code = "state_commit_failed",
-            "DynamoDB prior write could not be committed"
-        );
-        return;
+pub async fn run_maintenance(store: &Arc<TableStore>, registry: &Weak<ServiceRegistry>) {
+    let mut gate = store.operation_gate.clone().lock_owned().await;
+    if store.has_uncommitted() {
+        gate = match store.persist_locked(gate).await {
+            Ok(gate) => gate,
+            Err(_) => {
+                error!(
+                    service = "dynamodb",
+                    cause_code = "state_commit_failed",
+                    "DynamoDB prior write could not be committed"
+                );
+                return;
+            }
+        };
     }
     store.mark_uncommitted();
     store.purge_expired_txn_tokens();
@@ -1618,7 +1623,7 @@ pub async fn run_maintenance(store: &TableStore, registry: &Weak<ServiceRegistry
     }
     changed |= store.has_dirty_items().await;
     if changed {
-        if store.persist().await.is_err() {
+        if store.persist_locked(gate).await.is_err() {
             error!(
                 service = "dynamodb",
                 cause_code = "maintenance_persistence_failed"

@@ -191,6 +191,12 @@ pub enum InsertResult {
     Existing(Arc<GuardedQueue>),
 }
 
+enum MoveTaskUpdate {
+    Moved,
+    Finish(String),
+    Cancel,
+}
+
 /// Region/account-scoped queue store.
 #[derive(Default)]
 pub struct SqsStore {
@@ -198,6 +204,7 @@ pub struct SqsStore {
     recently_deleted: DashMap<Key, Instant>,
     move_tasks: DashMap<String, MoveTask>,
     lifecycle: Arc<RwLock<()>>,
+    move_task_gate: Arc<Mutex<()>>,
     persistence: Option<SqsPersistence>,
 }
 
@@ -332,6 +339,10 @@ impl SqsStore {
         self.queues.iter().map(|e| e.value().clone()).collect()
     }
 
+    pub(crate) async fn move_task_write(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.move_task_gate.clone().lock_owned().await
+    }
+
     pub fn insert_move_task(&self, task: MoveTask) -> Result<(), SqsError> {
         if let Some(db) = self.persistence() {
             db.save_task(&task)?;
@@ -356,31 +367,54 @@ impl SqsStore {
         self.move_tasks.get(handle).map(|task| task.status.clone())
     }
 
-    pub fn record_message_moved(&self, handle: &str) -> Result<bool, SqsError> {
-        let Some(mut task) = self.move_tasks.get_mut(handle) else {
-            return Ok(false);
-        };
-        let mut updated = task.clone();
-        updated.messages_moved += 1;
-        if let Some(db) = self.persistence() {
-            db.save_task(&updated)?;
-        }
-        *task = updated;
-        Ok(task.status == "RUNNING")
+    pub async fn record_message_moved(self: &Arc<Self>, handle: &str) -> Result<bool, SqsError> {
+        Ok(self
+            .update_move_task(handle, MoveTaskUpdate::Moved)
+            .await?
+            .is_some_and(|task| task.status == "RUNNING"))
     }
 
-    pub fn finish_move_task(&self, handle: &str, status: &str) -> Result<(), SqsError> {
-        if let Some(mut task) = self.move_tasks.get_mut(handle) {
-            if task.status == "RUNNING" {
-                let mut updated = task.clone();
-                updated.status = status.to_string();
-                if let Some(db) = self.persistence() {
-                    db.save_task(&updated)?;
-                }
-                *task = updated;
+    pub async fn finish_move_task(
+        self: &Arc<Self>,
+        handle: &str,
+        status: &str,
+    ) -> Result<(), SqsError> {
+        self.update_move_task(handle, MoveTaskUpdate::Finish(status.into()))
+            .await
+            .map(drop)
+    }
+
+    async fn update_move_task(
+        self: &Arc<Self>,
+        handle: &str,
+        update: MoveTaskUpdate,
+    ) -> Result<Option<MoveTask>, SqsError> {
+        let gate = self.move_task_write().await;
+        let store = self.clone();
+        let handle = handle.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let Some(mut task) = store
+                .move_tasks
+                .get(&handle)
+                .map(|entry| entry.value().clone())
+            else {
+                return Ok(None);
+            };
+            match (update, task.status.as_str()) {
+                (MoveTaskUpdate::Moved, _) => task.messages_moved += 1,
+                (MoveTaskUpdate::Finish(status), "RUNNING") => task.status = status,
+                (MoveTaskUpdate::Cancel, "RUNNING") => task.status = "CANCELLED".into(),
+                (MoveTaskUpdate::Finish(_) | MoveTaskUpdate::Cancel, _) => return Ok(None),
             }
-        }
-        Ok(())
+            if let Some(db) = store.persistence() {
+                db.save_task(&task)?;
+            }
+            store.move_tasks.insert(handle, task.clone());
+            Ok(Some(task))
+        })
+        .await
+        .map_err(|_| SqsError::StorageUnavailable)?
     }
 
     pub fn list_move_tasks(&self, source_arn: &str) -> Vec<MoveTask> {
@@ -395,20 +429,11 @@ impl SqsStore {
     }
 
     /// Cancel a running task. Missing or terminal tasks are rejected.
-    pub fn cancel_move_task(&self, handle: &str) -> Result<Option<u64>, SqsError> {
-        let Some(mut task) = self.move_tasks.get_mut(handle) else {
-            return Ok(None);
-        };
-        if task.status != "RUNNING" {
-            return Ok(None);
-        }
-        let mut updated = task.clone();
-        updated.status = "CANCELLED".to_string();
-        if let Some(db) = self.persistence() {
-            db.save_task(&updated)?;
-        }
-        *task = updated;
-        Ok(Some(task.messages_moved))
+    pub async fn cancel_move_task(self: &Arc<Self>, handle: &str) -> Result<Option<u64>, SqsError> {
+        Ok(self
+            .update_move_task(handle, MoveTaskUpdate::Cancel)
+            .await?
+            .map(|task| task.messages_moved))
     }
 }
 

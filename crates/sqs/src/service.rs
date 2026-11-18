@@ -979,6 +979,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    mod redrive_writer_tests {
+        include!("service/redrive_writer_tests.rs");
+    }
+
     struct StrictQueueFixture {
         _registry: Arc<ServiceRegistry>,
         handler: SqsHandler,

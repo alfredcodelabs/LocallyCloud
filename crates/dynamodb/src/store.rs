@@ -510,7 +510,7 @@ pub struct TableStore {
     ttl_deadlines: DashMap<ScopedKey, f64>,
     txn_tokens: DashMap<TxnTokenKey, Arc<Mutex<Option<TxnOutcome>>>>,
     pub replica_topology: Mutex<()>,
-    pub operation_gate: Mutex<()>,
+    pub operation_gate: Arc<Mutex<()>>,
     pub(crate) maintenance_changed: Arc<Notify>,
     pub(crate) capacity: crate::capacity::CapacityModel,
     uncommitted: AtomicBool,
@@ -828,8 +828,28 @@ impl TableStore {
     }
 
     /// Commit changed items and metadata before the service acknowledges a write.
-    /// Callers serialize mutations with operation_gate, including cancellation recovery.
-    pub async fn persist(&self) -> Result<(), DdbError> {
+    /// Acquire the operation gate before handing the commit to a blocking worker.
+    pub async fn persist(self: &Arc<Self>) -> Result<(), DdbError> {
+        let gate = self.operation_gate.clone().lock_owned().await;
+        self.persist_locked(gate).await.map(drop)
+    }
+
+    /// The worker owns the operation gate through commit and bookkeeping, even if
+    /// the caller drops its future while SQLite waits for a writer.
+    pub(crate) async fn persist_locked(
+        self: &Arc<Self>,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, DdbError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.persist_blocking()?;
+            Ok(gate)
+        })
+        .await
+        .map_err(|_| DdbError::Internal("DynamoDB persistence task failed".into()))?
+    }
+
+    fn persist_blocking(&self) -> Result<(), DdbError> {
         let pending = self.pending_keys();
         let entries: Vec<_> = pending
             .iter()
@@ -841,7 +861,7 @@ impl TableStore {
             .collect();
         let mut locked = Vec::with_capacity(entries.len());
         for ((account, region, _), table) in &entries {
-            locked.push((account, region, table.data.write().await));
+            locked.push((account, region, table.data.blocking_write()));
         }
         let Some(connection) = &self.connection else {
             for (account, region, table) in &mut locked {
@@ -1312,7 +1332,7 @@ mod tests {
             enabled: true,
             view_type: "NEW_AND_OLD_IMAGES".into(),
         });
-        let store = TableStore::with_state(state.clone()).unwrap();
+        let store = Arc::new(TableStore::with_state(state.clone()).unwrap());
         store.create("0", "us-east-1", data(def)).unwrap();
         let table = store.get("0", "us-east-1", "events").unwrap();
         let mut item = Item::new();
@@ -1328,7 +1348,7 @@ mod tests {
         store.persist().await.unwrap();
         drop(store);
 
-        let store = TableStore::with_state(state.clone()).unwrap();
+        let store = Arc::new(TableStore::with_state(state.clone()).unwrap());
         let table = store.get("0", "us-east-1", "events").unwrap();
         {
             let guard = table.read().await;
@@ -1360,7 +1380,7 @@ mod tests {
                 .as_nanos()
         ));
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
-        let store = TableStore::with_state(state.clone()).unwrap();
+        let store = Arc::new(TableStore::with_state(state.clone()).unwrap());
         store
             .create("0", "us-east-1", data(simple_def("tbl")))
             .unwrap();
@@ -1402,7 +1422,7 @@ mod tests {
             .unwrap();
         store.persist().await.unwrap();
         drop(store);
-        let reopened = TableStore::with_state(state.clone()).unwrap();
+        let reopened = Arc::new(TableStore::with_state(state.clone()).unwrap());
         assert!(reopened
             .get("0", "us-east-1", "tbl")
             .unwrap()
@@ -1442,7 +1462,7 @@ mod tests {
     async fn persistence_does_not_lock_or_update_unrelated_tables() {
         let root = std::env::temp_dir().join(format!("ddb-incremental-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
-        let store = TableStore::with_state(state.clone()).unwrap();
+        let store = Arc::new(TableStore::with_state(state.clone()).unwrap());
         for name in ["alpha", "bravo"] {
             store
                 .create("0", "us-east-1", data(simple_def(name)))
@@ -1484,7 +1504,7 @@ mod tests {
     async fn failed_multitable_commit_preserves_candidates_for_retry_and_delete() {
         let root = std::env::temp_dir().join(format!("ddb-delta-retry-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
-        let store = TableStore::with_state(state.clone()).unwrap();
+        let store = Arc::new(TableStore::with_state(state.clone()).unwrap());
         for name in ["alpha", "bravo", "removed"] {
             store
                 .create("0", "us-east-1", data(simple_def(name)))
@@ -1566,7 +1586,7 @@ mod tests {
     async fn maintenance_deadlines_follow_commits_restore_and_token_expiry() {
         let root = std::env::temp_dir().join(format!("ddb-maintenance-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
-        let store = TableStore::with_state(state.clone()).unwrap();
+        let store = Arc::new(TableStore::with_state(state.clone()).unwrap());
         store
             .create("0", "us-east-1", data(simple_def("plain")))
             .unwrap();
@@ -1586,7 +1606,7 @@ mod tests {
         // An already expired item is due now, not on the 100 ms retry cadence.
         assert!(store.maintenance_deadline(last).unwrap() <= tokio::time::Instant::now());
         drop(store);
-        let store = TableStore::with_state(state).unwrap();
+        let store = Arc::new(TableStore::with_state(state).unwrap());
         assert!(store.maintenance_deadline(last).is_some());
         store
             .get("0", "us-east-1", "expires")
@@ -1618,7 +1638,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_deadline_waits_for_the_earliest_expiry_and_is_capped() {
-        let store = TableStore::new();
+        let store = Arc::new(TableStore::new());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1690,7 +1710,7 @@ mod tests {
 
     #[tokio::test]
     async fn huge_ttl_values_do_not_overflow_the_maintenance_deadline() {
-        let store = TableStore::new();
+        let store = Arc::new(TableStore::new());
         let mut ttl = data(simple_def("expires"));
         ttl.ttl_attribute = Some("exp".into());
         let mut item = Item::new();
@@ -1719,7 +1739,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_memory_mutation_keeps_maintenance_scheduled() {
-        let store = TableStore::new();
+        let store = Arc::new(TableStore::new());
         let mut ttl = data(simple_def("expires"));
         ttl.ttl_attribute = Some("exp".into());
         let mut item = Item::new();

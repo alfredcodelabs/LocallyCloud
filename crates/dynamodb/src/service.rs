@@ -409,12 +409,15 @@ impl NativeHandler for DynamoHandler {
         if let Err(error) = authorize(&self.registry, &request, &op, &body) {
             return error.into_response(&request.request_id);
         }
-        let _gate = self.store.operation_gate.lock().await;
-        if self.store.has_uncommitted() {
-            if let Err(err) = self.store.persist().await {
-                return err.into_response(&request.request_id);
+        let gate = self.store.operation_gate.clone().lock_owned().await;
+        let gate = if self.store.has_uncommitted() {
+            match self.store.persist_locked(gate).await {
+                Ok(gate) => gate,
+                Err(err) => return err.into_response(&request.request_id),
             }
-        }
+        } else {
+            gate
+        };
         let read_only = matches!(
             op.as_str(),
             "DescribeTable"
@@ -444,7 +447,7 @@ impl NativeHandler for DynamoHandler {
             .dispatch(&op, &context(&self.store, &request), &body)
             .await;
         if !read_only || self.store.has_dirty_items().await {
-            if let Err(err) = self.store.persist().await {
+            if let Err(err) = self.store.persist_locked(gate).await {
                 return err.into_response(&request.request_id);
             }
         } else if may_mutate {
@@ -499,12 +502,16 @@ impl NativeHandler for StreamsHandler {
         if let Err(error) = authorize(&self.registry, &request, &op, &authorization_body) {
             return error.into_response(&request.request_id);
         }
-        let _gate = self.store.operation_gate.lock().await;
-        if self.store.has_uncommitted() {
-            if let Err(err) = self.store.persist().await {
-                return err.into_response(&request.request_id);
+        let gate = self.store.operation_gate.clone().lock_owned().await;
+        let gate = if self.store.has_uncommitted() {
+            match self.store.persist_locked(gate).await {
+                Ok(gate) => gate,
+                Err(err) => return err.into_response(&request.request_id),
             }
-        }
+        } else {
+            gate
+        };
+        let _gate = gate;
         let ctx = context(&self.store, &request);
         let result = match op.as_str() {
             "ListStreams" => streams::list_streams(&ctx, &body).await,
@@ -755,6 +762,93 @@ mod tests {
         transaction.rollback().unwrap();
         drop(competing_writer);
         drop(h);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_writer_wait_keeps_runtime_live_and_cancelled_commit_exclusive() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-state")
+            .join(format!("ddb-writer-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let h = Arc::new(DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(db.clone()).unwrap()),
+            Weak::new(),
+        ));
+        h.reaper_started.store(true, Ordering::Release);
+        let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+        assert_eq!(call(&h, "CreateTable", create).await.status(), 200);
+        let (ready_send, ready_receive) = tokio::sync::oneshot::channel();
+        let (release_send, release_receive) = std::sync::mpsc::channel();
+        let writer_db = db.clone();
+        let writer = std::thread::spawn(move || {
+            let mut connection = writer_db.connection().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            ready_send.send(()).unwrap();
+            // The fallback also makes a regression fail instead of hanging the test runtime.
+            let _ = release_receive.recv_timeout(Duration::from_secs(3));
+            transaction.commit().unwrap();
+        });
+        ready_receive.await.unwrap();
+        let put_handler = h.clone();
+        let put = tokio::spawn(async move {
+            call(
+                &put_handler,
+                "PutItem",
+                r#"{"TableName":"tbl","Item":{"id":{"S":"cancelled"}}}"#,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !put.is_finished(),
+            "the timer must run while SQLite still waits"
+        );
+        assert!(h.store.has_uncommitted());
+        put.abort();
+        assert!(put.await.unwrap_err().is_cancelled());
+        let reader = h.clone();
+        let read = tokio::spawn(async move {
+            call_json(
+                &reader,
+                "GetItem",
+                r#"{"TableName":"tbl","Key":{"id":{"S":"cancelled"}}}"#,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !read.is_finished(),
+            "cancelled callers must not release the commit gate"
+        );
+        release_send.send(()).unwrap();
+        tokio::task::spawn_blocking(move || writer.join().unwrap())
+            .await
+            .unwrap();
+        let (status, item) = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(item["Item"]["id"]["S"], "cancelled");
+        assert!(!h.store.has_uncommitted());
+        drop(h);
+        let restored = DynamoHandler::with_store(
+            Arc::new(TableStore::with_state(db.clone()).unwrap()),
+            Weak::new(),
+        );
+        let (status, item) = call_json(
+            &restored,
+            "GetItem",
+            r#"{"TableName":"tbl","Key":{"id":{"S":"cancelled"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(item["Item"]["id"]["S"], "cancelled");
+        drop(restored);
+        drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
 

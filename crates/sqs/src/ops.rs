@@ -813,7 +813,7 @@ pub async fn get_queue_url(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> 
 }
 
 fn expire_messages(
-    ctx: &Ctx<'_>,
+    store: &SqsStore,
     q: &GuardedQueue,
     state: &mut QueueState,
 ) -> Result<(), SqsError> {
@@ -838,7 +838,7 @@ fn expire_messages(
         .filter(|(_, attempt)| attempt.expires_at <= now)
         .map(|(id, _)| id.as_str())
         .collect();
-    if let Some(db) = ctx.store.persistence() {
+    if let Some(db) = store.persistence() {
         if !expired.is_empty() {
             db.delete_messages(q, &expired)?;
         }
@@ -906,7 +906,7 @@ fn computed_attributes(q: &GuardedQueue, state: &QueueState) -> BTreeMap<String,
 pub async fn get_queue_attributes(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
     let q = resolve_queue(ctx, v)?;
     let mut state = q.state.lock().await;
-    expire_messages(ctx, &q, &mut state)?;
+    expire_messages(&ctx.store, &q, &mut state)?;
     let requested: Vec<String> = v
         .get("AttributeNames")
         .and_then(Value::as_array)
@@ -1523,7 +1523,7 @@ pub async fn send_message_batch(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsEr
 /// Move messages whose receive count has reached the redrive threshold to the DLQ before a
 /// receive. The destination and its allow policy are resolved before source mutation.
 async fn redrive_expired(ctx: &Ctx<'_>, q: &Arc<GuardedQueue>) -> Result<(), SqsError> {
-    let _lifecycle = ctx.store.lifecycle_read().await;
+    let lifecycle = ctx.store.lifecycle_read().await;
     let (dlq_arn, max_receive) = {
         let state = q.state.lock().await;
         match parse_redrive_policy(&state)? {
@@ -1559,59 +1559,66 @@ async fn redrive_expired(ctx: &Ctx<'_>, q: &Arc<GuardedQueue>) -> Result<(), Sqs
             "a queue cannot be its own dead-letter queue".into(),
         ));
     }
-    // Hold both queue locks from validation through transfer. Queue ARN order prevents
-    // deadlocks when two queues have opposing redrive policies.
-    let (mut state, mut dlq_state) = if q.arn.to_arn() < dlq.arn.to_arn() {
-        (q.state.lock().await, dlq.state.lock().await)
-    } else {
-        let destination = dlq.state.lock().await;
-        (q.state.lock().await, destination)
-    };
-    if !redrive_allowed(&q.arn, &dlq_state)? {
-        return Err(SqsError::InvalidAttributeValue(
-            "dead-letter queue no longer allows this source queue".into(),
-        ));
-    }
-    expire_messages(ctx, q, &mut state)?;
-    let now = Instant::now();
-    let mut moved = false;
-    loop {
-        let transfer: Vec<Message> = state
-            .messages
-            .iter()
-            .filter(|message| message.is_visible(now) && message.receive_count >= max_receive)
-            .take(128)
-            .map(|message| {
-                let mut message = message.clone();
-                message.enter_queue(now_ms(), q.fifo);
-                message.receive_count = 0;
-                message.first_receive_ms = None;
-                message.receipt_handle = None;
-                message.visible_at = Instant::now();
-                message
-            })
-            .collect();
-        if transfer.is_empty() {
-            break;
+    let store = ctx.store.clone();
+    let q = q.clone();
+    tokio::task::spawn_blocking(move || {
+        let _lifecycle = lifecycle;
+        // Hold both queue locks from validation through transfer. Queue ARN order prevents
+        // deadlocks when two queues have opposing redrive policies.
+        let (mut state, mut dlq_state) = if q.arn.to_arn() < dlq.arn.to_arn() {
+            (q.state.blocking_lock(), dlq.state.blocking_lock())
+        } else {
+            let destination = dlq.state.blocking_lock();
+            (q.state.blocking_lock(), destination)
+        };
+        if !redrive_allowed(&q.arn, &dlq_state)? {
+            return Err(SqsError::InvalidAttributeValue(
+                "dead-letter queue no longer allows this source queue".into(),
+            ));
         }
-        if let Some(db) = ctx.store.persistence() {
-            db.move_messages(q, &dlq, &transfer)?;
+        expire_messages(&store, &q, &mut state)?;
+        let now = Instant::now();
+        let mut moved = false;
+        loop {
+            let transfer: Vec<Message> = state
+                .messages
+                .iter()
+                .filter(|message| message.is_visible(now) && message.receive_count >= max_receive)
+                .take(128)
+                .map(|message| {
+                    let mut message = message.clone();
+                    message.enter_queue(now_ms(), q.fifo);
+                    message.receive_count = 0;
+                    message.first_receive_ms = None;
+                    message.receipt_handle = None;
+                    message.visible_at = Instant::now();
+                    message
+                })
+                .collect();
+            if transfer.is_empty() {
+                break;
+            }
+            if let Some(db) = store.persistence() {
+                db.move_messages(&q, &dlq, &transfer)?;
+            }
+            let ids: HashSet<&str> = transfer.iter().map(|message| message.id.as_str()).collect();
+            state
+                .messages
+                .retain(|message| !ids.contains(message.id.as_str()));
+            for message in transfer {
+                dlq_state.push_message(message);
+            }
+            moved = true;
         }
-        let ids: HashSet<&str> = transfer.iter().map(|message| message.id.as_str()).collect();
-        state
-            .messages
-            .retain(|message| !ids.contains(message.id.as_str()));
-        for message in transfer {
-            dlq_state.push_message(message);
+        drop(state);
+        drop(dlq_state);
+        if moved {
+            dlq.notify.notify_waiters();
         }
-        moved = true;
-    }
-    drop(state);
-    drop(dlq_state);
-    if moved {
-        dlq.notify.notify_waiters();
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|_| SqsError::StorageUnavailable)?
 }
 
 /// Parse the stored `RedrivePolicy`; malformed stored state fails closed.
@@ -1814,7 +1821,7 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
 
     let wait_secs = {
         let mut state = q.state.lock().await;
-        expire_messages(ctx, &q, &mut state)?;
+        expire_messages(&ctx.store, &q, &mut state)?;
         let wait = optional_i64(v, "WaitTimeSeconds")?.unwrap_or_else(|| state.wait_time_seconds());
         if !(0..=MAX_RECEIVE_WAIT_SECONDS).contains(&wait) {
             return Err(SqsError::InvalidParameterValue(format!(
@@ -1840,7 +1847,7 @@ pub async fn receive_message(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError
         redrive_expired(ctx, &q).await?;
         let (selected, next_visibility) = {
             let mut state = q.state.lock().await;
-            expire_messages(ctx, &q, &mut state)?;
+            expire_messages(&ctx.store, &q, &mut state)?;
             let visibility = vis_override.unwrap_or_else(|| state.visibility_timeout());
             let mut selected = select_messages(&mut state, q.fifo, max, visibility);
             if let Some(db) = ctx.store.persistence() {
@@ -2432,8 +2439,9 @@ enum MoveOneResult {
 
 async fn move_one_message(
     ctx: &Ctx<'_>,
-    source: &GuardedQueue,
-    destination: &GuardedQueue,
+    lifecycle: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    source: &Arc<GuardedQueue>,
+    destination: &Arc<GuardedQueue>,
 ) -> MoveOneResult {
     // KMS calls must happen outside both queue locks. If the selected message or
     // either queue key changes during preparation, retry on the next worker tick.
@@ -2453,10 +2461,25 @@ async fn move_one_message(
         };
         (message.clone(), queue_key_id(&state))
     };
-    let snapshot = if let Some(db) = ctx.store.persistence() {
-        match db.hydrate_message(source, &snapshot) {
+    let snapshot = if ctx.store.persistence().is_some() {
+        let store = ctx.store.clone();
+        let source = source.clone();
+        let lifecycle = lifecycle.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _lifecycle = lifecycle;
+            match store.persistence() {
+                Some(db) => db.hydrate_message(&source, &snapshot),
+                None => Ok(snapshot),
+            }
+        })
+        .await
+        .unwrap_or(Err(SqsError::StorageUnavailable))
+        {
             Ok(message) => message,
-            Err(_) => return MoveOneResult::Retryable,
+            Err(error) => {
+                error.log(ctx.request_id, Some("MoveMessages"));
+                return MoveOneResult::Retryable;
+            }
         }
     } else {
         snapshot
@@ -2488,58 +2511,72 @@ async fn move_one_message(
         None => None,
     };
 
-    let (mut source_state, mut destination_state) =
-        if source.arn.to_arn() < destination.arn.to_arn() {
-            (source.state.lock().await, destination.state.lock().await)
-        } else {
-            let destination_state = destination.state.lock().await;
-            (source.state.lock().await, destination_state)
-        };
-    if queue_key_id(&source_state) != source_key
-        || queue_key_id(&destination_state) != destination_key
-    {
-        return MoveOneResult::Waiting;
-    }
-    if expire_messages(ctx, source, &mut source_state).is_err() {
-        return MoveOneResult::Retryable;
-    }
-    let Some(index) = source_state.messages.iter().position(|message| {
-        message.id == snapshot.id
-            && message.receipt_handle == snapshot.receipt_handle
-            && message.receive_count == snapshot.receive_count
-            && message.is_visible(Instant::now())
-    }) else {
-        return MoveOneResult::Waiting;
-    };
-    let mut message = source_state.messages[index].clone();
-    message.body = if encrypted.is_some() {
-        String::new()
-    } else {
-        plaintext
-    };
-    message.encrypted_body = encrypted;
-    message.body_on_disk = false;
-    message.receipt_handle = None;
-    message.receive_count = 0;
-    message.first_receive_ms = None;
-    message.visible_at = Instant::now();
-    // Operator redrive is a new enqueue, unlike automatic Standard DLQ transfer.
-    message.enter_queue(now_ms(), true);
-    if let Some(db) = ctx.store.persistence() {
-        if db
-            .move_messages(source, destination, std::slice::from_ref(&message))
-            .is_err()
+    let store = ctx.store.clone();
+    let source = source.clone();
+    let destination = destination.clone();
+    tokio::task::spawn_blocking(move || {
+        let _lifecycle = lifecycle;
+        let (mut source_state, mut destination_state) =
+            if source.arn.to_arn() < destination.arn.to_arn() {
+                (
+                    source.state.blocking_lock(),
+                    destination.state.blocking_lock(),
+                )
+            } else {
+                let destination_state = destination.state.blocking_lock();
+                (source.state.blocking_lock(), destination_state)
+            };
+        if queue_key_id(&source_state) != source_key
+            || queue_key_id(&destination_state) != destination_key
         {
+            return MoveOneResult::Waiting;
+        }
+        if expire_messages(&store, &source, &mut source_state).is_err() {
             return MoveOneResult::Retryable;
         }
-        message.offload_body();
-    }
-    let _ = source_state.messages.remove(index);
-    destination_state.push_message(message);
-    drop(source_state);
-    drop(destination_state);
-    destination.notify.notify_waiters();
-    MoveOneResult::Moved
+        let Some(index) = source_state.messages.iter().position(|message| {
+            message.id == snapshot.id
+                && message.receipt_handle == snapshot.receipt_handle
+                && message.receive_count == snapshot.receive_count
+                && message.is_visible(Instant::now())
+        }) else {
+            return MoveOneResult::Waiting;
+        };
+        let mut message = source_state.messages[index].clone();
+        message.body = if encrypted.is_some() {
+            String::new()
+        } else {
+            plaintext
+        };
+        message.encrypted_body = encrypted;
+        message.body_on_disk = false;
+        message.receipt_handle = None;
+        message.receive_count = 0;
+        message.first_receive_ms = None;
+        message.visible_at = Instant::now();
+        // Operator redrive is a new enqueue, unlike automatic Standard DLQ transfer.
+        message.enter_queue(now_ms(), true);
+        if let Some(db) = store.persistence() {
+            if db
+                .move_messages(&source, &destination, std::slice::from_ref(&message))
+                .is_err()
+            {
+                return MoveOneResult::Retryable;
+            }
+            message.offload_body();
+        }
+        let _ = source_state.messages.remove(index);
+        destination_state.push_message(message);
+        drop(source_state);
+        drop(destination_state);
+        destination.notify.notify_waiters();
+        MoveOneResult::Moved
+    })
+    .await
+    .unwrap_or_else(|_| {
+        SqsError::StorageUnavailable.log(ctx.request_id, Some("MoveMessages"));
+        MoveOneResult::Retryable
+    })
 }
 
 pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
@@ -2555,7 +2592,7 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
         ));
     }
     let rate = bounded_i64(v, "MaxNumberOfMessagesPerSecond", 500, 1, 500)? as u64;
-    let lifecycle = ctx.store.lifecycle_read().await;
+    let lifecycle = Arc::new(ctx.store.lifecycle_read().await);
     let source = ctx.store.get(&source_key).ok_or_else(|| {
         SqsError::ResourceNotFound(format!("source queue {source_arn} does not exist"))
     })?;
@@ -2620,23 +2657,7 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
         let probe = encrypt_body(ctx, &destination.arn.to_arn(), key, "").await?;
         decrypt_body(ctx, &probe).await?;
     }
-    let messages_to_move = {
-        let mut state = source.state.lock().await;
-        expire_messages(ctx, &source, &mut state)?;
-        state.messages.len() as u64
-    };
     let handle = b64().encode(format!("{source_arn}:{}", Uuid::new_v4()));
-    ctx.store.insert_move_task(crate::store::MoveTask {
-        handle: handle.clone(),
-        source_arn,
-        destination_arn: Some(destination.arn.to_arn()),
-        status: "RUNNING".to_string(),
-        messages_moved: 0,
-        messages_to_move,
-        max_messages_per_second: rate,
-        started_ms: now_ms(),
-    })?;
-
     let store = ctx.store.clone();
     let task_handle = handle.clone();
     let region = ctx.region.to_string();
@@ -2647,61 +2668,89 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
     request.body = bytes::Bytes::new();
     let metrics = ctx.metrics.clone();
     let queue_urls = ctx.queue_urls.clone();
-    tokio::spawn(async move {
-        let _lifecycle = lifecycle;
-        let worker_ctx = Ctx {
-            store: store.clone(),
-            region: &region,
-            account: &account,
-            request_id: &request_id,
-            dispatcher,
-            request: &request,
-            metrics,
-            queue_urls: &queue_urls,
-            trace_header: None,
-        };
-        let interval = Duration::from_secs_f64(1.0 / rate as f64);
-        let mut retry_delay = Duration::from_millis(100);
-        loop {
-            if store.move_task_status(&task_handle).as_deref() != Some("RUNNING") {
-                return;
-            }
-            match move_one_message(&worker_ctx, &source, &destination).await {
-                MoveOneResult::Moved => {
-                    retry_delay = Duration::from_millis(100);
-                    match store.record_message_moved(&task_handle) {
-                        Ok(true) => {}
-                        Ok(false) => return,
-                        Err(error) => {
-                            error.log(&request_id, Some("MoveMessages"));
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(interval).await;
-                }
-                MoveOneResult::Retryable => {
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
-                }
-                MoveOneResult::Blocked => {
-                    if let Err(error) = store.finish_move_task(&task_handle, "FAILED") {
-                        error.log(&request_id, Some("MoveMessages"));
-                    }
-                    return;
-                }
-                MoveOneResult::Waiting => {
-                    tokio::time::sleep(interval.max(Duration::from_millis(100))).await;
-                }
-                MoveOneResult::Empty => {
-                    if let Err(error) = store.finish_move_task(&task_handle, "COMPLETED") {
-                        error.log(&request_id, Some("MoveMessages"));
-                    }
-                    return;
-                }
-            }
+    let task_gate = store.move_task_write().await;
+    tokio::task::spawn_blocking(move || {
+        let _task_gate = task_gate;
+        if store.has_running_move_task(&source_arn) {
+            return Err(SqsError::InvalidParameterValue(
+                "a message move task is already running for this source".into(),
+            ));
         }
-    });
-    Ok(json!({ "TaskHandle": handle }))
+        let messages_to_move = {
+            let mut state = source.state.blocking_lock();
+            expire_messages(&store, &source, &mut state)?;
+            state.messages.len() as u64
+        };
+        store.insert_move_task(crate::store::MoveTask {
+            handle: handle.clone(),
+            source_arn,
+            destination_arn: Some(destination.arn.to_arn()),
+            status: "RUNNING".to_string(),
+            messages_moved: 0,
+            messages_to_move,
+            max_messages_per_second: rate,
+            started_ms: now_ms(),
+        })?;
+
+        tokio::spawn(async move {
+            let worker_ctx = Ctx {
+                store: store.clone(),
+                region: &region,
+                account: &account,
+                request_id: &request_id,
+                dispatcher,
+                request: &request,
+                metrics,
+                queue_urls: &queue_urls,
+                trace_header: None,
+            };
+            let interval = Duration::from_secs_f64(1.0 / rate as f64);
+            let mut retry_delay = Duration::from_millis(100);
+            loop {
+                if store.move_task_status(&task_handle).as_deref() != Some("RUNNING") {
+                    return;
+                }
+                match move_one_message(&worker_ctx, lifecycle.clone(), &source, &destination).await
+                {
+                    MoveOneResult::Moved => {
+                        retry_delay = Duration::from_millis(100);
+                        match store.record_message_moved(&task_handle).await {
+                            Ok(true) => {}
+                            Ok(false) => return,
+                            Err(error) => {
+                                error.log(&request_id, Some("MoveMessages"));
+                                return;
+                            }
+                        }
+                        tokio::time::sleep(interval).await;
+                    }
+                    MoveOneResult::Retryable => {
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
+                    }
+                    MoveOneResult::Blocked => {
+                        if let Err(error) = store.finish_move_task(&task_handle, "FAILED").await {
+                            error.log(&request_id, Some("MoveMessages"));
+                        }
+                        return;
+                    }
+                    MoveOneResult::Waiting => {
+                        tokio::time::sleep(interval.max(Duration::from_millis(100))).await;
+                    }
+                    MoveOneResult::Empty => {
+                        if let Err(error) = store.finish_move_task(&task_handle, "COMPLETED").await
+                        {
+                            error.log(&request_id, Some("MoveMessages"));
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(json!({ "TaskHandle": handle }))
+    })
+    .await
+    .map_err(|_| SqsError::StorageUnavailable)?
 }
 
 pub async fn list_message_move_tasks(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SqsError> {
@@ -2756,7 +2805,7 @@ pub async fn cancel_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value,
             ))
         }
     }
-    let moved = ctx.store.cancel_move_task(handle)?.ok_or_else(|| {
+    let moved = ctx.store.cancel_move_task(handle).await?.ok_or_else(|| {
         SqsError::InvalidParameterValue("the specified task is no longer running".into())
     })?;
     Ok(json!({ "ApproximateNumberOfMessagesMoved": moved }))
