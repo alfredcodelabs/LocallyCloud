@@ -125,6 +125,12 @@ pub fn resolve_with_endpoint(
             return Ok(decide(registry, name, ResolutionSource::HostPath));
         }
     }
+    if input.path.starts_with("/v2/email/") {
+        let name = ServiceName::new("ses");
+        if registry.lookup(&name).is_some() {
+            return Ok(decide(registry, name, ResolutionSource::RestJsonPath));
+        }
+    }
     if lambda_control_plane_path(input.path) {
         let name = ServiceName::new("lambda");
         if registry.lookup(&name).is_some() {
@@ -843,5 +849,34 @@ mod tests {
             body: b"",
         };
         assert_eq!(resolve(&reg, &input), Err(Unresolved));
+    }
+    #[test]
+    fn ses_v2_path_fallback_keeps_credential_scope_priority() {
+        let registry = ServiceRegistry::with_known_services();
+        registry.register_native(
+            ServiceName::new("ses"),
+            ServiceMetadata::new(AwsProtocol::RestJson, None),
+            Arc::new(TestHandler),
+        );
+        let mut input = RouteInput {
+            authorization: None,
+            x_amz_credential: None,
+            x_amz_target: None,
+            host: Some("localhost:4566"),
+            path: "/v2/email/outbound-emails",
+            body: b"{}",
+        };
+        let decision = resolve(&registry, &input).unwrap();
+        assert_eq!(decision.service_name, ServiceName::new("ses"));
+        assert_eq!(decision.disposition, RouteDisposition::HandledNatively);
+        input.authorization =
+            Some("AWS4-HMAC-SHA256 Credential=test/20261118/us-east-1/iam/aws4_request");
+        assert_eq!(
+            resolve(&registry, &input).unwrap().service_name,
+            ServiceName::new("iam")
+        );
+        input.authorization = None;
+        input.path = "/v2/emailish/outbound-emails";
+        assert!(resolve(&registry, &input).is_err());
     }
 }

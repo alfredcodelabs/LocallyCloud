@@ -33,6 +33,7 @@ services = [
     "dep:locallycloud-elbv2",
     "dep:locallycloud-kms",
     "dep:locallycloud-ssm",
+    "dep:locallycloud-ses",
     "dep:locallycloud-secretsmanager",
     "dep:locallycloud-cloudwatch-monitoring",
     "dep:locallycloud-cloudwatch-logs",
@@ -73,6 +74,7 @@ locallycloud-ec2 = { workspace = true, optional = true }
 locallycloud-elbv2 = { workspace = true, optional = true }
 locallycloud-kms = { workspace = true, optional = true }
 locallycloud-ssm = { workspace = true, optional = true }
+locallycloud-ses = { workspace = true, optional = true }
 locallycloud-secretsmanager = { workspace = true, optional = true }
 locallycloud-cloudwatch-monitoring = { workspace = true, optional = true }
 locallycloud-cloudwatch-logs = { workspace = true, optional = true }

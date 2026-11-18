@@ -2256,6 +2256,7 @@ dependencies = [
  "locallycloud-route53",
  "locallycloud-s3",
  "locallycloud-secretsmanager",
+ "locallycloud-ses",
  "locallycloud-sns",
  "locallycloud-sqs",
  "locallycloud-ssm",
@@ -2938,6 +2939,30 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "locallycloud-ses"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "email_address",
+ "form_urlencoded",
+ "http",
+ "locallycloud-core",
+ "locallycloud-state",
+ "percent-encoding",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
  "uuid",
  "zeroize",
 ]

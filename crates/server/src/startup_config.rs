@@ -14,6 +14,7 @@ use locallycloud_eventbridge::EventBridgeConfig;
 use locallycloud_iam_sts::{IamConfig, IamCredentials};
 use locallycloud_lambda::config::{LambdaExecutionConfig, ResolvedLambdaExecutionConfig};
 use locallycloud_s3::{S3Config, S3CredentialSources};
+use locallycloud_ses::{SesConfig, SesCredentials};
 use locallycloud_sqs::SqsConfig;
 use locallycloud_state::StateDb;
 use locallycloud_stepfunctions::StepFunctionsConfig;
@@ -49,6 +50,8 @@ pub struct StartupConfig {
     pub s3: S3Config,
     pub s3_credential_sources: std::sync::Arc<S3CredentialSources>,
     pub sqs: SqsConfig,
+    pub ses: SesConfig,
+    pub ses_credentials: SesCredentials,
     pub dynamodb: DynamoDbConfig,
     pub eventbridge: EventBridgeConfig,
     pub stepfunctions: StepFunctionsConfig,
@@ -118,6 +121,7 @@ struct FileConfig {
     logging: LoggingConfig,
     s3: S3Config,
     sqs: SqsConfig,
+    ses: SesConfig,
     dynamodb: DynamoDbConfig,
     eventbridge: EventBridgeConfig,
     stepfunctions: StepFunctionsConfig,
@@ -196,6 +200,12 @@ impl StartupConfig {
             .stepfunctions
             .resolve_with(get)
             .map_err(StartupError::Invalid)?;
+        let ses = document
+            .ses
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let ses_credentials =
+            SesCredentials::from_lookup(&ses, get).map_err(StartupError::Invalid)?;
         let mut logging = document.logging;
         if let Some(value) = get("RUST_LOG") {
             logging.filter = value.into_string().map_err(|_| invalid("RUST_LOG"))?;
@@ -311,6 +321,8 @@ impl StartupConfig {
             s3,
             s3_credential_sources,
             sqs,
+            ses,
+            ses_credentials,
             dynamodb,
             eventbridge,
             stepfunctions,

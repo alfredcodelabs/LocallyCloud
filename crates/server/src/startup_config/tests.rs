@@ -489,3 +489,42 @@ fn second_batch_invalid_inputs_do_not_become_silent_defaults() {
         assert!(serde_json::from_str::<FileConfig>(document).is_err());
     }
 }
+
+#[test]
+fn ses_uses_shared_file_environment_precedence_and_separate_credentials() {
+    let config = resolve(
+        r#"{"ses":{"provider":"resend","max_concurrency":3}}"#,
+        &[
+            ("LOCALLYCLOUD_SES_PROVIDER", "capture"),
+            ("LOCALLYCLOUD_SES_MAX_CONCURRENCY", "4"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        config.ses.provider,
+        locallycloud_ses::config::Provider::Capture
+    );
+    assert_eq!(config.ses.max_concurrency, 4);
+    assert!(resolve(r#"{"ses":{"provider":"resend"}}"#, &[]).is_err());
+    assert!(resolve(
+        r#"{"ses":{"provider":"capture"}}"#,
+        &[("LOCALLYCLOUD_SES_PROVIDER_API_KEY", "")]
+    )
+    .is_err());
+    for input in [
+        r#"{"ses":{"api_key":"must-stay-out-of-json"}}"#,
+        r#"{"ses":null}"#,
+        r#"{"ses":{"request_timeout_secs":null}}"#,
+    ] {
+        assert!(serde_json::from_str::<FileConfig>(input).is_err());
+    }
+    let result = resolve(
+        r#"{"ses":{"provider":"resend"}}"#,
+        &[(
+            "LOCALLYCLOUD_SES_PROVIDER_API_KEY",
+            "secret\nshould-not-appear",
+        )],
+    );
+    let error = result.err().unwrap().to_string();
+    assert!(!error.contains("should-not-appear"));
+}

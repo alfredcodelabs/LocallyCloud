@@ -220,6 +220,7 @@ impl ServiceRegistry {
             ("lambda", RestJson, None),
             ("sqs", Json10, Some("AmazonSQS")),
             ("sns", Query, None),
+            ("ses", RestJson, None),
             ("iam", Query, None),
             ("sts", Query, None),
             ("cloudformation", Query, None),

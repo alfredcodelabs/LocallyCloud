@@ -786,6 +786,23 @@ async fn main() {
         tracing::error!(%error, "failed to register KMS");
         std::process::exit(4);
     }
+    {
+        let registry = registry.clone();
+        let state = state.clone();
+        let ses_config = startup.ses;
+        let ses_credentials = startup.ses_credentials;
+        let listeners = vec![config.listen_addr];
+        initialize_persistent_service("ses", move || {
+            locallycloud_ses::register_with_state_and_config(
+                &registry,
+                state,
+                ses_config,
+                ses_credentials,
+                &listeners,
+            )
+        })
+        .await;
+    }
     if let Err(error) = locallycloud_ssm::register_with_state(&registry, state.clone()) {
         tracing::error!(%error, "failed to register SSM");
         std::process::exit(4);
