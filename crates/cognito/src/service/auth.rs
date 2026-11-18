@@ -97,9 +97,24 @@ impl CognitoHandler {
         let mailbox = self.mailbox.clone();
         let request = request.clone();
         let input = input.clone();
-        tokio::task::spawn_blocking(move || Self::sign_up_in_pool(&request, &input, cell, mailbox))
+        let prepared = tokio::task::spawn_blocking(move || {
+            Self::sign_up_in_pool(&request, &input, cell, mailbox)
+        })
+        .await
+        .map_err(|_| CognitoError::Internal)??;
+        let registry = self.registry.clone();
+        // Delivery and completion remain owned when the public HTTP caller disconnects.
+        tokio::spawn(async move {
+            let delivered = prepared.deliver(registry).await;
+            tokio::task::spawn_blocking(move || {
+                delivered?;
+                prepared.finish()
+            })
             .await
             .map_err(|_| CognitoError::Internal)?
+        })
+        .await
+        .map_err(|_| CognitoError::Internal)?
     }
 
     #[cfg(test)]
@@ -109,7 +124,9 @@ impl CognitoHandler {
         input: &Map<String, Value>,
     ) -> Result<Value, CognitoError> {
         let cell = self.client_pool(request, string(input, "ClientId")?)?;
-        Self::sign_up_in_pool(request, input, cell, self.mailbox.clone())
+        let prepared = Self::sign_up_in_pool(request, input, cell, self.mailbox.clone())?;
+        prepared.deliver_local()?;
+        prepared.finish()
     }
 
     fn sign_up_in_pool(
@@ -117,7 +134,7 @@ impl CognitoHandler {
         input: &Map<String, Value>,
         cell: Arc<Mutex<Pool>>,
         mailbox: Option<Arc<crate::ConfirmationMailbox>>,
-    ) -> Result<Value, CognitoError> {
+    ) -> Result<email::PreparedSignup, CognitoError> {
         allowed(
             input,
             &["ClientId", "Username", "Password", "UserAttributes"],
@@ -140,11 +157,11 @@ impl CognitoHandler {
         if pool.deleted || !pool.clients.contains_key(client_id) {
             return Err(CognitoError::ResourceNotFound);
         }
-        if pool.users.contains_key(username) {
+        if pool.users.contains_key(username) || pool.pending_signups.contains(username) {
             return Err(CognitoError::UsernameExists);
         }
+        let mut delivery = email::Delivery::None;
         let confirmation = if pool.auto_verify_email {
-            let mailbox = mailbox.as_ref().ok_or(CognitoError::CodeDeliveryFailure)?;
             let email = attributes
                 .get("email")
                 .filter(|v| v.contains('@') && !v.chars().any(char::is_whitespace))
@@ -152,7 +169,20 @@ impl CognitoHandler {
             use rand::Rng;
             let code = format!("{:06}", rand::rngs::OsRng.gen_range(0..1_000_000u32));
             let expires = now()? + 86400;
-            mailbox.deliver(&json!({"AccountId":request.account_id,"Region":request.region,"UserPoolId":pool.id,"ClientId":client_id,"Username":username,"Destination":email,"DeliveryMedium":"EMAIL","ConfirmationCode":code,"ExpiresAt":expires}))?;
+            delivery = if let Some(settings) = &pool.email {
+                email::Delivery::Ses {
+                    settings: settings.clone(),
+                    source: pool.arn.clone(),
+                    account: request.account_id.clone(),
+                    region: request.region.clone(),
+                    payload: settings.message(email, &code),
+                }
+            } else {
+                email::Delivery::Mailbox {
+                    mailbox: mailbox.clone().ok_or(CognitoError::CodeDeliveryFailure)?,
+                    message: json!({"AccountId":request.account_id,"Region":request.region,"UserPoolId":pool.id,"ClientId":client_id,"Username":username,"Destination":email,"DeliveryMedium":"EMAIL","ConfirmationCode":code,"ExpiresAt":expires}),
+                }
+            };
             Some(ConfirmationCode {
                 client_id: client_id.into(),
                 hash: PasswordHash::new(&code),
@@ -168,25 +198,31 @@ impl CognitoHandler {
             json!({"AttributeName":"email","DeliveryMedium":"EMAIL","Destination":format!("{}***@{}",local.chars().next().unwrap_or('*'),domain)})
         });
         let sub = Uuid::new_v4().to_string();
-        pool.users.insert(
-            username.to_owned(),
-            User {
-                username: username.to_owned(),
-                sub: sub.clone(),
-                status: "UNCONFIRMED",
-                enabled: true,
-                password: PasswordHash::new(password),
-                password_generation: opaque_token(),
-                confirmation,
-                attributes,
-                created: now()?,
-            },
-        );
+        let user = User {
+            username: username.to_owned(),
+            sub: sub.clone(),
+            status: "UNCONFIRMED",
+            enabled: true,
+            password: PasswordHash::new(password),
+            password_generation: opaque_token(),
+            confirmation,
+            attributes,
+            created: now()?,
+        };
         let mut result = json!({"UserConfirmed":false,"UserSub":sub});
         if let Some(details) = details {
             result["CodeDeliveryDetails"] = details;
         }
-        Ok(result)
+        pool.pending_signups.insert(username.to_owned());
+        drop(pool);
+        Ok(email::PreparedSignup {
+            cell,
+            username: username.into(),
+            client_id: client_id.into(),
+            user: Some(user),
+            result,
+            delivery,
+        })
     }
 
     pub(super) fn confirm_user(

@@ -92,6 +92,35 @@ pub(crate) fn decode(request: &ServiceRequest) -> Result<Call, Error> {
                 },
             )
         }
+        ("POST", "/v2/email/list-identities") => {
+            let v = json_body(request)?;
+            let limit = v
+                .get("PageSize")
+                .map(|v| v.as_u64().ok_or(Error::BadRequest("Invalid PageSize")))
+                .transpose()?
+                .unwrap_or(100);
+            if !(1..=1000).contains(&limit) {
+                return Err(Error::BadRequest("PageSize must be between 1 and 1000"));
+            }
+            if v.get("Filter")
+                .is_some_and(|f| f.as_object().is_none_or(|f| !f.is_empty()))
+            {
+                return Err(Error::BadRequest("Identity filters are not implemented"));
+            }
+            let after = match v.get("NextToken") {
+                None => String::new(),
+                Some(Value::String(s)) => s.clone(),
+                Some(_) => return Err(Error::BadRequest("Invalid NextToken")),
+            };
+            (
+                "ListEmailIdentities",
+                Operation::List {
+                    after,
+                    limit: limit as usize,
+                    kind: None,
+                },
+            )
+        }
         ("GET", "/v2/email/identities") => {
             let values: BTreeMap<_, _> =
                 form_urlencoded::parse(request.uri.query().unwrap_or("").as_bytes())

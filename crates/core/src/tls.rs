@@ -46,7 +46,7 @@ pub trait TlsIdentityResolver: Send + Sync {
 
 pub fn tls_config(identity: &TlsIdentity) -> io::Result<ServerConfig> {
     let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
-    ServerConfig::builder_with_provider(Arc::new(provider))
+    let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .map_err(io::Error::other)?
         .with_no_client_auth()
@@ -54,7 +54,40 @@ pub fn tls_config(identity: &TlsIdentity) -> io::Result<ServerConfig> {
             vec![CertificateDer::from(identity.certificate_der.clone())],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key_der.to_vec())),
         )
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// HTTP/2 signs the authority as `host`; expose it consistently before routing and IAM.
+pub fn normalize_http2_authority<B>(
+    request: &mut http::Request<B>,
+) -> Result<(), http::StatusCode> {
+    if request.version() != http::Version::HTTP_2 {
+        return Ok(());
+    }
+    let authority = request
+        .uri()
+        .authority()
+        .ok_or(http::StatusCode::BAD_REQUEST)?
+        .as_str()
+        .to_owned();
+    let values = request.headers().get_all(http::header::HOST);
+    if values.iter().count() > 1
+        || values.iter().any(|host| {
+            host.to_str()
+                .map_or(true, |host| !host.eq_ignore_ascii_case(&authority))
+        })
+    {
+        return Err(http::StatusCode::BAD_REQUEST);
+    }
+    if !request.headers().contains_key(http::header::HOST) {
+        request.headers_mut().insert(
+            http::header::HOST,
+            http::HeaderValue::from_str(&authority).map_err(|_| http::StatusCode::BAD_REQUEST)?,
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +284,66 @@ impl AsyncWrite for DomainIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http2_authority_is_normalized_and_conflicting_host_is_rejected() {
+        let mut request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .uri("https://aws.localhost:4566/")
+            .body(())
+            .unwrap();
+        normalize_http2_authority(&mut request).unwrap();
+        assert_eq!(request.headers()[http::header::HOST], "aws.localhost:4566");
+        request.headers_mut().insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("other.localhost"),
+        );
+        assert_eq!(
+            normalize_http2_authority(&mut request),
+            Err(http::StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_listener_accepts_cleartext_http2_sdk_connections() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let app = axum::Router::new().route("/", axum::routing::post(|| async { "h2" }));
+        let server = tokio::spawn(async move {
+            axum::serve(DomainListener::new(tcp, None), app)
+                .await
+                .unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake::<_, _, http_body_util::Empty<bytes::Bytes>>(
+                hyper_util::rt::TokioExecutor::new(),
+                hyper_util::rt::TokioIo::new(stream),
+            )
+            .await
+            .unwrap();
+        let driver = tokio::spawn(async move {
+            connection.await.unwrap();
+        });
+        let response = sender
+            .send_request(
+                http::Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{addr}/"))
+                    .body(http_body_util::Empty::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        use http_body_util::BodyExt;
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "h2"
+        );
+        driver.abort();
+        server.abort();
+    }
 
     #[tokio::test]
     async fn stalled_peers_and_unknown_tls_do_not_block_plain_http() {

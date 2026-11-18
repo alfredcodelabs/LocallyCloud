@@ -248,7 +248,13 @@ impl NativeHandler for CloudTrailService {
             .headers
             .get("x-amz-target")
             .and_then(|value| value.to_str().ok());
-        if target != Some("com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents") {
+        if !matches!(
+            target,
+            Some(
+                "CloudTrail_20131101.LookupEvents"
+                    | "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents"
+            )
+        ) {
             return Error::new(
                 "UnsupportedOperationException",
                 "CloudTrail operation is unavailable",
@@ -412,6 +418,29 @@ mod tests {
             region: region.into(),
             account_id: account.into(),
             request_id: "lookup-id".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn current_and_legacy_sdk_targets_decode_without_rewriting() {
+        let handler = CloudTrailService::default();
+        for target in [
+            "CloudTrail_20131101.LookupEvents",
+            "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents",
+            "CloudTrail_20131101.Unknown",
+        ] {
+            let mut req = request("111111111111", "us-east-1");
+            req.headers.insert("x-amz-target", target.parse().unwrap());
+            req.body = "{}".into();
+            let response = handler.handle(req).await;
+            assert_eq!(
+                response.status().as_u16(),
+                if target.ends_with(".LookupEvents") {
+                    200
+                } else {
+                    400
+                }
+            );
         }
     }
 

@@ -931,10 +931,7 @@ async fn main() {
     let cloudtrail = locallycloud_cloudtrail::CloudTrailService::new();
     registry.register_native(
         ServiceName::new("cloudtrail"),
-        ServiceMetadata::new(
-            AwsProtocol::Json11,
-            Some("com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101"),
-        ),
+        ServiceMetadata::new(AwsProtocol::Json11, Some("CloudTrail_20131101")),
         cloudtrail.clone(),
     );
     registry.set_completion_observer(cloudtrail);

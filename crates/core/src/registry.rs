@@ -245,11 +245,7 @@ impl ServiceRegistry {
             ("ssm", Json11, Some("AmazonSSM")),
             ("glue", Json11, Some("AWSGlue")),
             ("athena", Json11, Some("AmazonAthena")),
-            (
-                "cloudtrail",
-                Json11,
-                Some("com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101"),
-            ),
+            ("cloudtrail", Json11, Some("CloudTrail_20131101")),
             ("xray", RestJson, None),
             ("route53", RestXml, None),
             ("wafv2", Json11, Some("AWSWAF_20190729")),
@@ -572,6 +568,10 @@ impl ServiceRegistry {
     /// Resolve a service by the longest registered `X-Amz-Target` prefix that the target
     /// value begins with.
     pub fn lookup_by_target_prefix(&self, target: &str) -> Option<ServiceName> {
+        let target = target
+            .strip_prefix("com.amazonaws.cloudtrail.v20131101.")
+            .filter(|target| target.starts_with("CloudTrail_20131101."))
+            .unwrap_or(target);
         let mut best: Option<(ServiceName, usize)> = None;
         for entry in self.services.iter() {
             if let Some(prefix) = &entry.value().metadata.target_prefix {
@@ -809,6 +809,20 @@ mod tests {
         assert_eq!(svc, Some(ServiceName::new("dynamodb")));
         let sfn = reg.lookup_by_target_prefix("AWSStepFunctions.StartExecution");
         assert_eq!(sfn, Some(ServiceName::new("states")));
+    }
+
+    #[test]
+    fn cloudtrail_current_and_legacy_targets_share_the_registered_service() {
+        let registry = ServiceRegistry::with_known_services();
+        for target in [
+            "CloudTrail_20131101.LookupEvents",
+            "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents",
+        ] {
+            assert_eq!(
+                registry.lookup_by_target_prefix(target),
+                Some(ServiceName::new("cloudtrail"))
+            );
+        }
     }
 
     #[test]

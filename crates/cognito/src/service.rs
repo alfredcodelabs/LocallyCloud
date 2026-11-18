@@ -14,6 +14,7 @@ use crate::crypto::{opaque_token, PasswordHash, SigningKey};
 use crate::{CognitoError, TARGET_PREFIX};
 
 mod auth;
+mod email;
 
 const MAX_BODY: usize = 128 * 1024;
 const TOKEN_LIFETIME: i64 = 3600;
@@ -52,6 +53,8 @@ struct Pool {
     region: String,
     created: i64,
     auto_verify_email: bool,
+    email: Option<email::EmailSettings>,
+    pending_signups: std::collections::HashSet<String>,
     deleted: bool,
     clients: HashMap<String, AppClient>,
     challenges: HashMap<String, PasswordChallenge>,
@@ -202,7 +205,11 @@ impl CognitoHandler {
         request: &ServiceRequest,
         input: &Map<String, Value>,
     ) -> Result<Value, CognitoError> {
-        allowed(input, &["PoolName", "AutoVerifiedAttributes"])?;
+        allowed(
+            input,
+            &["PoolName", "AutoVerifiedAttributes", "EmailConfiguration"],
+        )?;
+        let email = email::EmailSettings::parse(input.get("EmailConfiguration"), request)?;
         let auto_verify_email = match input.get("AutoVerifiedAttributes") {
             None => false,
             Some(value) => {
@@ -242,6 +249,8 @@ impl CognitoHandler {
             region: request.region.clone(),
             created,
             auto_verify_email,
+            email,
+            pending_signups: Default::default(),
             deleted: false,
             clients: HashMap::new(),
             challenges: HashMap::new(),
@@ -813,14 +822,18 @@ fn issuer(pool: &Pool) -> String {
 }
 
 fn pool_view(pool: &Pool) -> Value {
-    json!({
+    let mut value = json!({
         "Id": pool.id, "Name": pool.name, "Arn": pool.arn,
         "Status": "Enabled", "CreationDate": pool.created,
         "LastModifiedDate": pool.created, "EstimatedNumberOfUsers": pool.users.len(),
         "Policies": {"PasswordPolicy": {"MinimumLength": 8, "RequireUppercase": true, "RequireLowercase": true, "RequireNumbers": true, "RequireSymbols": true}},
         "AutoVerifiedAttributes": if pool.auto_verify_email { vec!["email"] } else { vec![] },
         "LambdaConfig": {}
-    })
+    });
+    if let Some(email) = &pool.email {
+        value["EmailConfiguration"] = email.output();
+    }
+    value
 }
 
 fn client_view(client: &AppClient, pool_id: &str) -> Value {

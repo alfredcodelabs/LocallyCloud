@@ -916,9 +916,12 @@ fn dashboard_ui_request(method: &http::Method, uri: &http::Uri, headers: &http::
 
 async fn tls_domain_handler(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if let Err(status) = crate::tls::normalize_http2_authority(&mut req) {
+        return status.into_response();
+    }
     let connection = req
         .extensions()
         .get::<ConnectInfo<crate::tls::ConnectionInfo>>();

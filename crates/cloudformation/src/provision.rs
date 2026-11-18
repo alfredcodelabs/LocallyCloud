@@ -38,6 +38,7 @@ mod kms_rotation_tests;
 mod monitoring;
 mod s3_configuration;
 mod scheduler;
+mod ses;
 pub(crate) use ec2::validate_network_property_names;
 
 /// How an update that changes a resource's physical identity must handle the old instance.
@@ -79,6 +80,7 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::Glue::Table",
     "AWS::KMS::Key",
     "AWS::KMS::Alias",
+    "AWS::SES::EmailIdentity",
     "AWS::SNS::Topic",
     "AWS::SNS::Subscription",
     "AWS::Events::EventBus",
@@ -262,6 +264,7 @@ impl Provisioner {
             "AWS::Glue::Table" => self.glue_table(logical_id, properties).await,
             "AWS::KMS::Key" => self.kms_key(logical_id, properties).await,
             "AWS::KMS::Alias" => self.kms_alias(logical_id, properties).await,
+            "AWS::SES::EmailIdentity" => self.ses_identity(logical_id, properties).await,
             "AWS::SNS::Topic" => self.sns_topic(logical_id, stack_name, properties).await,
             "AWS::SNS::Subscription" => self.sns_subscription(logical_id, properties).await,
             "AWS::Events::EventBus" => self.events_event_bus(logical_id, properties).await,
@@ -528,6 +531,15 @@ impl Provisioner {
                     properties,
                 )
                 .await
+            }
+            "AWS::SES::EmailIdentity" => {
+                if previous_properties.get("EmailIdentity") != properties.get("EmailIdentity") {
+                    self.ses_identity(logical_id, properties).await
+                } else {
+                    Err(CfnError::ResourceFailed(
+                        "SES identity attribute updates are not implemented".into(),
+                    ))
+                }
             }
             "AWS::SNS::Topic" => {
                 self.update_sns_topic(logical_id, current, previous_properties, properties)
@@ -912,6 +924,7 @@ impl Provisioner {
             "AWS::Glue::Table" => self.delete_glue_table(physical_id, properties).await,
             "AWS::KMS::Key" => self.delete_kms_key(physical_id, properties).await,
             "AWS::KMS::Alias" => self.delete_kms_alias(physical_id).await,
+            "AWS::SES::EmailIdentity" => self.delete_ses_identity(physical_id).await,
             "AWS::SNS::Topic" => self.delete_sns_topic(physical_id).await,
             "AWS::SNS::Subscription" => self.delete_sns_subscription(physical_id).await,
             "AWS::Events::EventBus" => self.delete_events_event_bus(physical_id).await,

@@ -1,6 +1,6 @@
 use locallycloud_core::tls::tls_config;
 pub use locallycloud_core::tls::{
-    ConnectionInfo, DomainListener, TlsIdentity, TlsIdentityResolver,
+    normalize_http2_authority, ConnectionInfo, DomainListener, TlsIdentity, TlsIdentityResolver,
 };
 use std::{io, sync::Arc};
 use zeroize::Zeroizing;

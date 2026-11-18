@@ -131,6 +131,7 @@ impl IamStsState {
             let parts: Vec<_> = source.splitn(6, ':').collect();
             let (expected_service, resource_prefix) = match request.service_principal.as_str() {
                 "states.amazonaws.com" => ("states", "stateMachine:"),
+                "email.cognito-idp.amazonaws.com" => ("cognito-idp", "userpool/"),
                 "events.amazonaws.com" => ("events", "rule/"),
                 "pipes.amazonaws.com" => ("pipes", "pipe/"),
                 "scheduler.amazonaws.com" => ("scheduler", "schedule-group/"),
@@ -2412,6 +2413,40 @@ mod tests {
         };
         assert!(!state.identity_policy_allows(delegated.clone()));
         assert!(state.identity_policy_denies(delegated));
+    }
+
+    #[test]
+    fn cognito_email_role_trust_binds_the_user_pool_account_and_service() {
+        let account = "000000000000";
+        let store = Arc::new(IamStore::new());
+        let role_arn = format!("arn:aws:iam::{account}:role/email");
+        store.create_role(account,crate::model::IamRole {role_name:"email".into(),role_id:"AROATEST".into(),arn:role_arn.clone(),path:"/".into(),create_date:now_iso8601(),assume_role_policy_document:r#"{"Statement":{"Effect":"Allow","Principal":{"Service":"email.cognito-idp.amazonaws.com"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"aws:SourceAccount":"000000000000"}}}}"#.into(),description:None,max_session_duration:3600,tags:Default::default(),attached_policies:vec![],inline_policies:Default::default(),permission_boundary:None});
+        let mut state = IamStsState::new(store, Arc::new(SessionStore::new()));
+        state.mode = EnforcementMode::Strict;
+        let mut request = ServiceRoleAuthorizationRequest {
+            delegated_caller: None,
+            caller_context: Default::default(),
+            source_arn: Some(format!(
+                "arn:aws:cognito-idp:us-east-1:{account}:userpool/us-east-1_test"
+            )),
+            caller: RequestIdentity {
+                account_id: account.into(),
+                access_key_id: None,
+                arn: None,
+            },
+            role_arn,
+            service_principal: "email.cognito-idp.amazonaws.com".into(),
+            action: "ses:SendEmail".into(),
+            resource: format!("arn:aws:ses:us-east-1:{account}:identity/example.com"),
+        };
+        assert_eq!(state.authorize_service_role_trust(request.clone()), Ok(()));
+        request.source_arn =
+            Some("arn:aws:cognito-idp:us-east-1:111111111111:userpool/us-east-1_other".into());
+        assert!(state.authorize_service_role_trust(request.clone()).is_err());
+        request.source_arn = Some(format!(
+            "arn:aws:states:us-east-1:{account}:stateMachine:other"
+        ));
+        assert!(state.authorize_service_role_trust(request).is_err());
     }
 
     #[test]

@@ -190,12 +190,13 @@ fn verify_at(
     if names.is_empty()
         || names.windows(2).any(|pair| pair[0] >= pair[1])
         || names.iter().any(|name| {
-            name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b == b'-' || b.is_ascii_digit())
+            *name != ":authority"
+                && (name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b == b'-' || b.is_ascii_digit()))
         })
-        || !names.contains(&"host")
+        || (!names.contains(&"host") && !names.contains(&":authority"))
         || !names.contains(&"x-amz-date")
         || (headers.contains_key("x-amz-target") && !names.contains(&"x-amz-target"))
     {
@@ -212,6 +213,21 @@ fn verify_at(
     }
     let mut canonical_headers = String::new();
     for name in &names {
+        if *name == ":authority" {
+            let Some(authority) = uri.authority() else {
+                return false;
+            };
+            if headers.get_all(http::header::HOST).iter().any(|host| {
+                host.to_str()
+                    .map_or(true, |host| !host.eq_ignore_ascii_case(authority.as_str()))
+            }) {
+                return false;
+            }
+            canonical_headers.push_str(":authority:");
+            canonical_headers.push_str(authority.as_str());
+            canonical_headers.push('\n');
+            continue;
+        }
         let values = headers.get_all(*name);
         let mut iter = values.iter();
         let Some(first) = iter.next() else {
@@ -445,6 +461,9 @@ mod tests {
     use http::HeaderValue;
 
     fn signed_request(token: Option<&str>) -> (HeaderMap, Vec<u8>) {
+        signed_for_transport(token, false)
+    }
+    fn signed_for_transport(token: Option<&str>, http2: bool) -> (HeaderMap, Vec<u8>) {
         let date_format =
             format_description::parse_borrowed::<3>("[year][month][day]T[hour][minute][second]Z")
                 .unwrap();
@@ -459,15 +478,16 @@ mod tests {
             "x-amz-target",
             HeaderValue::from_static("AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken"),
         );
-        let mut canonical_headers = format!("host:localhost:4566\nx-amz-date:{date}\n");
-        let mut signed_headers = "host;x-amz-date;x-amz-target".to_string();
+        let host_name = if http2 { ":authority" } else { "host" };
+        let mut canonical_headers = format!("{host_name}:localhost:4566\nx-amz-date:{date}\n");
+        let mut signed_headers = format!("{host_name};x-amz-date;x-amz-target");
         if let Some(token) = token {
             headers.insert(
                 "x-amz-security-token",
                 HeaderValue::from_str(token).unwrap(),
             );
             canonical_headers.push_str(&format!("x-amz-security-token:{token}\n"));
-            signed_headers = "host;x-amz-date;x-amz-security-token;x-amz-target".into();
+            signed_headers = format!("{host_name};x-amz-date;x-amz-security-token;x-amz-target");
         }
         canonical_headers
             .push_str("x-amz-target:AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken\n");
@@ -487,6 +507,35 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKID/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
         )).unwrap());
         (headers, body)
+    }
+
+    #[test]
+    fn http2_authority_signatures_bind_the_actual_uri_authority() {
+        for token in [None, Some("fixture-session")] {
+            let (headers, body) = signed_for_transport(token, true);
+            let verify_uri = |uri: &str, headers: &HeaderMap| {
+                verify(
+                    &Method::POST,
+                    &uri.parse().unwrap(),
+                    headers,
+                    &body,
+                    "us-east-1",
+                    "ecr",
+                    |_| {
+                        Some(SigningCredentials {
+                            secret_access_key: "secret".into(),
+                            session_token: token.map(str::to_owned),
+                        })
+                    },
+                )
+            };
+            assert!(verify_uri("http://localhost:4566/", &headers));
+            assert!(!verify_uri("http://other.localhost:4566/", &headers));
+            assert!(!verify_uri("/", &headers));
+            let mut conflict = headers.clone();
+            conflict.insert("host", "other.localhost:4566".parse().unwrap());
+            assert!(!verify_uri("http://localhost:4566/", &conflict));
+        }
     }
 
     fn check(headers: &HeaderMap, body: &[u8], token: Option<&str>) -> bool {

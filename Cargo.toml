@@ -60,12 +60,12 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # HTTP server / routing
-axum = { version = "=0.8.9", features = ["ws"] }
+axum = { version = "=0.8.9", features = ["ws", "http2"] }
 tower-http = { version = "=0.6.11", features = ["trace", "cors"] }
 
 # Low-level HTTP client for the SigV4-preserving reverse proxy (host-header control)
 hyper = { version = "1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server-auto", "tokio"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"

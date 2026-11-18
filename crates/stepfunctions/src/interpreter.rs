@@ -2502,6 +2502,17 @@ impl Interpreter {
                     "unsupported AWS SDK integration {target}"
                 )));
             }
+            ("sesv2", "sendEmail") => {
+                if !matches!(pattern, IntegrationPattern::RequestResponse) {
+                    return Err(AslError::runtime(
+                        "SES sendEmail only supports request-response",
+                    ));
+                }
+                return self
+                    .dispatch_ses(payload)
+                    .await
+                    .map_err(|e| sdk_error("sesv2", e));
+            }
             ("s3", _) => {
                 if !matches!(pattern, IntegrationPattern::RequestResponse) {
                     return Err(AslError::runtime(
@@ -2574,6 +2585,63 @@ impl Interpreter {
             .dispatch_json(canonical, &format!("{prefix}.{operation}"), payload)
             .await;
         result.map_err(|error| sdk_error(canonical, error))
+    }
+
+    async fn dispatch_ses(&self, payload: &Value) -> Result<Value, AslError> {
+        if !self.store.healthy() {
+            return Err(AslError::task_failed(
+                "Step Functions durable state is unavailable",
+            ));
+        }
+        self.authorize_task("ses:SendEmail", "*")?;
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| AslError::task_failed("registry gone"))?;
+        let dispatcher = registry
+            .internal_dispatcher()
+            .ok_or_else(|| AslError::task_failed("internal dispatcher unavailable"))?;
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/{}/ses/aws4_request",
+                self.region
+            ))
+            .map_err(|_| AslError::runtime("Invalid SES region"))?,
+        );
+        IdentityPropagator::attach(
+            &mut headers,
+            &CallerIdentity::AssumedRole {
+                role_arn: self.role_arn.clone(),
+                session_name: "stepfunctions".into(),
+            },
+        );
+        headers.insert(
+            "x-locallycloud-source-arn",
+            HeaderValue::from_str(&self.sm_arn)
+                .map_err(|_| AslError::runtime("Invalid state machine ARN"))?,
+        );
+        headers.insert(
+            "x-locallycloud-source-account",
+            HeaderValue::from_str(&self.account)
+                .map_err(|_| AslError::runtime("Invalid account"))?,
+        );
+        let response = dispatcher
+            .dispatch_scoped(
+                &Method::POST,
+                &"/v2/email/outbound-emails"
+                    .parse()
+                    .map_err(|_| AslError::runtime("Invalid SES path"))?,
+                &headers,
+                Bytes::from(payload.to_string()),
+                &uuid::Uuid::new_v4().to_string(),
+                &self.account,
+                &self.region,
+            )
+            .await;
+        parse_target_response(response, Some("sesv2")).await
     }
 
     async fn dispatch_nested_execution(
@@ -2756,7 +2824,7 @@ impl Interpreter {
         let native_policy_owner = action
             .split_once(':')
             .map(|(service, _)| service)
-            .filter(|service| matches!(*service, "s3" | "sqs" | "lambda" | "kms"))
+            .filter(|service| matches!(*service, "s3" | "sqs" | "lambda" | "kms" | "ses"))
             .is_some_and(|service| {
                 registry
                     .native_handler(&locallycloud_core::registry::ServiceName::new(service))
@@ -3551,6 +3619,7 @@ fn sdk_error(service: &str, mut error: AslError) -> AslError {
         "states" => "Sfn",
         "sqs" => "Sqs",
         "sns" => "Sns",
+        "sesv2" => "SesV2",
         "dynamodb" => "DynamoDb",
         "events" => "EventBridge",
         _ => return error,
@@ -3578,6 +3647,7 @@ fn service_error_prefix(service: &str) -> &str {
         "s3" => "S3",
         "sqs" => "SQS",
         "sns" => "SNS",
+        "sesv2" => "SesV2",
         "events" => "EventBridge",
         "states" => "StepFunctions",
         "athena" => "Athena",

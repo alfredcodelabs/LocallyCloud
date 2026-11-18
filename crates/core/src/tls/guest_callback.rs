@@ -251,10 +251,19 @@ impl GuestCallbackTls {
         .map_err(|_| {
             io::Error::new(io::ErrorKind::TimedOut, "private TLS handshake timed out")
         })??;
-        let app = app.layer(Extension(ConnectInfo(connection)));
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(io), TowerToHyperService::new(app))
-            .with_upgrades()
+        let app = app
+            .layer(Extension(ConnectInfo(connection)))
+            .layer(axum::middleware::from_fn(
+                |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    use axum::response::IntoResponse;
+                    if let Err(status) = super::normalize_http2_authority(&mut request) {
+                        return status.into_response();
+                    }
+                    next.run(request).await
+                },
+            ));
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .serve_connection_with_upgrades(TokioIo::new(io), TowerToHyperService::new(app))
             .await
             .map_err(io::Error::other)
     }

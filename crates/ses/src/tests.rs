@@ -775,3 +775,43 @@ fn query_empty_results_keep_the_sdk_result_wrapper() {
         assert!(xml.contains(&format!("<{action}Result></{action}Result>")));
     }
 }
+
+#[tokio::test]
+async fn current_sdk_list_route_paginates_and_validates_json() {
+    let f = Fixture::new();
+    let h = f.handler(SesConfig::default());
+    for name in ["a.example.com", "b.example.com"] {
+        identity(&h, name).await;
+    }
+    let (status, first) = call(
+        &h,
+        "POST",
+        "/v2/email/list-identities",
+        json!({"PageSize":1}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(first["EmailIdentities"][0]["IdentityName"], "a.example.com");
+    let (status, second) = call(
+        &h,
+        "POST",
+        "/v2/email/list-identities",
+        json!({"PageSize":1,"NextToken":first["NextToken"]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        second["EmailIdentities"][0]["IdentityName"],
+        "b.example.com"
+    );
+    for body in [
+        json!({"PageSize":1001}),
+        json!({"NextToken":5}),
+        json!({"Filter":{"IDENTITY_TYPE":"DOMAIN"}}),
+    ] {
+        assert_eq!(
+            call(&h, "POST", "/v2/email/list-identities", body).await.0,
+            400
+        );
+    }
+}

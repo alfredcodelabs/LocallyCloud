@@ -1697,7 +1697,8 @@ impl CfnHandler {
                     Ok(updated) => {
                         let deferred = (matches!(
                             decl.resource_type.as_str(),
-                            "AWS::EC2::NatGateway"
+                            "AWS::SES::EmailIdentity"
+                                | "AWS::EC2::NatGateway"
                                 | "AWS::EC2::Route"
                                 | "AWS::EC2::VPCGatewayAttachment"
                         ) || crate::provision::is_custom_resource(
