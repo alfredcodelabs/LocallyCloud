@@ -2,6 +2,7 @@
 use crate::error::IamStsError;
 use crate::model::{IamGroup, IamPolicy, IamRole, IamUser, InstanceProfile};
 use crate::persistence::IamPersistence;
+use crate::transaction::ResourceScope;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -32,6 +33,51 @@ pub(crate) struct IamRecords {
     pub policies: BTreeMap<Key, IamPolicy>,
     pub instance_profiles: BTreeMap<Key, InstanceProfile>,
 }
+impl IamRecords {
+    fn select(&self, scope: &ResourceScope) -> Self {
+        fn selected<T: Clone>(map: &BTreeMap<Key, T>, keys: &BTreeSet<Key>) -> BTreeMap<Key, T> {
+            keys.iter()
+                .filter_map(|key| map.get(key).map(|value| (key.clone(), value.clone())))
+                .collect()
+        }
+        Self {
+            bootstrap_initialized: BTreeSet::new(),
+            users: selected(&self.users, &scope.users),
+            groups: selected(&self.groups, &scope.groups),
+            roles: selected(&self.roles, &scope.roles),
+            policies: selected(&self.policies, &scope.policies),
+            instance_profiles: selected(&self.instance_profiles, &scope.instance_profiles),
+        }
+    }
+    fn within(&self, scope: &ResourceScope) -> bool {
+        self.bootstrap_initialized.is_empty()
+            && self.users.keys().all(|key| scope.users.contains(key))
+            && self.groups.keys().all(|key| scope.groups.contains(key))
+            && self.roles.keys().all(|key| scope.roles.contains(key))
+            && self.policies.keys().all(|key| scope.policies.contains(key))
+            && self
+                .instance_profiles
+                .keys()
+                .all(|key| scope.instance_profiles.contains(key))
+    }
+    fn publish(&mut self, scope: ResourceScope, after: Self) {
+        fn publish<T>(map: &mut BTreeMap<Key, T>, keys: BTreeSet<Key>, after: BTreeMap<Key, T>) {
+            for key in keys {
+                map.remove(&key);
+            }
+            map.extend(after);
+        }
+        publish(&mut self.users, scope.users, after.users);
+        publish(&mut self.groups, scope.groups, after.groups);
+        publish(&mut self.roles, scope.roles, after.roles);
+        publish(&mut self.policies, scope.policies, after.policies);
+        publish(
+            &mut self.instance_profiles,
+            scope.instance_profiles,
+            after.instance_profiles,
+        );
+    }
+}
 #[derive(Default)]
 pub struct IamStore {
     records: RwLock<IamRecords>,
@@ -39,6 +85,7 @@ pub struct IamStore {
     mutation: Mutex<()>,
     persistence: Option<Arc<IamPersistence>>,
 }
+#[cfg(test)]
 pub(crate) enum TagTarget {
     User(String),
     Role(String),
@@ -79,33 +126,13 @@ impl IamStore {
         *self.records.write().unwrap() = after;
         Ok(result)
     }
-    pub(crate) fn transact_tags<T>(
+    pub(crate) fn transact_resources<T>(
         &self,
-        account: &str,
-        target: TagTarget,
+        scope: ResourceScope,
         operation: impl FnOnce(&IamStore) -> Result<T, IamStsError>,
     ) -> Result<T, IamStsError> {
         let _mutation = self.mutation.lock().unwrap();
-        let name = match &target {
-            TagTarget::User(name) | TagTarget::Role(name) => name,
-        };
-        let target_key = key(account, name);
-        let mut before = IamRecords::default();
-        {
-            let records = self.records.read().unwrap();
-            match &target {
-                TagTarget::User(_) => {
-                    if let Some(user) = records.users.get(&target_key) {
-                        before.users.insert(target_key.clone(), user.clone());
-                    }
-                }
-                TagTarget::Role(_) => {
-                    if let Some(role) = records.roles.get(&target_key) {
-                        before.roles.insert(target_key.clone(), role.clone());
-                    }
-                }
-            }
-        }
+        let before = self.records.read().unwrap().select(&scope);
         let staged = Self {
             records: RwLock::new(before.clone()),
             ..Self::default()
@@ -113,40 +140,47 @@ impl IamStore {
         let result = operation(&staged)?;
         let root_untouched = staged.root.read().unwrap().is_none();
         let after = staged.records.into_inner().unwrap();
-        let only_target = match &target {
-            TagTarget::User(_) => {
-                before.users.len() == 1
-                    && after.users.len() == 1
-                    && after.users.contains_key(&target_key)
-                    && after.roles.is_empty()
-            }
-            TagTarget::Role(_) => {
-                before.roles.len() == 1
-                    && after.roles.len() == 1
-                    && after.roles.contains_key(&target_key)
-                    && after.users.is_empty()
-            }
-        };
-        if !only_target
-            || !root_untouched
-            || !after.bootstrap_initialized.is_empty()
-            || !after.groups.is_empty()
-            || !after.policies.is_empty()
-            || !after.instance_profiles.is_empty()
-        {
+        if !root_untouched || !after.within(&scope) {
             return Err(crate::persistence::state_error(
-                "IAM tag transaction escaped its target",
+                "IAM transaction escaped its resource scope",
             ));
         }
         if let Some(persistence) = &self.persistence {
             persistence.commit_resources(&before, &after)?;
         }
-        let mut records = self.records.write().unwrap();
-        match target {
-            TagTarget::User(_) => records.users.extend(after.users),
-            TagTarget::Role(_) => records.roles.extend(after.roles),
-        }
+        self.records.write().unwrap().publish(scope, after);
         Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transact_tags<T>(
+        &self,
+        account: &str,
+        target: TagTarget,
+        operation: impl FnOnce(&IamStore) -> Result<T, IamStsError>,
+    ) -> Result<T, IamStsError> {
+        let mut scope = ResourceScope::default();
+        match &target {
+            TagTarget::User(name) => {
+                scope.users.insert(key(account, name));
+            }
+            TagTarget::Role(name) => {
+                scope.roles.insert(key(account, name));
+            }
+        }
+        self.transact_resources(scope, |staged| {
+            let result = operation(staged)?;
+            let present = match &target {
+                TagTarget::User(name) => staged.get_user(account, name).is_some(),
+                TagTarget::Role(name) => staged.get_role(account, name).is_some(),
+            };
+            if !present {
+                return Err(crate::persistence::state_error(
+                    "IAM tag target was removed",
+                ));
+            }
+            Ok(result)
+        })
     }
 
     pub(crate) fn provision_root(&self, root: AccountRoot) -> Result<(), ()> {

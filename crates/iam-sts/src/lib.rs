@@ -18,6 +18,7 @@ pub mod service;
 pub mod store;
 pub mod sts;
 mod tag_pagination;
+mod transaction;
 
 pub use config::{IamConfig, IamConfigError, IamCredentials};
 pub use persistence::authenticate_state_key;

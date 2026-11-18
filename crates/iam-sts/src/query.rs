@@ -113,9 +113,9 @@ impl QueryRequest {
 }
 
 /// Wrap a result body in the Query response envelope for `action` in namespace `xmlns`.
-/// Pass an empty `result_body` for operations that return only `ResponseMetadata`.
+/// Empty bodies omit the result unless the SDK model declares an empty output shape.
 pub fn response_envelope(action: &str, xmlns: &str, result_body: &str, request_id: &str) -> String {
-    let result = if result_body.is_empty() {
+    let result = if result_body.is_empty() && action != "UpdateRole" {
         String::new()
     } else {
         format!("<{action}Result>{result_body}</{action}Result>")
@@ -246,6 +246,13 @@ mod tests {
             .starts_with("<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">"));
         assert!(xml.contains("<GetUserResult><User><UserName>a</UserName></User></GetUserResult>"));
         assert!(xml.contains("<RequestId>rid-9</RequestId>"));
+    }
+
+    #[test]
+    fn empty_update_role_output_keeps_the_sdk_result_wrapper() {
+        let xml = response_envelope("UpdateRole", IAM_XMLNS, "", "rid-update");
+        assert!(xml.contains("<UpdateRoleResult></UpdateRoleResult>"));
+        assert!(xml.contains("<RequestId>rid-update</RequestId>"));
     }
 
     #[test]

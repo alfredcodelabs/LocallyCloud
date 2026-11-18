@@ -31,8 +31,9 @@ use crate::error::IamStsError;
 use crate::iam::{self, Entity, OpResult};
 use crate::policy::service_trust_allows;
 use crate::query::{response_envelope, QueryRequest, IAM_XMLNS, STS_XMLNS};
-use crate::store::{AccountRoot, IamStore, TagTarget};
+use crate::store::{AccountRoot, IamStore};
 use crate::sts::{self, SessionStore};
+use crate::transaction::ResourceScope;
 use crate::{
     arn::build_iam_arn,
     ids,
@@ -1064,20 +1065,13 @@ impl NativeHandler for IamHandler {
             let state = self.state.clone();
             let authorization_request = request.clone();
             tokio::task::spawn_blocking(move || {
-                let target = match operation.as_str() {
-                    "TagUser" | "UntagUser" => Some(TagTarget::User(q.require("UserName")?.into())),
-                    "TagRole" | "UntagRole" => Some(TagTarget::Role(q.require("RoleName")?.into())),
-                    _ => None,
-                };
+                let scope = ResourceScope::for_operation(&account, &operation, &q);
                 let apply = |staged: &IamStore| {
                     // Evaluate the complete committed store while its mutation gate is held.
                     state.authorize_iam(&authorization_request, &operation, &q)?;
                     dispatch_iam_store(staged, &account, &operation, &q)
                 };
-                match target {
-                    Some(target) => store.transact_tags(&account, target, apply),
-                    None => store.transact(apply),
-                }
+                store.transact_resources(scope, apply)
             })
             .await
             .unwrap_or_else(|_| {
@@ -3105,13 +3099,10 @@ mod durability_tests {
         Arc::new(IamPersistence::with_cipher(db, StateCipher::with_key(&[key; 32])).unwrap())
     }
     fn dispatch(store: &IamStore, action: &str, query: &str) -> OpResult {
-        store.transact(|staged| {
-            dispatch_iam_store(
-                staged,
-                "000000000000",
-                action,
-                &QueryRequest::parse(query.as_bytes()),
-            )
+        let query = QueryRequest::parse(query.as_bytes());
+        let scope = ResourceScope::for_operation("000000000000", action, &query);
+        store.transact_resources(scope, |staged| {
+            dispatch_iam_store(staged, "000000000000", action, &query)
         })
     }
 
@@ -3438,3 +3429,7 @@ mod principal_attributes_tests;
 #[cfg(test)]
 #[path = "service/anonymous_resource_policy_tests.rs"]
 mod anonymous_resource_policy_tests;
+
+#[cfg(test)]
+#[path = "transaction_tests.rs"]
+mod transaction_tests;
