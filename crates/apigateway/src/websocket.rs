@@ -371,7 +371,10 @@ async fn run_connection(mut socket: WebSocket, runtime: WebSocketRuntime, connec
                 }
             }
             payload = outbound.recv() => {
-                let Some(payload) = payload else { break };
+                let Some(payload) = payload else {
+                    let _ = timeout(Duration::from_secs(1), socket.send(Message::Close(None))).await;
+                    break;
+                };
                 if !matches!(
                     timeout(Duration::from_secs(1), socket.send(Message::Binary(payload.into()))).await,
                     Ok(Ok(()))
@@ -1065,6 +1068,80 @@ mod tests {
     fn assert_gone(result: Out) {
         assert!(matches!(result, Err(ApiGwError::Gone(_))));
     }
+
+    #[tokio::test]
+    async fn deleting_a_live_connection_sends_a_websocket_close_frame() {
+        use axum::{routing::get, Router};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let store = Arc::new(ApiGwStore::new());
+        let runtime = WebSocketRuntime {
+            store: store.clone(),
+            registry: Weak::new(),
+            account: ACCOUNT.into(),
+            region: REGION.into(),
+            api_id: "api-1".into(),
+            stage: "prod".into(),
+            domain_name: "api-1.execute-api.us-east-1.amazonaws.com".into(),
+            source_ip: "127.0.0.1".into(),
+            route_selection_expression: "$request.body.action".into(),
+            routes: Vec::new(),
+            integrations: BTreeMap::new(),
+            authorizer_context: None,
+            iam_identity: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(move |upgrade: WebSocketUpgrade| {
+                        let runtime = runtime.clone();
+                        async move {
+                            upgrade.on_upgrade(move |socket| {
+                                run_connection(socket, runtime, CONNECTION.into())
+                            })
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            assert!(header.starts_with(b"HTTP/1.1 101 "));
+            while get_connection(&store, ACCOUNT, REGION, CONNECTION)
+                .await
+                .is_err()
+            {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                delete_connection(&store, ACCOUNT, REGION, CONNECTION)
+                    .await
+                    .unwrap()
+                    .0,
+                204
+            );
+            let mut frame = [0; 2];
+            socket.read_exact(&mut frame).await.unwrap();
+            assert_eq!(frame, [0x88, 0]);
+            assert_gone(get_connection(&store, ACCOUNT, REGION, CONNECTION).await);
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn register_and_get_return_expected_metadata() {
         let store = registered_store().await;

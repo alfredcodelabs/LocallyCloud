@@ -3205,8 +3205,8 @@ async fn invoke_api_destination_with_response(
             }
         }
         "OAUTH_CLIENT_CREDENTIALS" => match oauth_token(http, &connection.auth_parameters).await {
-            Some(token) => request.header("authorization", &format!("Bearer {token}")),
-            None => return ApiDelivery::RetriableFailure,
+            Ok(token) => request.header("authorization", &format!("Bearer {token}")),
+            Err(error) => return api_http_failure(error),
         },
         _ => return ApiDelivery::TerminalFailure,
     };
@@ -3242,11 +3242,15 @@ async fn invoke_api_destination_with_response(
             }
         }
         Ok(_) => ApiDelivery::TerminalFailure,
+        Err(error) => api_http_failure(error),
+    }
+}
+
+fn api_http_failure(error: HttpError) -> ApiDelivery {
+    match error {
         // A local policy denial cannot succeed on retry; the event goes to the DLQ.
-        Err(HttpError::DestinationDenied | HttpError::InvalidRequest) => {
-            ApiDelivery::TerminalFailure
-        }
-        Err(HttpError::Transport | HttpError::ResponseTooLarge) => ApiDelivery::RetriableFailure,
+        HttpError::DestinationDenied | HttpError::InvalidRequest => ApiDelivery::TerminalFailure,
+        HttpError::Transport | HttpError::ResponseTooLarge => ApiDelivery::RetriableFailure,
     }
 }
 
@@ -3284,15 +3288,26 @@ fn apply_http_parameters(
     Ok(())
 }
 
-async fn oauth_token(http: &dyn HttpClient, parameters: &Value) -> Option<String> {
+async fn oauth_token(http: &dyn HttpClient, parameters: &Value) -> Result<String, HttpError> {
     let oauth = parameters.get("OAuthParameters").unwrap_or(parameters);
-    let endpoint = oauth.get("AuthorizationEndpoint")?.as_str()?;
+    let endpoint = oauth
+        .get("AuthorizationEndpoint")
+        .and_then(Value::as_str)
+        .ok_or(HttpError::InvalidRequest)?;
     if !endpoint.starts_with("https://") {
-        return None;
+        return Err(HttpError::InvalidRequest);
     }
-    let clients = oauth.get("ClientParameters")?;
-    let client_id = clients.get("ClientID")?.as_str()?;
-    let client_secret = clients.get("ClientSecret")?.as_str()?;
+    let clients = oauth
+        .get("ClientParameters")
+        .ok_or(HttpError::InvalidRequest)?;
+    let client_id = clients
+        .get("ClientID")
+        .and_then(Value::as_str)
+        .ok_or(HttpError::InvalidRequest)?;
+    let client_secret = clients
+        .get("ClientSecret")
+        .and_then(Value::as_str)
+        .ok_or(HttpError::InvalidRequest)?;
     let method = Method::from_bytes(
         oauth
             .get("HttpMethod")
@@ -3300,10 +3315,10 @@ async fn oauth_token(http: &dyn HttpClient, parameters: &Value) -> Option<String
             .unwrap_or("POST")
             .as_bytes(),
     )
-    .ok()?;
+    .map_err(|_| HttpError::InvalidRequest)?;
     let http_parameters = oauth.get("OAuthHttpParameters");
     let mut request = HttpRequest::new(method.clone(), endpoint);
-    apply_http_parameters(&mut request, http_parameters).ok()?;
+    apply_http_parameters(&mut request, http_parameters)?;
     let mut form = vec![
         ("grant_type", "client_credentials"),
         ("client_id", client_id),
@@ -3324,19 +3339,16 @@ async fn oauth_token(http: &dyn HttpClient, parameters: &Value) -> Option<String
         append_query(&mut request.url, form);
     } else {
         request.body = form_body(form);
-        request
-            .header("content-type", "application/x-www-form-urlencoded")
-            .ok()?;
+        request.header("content-type", "application/x-www-form-urlencoded")?;
     }
-    let response = http.send(request).await.ok()?;
+    let response = http.send(request).await?;
     if !(200..300).contains(&response.status) {
-        return None;
+        return Err(HttpError::Transport);
     }
     serde_json::from_slice::<Value>(&response.body)
-        .ok()?
-        .get("access_token")?
-        .as_str()
-        .map(str::to_string)
+        .ok()
+        .and_then(|value| value.get("access_token")?.as_str().map(str::to_string))
+        .ok_or(HttpError::Transport)
 }
 
 fn append_query<'a>(url: &mut String, values: impl IntoIterator<Item = (&'a str, &'a str)>) {
@@ -3652,6 +3664,66 @@ mod tests {
                 invoke_api_destination(&Fixed(reply), &destination, &connection, "{}").await,
                 expected
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_policy_failures_are_terminal_before_the_destination_is_contacted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailedOAuth {
+            error: HttpError,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl HttpClient for FailedOAuth {
+            async fn send(
+                &self,
+                request: HttpRequest,
+            ) -> Result<crate::http_client::HttpResponse, HttpError> {
+                assert_eq!(request.url, "https://auth.example/token");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(self.error)
+            }
+        }
+        let destination = ApiDestination {
+            name: "oauth-policy".into(),
+            arn: "arn:aws:events:us-east-1:000000000000:api-destination/oauth-policy".into(),
+            connection_arn: "arn:aws:events:us-east-1:000000000000:connection/oauth-policy".into(),
+            endpoint: "https://api.example/invoke".into(),
+            method: "POST".into(),
+            rate_limit: None,
+            tags: BTreeMap::new(),
+        };
+        let connection = Connection {
+            name: "oauth-policy".into(),
+            arn: destination.connection_arn.clone(),
+            auth_type: "OAUTH_CLIENT_CREDENTIALS".into(),
+            auth_parameters: json!({"OAuthParameters": {
+                "AuthorizationEndpoint":"https://auth.example/token",
+                "ClientParameters":{"ClientID":"client","ClientSecret":"fictional-secret"}
+            }}),
+            tags: BTreeMap::new(),
+        };
+        for (error, expected) in [
+            (HttpError::DestinationDenied, ApiDelivery::TerminalFailure),
+            (HttpError::InvalidRequest, ApiDelivery::TerminalFailure),
+            (HttpError::Transport, ApiDelivery::RetriableFailure),
+            (HttpError::ResponseTooLarge, ApiDelivery::RetriableFailure),
+        ] {
+            let http = FailedOAuth {
+                error,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                invoke_api_destination(&http, &destination, &connection, "{}").await,
+                expected
+            );
+            assert_eq!(
+                invoke_api_destination_for_status(&http, &destination, &connection, "{}").await,
+                expected
+            );
+            assert_eq!(http.calls.load(Ordering::SeqCst), 2);
         }
     }
 
