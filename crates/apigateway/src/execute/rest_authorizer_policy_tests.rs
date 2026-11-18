@@ -202,3 +202,30 @@ fn resource_allow_cannot_override_authorizer_deny_with_question_mark_wildcards()
         403
     );
 }
+
+#[test]
+fn lambda_unauthorized_errors_are_distinct_from_authorizer_failures() {
+    for kind in [ApiKind::Rest, ApiKind::Http] {
+        for (message, expected) in [
+            ("Unauthorized", 401),
+            ("unauthorized", 500),
+            ("Internal detail", 500),
+        ] {
+            let output = LambdaOutput {
+                status: 200,
+                headers: HeaderMap::new(),
+                function_error: true,
+                body: Bytes::from(json!({"errorType":"Error","errorMessage":message}).to_string()),
+            };
+            assert_eq!(authorizer_result(kind, &output).unwrap_err(), expected);
+        }
+    }
+    let output = LambdaOutput {
+        status: 200,
+        headers: HeaderMap::new(),
+        function_error: false,
+        body: Bytes::from_static(br#"{"errorMessage":"Unauthorized"}"#),
+    };
+    assert_eq!(authorizer_result(ApiKind::Http, &output).unwrap_err(), 401);
+    assert!(authorizer_result(ApiKind::Rest, &output).is_ok());
+}

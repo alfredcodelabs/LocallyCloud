@@ -483,7 +483,13 @@ mod tests {
             assert!(!check(&Method::PUT, &uri, &changed_headers));
             changed_headers.remove(header);
         }
-        let now = OffsetDateTime::now_utc();
+        let now = time::PrimitiveDateTime::parse(
+            parameters(&uri).unwrap().get("X-Amz-Date").unwrap(),
+            &format_description::parse_borrowed::<3>("[year][month][day]T[hour][minute][second]Z")
+                .unwrap(),
+        )
+        .unwrap()
+        .assume_utc();
         assert_eq!(
             verify_at(
                 &Method::PUT,

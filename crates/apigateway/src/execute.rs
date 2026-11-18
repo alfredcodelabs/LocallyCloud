@@ -1869,10 +1869,7 @@ async fn lambda_authorize(
     )
     .await
     .map_err(|_| 500u16)?;
-    if output.function_error {
-        return Err(500);
-    }
-    let result: Value = serde_json::from_slice(&output.body).map_err(|_| 500u16)?;
+    let result = authorizer_result(kind, &output)?;
     let interpreted =
         interpret_authorizer(kind, authorizer, &result, &method_arn, resource_decision)?;
     if ttl > 0 {
@@ -1886,6 +1883,19 @@ async fn lambda_authorize(
             .await;
     }
     Ok(interpreted)
+}
+
+fn authorizer_result(kind: ApiKind, output: &LambdaOutput) -> Result<Value, u16> {
+    let result: Value = serde_json::from_slice(&output.body).map_err(|_| 500u16)?;
+    match (
+        output.function_error,
+        kind,
+        result.get("errorMessage").and_then(Value::as_str),
+    ) {
+        (true, _, Some("Unauthorized")) | (false, ApiKind::Http, Some("Unauthorized")) => Err(401),
+        (true, _, _) => Err(500),
+        (false, _, _) => Ok(result),
+    }
 }
 
 fn kind_name(kind: ApiKind) -> &'static str {
