@@ -1381,7 +1381,7 @@ pub async fn start_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError
         variables: BTreeMap::new(),
         redrive_count: 0,
         redrive_date: None,
-        history: Vec::new(),
+        history: Arc::default(),
     };
     let exec_handle = if target.type_ == "STANDARD" {
         match ctx
@@ -1531,7 +1531,7 @@ pub async fn start_sync_execution(ctx: &Ctx<'_>, v: &Value) -> Result<Value, Sfn
         variables: BTreeMap::new(),
         redrive_count: 0,
         redrive_date: None,
-        history: Vec::new(),
+        history: Arc::default(),
     }));
     let mut interpreter = interpreter_for(
         ctx,

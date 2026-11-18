@@ -272,7 +272,8 @@ async fn guard_failure_rolls_back_status_history_and_journal_and_rejects_prefix_
     let cell = ExecutionCell::new(original.clone(), Some(persistence), failed.clone());
     {
         let mut guard = cell.write().await;
-        Arc::make_mut(&mut guard.history[0]).details = serde_json::json!({"output":"modified"});
+        Arc::make_mut(&mut Arc::make_mut(&mut guard.history)[0]).details =
+            serde_json::json!({"output":"modified"});
     }
     assert!(failed.load(Ordering::Acquire));
     assert_eq!(
@@ -376,4 +377,86 @@ async fn interrupted_and_redriven_executions_append_monotonic_events_on_restart(
         vec![1, 2, 3, 4]
     );
     assert_eq!(execution.history[3].event_type, "ExecutionAborted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_backups_share_history_and_append_detaches_without_changing_prior_snapshots() {
+    let fixture = TestState::new();
+    let persistence = fixture.persistence();
+    let original = execution("shared-backup", 1024);
+    persistence.save_execution(&original).unwrap();
+    let failed = Arc::new(AtomicBool::new(false));
+    let cell = ExecutionCell::new(original.clone(), Some(persistence.clone()), failed.clone());
+    {
+        let mut guard = cell.write().await;
+        assert!(Arc::ptr_eq(
+            &guard.history,
+            &guard.backup.as_ref().unwrap().history
+        ));
+        assert!(Arc::ptr_eq(&guard.history, &original.history));
+        // Cloning/backing up the execution does not touch each event's reference count.
+        assert_eq!(Arc::strong_count(&original.history[0]), 1);
+        guard.current_state = Some("updated".into());
+    }
+    assert!(!failed.load(Ordering::Acquire));
+    assert!(Arc::ptr_eq(&cell.read().await.history, &original.history));
+    {
+        let mut guard = cell.write().await;
+        assert_eq!(
+            guard.record("ExecutionSucceeded", serde_json::json!({"output":"ok"})),
+            Some(1025)
+        );
+        assert!(!Arc::ptr_eq(&guard.history, &original.history));
+        assert!(Arc::ptr_eq(&guard.history[0], &original.history[0]));
+    }
+    assert!(!failed.load(Ordering::Acquire));
+    assert_eq!(original.history.len(), 1024);
+    assert_eq!(cell.read().await.history.len(), 1025);
+    let restored = fixture.restore().unwrap();
+    let restored = restored.executions.get(&original.arn).unwrap().clone();
+    let restored = restored.read().await;
+    assert_eq!(restored.current_state.as_deref(), Some("updated"));
+    assert_eq!(restored.history.len(), 1025);
+    assert_eq!(restored.history[1024].event_type, "ExecutionSucceeded");
+
+    // Failed metadata writes roll back without replacing/copying the committed history.
+    let committed = cell.read().await.history.clone();
+    fixture.state.connection().unwrap().execute_batch("CREATE TRIGGER reject_metadata BEFORE UPDATE ON sfn_executions BEGIN SELECT RAISE(ABORT,'injected metadata failure'); END;").unwrap();
+    {
+        let mut guard = cell.write().await;
+        guard.current_state = Some("uncommitted".into());
+        guard.status = Status::Failed;
+    }
+    assert!(failed.load(Ordering::Acquire));
+    let value = cell.read().await;
+    assert_eq!(value.current_state.as_deref(), Some("updated"));
+    assert_eq!(value.status, original.status);
+    assert!(Arc::ptr_eq(&value.history, &committed));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_history_guard_rejects_truncation_reordering_and_identity_changes() {
+    let fixture = TestState::new();
+    let persistence = fixture.persistence();
+    let original = execution("shared-invariants", 3);
+    persistence.save_execution(&original).unwrap();
+    for edit in 0..3 {
+        let failed = Arc::new(AtomicBool::new(false));
+        let cell = ExecutionCell::new(original.clone(), Some(persistence.clone()), failed.clone());
+        {
+            let mut guard = cell.write().await;
+            match edit {
+                0 => Arc::make_mut(&mut guard.history).truncate(1),
+                1 => Arc::make_mut(&mut guard.history).swap(0, 1),
+                _ => guard.arn = "different-execution".into(),
+            }
+        }
+        assert!(failed.load(Ordering::Acquire));
+        let value = cell.read().await;
+        assert_eq!(value.arn, original.arn);
+        assert!(Arc::ptr_eq(&value.history, &original.history));
+    }
+    let restored = fixture.restore().unwrap();
+    let restored = restored.executions.get(&original.arn).unwrap().clone();
+    assert_eq!(restored.read().await.history.len(), 3);
 }

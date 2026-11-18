@@ -157,7 +157,7 @@ impl Persistence {
                 ))
             })
             .map_err(|e| e.to_string())?;
-        execution.history.reserve(count);
+        Arc::make_mut(&mut execution.history).reserve(count);
         for row in rows {
             let (id, version, payload) = row.map_err(|e| e.to_string())?;
             if version != 1
@@ -183,7 +183,7 @@ impl Persistence {
                 .map_err(|e| e.to_string())?;
             let event: HistoryEvent = serde_json::from_slice(&clear).map_err(|e| e.to_string())?;
             validate_event(&event, execution.history.len() + 1)?;
-            execution.history.push(Arc::new(event));
+            Arc::make_mut(&mut execution.history).push(Arc::new(event));
         }
         if execution.history.len() != count {
             return Err("persisted execution history is incomplete".into());
@@ -457,17 +457,18 @@ impl Drop for ExecutionWriteGuard<'_> {
         let Some(persistence) = self.persistence else {
             return;
         };
-        // The rollback snapshot shares immutable events. Any prefix edit must fail closed,
-        // rather than leave runtime history different from the append-only journal.
+        // Metadata-only writes share the entire immutable history with their backup.
+        // After copy-on-write, retain the append-only journal's exact prefix check.
         let append_only = self.backup.as_ref().is_some_and(|backup| {
-            self.guard.history.len() >= backup.history.len()
-                && self
-                    .guard
-                    .history
-                    .iter()
-                    .zip(&backup.history)
-                    .all(|(current, previous)| Arc::ptr_eq(current, previous))
-                && self.guard.arn == backup.arn
+            self.guard.arn == backup.arn
+                && (Arc::ptr_eq(&self.guard.history, &backup.history)
+                    || (self.guard.history.len() >= backup.history.len()
+                        && self
+                            .guard
+                            .history
+                            .iter()
+                            .zip(backup.history.iter())
+                            .all(|(current, previous)| Arc::ptr_eq(current, previous))))
         });
         // Keep the lock until commit/rollback so readers never observe provisional status.
         if self.failed.load(Ordering::Acquire)

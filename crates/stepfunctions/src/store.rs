@@ -180,7 +180,7 @@ pub struct Execution {
     pub redrive_count: u32,
     pub redrive_date: Option<f64>,
     #[serde(default, skip_serializing)]
-    pub history: Vec<Arc<HistoryEvent>>,
+    pub history: Arc<Vec<Arc<HistoryEvent>>>,
 }
 
 impl Execution {
@@ -199,7 +199,7 @@ impl Execution {
             return None;
         }
         let id = self.history.len() as u64 + 1;
-        self.history.push(Arc::new(HistoryEvent {
+        Arc::make_mut(&mut self.history).push(Arc::new(HistoryEvent {
             id,
             previous_event_id,
             event_type: event_type.to_string(),
