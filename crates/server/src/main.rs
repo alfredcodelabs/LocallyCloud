@@ -862,14 +862,25 @@ async fn main() {
     }
     locallycloud_xray::register(&registry);
     let arc = locallycloud_arc::register(&registry);
-    registry.register_native(
-        ServiceName::new("arc-region-switch"),
-        ServiceMetadata::new(AwsProtocol::Json10, Some("ArcRegionSwitch")),
-        Arc::new(locallycloud_region_switch::RegionSwitchHandler::new(
-            Arc::new(ArcRoutingControls(arc.clone())),
-            Arc::new(IamExecutionRoleAuthorizer(Arc::downgrade(&registry))),
-        )),
-    );
+    {
+        let registry = registry.clone();
+        let state = state.clone();
+        let controls = Arc::new(ArcRoutingControls(arc.clone()));
+        initialize_persistent_service("arc-region-switch", move || {
+            let handler = locallycloud_region_switch::RegionSwitchHandler::with_state(
+                controls,
+                Arc::new(IamExecutionRoleAuthorizer(Arc::downgrade(&registry))),
+                state,
+            )?;
+            registry.register_native(
+                ServiceName::new("arc-region-switch"),
+                ServiceMetadata::new(AwsProtocol::Json10, Some("ArcRegionSwitch")),
+                Arc::new(handler),
+            );
+            Ok::<(), String>(())
+        })
+        .await;
+    }
     let route53 = locallycloud_route53::register(&registry);
     route53.set_routing_control_resolver(Arc::new(move |arn| arc.is_on(arn)));
     let alias_gateway = gateway_waf.clone();
@@ -928,7 +939,27 @@ async fn main() {
         ServiceMetadata::new(AwsProtocol::Json11, Some("AWSWAF_20190729")),
         waf,
     );
-    let cloudtrail = locallycloud_cloudtrail::CloudTrailService::new();
+    let cloudtrail = {
+        let registry = Arc::downgrade(&registry);
+        let state = state.clone();
+        match tokio::task::spawn_blocking(move || {
+            locallycloud_cloudtrail::CloudTrailService::with_state(registry, state)
+        })
+        .await
+        {
+            Ok(Ok(service)) => service,
+            _ => {
+                observability::log_service_error(
+                    "cloudtrail",
+                    Some("startup"),
+                    "startup",
+                    "state_initialization_failed",
+                    500,
+                );
+                std::process::exit(4);
+            }
+        }
+    };
     registry.register_native(
         ServiceName::new("cloudtrail"),
         ServiceMetadata::new(AwsProtocol::Json11, Some("CloudTrail_20131101")),

@@ -21,6 +21,8 @@ struct StoredCertificate {
     imported_at: i64,
     certificate_der: Vec<u8>,
     private_key_der: Vec<u8>,
+    #[serde(default)]
+    request: Option<crate::request::PendingRequest>,
 }
 impl Drop for StoredCertificate {
     fn drop(&mut self) {
@@ -62,8 +64,10 @@ impl AcmPersistence {
             let mut stored: StoredCertificate =
                 serde_json::from_slice(&bytes).map_err(|_| internal())?;
             if stored.arn != arn
-                || stored.private_key_der.is_empty()
-                || stored.certificate_der.is_empty()
+                || (stored.request.is_none()
+                    && (stored.private_key_der.is_empty() || stored.certificate_der.is_empty()))
+                || (stored.request.is_some()
+                    && (!stored.private_key_der.is_empty() || !stored.certificate_der.is_empty()))
             {
                 return Err(internal());
             }
@@ -72,10 +76,17 @@ impl AcmPersistence {
                 metadata: stored.metadata.clone(),
                 tags: std::mem::take(&mut stored.tags),
                 imported_at: stored.imported_at,
-                tls: Some(Arc::new(AcmTlsIdentity {
-                    certificate_der: std::mem::take(&mut stored.certificate_der),
-                    private_key_der: Zeroizing::new(std::mem::take(&mut stored.private_key_der)),
-                })),
+                request: stored.request.clone(),
+                tls: if stored.request.is_none() {
+                    Some(Arc::new(AcmTlsIdentity {
+                        certificate_der: std::mem::take(&mut stored.certificate_der),
+                        private_key_der: Zeroizing::new(std::mem::take(
+                            &mut stored.private_key_der,
+                        )),
+                    }))
+                } else {
+                    None
+                },
                 associations: BTreeMap::new(),
             };
             state
@@ -87,14 +98,22 @@ impl AcmPersistence {
         Ok(state)
     }
     pub fn save(&self, scope: &Scope, certificate: &Certificate) -> Result<(), AwsError> {
-        let tls = certificate.tls.as_ref().ok_or_else(internal)?;
+        let tls = certificate.tls.as_ref();
+        if tls.is_none() && certificate.request.is_none() {
+            return Err(internal());
+        }
         let stored = StoredCertificate {
             arn: certificate.arn.clone(),
             metadata: certificate.metadata.clone(),
             tags: certificate.tags.clone(),
             imported_at: certificate.imported_at,
-            certificate_der: tls.certificate_der.clone(),
-            private_key_der: tls.private_key_der.to_vec(),
+            certificate_der: tls
+                .map(|tls| tls.certificate_der.clone())
+                .unwrap_or_default(),
+            private_key_der: tls
+                .map(|tls| tls.private_key_der.to_vec())
+                .unwrap_or_default(),
+            request: certificate.request.clone(),
         };
         let bytes = Zeroizing::new(serde_json::to_vec(&stored).map_err(|_| internal())?);
         let payload = self
@@ -157,12 +176,63 @@ mod tests {
         AcmHandler {
             state: Arc::new(Mutex::new(persistence.restore().unwrap())),
             persistence: Some(Arc::new(persistence)),
+            registry: Default::default(),
         }
     }
     fn import(handler: &AcmHandler, req: &ServiceRequest) -> String {
         let (cert, key) = fixture("api.example.test", "2048");
         handler.import(req,json!({"Certificate":STANDARD.encode(cert),"PrivateKey":STANDARD.encode(&key),"Tags":[{"Key":"environment","Value":"local"}]}).as_object().unwrap()).unwrap()["CertificateArn"].as_str().unwrap().to_owned()
     }
+    #[test]
+    fn requested_certificate_is_pending_idempotent_scoped_and_durable() {
+        let (directory, db) = database();
+        let req = request();
+        let first = handler(db.clone());
+        let body = json!({"DomainName":"api.example.test","ValidationMethod":"DNS","IdempotencyToken":"request_1","SubjectAlternativeNames":["*.example.test"]});
+        let arn = first
+            .execute("RequestCertificate", &req, body.as_object().unwrap())
+            .unwrap()["CertificateArn"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let described = first
+            .describe(&req, json!({"CertificateArn":arn}).as_object().unwrap())
+            .unwrap();
+        assert_eq!(described["Certificate"]["Status"], "PENDING_VALIDATION");
+        assert_eq!(
+            described["Certificate"]["DomainValidationOptions"][0]["ResourceRecord"]["Type"],
+            "CNAME"
+        );
+        assert_eq!(
+            first.preflight(&req.account_id, &req.region, &arn, "api.example.test"),
+            AssociationDecision::UnsupportedMaterial
+        );
+        let second = handler(db.clone());
+        assert_eq!(
+            second
+                .execute("RequestCertificate", &req, body.as_object().unwrap())
+                .unwrap()["CertificateArn"],
+            arn
+        );
+        let restored = second
+            .describe(&req, json!({"CertificateArn":arn}).as_object().unwrap())
+            .unwrap();
+        assert_eq!(restored, described);
+        let mut foreign = req.clone();
+        foreign.region = "us-west-2".into();
+        assert!(second
+            .describe(&foreign, json!({"CertificateArn":arn}).as_object().unwrap())
+            .is_err());
+        let bad = json!({"DomainName":"bad..example.test","ValidationMethod":"DNS"});
+        assert!(second
+            .execute("RequestCertificate", &req, bad.as_object().unwrap())
+            .is_err());
+        drop(first);
+        drop(second);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn encrypted_restart_preserves_material_tags_scope_and_reacquires_associations() {
         let (directory, db) = database();

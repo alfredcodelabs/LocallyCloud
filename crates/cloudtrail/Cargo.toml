@@ -16,5 +16,12 @@ serde_json.workspace = true
 uuid.workspace = true
 time.workspace = true
 
-[dev-dependencies]
 tokio.workspace = true
+locallycloud-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+locallycloud-s3.workspace = true

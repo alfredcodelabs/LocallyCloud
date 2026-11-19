@@ -13,6 +13,7 @@ use crate::integration::kms::{KmsInternalApi, KMS_INTERNAL_API_VERSION};
 use crate::integration::lambda::{LambdaInternalApi, LAMBDA_INTERNAL_API_VERSION};
 use crate::integration::logs::{InternalLogSink, INTERNAL_LOG_SINK_VERSION};
 use crate::integration::metrics::{MetricSink, METRIC_SINK_VERSION};
+use crate::integration::s3::{S3DeliveryAuthorizationApi, S3_DELIVERY_AUTHORIZATION_VERSION};
 use crate::integration::InternalDispatcher;
 use dashmap::DashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -88,6 +89,7 @@ pub struct ServiceEntry {
     /// Optional typed capability published atomically with the IAM handler.
     authorization_evaluator: Option<Arc<dyn AuthorizationEvaluator>>,
     dynamodb_streams_api: Option<Arc<dyn DynamoDbStreamsApi>>,
+    s3_delivery_api: Option<Arc<dyn S3DeliveryAuthorizationApi>>,
 }
 
 #[derive(Default)]
@@ -98,6 +100,7 @@ struct NativeCapabilities {
     lambda_api: Option<Arc<dyn LambdaInternalApi>>,
     authorization_evaluator: Option<Arc<dyn AuthorizationEvaluator>>,
     dynamodb_streams_api: Option<Arc<dyn DynamoDbStreamsApi>>,
+    s3_delivery_api: Option<Arc<dyn S3DeliveryAuthorizationApi>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -280,6 +283,7 @@ impl ServiceRegistry {
                 lambda_api: None,
                 authorization_evaluator: None,
                 dynamodb_streams_api: None,
+                s3_delivery_api: None,
             },
         );
     }
@@ -404,6 +408,7 @@ impl ServiceRegistry {
             lambda_api,
             authorization_evaluator,
             dynamodb_streams_api,
+            s3_delivery_api,
         } = capabilities;
         self.services.insert(
             name,
@@ -417,6 +422,7 @@ impl ServiceRegistry {
                 lambda_api,
                 authorization_evaluator,
                 dynamodb_streams_api,
+                s3_delivery_api,
             },
         );
     }
@@ -489,6 +495,40 @@ impl ServiceRegistry {
                 ..Default::default()
             },
         );
+    }
+
+    pub fn register_native_with_s3_delivery_api(
+        &self,
+        name: ServiceName,
+        metadata: ServiceMetadata,
+        handler: Arc<dyn NativeHandler>,
+        api: Arc<dyn S3DeliveryAuthorizationApi>,
+    ) {
+        self.register_native_entry(
+            name,
+            metadata,
+            handler,
+            NativeCapabilities {
+                s3_delivery_api: Some(api),
+                ..Default::default()
+            },
+        );
+    }
+
+    pub fn s3_delivery_api(
+        &self,
+        name: &ServiceName,
+    ) -> Option<Arc<dyn S3DeliveryAuthorizationApi>> {
+        self.services.get(name).and_then(|entry| {
+            if entry.disposition != Disposition::Native || entry.handler.is_none() {
+                return None;
+            }
+            entry
+                .s3_delivery_api
+                .as_ref()
+                .filter(|api| api.version() == S3_DELIVERY_AUTHORIZATION_VERSION)
+                .cloned()
+        })
     }
 
     pub fn dynamodb_streams_api(&self, name: &ServiceName) -> Option<Arc<dyn DynamoDbStreamsApi>> {
@@ -859,6 +899,47 @@ mod tests {
             Some(ServiceName::new("sns"))
         );
         assert_eq!(reg.lookup_by_action("Unknown"), None);
+    }
+
+    #[test]
+    fn s3_delivery_capability_is_versioned_and_replaced_with_its_handler() {
+        use crate::integration::s3::{
+            S3DeliveryAuthorizationError, S3DeliveryAuthorizationRequest,
+        };
+        struct Api(u16);
+        #[async_trait::async_trait]
+        impl S3DeliveryAuthorizationApi for Api {
+            fn version(&self) -> u16 {
+                self.0
+            }
+            async fn authorize_delivery(
+                &self,
+                _: S3DeliveryAuthorizationRequest,
+            ) -> Result<(), S3DeliveryAuthorizationError> {
+                Ok(())
+            }
+        }
+        let registry = ServiceRegistry::new();
+        let name = ServiceName::new("s3");
+        let metadata = ServiceMetadata::new(AwsProtocol::RestXml, None);
+        registry.register_native_with_s3_delivery_api(
+            name.clone(),
+            metadata.clone(),
+            Arc::new(TestHandler),
+            Arc::new(Api(1)),
+        );
+        assert!(registry.s3_delivery_api(&name).is_some());
+        registry.register_native_with_s3_delivery_api(
+            name.clone(),
+            metadata.clone(),
+            Arc::new(TestHandler),
+            Arc::new(Api(2)),
+        );
+        assert!(registry.s3_delivery_api(&name).is_none());
+        registry.register_native(name.clone(), metadata.clone(), Arc::new(TestHandler));
+        assert!(registry.s3_delivery_api(&name).is_none());
+        registry.register_proxied(name.clone(), metadata);
+        assert!(registry.s3_delivery_api(&name).is_none());
     }
 
     #[test]

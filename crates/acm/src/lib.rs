@@ -3,6 +3,7 @@
 //! available only through the scoped internal TLS capability, never the AWS API.
 mod material;
 mod persistence;
+mod request;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,7 @@ struct Certificate {
     imported_at: i64,
     tls: Option<Arc<AcmTlsIdentity>>,
     associations: BTreeMap<String, String>,
+    request: Option<request::PendingRequest>,
 }
 
 #[derive(Default)]
@@ -102,6 +104,7 @@ pub trait AcmAssociationApi: Send + Sync {
 pub struct AcmHandler {
     state: Arc<Mutex<State>>,
     persistence: Option<Arc<persistence::AcmPersistence>>,
+    registry: std::sync::Weak<ServiceRegistry>,
 }
 
 impl AcmHandler {
@@ -122,7 +125,24 @@ impl AcmHandler {
         req: &ServiceRequest,
         body: &Map<String, Value>,
     ) -> Result<Value, AwsError> {
+        locallycloud_core::integration::authorization::authorize_native_read(
+            &self.registry,
+            req,
+            "acm",
+            &format!("acm:{op}"),
+            body.get("CertificateArn")
+                .and_then(Value::as_str)
+                .unwrap_or("*"),
+        )
+        .map_err(|_| {
+            AwsError::new(
+                "AccessDeniedException",
+                "Not authorized for this ACM operation",
+                403,
+            )
+        })?;
         match op {
+            "RequestCertificate" => self.request_certificate(req, body),
             "ImportCertificate" => self.import(req, body),
             "DescribeCertificate" => self.describe(req, body),
             "ListCertificates" => self.list(req, body),
@@ -180,7 +200,9 @@ impl AcmHandler {
                 .get_mut(&scope)
                 .and_then(|certs| certs.get_mut(arn))
                 .ok_or_else(not_found)?;
-            if existing.metadata.key_algorithm != metadata.key_algorithm {
+            if existing.request.is_some()
+                || existing.metadata.key_algorithm != metadata.key_algorithm
+            {
                 return Err(invalid_parameter());
             }
             if existing
@@ -215,6 +237,7 @@ impl AcmHandler {
             imported_at: now,
             tls: Some(tls),
             associations: BTreeMap::new(),
+            request: None,
         };
         self.save(&scope, &certificate)?;
         certs.insert(arn.clone(), certificate);
@@ -232,11 +255,15 @@ impl AcmHandler {
             .and_then(|certs| certs.get(arn))
             .ok_or_else(not_found)?;
         let m = &cert.metadata;
-        let status = if now() >= m.not_after {
-            "EXPIRED"
-        } else {
-            "ISSUED"
-        };
+        if let Some(request) = &cert.request {
+            return Ok(json!({"Certificate":{
+                "CertificateArn":cert.arn,"DomainName":m.domain,"SubjectAlternativeNames":m.names,
+                "Status":cert.status(),"Type":cert.certificate_type(),"KeyAlgorithm":m.key_algorithm,
+                "CreatedAt":cert.imported_at,"Subject":m.subject,"DomainValidationOptions":request.validation,
+                "Options":request.options,"InUseBy":[],"RenewalEligibility":"INELIGIBLE"
+            }}));
+        }
+        let status = cert.status();
         Ok(json!({"Certificate": {
             "CertificateArn": cert.arn,
             "DomainName": m.domain,
@@ -302,11 +329,7 @@ impl AcmHandler {
         if let Some(certs) = all {
             for cert in certs.values() {
                 let key_type = cert.metadata.key_algorithm.as_str();
-                let status = if now() >= cert.metadata.not_after {
-                    "EXPIRED"
-                } else {
-                    "ISSUED"
-                };
+                let status = cert.status();
                 if statuses
                     .as_ref()
                     .is_some_and(|v| !v.iter().any(|s| s == status))
@@ -319,7 +342,7 @@ impl AcmHandler {
                     || (types.is_none() && key_type == "RSA_2048");
                 if allowed_type {
                     summaries.push(json!({"CertificateArn": cert.arn, "DomainName": cert.metadata.domain,
-                            "SubjectAlternativeNameSummaries": cert.metadata.names, "Status": status, "Type": "IMPORTED",
+                            "SubjectAlternativeNameSummaries": cert.metadata.names, "Status": status, "Type": cert.certificate_type(),
                             "KeyAlgorithm": key_type, "HasAdditionalSubjectAlternativeNames": false, "InUse": !cert.associations.is_empty()}));
                 }
             }
@@ -434,6 +457,9 @@ fn eligible_certificate<'a>(
         .get(&scope)
         .and_then(|certs| certs.get(arn))
         .ok_or(AssociationDecision::NotFound)?;
+    if cert.request.is_some() {
+        return Err(AssociationDecision::UnsupportedMaterial);
+    }
     let now = now();
     if now < cert.metadata.not_before || now >= cert.metadata.not_after {
         return Err(AssociationDecision::UnsupportedMaterial);
@@ -620,7 +646,13 @@ impl NativeHandler for AcmHandler {
 }
 
 pub fn register(registry: &Arc<ServiceRegistry>) -> Arc<AcmHandler> {
-    register_handler(registry, AcmHandler::new())
+    register_handler(
+        registry,
+        Arc::new(AcmHandler {
+            registry: Arc::downgrade(registry),
+            ..Default::default()
+        }),
+    )
 }
 
 pub fn register_with_state(
@@ -634,6 +666,7 @@ pub fn register_with_state(
         Arc::new(AcmHandler {
             state: Arc::new(Mutex::new(state)),
             persistence: Some(Arc::new(persistence)),
+            registry: Arc::downgrade(registry),
         }),
     ))
 }
@@ -1000,6 +1033,7 @@ mod tests {
                     imported_at: 0,
                     tls: None,
                     associations: BTreeMap::new(),
+                    request: None,
                 },
             );
         assert_eq!(

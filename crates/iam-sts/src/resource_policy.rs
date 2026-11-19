@@ -175,6 +175,7 @@ fn parse_with_options(
                             | "s3:max-keys"
                             | "s3:if-none-match"
                             | "s3:if-match"
+                            | "s3:x-amz-acl"
                             | "s3:objectcreationoperation"
                             | "events:source"
                             | "events:detail-type"
@@ -327,6 +328,18 @@ impl ResourceStatement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloudtrail_acl_condition_is_retained_and_unknown_acl_keys_fail_closed() {
+        let policy = r#"{"Statement":{"Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::audit/AWSLogs/000000000000/*","Condition":{"StringEquals":{"s3:x-amz-acl":"bucket-owner-full-control"}}}}"#;
+        let parsed = parse(policy).unwrap();
+        assert_eq!(
+            parsed[0].statement.conditions["StringEquals"]["s3:x-amz-acl"],
+            vec!["bucket-owner-full-control"]
+        );
+        assert!(parse(&policy.replace("s3:x-amz-acl", "s3:x-amz-unknown-acl")).is_err());
+    }
+
     #[test]
     fn event_bus_conditions_accept_source_and_detail_type_but_reject_unknown_keys() {
         for key in ["events:source", "events:detail-type"] {

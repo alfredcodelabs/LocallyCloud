@@ -853,8 +853,31 @@ impl S3Handler {
             .expect("S3 SlowDown response is valid")
     }
 
-    /// Core inserts this marker only after verifying an external request in strict IAM mode.
-    /// Internal scoped calls and permissive mode do not carry it.
+    /// Attested service delivery can grant ownership only to the bucket owner.
+    fn owner_only_service_delivery(req: &ServiceRequest) -> bool {
+        req.headers
+            .get("x-locallycloud-verified-internal-scope")
+            .is_some_and(|v| v == "1")
+            && req
+                .headers
+                .get("x-amz-acl")
+                .is_some_and(|v| v == "bucket-owner-full-control")
+            && !req
+                .headers
+                .keys()
+                .any(|key| key.as_str().starts_with("x-amz-grant-"))
+            && req
+                .headers
+                .get(locallycloud_core::integration::identity::PRINCIPAL_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_suffix(".amazonaws.com"))
+                .is_some_and(|v| {
+                    !v.is_empty()
+                        && v.bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })
+    }
+
     async fn authorize_object_write(
         &self,
         req: &ServiceRequest,
@@ -965,6 +988,7 @@ impl S3Handler {
             for (header, key) in [
                 ("if-none-match", "s3:if-none-match"),
                 ("if-match", "s3:if-match"),
+                ("x-amz-acl", "s3:x-amz-acl"),
             ] {
                 if let Some(value) = req
                     .headers
@@ -1154,7 +1178,8 @@ impl S3Handler {
             }
             (&Method::HEAD, Shape::Bucket(_)) => q.only_keys(&[]),
             (&Method::GET, Shape::Bucket(_)) => {
-                (q.only_keys(&["notification"]) && q.has("notification"))
+                (q.only_keys(&["acl"]) && q.has("acl"))
+                    || (q.only_keys(&["notification"]) && q.has("notification"))
                     || (q.only_keys(&["versioning"]) && q.has("versioning"))
                     || (q.only_keys(&["policy"]) && q.has("policy"))
                     || (q.only_keys(&["encryption"]) && q.has("encryption"))
@@ -1441,7 +1466,9 @@ impl S3Handler {
                     .any(|name| name == "x-amz-acl" || name.as_str().starts_with("x-amz-grant-"))
             {
                 ops::bucket_configuration::validate_acl(&ctx, bucket, &req.headers).await?;
-                if !ops::bucket_configuration::ownership_enforced(&ctx, bucket).await? {
+                if !ops::bucket_configuration::ownership_enforced(&ctx, bucket).await?
+                    && !Self::owner_only_service_delivery(req)
+                {
                     return Err(S3Error::NotImplemented(
                         "strict object ACL grants and ownership modes are not implemented".into(),
                     ));
@@ -1681,7 +1708,11 @@ impl S3Handler {
                         .await?;
                         ops::list_multipart_uploads(&ctx, b, &q).await
                     }
-                    Some(BucketRead::Acl) => ops::get_bucket_acl(&ctx, b).await,
+                    Some(BucketRead::Acl) => {
+                        self.authorize_action(req, "s3:GetBucketAcl", &format!("arn:aws:s3:::{b}"))
+                            .await?;
+                        ops::get_bucket_acl(&ctx, b).await
+                    }
                     Some(BucketRead::Cors) => ops::get_bucket_cors(&ctx, b).await,
                     Some(BucketRead::Tagging) => {
                         self.authorize_action(
@@ -2099,6 +2130,66 @@ impl NativeHandler for S3Handler {
 }
 
 /// Register S3 as a `Native` REST-XML service in the Core registry.
+#[async_trait]
+impl locallycloud_core::integration::s3::S3DeliveryAuthorizationApi for S3Handler {
+    async fn authorize_delivery(
+        &self,
+        delivery: locallycloud_core::integration::s3::S3DeliveryAuthorizationRequest,
+    ) -> Result<(), locallycloud_core::integration::s3::S3DeliveryAuthorizationError> {
+        use locallycloud_core::integration::identity::{CallerIdentity, IdentityPropagator};
+        use locallycloud_core::integration::s3::S3DeliveryAuthorizationError as Error;
+        if delivery.source_service.as_str().is_empty()
+            || !delivery
+                .source_service
+                .as_str()
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || !delivery
+                .source_arn
+                .starts_with(&format!("arn:aws:{}:", delivery.source_service.as_str()))
+            || delivery.source_arn.split(':').nth(4) != Some(delivery.account_id.as_str())
+            || delivery.key.len() > 1024
+        {
+            return Err(Error::Denied);
+        }
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            http::HeaderValue::from_static("1"),
+        );
+        headers.insert(
+            "x-locallycloud-source-arn",
+            http::HeaderValue::from_str(&delivery.source_arn).map_err(|_| Error::Denied)?,
+        );
+        headers.insert(
+            "x-locallycloud-source-account",
+            http::HeaderValue::from_str(&delivery.account_id).map_err(|_| Error::Denied)?,
+        );
+        headers.insert(
+            "x-amz-acl",
+            http::HeaderValue::from_static("bucket-owner-full-control"),
+        );
+        IdentityPropagator::attach(
+            &mut headers,
+            &CallerIdentity::ServicePrincipal {
+                service: delivery.source_service.as_str().into(),
+            },
+        );
+        let request = ServiceRequest {
+            method: Method::PUT,
+            uri: http::Uri::from_static("/"),
+            headers,
+            body: bytes::Bytes::new(),
+            region: delivery.region,
+            account_id: delivery.account_id,
+            request_id: "s3-delivery-preflight".into(),
+        };
+        self.authorize_object_write(&request, &delivery.bucket, &delivery.key)
+            .await
+            .map_err(|_| Error::Denied)
+    }
+}
+
 pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
@@ -2147,20 +2238,21 @@ pub fn register_with_state_endpoint_config_and_sources(
     )?;
     handler.endpoint_hostname = hostname;
     let handler = Arc::new(handler);
-    registry.register_native(
+    registry.register_native_with_s3_delivery_api(
         ServiceName::new("s3"),
         ServiceMetadata::new(AwsProtocol::RestXml, None),
+        handler.clone(),
         handler.clone(),
     );
     Ok(handler)
 }
 
 pub fn register(registry: &Arc<ServiceRegistry>) {
-    let handler: Arc<dyn NativeHandler> =
-        Arc::new(S3Handler::with_registry(Arc::downgrade(registry)));
-    registry.register_native(
+    let handler = Arc::new(S3Handler::with_registry(Arc::downgrade(registry)));
+    registry.register_native_with_s3_delivery_api(
         ServiceName::new("s3"),
         ServiceMetadata::new(AwsProtocol::RestXml, None),
+        handler.clone(),
         handler,
     );
 }
@@ -2172,6 +2264,51 @@ mod blob_isolation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_delivery_acl_requires_internal_attestation_and_no_other_grants() {
+        use locallycloud_core::integration::identity::PRINCIPAL_HEADER;
+        let mut req = ServiceRequest {
+            method: Method::PUT,
+            uri: http::Uri::from_static("/bucket/key"),
+            headers: http::HeaderMap::new(),
+            body: Bytes::new(),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            request_id: "test".into(),
+        };
+        req.headers.insert(
+            "x-amz-acl",
+            HeaderValue::from_static("bucket-owner-full-control"),
+        );
+        req.headers.insert(
+            PRINCIPAL_HEADER,
+            HeaderValue::from_static("cloudtrail.amazonaws.com"),
+        );
+        assert!(!S3Handler::owner_only_service_delivery(&req));
+        req.headers.insert(
+            "x-locallycloud-verified-internal-scope",
+            HeaderValue::from_static("1"),
+        );
+        assert!(S3Handler::owner_only_service_delivery(&req));
+        req.headers
+            .insert("x-amz-grant-read", HeaderValue::from_static("uri=AllUsers"));
+        assert!(!S3Handler::owner_only_service_delivery(&req));
+        req.headers.remove("x-amz-grant-read");
+        req.headers
+            .insert("x-amz-acl", HeaderValue::from_static("public-read"));
+        assert!(!S3Handler::owner_only_service_delivery(&req));
+        req.headers.insert(
+            "x-amz-acl",
+            HeaderValue::from_static("bucket-owner-full-control"),
+        );
+        req.headers.insert(
+            PRINCIPAL_HEADER,
+            HeaderValue::from_static("arn:aws:iam::000000000000:role/test"),
+        );
+        assert!(!S3Handler::owner_only_service_delivery(&req));
+    }
+
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::time::Duration;

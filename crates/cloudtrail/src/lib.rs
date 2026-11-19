@@ -1,7 +1,9 @@
 //! Bounded, regional CloudTrail management event history.
 //!
-//! This first native slice implements LookupEvents. Trail lifecycle and delivery are explicitly
-//! rejected until receivers and the full AWS contracts are available.
+//! Supports persisted S3 trail lifecycle and bounded delivery of the management operations
+//! captured below. Data-event selectors, organization trails and log digests are unavailable.
+
+mod trails;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -19,7 +21,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-const MAX_BODY: usize = 32 * 1024;
+const MAX_BODY: usize = 128 * 1024;
 const MAX_HISTORY_PER_SCOPE: usize = 10_000;
 const MAX_TOKENS: usize = 256;
 const HISTORY_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -56,11 +58,22 @@ struct State {
 #[derive(Default)]
 pub struct CloudTrailService {
     state: Mutex<State>,
+    trails: trails::Trails,
 }
 
 impl CloudTrailService {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn with_state(
+        registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
+        db: Arc<locallycloud_state::StateDb>,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Arc::new(Self {
+            state: Mutex::new(State::default()),
+            trails: trails::Trails::with_state(registry, db)?,
+        }))
     }
 
     fn lookup(&self, request: &ServiceRequest, body: &Map<String, Value>) -> Result<Value, Error> {
@@ -223,13 +236,14 @@ impl CompletionObserver for CloudTrailService {
             source: source.to_string(),
             error_code: outcome.error_code,
         };
+        self.trails.observe(event.clone());
         // A poisoned or contended observer must never alter the originating response.
         if let Ok(mut state) = self.state.lock() {
             let events = state
                 .history
                 .entry((outcome.account_id, outcome.region))
                 .or_default();
-            events.push_back(event);
+            events.push_back(event.clone());
             while events.len() > MAX_HISTORY_PER_SCOPE {
                 events.pop_front();
             }
@@ -248,19 +262,20 @@ impl NativeHandler for CloudTrailService {
             .headers
             .get("x-amz-target")
             .and_then(|value| value.to_str().ok());
-        if !matches!(
-            target,
-            Some(
-                "CloudTrail_20131101.LookupEvents"
-                    | "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents"
-            )
-        ) {
-            return Error::new(
-                "UnsupportedOperationException",
-                "CloudTrail operation is unavailable",
-            )
-            .render(&request.request_id);
-        }
+        let op = match target.and_then(|target| {
+            target.strip_prefix("CloudTrail_20131101.").or_else(|| {
+                target.strip_prefix("com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.")
+            })
+        }) {
+            Some(op) => op,
+            None => {
+                return Error::new(
+                    "UnsupportedOperationException",
+                    "CloudTrail operation is unavailable",
+                )
+                .render(&request.request_id)
+            }
+        };
         if request.body.len() > MAX_BODY {
             return Error::new(
                 "InvalidLookupAttributesException",
@@ -275,7 +290,14 @@ impl NativeHandler for CloudTrailService {
                     .render(&request.request_id)
             }
         };
-        match self.lookup(&request, &body) {
+        let result = if op == "LookupEvents" {
+            self.trails
+                .authorize(&request, op, "*")
+                .and_then(|_| self.lookup(&request, &body))
+        } else {
+            self.trails.execute(op, request.clone(), body).await
+        };
+        match result {
             Ok(value) => Response::builder()
                 .status(200)
                 .header("content-type", "application/x-amz-json-1.1")
@@ -362,12 +384,14 @@ impl Error {
     fn internal() -> Self {
         Self::new(
             "CloudTrailServiceException",
-            "CloudTrail history is unavailable",
+            "CloudTrail state is unavailable",
         )
     }
     fn render(self, request_id: &str) -> Response {
         let status = if self.code == "CloudTrailServiceException" {
             500
+        } else if self.code == "AccessDeniedException" {
+            403
         } else {
             400
         };
@@ -419,6 +443,225 @@ mod tests {
             account_id: account.into(),
             request_id: "lookup-id".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn trail_delivers_gzip_to_native_s3_and_resumes_after_restart() {
+        use bytes::Bytes;
+        use locallycloud_core::{
+            integration::InternalDispatcher,
+            proxy::{LegacyHealth, ProxyConfig},
+            registry::{ServiceName, ServiceRegistry},
+        };
+        use locallycloud_state::{StateCipher, StateDb};
+        let registry = ServiceRegistry::with_known_services();
+        locallycloud_s3::register(&registry);
+        let dispatcher = Arc::new(InternalDispatcher::new_shared(
+            &registry,
+            ProxyConfig {
+                backend_url: "http://127.0.0.1:1".into(),
+                upstream_timeout: Duration::from_secs(1),
+            },
+            LegacyHealth::new(false),
+            "us-east-1".into(),
+            "111111111111".into(),
+        ));
+        registry.set_internal_dispatcher(dispatcher.clone());
+        let headers = http::HeaderMap::from_iter([(
+            http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=locallycloud/19700101/us-east-1/s3/aws4_request"
+                .parse()
+                .unwrap(),
+        )]);
+        let response = dispatcher
+            .dispatch_scoped(
+                &http::Method::PUT,
+                &"/audit-test".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+                "bucket",
+                "111111111111",
+                "us-east-1",
+            )
+            .await;
+        assert!(response.status().is_success());
+        let (directory, db, trail_state) = tokio::task::spawn_blocking({
+            let registry = Arc::downgrade(&registry);
+            move || {
+                let directory = std::env::temp_dir().join(format!("cloudtrail-{}", Uuid::new_v4()));
+                let db = Arc::new(StateDb::open(directory.join("state.sqlite3")).unwrap());
+                let trails = trails::Trails::with_cipher(
+                    registry,
+                    db.clone(),
+                    StateCipher::with_key(&[6; 32]),
+                )
+                .unwrap();
+                (directory, db, trails)
+            }
+        })
+        .await
+        .unwrap();
+        let service = CloudTrailService {
+            state: Mutex::new(State::default()),
+            trails: trail_state,
+        };
+        let req = request("111111111111", "us-east-1");
+        service
+            .trails
+            .execute(
+                "CreateTrail",
+                req.clone(),
+                json!({"Name":"audit","S3BucketName":"audit-test"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .await
+            .unwrap();
+        let response = dispatcher
+            .dispatch_scoped(
+                &http::Method::GET,
+                &"/audit-test?list-type=2".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+                "list",
+                "111111111111",
+                "us-east-1",
+            )
+            .await;
+        let xml = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            !xml.contains("<Key>"),
+            "permission preflight must not create objects"
+        );
+        service
+            .trails
+            .execute(
+                "StartLogging",
+                req.clone(),
+                json!({"Name":"audit"}).as_object().unwrap().clone(),
+            )
+            .await
+            .unwrap();
+        let event = outcome("111111111111", "us-east-1", "CreateQueue", None);
+        let id = event.dispatch_id.clone();
+        service.observe(event);
+        let status = service
+            .trails
+            .execute(
+                "GetTrailStatus",
+                req.clone(),
+                json!({"Name":"audit"}).as_object().unwrap().clone(),
+            )
+            .await
+            .unwrap();
+        assert!(status["LatestDeliveryTime"].is_number());
+        assert!(status.get("LatestDeliveryError").is_none());
+        let response = dispatcher
+            .dispatch_scoped(
+                &http::Method::GET,
+                &"/audit-test?list-type=2".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+                "list",
+                "111111111111",
+                "us-east-1",
+            )
+            .await;
+        let xml = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let key = xml
+            .split("<Key>")
+            .nth(1)
+            .unwrap()
+            .split("</Key>")
+            .next()
+            .unwrap();
+        assert!(key.contains("CloudTrail/us-east-1/"));
+        let response = dispatcher
+            .dispatch_scoped(
+                &http::Method::GET,
+                &format!("/audit-test/{key}").parse().unwrap(),
+                &headers,
+                Bytes::new(),
+                "read",
+                "111111111111",
+                "us-east-1",
+            )
+            .await;
+        let data = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let mut decoded = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&data[..]), &mut decoded)
+            .unwrap();
+        let log: Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(log["Records"][0]["eventID"], id);
+        drop(service);
+        let trails = tokio::task::spawn_blocking({
+            let db = db.clone();
+            let registry = Arc::downgrade(&registry);
+            move || {
+                trails::Trails::with_cipher(registry, db, StateCipher::with_key(&[6; 32])).unwrap()
+            }
+        })
+        .await
+        .unwrap();
+        let service = CloudTrailService {
+            state: Mutex::new(State::default()),
+            trails,
+        };
+        service.observe(outcome("111111111111", "us-east-1", "DeleteQueue", None));
+        let status = service
+            .trails
+            .execute(
+                "GetTrailStatus",
+                req.clone(),
+                json!({"Name":"audit"}).as_object().unwrap().clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status["IsLogging"], true);
+        service
+            .trails
+            .execute(
+                "StopLogging",
+                req.clone(),
+                json!({"Name":"audit"}).as_object().unwrap().clone(),
+            )
+            .await
+            .unwrap();
+        let missing = service
+            .trails
+            .execute(
+                "CreateTrail",
+                req,
+                json!({"Name":"missing","S3BucketName":"missing-bucket"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "S3BucketDoesNotExistException");
+        assert!(registry.s3_delivery_api(&ServiceName::new("s3")).is_some());
+        drop(service);
+        drop(db);
+        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(directory))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

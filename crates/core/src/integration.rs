@@ -40,6 +40,7 @@ pub mod logs;
 pub mod metrics;
 pub mod pattern;
 pub mod request_context;
+pub mod s3;
 pub mod sigv4;
 
 pub struct InternalDispatcher {

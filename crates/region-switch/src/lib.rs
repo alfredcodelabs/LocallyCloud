@@ -1,8 +1,12 @@
 //! ARC Region Switch subset: two-region, one-step routing-control plans.
 //! The routing-control backend is injected; this crate never owns ARC state.
 
+mod persistence;
+
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -46,15 +50,17 @@ pub trait ExecutionRoleAuthorizer: Send + Sync {
     ) -> Result<(), String>;
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Plan {
     value: Value,
     account: String,
     controls: BTreeMap<String, String>,
     actions: Vec<(String, String, String)>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Execution {
     value: Value,
     fingerprint: String,
@@ -71,7 +77,8 @@ struct State {
 pub struct RegionSwitchHandler {
     controls: Arc<dyn RoutingControls>,
     roles: Arc<dyn ExecutionRoleAuthorizer>,
-    state: Mutex<State>,
+    state: Arc<tokio::sync::Mutex<State>>,
+    persistence: Option<Arc<persistence::Persistence>>,
 }
 
 impl RegionSwitchHandler {
@@ -82,8 +89,24 @@ impl RegionSwitchHandler {
         Self {
             controls,
             roles,
-            state: Mutex::new(State::default()),
+            state: Arc::new(tokio::sync::Mutex::new(State::default())),
+            persistence: None,
         }
+    }
+
+    pub fn with_state(
+        controls: Arc<dyn RoutingControls>,
+        roles: Arc<dyn ExecutionRoleAuthorizer>,
+        db: Arc<locallycloud_state::StateDb>,
+    ) -> Result<Self, String> {
+        let persistence = persistence::Persistence::new(db)?;
+        let state = persistence.restore()?;
+        Ok(Self {
+            controls,
+            roles,
+            state: Arc::new(tokio::sync::Mutex::new(state)),
+            persistence: Some(Arc::new(persistence)),
+        })
     }
 
     async fn dispatch(
@@ -93,7 +116,7 @@ impl RegionSwitchHandler {
         body: &Value,
     ) -> Result<Value, Error> {
         let resource = match op {
-            "CreatePlan" => "*",
+            "CreatePlan" | "ListPlans" => "*",
             "GetPlan" => body.get("arn").and_then(Value::as_str).unwrap_or("*"),
             "StartPlanExecution" | "GetPlanExecution" => {
                 body.get("planArn").and_then(Value::as_str).unwrap_or("*")
@@ -269,7 +292,36 @@ impl RegionSwitchHandler {
                         .await
                         .map_err(Error::denied)?;
                 }
-                let mut state = self.state.lock().map_err(|_| Error::internal())?;
+                let tags = match body.get("tags") {
+                    None => BTreeMap::new(),
+                    Some(Value::Object(tags)) if tags.len() <= 200 => tags
+                        .iter()
+                        .map(|(key, value)| {
+                            let value = value
+                                .as_str()
+                                .ok_or_else(|| Error::invalid("Invalid tag value"))?;
+                            if key.is_empty()
+                                || key.len() > 128
+                                || key.starts_with("aws:")
+                                || value.len() > 256
+                            {
+                                return Err(Error::invalid("Invalid plan tag"));
+                            }
+                            Ok((key.clone(), value.to_owned()))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                    _ => return Err(Error::invalid("Invalid plan tags")),
+                };
+                let request = request.clone();
+                let body = body.clone();
+                let name = name.to_owned();
+                let regions = regions.clone();
+                let role = role.to_owned();
+                let workflows = workflows.clone();
+                let mut state = self.state.clone().lock_owned().await;
+                let persistence = self.persistence.clone();
+                tokio::task::spawn_blocking(move || {
+
                 if state
                     .plans
                     .values()
@@ -292,29 +344,102 @@ impl RegionSwitchHandler {
                     value["primaryRegion"] = primary.clone();
                 }
                 if let Some(description) = body.get("description") {
+                    if !description.is_string() { return Err(Error::invalid("description must be a string")); }
                     value["description"] = description.clone();
                 }
-                state.plans.insert(
-                    arn,
-                    Plan {
-                        value: value.clone(),
-                        account: request.account_id.clone(),
-                        controls,
-                        actions,
-                    },
-                );
+                if let Some(value_rto)=body.get("recoveryTimeObjectiveMinutes") {
+                    if value_rto.as_u64().is_none_or(|v|!(1..=10080).contains(&v)) { return Err(Error::invalid("Invalid recoveryTimeObjectiveMinutes")); }
+                    value["recoveryTimeObjectiveMinutes"]=value_rto.clone();
+                }
+                let plan = Plan { value:value.clone(), account:request.account_id.clone(), controls, actions, tags };
+                if let Some(persistence) = persistence { persistence.plan(&plan)?; }
+                state.plans.insert(arn,plan);
                 Ok(json!({"plan":value}))
+                }).await.map_err(|_|Error::internal())?
+            }
+            "ListPlans" => {
+                if body.as_object().is_none_or(|fields| {
+                    fields
+                        .keys()
+                        .any(|key| key != "maxResults" && key != "nextToken")
+                }) {
+                    return Err(Error::invalid("Unsupported list field"));
+                }
+                let limit = match body.get("maxResults") {
+                    None => 100,
+                    Some(v) => v
+                        .as_u64()
+                        .filter(|v| (1..=100).contains(v))
+                        .ok_or_else(|| Error::invalid("maxResults must be between 1 and 100"))?
+                        as usize,
+                };
+                let cursor = match body.get("nextToken") {
+                    None => None,
+                    Some(Value::String(token)) if token.len() <= 4096 => {
+                        let (account, cursor): (String, String) = serde_json::from_str(token)
+                            .map_err(|_| Error::invalid("Invalid nextToken"))?;
+                        if account != request.account_id
+                            || !cursor.starts_with(&format!(
+                                "arn:aws:arc-region-switch::{}:plan/",
+                                request.account_id
+                            ))
+                        {
+                            return Err(Error::invalid("Invalid nextToken"));
+                        }
+                        Some(cursor)
+                    }
+                    _ => return Err(Error::invalid("Invalid nextToken")),
+                };
+                let state = self.state.lock().await;
+                let mut plans = state.plans.iter().filter(|(arn, p)| {
+                    p.account == request.account_id
+                        && cursor.as_ref().is_none_or(|cursor| *arn > cursor)
+                });
+                let page = plans.by_ref().take(limit).collect::<Vec<_>>();
+                let summaries = page
+                    .iter()
+                    .map(|(_, p)| {
+                        let mut summary = serde_json::Map::new();
+                        for field in [
+                            "arn",
+                            "owner",
+                            "name",
+                            "regions",
+                            "recoveryApproach",
+                            "primaryRegion",
+                            "version",
+                            "updatedAt",
+                            "description",
+                            "executionRole",
+                            "recoveryTimeObjectiveMinutes",
+                        ] {
+                            if let Some(value) = p.value.get(field) {
+                                summary.insert(field.into(), value.clone());
+                            }
+                        }
+                        Value::Object(summary)
+                    })
+                    .collect::<Vec<_>>();
+                let mut response = json!({"plans":summaries});
+                if plans.next().is_some() {
+                    if let Some((arn, _)) = page.last() {
+                        response["nextToken"] = serde_json::to_string(&(&request.account_id, arn))
+                            .map_err(|_| Error::internal())?
+                            .into();
+                    }
+                }
+                Ok(response)
             }
             "GetPlan" => {
                 let arn = required(body, "arn")?;
-                let state = self.state.lock().map_err(|_| Error::internal())?;
+                let state = self.state.lock().await;
                 let plan = scoped_plan(&state, arn, &request.account_id)?;
                 Ok(json!({"plan":plan.value}))
             }
             "StartPlanExecution" => {
                 let arn = required(body, "planArn")?.to_string();
                 let plan = {
-                    let state = self.state.lock().map_err(|_| Error::internal())?;
+                    let state = self.state.lock().await;
                     scoped_plan(&state, &arn, &request.account_id)?.clone()
                 };
                 let target = required(body, "targetRegion")?;
@@ -350,7 +475,7 @@ impl RegionSwitchHandler {
                 fingerprint.as_object_mut().unwrap().remove("clientToken");
                 let fingerprint = fingerprint.to_string();
                 if let Some(token) = &token {
-                    let state = self.state.lock().map_err(|_| Error::internal())?;
+                    let state = self.state.lock().await;
                     if let Some(id) = state.tokens.get(&(arn.clone(), token.clone())) {
                         let previous = &state.executions[&(arn.clone(), id.clone())];
                         if previous.fingerprint != fingerprint {
@@ -372,7 +497,15 @@ impl RegionSwitchHandler {
                         .await
                         .map_err(Error::denied)?;
                 }
-                let mut state = self.state.lock().map_err(|_| Error::internal())?;
+                let request = request.clone();
+                let target = target.to_owned();
+                let action = action.to_owned();
+                let mode = mode.to_owned();
+                let mut state = self.state.clone().lock_owned().await;
+                let controls = self.controls.clone();
+                let persistence = self.persistence.clone();
+                tokio::task::spawn_blocking(move || {
+
                 if let Some(token) = &token {
                     if let Some(id) = state.tokens.get(&(arn.clone(), token.clone())) {
                         let previous = &state.executions[&(arn.clone(), id.clone())];
@@ -389,7 +522,7 @@ impl RegionSwitchHandler {
                 } else {
                     plan.controls
                         .keys()
-                        .find(|r| r.as_str() != target)
+                        .find(|r| r.as_str() != target.as_str())
                         .unwrap()
                         .clone()
                 };
@@ -405,14 +538,13 @@ impl RegionSwitchHandler {
                 let started = now();
                 // The destination must be On before the origin can be Off. If the second
                 // operation fails, both controls remain On and traffic is never blackholed.
-                let result = self
-                    .controls
+                let result = controls
                     .get(origin_arn)
-                    .and_then(|_| self.controls.set(destination_arn, true))
-                    .and_then(|_| self.controls.get(destination_arn))
+                    .and_then(|_| controls.set(destination_arn, true))
+                    .and_then(|_| controls.get(destination_arn))
                     .and_then(|on| {
                         if on {
-                            self.controls.set(origin_arn, false)
+                            controls.set(origin_arn, false)
                         } else {
                             Err("Destination routing control did not become On".into())
                         }
@@ -430,6 +562,8 @@ impl RegionSwitchHandler {
                     execution["comment"] = json!(error);
                 }
                 let response = json!({"executionId":id,"plan":arn,"planVersion":"1","activateRegion":destination,"deactivateRegion":origin});
+                let saved_execution = Execution { value:execution.clone(), fingerprint:fingerprint.clone(), response:response.clone() };
+                if let Some(persistence) = persistence { persistence.execution(&request.account_id,&arn,&id,token.clone(),saved_execution)?; }
                 state.executions.insert(
                     (arn.clone(), id.clone()),
                     Execution {
@@ -442,10 +576,11 @@ impl RegionSwitchHandler {
                     state.tokens.insert((arn, token), id);
                 }
                 Ok(response)
+                }).await.map_err(|_|Error::internal())?
             }
             "GetPlanExecution" => {
                 let arn = required(body, "planArn")?;
-                let state = self.state.lock().map_err(|_| Error::internal())?;
+                let state = self.state.lock().await;
                 scoped_plan(&state, arn, &request.account_id)?;
                 let id = required(body, "executionId")?;
                 let execution = state
@@ -541,7 +676,7 @@ impl NativeHandler for RegionSwitchHandler {
         Ok(self
             .state
             .lock()
-            .map_err(|_| "Region Switch inventory unavailable")?
+            .await
             .plans
             .iter()
             .filter(|(_, p)| p.account == account)
@@ -559,6 +694,9 @@ impl NativeHandler for RegionSwitchHandler {
         };
         if request.method != Method::POST || request.uri.path() != "/" {
             return Error::invalid("Only POST / is supported").response();
+        }
+        if request.body.len() > 1024 * 1024 {
+            return Error::invalid("Request body exceeds 1 MiB").response();
         }
         let body: Value = match serde_json::from_slice::<Value>(&request.body) {
             Ok(value) if value.is_object() => value,
@@ -662,6 +800,135 @@ mod tests {
                         "us-east-1":[{"routingControlArn":east,"state":"Off"}],
                         "us-west-2":[{"routingControlArn":west,"state":"On"}]}}}}]}]})
     }
+    #[tokio::test]
+    async fn list_pages_are_account_scoped_and_restore_with_executions() {
+        use locallycloud_state::{StateCipher, StateDb};
+        let (directory, db, persistence, state) = tokio::task::spawn_blocking(|| {
+            let directory = std::env::temp_dir().join(format!("region-switch-{}", Uuid::new_v4()));
+            let db = Arc::new(StateDb::open(directory.join("state.sqlite3")).unwrap());
+            let persistence =
+                persistence::Persistence::with_cipher(db.clone(), StateCipher::with_key(&[9; 32]))
+                    .unwrap();
+            let state = persistence.restore().unwrap();
+            (directory, db, persistence, state)
+        })
+        .await
+        .unwrap();
+        let backend = Arc::new(Controls::default());
+        backend.on.lock().unwrap().insert(
+            "arn:aws:route53-recovery-control::123456789012:routingcontrol/east".into(),
+            true,
+        );
+        backend.on.lock().unwrap().insert(
+            "arn:aws:route53-recovery-control::123456789012:routingcontrol/west".into(),
+            false,
+        );
+        let roles = Arc::new(Roles {
+            exists: AtomicBool::new(true),
+            caller_allowed: AtomicBool::new(true),
+        });
+        let first = RegionSwitchHandler {
+            controls: backend.clone(),
+            roles: roles.clone(),
+            state: Arc::new(tokio::sync::Mutex::new(state)),
+            persistence: Some(Arc::new(persistence)),
+        };
+        let mut arns = Vec::new();
+        for index in 0..3 {
+            let mut body = plan();
+            body["name"] = format!("switch-{index}").into();
+            arns.push(
+                first
+                    .dispatch("CreatePlan", &request(), &body)
+                    .await
+                    .unwrap()["plan"]["arn"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        let page = first
+            .dispatch("ListPlans", &request(), &json!({"maxResults":1}))
+            .await
+            .unwrap();
+        assert_eq!(page["plans"].as_array().unwrap().len(), 1);
+        assert!(page["plans"][0].get("workflows").is_none());
+        let next = first
+            .dispatch(
+                "ListPlans",
+                &request(),
+                &json!({"maxResults":1,"nextToken":page["nextToken"]}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(page["plans"][0]["arn"], next["plans"][0]["arn"]);
+        let mut foreign = request();
+        foreign.account_id = "111111111111".into();
+        assert!(first
+            .dispatch(
+                "ListPlans",
+                &foreign,
+                &json!({"nextToken":page["nextToken"]})
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            first
+                .dispatch("ListPlans", &foreign, &json!({}))
+                .await
+                .unwrap()["plans"],
+            json!([])
+        );
+        let input = json!({"planArn":arns[0],"targetRegion":"us-west-2","action":"activate","clientToken":"persistent"});
+        let execution = first
+            .dispatch("StartPlanExecution", &request(), &input)
+            .await
+            .unwrap();
+        let restored = {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || {
+                persistence::Persistence::with_cipher(db, StateCipher::with_key(&[9; 32]))
+                    .unwrap()
+                    .restore()
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        };
+        let second = RegionSwitchHandler {
+            controls: backend.clone(),
+            roles,
+            state: Arc::new(tokio::sync::Mutex::new(restored)),
+            persistence: None,
+        };
+        assert_eq!(
+            second
+                .dispatch("ListPlans", &request(), &json!({}))
+                .await
+                .unwrap()["plans"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let calls = backend.calls.lock().unwrap().len();
+        assert_eq!(
+            second
+                .dispatch("StartPlanExecution", &request(), &input)
+                .await
+                .unwrap(),
+            execution
+        );
+        assert_eq!(backend.calls.lock().unwrap().len(), calls);
+        drop(first);
+        drop(second);
+        drop(db);
+        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(directory))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn switches_destination_first_and_replays_token() {
         let backend = Arc::new(Controls::default());

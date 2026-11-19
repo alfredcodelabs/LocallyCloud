@@ -122,6 +122,7 @@ pub(super) fn apply_predicates(
 
 #[derive(Clone)]
 pub(super) enum Projection {
+    All,
     Count(String),
     Sum { column: String, alias: String },
     Columns(Vec<String>),
@@ -216,9 +217,90 @@ impl<'a> SqlParser<'a> {
         }
     }
 
+    pub(super) fn constant(mut self) -> Result<Option<QueryResult>, String> {
+        self.keyword("SELECT")?;
+        let mut columns = Vec::new();
+        let mut values = Vec::new();
+        loop {
+            self.skip_whitespace();
+            let (kind, value) = if self.try_punctuation(b'\'') {
+                let mut literal = Vec::new();
+                loop {
+                    let byte = self.peek().ok_or("Unterminated SQL literal")?;
+                    self.position += 1;
+                    if byte == b'\'' {
+                        if self.peek() == Some(b'\'') {
+                            self.position += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    literal.push(byte);
+                }
+                (
+                    "varchar",
+                    Some(String::from_utf8(literal).map_err(|_| "Invalid UTF-8")?),
+                )
+            } else if self.try_keyword("TRUE") {
+                ("boolean", Some("true".into()))
+            } else if self.try_keyword("FALSE") {
+                ("boolean", Some("false".into()))
+            } else if self.try_keyword("NULL") {
+                ("unknown", None)
+            } else if self.peek().is_some_and(|b| b.is_ascii_digit() || b == b'-') {
+                let start = self.position;
+                if self.peek() == Some(b'-') {
+                    self.position += 1;
+                }
+                while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                    self.position += 1;
+                }
+                let number = std::str::from_utf8(&self.input[start..self.position])
+                    .map_err(|_| "Invalid integer")?
+                    .parse::<i64>()
+                    .map_err(|_| "Invalid integer")?;
+                (
+                    if i32::try_from(number).is_ok() {
+                        "integer"
+                    } else {
+                        "bigint"
+                    },
+                    Some(number.to_string()),
+                )
+            } else {
+                return Ok(None);
+            };
+            let name = if self.try_keyword("AS") {
+                self.identifier()?
+            } else {
+                format!("_col{}", columns.len())
+            };
+            columns.push(ResultColumn { name, kind });
+            values.push(value);
+            if columns.len() > 32 {
+                return Err("Too many selected columns".into());
+            }
+            if !self.try_punctuation(b',') {
+                break;
+            }
+        }
+        self.try_punctuation(b';');
+        self.skip_whitespace();
+        if self.position != self.input.len() {
+            return Ok(None);
+        }
+        let header = columns.iter().map(|c| Some(c.name.clone())).collect();
+        Ok(Some(QueryResult {
+            columns,
+            rows: vec![header, values],
+        }))
+    }
+
     pub(super) fn parse(mut self) -> Result<ParsedQuery, String> {
         self.keyword("SELECT")?;
-        let projection = if self.try_keyword("SUM") {
+        let projection = if self.try_punctuation(b'*') {
+            Projection::All
+        } else if self.try_keyword("SUM") {
             self.punctuation(b'(')?;
             let column = self.identifier()?;
             self.punctuation(b')')?;
@@ -523,6 +605,9 @@ pub(super) fn result_csv_rows(
         if row.len() != column_count {
             return Err("Result CSV column count does not match execution metadata".into());
         }
+        if rows.len().saturating_add(1).saturating_mul(column_count) > 4_000_000 {
+            return Err("Result CSV exceeds the cell limit".into());
+        }
         rows.push(row);
     }
     Ok(rows)
@@ -584,5 +669,44 @@ mod result_adapter_tests {
             .metadata()["Precision"],
             i32::MAX
         );
+    }
+}
+
+#[cfg(test)]
+mod select_regression_tests {
+    use super::*;
+    #[test]
+    fn constants_and_star_are_distinct_from_table_projections() {
+        let result = SqlParser::new(
+            "SELECT 1 AS proof, 'it''s local' AS message, true AS enabled, NULL AS missing;",
+        )
+        .constant()
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.columns[0].kind, "integer");
+        assert_eq!(
+            result.rows[1],
+            vec![
+                Some("1".into()),
+                Some("it's local".into()),
+                Some("true".into()),
+                None
+            ]
+        );
+        assert!(SqlParser::new("SELECT 1; DROP TABLE hidden")
+            .constant()
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            SqlParser::new("SELECT * FROM catalog")
+                .parse()
+                .unwrap()
+                .projection,
+            Projection::All
+        ));
+        assert!(SqlParser::new("SELECT 1 FROM catalog")
+            .constant()
+            .unwrap()
+            .is_none());
     }
 }

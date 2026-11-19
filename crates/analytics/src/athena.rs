@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::state::Scope;
 
 mod duckdb;
+mod flat;
 mod sql;
 pub use duckdb::DuckDbEngine;
 use duckdb::IcebergQueryEngine;
@@ -936,7 +937,10 @@ async fn read_query(
     spec: &QuerySpec,
     engine: Option<&dyn IcebergQueryEngine>,
 ) -> Result<(QueryResult, u64), WorkerFailure> {
-    let parsed = match SqlParser::new(&spec.query_string).parse() {
+    if let Ok(Some(result)) = SqlParser::new(&spec.query_string).constant() {
+        return Ok((result, 0));
+    }
+    let mut parsed = match SqlParser::new(&spec.query_string).parse() {
         Ok(parsed) => parsed,
         Err(reason) => {
             return match engine {
@@ -964,6 +968,43 @@ async fn read_query(
             )
         })?;
     let table = glue_table_snapshot(registry, scope, caller, &database, &parsed.table).await?;
+    if !is_iceberg_table(&table) {
+        if let Projection::Count(alias) = &parsed.projection {
+            let serde = table
+                .storage_descriptor
+                .as_ref()
+                .and_then(|v| v["SerdeInfo"]["SerializationLibrary"].as_str());
+            if parsed.predicates.is_empty() && serde == Some(JSON_SERDE) {
+                let (count, scanned) = jsonl_count(registry, scope, caller, record, &table).await?;
+                return Ok((QueryResult::count(alias.clone(), count), scanned));
+            }
+        }
+        return flat::query(registry, scope, caller, record, &table, &parsed).await;
+    }
+    if matches!(parsed.projection, Projection::All) {
+        let (metadata, _, _, _) =
+            iceberg_snapshot_objects(registry, scope, caller, record, &table, 0).await?;
+        let id = metadata["current-schema-id"].as_i64();
+        let fields = metadata["schemas"]
+            .as_array()
+            .and_then(|schemas| {
+                schemas
+                    .iter()
+                    .find(|schema| schema["schema-id"].as_i64() == id)
+            })
+            .and_then(|schema| schema["fields"].as_array())
+            .ok_or_else(|| WorkerFailure::failed("Iceberg schema fields are missing", 0))?;
+        let names = fields
+            .iter()
+            .map(|field| {
+                field["name"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| WorkerFailure::failed("Invalid Iceberg column name", 0))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        parsed.projection = Projection::Columns(names);
+    }
     let result = if let Some(engine) = engine.filter(|_| is_iceberg_table(&table)) {
         engine
             .query(
@@ -985,6 +1026,7 @@ async fn read_query(
             ));
         }
         let mut names = match &parsed.projection {
+            Projection::All => return Err(WorkerFailure::failed("Unresolved star projection", 0)),
             Projection::Columns(names) => names.clone(),
             Projection::Count(_) => Vec::new(),
             Projection::Sum { column, .. } => vec![column.clone()],
@@ -1008,6 +1050,7 @@ async fn read_query(
         apply_predicates(&mut result, &parsed.predicates)
             .map_err(|reason| WorkerFailure::failed(reason, scanned))?;
         match &parsed.projection {
+            Projection::All => return Err(WorkerFailure::failed("Unresolved star projection", 0)),
             Projection::Sum { alias, .. } => (
                 sum_result(&result, alias)
                     .map_err(|reason| WorkerFailure::failed(reason, scanned))?,
@@ -1027,6 +1070,7 @@ async fn read_query(
         }
     } else {
         match parsed.projection {
+            Projection::All => return Err(WorkerFailure::failed("Unresolved star projection", 0)),
             Projection::Count(alias) => {
                 let (count, scanned) = if is_iceberg_table(&table) {
                     iceberg_count(registry, scope, caller, record, &table).await?
@@ -1987,7 +2031,12 @@ fn table_location(table: &GlueTableOutput) -> Result<S3Location, WorkerFailure> 
         .ok_or_else(|| {
             WorkerFailure::failed("Glue table is missing SerdeInfo.SerializationLibrary", 0)
         })?;
-    if serde != JSON_SERDE {
+    if !matches!(
+        serde,
+        JSON_SERDE
+            | "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+            | "org.apache.hadoop.hive.serde2.OpenCSVSerde"
+    ) {
         return Err(WorkerFailure::failed(
             format!("Unsupported Glue serialization library {serde}"),
             0,
@@ -3390,6 +3439,135 @@ mod tests {
             changed["ResultSet"]["ResultSetMetadata"],
             first["ResultSet"]["ResultSetMetadata"]
         );
+    }
+
+    #[tokio::test]
+    async fn text_queries_read_native_s3_glue_and_write_exact_results() {
+        let (registry, _) = analytics_registry();
+        locallycloud_s3::register(&registry);
+        let scope = Scope::new(ACCOUNT_ID, REGION);
+        let weak = Arc::downgrade(&registry);
+        s3_request(
+            &weak,
+            &scope,
+            None,
+            "s3:CreateBucket",
+            "arn:aws:s3:::analytics-data".into(),
+            Method::PUT,
+            "/analytics-data".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        seed_glue_catalog(&registry, &scope).await;
+        for (name, serde, body) in [
+            ("csv_items", flat::LAZY_SERDE, "1,hello\n2,world\n"),
+            (
+                "json_items",
+                JSON_SERDE,
+                "{\"id\":1,\"value\":\"hello\"}\n{\"id\":2,\"value\":\"world\"}\n",
+            ),
+        ] {
+            let _:Value=glue_json_request(&weak,&scope,None,"CreateTable",json!({"CatalogId":scope.account_id(),"DatabaseName":"analytics_db","TableInput":{"Name":name,"StorageDescriptor":{"Columns":[{"Name":"id","Type":"int"},{"Name":"value","Type":"string"}],"Location":format!("s3://analytics-data/{name}/"),"InputFormat":JSON_INPUT_FORMAT,"SerdeInfo":{"SerializationLibrary":serde,"Parameters":{"field.delim":","}}}}})).await.unwrap();
+            put_object(
+                &weak,
+                &scope,
+                None,
+                "analytics-data",
+                &format!("{name}/data"),
+                Bytes::copy_from_slice(body.as_bytes()),
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        let oversized_projection = format!(
+            "SELECT {} FROM analytics_db.csv_items",
+            vec!["value"; 32].join(",")
+        );
+        for (index, (query, expected)) in [
+            (
+                "SELECT 1 AS proof",
+                vec![vec![Some("proof".into())], vec![Some("1".into())]],
+            ),
+            (
+                "SELECT * FROM analytics_db.csv_items",
+                vec![
+                    vec![Some("id".into()), Some("value".into())],
+                    vec![Some("1".into()), Some("hello".into())],
+                    vec![Some("2".into()), Some("world".into())],
+                ],
+            ),
+            (
+                "SELECT value FROM analytics_db.json_items WHERE id >= 2",
+                vec![vec![Some("value".into())], vec![Some("world".into())]],
+            ),
+            (
+                "SELECT SUM(id) AS total FROM analytics_db.csv_items",
+                vec![vec![Some("total".into())], vec![Some("3".into())]],
+            ),
+            (oversized_projection.as_str(), Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let spec = QuerySpec {
+                query_string: query.into(),
+                context: None,
+                result_configuration: ResultConfiguration {
+                    output_location: "s3://analytics-data/results/".into(),
+                },
+                work_group: None,
+            };
+            let output = S3Location {
+                bucket: "analytics-data".into(),
+                key: format!("results/text-{index}.csv"),
+            };
+            let record = Arc::new(Mutex::new(QueryRecord {
+                id: format!("text-{index}"),
+                spec: spec.clone(),
+                effective_output_location: output.clone(),
+                state: QueryState::Running,
+                submission_time: 0.0,
+                completion_time: None,
+                reason: None,
+                scanned_bytes: 0,
+                result: None,
+                result_token: "test".into(),
+                caller: None,
+            }));
+            if expected.is_empty() {
+                put_object(
+                    &weak,
+                    &scope,
+                    None,
+                    "analytics-data",
+                    "csv_items/data",
+                    Bytes::from(format!("1,{}\n", "x".repeat(3 * 1024 * 1024))),
+                    0,
+                )
+                .await
+                .unwrap();
+                let failure = execute_query(&weak, &scope, None, &record, &spec, &output, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(failure, WorkerFailure::Failed { reason, .. } if reason.contains("result byte limit"))
+                );
+                continue;
+            }
+            execute_query(&weak, &scope, None, &record, &spec, &output, None)
+                .await
+                .unwrap_or_else(|_| panic!("query failed: {query}"));
+            let body = get_object(&weak, &scope, None, "analytics-data", &output.key, 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                sql::result_csv_rows(&body, expected[0].len()).unwrap(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]

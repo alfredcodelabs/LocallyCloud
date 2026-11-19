@@ -143,6 +143,7 @@ impl DuckDbEngine {
         )
         .await?;
         let mut fields = match &parsed.projection {
+            Projection::All => return Err(failure("Unresolved star projection", scanned)),
             Projection::Columns(names) => names.clone(),
             Projection::Sum { column, .. } => vec![column.clone()],
             Projection::Count(_) => Vec::new(),
@@ -652,6 +653,7 @@ fn render(
     path: &Path,
 ) -> Result<(String, Vec<ResultColumn>), WorkerFailure> {
     let (select, output) = match &parsed.projection {
+        Projection::All => return Err(failure("Unresolved star projection", 0)),
         Projection::Count(alias) => (
             "CAST(COUNT(*) AS VARCHAR) AS c0".into(),
             vec![ResultColumn {

@@ -1259,3 +1259,30 @@ async fn conditional_write_policy_enforces_headers_but_allows_multipart_setup() 
         .insert("if-none-match", HeaderValue::from_static("*"));
     assert_eq!(fixture.s3.handle(complete).await.status(), 200);
 }
+
+#[tokio::test]
+async fn strict_bucket_acl_read_checks_its_own_permission() {
+    let f = Fixture::new().await;
+    let allowed =
+        f.s3.handle(request(
+            Method::GET,
+            "/policy-source?acl",
+            "",
+            OWNER,
+            Some(&f.admin),
+        ))
+        .await;
+    assert_eq!(allowed.status(), 200);
+    assert!(body(allowed).await.contains("AccessControlPolicy"));
+    let denied =
+        f.s3.handle(request(
+            Method::GET,
+            "/policy-source?acl",
+            "",
+            OWNER,
+            Some(&f.reader),
+        ))
+        .await;
+    assert_eq!(denied.status(), 403);
+    assert!(body(denied).await.contains("AccessDenied"));
+}
