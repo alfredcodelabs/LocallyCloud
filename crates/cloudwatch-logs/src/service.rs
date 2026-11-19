@@ -51,34 +51,65 @@ impl LogsHandler {
         registry: Weak<ServiceRegistry>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, RegistrationError> {
-        Self::with_store(registry, clock, Arc::new(LogsStore::default()))
+        Self::with_store(
+            registry,
+            clock,
+            Arc::new(LogsStore::default()),
+            crate::LogsConfig::default(),
+        )
     }
 
     pub(crate) fn with_state(
         registry: Weak<ServiceRegistry>,
         state: Arc<locallycloud_state::StateDb>,
     ) -> Result<Self, RegistrationError> {
+        Self::with_state_and_config(registry, state, crate::LogsConfig::default())
+    }
+
+    pub(crate) fn with_state_and_config(
+        registry: Weak<ServiceRegistry>,
+        state: Arc<locallycloud_state::StateDb>,
+        config: crate::LogsConfig,
+    ) -> Result<Self, RegistrationError> {
+        config
+            .validate()
+            .map_err(|_| RegistrationError::InvalidConfiguration)?;
         let cipher = locallycloud_state::StateCipher::from_env()
             .map_err(|_| RegistrationError::StateUnavailable)?;
         let store = Arc::new(
             LogsStore::durable(state, cipher).map_err(|_| RegistrationError::StateUnavailable)?,
         );
-        Self::with_store(registry, Arc::new(SystemClock), store)
+        Self::with_store(registry, Arc::new(SystemClock), store, config)
     }
 
     fn with_store(
         registry: Weak<ServiceRegistry>,
         clock: Arc<dyn Clock>,
         store: Arc<LogsStore>,
+        config: crate::LogsConfig,
     ) -> Result<Self, RegistrationError> {
         registry
             .upgrade()
             .ok_or(RegistrationError::RegistryUnavailable)?;
-        let retention_worker = RetentionWorker::new(store.clone(), clock.clone());
-        let metric_delivery_worker = MetricDeliveryWorker::new(store.clone(), registry.clone());
-        let subscription_delivery_worker =
-            SubscriptionDeliveryWorker::new(store.clone(), registry.clone());
+        let retention_worker = RetentionWorker::with_delay(
+            store.clone(),
+            clock.clone(),
+            std::time::Duration::from_millis(config.retention_reclaim_delay_ms),
+        );
+        let metric_delivery_worker = MetricDeliveryWorker::with_retry_interval(
+            store.clone(),
+            registry.clone(),
+            std::time::Duration::from_millis(config.delivery_retry_interval_ms),
+        );
+        let subscription_delivery_worker = SubscriptionDeliveryWorker::with_retry_interval(
+            store.clone(),
+            registry.clone(),
+            std::time::Duration::from_millis(config.delivery_retry_interval_ms),
+        );
         let query_worker = QueryWorker::new(store.clone(), clock.clone());
+        let (retention_pending, metrics_pending, subscriptions_pending, queries_pending) = store
+            .background_work()
+            .map_err(|_| RegistrationError::StateUnavailable)?;
         let persistence = store.persistence();
         let api = Arc::new(LogsApi {
             registry,
@@ -101,10 +132,18 @@ impl LogsHandler {
             query_worker,
         };
         if tokio::runtime::Handle::try_current().is_ok() {
-            handler.retention_worker.wake();
-            handler.metric_delivery_worker.wake();
-            handler.subscription_delivery_worker.wake();
-            handler.query_worker.wake();
+            if retention_pending {
+                handler.retention_worker.wake();
+            }
+            if metrics_pending {
+                handler.metric_delivery_worker.wake();
+            }
+            if subscriptions_pending {
+                handler.subscription_delivery_worker.wake();
+            }
+            if queries_pending {
+                handler.query_worker.wake();
+            }
         }
         Ok(handler)
     }
@@ -677,10 +716,23 @@ impl NativeHandler for LogsHandler {
                 .header("x-amzn-RequestId", &request.request_id)
                 .body(Body::from(value.to_string()))
                 .expect("CloudWatch Logs JSON response is valid"),
-            Err(error) => locallycloud_core::error_mapping::AwsError::from(error)
-                .with_request_id(request.request_id)
-                .render(AwsProtocol::Json11)
-                .into_response(),
+            Err(error) => {
+                let operation = protocol::operation(&request.headers)
+                    .ok()
+                    .map(Operation::name);
+                let error = locallycloud_core::error_mapping::AwsError::from(error);
+                locallycloud_core::observability::log_service_error(
+                    "logs",
+                    operation,
+                    &request.request_id,
+                    &error.code,
+                    error.http_status,
+                );
+                error
+                    .with_request_id(request.request_id)
+                    .render(AwsProtocol::Json11)
+                    .into_response()
+            }
         }
     }
 }
@@ -770,6 +822,23 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200, "{body}");
+    }
+
+    #[tokio::test]
+    async fn empty_registration_and_reads_do_not_start_background_workers() {
+        let handler = handler();
+        assert!(!handler.retention_worker.started());
+        assert!(!handler.metric_delivery_worker.started());
+        assert!(!handler.subscription_delivery_worker.started());
+        assert!(!handler.query_worker.started());
+        let response = handler
+            .handle(request("DescribeLogGroups", json!({})))
+            .await;
+        assert!(response.status().is_success());
+        assert!(!handler.retention_worker.started());
+        assert!(!handler.metric_delivery_worker.started());
+        assert!(!handler.subscription_delivery_worker.started());
+        assert!(!handler.query_worker.started());
     }
 
     #[tokio::test]

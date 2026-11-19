@@ -186,7 +186,7 @@ impl KinesisHandler {
                 }
                 if let Some(p) = &self.persistence {
                     p.configure(&key, hours, &stream.tags)
-                        .map_err(|_| KinesisError::Internal)?;
+                        .map_err(|_| KinesisError::Persistence)?;
                 }
                 stream.retention_hours = hours;
                 self.trim_expired(&mut store, now_epoch()?)?;
@@ -268,7 +268,7 @@ impl KinesisHandler {
                 validate_tags(&tags)?;
                 if let Some(p) = &self.persistence {
                     p.configure(&key, stream.retention_hours, &tags)
-                        .map_err(|_| KinesisError::Internal)?;
+                        .map_err(|_| KinesisError::Persistence)?;
                 }
                 stream.tags = tags;
                 Ok(Success::Empty)

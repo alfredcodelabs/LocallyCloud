@@ -17,6 +17,12 @@ pub(super) enum DeliveryPhase {
 pub(super) enum FailureCode {
     #[default]
     InternalError,
+    KinesisAccessDenied,
+    RegistryUnavailable,
+    DispatcherUnavailable,
+    InvalidS3Uri,
+    S3Timeout,
+    S3NotAcknowledged,
     #[serde(rename = "MetadataExtraction.Failed")]
     MetadataExtractionFailed,
     #[serde(rename = "Iceberg.NoSuchTable")]
@@ -30,7 +36,13 @@ pub(super) enum FailureCode {
 impl FailureCode {
     pub fn code(self) -> &'static str {
         match self {
-            Self::InternalError => "InternalError",
+            Self::InternalError
+            | Self::KinesisAccessDenied
+            | Self::RegistryUnavailable
+            | Self::DispatcherUnavailable
+            | Self::InvalidS3Uri
+            | Self::S3Timeout
+            | Self::S3NotAcknowledged => "InternalError",
             Self::MetadataExtractionFailed => "MetadataExtraction.Failed",
             Self::NoSuchTable => "Iceberg.NoSuchTable",
             Self::GlueAccessDenied => "Glue.AccessDenied",
@@ -38,9 +50,29 @@ impl FailureCode {
         }
     }
 
+    pub fn diagnostic(self) -> (&'static str, u16) {
+        match self {
+            Self::RegistryUnavailable => ("registry_unavailable", 500),
+            Self::DispatcherUnavailable => ("dispatcher_unavailable", 500),
+            Self::InvalidS3Uri => ("s3_uri_invalid", 500),
+            Self::S3Timeout => ("s3_dispatch_timeout", 504),
+            Self::S3NotAcknowledged => ("s3_write_not_acknowledged", 503),
+            Self::KinesisAccessDenied => ("kinesis_access_denied", 403),
+            Self::GlueAccessDenied | Self::S3AccessDenied => (self.code(), 403),
+            Self::MetadataExtractionFailed | Self::NoSuchTable => (self.code(), 400),
+            Self::InternalError => ("delivery_internal_failure", 500),
+        }
+    }
+
     pub fn message(self) -> &'static str {
         match self {
-            Self::InternalError => {
+            Self::InternalError
+            | Self::KinesisAccessDenied
+            | Self::RegistryUnavailable
+            | Self::DispatcherUnavailable
+            | Self::InvalidS3Uri
+            | Self::S3Timeout
+            | Self::S3NotAcknowledged => {
                 "Local Iceberg delivery failed after the configured retry duration"
             }
             Self::MetadataExtractionFailed => {
@@ -143,8 +175,8 @@ pub(super) fn backup_configuration(
     }
 }
 
-pub(super) fn backoff(attempt: u8) -> Duration {
-    Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(5)).min(MAX_RETRY_DELAY)
+pub(super) fn backoff(attempt: u8, maximum: Duration) -> Duration {
+    Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(5)).min(maximum)
 }
 
 impl DeliveryStream {
@@ -256,7 +288,13 @@ impl Inner {
             .upgrade()
             .and_then(|r| r.log_sink(&ServiceName::new("logs")))
         else {
-            tracing::warn!(stream=%batch.key.name,"Firehose error logging sink is unavailable");
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("DeliveryErrorLog"),
+                &batch.token.to_string(),
+                "log_sink_unavailable",
+                503,
+            );
             return;
         };
         let Ok(now) = StartedAt::now() else {
@@ -294,7 +332,13 @@ impl Inner {
         )
         .await;
         if !matches!(result, Ok(Ok(_))) {
-            tracing::warn!(stream=%batch.key.name,"Firehose error log was not acknowledged; delivery state is unaffected");
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("DeliveryErrorLog"),
+                &batch.token.to_string(),
+                "log_write_not_acknowledged",
+                503,
+            );
         }
     }
 }

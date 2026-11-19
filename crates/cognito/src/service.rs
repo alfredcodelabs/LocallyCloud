@@ -776,11 +776,26 @@ impl NativeHandler for CognitoHandler {
                 .header("x-amzn-RequestId", &request.request_id)
                 .body(Body::from(value.to_string()))
                 .expect("valid Cognito response"),
-            Err(error) => error
-                .into_aws()
-                .with_request_id(request.request_id)
-                .render(AwsProtocol::Json11)
-                .into_response(),
+            Err(error) => {
+                let operation = request
+                    .headers
+                    .get("x-amz-target")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("AWSCognitoIdentityProviderService."))
+                    .and_then(crate::error::operation_name);
+                let error = error.into_aws();
+                locallycloud_core::observability::log_service_error(
+                    "cognito-idp",
+                    operation,
+                    &request.request_id,
+                    &error.code,
+                    error.http_status,
+                );
+                error
+                    .with_request_id(request.request_id)
+                    .render(AwsProtocol::Json11)
+                    .into_response()
+            }
         }
     }
 }

@@ -7,14 +7,19 @@ use std::path::PathBuf;
 use crate::ec2_runtime::Ec2RuntimeConfig;
 use locallycloud_apigateway::ApiGatewayConfig;
 use locallycloud_cloudformation::CloudFormationConfig;
+use locallycloud_cloudwatch_logs::LogsConfig;
+use locallycloud_cognito::CognitoConfig;
 use locallycloud_core::config::LocallyCloudConfig;
 use locallycloud_core::observability::{LogColor, LogFormat, LoggingConfig};
 use locallycloud_dynamodb::DynamoDbConfig;
 use locallycloud_eventbridge::EventBridgeConfig;
+use locallycloud_firehose::FirehoseConfig;
 use locallycloud_iam_sts::{IamConfig, IamCredentials};
+use locallycloud_kinesis::KinesisConfig;
 use locallycloud_lambda::config::{LambdaExecutionConfig, ResolvedLambdaExecutionConfig};
 use locallycloud_s3::{S3Config, S3CredentialSources};
 use locallycloud_ses::{SesConfig, SesCredentials};
+use locallycloud_sns::SnsConfig;
 use locallycloud_sqs::SqsConfig;
 use locallycloud_state::StateDb;
 use locallycloud_stepfunctions::StepFunctionsConfig;
@@ -55,6 +60,11 @@ pub struct StartupConfig {
     pub dynamodb: DynamoDbConfig,
     pub eventbridge: EventBridgeConfig,
     pub stepfunctions: StepFunctionsConfig,
+    pub sns: SnsConfig,
+    pub kinesis: KinesisConfig,
+    pub firehose: FirehoseConfig,
+    pub cognito: CognitoConfig,
+    pub logs: LogsConfig,
 }
 
 pub struct StateConfig {
@@ -125,6 +135,11 @@ struct FileConfig {
     dynamodb: DynamoDbConfig,
     eventbridge: EventBridgeConfig,
     stepfunctions: StepFunctionsConfig,
+    sns: SnsConfig,
+    kinesis: KinesisConfig,
+    firehose: FirehoseConfig,
+    cognito: CognitoConfig,
+    logs: LogsConfig,
 }
 
 fn invalid(setting: &str) -> StartupError {
@@ -206,6 +221,26 @@ impl StartupConfig {
             .map_err(StartupError::Invalid)?;
         let ses_credentials =
             SesCredentials::from_lookup(&ses, get).map_err(StartupError::Invalid)?;
+        let sns = document
+            .sns
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let kinesis = document
+            .kinesis
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let firehose = document
+            .firehose
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let cognito = document
+            .cognito
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
+        let logs = document
+            .logs
+            .resolve_with(get)
+            .map_err(StartupError::Invalid)?;
         let mut logging = document.logging;
         if let Some(value) = get("RUST_LOG") {
             logging.filter = value.into_string().map_err(|_| invalid("RUST_LOG"))?;
@@ -326,6 +361,11 @@ impl StartupConfig {
             dynamodb,
             eventbridge,
             stepfunctions,
+            sns,
+            kinesis,
+            firehose,
+            cognito,
+            logs,
         })
     }
 }

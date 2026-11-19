@@ -49,7 +49,7 @@ impl SnsError {
         }
     }
 
-    fn sender_fault(&self) -> bool {
+    pub(crate) fn sender_fault(&self) -> bool {
         !matches!(self, SnsError::InternalError)
     }
 
@@ -59,12 +59,52 @@ impl SnsError {
         protocol: AwsProtocol,
         request_id: &str,
     ) -> axum::response::Response {
+        self.into_response_for_operation(protocol, request_id, None)
+    }
+
+    pub(crate) fn into_response_for_operation(
+        self,
+        protocol: AwsProtocol,
+        request_id: &str,
+        operation: Option<&'static str>,
+    ) -> axum::response::Response {
+        locallycloud_core::observability::log_service_error(
+            "sns",
+            operation,
+            request_id,
+            self.code(),
+            self.http_status(),
+        );
         let mut err = AwsError::new(self.code(), self.to_string(), self.http_status())
             .with_request_id(request_id.to_string())
             .with_xml_namespace("http://sns.amazonaws.com/doc/2010-03-31/");
         err.sender_fault = self.sender_fault();
         err.render(protocol).into_response()
     }
+}
+
+/// Return only an implemented, static operation name; never log arbitrary request headers.
+pub(crate) fn operation_name(value: &str) -> Option<&'static str> {
+    const OPERATIONS: &[&str] = &[
+        "CreateTopic",
+        "DeleteTopic",
+        "ListTopics",
+        "GetTopicAttributes",
+        "SetTopicAttributes",
+        "Subscribe",
+        "ConfirmSubscription",
+        "Unsubscribe",
+        "ListSubscriptions",
+        "ListSubscriptionsByTopic",
+        "GetSubscriptionAttributes",
+        "SetSubscriptionAttributes",
+        "TagResource",
+        "UntagResource",
+        "ListTagsForResource",
+        "Publish",
+        "PublishBatch",
+    ];
+    OPERATIONS.iter().copied().find(|name| *name == value)
 }
 
 #[cfg(test)]

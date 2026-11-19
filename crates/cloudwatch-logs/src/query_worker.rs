@@ -25,6 +25,11 @@ impl QueryWorker {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> bool {
+        self.handle.lock().unwrap().is_some()
+    }
+
     pub fn wake(&self) {
         let Ok(mut handle) = self.handle.lock() else {
             return;
@@ -63,7 +68,16 @@ async fn run(store: Arc<LogsStore>, clock: Arc<dyn Clock>, notify: Arc<Notify>) 
                 match tokio::task::spawn_blocking(move || owned.claim_scheduled_query()).await {
                     Ok(Ok(Some(query))) => query,
                     Ok(Ok(None)) => break,
-                    _ => return,
+                    _ => {
+                        locallycloud_core::observability::log_service_error(
+                            "logs",
+                            Some("QueryExecution"),
+                            "background",
+                            "query_claim_failed",
+                            500,
+                        );
+                        return;
+                    }
                 };
             match execute_query(&store, &query).await {
                 Some((rows, statistics)) => {
@@ -78,6 +92,13 @@ async fn run(store: Arc<LogsStore>, clock: Arc<dyn Clock>, notify: Arc<Notify>) 
                         .await,
                         Ok(Ok(_))
                     ) {
+                        locallycloud_core::observability::log_service_error(
+                            "logs",
+                            Some("QueryExecution"),
+                            &query.id,
+                            "query_checkpoint_failed",
+                            500,
+                        );
                         return;
                     }
                 }
@@ -91,6 +112,13 @@ async fn run(store: Arc<LogsStore>, clock: Arc<dyn Clock>, notify: Arc<Notify>) 
                             .await,
                         Ok(Ok(()))
                     ) {
+                        locallycloud_core::observability::log_service_error(
+                            "logs",
+                            Some("QueryExecution"),
+                            &query.id,
+                            "query_checkpoint_failed",
+                            500,
+                        );
                         return;
                     }
                 }

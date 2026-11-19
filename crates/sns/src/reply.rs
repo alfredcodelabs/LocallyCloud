@@ -54,6 +54,18 @@ pub struct BatchErr {
     pub id: String,
     pub code: String,
     pub message: String,
+    pub sender_fault: bool,
+}
+
+impl BatchErr {
+    pub(crate) fn new(id: String, error: crate::error::SnsError) -> Self {
+        Self {
+            id,
+            code: error.code().into(),
+            message: error.to_string(),
+            sender_fault: error.sender_fault(),
+        }
+    }
 }
 
 impl Reply {
@@ -132,7 +144,7 @@ impl Reply {
                     .collect();
                 let err: Vec<Value> = failed
                     .iter()
-                    .map(|e| json!({ "Id": e.id, "Code": e.code, "Message": e.message, "SenderFault": true }))
+                    .map(|e| json!({ "Id": e.id, "Code": e.code, "Message": e.message, "SenderFault": e.sender_fault }))
                     .collect();
                 json!({ "Successful": ok, "Failed": err })
             }
@@ -232,10 +244,11 @@ impl Reply {
                     .iter()
                     .map(|e| {
                         format!(
-                            "<member>{}{}{}<SenderFault>true</SenderFault></member>",
+                            "<member>{}{}{}<SenderFault>{}</SenderFault></member>",
                             text_el("Id", &e.id),
                             text_el("Code", &e.code),
                             text_el("Message", &e.message),
+                            e.sender_fault,
                         )
                     })
                     .collect();
@@ -262,5 +275,29 @@ mod tests {
     fn empty_query_reply_keeps_operation_result() {
         let xml = query_envelope("TagResource", "", "rid");
         assert!(xml.contains("<TagResourceResult></TagResourceResult>"));
+    }
+}
+
+#[cfg(test)]
+mod batch_error_tests {
+    use super::*;
+    #[test]
+    fn internal_and_caller_batch_failures_keep_sender_fault_in_both_protocols() {
+        let reply = Reply::PublishBatch {
+            successful: vec![],
+            failed: vec![
+                BatchErr::new("internal".into(), crate::error::SnsError::InternalError),
+                BatchErr::new(
+                    "caller".into(),
+                    crate::error::SnsError::InvalidParameter("Invalid message".into()),
+                ),
+            ],
+        };
+        let json = reply.to_json();
+        assert_eq!(json["Failed"][0]["SenderFault"], false);
+        assert_eq!(json["Failed"][1]["SenderFault"], true);
+        let xml = reply.to_xml_inner();
+        assert!(xml.contains("<Code>InternalError</Code><Message>Internal error.</Message><SenderFault>false</SenderFault>"));
+        assert!(xml.contains("<SenderFault>true</SenderFault>"));
     }
 }

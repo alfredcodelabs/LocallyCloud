@@ -10,10 +10,9 @@ use tokio::task::JoinHandle;
 use crate::clock::Clock;
 use crate::store::LogsStore;
 
-const RECLAIM_DELAY: Duration = Duration::from_millis(100);
-
 pub struct RetentionWorker {
     store: Arc<LogsStore>,
+    delay: Duration,
     clock: Arc<dyn Clock>,
     notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
@@ -21,14 +20,20 @@ pub struct RetentionWorker {
 }
 
 impl RetentionWorker {
-    pub fn new(store: Arc<LogsStore>, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_delay(store: Arc<LogsStore>, clock: Arc<dyn Clock>, delay: Duration) -> Self {
         Self {
+            delay,
             store,
             clock,
             notify: Arc::new(Notify::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> bool {
+        self.handle.lock().unwrap().is_some()
     }
 
     pub fn wake(&self) {
@@ -40,8 +45,9 @@ impl RetentionWorker {
             let clock = self.clock.clone();
             let notify = self.notify.clone();
             let shutdown = self.shutdown.clone();
+            let delay = self.delay;
             *handle = Some(tokio::spawn(async move {
-                run(store, clock, notify, shutdown).await;
+                run(store, clock, notify, shutdown, delay).await;
             }));
         }
         self.notify.notify_one();
@@ -65,13 +71,14 @@ async fn run(
     clock: Arc<dyn Clock>,
     notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
+    delay: Duration,
 ) {
     loop {
         notify.notified().await;
         if shutdown.load(Ordering::Acquire) {
             return;
         }
-        tokio::time::sleep(RECLAIM_DELAY).await;
+        tokio::time::sleep(delay).await;
 
         loop {
             if shutdown.load(Ordering::Acquire) {
@@ -82,7 +89,16 @@ async fn run(
             let next_expiration_ms =
                 match tokio::task::spawn_blocking(move || owned.purge_expired(now_ms)).await {
                     Ok(Ok(next)) => next,
-                    _ => break,
+                    _ => {
+                        locallycloud_core::observability::log_service_error(
+                            "logs",
+                            Some("Retention"),
+                            "background",
+                            "retention_persistence_failed",
+                            500,
+                        );
+                        break;
+                    }
                 };
             let Some(deadline_ms) = next_expiration_ms else {
                 break;
@@ -90,7 +106,7 @@ async fn run(
             let wait_ms = deadline_ms.saturating_sub(now_ms).max(1) as u64;
             tokio::select! {
                 _ = notify.notified() => {
-                    tokio::time::sleep(RECLAIM_DELAY).await;
+                    tokio::time::sleep(delay).await;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
             }

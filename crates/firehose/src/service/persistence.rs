@@ -288,21 +288,21 @@ impl Inner {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        let connection = state.connection().map_err(|_| FirehoseError::Internal)?;
-        save_config(&connection, key, stream).map_err(|_| FirehoseError::Internal)
+        let connection = state.connection().map_err(|_| FirehoseError::Persistence)?;
+        save_config(&connection, key, stream).map_err(|_| FirehoseError::Persistence)
     }
 
     pub(super) fn persist_delete(&self, key: &StreamKey) -> Result<(), FirehoseError> {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        let connection = state.connection().map_err(|_| FirehoseError::Internal)?;
+        let connection = state.connection().map_err(|_| FirehoseError::Persistence)?;
         connection
             .execute(
                 "DELETE FROM firehose_streams WHERE account=?1 AND region=?2 AND name=?3",
                 params![key.scope.account_id, key.scope.region, key.name],
             )
-            .map_err(|_| FirehoseError::Internal)?;
+            .map_err(|_| FirehoseError::Persistence)?;
         Ok(())
     }
 
@@ -316,16 +316,16 @@ impl Inner {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        let mut connection = state.connection().map_err(|_| FirehoseError::Internal)?;
+        let mut connection = state.connection().map_err(|_| FirehoseError::Persistence)?;
         let tx = connection
             .transaction()
-            .map_err(|_| FirehoseError::Internal)?;
-        save_config(&tx, key, stream).map_err(|_| FirehoseError::Internal)?;
+            .map_err(|_| FirehoseError::Persistence)?;
+        save_config(&tx, key, stream).map_err(|_| FirehoseError::Persistence)?;
         for data in records {
             tx.execute("INSERT INTO firehose_records(account,region,name,state,payload) VALUES(?1,?2,?3,'pending',?4)",
-                params![key.scope.account_id,key.scope.region,key.name,data]).map_err(|_| FirehoseError::Internal)?;
+                params![key.scope.account_id,key.scope.region,key.name,data]).map_err(|_| FirehoseError::Persistence)?;
         }
-        tx.commit().map_err(|_| FirehoseError::Internal)
+        tx.commit().map_err(|_| FirehoseError::Persistence)
     }
 
     pub(super) fn persist_take(
@@ -339,27 +339,27 @@ impl Inner {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        let mut connection = state.connection().map_err(|_| FirehoseError::Internal)?;
+        let mut connection = state.connection().map_err(|_| FirehoseError::Persistence)?;
         let tx = connection
             .transaction()
-            .map_err(|_| FirehoseError::Internal)?;
+            .map_err(|_| FirehoseError::Persistence)?;
         if queue == "retained" {
             tx.execute(
                 "UPDATE firehose_records SET state='retained' WHERE account=?1 AND region=?2 AND name=?3 AND state='inflight' AND token=?4",
                 params![key.scope.account_id,key.scope.region,key.name,token.to_string()],
-            ).map_err(|_| FirehoseError::Internal)?;
+            ).map_err(|_| FirehoseError::Persistence)?;
         }
         let changed = tx.execute(
             "UPDATE firehose_records SET state='inflight',token=?1 WHERE id IN (
                 SELECT id FROM firehose_records WHERE account=?2 AND region=?3 AND name=?4 AND state=?5
                 ORDER BY id LIMIT ?6)",
             params![token.to_string(),key.scope.account_id,key.scope.region,key.name,queue,count as i64],
-        ).map_err(|_| FirehoseError::Internal)?;
+        ).map_err(|_| FirehoseError::Persistence)?;
         if changed != count {
-            return Err(FirehoseError::Internal);
+            return Err(FirehoseError::Persistence);
         }
-        save_config(&tx, key, stream).map_err(|_| FirehoseError::Internal)?;
-        tx.commit().map_err(|_| FirehoseError::Internal)
+        save_config(&tx, key, stream).map_err(|_| FirehoseError::Persistence)?;
+        tx.commit().map_err(|_| FirehoseError::Persistence)
     }
 
     /// A downstream ACK and Kinesis checkpoint commit atomically with removal of delivered rows.
@@ -374,26 +374,26 @@ impl Inner {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        let mut connection = state.connection().map_err(|_| FirehoseError::Internal)?;
+        let mut connection = state.connection().map_err(|_| FirehoseError::Persistence)?;
         let tx = connection
             .transaction()
-            .map_err(|_| FirehoseError::Internal)?;
+            .map_err(|_| FirehoseError::Persistence)?;
         let changed = if delivered {
             tx.execute("DELETE FROM firehose_records WHERE account=?1 AND region=?2 AND name=?3 AND state='inflight' AND token=?4",
                 params![key.scope.account_id,key.scope.region,key.name,token.to_string()])
         } else {
             tx.execute("UPDATE firehose_records SET state='retained' WHERE account=?1 AND region=?2 AND name=?3 AND state='inflight' AND token=?4",
                 params![key.scope.account_id,key.scope.region,key.name,token.to_string()])
-        }.map_err(|_| FirehoseError::Internal)?;
+        }.map_err(|_| FirehoseError::Persistence)?;
         if changed != count {
-            return Err(FirehoseError::Internal);
+            return Err(FirehoseError::Persistence);
         }
         if delivered {
             tx.execute("DELETE FROM firehose_routing_plans WHERE account=?1 AND region=?2 AND name=?3 AND token=?4",
                 params![key.scope.account_id,key.scope.region,key.name,token.to_string()])
-                .map_err(|_|FirehoseError::Internal)?;
+                .map_err(|_|FirehoseError::Persistence)?;
         }
-        save_config(&tx, key, stream).map_err(|_| FirehoseError::Internal)?;
-        tx.commit().map_err(|_| FirehoseError::Internal)
+        save_config(&tx, key, stream).map_err(|_| FirehoseError::Persistence)?;
+        tx.commit().map_err(|_| FirehoseError::Persistence)
     }
 }

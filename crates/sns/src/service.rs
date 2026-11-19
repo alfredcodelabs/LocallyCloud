@@ -24,30 +24,46 @@ use crate::store::SnsStore;
 pub struct SnsHandler {
     store: Arc<SnsStore>,
     registry: Weak<ServiceRegistry>,
-    http: reqwest::Client,
+    http: Arc<locallycloud_core::egress::EgressClient>,
 }
 
 impl SnsHandler {
-    fn new(registry: Weak<ServiceRegistry>) -> Self {
-        // Bounded timeout so a slow/unreachable http(s) subscriber never stalls Publish.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        SnsHandler {
-            store: Arc::new(SnsStore::new()),
+    fn from_store(
+        registry: Weak<ServiceRegistry>,
+        mut store: SnsStore,
+        config: crate::SnsConfig,
+        endpoint: &str,
+        listeners: &[std::net::SocketAddr],
+    ) -> Result<Self, crate::persistence::PersistError> {
+        config.validate()?;
+        let url = reqwest::Url::parse(endpoint)
+            .map_err(|_| "SNS confirmation endpoint must be an HTTP(S) URL")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("SNS confirmation endpoint must be an HTTP(S) URL without credentials, query or fragment".into());
+        }
+        let http = Arc::new(locallycloud_core::egress::EgressClient::new(
+            locallycloud_core::egress::EgressSettings {
+                local_origins: config.http_local_origins.clone(),
+                client_capacity: config.http_client_cache_capacity,
+                connect_timeout: Some(std::time::Duration::from_secs(config.http_timeout_secs)),
+                request_timeout: Some(std::time::Duration::from_secs(config.http_timeout_secs)),
+                ..Default::default()
+            },
+            listeners,
+        )?);
+        store.config = config;
+        store.confirmation_endpoint = Some(endpoint.trim_end_matches('/').into());
+        Ok(Self {
+            store: Arc::new(store),
             registry,
             http,
-        }
-    }
-
-    fn with_state(
-        registry: Weak<ServiceRegistry>,
-        state: Arc<StateDb>,
-    ) -> Result<Self, crate::persistence::PersistError> {
-        let mut handler = Self::new(registry);
-        handler.store = Arc::new(SnsStore::with_state(state)?);
-        Ok(handler)
+        })
     }
 
     fn resume_outbox(&self) -> Result<(), crate::persistence::PersistError> {
@@ -93,7 +109,13 @@ impl SnsHandler {
             }
             if let Some(sender) = &state.fifo_delivery {
                 if sender.send(job).is_err() {
-                    tracing::error!("SNS FIFO outbox replay worker stopped");
+                    locallycloud_core::observability::log_service_error(
+                        "sns",
+                        Some("OutboxReplay"),
+                        "background",
+                        "fifo_worker_unavailable",
+                        500,
+                    );
                 }
             }
         } else {
@@ -163,6 +185,7 @@ impl NativeHandler for SnsHandler {
                     .into_response(protocol.aws(), &request.request_id)
             }
         };
+        let diagnostic_operation = crate::error::operation_name(&op);
         if matches!(
             op.as_str(),
             "ListTopics"
@@ -194,7 +217,11 @@ impl NativeHandler for SnsHandler {
             .is_err()
             {
                 return SnsError::AuthorizationError("Not authorized to read SNS resources".into())
-                    .into_response(protocol.aws(), &request.request_id);
+                    .into_response_for_operation(
+                        protocol.aws(),
+                        &request.request_id,
+                        diagnostic_operation,
+                    );
             }
         }
         let ctx = Ctx {
@@ -206,18 +233,49 @@ impl NativeHandler for SnsHandler {
         let _gate = self.store.operation_gate.lock().await;
         if self.store.has_uncommitted() {
             if let Err(error) = self.store.persist_metadata().await {
-                return error.into_response(protocol.aws(), &request.request_id);
+                return error.into_response_for_operation(
+                    protocol.aws(),
+                    &request.request_id,
+                    diagnostic_operation,
+                );
             }
         }
         let result = self.dispatch(&op, &ctx, &input).await;
         if self.store.has_uncommitted() {
             if let Err(error) = self.store.persist_metadata().await {
-                return error.into_response(protocol.aws(), &request.request_id);
+                return error.into_response_for_operation(
+                    protocol.aws(),
+                    &request.request_id,
+                    diagnostic_operation,
+                );
             }
         }
         match result {
-            Ok(reply) => serialize(protocol, &op, &reply, &request.request_id),
-            Err(err) => err.into_response(protocol.aws(), &request.request_id),
+            Ok(reply) => {
+                if let Reply::PublishBatch { failed, .. } = &reply {
+                    if !failed.is_empty() {
+                        let (cause, status) = if failed.iter().any(|failure| !failure.sender_fault)
+                        {
+                            ("batch_entry_internal_failure", 500)
+                        } else {
+                            ("batch_entries_rejected", 400)
+                        };
+                        locallycloud_core::observability::log_service_error(
+                            "sns",
+                            Some("PublishBatch"),
+                            &request.request_id,
+                            cause,
+                            status,
+                        );
+                    }
+                }
+                serialize(protocol, &op, &reply, &request.request_id)
+            }
+            Err(err) => err.into_response_for_operation(
+                protocol.aws(),
+                &request.request_id,
+                diagnostic_operation,
+            ),
         }
     }
 }
@@ -243,18 +301,61 @@ fn serialize(protocol: Protocol, op: &str, reply: &Reply, request_id: &str) -> R
 }
 
 /// Register SNS as a `Native` service. Holds a weak reference to the registry for fanout.
-pub fn register(registry: &Arc<ServiceRegistry>) {
-    register_handler(
+pub fn register(registry: &Arc<ServiceRegistry>) -> Result<(), crate::persistence::PersistError> {
+    register_with_config_and_endpoint(
         registry,
-        Arc::new(SnsHandler::new(Arc::downgrade(registry))),
-    );
+        crate::SnsConfig::default(),
+        "http://localhost:4566",
+        &[],
+    )
+}
+
+pub fn register_with_config_and_endpoint(
+    registry: &Arc<ServiceRegistry>,
+    config: crate::SnsConfig,
+    endpoint: &str,
+    listeners: &[std::net::SocketAddr],
+) -> Result<(), crate::persistence::PersistError> {
+    let handler = SnsHandler::from_store(
+        Arc::downgrade(registry),
+        SnsStore::new(),
+        config,
+        endpoint,
+        listeners,
+    )?;
+    register_handler(registry, Arc::new(handler));
+    Ok(())
 }
 
 pub fn register_with_state(
     registry: &Arc<ServiceRegistry>,
     state: Arc<StateDb>,
 ) -> Result<(), crate::persistence::PersistError> {
-    let handler = Arc::new(SnsHandler::with_state(Arc::downgrade(registry), state)?);
+    register_with_state_config_and_endpoint(
+        registry,
+        state,
+        crate::SnsConfig::default(),
+        "http://localhost:4566",
+        &[],
+    )
+}
+
+pub fn register_with_state_config_and_endpoint(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    config: crate::SnsConfig,
+    endpoint: &str,
+    listeners: &[std::net::SocketAddr],
+) -> Result<(), crate::persistence::PersistError> {
+    config.validate()?;
+    let store = SnsStore::with_state(state)?;
+    let handler = Arc::new(SnsHandler::from_store(
+        Arc::downgrade(registry),
+        store,
+        config,
+        endpoint,
+        listeners,
+    )?);
     handler.resume_outbox()?;
     register_handler(registry, handler);
     Ok(())
@@ -292,7 +393,7 @@ mod tests {
             ),
         ));
 
-        crate::register(&reg);
+        crate::register(&reg).unwrap();
         reg
     }
 
@@ -496,7 +597,9 @@ mod tests {
         let registry = ServiceRegistry::with_known_services();
         let worker = tokio::spawn(crate::fanout::deliver_accepted(
             registry,
-            reqwest::Client::new(),
+            Arc::new(
+                locallycloud_core::egress::EgressClient::new(Default::default(), &[]).unwrap(),
+            ),
             store.clone(),
             job.clone(),
         ));

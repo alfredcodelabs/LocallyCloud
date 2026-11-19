@@ -330,12 +330,12 @@ impl locallycloud_elbv2::TargetEndpointResolver for Ec2TargetResolver {
     }
 }
 
-async fn initialize_persistent_service<E: Send + 'static>(
+async fn initialize_persistent_service<T: Send + 'static, E: Send + 'static>(
     service: &'static str,
-    initialize: impl FnOnce() -> Result<(), E> + Send + 'static,
-) {
+    initialize: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> T {
     let cause = match tokio::task::spawn_blocking(initialize).await {
-        Ok(Ok(())) => return,
+        Ok(Ok(value)) => return value,
         Ok(Err(_)) => "state_initialization_failed",
         Err(_) => "initializer_task_failed",
     };
@@ -627,9 +627,20 @@ async fn main() {
         })
         .await;
     }
-    if let Err(error) = locallycloud_sns::register_with_state(&registry, state.clone()) {
-        tracing::error!(%error, "failed to register SNS");
-        std::process::exit(4);
+    {
+        let registry = registry.clone();
+        let state = state.clone();
+        let endpoint = endpoint.guest_endpoint().to_owned();
+        initialize_persistent_service("sns", move || {
+            locallycloud_sns::register_with_state_config_and_endpoint(
+                &registry,
+                state,
+                startup.sns,
+                &endpoint,
+                &[config.listen_addr],
+            )
+        })
+        .await;
     }
     {
         let registry = registry.clone();
@@ -842,17 +853,25 @@ async fn main() {
         tracing::error!(%error, "failed to restore Glue catalog; check LOCALLYCLOUD_KMS_MASTER_KEY and state database compatibility");
         std::process::exit(4);
     }
-    if let Err(error) = locallycloud_kinesis::register_with_state(&registry, state.clone()) {
-        tracing::error!(%error, "failed to register Kinesis");
-        std::process::exit(4);
-    }
-    let firehose_handle = match locallycloud_firehose::register_with_state(&registry, state.clone())
     {
-        Ok(handle) => handle,
-        Err(error) => {
-            tracing::error!(%error, "failed to register Firehose");
-            std::process::exit(4);
-        }
+        let registry = registry.clone();
+        let state = state.clone();
+        initialize_persistent_service("kinesis", move || {
+            locallycloud_kinesis::register_with_state_and_config(&registry, state, startup.kinesis)
+        })
+        .await;
+    }
+    let firehose_handle = {
+        let registry = registry.clone();
+        let state = state.clone();
+        initialize_persistent_service("firehose", move || {
+            locallycloud_firehose::register_with_state_and_config(
+                &registry,
+                state,
+                startup.firehose,
+            )
+        })
+        .await
     };
     if let Err(error) =
         locallycloud_cloudwatch_monitoring::register_with_state(&registry, state.clone())
@@ -922,12 +941,12 @@ async fn main() {
             std::process::exit(6);
         }
     };
-    let cognito = match locallycloud_cognito::register_with_mailbox(&registry) {
-        Ok(handler) => handler,
-        Err(error) => {
-            tracing::error!(%error, "failed to initialize Cognito confirmation delivery");
-            std::process::exit(4);
-        }
+    let cognito = {
+        let registry = registry.clone();
+        initialize_persistent_service("cognito-idp", move || {
+            locallycloud_cognito::register_with_config(&registry, startup.cognito)
+        })
+        .await
     };
     gateway_waf.set_cognito_jwks(cognito);
     locallycloud_cloudfront::register(&registry);
@@ -966,10 +985,17 @@ async fn main() {
         cloudtrail.clone(),
     );
     registry.set_completion_observer(cloudtrail);
-    if let Err(error) = locallycloud_cloudwatch_logs::register_with_state(&registry, state.clone())
     {
-        tracing::error!(error = %error, "failed to register CloudWatch Logs");
-        std::process::exit(4);
+        let registry = registry.clone();
+        let state = state.clone();
+        initialize_persistent_service("logs", move || {
+            locallycloud_cloudwatch_logs::register_with_state_and_config(
+                &registry,
+                state,
+                startup.logs,
+            )
+        })
+        .await;
     }
     let rds_registry = registry.clone();
     let rds_registration =

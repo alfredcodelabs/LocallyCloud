@@ -57,6 +57,8 @@ type Key = (String, String, String);
 
 #[derive(Default)]
 pub struct SnsStore {
+    pub(crate) config: crate::SnsConfig,
+    pub(crate) confirmation_endpoint: Option<String>,
     topics: DashMap<Key, Arc<RwLock<TopicState>>>,
     state: Option<Arc<StateDb>>,
     pub operation_gate: Mutex<()>,

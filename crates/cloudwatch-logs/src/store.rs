@@ -99,6 +99,26 @@ impl LogsStore {
         })
     }
 
+    /// Restore only workers with pending work; do not clone event histories or effect bodies.
+    pub(crate) fn background_work(&self) -> Result<(bool, bool, bool, bool), LogsError> {
+        let state = self.read()?;
+        Ok((
+            state.groups.values().any(|group| {
+                group.retention_days.is_some()
+                    && group
+                        .streams
+                        .values()
+                        .any(|stream| !stream.events.is_empty())
+            }),
+            !state.metric_effects.is_empty(),
+            !state.subscription_deliveries.is_empty(),
+            state
+                .queries
+                .values()
+                .any(|query| query.status == QueryStatus::Scheduled),
+        ))
+    }
+
     pub(crate) fn persistence(&self) -> Option<Arc<Persistence>> {
         self.persistence.clone()
     }

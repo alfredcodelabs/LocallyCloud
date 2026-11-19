@@ -447,7 +447,7 @@ const SUBSCRIBABLE: &[&str] = &["http", "https", "sqs", "lambda"];
 pub async fn subscribe(
     ctx: &Ctx<'_>,
     registry: &ServiceRegistry,
-    http: &reqwest::Client,
+    http: &std::sync::Arc<locallycloud_core::egress::EgressClient>,
     input: &Input,
 ) -> Result<Reply, SnsError> {
     let topic = resolve_topic(ctx, input)?;
@@ -540,8 +540,18 @@ pub async fn subscribe(
     // the subscriber can confirm via the SubscribeURL (best-effort; never fails Subscribe).
     if (protocol == "http" || protocol == "https") && !endpoint.is_empty() {
         if let Some(token) = pending_token {
-            crate::fanout::send_confirmation(http, &endpoint, &topic_arn, &token, ctx.request_id)
-                .await;
+            crate::fanout::send_confirmation(
+                http,
+                ctx.store
+                    .confirmation_endpoint
+                    .as_deref()
+                    .unwrap_or("http://localhost:4566"),
+                &endpoint,
+                &topic_arn,
+                &token,
+                ctx.request_id,
+            )
+            .await;
         }
     }
     Ok(Reply::Field("SubscriptionArn", reported))
@@ -815,7 +825,7 @@ fn paginate<T: Clone>(
 async fn do_publish(
     ctx: &Ctx<'_>,
     registry: &Arc<ServiceRegistry>,
-    http: &reqwest::Client,
+    http: &std::sync::Arc<locallycloud_core::egress::EgressClient>,
     topic: &Arc<RwLock<TopicState>>,
     input: &Input,
 ) -> Result<(String, Option<String>), SnsError> {
@@ -1014,7 +1024,7 @@ async fn do_publish(
 pub async fn publish(
     ctx: &Ctx<'_>,
     registry: &Arc<ServiceRegistry>,
-    http: &reqwest::Client,
+    http: &std::sync::Arc<locallycloud_core::egress::EgressClient>,
     input: &Input,
 ) -> Result<Reply, SnsError> {
     // Direct SMS has no data plane in locallycloud and must not report a false success.
@@ -1040,7 +1050,7 @@ pub async fn publish(
 pub async fn publish_batch(
     ctx: &Ctx<'_>,
     registry: &Arc<ServiceRegistry>,
-    http: &reqwest::Client,
+    http: &std::sync::Arc<locallycloud_core::egress::EgressClient>,
     input: &Input,
 ) -> Result<Reply, SnsError> {
     let topic = resolve_topic(ctx, input)?;
@@ -1086,11 +1096,7 @@ pub async fn publish_batch(
                 message_id,
                 sequence_number,
             }),
-            Err(err) => failed.push(BatchErr {
-                id,
-                code: err.code().to_string(),
-                message: err.to_string(),
-            }),
+            Err(err) => failed.push(BatchErr::new(id, err)),
         }
     }
     Ok(Reply::PublishBatch { successful, failed })

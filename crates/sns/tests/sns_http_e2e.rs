@@ -73,7 +73,7 @@ async fn spawn_blocked_notification_endpoint() -> (
     (format!("http://{addr}/"), rec, started, release)
 }
 
-fn registry() -> Arc<ServiceRegistry> {
+fn registry(origin: &str) -> Arc<ServiceRegistry> {
     let reg = ServiceRegistry::with_known_services();
     locallycloud_sqs::register(&reg);
     reg.set_internal_dispatcher(Arc::new(
@@ -89,7 +89,16 @@ fn registry() -> Arc<ServiceRegistry> {
         ),
     ));
 
-    locallycloud_sns::register(&reg);
+    locallycloud_sns::register_with_config_and_endpoint(
+        &reg,
+        locallycloud_sns::SnsConfig {
+            http_local_origins: vec![origin.trim_end_matches('/').into()],
+            ..Default::default()
+        },
+        "http://localhost:4566",
+        &[],
+    )
+    .unwrap();
     reg
 }
 
@@ -144,7 +153,7 @@ async fn wait_for(rec: &Recorder, kind: &str) -> Option<String> {
 #[tokio::test]
 async fn http_subscription_confirmation_then_notification() {
     let (endpoint, rec) = spawn_endpoint(200).await;
-    let reg = registry();
+    let reg = registry(&endpoint);
     let sns_h = handler(&reg, "sns");
 
     let topic = sns(&sns_h, "CreateTopic", json!({ "Name": "t" })).await["TopicArn"]
@@ -193,7 +202,7 @@ async fn http_subscription_confirmation_then_notification() {
 async fn failed_http_delivery_is_dead_lettered_to_sqs() {
     // The subscriber endpoint always fails (HTTP 500).
     let (endpoint, rec) = spawn_endpoint(500).await;
-    let reg = registry();
+    let reg = registry(&endpoint);
     let sns_h = handler(&reg, "sns");
     let sqs_h = handler(&reg, "sqs");
 
@@ -269,7 +278,7 @@ async fn failed_http_delivery_is_dead_lettered_to_sqs() {
 #[tokio::test]
 async fn blocked_http_subscription_does_not_delay_sqs_or_publish() {
     let (endpoint, rec, started, release) = spawn_blocked_notification_endpoint().await;
-    let reg = registry();
+    let reg = registry(&endpoint);
     let sns_h = handler(&reg, "sns");
     let sqs_h = handler(&reg, "sqs");
 
@@ -348,4 +357,83 @@ async fn blocked_http_subscription_does_not_delay_sqs_or_publish() {
         delivered,
         "SQS delivery must complete while HTTP remains blocked"
     );
+}
+
+#[tokio::test]
+async fn unlisted_literal_and_dns_loopback_subscribers_have_no_http_effects() {
+    let (allowed, _) = spawn_endpoint(200).await;
+    let (blocked, recorder) = spawn_endpoint(200).await;
+    let reg = registry(&allowed);
+    let sns_handler = handler(&reg, "sns");
+    let topic = sns(
+        &sns_handler,
+        "CreateTopic",
+        json!({"Name":"egress-blocked"}),
+    )
+    .await["TopicArn"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for endpoint in [
+        blocked.clone(),
+        blocked.replace("127.0.0.1", "localhost"),
+        "http://169.254.169.254/latest/meta-data/".into(),
+    ] {
+        let response = sns(&sns_handler, "Subscribe", json!({"TopicArn":topic,"Protocol":"http","Endpoint":endpoint,"ReturnSubscriptionArn":true})).await;
+        assert!(response["SubscriptionArn"].is_string(), "{response}");
+    }
+    assert!(recorder.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn confirmation_redirect_cannot_reach_a_second_origin() {
+    let (blocked, recorder) = spawn_endpoint(200).await;
+    let target = blocked.clone();
+    let app = Router::new().fallback(move || {
+        let location = target.clone();
+        async move {
+            (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, location)],
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{address}");
+    let reg = registry(&endpoint);
+    let sns_handler = handler(&reg, "sns");
+    let topic = sns(&sns_handler, "CreateTopic", json!({"Name":"no-redirect"})).await["TopicArn"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let response = sns(
+        &sns_handler,
+        "Subscribe",
+        json!({"TopicArn":topic,"Protocol":"http","Endpoint":endpoint}),
+    )
+    .await;
+    assert_eq!(response["SubscriptionArn"], "pending confirmation");
+    assert!(recorder.lock().unwrap().is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn explicitly_allowed_origin_cannot_be_the_emulator_listener() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let reg = ServiceRegistry::with_known_services();
+    let config = locallycloud_sns::SnsConfig {
+        http_local_origins: vec![format!("http://{address}")],
+        ..Default::default()
+    };
+    let result = locallycloud_sns::register_with_config_and_endpoint(
+        &reg,
+        config,
+        "http://localhost:4566",
+        &[address],
+    );
+    assert!(result.is_err());
+    assert!(reg.native_handler(&ServiceName::new("sns")).is_none());
 }

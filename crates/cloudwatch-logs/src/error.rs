@@ -2,6 +2,8 @@ use locallycloud_core::error_mapping::AwsError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistrationError {
+    #[error("CloudWatch Logs configuration is invalid")]
+    InvalidConfiguration,
     #[error("service registry is unavailable while constructing CloudWatch Logs")]
     RegistryUnavailable,
     #[error(

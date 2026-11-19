@@ -27,15 +27,27 @@ pub fn log_service_error(
             "service request failed"
         );
     } else {
-        tracing::debug!(
-            service,
-            operation,
-            request_id,
-            cause_code,
-            status,
-            "service request rejected"
-        );
+        log_service_rejection(service, operation, request_id, cause_code, status);
     }
+}
+
+/// An expected service rejection can retain a protocol-required 5xx without becoming an ERROR.
+/// Classification belongs to the service's typed failure, not to a message-string heuristic.
+pub fn log_service_rejection(
+    service: &str,
+    operation: Option<&str>,
+    request_id: &str,
+    cause_code: &str,
+    status: u16,
+) {
+    tracing::debug!(
+        service,
+        operation,
+        request_id,
+        cause_code,
+        status,
+        "service request rejected"
+    );
 }
 
 /// A unique identifier assigned to each inbound request, used to correlate log records

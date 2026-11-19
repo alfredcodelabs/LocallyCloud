@@ -1,3 +1,4 @@
+use crate::error::KinesisError;
 mod batch;
 mod control;
 mod persistence;
@@ -33,7 +34,6 @@ const MAX_RECORDS: usize = 10_000;
 const MAX_GET_RECORD_BYTES: usize = 10 * 1024 * 1024;
 #[cfg(test)]
 const RETENTION_SECONDS: f64 = 24.0 * 60.0 * 60.0;
-const DEFAULT_MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 const SHARD_ID: &str = "shardId-000000000000";
 const MAX_SHARDS: i64 = 128;
@@ -185,15 +185,28 @@ pub(crate) struct KinesisHandler {
 
 impl KinesisHandler {
     pub(crate) fn new() -> Self {
-        Self::from_store(Store::default(), None, None)
+        Self::from_store(
+            Store::default(),
+            None,
+            None,
+            crate::KinesisConfig::default(),
+        )
     }
 
     pub(crate) fn with_state(state: Arc<StateDb>) -> Result<Self, StateError> {
+        Self::with_state_and_config(state, crate::KinesisConfig::default())
+    }
+
+    pub(crate) fn with_state_and_config(
+        state: Arc<StateDb>,
+        config: crate::KinesisConfig,
+    ) -> Result<Self, StateError> {
         let (persistence, store, secret) = persistence::Persistence::open(state)?;
         Ok(Self::from_store(
             store,
             Some(Arc::new(persistence)),
             Some(secret),
+            config,
         ))
     }
 
@@ -201,6 +214,7 @@ impl KinesisHandler {
         store: Store,
         persistence: Option<Arc<persistence::Persistence>>,
         secret: Option<[u8; 32]>,
+        config: crate::KinesisConfig,
     ) -> Self {
         let iterator_secret = secret.unwrap_or_else(|| {
             let mut value = [0_u8; 32];
@@ -210,14 +224,8 @@ impl KinesisHandler {
         });
         Self {
             store: Arc::new(Mutex::new(store)),
-            max_buffered_bytes: std::env::var("LOCALLYCLOUD_KINESIS_MAX_BUFFERED_BYTES")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|limit| *limit > 0)
-                .unwrap_or(DEFAULT_MAX_BUFFERED_BYTES),
-            simulate_write_limits: std::env::var("LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS")
-                .as_deref()
-                == Ok("1"),
+            max_buffered_bytes: config.max_buffered_bytes,
+            simulate_write_limits: config.simulate_write_limits,
             write_clock: now_epoch,
             registry: Weak::new(),
             iterator_secret,
@@ -230,7 +238,7 @@ impl KinesisHandler {
             for (key, stream) in &mut store.streams {
                 persistence
                     .trim(key, stream, now)
-                    .map_err(|_| KinesisError::Internal)?;
+                    .map_err(|_| KinesisError::Persistence)?;
             }
         } else {
             store.trim_expired(now);
@@ -334,10 +342,9 @@ impl KinesisHandler {
             tags: request.tags,
         };
         if let Some(persistence) = &self.persistence {
-            persistence.create(&key, &stream).map_err(|error| {
-                tracing::error!(%error, "Kinesis stream persistence failed");
-                KinesisError::Internal
-            })?;
+            persistence
+                .create(&key, &stream)
+                .map_err(|_| KinesisError::Persistence)?;
         }
         store.streams.insert(key, stream);
         Ok(Success::Empty)
@@ -461,7 +468,7 @@ impl KinesisHandler {
                     shard_index,
                     &record,
                 )
-                .map_err(|_| KinesisError::Internal)?;
+                .map_err(|_| KinesisError::Persistence)?;
         }
         stream.next_sequence = next_sequence;
         stream.shards[shard_index].next_position += 1;
@@ -527,7 +534,7 @@ impl KinesisHandler {
                                 shard_index(&request.shard_id).ok_or_else(invalid_iterator)?,
                                 timestamp,
                             )
-                            .map_err(|_| KinesisError::Internal)?
+                            .map_err(|_| KinesisError::Persistence)?
                             .unwrap_or(shard.next_position)
                     } else {
                         shard.first_position
@@ -552,7 +559,7 @@ impl KinesisHandler {
                                 shard_index(&request.shard_id).ok_or_else(invalid_iterator)?,
                                 sequence,
                             )
-                            .map_err(|_| KinesisError::Internal)?
+                            .map_err(|_| KinesisError::Persistence)?
                             .map(|position| {
                                 position
                                     + usize::from(
@@ -648,7 +655,7 @@ impl KinesisHandler {
                         payload.position,
                         limit as usize,
                     )
-                    .map_err(|_| KinesisError::Internal)?;
+                    .map_err(|_| KinesisError::Persistence)?;
                 Box::new(disk_records.iter())
             } else {
                 Box::new(
@@ -675,7 +682,7 @@ impl KinesisHandler {
                     &StreamKey::new(scope, &payload.stream_name),
                     shard_index(&payload.shard_id).ok_or_else(invalid_iterator)?,
                 )
-                .map_err(|_| KinesisError::Internal)?
+                .map_err(|_| KinesisError::Persistence)?
         } else {
             shard.records.back().map(|record| record.arrival_time)
         };
@@ -742,7 +749,7 @@ impl KinesisHandler {
         if let Some(persistence) = &self.persistence {
             persistence
                 .delete(&key)
-                .map_err(|_| KinesisError::Internal)?;
+                .map_err(|_| KinesisError::Persistence)?;
         }
         let removed = store
             .streams
@@ -821,9 +828,12 @@ impl NativeHandler for KinesisHandler {
 
     async fn handle(&self, request: ServiceRequest) -> Response {
         let request_id = request.request_id.clone();
+        let operation = operation(&request.headers)
+            .ok()
+            .and_then(crate::error::operation_name);
         let handler = self.clone();
         let outcome = tokio::task::spawn_blocking(move || handler.process(&request)).await;
-        match outcome.unwrap_or(Err(KinesisError::Internal)) {
+        match outcome.unwrap_or(Err(KinesisError::Worker)) {
             Ok(success) => {
                 let body = match success {
                     Success::Empty => Body::empty(),
@@ -836,10 +846,25 @@ impl NativeHandler for KinesisHandler {
                     .body(body)
                     .expect("Kinesis JSON response is valid")
             }
-            Err(error) => AwsError::from(error)
-                .with_request_id(request_id)
-                .render(AwsProtocol::Json11)
-                .into_response(),
+            Err(error) => {
+                let cause = match &error {
+                    KinesisError::Persistence => Some("persistence_failed"),
+                    KinesisError::Worker => Some("operation_task_failed"),
+                    _ => None,
+                };
+                let error = AwsError::from(error);
+                locallycloud_core::observability::log_service_error(
+                    "kinesis",
+                    operation,
+                    &request_id,
+                    cause.unwrap_or(&error.code),
+                    error.http_status,
+                );
+                error
+                    .with_request_id(request_id)
+                    .render(AwsProtocol::Json11)
+                    .into_response()
+            }
         }
     }
 }
@@ -847,54 +872,6 @@ impl NativeHandler for KinesisHandler {
 enum Success {
     Empty,
     Json(Value),
-}
-
-#[derive(Debug)]
-enum KinesisError {
-    Serialization(String),
-    Validation(String),
-    UnknownOperation,
-    ResourceInUse(String),
-    ResourceNotFound(String),
-    InvalidArgument(String),
-    ExpiredIterator(String),
-    ExpiredNextToken,
-    LimitExceeded(String),
-    Capacity(String),
-    Internal,
-}
-
-impl From<KinesisError> for AwsError {
-    fn from(error: KinesisError) -> Self {
-        let (code, message, status) = match error {
-            KinesisError::Serialization(message) => ("SerializationException", message, 400),
-            KinesisError::Validation(message) => ("ValidationException", message, 400),
-            KinesisError::UnknownOperation => (
-                "UnknownOperationException",
-                "The requested Kinesis operation is not supported".into(),
-                400,
-            ),
-            KinesisError::ResourceInUse(message) => ("ResourceInUseException", message, 400),
-            KinesisError::ResourceNotFound(message) => ("ResourceNotFoundException", message, 400),
-            KinesisError::InvalidArgument(message) => ("InvalidArgumentException", message, 400),
-            KinesisError::ExpiredIterator(message) => ("ExpiredIteratorException", message, 400),
-            KinesisError::LimitExceeded(message) => ("LimitExceededException", message, 400),
-            KinesisError::ExpiredNextToken => (
-                "ExpiredNextTokenException",
-                "The pagination token has expired".into(),
-                400,
-            ),
-            KinesisError::Capacity(message) => {
-                ("ProvisionedThroughputExceededException", message, 400)
-            }
-            KinesisError::Internal => (
-                "InternalFailureException",
-                "The request could not be completed".into(),
-                500,
-            ),
-        };
-        AwsError::new(code, message, status)
-    }
 }
 
 #[derive(Default, Deserialize)]
@@ -1128,6 +1105,32 @@ mod tests {
             panic!("iterator response");
         };
         value["ShardIterator"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn injected_capacity_is_instance_local_and_controls_admission() {
+        let limited = KinesisHandler::from_store(
+            Store::default(),
+            None,
+            None,
+            crate::KinesisConfig {
+                max_buffered_bytes: 1,
+                simulate_write_limits: false,
+            },
+        );
+        let normal = KinesisHandler::new();
+        create(&limited);
+        create(&normal);
+        assert!(matches!(
+            put(&limited, b"x"),
+            Err(KinesisError::Capacity(_))
+        ));
+        assert!(put(&normal, b"x").is_ok());
+        assert!(
+            limited.lock_store().unwrap().streams[&StreamKey::new(&scope(), "events")].shards[0]
+                .records
+                .is_empty()
+        );
     }
 
     #[test]

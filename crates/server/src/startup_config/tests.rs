@@ -528,3 +528,128 @@ fn ses_uses_shared_file_environment_precedence_and_separate_credentials() {
     let error = result.err().unwrap().to_string();
     assert!(!error.contains("should-not-appear"));
 }
+
+#[test]
+fn batch_three_defaults_file_and_environment_are_resolved_independently() {
+    let defaults = resolve("{}", &[]).unwrap();
+    assert_eq!(defaults.sns.http_timeout_secs, 5);
+    assert_eq!(defaults.sns.outbox_retry_max_secs, 30);
+    assert_eq!(defaults.kinesis.max_buffered_bytes, 64 * 1024 * 1024);
+    assert!(!defaults.kinesis.simulate_write_limits);
+    assert_eq!(defaults.firehose.s3_dispatch_timeout_secs, 10);
+    assert_eq!(defaults.logs.delivery_retry_interval_ms, 5000);
+    assert!(defaults.cognito.mailbox_dir.is_none());
+    let json = r#"{"sns":{"http_timeout_secs":7},"kinesis":{"max_buffered_bytes":2048,"simulate_write_limits":true},"firehose":{"s3_dispatch_timeout_secs":8,"source_poll_interval_ms":750},"cognito":{"mailbox_dir":"/file/mailbox"},"logs":{"delivery_retry_interval_ms":1200}}"#;
+    let file = resolve(json, &[]).unwrap();
+    assert_eq!(file.sns.http_timeout_secs, 7);
+    assert_eq!(file.kinesis.max_buffered_bytes, 2048);
+    assert_eq!(
+        file.cognito.mailbox_dir,
+        Some(PathBuf::from("/file/mailbox"))
+    );
+    let env = resolve(
+        json,
+        &[
+            ("LOCALLYCLOUD_SNS_HTTP_TIMEOUT_SECS", "2"),
+            (
+                "LOCALLYCLOUD_SNS_HTTP_LOCAL_ORIGINS",
+                r#"["http://127.0.0.1:8080"]"#,
+            ),
+            ("LOCALLYCLOUD_SNS_HTTP_CLIENT_CACHE_CAPACITY", "4"),
+            ("LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS", "0"),
+            ("LOCALLYCLOUD_FIREHOSE_SOURCE_POLL_INTERVAL_MS", "25"),
+            ("LOCALLYCLOUD_COGNITO_MAILBOX_DIR", "/env/mailbox"),
+            ("LOCALLYCLOUD_LOGS_DELIVERY_RETRY_INTERVAL_MS", "50"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(env.sns.http_timeout_secs, 2);
+    assert_eq!(env.sns.http_client_cache_capacity, 4);
+    assert_eq!(env.sns.http_local_origins, vec!["http://127.0.0.1:8080"]);
+    assert_eq!(env.sns.outbox_retry_initial_secs, 1);
+    assert_eq!(env.kinesis.max_buffered_bytes, 2048);
+    assert!(!env.kinesis.simulate_write_limits);
+    assert_eq!(env.firehose.source_poll_interval_ms, 25);
+    assert_eq!(env.firehose.s3_dispatch_timeout_secs, 8);
+    assert_eq!(env.cognito.mailbox_dir, Some(PathBuf::from("/env/mailbox")));
+    assert_eq!(env.logs.delivery_retry_interval_ms, 50);
+    assert_eq!(env.logs.retention_reclaim_delay_ms, 100);
+}
+
+#[test]
+fn batch_three_rejects_invalid_explicit_settings_without_echoing_values() {
+    let numeric = [
+        "LOCALLYCLOUD_SNS_HTTP_TIMEOUT_SECS",
+        "LOCALLYCLOUD_SNS_HTTP_CLIENT_CACHE_CAPACITY",
+        "LOCALLYCLOUD_SNS_OUTBOX_RETRY_INITIAL_SECS",
+        "LOCALLYCLOUD_SNS_OUTBOX_RETRY_MAX_SECS",
+        "LOCALLYCLOUD_KINESIS_MAX_BUFFERED_BYTES",
+        "LOCALLYCLOUD_FIREHOSE_SOURCE_POLL_INTERVAL_MS",
+        "LOCALLYCLOUD_FIREHOSE_S3_DISPATCH_TIMEOUT_SECS",
+        "LOCALLYCLOUD_FIREHOSE_MAX_RETRY_DELAY_SECS",
+        "LOCALLYCLOUD_LOGS_DELIVERY_RETRY_INTERVAL_MS",
+        "LOCALLYCLOUD_LOGS_RETENTION_RECLAIM_DELAY_MS",
+    ];
+    for name in numeric {
+        for value in ["", "0", "-1", "999999999999", "private-canary-value"] {
+            let error = match resolve("{}", &[(name, value)]) {
+                Err(error) => error,
+                Ok(_) => panic!("accepted invalid {name}"),
+            };
+            assert!(!error.to_string().contains("private-canary-value"));
+        }
+        assert!(StartupConfig::resolve(FileConfig::default(), &|key| {
+            (key == name).then(|| OsString::from_vec(vec![0xff]))
+        })
+        .is_err());
+    }
+    for (name, value) in [
+        (
+            "LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS",
+            "private-canary-value",
+        ),
+        (
+            "LOCALLYCLOUD_COGNITO_MAILBOX_DIR",
+            "relative/private-canary-value",
+        ),
+    ] {
+        let error = match resolve("{}", &[(name, value)]) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted invalid {name}"),
+        };
+        assert!(!error.to_string().contains("private-canary-value"));
+    }
+    assert!(resolve(
+        r#"{"sns":{"outbox_retry_initial_secs":10,"outbox_retry_max_secs":5}}"#,
+        &[]
+    )
+    .is_err());
+    for value in [
+        "private-canary-value",
+        r#"["http://user:private-canary-value@127.0.0.1:8080"]"#,
+        r#"["http://169.254.169.254"]"#,
+        r#"["http://127.0.0.1:8080/path"]"#,
+    ] {
+        let error = match resolve("{}", &[("LOCALLYCLOUD_SNS_HTTP_LOCAL_ORIGINS", value)]) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted invalid local origins"),
+        };
+        assert!(!error.to_string().contains("private-canary-value"));
+    }
+
+    for json in [
+        r#"{"sns":{"http_timeout_secs":null}}"#,
+        r#"{"kinesis":{"simulate_write_limits":"true"}}"#,
+        r#"{"firehose":{"source_poll_interval_ms":null}}"#,
+        r#"{"cognito":{"mailbox_dir":null}}"#,
+        r#"{"logs":{"unknown":1}}"#,
+        r#"{"sns":{"http_local_origins":null}}"#,
+        r#"{"sns":null}"#,
+        r#"{"kinesis":null}"#,
+        r#"{"firehose":null}"#,
+        r#"{"cognito":null}"#,
+        r#"{"logs":null}"#,
+    ] {
+        assert!(serde_json::from_str::<FileConfig>(json).is_err(), "{json}");
+    }
+}

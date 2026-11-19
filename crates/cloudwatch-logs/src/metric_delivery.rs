@@ -10,6 +10,7 @@ use crate::store::LogsStore;
 const DELIVERY_BATCH_SIZE: usize = 500;
 
 pub struct MetricDeliveryWorker {
+    retry_interval: std::time::Duration,
     store: Arc<LogsStore>,
     registry: Weak<ServiceRegistry>,
     notify: Arc<Notify>,
@@ -17,13 +18,33 @@ pub struct MetricDeliveryWorker {
 }
 
 impl MetricDeliveryWorker {
+    #[cfg(test)]
     pub fn new(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>) -> Self {
+        Self::with_retry_interval(
+            store,
+            registry,
+            std::time::Duration::from_millis(
+                crate::LogsConfig::default().delivery_retry_interval_ms,
+            ),
+        )
+    }
+    pub fn with_retry_interval(
+        store: Arc<LogsStore>,
+        registry: Weak<ServiceRegistry>,
+        retry_interval: std::time::Duration,
+    ) -> Self {
         Self {
+            retry_interval,
             store,
             registry,
             notify: Arc::new(Notify::new()),
             handle: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> bool {
+        self.handle.lock().unwrap().is_some()
     }
 
     pub fn wake(&self) {
@@ -34,8 +55,9 @@ impl MetricDeliveryWorker {
             let store = self.store.clone();
             let registry = self.registry.clone();
             let notify = self.notify.clone();
+            let retry_interval = self.retry_interval;
             *handle = Some(tokio::spawn(async move {
-                run(store, registry, notify).await;
+                run(store, registry, notify, retry_interval).await;
             }));
         }
         self.notify.notify_one();
@@ -78,13 +100,35 @@ async fn finish(store: &Arc<LogsStore>, ids: Vec<u64>, settled: bool) -> bool {
     )
 }
 
-async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc<Notify>) {
+async fn run(
+    store: Arc<LogsStore>,
+    registry: Weak<ServiceRegistry>,
+    notify: Arc<Notify>,
+    retry_interval: std::time::Duration,
+) {
+    let mut retry_pending = false;
     loop {
-        tokio::select! { _=notify.notified()=>{}, _=tokio::time::sleep(std::time::Duration::from_secs(5))=>{} }
+        if retry_pending {
+            tokio::select! { _=notify.notified()=>{}, _=tokio::time::sleep(retry_interval)=>{} }
+        } else {
+            notify.notified().await;
+        }
+        retry_pending = false;
         loop {
             let effects = match store.pending_metric_effects(DELIVERY_BATCH_SIZE) {
                 Ok(effects) if !effects.is_empty() => effects,
-                _ => break,
+                Ok(_) => break,
+                Err(_) => {
+                    locallycloud_core::observability::log_service_error(
+                        "logs",
+                        Some("MetricDelivery"),
+                        "background",
+                        "metric_queue_read_failed",
+                        500,
+                    );
+                    retry_pending = true;
+                    break;
+                }
             };
             let ids: Vec<_> = effects.iter().map(|effect| effect.id).collect();
             let durable = store.persistence().is_some();
@@ -102,7 +146,24 @@ async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc
                 .upgrade()
                 .and_then(|registry| registry.metric_sink(&ServiceName::new("monitoring")));
             let Some(sink) = sink else {
-                let _ = finish(&store, ids, false).await;
+                if !finish(&store, ids, false).await {
+                    locallycloud_core::observability::log_service_error(
+                        "logs",
+                        Some("MetricDelivery"),
+                        "background",
+                        "metric_checkpoint_failed",
+                        500,
+                    );
+                } else {
+                    locallycloud_core::observability::log_service_error(
+                        "logs",
+                        Some("MetricDelivery"),
+                        "background",
+                        "metric_sink_unavailable",
+                        503,
+                    );
+                }
+                retry_pending = true;
                 break;
             };
             let outcome = emit(sink.as_ref(), observations.clone(), durable).await;
@@ -127,6 +188,19 @@ async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc
             let retry_empty = retry.is_empty();
             let retry_ok = finish(&store, retry, false).await;
             if !settled_ok || !retry_ok || !retry_empty {
+                let (cause, status) = if !settled_ok || !retry_ok {
+                    ("metric_checkpoint_failed", 500)
+                } else {
+                    ("metric_delivery_pending", 503)
+                };
+                locallycloud_core::observability::log_service_error(
+                    "logs",
+                    Some("MetricDelivery"),
+                    "background",
+                    cause,
+                    status,
+                );
+                retry_pending = true;
                 break;
             }
         }

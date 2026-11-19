@@ -153,7 +153,7 @@ impl KinesisHandler {
                 .collect();
             persistence
                 .append_many(&key, stream, &refs, next)
-                .map_err(|_| KinesisError::Internal)?;
+                .map_err(|_| KinesisError::Persistence)?;
         }
         for (index, record) in accepted {
             stream.shards[index].next_position += 1;
@@ -254,7 +254,7 @@ mod tests {
             assert_eq!(stream.next_sequence, 3);
         }
         db.connection().unwrap().execute_batch("CREATE TRIGGER fail_batch BEFORE INSERT ON kinesis_shard_records WHEN NEW.partition_key='fail' BEGIN SELECT RAISE(ABORT,'injected');END;").unwrap();
-        assert!(matches!(handler.put_records(request(&scope,json!([{"Data":"eA==","PartitionKey":"p"},{"Data":"eA==","PartitionKey":"fail"}])),&scope),Err(KinesisError::Internal)));
+        assert!(matches!(handler.put_records(request(&scope,json!([{"Data":"eA==","PartitionKey":"p"},{"Data":"eA==","PartitionKey":"fail"}])),&scope),Err(KinesisError::Persistence)));
         assert!(
             handler.lock_store().unwrap().streams[&StreamKey::new(&scope, "events")]
                 .shards

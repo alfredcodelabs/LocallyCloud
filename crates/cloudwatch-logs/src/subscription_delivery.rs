@@ -26,6 +26,7 @@ const DELIVERY_BATCH_SIZE: usize = 100;
 const MAX_ASYNC_PAYLOAD_BYTES: usize = 256 * 1024;
 
 pub struct SubscriptionDeliveryWorker {
+    retry_interval: std::time::Duration,
     store: Arc<LogsStore>,
     registry: Weak<ServiceRegistry>,
     notify: Arc<Notify>,
@@ -33,13 +34,23 @@ pub struct SubscriptionDeliveryWorker {
 }
 
 impl SubscriptionDeliveryWorker {
-    pub fn new(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>) -> Self {
+    pub fn with_retry_interval(
+        store: Arc<LogsStore>,
+        registry: Weak<ServiceRegistry>,
+        retry_interval: std::time::Duration,
+    ) -> Self {
         Self {
+            retry_interval,
             store,
             registry,
             notify: Arc::new(Notify::new()),
             handle: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> bool {
+        self.handle.lock().unwrap().is_some()
     }
 
     pub fn wake(&self) {
@@ -50,8 +61,9 @@ impl SubscriptionDeliveryWorker {
             let store = self.store.clone();
             let registry = self.registry.clone();
             let notify = self.notify.clone();
+            let retry_interval = self.retry_interval;
             *handle = Some(tokio::spawn(async move {
-                run(store, registry, notify).await;
+                run(store, registry, notify, retry_interval).await;
             }));
         }
         self.notify.notify_one();
@@ -69,28 +81,70 @@ impl Drop for SubscriptionDeliveryWorker {
     }
 }
 
-async fn run(store: Arc<LogsStore>, registry: Weak<ServiceRegistry>, notify: Arc<Notify>) {
+async fn run(
+    store: Arc<LogsStore>,
+    registry: Weak<ServiceRegistry>,
+    notify: Arc<Notify>,
+    retry_interval: std::time::Duration,
+) {
+    let mut retry_pending = false;
     loop {
-        tokio::select! { _=notify.notified()=>{}, _=tokio::time::sleep(std::time::Duration::from_secs(5))=>{} }
+        if retry_pending {
+            tokio::select! { _=notify.notified()=>{}, _=tokio::time::sleep(retry_interval)=>{} }
+        } else {
+            notify.notified().await;
+        }
+        retry_pending = false;
         loop {
             let deliveries = match store.pending_subscription_deliveries(DELIVERY_BATCH_SIZE) {
                 Ok(deliveries) if !deliveries.is_empty() => deliveries,
-                _ => break,
+                Ok(_) => break,
+                Err(_) => {
+                    locallycloud_core::observability::log_service_error(
+                        "logs",
+                        Some("SubscriptionDelivery"),
+                        "background",
+                        "subscription_queue_read_failed",
+                        500,
+                    );
+                    retry_pending = true;
+                    break;
+                }
             };
             let mut failed = false;
             for delivery in deliveries {
                 let delivered = deliver(&registry, &delivery).await;
                 let owned = store.clone();
+                let correlation = format!("logs-subscription:{}", delivery.id);
                 let finished = tokio::task::spawn_blocking(move || {
                     owned.finish_subscription_delivery(delivery.id, delivered)
                 })
                 .await;
                 if !matches!(finished, Ok(Ok(()))) {
-                    return;
+                    locallycloud_core::observability::log_service_error(
+                        "logs",
+                        Some("SubscriptionDelivery"),
+                        &correlation,
+                        "subscription_checkpoint_failed",
+                        500,
+                    );
+                    failed = true;
+                    break;
+                }
+                if !delivered {
+                    // Denial and missing destinations are expected delivery rejections.
+                    locallycloud_core::observability::log_service_error(
+                        "logs",
+                        Some("SubscriptionDelivery"),
+                        &correlation,
+                        "subscription_delivery_rejected",
+                        400,
+                    );
                 }
                 failed |= !delivered;
             }
             if failed {
+                retry_pending = true;
                 break;
             }
         }

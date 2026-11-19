@@ -58,44 +58,93 @@ pub struct FanoutJob {
     pub delivery: Delivery,
 }
 
+#[derive(Clone, Copy)]
+pub enum DeliveryFailure {
+    Subscription,
+    Task,
+    HttpRejected(u16),
+    Egress(locallycloud_core::egress::EgressError),
+}
+impl DeliveryFailure {
+    fn diagnostic(self) -> (&'static str, u16) {
+        match self {
+            Self::Subscription => ("subscription_not_acknowledged", 400),
+            Self::Task => ("delivery_task_failed", 500),
+            Self::HttpRejected(status) => ("http_subscriber_rejected", status),
+            Self::Egress(error) => {
+                use locallycloud_core::egress::EgressError;
+                match error {
+                    EgressError::InvalidUrl
+                    | EgressError::InvalidOrigin(_)
+                    | EgressError::DestinationDenied
+                    | EgressError::DnsAnswers => ("http_destination_denied", 400),
+                    EgressError::Timeout => ("http_subscriber_timeout", 504),
+                    EgressError::DnsResolution => ("http_dns_resolution_failed", 503),
+                    EgressError::HostProbe => ("http_host_probe_failed", 503),
+                    EgressError::CacheUnavailable | EgressError::ClientInitialization => {
+                        ("http_client_unavailable", 500)
+                    }
+                    EgressError::TlsConfiguration => ("http_tls_configuration_failed", 500),
+                    EgressError::Connection => ("http_subscriber_connection_failed", 503),
+                }
+            }
+        }
+    }
+}
+
 /// Deliver to every confirmed subscription whose filter policy matches. Each subscription owns
 /// its task, so a slow endpoint cannot delay another target. The caller may await this function to
 /// serialize FIFO publications, or detach it for standard topics.
 pub async fn deliver_accepted(
     registry: Arc<ServiceRegistry>,
-    http: reqwest::Client,
+    http: Arc<locallycloud_core::egress::EgressClient>,
     store: Arc<crate::store::SnsStore>,
     job: FanoutJob,
 ) {
     let id = job.outbox_id;
-    let mut backoff = std::time::Duration::from_secs(1);
+    let mut backoff = std::time::Duration::from_secs(store.config.outbox_retry_initial_secs);
     loop {
-        let delivered = fan_out(registry.clone(), http.clone(), job.clone()).await;
-        if delivered {
-            match store.complete_job(id) {
-                Ok(()) => return,
-                Err(error) => tracing::warn!(%error, "SNS delivered publication remains in outbox"),
+        let outcome = fan_out(registry.clone(), http.clone(), job.clone()).await;
+        let (cause, status) = match outcome {
+            Ok(()) => {
+                let owned = store.clone();
+                match tokio::task::spawn_blocking(move || owned.complete_job(id)).await {
+                    Ok(Ok(())) => return,
+                    _ => ("outbox_acknowledgement_failed", 500),
+                }
             }
-        } else {
-            tracing::warn!(message_id = %job.delivery.message_id, "SNS publication retained for retry");
-        }
+            Err(failure) => failure.diagnostic(),
+        };
+        locallycloud_core::observability::log_service_error(
+            "sns",
+            Some("Fanout"),
+            &job.delivery.request_id,
+            cause,
+            status,
+        );
         if id.is_none() {
             return;
         }
         // A deleted topic cascades its outbox rows; stop retrying that publication.
-        if matches!(store.job_exists(id), Ok(false)) {
+        let owned = store.clone();
+        if matches!(
+            tokio::task::spawn_blocking(move || owned.job_exists(id)).await,
+            Ok(Ok(false))
+        ) {
             return;
         }
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(
+            store.config.outbox_retry_max_secs,
+        ));
     }
 }
 
 pub async fn fan_out(
     registry: Arc<ServiceRegistry>,
-    http: reqwest::Client,
+    http: Arc<locallycloud_core::egress::EgressClient>,
     job: FanoutJob,
-) -> bool {
+) -> Result<(), DeliveryFailure> {
     let delivery = Arc::new(job.delivery);
     let mut tasks = tokio::task::JoinSet::new();
     for sub in job.subscriptions {
@@ -107,41 +156,65 @@ pub async fn fan_out(
         let delivery = delivery.clone();
         tasks.spawn(async move { deliver_subscription(&registry, &http, &sub, &delivery).await });
     }
-    let mut delivered = true;
+    let mut failure = None;
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok(ok) => delivered &= ok,
-            Err(error) => {
-                tracing::warn!(%error, "SNS subscription delivery task failed");
-                delivered = false;
+            Ok(Ok(())) => {}
+            Ok(Err(cause)) => {
+                if failure.is_none_or(|previous: DeliveryFailure| {
+                    previous.diagnostic().1 < 500 && cause.diagnostic().1 >= 500
+                }) {
+                    failure = Some(cause);
+                }
+            }
+            Err(_) => {
+                failure = Some(DeliveryFailure::Task);
             }
         }
     }
-    delivered
+    failure.map_or(Ok(()), Err)
 }
 
 async fn deliver_subscription(
     registry: &ServiceRegistry,
-    http: &reqwest::Client,
+    http: &Arc<locallycloud_core::egress::EgressClient>,
     sub: &Subscription,
     d: &Delivery,
-) -> bool {
+) -> Result<(), DeliveryFailure> {
     let (retries, delay) = delivery_policy(sub);
+    let mut failure = DeliveryFailure::Subscription;
     for attempt in 0..=retries {
         let delivered = match sub.protocol.as_str() {
-            "sqs" => deliver_to_sqs(registry, sub, d).await,
-            "lambda" => deliver_to_lambda(registry, sub, d).await,
+            "sqs" => {
+                if deliver_to_sqs(registry, sub, d).await {
+                    Ok(())
+                } else {
+                    Err(DeliveryFailure::Subscription)
+                }
+            }
+            "lambda" => {
+                if deliver_to_lambda(registry, sub, d).await {
+                    Ok(())
+                } else {
+                    Err(DeliveryFailure::Subscription)
+                }
+            }
             "http" | "https" => deliver_to_http(http, sub, d).await,
-            _ => false,
+            _ => Err(DeliveryFailure::Subscription),
         };
-        if delivered {
-            return true;
+        match delivered {
+            Ok(()) => return Ok(()),
+            Err(cause) => failure = cause,
         }
         if attempt < retries && !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
     }
-    handle_failed_delivery(registry, sub, d).await
+    if handle_failed_delivery(registry, sub, d).await {
+        Ok(())
+    } else {
+        Err(failure)
+    }
 }
 
 fn delivery_policy(sub: &Subscription) -> (u32, std::time::Duration) {
@@ -192,15 +265,9 @@ async fn handle_failed_delivery(
                 attributes: &d.attributes,
             };
             let sent = send_to_sqs_arn(registry, &arn, &notification.envelope_string(), d).await;
-            if !sent {
-                tracing::warn!(subscription = %sub.arn, dlq = %arn, "SNS dead-letter target unresolved");
-            }
             sent
         }
-        None => {
-            tracing::warn!(subscription = %sub.arn, "SNS delivery failed with no RedrivePolicy");
-            false
-        }
+        None => false,
     }
 }
 
@@ -384,7 +451,11 @@ async fn send_to_sqs_arn(
 /// POST the notification (non-raw envelope, or bare body for raw delivery) to an http/https
 /// subscriber with the AWS-documented SNS headers. A non-2xx or unreachable endpoint is a
 /// failed delivery (routed to the DLQ by the caller) but never fails `Publish`.
-async fn deliver_to_http(http: &reqwest::Client, sub: &Subscription, d: &Delivery) -> bool {
+async fn deliver_to_http(
+    http: &Arc<locallycloud_core::egress::EgressClient>,
+    sub: &Subscription,
+    d: &Delivery,
+) -> Result<(), DeliveryFailure> {
     let raw = sub.raw_delivery();
     let body = if raw {
         d.resolve(&sub.protocol).to_string()
@@ -401,7 +472,8 @@ async fn deliver_to_http(http: &reqwest::Client, sub: &Subscription, d: &Deliver
         notification.envelope_string()
     };
     let mut builder = http
-        .post(&sub.endpoint)
+        .request(Method::POST, &sub.endpoint)
+        .map_err(DeliveryFailure::Egress)?
         .header("x-amz-sns-message-type", "Notification")
         .header("x-amz-sns-message-id", &d.message_id)
         .header("x-amz-sns-topic-arn", &d.topic_arn)
@@ -411,7 +483,13 @@ async fn deliver_to_http(http: &reqwest::Client, sub: &Subscription, d: &Deliver
     if raw {
         builder = builder.header("x-amz-sns-rawdelivery", "true");
     }
-    matches!(builder.send().await, Ok(resp) if resp.status().is_success())
+    match builder.send().await {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(DeliveryFailure::HttpRejected(response.status().as_u16())),
+        Err(error) => Err(DeliveryFailure::Egress(
+            locallycloud_core::egress::EgressError::from_request(&error),
+        )),
+    }
 }
 
 async fn deliver_to_lambda(registry: &ServiceRegistry, sub: &Subscription, d: &Delivery) -> bool {
@@ -481,13 +559,13 @@ fn base_headers(_region: &str, _account: &str, _request_id: &str) -> HeaderMap {
 /// POST a `SubscriptionConfirmation` message to an http/https endpoint so the subscriber can
 /// confirm via the `SubscribeURL`. Best-effort: a failure never fails `Subscribe`.
 pub async fn send_confirmation(
-    http: &reqwest::Client,
+    http: &Arc<locallycloud_core::egress::EgressClient>,
+    base: &str,
     endpoint: &str,
     topic_arn: &str,
     token: &str,
     request_id: &str,
 ) {
-    let base = endpoint_base();
     let subscribe_url =
         format!("{base}/?Action=ConfirmSubscription&TopicArn={topic_arn}&Token={token}");
     let timestamp = time::OffsetDateTime::now_utc()
@@ -500,39 +578,44 @@ pub async fn send_confirmation(
         &subscribe_url,
         &timestamp,
     );
-    let _ = http
-        .post(endpoint)
+    let request = match http.request(Method::POST, endpoint) {
+        Ok(request) => request,
+        Err(error) => {
+            let (cause, status) = DeliveryFailure::Egress(error).diagnostic();
+            locallycloud_core::observability::log_service_error(
+                "sns",
+                Some("Subscribe"),
+                request_id,
+                cause,
+                status,
+            );
+            return;
+        }
+    };
+    let response = request
         .header("x-amz-sns-message-type", "SubscriptionConfirmation")
         .header("x-amz-sns-topic-arn", topic_arn)
         .header("content-type", "text/plain; charset=UTF-8")
         .body(msg.to_string())
         .send()
         .await;
-}
-
-/// The externally-reachable base URL of this locallycloud, from the name-independent config
-/// (`AWS_ENDPOINT_URL`, else `LOCALLYCLOUD_HOST`/`LOCALLYCLOUD_PORT`), defaulting to the
-/// documented `http://localhost:4566`. Used to build the confirmation `SubscribeURL`.
-fn endpoint_base() -> String {
-    if let Ok(url) = std::env::var("AWS_ENDPOINT_URL") {
-        if !url.is_empty() {
-            return url.trim_end_matches('/').to_string();
-        }
-    }
-    let host = std::env::var("LOCALLYCLOUD_HOST")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "localhost".into());
-    let host = if host == "0.0.0.0" {
-        "localhost".to_string()
-    } else {
-        host
+    let failure = match response {
+        Ok(response) if response.status().is_success() => None,
+        Ok(response) => Some(("confirmation_not_acknowledged", response.status().as_u16())),
+        Err(error) => Some(
+            DeliveryFailure::Egress(locallycloud_core::egress::EgressError::from_request(&error))
+                .diagnostic(),
+        ),
     };
-    let port = std::env::var("LOCALLYCLOUD_PORT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "4566".into());
-    format!("http://{host}:{port}")
+    if let Some((cause, status)) = failure {
+        locallycloud_core::observability::log_service_error(
+            "sns",
+            Some("Subscribe"),
+            request_id,
+            cause,
+            status,
+        );
+    }
 }
 
 fn json_request(

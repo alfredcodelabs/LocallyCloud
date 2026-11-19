@@ -1,3 +1,4 @@
+use crate::error::FirehoseError;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -50,9 +51,6 @@ const MAX_BUFFERED_BYTES: usize = 10 * 1024 * 1024;
 const LOCAL_COALESCE_DELAY: Duration = Duration::from_secs(2);
 const COALESCE_SIZE_BYTES: usize = 1024 * 1024;
 const MAX_DELIVERY_ATTEMPTS: u8 = 6;
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-const S3_DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
-const SOURCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DESTINATION_ID: &str = "destinationId-000000000001";
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -177,6 +175,7 @@ struct Batch {
 }
 
 struct Inner {
+    config: crate::FirehoseConfig,
     registry: Weak<ServiceRegistry>,
     streams: Mutex<HashMap<StreamKey, DeliveryStream>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -202,6 +201,7 @@ impl FirehoseHandler {
             None,
             HashMap::new(),
             Arc::new(routing::JqEvaluator::default()),
+            crate::FirehoseConfig::default(),
         )
     }
 
@@ -210,8 +210,10 @@ impl FirehoseHandler {
         state: Option<Arc<StateDb>>,
         streams: HashMap<StreamKey, DeliveryStream>,
         metadata_evaluator: Arc<dyn routing::MetadataEvaluator>,
+        config: crate::FirehoseConfig,
     ) -> (Self, FirehoseHandle) {
         let inner = Arc::new(Inner {
+            config,
             registry,
             streams: Mutex::new(streams),
             worker: Mutex::new(None),
@@ -233,12 +235,21 @@ impl FirehoseHandler {
         registry: Weak<ServiceRegistry>,
         state: Arc<StateDb>,
     ) -> Result<(Self, FirehoseHandle), persistence::PersistError> {
+        Self::with_state_and_config(registry, state, crate::FirehoseConfig::default())
+    }
+
+    pub(crate) fn with_state_and_config(
+        registry: Weak<ServiceRegistry>,
+        state: Arc<StateDb>,
+        config: crate::FirehoseConfig,
+    ) -> Result<(Self, FirehoseHandle), persistence::PersistError> {
         let streams = persistence::load(&state)?;
         Ok(Self::from_parts(
             registry,
             Some(state),
             streams,
             Arc::new(routing::JqEvaluator::default()),
+            config,
         ))
     }
 
@@ -285,7 +296,9 @@ impl FirehoseHandler {
             }
             "PutRecord" => self.put_record(decode(&request.body)?, &scope),
             "PutRecordBatch" => self.put_record_batch(decode(&request.body)?, &scope),
-            "DeleteDeliveryStream" => self.delete_delivery_stream(decode(&request.body)?, &scope),
+            "DeleteDeliveryStream" => {
+                self.delete_delivery_stream(decode(&request.body)?, &scope, &request.request_id)
+            }
             "LocallyCloudRetryDeliveryStream" => {
                 self.retry_delivery_stream(decode(&request.body)?, &scope)
             }
@@ -902,6 +915,7 @@ impl FirehoseHandler {
         &self,
         request: DeleteDeliveryStreamRequest,
         scope: &Scope,
+        request_id: &str,
     ) -> Result<Success, FirehoseError> {
         validate_stream_name(&request.delivery_stream_name)?;
         let force = request.allow_force_delete.unwrap_or(false);
@@ -916,7 +930,10 @@ impl FirehoseHandler {
             }
             let (discarded_records, discarded_bytes) = buffered_usage(stream);
             tracing::warn!(
-                stream = %request.delivery_stream_name,
+                service = "firehose",
+                operation = "DeleteDeliveryStream",
+                request_id,
+                cause_code = "retained_records_discarded",
                 discarded_records,
                 discarded_bytes,
                 "Force-deleted terminal Firehose stream and discarded in-memory records"
@@ -1013,7 +1030,7 @@ fn authorize_roles(
                 &source.role_arn,
                 action,
                 &source.arn,
-                FailureCode::InternalError,
+                FailureCode::KinesisAccessDenied,
             )?;
         }
     }
@@ -1087,8 +1104,14 @@ impl FirehoseHandle {
             .ok()
             .and_then(|mut worker| worker.take());
         if let Some(worker) = worker {
-            if let Err(error) = worker.await {
-                tracing::warn!(%error, "Firehose delivery worker terminated unexpectedly");
+            if worker.await.is_err() {
+                locallycloud_core::observability::log_service_error(
+                    "firehose",
+                    Some("DeliveryWorker"),
+                    "shutdown",
+                    "worker_join_failed",
+                    500,
+                );
             }
         }
     }
@@ -1113,8 +1136,13 @@ impl Inner {
             &stream.destination,
             None,
         )
-        .map_err(|_| {
-            FirehoseError::ServiceUnavailable("Firehose role authorization is denied".into())
+        .map_err(|failure| match failure {
+            FailureCode::S3AccessDenied
+            | FailureCode::GlueAccessDenied
+            | FailureCode::KinesisAccessDenied => FirehoseError::DeliveryRoleDenied,
+            _ => FirehoseError::ServiceUnavailable(
+                "Firehose role authorization is unavailable".into(),
+            ),
         })
     }
 
@@ -1162,7 +1190,13 @@ impl Inner {
                 let inner = self.clone();
                 let Ok(batches) = tokio::task::spawn_blocking(move || inner.take_batches()).await
                 else {
-                    tracing::error!("Firehose queue claim task failed");
+                    locallycloud_core::observability::log_service_error(
+                        "firehose",
+                        Some("DeliveryWorker"),
+                        "background",
+                        "queue_claim_task_failed",
+                        500,
+                    );
                     return;
                 };
                 if batches.is_empty() {
@@ -1203,6 +1237,14 @@ impl Inner {
                     };
                     let observed_at = Instant::now();
                     if let Err(failure) = outcome {
+                        let (cause, status) = failure.diagnostic();
+                        locallycloud_core::observability::log_service_error(
+                            "firehose",
+                            Some("DeliverBatch"),
+                            &batch.token.to_string(),
+                            cause,
+                            status,
+                        );
                         self.log_delivery_error(&batch, failure).await;
                     }
                     let inner = self.clone();
@@ -1212,8 +1254,12 @@ impl Inner {
                     .await
                     .is_err()
                     {
-                        tracing::error!(
-                            "Firehose completion task failed; journal retains ownership"
+                        locallycloud_core::observability::log_service_error(
+                            "firehose",
+                            Some("DeliveryWorker"),
+                            "background",
+                            "completion_task_failed",
+                            500,
                         );
                         return;
                     }
@@ -1233,8 +1279,8 @@ impl Inner {
             stream.source.as_ref().is_some_and(|source| !source.stopped) && !stream.terminal_failure
         }) {
             Some(
-                due.unwrap_or(SOURCE_POLL_INTERVAL)
-                    .min(SOURCE_POLL_INTERVAL),
+                due.unwrap_or(Duration::from_millis(self.config.source_poll_interval_ms))
+                    .min(Duration::from_millis(self.config.source_poll_interval_ms)),
             )
         } else {
             due
@@ -1350,7 +1396,17 @@ impl Inner {
                         }
                     }
                 }
-                tracing::warn!(stream = %key.name, reason, "Firehose Kinesis source poll failed");
+                locallycloud_core::observability::log_service_error(
+                    "firehose",
+                    Some("PollKinesisSource"),
+                    "background",
+                    reason,
+                    if reason == "SOURCE_ACCESS_DENIED" {
+                        403
+                    } else {
+                        503
+                    },
+                );
                 continue;
             };
             let Ok(mut streams) = self.lock_streams() else {
@@ -1379,7 +1435,13 @@ impl Inner {
                 || records.iter().map(|(_, _, data)| data.len()).sum::<usize>() > MAX_BUFFERED_BYTES
             {
                 source.failure = Some("SOURCE_BATCH_TOO_LARGE".to_string());
-                tracing::warn!(stream = %key.name, "Firehose Kinesis source page exceeds supported limit");
+                locallycloud_core::observability::log_service_error(
+                    "firehose",
+                    Some("PollKinesisSource"),
+                    "background",
+                    "source_page_exceeds_limit",
+                    400,
+                );
                 continue;
             }
             source.failure = None;
@@ -1393,9 +1455,15 @@ impl Inner {
                 .into_iter()
                 .map(|(_, _, data)| data)
                 .collect::<Vec<_>>();
-            if let Err(error) = self.append_pending(&key, stream, data) {
+            if self.append_pending(&key, stream, data).is_err() {
                 *stream = previous;
-                tracing::error!(stream = %key.name, ?error, "Firehose source records could not be committed");
+                locallycloud_core::observability::log_service_error(
+                    "firehose",
+                    Some("PollKinesisSource"),
+                    "background",
+                    "source_checkpoint_failed",
+                    500,
+                );
                 continue;
             }
         }
@@ -1510,7 +1578,7 @@ impl Inner {
         );
         let uri: Uri = "/".parse().map_err(|_| ())?;
         let response = tokio::time::timeout(
-            S3_DISPATCH_TIMEOUT,
+            Duration::from_secs(self.config.s3_dispatch_timeout_secs),
             dispatcher.dispatch_scoped(
                 &Method::POST,
                 &uri,
@@ -1538,22 +1606,38 @@ impl Inner {
 
     fn take_batches_at(&self, now: Instant) -> Vec<Batch> {
         let Ok(mut streams) = self.streams.lock() else {
-            tracing::error!("Firehose stream store lock is poisoned");
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("DeliveryWorker"),
+                "background",
+                "stream_store_unavailable",
+                500,
+            );
             return Vec::new();
         };
         streams
             .iter_mut()
             .filter_map(|(key, stream)| {
-                if stream.delivery_delay(now).is_none_or(|delay| !delay.is_zero()) {
+                if stream
+                    .delivery_delay(now)
+                    .is_none_or(|delay| !delay.is_zero())
+                {
                     return None;
                 }
-                if stream.phase == DeliveryPhase::Primary && !stream.retained.is_empty() && stream.retry_expired(now) {
+                if stream.phase == DeliveryPhase::Primary
+                    && !stream.retained.is_empty()
+                    && stream.retry_expired(now)
+                {
                     let mut updated = stream.clone();
-                    let backup_bytes=self.pending_backup_bytes(key,&updated);
-                    updated.exhaust_primary_at(now,backup_bytes);
+                    let backup_bytes = self.pending_backup_bytes(key, &updated);
+                    updated.exhaust_primary_at(now, backup_bytes);
                     match self.persist_create(key, &updated) {
                         Ok(()) => *stream = updated,
-                        Err(_) => stream.retry_at = Some(now + SOURCE_POLL_INTERVAL),
+                        Err(_) => {
+                            stream.retry_at = Some(
+                                now + Duration::from_millis(self.config.source_poll_interval_ms),
+                            )
+                        }
                     }
                     return None;
                 }
@@ -1567,16 +1651,28 @@ impl Inner {
                 } else {
                     return None;
                 };
-                let count = if queue == "retained" { stream.retained.len() } else { stream.pending.len() };
+                let count = if queue == "retained" {
+                    stream.retained.len()
+                } else {
+                    stream.pending.len()
+                };
                 let token = stream.retry_token.unwrap_or_else(Uuid::new_v4);
                 let previous_pending = stream.pending_since;
                 if queue == "pending" {
                     stream.pending_since = None;
                 }
-                if let Err(error) = self.persist_take(key, queue, count, token, stream) {
+                if self.persist_take(key, queue, count, token, stream).is_err() {
                     stream.pending_since = previous_pending;
-                    stream.retry_at = Some(Instant::now() + SOURCE_POLL_INTERVAL);
-                    tracing::error!(stream = %key.name, ?error, "Firehose batch could not be journaled");
+                    stream.retry_at = Some(
+                        Instant::now() + Duration::from_millis(self.config.source_poll_interval_ms),
+                    );
+                    locallycloud_core::observability::log_service_error(
+                        "firehose",
+                        Some("ClaimBatch"),
+                        &token.to_string(),
+                        "batch_journal_failed",
+                        500,
+                    );
                     return None;
                 }
                 stream.retry_token = None;
@@ -1621,8 +1717,9 @@ impl Inner {
         updated.in_flight = None;
         updated.retry_token = Some(batch.token);
         updated.retained.extend(batch.records.iter().cloned());
-        updated.retry_at = Some(Instant::now() + SOURCE_POLL_INTERVAL);
-        if let Err(error) = self.persist_complete(
+        updated.retry_at =
+            Some(Instant::now() + Duration::from_millis(self.config.source_poll_interval_ms));
+        if let Err(_error) = self.persist_complete(
             &batch.key,
             &updated,
             batch.token,
@@ -1632,23 +1729,34 @@ impl Inner {
             stream.in_flight = None;
             stream.retry_token = Some(batch.token);
             stream.retained.extend(batch.records);
-            stream.retry_at = Some(Instant::now() + SOURCE_POLL_INTERVAL);
-            tracing::error!(stream = %batch.key.name, ?error, "Firehose denied batch could not be retained");
+            stream.retry_at =
+                Some(Instant::now() + Duration::from_millis(self.config.source_poll_interval_ms));
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("DeliverBatch"),
+                &batch.token.to_string(),
+                "denied_batch_checkpoint_failed",
+                500,
+            );
             self.notify.notify_one();
             return;
         }
         *stream = updated;
-        tracing::warn!(stream = %batch.key.name, "Firehose delivery role authorization denied; batch retained");
+        locallycloud_core::observability::log_service_error(
+            "firehose",
+            Some("DeliverBatch"),
+            &batch.token.to_string(),
+            "delivery_role_denied",
+            403,
+        );
     }
 
     async fn deliver_batch(self: &Arc<Self>, batch: &Batch) -> Result<(), FailureCode> {
         let Some(registry) = self.registry.upgrade() else {
-            tracing::warn!(stream = %batch.key.name, "Firehose registry is unavailable");
-            return Err(FailureCode::InternalError);
+            return Err(FailureCode::RegistryUnavailable);
         };
         let Some(dispatcher) = registry.internal_dispatcher() else {
-            tracing::warn!(stream = %batch.key.name, "Firehose internal dispatcher is unavailable");
-            return Err(FailureCode::InternalError);
+            return Err(FailureCode::DispatcherUnavailable);
         };
         if let Some(routing) = &batch.destination.routing {
             return self.deliver_routed_batch(batch, routing, &dispatcher).await;
@@ -1689,10 +1797,7 @@ impl Inner {
         .parse()
         {
             Ok(uri) => uri,
-            Err(error) => {
-                tracing::warn!(stream = %batch.key.name, %error, "Firehose S3 URI is invalid");
-                return Err(FailureCode::InternalError);
-            }
+            Err(_) => return Err(FailureCode::InvalidS3Uri),
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1716,7 +1821,7 @@ impl Inner {
         );
         let request_id = Uuid::new_v4().to_string();
         let response = tokio::time::timeout(
-            S3_DISPATCH_TIMEOUT,
+            Duration::from_secs(self.config.s3_dispatch_timeout_secs),
             dispatcher.dispatch_scoped(
                 &Method::PUT,
                 &uri,
@@ -1729,8 +1834,7 @@ impl Inner {
         )
         .await;
         let Ok(response) = response else {
-            tracing::warn!(stream = %batch.key.name, "Firehose S3 PutObject timed out");
-            return Err(FailureCode::InternalError);
+            return Err(FailureCode::S3Timeout);
         };
         let has_etag = response
             .headers()
@@ -1740,7 +1844,7 @@ impl Inner {
         if response.status() == http::StatusCode::FORBIDDEN {
             let status = response.status();
             let body = tokio::time::timeout(
-                S3_DISPATCH_TIMEOUT,
+                Duration::from_secs(self.config.s3_dispatch_timeout_secs),
                 axum::body::to_bytes(response.into_body(), iceberg::MAX_S3_ERROR_BODY),
             )
             .await
@@ -1753,13 +1857,7 @@ impl Inner {
             });
         }
         if !response.status().is_success() || !has_etag {
-            tracing::warn!(
-                stream = %batch.key.name,
-                status = %response.status(),
-                has_etag,
-                "Firehose S3 PutObject was not acknowledged"
-            );
-            return Err(FailureCode::InternalError);
+            return Err(FailureCode::S3NotAcknowledged);
         }
         Ok(())
     }
@@ -1781,7 +1879,13 @@ impl Inner {
     fn complete_delivery_at(&self, batch: Batch, result: Result<(), FailureCode>, now: Instant) {
         let delivered = result.is_ok();
         let Ok(mut streams) = self.streams.lock() else {
-            tracing::error!("Firehose stream store lock is poisoned after delivery");
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("CompleteBatch"),
+                &batch.token.to_string(),
+                "stream_store_unavailable",
+                500,
+            );
             return;
         };
         let Some(stream) = streams.get_mut(&batch.key) else {
@@ -1836,7 +1940,12 @@ impl Inner {
                     updated.retry_at = if updated.terminal_failure {
                         None
                     } else {
-                        Some(now + failure::backoff(updated.backup_attempts))
+                        Some(
+                            now + failure::backoff(
+                                updated.backup_attempts,
+                                Duration::from_secs(self.config.max_retry_delay_secs),
+                            ),
+                        )
                     };
                 }
                 DeliveryPhase::Primary => {
@@ -1847,7 +1956,13 @@ impl Inner {
                             Ok(started) => updated.retry_started = Some(started),
                             Err(_) => {
                                 updated.terminal_failure = true;
-                                tracing::error!(stream = %batch.key.name, "Firehose retry clock unavailable; records retained");
+                                locallycloud_core::observability::log_service_error(
+                                    "firehose",
+                                    Some("CompleteBatch"),
+                                    &batch.token.to_string(),
+                                    "retry_clock_unavailable",
+                                    500,
+                                );
                             }
                         }
                     }
@@ -1858,22 +1973,26 @@ impl Inner {
                     {
                         let backup_bytes = self.pending_backup_bytes(&batch.key, &updated);
                         updated.exhaust_primary_at(now, backup_bytes);
-                        tracing::error!(
-                            stream = %batch.key.name,
-                            attempts = updated.delivery_attempts,
-                            retained_records = updated.retained.len(),
-                            "Firehose delivery exhausted; records retained in the local queue"
+                        let failure = updated.primary_failure;
+                        let (_, status) = failure.diagnostic();
+                        locallycloud_core::observability::log_service_error(
+                            "firehose",
+                            Some("CompleteBatch"),
+                            &batch.token.to_string(),
+                            "delivery_exhausted",
+                            status,
                         );
                     } else {
                         let seconds = 1_u64 << updated.delivery_attempts.saturating_sub(1).min(5);
-                        let delay = Duration::from_secs(seconds).min(MAX_RETRY_DELAY);
+                        let delay = Duration::from_secs(seconds)
+                            .min(Duration::from_secs(self.config.max_retry_delay_secs));
                         let remaining = updated.retry_remaining(now).unwrap_or(delay);
                         updated.retry_at = Some(now + delay.min(remaining));
                     }
                 }
             }
         }
-        if let Err(error) = self.persist_complete(
+        if let Err(_error) = self.persist_complete(
             &batch.key,
             &updated,
             batch.token,
@@ -1885,8 +2004,15 @@ impl Inner {
             stream.in_flight = None;
             stream.retry_token = Some(batch.token);
             stream.retained.extend(batch.records);
-            stream.retry_at = Some(Instant::now() + SOURCE_POLL_INTERVAL);
-            tracing::error!(stream = %batch.key.name, ?error, "Firehose delivery checkpoint could not be committed");
+            stream.retry_at =
+                Some(Instant::now() + Duration::from_millis(self.config.source_poll_interval_ms));
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("CompleteBatch"),
+                &batch.token.to_string(),
+                "delivery_checkpoint_failed",
+                500,
+            );
             self.notify.notify_one();
             return;
         }
@@ -1914,17 +2040,49 @@ impl NativeHandler for FirehoseHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        match self.process(&request).await {
+        let operation = operation(&request.headers)
+            .ok()
+            .and_then(crate::error::operation_name);
+        let inner = self.inner.clone();
+        let owned = request.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let result =
+            tokio::task::spawn_blocking(move || runtime.block_on(Self { inner }.process(&owned)))
+                .await
+                .unwrap_or(Err(FirehoseError::Worker));
+        match result {
             Ok(success) => Response::builder()
                 .status(200)
                 .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
                 .header("x-amzn-RequestId", &request.request_id)
                 .body(Body::from(success.into_value().to_string()))
                 .expect("Firehose JSON response is valid"),
-            Err(error) => AwsError::from(error)
-                .with_request_id(request.request_id)
-                .render(AwsProtocol::Json11)
-                .into_response(),
+            Err(error) => {
+                let cause = match &error {
+                    FirehoseError::Persistence => Some("persistence_failed"),
+                    FirehoseError::Worker => Some("operation_task_failed"),
+                    FirehoseError::DeliveryRoleDenied => Some("delivery_role_denied"),
+                    _ => None,
+                };
+                let expected_rejection = matches!(error, FirehoseError::DeliveryRoleDenied);
+                let error = AwsError::from(error);
+                let log = if expected_rejection {
+                    locallycloud_core::observability::log_service_rejection
+                } else {
+                    locallycloud_core::observability::log_service_error
+                };
+                log(
+                    "firehose",
+                    operation,
+                    &request.request_id,
+                    cause.unwrap_or(&error.code),
+                    error.http_status,
+                );
+                error
+                    .with_request_id(request.request_id)
+                    .render(AwsProtocol::Json11)
+                    .into_response()
+            }
         }
     }
 }
@@ -1938,44 +2096,6 @@ impl Success {
         match self {
             Self::Json(value) => value,
         }
-    }
-}
-
-#[derive(Debug)]
-enum FirehoseError {
-    Serialization(String),
-    InvalidArgument(String),
-    UnknownOperation,
-    ResourceInUse(String),
-    ResourceNotFound(String),
-    AccessDenied,
-    ServiceUnavailable(String),
-    Internal,
-}
-
-impl From<FirehoseError> for AwsError {
-    fn from(error: FirehoseError) -> Self {
-        let (code, message, status) = match error {
-            FirehoseError::Serialization(message) => ("SerializationException", message, 400),
-            FirehoseError::InvalidArgument(message) => ("InvalidArgumentException", message, 400),
-            FirehoseError::UnknownOperation => (
-                "UnknownOperationException",
-                "The requested Firehose operation is not supported by this milestone".into(),
-                400,
-            ),
-            FirehoseError::ResourceInUse(message) => ("ResourceInUseException", message, 400),
-            FirehoseError::ResourceNotFound(message) => ("ResourceNotFoundException", message, 400),
-            FirehoseError::AccessDenied => ("AccessDeniedException", "Access denied".into(), 403),
-            FirehoseError::ServiceUnavailable(message) => {
-                ("ServiceUnavailableException", message, 503)
-            }
-            FirehoseError::Internal => (
-                "InternalFailureException",
-                "The request could not be completed".into(),
-                500,
-            ),
-        };
-        AwsError::new(code, message, status)
     }
 }
 

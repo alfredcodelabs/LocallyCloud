@@ -1,3 +1,7 @@
+mod config;
+pub use config::FirehoseConfig;
+
+mod error;
 mod iceberg;
 mod service;
 
@@ -46,3 +50,16 @@ mod commit_test;
 
 #[cfg(test)]
 mod public_commit_test;
+
+pub fn register_with_state_and_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<StateDb>,
+    config: FirehoseConfig,
+) -> Result<FirehoseHandle, Box<dyn std::error::Error + Send + Sync>> {
+    config.validate()?;
+    let (handler, handle) =
+        FirehoseHandler::with_state_and_config(Arc::downgrade(registry), state, config)?;
+    register_handler(registry, handler);
+    handle.resume()?;
+    Ok(handle)
+}

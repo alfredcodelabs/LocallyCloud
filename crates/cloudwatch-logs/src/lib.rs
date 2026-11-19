@@ -1,5 +1,8 @@
 //! Fail-closed AWS CloudWatch Logs protocol entry point.
 
+mod config;
+pub use config::LogsConfig;
+
 mod clock;
 mod emf;
 mod error;
@@ -60,6 +63,16 @@ where
         sink,
     );
     Ok(())
+}
+
+pub fn register_with_state_and_config(
+    registry: &Arc<ServiceRegistry>,
+    state: Arc<locallycloud_state::StateDb>,
+    config: LogsConfig,
+) -> Result<(), RegistrationError> {
+    register_with_builder(registry, move |weak| {
+        LogsHandler::with_state_and_config(weak, state, config)
+    })
 }
 
 #[cfg(test)]
