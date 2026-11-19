@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use locallycloud_state::StateDb;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::error::SnsError;
@@ -23,7 +23,7 @@ struct SavedDedup {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SavedTopic {
+pub(crate) struct SavedTopic {
     arn: TopicArn,
     identity: String,
     fifo: bool,
@@ -42,7 +42,7 @@ fn now_unix() -> i64 {
 }
 
 impl SavedTopic {
-    fn from_state(topic: &TopicState) -> Self {
+    pub(crate) fn from_state(topic: &TopicState) -> Self {
         let now = now_unix();
         Self {
             arn: topic.arn.clone(),
@@ -176,7 +176,7 @@ impl SnsStore {
             let _serial = serial;
             let mut connection = state.connection().map_err(|_| SnsError::InternalError)?;
             let transaction = connection
-                .transaction()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| SnsError::InternalError)?;
             for (arn, saved) in changes {
                 match saved {
@@ -203,27 +203,36 @@ impl SnsStore {
     }
 
     /// Commit FIFO sequence/dedup and one publication before Publish returns an ACK.
-    pub fn accept_job(&self, topic: &TopicState, job: &FanoutJob) -> Result<Option<i64>, SnsError> {
+    pub(crate) async fn accept_job(
+        self: &Arc<Self>,
+        topic: SavedTopic,
+        job: FanoutJob,
+    ) -> Result<Option<i64>, SnsError> {
         let Some(state) = self.state() else {
             return Ok(None);
         };
-        let mut connection = state.connection().map_err(|_| SnsError::InternalError)?;
-        let transaction = connection
-            .transaction()
-            .map_err(|_| SnsError::InternalError)?;
-        save_topic(&transaction, &SavedTopic::from_state(topic))
-            .map_err(|_| SnsError::InternalError)?;
-        let encoded = serde_json::to_string(job).map_err(|_| SnsError::InternalError)?;
-        transaction
-            .execute(
-                "INSERT INTO sns_outbox(account,region,name,job) VALUES(?1,?2,?3,?4)",
-                params![topic.arn.account, topic.arn.region, topic.arn.name, encoded],
-            )
-            .map_err(|_| SnsError::InternalError)?;
-        let id = transaction.last_insert_rowid();
-        transaction.commit().map_err(|_| SnsError::InternalError)?;
-        self.clear_topic_uncommitted(&topic.arn);
-        Ok(Some(id))
+        let state = state.clone();
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = state.connection().map_err(|_| SnsError::InternalError)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| SnsError::InternalError)?;
+            save_topic(&transaction, &topic).map_err(|_| SnsError::InternalError)?;
+            let encoded = serde_json::to_string(&job).map_err(|_| SnsError::InternalError)?;
+            transaction
+                .execute(
+                    "INSERT INTO sns_outbox(account,region,name,job) VALUES(?1,?2,?3,?4)",
+                    params![topic.arn.account, topic.arn.region, topic.arn.name, encoded],
+                )
+                .map_err(|_| SnsError::InternalError)?;
+            let id = transaction.last_insert_rowid();
+            transaction.commit().map_err(|_| SnsError::InternalError)?;
+            store.clear_topic_uncommitted(&topic.arn);
+            Ok(Some(id))
+        })
+        .await
+        .map_err(|_| SnsError::InternalError)?
     }
 
     pub fn pending_jobs(&self) -> Result<Vec<FanoutJob>, PersistError> {

@@ -503,6 +503,32 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), 403);
+        request.headers.remove(http::header::AUTHORIZATION);
+        request
+            .headers
+            .remove("x-locallycloud-verified-external-sigv4");
+        request.headers.insert(
+            "x-amz-target",
+            "AWSCognitoIdentityProviderService.GetUser".parse().unwrap(),
+        );
+        request.body = json!({"AccessToken":"invalid"}).to_string().into();
+        let response = dispatcher
+            .dispatch(
+                &request.method,
+                &request.uri,
+                &request.headers,
+                request.body.clone(),
+                "public-get-user",
+            )
+            .await;
+        assert_eq!(response.status(), 400);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["__type"],
+            "NotAuthorizedException"
+        );
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
@@ -550,6 +576,87 @@ mod tests {
         let tokens = handler
             .initiate_auth(&request, auth.as_object().unwrap())
             .unwrap();
+        let access_token = tokens["AuthenticationResult"]["AccessToken"]
+            .as_str()
+            .unwrap();
+        let get = json!({"AccessToken":access_token});
+        let user = handler
+            .get_user(&request, get.as_object().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(user["Username"], "alice");
+        assert!(user["UserAttributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value["Name"] == "sub" && value["Value"] == created["UserSub"]));
+        for token in [
+            tokens["AuthenticationResult"]["IdToken"].as_str().unwrap(),
+            "invalid",
+        ] {
+            assert!(matches!(
+                handler
+                    .get_user(&request, json!({"AccessToken":token}).as_object().unwrap())
+                    .await,
+                Err(CognitoError::NotAuthorized)
+            ));
+        }
+        let cell = handler.pool(&request, id).unwrap();
+        let invalid_tokens = {
+            let pool = cell.lock().unwrap();
+            let claims = pool
+                .access_key
+                .verify(access_token, &issuer(&pool))
+                .unwrap();
+            [
+                ("exp", json!(now().unwrap() - 1)),
+                ("scope", json!("openid")),
+                ("client_id", json!("unknown")),
+                ("sub", json!("unknown")),
+                ("token_use", json!("id")),
+            ]
+            .into_iter()
+            .map(|(field, value)| {
+                let mut bad = claims.clone();
+                bad[field] = value;
+                pool.access_key.sign(&bad).unwrap()
+            })
+            .collect::<Vec<_>>()
+        };
+        for token in invalid_tokens {
+            assert!(matches!(
+                handler
+                    .get_user(&request, json!({"AccessToken":token}).as_object().unwrap())
+                    .await,
+                Err(CognitoError::NotAuthorized)
+            ));
+        }
+        let tampered = format!("{}.AAAA", access_token.rsplit_once('.').unwrap().0);
+        assert!(handler
+            .get_user(
+                &request,
+                json!({"AccessToken":tampered}).as_object().unwrap()
+            )
+            .await
+            .is_err());
+        cell.lock().unwrap().users.get_mut("alice").unwrap().enabled = false;
+        assert!(handler
+            .get_user(&request, get.as_object().unwrap())
+            .await
+            .is_err());
+        cell.lock().unwrap().users.get_mut("alice").unwrap().enabled = true;
+        let mut foreign = request.clone();
+        foreign.account_id = "111111111111".into();
+        assert!(handler
+            .get_user(&foreign, get.as_object().unwrap())
+            .await
+            .is_err());
+        foreign = request.clone();
+        foreign.region = "us-west-2".into();
+        assert!(handler
+            .get_user(&foreign, get.as_object().unwrap())
+            .await
+            .is_err());
         let jwks = handler
             .jwks_for_pool(&request.account_id, &request.region, id)
             .unwrap();

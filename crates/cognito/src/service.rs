@@ -81,7 +81,7 @@ struct PasswordChallenge {
 
 #[derive(Default)]
 pub struct CognitoHandler {
-    pools: RwLock<HashMap<PoolScope, Arc<Mutex<Pool>>>>,
+    pools: Arc<RwLock<HashMap<PoolScope, Arc<Mutex<Pool>>>>>,
     registry: std::sync::Weak<locallycloud_core::registry::ServiceRegistry>,
     mailbox: Option<Arc<crate::ConfirmationMailbox>>,
 }
@@ -171,7 +171,7 @@ impl CognitoHandler {
         let input = body.as_object().ok_or(CognitoError::InvalidParameter)?;
         if !matches!(
             operation,
-            "SignUp" | "InitiateAuth" | "RespondToAuthChallenge" | "ConfirmSignUp"
+            "SignUp" | "InitiateAuth" | "RespondToAuthChallenge" | "ConfirmSignUp" | "GetUser"
         ) {
             self.authorize_management(request, operation, input)?;
         }
@@ -187,6 +187,7 @@ impl CognitoHandler {
             "AdminCreateUser" => self.admin_create_user(request, input),
             "AdminSetUserPassword" => self.admin_set_password(request, input),
             "AdminGetUser" => self.admin_get_user(request, input),
+            "GetUser" => self.get_user(request, input).await,
             "ListUsers" => self.list_users(request, input),
             "AdminDeleteUser" => self.admin_delete_user(request, input),
             "AdminInitiateAuth" => self.admin_auth(request, input),
@@ -521,6 +522,68 @@ impl CognitoHandler {
             .get(string(input, "Username")?)
             .ok_or(CognitoError::UserNotFound)?;
         Ok(user_view(user))
+    }
+
+    async fn get_user(
+        &self,
+        request: &ServiceRequest,
+        input: &Map<String, Value>,
+    ) -> Result<Value, CognitoError> {
+        let pools = self.pools.clone();
+        let request = request.clone();
+        let input = input.clone();
+        tokio::task::spawn_blocking(move || Self::get_user_from_pools(&pools, &request, &input))
+            .await
+            .map_err(|_| CognitoError::Internal)?
+    }
+
+    fn get_user_from_pools(
+        pools: &RwLock<HashMap<PoolScope, Arc<Mutex<Pool>>>>,
+        request: &ServiceRequest,
+        input: &Map<String, Value>,
+    ) -> Result<Value, CognitoError> {
+        allowed(input, &["AccessToken"])?;
+        let token = string(input, "AccessToken")?;
+        if token.is_empty() || token.len() > 131_072 {
+            return Err(CognitoError::InvalidParameter);
+        }
+        let header = jsonwebtoken::decode_header(token).map_err(|_| CognitoError::NotAuthorized)?;
+        let kid = header.kid.ok_or(CognitoError::NotAuthorized)?;
+        let pools = pools.read().map_err(|_| CognitoError::Internal)?;
+        for (scope, cell) in pools.iter() {
+            if scope.account != request.account_id || scope.region != request.region {
+                continue;
+            }
+            let pool = cell.lock().map_err(|_| CognitoError::Internal)?;
+            if pool.access_key.jwk()["kid"].as_str() != Some(kid.as_str()) {
+                continue;
+            }
+            let claims = pool.access_key.verify(token, &issuer(&pool))?;
+            if claims["token_use"] != "access"
+                || !claims["scope"].as_str().is_some_and(|scope| {
+                    scope
+                        .split_whitespace()
+                        .any(|value| value == "aws.cognito.signin.user.admin")
+                })
+                || !claims["client_id"]
+                    .as_str()
+                    .is_some_and(|id| pool.clients.contains_key(id))
+            {
+                return Err(CognitoError::NotAuthorized);
+            }
+            let user = claims["username"]
+                .as_str()
+                .and_then(|name| pool.users.get(name))
+                .filter(|user| {
+                    user.enabled && user.status == "CONFIRMED" && claims["sub"] == user.sub
+                })
+                .ok_or(CognitoError::NotAuthorized)?;
+            let value = user_view(user);
+            return Ok(
+                json!({"Username": value["Username"], "UserAttributes": value["UserAttributes"]}),
+            );
+        }
+        Err(CognitoError::NotAuthorized)
     }
 
     fn list_users(

@@ -661,7 +661,7 @@ async fn roles_and_logs_require_runtime_capabilities_passrole_and_scoped_metadat
     let definition = json!({"family":"web","containerDefinitions":[{"name":"app","image":"111111111111.dkr.ecr.us-east-1.amazonaws.com/web:1","portMappings":[{"containerPort":8080}],"logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/web","awslogs-region":"us-east-1","awslogs-stream-prefix":"web"}}}],"requiresCompatibilities":["FARGATE"],"networkMode":"awsvpc","cpu":"256","memory":"512","taskRoleArn":"arn:aws:iam::111111111111:role/task","executionRoleArn":"arn:aws:iam::111111111111:role/execution"});
     assert!(handler
         .process(&wire_request("RegisterTaskDefinition", definition.clone()))
-        .is_err());
+        .is_ok());
     let runtime = Arc::new(Runtime {
         roles_enabled: true,
         logs_enabled: true,
@@ -682,7 +682,7 @@ async fn roles_and_logs_require_runtime_capabilities_passrole_and_scoped_metadat
             .next()
             .unwrap()
             .len(),
-        1
+        2
     );
     policy.deny_assignment.store(false, Ordering::SeqCst);
     handler

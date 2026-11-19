@@ -1293,6 +1293,7 @@ fn unsigned_public_request(
                                     | "AWSCognitoIdentityProviderService.InitiateAuth"
                                     | "AWSCognitoIdentityProviderService.RespondToAuthChallenge"
                                     | "AWSCognitoIdentityProviderService.ConfirmSignUp"
+                                    | "AWSCognitoIdentityProviderService.GetUser"
                             )
                         }))
         }
@@ -1441,6 +1442,40 @@ mod tests {
     use axum::routing::any;
     use axum::Router;
     use std::time::Duration;
+
+    #[test]
+    fn cognito_get_user_uses_token_authentication_only_at_the_public_root() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("AWSCognitoIdentityProviderService.GetUser"),
+        );
+        assert!(unsigned_public_request(
+            "cognito-idp",
+            &Method::POST,
+            &"/".parse().unwrap(),
+            &headers,
+            None
+        ));
+        assert!(!unsigned_public_request(
+            "cognito-idp",
+            &Method::POST,
+            &"/other".parse().unwrap(),
+            &headers,
+            None
+        ));
+        headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("AWSCognitoIdentityProviderService.AdminGetUser"),
+        );
+        assert!(!unsigned_public_request(
+            "cognito-idp",
+            &Method::POST,
+            &"/".parse().unwrap(),
+            &headers,
+            None
+        ));
+    }
 
     #[test]
     fn cloudwatch_rpc_operation_is_taken_from_exact_service_path() {

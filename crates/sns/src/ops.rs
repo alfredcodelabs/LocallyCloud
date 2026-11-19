@@ -18,6 +18,7 @@ use crate::error::SnsError;
 use crate::fanout::{sqs_target_exists, Delivery, FanoutJob};
 use crate::filter;
 use crate::model::{Subscription, TopicArn};
+use crate::persistence::SavedTopic;
 use crate::proto::Input;
 use crate::reply::{BatchErr, BatchOk, Reply, SubView};
 use crate::store::{DedupRecord, InsertResult, SnsStore, TopicState, DEDUP_WINDOW_SECS};
@@ -935,7 +936,11 @@ async fn do_publish(
                 request_id: ctx.request_id.to_string(),
             },
         };
-        match ctx.store.accept_job(&state, &job) {
+        let snapshot = SavedTopic::from_state(&state);
+        drop(state);
+        let accepted = ctx.store.accept_job(snapshot, job.clone()).await;
+        let mut state = topic.write().await;
+        match accepted {
             Ok(id) => job.outbox_id = id,
             Err(error) => {
                 state.sequence = previous_sequence;
@@ -994,8 +999,9 @@ async fn do_publish(
             request_id: ctx.request_id.to_string(),
         },
     };
-    job.outbox_id = ctx.store.accept_job(&state, &job)?;
+    let snapshot = SavedTopic::from_state(&state);
     drop(state);
+    job.outbox_id = ctx.store.accept_job(snapshot, job.clone()).await?;
     std::mem::drop(tokio::spawn(crate::fanout::deliver_accepted(
         registry.clone(),
         http.clone(),

@@ -491,7 +491,8 @@ mod tests {
                 request_id: "rid".into(),
             },
         };
-        job.outbox_id = store.accept_job(&*topic.read().await, &job).unwrap();
+        let saved = crate::persistence::SavedTopic::from_state(&*topic.read().await);
+        job.outbox_id = store.accept_job(saved, job.clone()).await.unwrap();
         let registry = ServiceRegistry::with_known_services();
         let worker = tokio::spawn(crate::fanout::deliver_accepted(
             registry,
@@ -503,6 +504,80 @@ mod tests {
         assert!(store.job_exists(job.outbox_id).unwrap());
         worker.abort();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistent_publish_accepts_concurrent_database_writers() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (root, state, store) = tokio::task::spawn_blocking(|| {
+            let root =
+                std::env::temp_dir().join(format!("sns-concurrent-{}", uuid::Uuid::new_v4()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+            let store = Arc::new(SnsStore::with_state(state.clone()).unwrap());
+            (root, state, store)
+        })
+        .await
+        .unwrap();
+        let arn = TopicArn::new("us-east-1", "000000000000", "concurrent");
+        store.insert(arn.clone(), false, Default::default(), Default::default());
+        store.persist_metadata().await.unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let writer = {
+            let state = state.clone();
+            let stop = stop.clone();
+            tokio::task::spawn_blocking(move || {
+                let connection = state.connection().unwrap();
+                connection.execute_batch("CREATE TABLE concurrent_writes (n INTEGER); INSERT INTO concurrent_writes VALUES(0)").unwrap();
+                ready.send(()).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    connection
+                        .execute("UPDATE concurrent_writes SET n=n+1", [])
+                        .unwrap();
+                    std::thread::yield_now();
+                }
+                connection
+                    .query_row("SELECT n FROM concurrent_writes", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        started.await.unwrap();
+        let topic = store.get(&arn).unwrap();
+        for index in 0..100 {
+            let job: FanoutJob = serde_json::from_value(json!({"subscriptions":[],"delivery":{
+                "message_id":format!("message-{index}"),"topic_arn":arn.to_arn(),"message":"publication",
+                "structure":null,"subject":null,"timestamp":"2026-01-01T00:00:00Z","attributes":{},
+                "group_id":null,"dedup_id":null,"region":"us-east-1","account":"000000000000","request_id":"concurrent"
+            }})).unwrap();
+            let saved = crate::persistence::SavedTopic::from_state(&*topic.read().await);
+            let result = store.accept_job(saved, job).await;
+            if result.is_err() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            assert!(result.unwrap().is_some());
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(writer.await.unwrap() > 0);
+        let pending = store.clone();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || pending.pending_jobs().unwrap().len())
+                .await
+                .unwrap(),
+            100
+        );
+        drop(store);
+        drop(state);
+        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(root))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -551,7 +626,8 @@ mod tests {
             },
         };
         // This is the accepted-publish commit; deliberately stop before scheduling fanout.
-        let id = store.accept_job(&*topic.read().await, &job).unwrap();
+        let saved = crate::persistence::SavedTopic::from_state(&*topic.read().await);
+        let id = store.accept_job(saved, job.clone()).await.unwrap();
         assert!(id.is_some());
         drop(store);
 

@@ -757,6 +757,14 @@ impl EcsHandler {
             if definition["status"] != "ACTIVE" && !input.service_launch {
                 return Err(EcsError::Client("Task definition is inactive".into()));
             }
+            if !definition["requiresCompatibilities"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "FARGATE"))
+            {
+                return Err(EcsError::Client(
+                    "Task definition is not compatible with FARGATE".into(),
+                ));
+            }
             let containers = definition["containerDefinitions"]
                 .as_array()
                 .ok_or(EcsError::Internal)?;
@@ -1981,19 +1989,34 @@ impl EcsHandler {
         scope: &Scope,
     ) -> Result<Value, EcsError> {
         valid_name(&input.family)?;
-        if input.requires_compatibilities.as_deref() != Some(&["FARGATE".to_owned()][..]) {
+        let compatibilities = input
+            .requires_compatibilities
+            .as_deref()
+            .unwrap_or_default();
+        if compatibilities
+            .iter()
+            .any(|value| !matches!(value.as_str(), "EC2" | "FARGATE"))
+        {
             return Err(EcsError::Client(
-                "Only requiresCompatibilities=[FARGATE] is supported".into(),
+                "Supported task definition compatibilities are EC2 and FARGATE".into(),
             ));
         }
-        if input.network_mode.as_deref() != Some("awsvpc") {
+        let fargate = compatibilities.iter().any(|value| value == "FARGATE");
+        let network_mode = input.network_mode.as_deref().unwrap_or("bridge");
+        if !matches!(network_mode, "bridge" | "host" | "awsvpc" | "none")
+            || (fargate && network_mode != "awsvpc")
+        {
             return Err(EcsError::Client(
                 "Fargate requires networkMode=awsvpc".into(),
             ));
         }
-        let cpu = parse_cpu(&input.cpu)?;
-        let memory = parse_memory(&input.memory)?;
-        if !valid_fargate_size(cpu, memory) {
+        let cpu = input.cpu.as_deref().map(parse_cpu).transpose()?;
+        let memory = input.memory.as_deref().map(parse_memory).transpose()?;
+        if fargate
+            && !cpu
+                .zip(memory)
+                .is_some_and(|(cpu, memory)| valid_fargate_size(cpu, memory))
+        {
             return Err(EcsError::Client(
                 "No Fargate configuration exists for given values".into(),
             ));
@@ -2006,22 +2029,29 @@ impl EcsHandler {
         let mut names = std::collections::BTreeSet::new();
         for container in &input.container_definitions {
             valid_name(&container.name)?;
+            if container.cpu.is_some_and(|cpu| cpu < 0)
+                || container.memory.is_some_and(|memory| memory <= 0)
+                || container
+                    .memory_reservation
+                    .is_some_and(|memory| memory <= 0)
+                || container
+                    .memory
+                    .zip(container.memory_reservation)
+                    .is_some_and(|(hard, soft)| hard <= soft)
+                || (!fargate
+                    && memory.is_none()
+                    && container.memory.is_none()
+                    && container.memory_reservation.is_none())
+            {
+                return Err(EcsError::Client(
+                    "Invalid container CPU or memory limits".into(),
+                ));
+            }
             if !names.insert(&container.name) || container.image.trim().is_empty() {
                 return Err(EcsError::Client(
                     "Container names must be unique and images nonempty".into(),
                 ));
             }
-        }
-        let has_roles = input.task_role_arn.is_some() || input.execution_role_arn.is_some();
-        if has_roles
-            && !self
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.supports_execution_identity())
-        {
-            return Err(EcsError::Client(
-                "Configured Fargate runtime does not support task execution identities".into(),
-            ));
         }
         for role in [
             input.task_role_arn.as_deref(),
@@ -2037,15 +2067,6 @@ impl EcsHandler {
         }
         for container in &input.container_definitions {
             if let Some(log) = &container.log_configuration {
-                if !self
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.supports_awslogs())
-                {
-                    return Err(EcsError::Client(
-                        "Configured Fargate runtime does not support awslogs".into(),
-                    ));
-                }
                 if input.execution_role_arn.is_none()
                     || log.log_driver != "awslogs"
                     || log.options.len() != 3
@@ -2070,21 +2091,25 @@ impl EcsHandler {
         let revision = definitions.len() + 1;
         let containers =
             serde_json::to_value(&input.container_definitions).map_err(|_| EcsError::Internal)?;
-        let value = json!({
+        let mut value = json!({
             "taskDefinitionArn": scope.task_arn(&input.family, revision),
             "family": input.family,
             "revision": revision,
             "status": "ACTIVE",
-            "networkMode": "awsvpc",
-            "requiresCompatibilities": ["FARGATE"],
-            "compatibilities": ["FARGATE"],
-            "cpu": cpu.to_string(),
-            "memory": memory.to_string(),
+            "networkMode": network_mode,
+            "requiresCompatibilities": compatibilities,
+            "compatibilities": if fargate { vec!["FARGATE"] } else { vec!["EC2"] },
             "containerDefinitions": containers,
             "volumes": [],
             "taskRoleArn": input.task_role_arn,
             "executionRoleArn": input.execution_role_arn
         });
+        if let Some(cpu) = cpu {
+            value["cpu"] = cpu.to_string().into();
+        }
+        if let Some(memory) = memory {
+            value["memory"] = memory.to_string().into();
+        }
         self.persist_sync(
             scope,
             "1definition",
@@ -2368,8 +2393,8 @@ struct ClusterId {
 struct RegisterTaskDefinition {
     family: String,
     container_definitions: Vec<ContainerDefinition>,
-    cpu: String,
-    memory: String,
+    cpu: Option<String>,
+    memory: Option<String>,
     network_mode: Option<String>,
     requires_compatibilities: Option<Vec<String>>,
     task_role_arn: Option<String>,
@@ -2380,6 +2405,12 @@ struct RegisterTaskDefinition {
 struct ContainerDefinition {
     name: String,
     image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_reservation: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     essential: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2939,6 +2970,51 @@ mod tests {
             .unwrap();
         assert_eq!(after["clusters"][0]["status"], "INACTIVE");
     }
+    #[test]
+    fn task_definition_accepts_container_resources_and_optional_task_resources() {
+        let handler = EcsHandler::new();
+        let minimal = json!({"family":"minimal","containerDefinitions":[{"name":"app","image":"example.invalid/app:1","cpu":128,"memory":128,"essential":true}]});
+        let value = handler
+            .process(&request(
+                "RegisterTaskDefinition",
+                minimal.clone(),
+                "111111111111",
+                "us-east-1",
+            ))
+            .unwrap();
+        assert_eq!(value["taskDefinition"]["networkMode"], "bridge");
+        assert_eq!(
+            value["taskDefinition"]["containerDefinitions"][0]["memory"],
+            128
+        );
+        assert!(value["taskDefinition"].get("cpu").is_none());
+        let mut fargate = task("resources", "256", "512");
+        fargate["containerDefinitions"][0]["cpu"] = 128.into();
+        fargate["containerDefinitions"][0]["memory"] = 128.into();
+        let value = handler
+            .process(&request(
+                "RegisterTaskDefinition",
+                fargate,
+                "111111111111",
+                "us-east-1",
+            ))
+            .unwrap();
+        assert_eq!(
+            value["taskDefinition"]["containerDefinitions"][0]["cpu"],
+            128
+        );
+        let mut invalid = minimal;
+        invalid["containerDefinitions"][0]["memory"] = (-1).into();
+        assert!(handler
+            .process(&request(
+                "RegisterTaskDefinition",
+                invalid,
+                "111111111111",
+                "us-east-1"
+            ))
+            .is_err());
+    }
+
     #[test]
     fn fargate_revision_validation_and_scope() {
         let handler = EcsHandler::new();

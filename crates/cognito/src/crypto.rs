@@ -5,7 +5,9 @@ use aws_lc_rs::rsa::{KeyPair, KeySize, PublicKeyComponents};
 use aws_lc_rs::signature::KeyPair as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use rand::{rngs::OsRng, RngCore};
 use ring::pbkdf2;
 use serde_json::Value;
@@ -81,6 +83,22 @@ impl SigningKey {
             "alg": "RS256", "e": self.public_e, "kid": self.kid,
             "kty": "RSA", "n": self.public_n, "use": "sig"
         })
+    }
+
+    pub(crate) fn verify(&self, token: &str, issuer: &str) -> Result<Value, CognitoError> {
+        let header = decode_header(token).map_err(|_| CognitoError::NotAuthorized)?;
+        if header.kid.as_deref() != Some(self.kid.as_str()) {
+            return Err(CognitoError::NotAuthorized);
+        }
+        let key = DecodingKey::from_rsa_components(&self.public_n, &self.public_e)
+            .map_err(|_| CognitoError::Internal)?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[issuer]);
+        validation.validate_aud = false;
+        validation.leeway = 0;
+        decode::<Value>(token, &key, &validation)
+            .map(|data| data.claims)
+            .map_err(|_| CognitoError::NotAuthorized)
     }
 }
 

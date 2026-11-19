@@ -33,8 +33,8 @@ fn req_str<'a>(req: &'a Value, field: &str) -> Result<&'a str, DdbError> {
 /// (`arn:aws:dynamodb:<region>:<account>:table/<name>/stream/<label>`).
 fn table_name_from_stream_arn(arn: &str) -> Result<&str, DdbError> {
     let after = arn
-        .split("table/")
-        .nth(1)
+        .split_once(":table/")
+        .map(|(_, resource)| resource)
         .ok_or_else(|| DdbError::Validation(format!("invalid stream ARN: {arn}")))?;
     after
         .split("/stream/")
@@ -369,5 +369,7 @@ mod tests {
     fn table_name_parsed_from_stream_arn() {
         let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/2024";
         assert_eq!(table_name_from_stream_arn(arn).unwrap(), "orders");
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/comparison-table/stream/2024";
+        assert_eq!(table_name_from_stream_arn(arn).unwrap(), "comparison-table");
     }
 }
