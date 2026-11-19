@@ -1899,23 +1899,41 @@ pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let values = parse_values(req)?;
     let key_cond = ConditionExpression::parse(key_expr, &names, &values)?;
 
-    // Candidate items with the index/table keys present, matching the key condition, sorted.
-    // Items are borrowed; only the returned page is copied.
-    let mut candidates: Vec<(StoredKey, &Item)> = guard
-        .items
-        .values()
-        .filter(|item| key_cond.matches(item))
-        .filter_map(|item| stored_key_for(item, &hash, range.as_deref()).map(|k| (k, item)))
-        .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
     let forward = req
         .get("ScanIndexForward")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    if !forward {
-        candidates.reverse();
-    }
-
+    let mut index_items;
+    let candidates: Box<dyn DoubleEndedIterator<Item = ReadCandidate<'_>> + '_> =
+        if index_name.is_some() {
+            index_items = guard
+                .items
+                .iter()
+                .filter(|(_, item)| key_cond.matches(item))
+                .filter_map(|(base, item)| {
+                    stored_key_for(item, &hash, range.as_deref()).map(|key| (key, base, item))
+                })
+                .collect::<Vec<_>>();
+            index_items.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+            Box::new(
+                index_items
+                    .iter()
+                    .map(|(key, base, item)| (key, *base, *item)),
+            )
+        } else {
+            Box::new(
+                guard
+                    .items
+                    .iter()
+                    .filter(|(_, item)| key_cond.matches(item))
+                    .map(|(key, item)| (key, key, item)),
+            )
+        };
+    let candidates: Box<dyn Iterator<Item = ReadCandidate<'_>> + '_> = if forward {
+        candidates
+    } else {
+        Box::new(candidates.rev())
+    };
     paginate_and_respond(
         req,
         &guard.def,
@@ -1923,6 +1941,7 @@ pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
         &hash,
         range.as_deref(),
         allowed,
+        forward,
     )
 }
 
@@ -1967,26 +1986,38 @@ pub async fn scan(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
         ));
     }
 
-    let mut candidates: Vec<(StoredKey, &Item)> = guard
-        .items
-        .values()
-        .filter_map(|item| stored_key_for(item, &hash, range.as_deref()).map(|k| (k, item)))
-        .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Parallel scan partitioning: each item handled by exactly one segment.
     if let (Some(total), Some(seg)) = (total_segments, segment) {
         if total == 0 || seg >= total {
             return Err(DdbError::Validation("invalid Segment/TotalSegments".into()));
         }
-        candidates = candidates
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| (*i as u64) % total == seg)
-            .map(|(_, kv)| kv)
-            .collect();
     }
-
+    let mut index_items;
+    let candidates: Box<dyn Iterator<Item = ReadCandidate<'_>> + '_> =
+        if req.get("IndexName").and_then(Value::as_str).is_some() {
+            index_items = guard
+                .items
+                .iter()
+                .filter_map(|(base, item)| {
+                    stored_key_for(item, &hash, range.as_deref()).map(|key| (key, base, item))
+                })
+                .collect::<Vec<_>>();
+            index_items.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+            Box::new(
+                index_items
+                    .iter()
+                    .map(|(key, base, item)| (key, *base, *item)),
+            )
+        } else {
+            Box::new(guard.items.iter().map(|(key, item)| (key, key, item)))
+        };
+    // Keep segment assignment independent of the page's ExclusiveStartKey.
+    let candidates =
+        candidates
+            .enumerate()
+            .filter_map(|(i, candidate)| match (total_segments, segment) {
+                (Some(total), Some(seg)) if (i as u64) % total != seg => None,
+                _ => Some(candidate),
+            });
     paginate_and_respond(
         req,
         &guard.def,
@@ -1994,6 +2025,7 @@ pub async fn scan(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
         &hash,
         range.as_deref(),
         allowed,
+        true,
     )
 }
 
@@ -2030,39 +2062,65 @@ fn filter_item(item: &Item, allowed: &std::collections::HashSet<String>) -> Item
         .collect()
 }
 
-/// Apply ExclusiveStartKey, Limit, FilterExpression, Select, and projection; build the
-/// Query/Scan response.
-fn paginate_and_respond(
+type ReadCandidate<'a> = (&'a StoredKey, &'a StoredKey, &'a Item);
+
+/// Evaluate only one page before applying filters and projections. Secondary index keys
+/// use the table key as a tie-breaker so a cursor identifies one item even among duplicates.
+fn paginate_and_respond<'a>(
     req: &Value,
     def: &TableDefinition,
-    mut candidates: Vec<(StoredKey, &Item)>,
+    candidates: impl Iterator<Item = ReadCandidate<'a>>,
     hash: &str,
     range: Option<&str>,
     allowed: Option<std::collections::HashSet<String>>,
+    forward: bool,
 ) -> Result<Value, DdbError> {
-    // ExclusiveStartKey: resume after the matching key.
-    if let Some(start_value) = req.get("ExclusiveStartKey") {
-        let start_item = item_from_json(start_value)?;
-        if let Some(start_key) = stored_key_for(&start_item, hash, range) {
-            if let Some(pos) = candidates.iter().position(|(k, _)| *k == start_key) {
-                candidates.drain(..=pos);
-            }
-        }
-    }
-
+    let start = req
+        .get("ExclusiveStartKey")
+        .map(|value| {
+            let item = item_from_json(value)?;
+            let key = stored_key_for(&item, hash, range).ok_or_else(|| {
+                DdbError::Validation("The provided starting key is invalid".into())
+            })?;
+            Ok::<_, DdbError>((
+                key,
+                stored_key_for(&item, def.hash_key(), def.range_key()).ok_or_else(|| {
+                    DdbError::Validation("The provided starting key is invalid".into())
+                })?,
+            ))
+        })
+        .transpose()?;
     let limit = match req.get("Limit").and_then(Value::as_u64) {
         Some(0) => return Err(DdbError::Validation("Limit must be at least 1".into())),
-        Some(l) => Some(l as usize),
-        None => None,
+        Some(l) => usize::try_from(l).unwrap_or(usize::MAX),
+        None => usize::MAX,
     };
-    let mut last_evaluated: Option<&Item> = None;
-    if let Some(limit) = limit {
-        if candidates.len() > limit {
-            last_evaluated = Some(candidates[limit - 1].1);
-            candidates.truncate(limit);
+    let mut page = Vec::new();
+    let mut page_bytes = 0;
+    let mut last_evaluated = None;
+    for (key, base, item) in candidates {
+        if let Some((start_key, start_base)) = &start {
+            let ordering = (key, base).cmp(&(start_key, start_base));
+            if (forward && !ordering.is_gt()) || (!forward && !ordering.is_lt()) {
+                continue;
+            }
         }
+        let bytes = match &allowed {
+            Some(set) => item
+                .iter()
+                .filter(|(name, _)| set.contains(name.as_str()))
+                .map(|(name, value)| name.len() + value.size())
+                .sum(),
+            None => item_size(item),
+        };
+        if page.len() == limit || page_bytes + bytes > 1024 * 1024 {
+            last_evaluated = page.last().copied();
+            break;
+        }
+        page_bytes += bytes;
+        page.push(item);
     }
-    let scanned_count = candidates.len();
+    let scanned_count = page.len();
 
     // FilterExpression after the read set.
     let filtered: Vec<&Item> = match req.get("FilterExpression").and_then(Value::as_str) {
@@ -2070,13 +2128,9 @@ fn paginate_and_respond(
             let names = parse_names(req);
             let values = parse_values(req)?;
             let filter = ConditionExpression::parse(expr, &names, &values)?;
-            candidates
-                .into_iter()
-                .map(|(_, i)| i)
-                .filter(|i| filter.matches(i))
-                .collect()
+            page.into_iter().filter(|i| filter.matches(i)).collect()
         }
-        None => candidates.into_iter().map(|(_, i)| i).collect(),
+        None => page,
     };
 
     let select = req.get("Select").and_then(Value::as_str).unwrap_or("");

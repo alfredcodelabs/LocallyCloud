@@ -173,7 +173,7 @@ proptest! {
 
     /// Property 8: Query pagination completeness — paging by Limit covers every item once.
     #[test]
-    fn query_pagination_is_complete(count in 1usize..15, page in 1usize..5) {
+    fn query_pagination_is_complete(count in 1usize..15, page in 1usize..5, forward in any::<bool>(), delete_cursor in any::<bool>()) {
         let h = DynamoHandler::new();
         rt().block_on(async {
             create_pk_sk(&h, "pgbl", false).await;
@@ -187,16 +187,23 @@ proptest! {
                     "TableName": "pgbl",
                     "KeyConditionExpression": "pk = :p",
                     "ExpressionAttributeValues": { ":p": {"S": "p"} },
-                    "Limit": page
+                    "Limit": page,
+                    "ScanIndexForward": forward
                 });
                 if let Some(s) = &start { q["ExclusiveStartKey"] = s.clone(); }
                 let (st, v) = call(&h, "Query", q).await;
                 prop_assert_eq!(st, 200);
                 for item in v["Items"].as_array().unwrap() {
-                    seen.insert(item["sk"]["N"].as_str().unwrap().to_string());
+                    prop_assert!(seen.insert(item["sk"]["N"].as_str().unwrap().to_string()), "each item appears on exactly one page");
                 }
                 match v.get("LastEvaluatedKey") {
-                    Some(lek) => start = Some(lek.clone()),
+                    Some(lek) => {
+                        if delete_cursor {
+                            let (status, _) = call(&h, "DeleteItem", json!({"TableName":"pgbl","Key":lek})).await;
+                            prop_assert_eq!(status, 200);
+                        }
+                        start = Some(lek.clone());
+                    },
                     None => break,
                 }
             }
@@ -216,11 +223,18 @@ proptest! {
             }
             let mut seen = std::collections::BTreeSet::new();
             for seg in 0..segments {
-                let (st, v) = call(&h, "Scan", json!({ "TableName": "psbl", "TotalSegments": segments, "Segment": seg })).await;
-                prop_assert_eq!(st, 200);
-                for item in v["Items"].as_array().unwrap() {
-                    let pk = item["pk"]["S"].as_str().unwrap().to_string();
-                    prop_assert!(seen.insert(pk), "each item appears in exactly one segment");
+                let mut request = json!({ "TableName": "psbl", "TotalSegments": segments, "Segment": seg, "Limit": 2 });
+                loop {
+                    let (st, v) = call(&h, "Scan", request.clone()).await;
+                    prop_assert_eq!(st, 200);
+                    for item in v["Items"].as_array().unwrap() {
+                        let pk = item["pk"]["S"].as_str().unwrap().to_string();
+                        prop_assert!(seen.insert(pk), "each item appears in exactly one segment and page");
+                    }
+                    match v.get("LastEvaluatedKey") {
+                        Some(key) => request["ExclusiveStartKey"] = key.clone(),
+                        None => break,
+                    }
                 }
             }
             prop_assert_eq!(seen.len(), count);
@@ -562,4 +576,108 @@ fn scan_pages_filter_project_and_respect_index_projection() {
             assert_eq!(keys, ["g", "pk"]);
         }
     });
+}
+
+#[tokio::test]
+async fn index_pages_resume_after_the_exact_base_key_among_duplicate_index_keys() {
+    let h = DynamoHandler::new();
+    let (status, _) = call(&h, "CreateTable", json!({
+        "TableName":"index-pages", "BillingMode":"PAY_PER_REQUEST",
+        "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"g","AttributeType":"S"}],
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        "GlobalSecondaryIndexes":[{"IndexName":"byG","KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],"Projection":{"ProjectionType":"KEYS_ONLY"}}]
+    })).await;
+    assert_eq!(status, 200);
+    for pk in ["a", "b", "c", "d", "e"] {
+        assert_eq!(
+            call(
+                &h,
+                "PutItem",
+                json!({"TableName":"index-pages","Item":{"pk":{"S":pk},"g":{"S":"shared"}}})
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    for (op, forward) in [("Query", true), ("Query", false), ("Scan", true)] {
+        let mut request = json!({"TableName":"index-pages","IndexName":"byG","Limit":2});
+        if op == "Query" {
+            request["KeyConditionExpression"] = json!("g = :g");
+            request["ExpressionAttributeValues"] = json!({":g":{"S":"shared"}});
+            request["ScanIndexForward"] = json!(forward);
+        }
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (status, page) = call(&h, op, request.clone()).await;
+            assert_eq!(status, 200);
+            for item in page["Items"].as_array().unwrap() {
+                seen.push(item["pk"]["S"].as_str().unwrap().to_owned());
+            }
+            match page.get("LastEvaluatedKey") {
+                Some(key) => request["ExclusiveStartKey"] = key.clone(),
+                None => break,
+            }
+        }
+        let mut expected = vec!["a", "b", "c", "d", "e"];
+        if !forward {
+            expected.reverse();
+        }
+        assert_eq!(seen, expected, "{op}, forward={forward}");
+    }
+}
+
+#[tokio::test]
+async fn query_and_scan_enforce_the_byte_page_before_filter_projection_and_count() {
+    let h = DynamoHandler::new();
+    create_pk_sk(&h, "byte-pages", false).await;
+    for i in 0..6 {
+        assert_eq!(
+            call(
+                &h,
+                "PutItem",
+                json!({"TableName":"byte-pages","Item":{
+                    "pk":{"S":"p"},"sk":{"N":i.to_string()},"payload":{"S":"x".repeat(300_000)}
+                }})
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    for op in ["Query", "Scan"] {
+        let mut request = json!({"TableName":"byte-pages","ProjectionExpression":"pk, sk"});
+        if op == "Query" {
+            request["KeyConditionExpression"] = json!("pk = :p");
+            request["ExpressionAttributeValues"] = json!({":p":{"S":"p"}});
+        }
+        let (status, first) = call(&h, op, request.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(first["ScannedCount"], 3);
+        assert_eq!(first["Count"], 3);
+        assert_eq!(first["LastEvaluatedKey"]["sk"]["N"], "2");
+        assert!(first["Items"][0].get("payload").is_none());
+        request["ExclusiveStartKey"] = first["LastEvaluatedKey"].clone();
+        let (status, second) = call(&h, op, request.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(second["Count"], 3);
+        assert!(second.get("LastEvaluatedKey").is_none());
+        request.as_object_mut().unwrap().remove("ExclusiveStartKey");
+        request["FilterExpression"] = json!("attribute_not_exists(payload)");
+        let (status, empty) = call(&h, op, request.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(empty["Count"], 0);
+        assert_eq!(empty["ScannedCount"], 3);
+        assert_eq!(empty["LastEvaluatedKey"], first["LastEvaluatedKey"]);
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("ProjectionExpression");
+        request["Select"] = json!("COUNT");
+        let (status, count) = call(&h, op, request).await;
+        assert_eq!(status, 200);
+        assert_eq!(count["ScannedCount"], 3);
+        assert_eq!(count["Count"], 0);
+        assert!(count.get("Items").is_none());
+    }
 }
