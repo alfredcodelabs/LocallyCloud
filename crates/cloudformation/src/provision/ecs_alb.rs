@@ -8,6 +8,13 @@ const ALB: &str = "AWS::ElasticLoadBalancingV2::LoadBalancer";
 const GROUP: &str = "AWS::ElasticLoadBalancingV2::TargetGroup";
 const LISTENER: &str = "AWS::ElasticLoadBalancingV2::Listener";
 
+/// Local gate for an ECS service to reach its desired running count.
+const SERVICE_STABILIZE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Deleting a service waits out the longest target deregistration delay (3600 s) plus a margin.
+const SERVICE_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3630);
+/// Pause between ECS service status polls.
+const SERVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 pub(crate) fn validate_ecs_alb_property_names(
     id: &str,
     kind: &str,
@@ -532,7 +539,7 @@ impl Provisioner {
             .get("DesiredCount")
             .and_then(Value::as_u64)
             .unwrap_or(1);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + SERVICE_STABILIZE_DEADLINE;
         loop {
             let value = self
                 .ecs_call(
@@ -616,10 +623,11 @@ impl Provisioner {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(CfnError::ResourceFailed(format!(
-                    "ECS service {physical} did not stabilize within the local 60-second gate"
+                    "ECS service {physical} did not stabilize within the local {}-second gate",
+                    SERVICE_STABILIZE_DEADLINE.as_secs()
                 )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(SERVICE_POLL_INTERVAL).await;
         }
     }
     pub(super) async fn ecs_alb_resource(
@@ -897,7 +905,7 @@ impl Provisioner {
                     physical,
                 )
                 .await?;
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3630);
+                let deadline = tokio::time::Instant::now() + SERVICE_CLEANUP_DEADLINE;
                 loop {
                     let value = self
                         .ecs_call(
@@ -919,7 +927,7 @@ impl Provisioner {
                             "ECS service {physical} cleanup timed out"
                         )));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(SERVICE_POLL_INTERVAL).await;
                 }
             }
             ALB | GROUP | LISTENER => {

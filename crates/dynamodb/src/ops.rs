@@ -2387,7 +2387,7 @@ pub async fn transact_write_items(ctx: &Ctx<'_>, req: &Value) -> Result<Value, D
         let slot = ctx.store.txn_slot(ctx.account, ctx.region, token);
         let mut outcome = slot.lock().await;
         if let Some(previous) = outcome.as_ref() {
-            if previous.created_at.elapsed() < std::time::Duration::from_secs(600) {
+            if previous.created_at.elapsed() < crate::store::CLIENT_REQUEST_TOKEN_WINDOW {
                 if previous.fingerprint != fingerprint {
                     return Err(DdbError::IdempotentParameterMismatch(
                         "A request with this ClientRequestToken has different parameters".into(),

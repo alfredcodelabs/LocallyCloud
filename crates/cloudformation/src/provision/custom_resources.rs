@@ -9,6 +9,9 @@ use bytes::Bytes;
 use http::{HeaderValue, Method};
 use serde_json::{json, Value};
 
+/// Pause between checks for a custom resource provider response.
+const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub(crate) fn is_custom_resource(kind: &str) -> bool {
     kind == "AWS::CloudFormation::CustomResource"
         || kind.strip_prefix("Custom::").is_some_and(|name| {
@@ -207,7 +210,7 @@ impl Provisioner {
                                 Err(error) => invocation_error = Some(error),
                             }
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                        _ = tokio::time::sleep(RESPONSE_POLL_INTERVAL) => {},
                     }
                 }
             };

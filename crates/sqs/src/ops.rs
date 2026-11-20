@@ -1235,6 +1235,12 @@ fn queue_key_id(state: &QueueState) -> Option<String> {
 
 const KMS_WAIT_LIMIT: Duration = Duration::from_secs(2);
 
+/// Operation name logged by the background message-move task.
+const MOVE_TASK_OPERATION: &str = "MoveMessages";
+/// Backoff of a message-move task while the destination is temporarily unavailable.
+const MOVE_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const MOVE_RETRY_MAXIMUM: Duration = Duration::from_secs(2);
+
 fn kms_context(arn: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("aws:sqs:queuearn".into(), arn.into())])
 }
@@ -2563,7 +2569,7 @@ async fn move_one_message(
         {
             Ok(message) => message,
             Err(error) => {
-                error.log(ctx.request_id, Some("MoveMessages"));
+                error.log(ctx.request_id, Some(MOVE_TASK_OPERATION));
                 return MoveOneResult::Retryable;
             }
         }
@@ -2660,7 +2666,7 @@ async fn move_one_message(
     })
     .await
     .unwrap_or_else(|_| {
-        SqsError::StorageUnavailable.log(ctx.request_id, Some("MoveMessages"));
+        SqsError::StorageUnavailable.log(ctx.request_id, Some(MOVE_TASK_OPERATION));
         MoveOneResult::Retryable
     })
 }
@@ -2791,7 +2797,7 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
                 trace_header: None,
             };
             let interval = Duration::from_secs_f64(1.0 / rate as f64);
-            let mut retry_delay = Duration::from_millis(100);
+            let mut retry_delay = MOVE_RETRY_INITIAL;
             loop {
                 if store.move_task_status(&task_handle).as_deref() != Some("RUNNING") {
                     return;
@@ -2799,12 +2805,12 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
                 match move_one_message(&worker_ctx, lifecycle.clone(), &source, &destination).await
                 {
                     MoveOneResult::Moved => {
-                        retry_delay = Duration::from_millis(100);
+                        retry_delay = MOVE_RETRY_INITIAL;
                         match store.record_message_moved(&task_handle).await {
                             Ok(true) => {}
                             Ok(false) => return,
                             Err(error) => {
-                                error.log(&request_id, Some("MoveMessages"));
+                                error.log(&request_id, Some(MOVE_TASK_OPERATION));
                                 return;
                             }
                         }
@@ -2812,21 +2818,21 @@ pub async fn start_message_move_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, 
                     }
                     MoveOneResult::Retryable => {
                         tokio::time::sleep(retry_delay).await;
-                        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
+                        retry_delay = retry_delay.saturating_mul(2).min(MOVE_RETRY_MAXIMUM);
                     }
                     MoveOneResult::Blocked => {
                         if let Err(error) = store.finish_move_task(&task_handle, "FAILED").await {
-                            error.log(&request_id, Some("MoveMessages"));
+                            error.log(&request_id, Some(MOVE_TASK_OPERATION));
                         }
                         return;
                     }
                     MoveOneResult::Waiting => {
-                        tokio::time::sleep(interval.max(Duration::from_millis(100))).await;
+                        tokio::time::sleep(interval.max(MOVE_RETRY_INITIAL)).await;
                     }
                     MoveOneResult::Empty => {
                         if let Err(error) = store.finish_move_task(&task_handle, "COMPLETED").await
                         {
-                            error.log(&request_id, Some("MoveMessages"));
+                            error.log(&request_id, Some(MOVE_TASK_OPERATION));
                         }
                         return;
                     }

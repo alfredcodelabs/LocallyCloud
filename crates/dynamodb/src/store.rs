@@ -220,6 +220,10 @@ pub struct ExportJob {
 
 /// Longest sleep before re-checking a far TTL deadline; also bounds `Instant` arithmetic.
 const TTL_MAX_SLEEP: Duration = Duration::from_secs(3600);
+/// AWS idempotency window of a transaction `ClientRequestToken` (10 minutes).
+const CLIENT_REQUEST_TOKEN_WINDOW_SECS: i64 = 600;
+pub(crate) const CLIENT_REQUEST_TOKEN_WINDOW: Duration =
+    Duration::from_secs(CLIENT_REQUEST_TOKEN_WINDOW_SECS as u64);
 
 /// An item's TTL in epoch seconds, when its TTL attribute is a finite number.
 pub(crate) fn ttl_of(item: &Item, attribute: &str) -> Option<f64> {
@@ -765,7 +769,7 @@ impl TableStore {
             let mut query = connection.prepare("SELECT account,region,token,fingerprint,created_unix,result FROM dynamodb_txn_tokens WHERE created_unix>?1")
                 .map_err(persist_error)?;
             let rows = query
-                .query_map(params![now - 600], |row| {
+                .query_map(params![now - CLIENT_REQUEST_TOKEN_WINDOW_SECS], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -977,7 +981,7 @@ impl TableStore {
         transaction
             .execute(
                 "DELETE FROM dynamodb_txn_tokens WHERE created_unix<=?1",
-                params![now - 600],
+                params![now - CLIENT_REQUEST_TOKEN_WINDOW_SECS],
             )
             .map_err(persist_error)?;
         for entry in &self.txn_tokens {
@@ -1191,9 +1195,9 @@ impl TableStore {
                     Err(_) => return retry,
                 };
                 match outcome.as_ref() {
-                    Some(outcome) if outcome.created_at.elapsed() < Duration::from_secs(600) => {
+                    Some(outcome) if outcome.created_at.elapsed() < CLIENT_REQUEST_TOKEN_WINDOW => {
                         tokio::time::Instant::from_std(
-                            outcome.created_at + Duration::from_secs(600),
+                            outcome.created_at + CLIENT_REQUEST_TOKEN_WINDOW,
                         )
                     }
                     _ => retry,
@@ -1214,7 +1218,7 @@ impl TableStore {
             };
             outcome
                 .as_ref()
-                .is_some_and(|outcome| outcome.created_at.elapsed() < Duration::from_secs(600))
+                .is_some_and(|outcome| outcome.created_at.elapsed() < CLIENT_REQUEST_TOKEN_WINDOW)
         });
     }
 
@@ -1626,7 +1630,7 @@ mod tests {
         assert_eq!(
             store.maintenance_deadline(last),
             Some(tokio::time::Instant::from_std(
-                created_at + Duration::from_secs(600)
+                created_at + CLIENT_REQUEST_TOKEN_WINDOW
             ))
         );
         slot.lock().await.as_mut().unwrap().created_at = created_at - Duration::from_secs(601);
