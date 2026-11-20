@@ -94,7 +94,8 @@ impl Session {
     }
 }
 
-/// Sessions keyed by AccessKeyId. Expired sessions are removed on resolve.
+/// Sessions keyed by AccessKeyId. Resolve evicts expired sessions from memory;
+/// durable rows are pruned during restore.
 #[derive(Default)]
 pub struct SessionStore {
     sessions: DashMap<String, Session>,
@@ -127,19 +128,15 @@ impl SessionStore {
 
     /// Resolve a caller by AccessKeyId, removing and ignoring an expired session.
     pub fn resolve(&self, access_key_id: &str) -> Option<Session> {
-        let expired = self
-            .sessions
-            .get(access_key_id)
-            .map(|s| s.expires_at <= OffsetDateTime::now_utc())
-            .unwrap_or(false);
-        if expired {
-            self.sessions.remove(access_key_id);
-            if let Some(persistence) = &self.persistence {
-                let _ = persistence.remove_session(access_key_id);
-            }
-            return None;
+        let now = OffsetDateTime::now_utc();
+        let session = self.sessions.get(access_key_id)?;
+        if session.expires_at > now {
+            return Some(session.clone());
         }
-        self.sessions.get(access_key_id).map(|s| s.clone())
+        drop(session);
+        self.sessions
+            .remove_if(access_key_id, |_, session| session.expires_at <= now);
+        None
     }
 }
 
@@ -579,6 +576,71 @@ mod tests {
             },
         );
         arn
+    }
+
+    #[test]
+    fn expired_session_resolution_does_not_wait_for_sqlite_writer() {
+        use locallycloud_state::{StateCipher, StateDb};
+        use std::sync::mpsc;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.locallycloud-tmp")
+            .join(format!("iam-session-expiry-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let persistence = Arc::new(
+            IamPersistence::with_cipher(db.clone(), StateCipher::with_key(&[0x51; 32])).unwrap(),
+        );
+        let sessions = Arc::new(SessionStore::durable(persistence.clone()).unwrap());
+        let expired = Session {
+            account: "000000000000".into(),
+            secret_access_key: "test-secret".into(),
+            session_token: "test-token".into(),
+            arn: "arn:aws:sts::000000000000:assumed-role/app/test".into(),
+            user_id: "AROAEXAMPLE:test".into(),
+            root_account: false,
+            role_arn: Some("arn:aws:iam::000000000000:role/app".into()),
+            session_policy: None,
+            expires_at: OffsetDateTime::now_utc() - Duration::seconds(1),
+        };
+        let mut active = expired.clone();
+        active.expires_at = OffsetDateTime::now_utc() + Duration::hours(1);
+        sessions.register("expired", expired).unwrap();
+        sessions.register("active", active).unwrap();
+
+        let writer = db.connection().unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker_sessions = sessions.clone();
+        let worker = std::thread::spawn(move || {
+            let result = (
+                worker_sessions.resolve("missing").is_none(),
+                worker_sessions.resolve("active").is_some(),
+                worker_sessions.resolve("expired").is_none(),
+            );
+            tx.send(result).unwrap();
+        });
+        let resolved = rx.recv_timeout(std::time::Duration::from_secs(1));
+        writer.execute_batch("ROLLBACK").unwrap();
+        worker.join().unwrap();
+        assert_eq!(resolved.unwrap(), (true, true, true));
+        assert!(!sessions.sessions.contains_key("expired"));
+        let count = || {
+            writer
+                .query_row("SELECT COUNT(*) FROM iam_sessions", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(), 2);
+        drop(sessions);
+        let restored = SessionStore::durable(persistence).unwrap();
+        assert!(restored.resolve("expired").is_none());
+        assert!(restored.resolve("active").is_some());
+        assert_eq!(count(), 1);
+        drop(restored);
+        drop(writer);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

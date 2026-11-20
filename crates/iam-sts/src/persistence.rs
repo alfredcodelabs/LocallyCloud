@@ -223,14 +223,6 @@ impl IamPersistence {
         }
         Ok(sessions)
     }
-    pub fn remove_session(&self, id: &str) -> Result<(), IamStsError> {
-        self.db
-            .connection()
-            .map_err(state_error)?
-            .execute("DELETE FROM iam_sessions WHERE id=?1", params![id])
-            .map_err(state_error)?;
-        Ok(())
-    }
 }
 fn decode<T: DeserializeOwned>(plain: &[u8]) -> Result<T, IamStsError> {
     serde_json::from_slice(plain).map_err(state_error)
