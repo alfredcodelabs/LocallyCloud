@@ -61,10 +61,14 @@ impl ApiGwError {
         }
     }
 
-    pub fn into_response(self, request_id: &str) -> axum::response::Response {
+    pub fn into_response(
+        self,
+        request_id: &str,
+        operation: Option<&str>,
+    ) -> axum::response::Response {
         locallycloud_core::observability::log_service_error(
             "apigateway",
-            None,
+            operation,
             request_id,
             self.code(),
             self.http_status(),
@@ -278,7 +282,7 @@ mod tests {
 
     #[test]
     fn renders_rest_json_error_headers() {
-        let response = ApiGwError::BadRequest("bad".into()).into_response("rid");
+        let response = ApiGwError::BadRequest("bad".into()).into_response("rid", None);
         assert_eq!(response.status(), 400);
         assert_eq!(
             response.headers().get("x-amzn-errortype").unwrap(),
@@ -294,7 +298,7 @@ mod tests {
             ApiGwError::LimitExceeded("quota exceeded".into()),
             ApiGwError::TooManyRequests("slow down".into()),
         ] {
-            let response = error.into_response("rid");
+            let response = error.into_response("rid", None);
             assert_eq!(response.status(), 429);
             assert_eq!(
                 response.headers().get(RETRY_AFTER).unwrap(),

@@ -251,9 +251,10 @@ caller_context: locallycloud_core::integration::request_context::verified_reques
         query: Option<&str>,
         ctx: &Ctx<'_>,
         body: &Value,
-    ) -> Result<(u16, Value), ApiGwError> {
+    ) -> (Option<&'static str>, Result<(u16, Value), ApiGwError>) {
         match segs.first().copied() {
-            Some("tags") => {
+            Some("tags") => (
+                None,
                 crate::tags::route(
                     method,
                     &segs.iter().skip(1).copied().collect::<Vec<_>>().join("/"),
@@ -261,8 +262,8 @@ caller_context: locallycloud_core::integration::request_context::verified_reques
                     ctx,
                     body,
                 )
-                .await
-            }
+                .await,
+            ),
             Some(
                 "restapis"
                 | "account"
@@ -272,7 +273,10 @@ caller_context: locallycloud_core::integration::request_context::verified_reques
                 | "domainnameaccessassociations",
             ) => route_v1(method, segs, query, ctx, body).await,
             Some("v2") => route_v2(method, segs, ctx, body).await,
-            _ => Err(ApiGwError::NotFound("Unknown API Gateway resource".into())),
+            _ => (
+                None,
+                Err(ApiGwError::NotFound("Unknown API Gateway resource".into())),
+            ),
         }
     }
 }
@@ -283,201 +287,303 @@ async fn route_v1(
     query: Option<&str>,
     ctx: &Ctx<'_>,
     body: &Value,
-) -> Result<(u16, Value), ApiGwError> {
+) -> (Option<&'static str>, Result<(u16, Value), ApiGwError>) {
     match (method, segs) {
-        (&Method::GET, ["account"]) => v1::get_account(ctx).await,
-        (&Method::PATCH, ["account"]) => v1::update_account(ctx, body).await,
-        (&Method::POST, ["restapis"]) => v1::create_rest_api(ctx, body).await,
-        (&Method::GET, ["restapis"]) => v1::get_rest_apis(ctx).await,
-        (&Method::GET, ["restapis", id]) => v1::get_rest_api(ctx, id).await,
-        (&Method::PATCH, ["restapis", id]) => v1::update_rest_api(ctx, id, body).await,
-        (&Method::DELETE, ["restapis", id]) => v1::delete_rest_api(ctx, id).await,
-        (&Method::GET, ["restapis", id, "resources"]) => v1::get_resources(ctx, id).await,
-        (&Method::POST, ["restapis", id, "resources", parent]) => {
+        (&Method::GET, ["account"]) => (Some("GetAccount"), v1::get_account(ctx).await),
+        (&Method::PATCH, ["account"]) => {
+            (Some("UpdateAccount"), v1::update_account(ctx, body).await)
+        }
+        (&Method::POST, ["restapis"]) => {
+            (Some("CreateRestApi"), v1::create_rest_api(ctx, body).await)
+        }
+        (&Method::GET, ["restapis"]) => (Some("GetRestApis"), v1::get_rest_apis(ctx).await),
+        (&Method::GET, ["restapis", id]) => (Some("GetRestApi"), v1::get_rest_api(ctx, id).await),
+        (&Method::PATCH, ["restapis", id]) => (
+            Some("UpdateRestApi"),
+            v1::update_rest_api(ctx, id, body).await,
+        ),
+        (&Method::DELETE, ["restapis", id]) => {
+            (Some("DeleteRestApi"), v1::delete_rest_api(ctx, id).await)
+        }
+        (&Method::GET, ["restapis", id, "resources"]) => {
+            (Some("GetResources"), v1::get_resources(ctx, id).await)
+        }
+        (&Method::POST, ["restapis", id, "resources", parent]) => (Some("CreateResource"), {
             v1::create_resource(ctx, id, parent, body).await
+        }),
+        (&Method::GET, ["restapis", id, "resources", rid]) => {
+            (Some("GetResource"), v1::get_resource(ctx, id, rid).await)
         }
-        (&Method::GET, ["restapis", id, "resources", rid]) => v1::get_resource(ctx, id, rid).await,
-        (&Method::DELETE, ["restapis", id, "resources", rid]) => {
+        (&Method::DELETE, ["restapis", id, "resources", rid]) => (Some("DeleteResource"), {
             v1::delete_resource(ctx, id, rid).await
-        }
-        (&Method::PUT, ["restapis", id, "resources", rid, "methods", m]) => {
+        }),
+        (&Method::PUT, ["restapis", id, "resources", rid, "methods", m]) => (Some("PutMethod"), {
             v1::put_method(ctx, id, rid, m, body).await
-        }
+        }),
         (&Method::PATCH, ["restapis", id, "resources", rid, "methods", m]) => {
-            v1::update_method(ctx, id, rid, m, body).await
+            (Some("UpdateMethod"), {
+                v1::update_method(ctx, id, rid, m, body).await
+            })
         }
         (&Method::GET, ["restapis", id, "resources", rid, "methods", m]) => {
-            v1::get_method(ctx, id, rid, m).await
+            (Some("GetMethod"), { v1::get_method(ctx, id, rid, m).await })
         }
         (&Method::DELETE, ["restapis", id, "resources", rid, "methods", m]) => {
-            v1::delete_method(ctx, id, rid, m).await
+            (Some("DeleteMethod"), {
+                v1::delete_method(ctx, id, rid, m).await
+            })
         }
         (&Method::PUT, ["restapis", id, "resources", rid, "methods", m, "integration"]) => {
-            v1::put_integration(ctx, id, rid, m, body).await
+            (Some("PutIntegration"), {
+                v1::put_integration(ctx, id, rid, m, body).await
+            })
         }
         (&Method::GET, ["restapis", id, "resources", rid, "methods", m, "integration"]) => {
-            v1::get_integration(ctx, id, rid, m).await
+            (Some("GetIntegration"), {
+                v1::get_integration(ctx, id, rid, m).await
+            })
         }
         (&Method::PUT, ["restapis", id, "resources", rid, "methods", m, "responses", sc]) => {
-            v1::put_method_response(ctx, id, rid, m, sc, body).await
+            (Some("PutMethodResponse"), {
+                v1::put_method_response(ctx, id, rid, m, sc, body).await
+            })
         }
         (&Method::GET, ["restapis", id, "resources", rid, "methods", m, "responses", sc]) => {
-            v1::get_method_response(ctx, id, rid, m, sc).await
+            (Some("GetMethodResponse"), {
+                v1::get_method_response(ctx, id, rid, m, sc).await
+            })
         }
         (
             &Method::PUT,
             ["restapis", id, "resources", rid, "methods", m, "integration", "responses", sc],
-        ) => v1::put_integration_response(ctx, id, rid, m, sc, body).await,
+        ) => (
+            Some("PutIntegrationResponse"),
+            v1::put_integration_response(ctx, id, rid, m, sc, body).await,
+        ),
         (
             &Method::GET,
             ["restapis", id, "resources", rid, "methods", m, "integration", "responses", sc],
-        ) => v1::get_integration_response(ctx, id, rid, m, sc).await,
-        (&Method::POST, ["restapis", id, "deployments"]) => {
+        ) => (
+            Some("GetIntegrationResponse"),
+            v1::get_integration_response(ctx, id, rid, m, sc).await,
+        ),
+        (&Method::POST, ["restapis", id, "deployments"]) => (Some("CreateDeployment"), {
             v1::create_deployment(ctx, id, body).await
+        }),
+        (&Method::GET, ["restapis", id, "deployments"]) => {
+            (Some("GetDeployments"), v1::get_deployments(ctx, id).await)
         }
-        (&Method::GET, ["restapis", id, "deployments"]) => v1::get_deployments(ctx, id).await,
-        (&Method::GET, ["restapis", id, "deployments", dep]) => {
+        (&Method::GET, ["restapis", id, "deployments", dep]) => (Some("GetDeployment"), {
             v1::get_deployment(ctx, id, dep).await
-        }
-        (&Method::DELETE, ["restapis", id, "deployments", dep]) => {
+        }),
+        (&Method::DELETE, ["restapis", id, "deployments", dep]) => (Some("DeleteDeployment"), {
             v1::delete_deployment(ctx, id, dep).await
+        }),
+        (&Method::POST, ["restapis", id, "stages"]) => {
+            (Some("CreateStage"), v1::create_stage(ctx, id, body).await)
         }
-        (&Method::POST, ["restapis", id, "stages"]) => v1::create_stage(ctx, id, body).await,
-        (&Method::GET, ["restapis", id, "stages"]) => v1::get_stages(ctx, id).await,
-        (&Method::GET, ["restapis", id, "stages", name]) => v1::get_stage(ctx, id, name).await,
-        (&Method::PATCH, ["restapis", id, "stages", name]) => {
+        (&Method::GET, ["restapis", id, "stages"]) => {
+            (Some("GetStages"), v1::get_stages(ctx, id).await)
+        }
+        (&Method::GET, ["restapis", id, "stages", name]) => {
+            (Some("GetStage"), v1::get_stage(ctx, id, name).await)
+        }
+        (&Method::PATCH, ["restapis", id, "stages", name]) => (Some("UpdateStage"), {
             v1::update_stage(ctx, id, name, body).await
-        }
-        (&Method::DELETE, ["restapis", id, "stages", name]) => {
+        }),
+        (&Method::DELETE, ["restapis", id, "stages", name]) => (Some("DeleteStage"), {
             v1::delete_stage(ctx, id, name).await
-        }
-        (&Method::POST, ["restapis", id, "authorizers"]) => {
+        }),
+        (&Method::POST, ["restapis", id, "authorizers"]) => (Some("CreateAuthorizer"), {
             v1::create_authorizer(ctx, id, body).await
+        }),
+        (&Method::GET, ["restapis", id, "authorizers"]) => {
+            (Some("GetAuthorizers"), v1::get_authorizers(ctx, id).await)
         }
-        (&Method::GET, ["restapis", id, "authorizers"]) => v1::get_authorizers(ctx, id).await,
-        (&Method::GET, ["restapis", id, "authorizers", aid]) => {
+        (&Method::GET, ["restapis", id, "authorizers", aid]) => (Some("GetAuthorizer"), {
             v1::get_authorizer(ctx, id, aid).await
-        }
-        (&Method::PATCH, ["restapis", id, "authorizers", aid]) => {
+        }),
+        (&Method::PATCH, ["restapis", id, "authorizers", aid]) => (Some("UpdateAuthorizer"), {
             v1::update_authorizer(ctx, id, aid, body).await
-        }
-        (&Method::DELETE, ["restapis", id, "authorizers", aid]) => {
+        }),
+        (&Method::DELETE, ["restapis", id, "authorizers", aid]) => (Some("DeleteAuthorizer"), {
             v1::delete_authorizer(ctx, id, aid).await
+        }),
+        (&Method::POST, ["restapis", id, "models"]) => {
+            (Some("CreateModel"), v1::create_model(ctx, id, body).await)
         }
-        (&Method::POST, ["restapis", id, "models"]) => v1::create_model(ctx, id, body).await,
-        (&Method::GET, ["restapis", id, "models"]) => v1::get_models(ctx, id).await,
-        (&Method::GET, ["restapis", id, "models", name]) => v1::get_model(ctx, id, name).await,
-        (&Method::PATCH, ["restapis", id, "models", name]) => {
+        (&Method::GET, ["restapis", id, "models"]) => {
+            (Some("GetModels"), v1::get_models(ctx, id).await)
+        }
+        (&Method::GET, ["restapis", id, "models", name]) => {
+            (Some("GetModel"), v1::get_model(ctx, id, name).await)
+        }
+        (&Method::PATCH, ["restapis", id, "models", name]) => (Some("UpdateModel"), {
             v1::update_model(ctx, id, name, body).await
-        }
-        (&Method::DELETE, ["restapis", id, "models", name]) => {
+        }),
+        (&Method::DELETE, ["restapis", id, "models", name]) => (Some("DeleteModel"), {
             v1::delete_model(ctx, id, name).await
-        }
+        }),
         (&Method::POST, ["restapis", id, "requestvalidators"]) => {
-            v1::create_request_validator(ctx, id, body).await
+            (Some("CreateRequestValidator"), {
+                v1::create_request_validator(ctx, id, body).await
+            })
         }
-        (&Method::GET, ["restapis", id, "requestvalidators"]) => {
+        (&Method::GET, ["restapis", id, "requestvalidators"]) => (Some("GetRequestValidators"), {
             v1::get_request_validators(ctx, id).await
-        }
+        }),
         (&Method::GET, ["restapis", id, "requestvalidators", vid]) => {
-            v1::get_request_validator(ctx, id, vid).await
+            (Some("GetRequestValidator"), {
+                v1::get_request_validator(ctx, id, vid).await
+            })
         }
         (&Method::PATCH, ["restapis", id, "requestvalidators", vid]) => {
-            v1::update_request_validator(ctx, id, vid, body).await
+            (Some("UpdateRequestValidator"), {
+                v1::update_request_validator(ctx, id, vid, body).await
+            })
         }
         (&Method::DELETE, ["restapis", id, "requestvalidators", vid]) => {
-            v1::delete_request_validator(ctx, id, vid).await
+            (Some("DeleteRequestValidator"), {
+                v1::delete_request_validator(ctx, id, vid).await
+            })
         }
         (&Method::PUT, ["restapis", id, "gatewayresponses", response_type]) => {
-            v1::put_gateway_response(ctx, id, response_type, body).await
+            (Some("PutGatewayResponse"), {
+                v1::put_gateway_response(ctx, id, response_type, body).await
+            })
         }
-        (&Method::GET, ["restapis", id, "gatewayresponses"]) => {
+        (&Method::GET, ["restapis", id, "gatewayresponses"]) => (Some("GetGatewayResponses"), {
             v1::get_gateway_responses(ctx, id).await
-        }
+        }),
         (&Method::GET, ["restapis", id, "gatewayresponses", response_type]) => {
-            v1::get_gateway_response(ctx, id, response_type).await
+            (Some("GetGatewayResponse"), {
+                v1::get_gateway_response(ctx, id, response_type).await
+            })
         }
-        (&Method::POST, ["apikeys"]) => v1::create_api_key(ctx, body).await,
-        (&Method::GET, ["apikeys"]) => {
+        (&Method::POST, ["apikeys"]) => (Some("CreateApiKey"), v1::create_api_key(ctx, body).await),
+        (&Method::GET, ["apikeys"]) => (Some("GetApiKeys"), {
             v1::get_api_keys(ctx, query_flag(query, "includeValues")).await
-        }
-        (&Method::GET, ["apikeys", id]) => {
+        }),
+        (&Method::GET, ["apikeys", id]) => (Some("GetApiKey"), {
             v1::get_api_key(ctx, id, query_flag(query, "includeValue")).await
+        }),
+        (&Method::PATCH, ["apikeys", id]) => (
+            Some("UpdateApiKey"),
+            v1::update_api_key(ctx, id, body).await,
+        ),
+        (&Method::DELETE, ["apikeys", id]) => {
+            (Some("DeleteApiKey"), v1::delete_api_key(ctx, id).await)
         }
-        (&Method::PATCH, ["apikeys", id]) => v1::update_api_key(ctx, id, body).await,
-        (&Method::DELETE, ["apikeys", id]) => v1::delete_api_key(ctx, id).await,
-        (&Method::POST, ["usageplans"]) => v1::create_usage_plan(ctx, body).await,
-        (&Method::GET, ["usageplans"]) => v1::get_usage_plans(ctx).await,
-        (&Method::GET, ["usageplans", id]) => v1::get_usage_plan(ctx, id).await,
-        (&Method::PATCH, ["usageplans", id]) => v1::update_usage_plan(ctx, id, body).await,
-        (&Method::DELETE, ["usageplans", id]) => v1::delete_usage_plan(ctx, id).await,
-        (&Method::POST, ["usageplans", id, "keys"]) => {
+        (&Method::POST, ["usageplans"]) => (
+            Some("CreateUsagePlan"),
+            v1::create_usage_plan(ctx, body).await,
+        ),
+        (&Method::GET, ["usageplans"]) => (Some("GetUsagePlans"), v1::get_usage_plans(ctx).await),
+        (&Method::GET, ["usageplans", id]) => {
+            (Some("GetUsagePlan"), v1::get_usage_plan(ctx, id).await)
+        }
+        (&Method::PATCH, ["usageplans", id]) => (
+            Some("UpdateUsagePlan"),
+            v1::update_usage_plan(ctx, id, body).await,
+        ),
+        (&Method::DELETE, ["usageplans", id]) => (
+            Some("DeleteUsagePlan"),
+            v1::delete_usage_plan(ctx, id).await,
+        ),
+        (&Method::POST, ["usageplans", id, "keys"]) => (Some("CreateUsagePlanKey"), {
             v1::create_usage_plan_key(ctx, id, body).await
-        }
-        (&Method::GET, ["usageplans", id, "keys"]) => v1::get_usage_plan_keys(ctx, id).await,
-        (&Method::GET, ["usageplans", id, "keys", key]) => {
+        }),
+        (&Method::GET, ["usageplans", id, "keys"]) => (
+            Some("GetUsagePlanKeys"),
+            v1::get_usage_plan_keys(ctx, id).await,
+        ),
+        (&Method::GET, ["usageplans", id, "keys", key]) => (Some("GetUsagePlanKey"), {
             v1::get_usage_plan_key(ctx, id, key).await
-        }
-        (&Method::DELETE, ["usageplans", id, "keys", key]) => {
+        }),
+        (&Method::DELETE, ["usageplans", id, "keys", key]) => (Some("DeleteUsagePlanKey"), {
             v1::delete_usage_plan_key(ctx, id, key).await
+        }),
+        (&Method::POST, ["domainnames"]) => (
+            Some("CreateDomainName"),
+            v1::create_domain_name(ctx, body).await,
+        ),
+        (&Method::GET, ["domainnames"]) => {
+            (Some("GetDomainNames"), v1::get_domain_names(ctx).await)
         }
-        (&Method::POST, ["domainnames"]) => v1::create_domain_name(ctx, body).await,
-        (&Method::GET, ["domainnames"]) => v1::get_domain_names(ctx).await,
-        (&Method::GET, ["domainnames", name]) => {
+        (&Method::GET, ["domainnames", name]) => (Some("GetDomainName"), {
             let id = query_value(query, "domainNameId");
             v1::get_domain_name(ctx, name, id.as_deref()).await
-        }
-        (&Method::PATCH, ["domainnames", name]) => {
+        }),
+        (&Method::PATCH, ["domainnames", name]) => (Some("UpdateDomainName"), {
             let id = query_value(query, "domainNameId");
             v1::update_domain_name(ctx, name, id.as_deref(), body).await
-        }
-        (&Method::DELETE, ["domainnames", name]) => {
+        }),
+        (&Method::DELETE, ["domainnames", name]) => (Some("DeleteDomainName"), {
             let id = query_value(query, "domainNameId");
             v1::delete_domain_name(ctx, name, id.as_deref()).await
-        }
+        }),
         (&Method::POST, ["domainnameaccessassociations"]) => {
-            v1::create_domain_name_access_association(ctx, body).await
+            (Some("CreateDomainNameAccessAssociation"), {
+                v1::create_domain_name_access_association(ctx, body).await
+            })
         }
         (&Method::GET, ["domainnameaccessassociations"]) => {
-            let owner = query_value(query, "resourceOwner");
-            let limit = query_value(query, "limit");
-            let position = query_value(query, "position");
-            v1::get_domain_name_access_associations(
-                ctx,
-                owner.as_deref(),
-                limit.as_deref(),
-                position.as_deref(),
-            )
-            .await
+            (Some("GetDomainNameAccessAssociations"), {
+                let owner = query_value(query, "resourceOwner");
+                let limit = query_value(query, "limit");
+                let position = query_value(query, "position");
+                v1::get_domain_name_access_associations(
+                    ctx,
+                    owner.as_deref(),
+                    limit.as_deref(),
+                    position.as_deref(),
+                )
+                .await
+            })
         }
         (&Method::DELETE, ["domainnameaccessassociations", arn @ ..]) if !arn.is_empty() => {
-            let encoded = arn.join("/").replace('+', "%2B");
-            let decoded = crate::proxy_event::percent_decode(&encoded);
-            v1::delete_domain_name_access_association(ctx, &decoded).await
+            (Some("DeleteDomainNameAccessAssociation"), {
+                let encoded = arn.join("/").replace('+', "%2B");
+                let decoded = crate::proxy_event::percent_decode(&encoded);
+                v1::delete_domain_name_access_association(ctx, &decoded).await
+            })
         }
         (&Method::POST, ["domainnames", name, "basepathmappings"]) => {
-            let id = query_value(query, "domainNameId");
-            v1::create_base_path_mapping(ctx, name, id.as_deref(), body).await
+            (Some("CreateBasePathMapping"), {
+                let id = query_value(query, "domainNameId");
+                v1::create_base_path_mapping(ctx, name, id.as_deref(), body).await
+            })
         }
         (&Method::GET, ["domainnames", name, "basepathmappings"]) => {
-            let id = query_value(query, "domainNameId");
-            v1::get_base_path_mappings(ctx, name, id.as_deref()).await
+            (Some("GetBasePathMappings"), {
+                let id = query_value(query, "domainNameId");
+                v1::get_base_path_mappings(ctx, name, id.as_deref()).await
+            })
         }
         (&Method::GET, ["domainnames", name, "basepathmappings", base]) => {
-            let id = query_value(query, "domainNameId");
-            v1::get_base_path_mapping(ctx, name, id.as_deref(), base).await
+            (Some("GetBasePathMapping"), {
+                let id = query_value(query, "domainNameId");
+                v1::get_base_path_mapping(ctx, name, id.as_deref(), base).await
+            })
         }
         (&Method::PATCH, ["domainnames", name, "basepathmappings", base]) => {
-            let id = query_value(query, "domainNameId");
-            v1::update_base_path_mapping(ctx, name, id.as_deref(), base, body).await
+            (Some("UpdateBasePathMapping"), {
+                let id = query_value(query, "domainNameId");
+                v1::update_base_path_mapping(ctx, name, id.as_deref(), base, body).await
+            })
         }
         (&Method::DELETE, ["domainnames", name, "basepathmappings", base]) => {
-            let id = query_value(query, "domainNameId");
-            v1::delete_base_path_mapping(ctx, name, id.as_deref(), base).await
+            (Some("DeleteBasePathMapping"), {
+                let id = query_value(query, "domainNameId");
+                v1::delete_base_path_mapping(ctx, name, id.as_deref(), base).await
+            })
         }
-        _ => Err(ApiGwError::NotFound(
-            "Unknown API Gateway v1 operation".into(),
-        )),
+        _ => (
+            None,
+            Err(ApiGwError::NotFound(
+                "Unknown API Gateway v1 operation".into(),
+            )),
+        ),
     }
 }
 
@@ -486,92 +592,135 @@ async fn route_v2(
     segs: &[&str],
     ctx: &Ctx<'_>,
     body: &Value,
-) -> Result<(u16, Value), ApiGwError> {
+) -> (Option<&'static str>, Result<(u16, Value), ApiGwError>) {
     match (method, segs) {
-        (&Method::POST, ["v2", "apis"]) => v2::create_api(ctx, body).await,
-        (&Method::GET, ["v2", "apis"]) => v2::get_apis(ctx).await,
-        (&Method::GET, ["v2", "apis", id]) => v2::get_api(ctx, id).await,
-        (&Method::PATCH, ["v2", "apis", id]) => v2::update_api(ctx, id, body).await,
-        (&Method::DELETE, ["v2", "apis", id]) => v2::delete_api(ctx, id).await,
-        (&Method::POST, ["v2", "apis", id, "routes"]) => v2::create_route(ctx, id, body).await,
-        (&Method::GET, ["v2", "apis", id, "routes"]) => v2::get_routes(ctx, id).await,
-        (&Method::GET, ["v2", "apis", id, "routes", rid]) => v2::get_route(ctx, id, rid).await,
-        (&Method::PATCH, ["v2", "apis", id, "routes", rid]) => {
+        (&Method::POST, ["v2", "apis"]) => (Some("CreateApi"), v2::create_api(ctx, body).await),
+        (&Method::GET, ["v2", "apis"]) => (Some("GetApis"), v2::get_apis(ctx).await),
+        (&Method::GET, ["v2", "apis", id]) => (Some("GetApi"), v2::get_api(ctx, id).await),
+        (&Method::PATCH, ["v2", "apis", id]) => {
+            (Some("UpdateApi"), v2::update_api(ctx, id, body).await)
+        }
+        (&Method::DELETE, ["v2", "apis", id]) => (Some("DeleteApi"), v2::delete_api(ctx, id).await),
+        (&Method::POST, ["v2", "apis", id, "routes"]) => {
+            (Some("CreateRoute"), v2::create_route(ctx, id, body).await)
+        }
+        (&Method::GET, ["v2", "apis", id, "routes"]) => {
+            (Some("GetRoutes"), v2::get_routes(ctx, id).await)
+        }
+        (&Method::GET, ["v2", "apis", id, "routes", rid]) => {
+            (Some("GetRoute"), v2::get_route(ctx, id, rid).await)
+        }
+        (&Method::PATCH, ["v2", "apis", id, "routes", rid]) => (Some("UpdateRoute"), {
             v2::update_route(ctx, id, rid, body).await
-        }
-        (&Method::DELETE, ["v2", "apis", id, "routes", rid]) => {
+        }),
+        (&Method::DELETE, ["v2", "apis", id, "routes", rid]) => (Some("DeleteRoute"), {
             v2::delete_route(ctx, id, rid).await
-        }
-        (&Method::POST, ["v2", "apis", id, "integrations"]) => {
+        }),
+        (&Method::POST, ["v2", "apis", id, "integrations"]) => (Some("CreateIntegration"), {
             v2::create_integration(ctx, id, body).await
+        }),
+        (&Method::GET, ["v2", "apis", id, "integrations"]) => {
+            (Some("GetIntegrations"), v2::get_integrations(ctx, id).await)
         }
-        (&Method::GET, ["v2", "apis", id, "integrations"]) => v2::get_integrations(ctx, id).await,
-        (&Method::GET, ["v2", "apis", id, "integrations", iid]) => {
+        (&Method::GET, ["v2", "apis", id, "integrations", iid]) => (Some("GetIntegration"), {
             v2::get_integration(ctx, id, iid).await
-        }
-        (&Method::PATCH, ["v2", "apis", id, "integrations", iid]) => {
+        }),
+        (&Method::PATCH, ["v2", "apis", id, "integrations", iid]) => (Some("UpdateIntegration"), {
             v2::update_integration(ctx, id, iid, body).await
-        }
+        }),
         (&Method::DELETE, ["v2", "apis", id, "integrations", iid]) => {
-            v2::delete_integration(ctx, id, iid).await
+            (Some("DeleteIntegration"), {
+                v2::delete_integration(ctx, id, iid).await
+            })
         }
-        (&Method::POST, ["v2", "apis", id, "deployments"]) => {
+        (&Method::POST, ["v2", "apis", id, "deployments"]) => (Some("CreateDeployment"), {
             v2::create_deployment(ctx, id, body).await
+        }),
+        (&Method::GET, ["v2", "apis", id, "deployments"]) => {
+            (Some("GetDeployments"), v2::get_deployments(ctx, id).await)
         }
-        (&Method::GET, ["v2", "apis", id, "deployments"]) => v2::get_deployments(ctx, id).await,
-        (&Method::GET, ["v2", "apis", id, "deployments", did]) => {
+        (&Method::GET, ["v2", "apis", id, "deployments", did]) => (Some("GetDeployment"), {
             v2::get_deployment(ctx, id, did).await
-        }
-        (&Method::DELETE, ["v2", "apis", id, "deployments", did]) => {
+        }),
+        (&Method::DELETE, ["v2", "apis", id, "deployments", did]) => (Some("DeleteDeployment"), {
             v2::delete_deployment(ctx, id, did).await
+        }),
+        (&Method::POST, ["v2", "apis", id, "stages"]) => {
+            (Some("CreateStage"), v2::create_stage(ctx, id, body).await)
         }
-        (&Method::POST, ["v2", "apis", id, "stages"]) => v2::create_stage(ctx, id, body).await,
-        (&Method::GET, ["v2", "apis", id, "stages"]) => v2::get_stages(ctx, id).await,
-        (&Method::GET, ["v2", "apis", id, "stages", name]) => v2::get_stage(ctx, id, name).await,
-        (&Method::PATCH, ["v2", "apis", id, "stages", name]) => {
+        (&Method::GET, ["v2", "apis", id, "stages"]) => {
+            (Some("GetStages"), v2::get_stages(ctx, id).await)
+        }
+        (&Method::GET, ["v2", "apis", id, "stages", name]) => {
+            (Some("GetStage"), v2::get_stage(ctx, id, name).await)
+        }
+        (&Method::PATCH, ["v2", "apis", id, "stages", name]) => (Some("UpdateStage"), {
             v2::update_stage(ctx, id, name, body).await
-        }
-        (&Method::DELETE, ["v2", "apis", id, "stages", name]) => {
+        }),
+        (&Method::DELETE, ["v2", "apis", id, "stages", name]) => (Some("DeleteStage"), {
             v2::delete_stage(ctx, id, name).await
-        }
-        (&Method::POST, ["v2", "apis", id, "authorizers"]) => {
+        }),
+        (&Method::POST, ["v2", "apis", id, "authorizers"]) => (Some("CreateAuthorizer"), {
             v2::create_authorizer(ctx, id, body).await
+        }),
+        (&Method::GET, ["v2", "apis", id, "authorizers"]) => {
+            (Some("GetAuthorizers"), v2::get_authorizers(ctx, id).await)
         }
-        (&Method::GET, ["v2", "apis", id, "authorizers"]) => v2::get_authorizers(ctx, id).await,
-        (&Method::GET, ["v2", "apis", id, "authorizers", aid]) => {
+        (&Method::GET, ["v2", "apis", id, "authorizers", aid]) => (Some("GetAuthorizer"), {
             v2::get_authorizer(ctx, id, aid).await
-        }
-        (&Method::PATCH, ["v2", "apis", id, "authorizers", aid]) => {
+        }),
+        (&Method::PATCH, ["v2", "apis", id, "authorizers", aid]) => (Some("UpdateAuthorizer"), {
             v2::update_authorizer(ctx, id, aid, body).await
-        }
-        (&Method::DELETE, ["v2", "apis", id, "authorizers", aid]) => {
+        }),
+        (&Method::DELETE, ["v2", "apis", id, "authorizers", aid]) => (Some("DeleteAuthorizer"), {
             v2::delete_authorizer(ctx, id, aid).await
+        }),
+        (&Method::POST, ["v2", "domainnames"]) => (
+            Some("CreateDomainName"),
+            v2::create_domain_name(ctx, body).await,
+        ),
+        (&Method::GET, ["v2", "domainnames"]) => {
+            (Some("GetDomainNames"), v2::get_domain_names(ctx).await)
         }
-        (&Method::POST, ["v2", "domainnames"]) => v2::create_domain_name(ctx, body).await,
-        (&Method::GET, ["v2", "domainnames"]) => v2::get_domain_names(ctx).await,
-        (&Method::GET, ["v2", "domainnames", name]) => v2::get_domain_name(ctx, name).await,
-        (&Method::PATCH, ["v2", "domainnames", name]) => {
+        (&Method::GET, ["v2", "domainnames", name]) => {
+            (Some("GetDomainName"), v2::get_domain_name(ctx, name).await)
+        }
+        (&Method::PATCH, ["v2", "domainnames", name]) => (Some("UpdateDomainName"), {
             v2::update_domain_name(ctx, name, body).await
-        }
-        (&Method::DELETE, ["v2", "domainnames", name]) => v2::delete_domain_name(ctx, name).await,
+        }),
+        (&Method::DELETE, ["v2", "domainnames", name]) => (
+            Some("DeleteDomainName"),
+            v2::delete_domain_name(ctx, name).await,
+        ),
         (&Method::POST, ["v2", "domainnames", name, "apimappings"]) => {
-            v2::create_api_mapping(ctx, name, body).await
+            (Some("CreateApiMapping"), {
+                v2::create_api_mapping(ctx, name, body).await
+            })
         }
-        (&Method::GET, ["v2", "domainnames", name, "apimappings"]) => {
+        (&Method::GET, ["v2", "domainnames", name, "apimappings"]) => (Some("GetApiMappings"), {
             v2::get_api_mappings(ctx, name).await
-        }
+        }),
         (&Method::GET, ["v2", "domainnames", name, "apimappings", mid]) => {
-            v2::get_api_mapping(ctx, name, mid).await
+            (Some("GetApiMapping"), {
+                v2::get_api_mapping(ctx, name, mid).await
+            })
         }
         (&Method::PATCH, ["v2", "domainnames", name, "apimappings", mid]) => {
-            v2::update_api_mapping(ctx, name, mid, body).await
+            (Some("UpdateApiMapping"), {
+                v2::update_api_mapping(ctx, name, mid, body).await
+            })
         }
         (&Method::DELETE, ["v2", "domainnames", name, "apimappings", mid]) => {
-            v2::delete_api_mapping(ctx, name, mid).await
+            (Some("DeleteApiMapping"), {
+                v2::delete_api_mapping(ctx, name, mid).await
+            })
         }
-        _ => Err(ApiGwError::NotFound(
-            "Unknown API Gateway v2 operation".into(),
-        )),
+        _ => (
+            None,
+            Err(ApiGwError::NotFound(
+                "Unknown API Gateway v2 operation".into(),
+            )),
+        ),
     }
 }
 
@@ -857,7 +1006,8 @@ impl NativeHandler for ApiGwHandler {
         if domain_host_is_private(&self.store, &request.account_id, &request.region, &host).await
             == Some(true)
         {
-            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
+            return ApiGwError::Forbidden("Forbidden".into())
+                .into_response(&request.request_id, None);
         }
         let direct = host.to_ascii_lowercase().contains(".execute-api.");
         let mut custom_domain = None;
@@ -921,7 +1071,7 @@ impl ApiGwHandler {
                     || !ingress.secure_transport
                 {
                     return ApiGwError::Forbidden("Forbidden".into())
-                        .into_response(&request.request_id);
+                        .into_response(&request.request_id, None);
                 }
                 std::collections::BTreeMap::from([
                     (
@@ -957,10 +1107,12 @@ impl ApiGwHandler {
         let domain_kind =
             domain_host_is_private(&self.store, &request.account_id, &request.region, host).await;
         if domain_kind == Some(true) {
-            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
+            return ApiGwError::Forbidden("Forbidden".into())
+                .into_response(&request.request_id, None);
         }
         if private_ingress.is_some() && management_target(host, request.uri.path()).is_some() {
-            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
+            return ApiGwError::Forbidden("Forbidden".into())
+                .into_response(&request.request_id, None);
         }
         if let Some((stage, connection_id, api_id)) = management_target(host, request.uri.path()) {
             let decoded_id = crate::proxy_event::percent_decode(connection_id);
@@ -972,7 +1124,7 @@ impl ApiGwHandler {
                 })
             {
                 return ApiGwError::BadRequest("Invalid connection ID".into())
-                    .into_response(&request.request_id);
+                    .into_response(&request.request_id, None);
             }
             let connection_id = decoded_id.as_str();
             let resource = format!(
@@ -982,7 +1134,7 @@ impl ApiGwHandler {
             if let Err(error) =
                 authorize_connection_management(&self.registry, &request, resource, &policy_context)
             {
-                return error.into_response(&request.request_id);
+                return error.into_response(&request.request_id, None);
             }
             if !connection_belongs_to_endpoint(
                 &self.store,
@@ -995,7 +1147,7 @@ impl ApiGwHandler {
             .await
             {
                 return ApiGwError::Gone(format!("The connection with id {connection_id} is gone"))
-                    .into_response(&request.request_id);
+                    .into_response(&request.request_id, None);
             }
             let empty_success = request.method == Method::POST;
             let result = match request.method {
@@ -1037,7 +1189,7 @@ impl ApiGwHandler {
                     .body(Body::empty())
                     .expect("management response is valid"),
                 Ok((status, value)) => json_response(status, value),
-                Err(error) => error.into_response(&request.request_id),
+                Err(error) => error.into_response(&request.request_id, None),
             };
         }
         let path_invoke = is_invoke_path(request.uri.path());
@@ -1056,7 +1208,8 @@ impl ApiGwHandler {
                 .await
             };
         if domain_kind == Some(false) && custom_target.is_none() {
-            return ApiGwError::NotFound("Not Found".into()).into_response(&request.request_id);
+            return ApiGwError::NotFound("Not Found".into())
+                .into_response(&request.request_id, None);
         }
         if execute_host || path_invoke || custom_target.is_some() {
             let waf = match self.waf.read() {
@@ -1065,14 +1218,14 @@ impl ApiGwHandler {
                         Some(evaluator) => Some(evaluator),
                         None => {
                             return ApiGwError::Internal("WAF evaluator unavailable".into())
-                                .into_response(&request.request_id)
+                                .into_response(&request.request_id, None)
                         }
                     },
                     None => None,
                 },
                 Err(_) => {
                     return ApiGwError::Internal("WAF evaluator unavailable".into())
-                        .into_response(&request.request_id)
+                        .into_response(&request.request_id, None)
                 }
             };
             let (invoke_host, invoke_uri) = custom_target
@@ -1109,15 +1262,16 @@ impl ApiGwHandler {
         }
 
         if private_ingress.is_some() {
-            return ApiGwError::Forbidden("Forbidden".into()).into_response(&request.request_id);
+            return ApiGwError::Forbidden("Forbidden".into())
+                .into_response(&request.request_id, None);
         }
         let path = match control_stage_path(request.uri.path()) {
             Ok(path) => path,
-            Err(error) => return error.into_response(&request.request_id),
+            Err(error) => return error.into_response(&request.request_id, None),
         };
         if path.starts_with("/tags/") && path.contains("//") {
             return ApiGwError::BadRequest("Invalid tagging resource path".into())
-                .into_response(&request.request_id);
+                .into_response(&request.request_id, None);
         }
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let body: Value = if request.body.is_empty() {
@@ -1127,12 +1281,12 @@ impl ApiGwHandler {
                 Ok(v) => v,
                 Err(e) => {
                     return ApiGwError::BadRequest(format!("invalid JSON body: {e}"))
-                        .into_response(&request.request_id)
+                        .into_response(&request.request_id, None)
                 }
             }
         };
         if let Err(error) = self.authorize_roles(&request, &segs, &body) {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, None);
         }
         {
             let resource = format!("arn:aws:apigateway:{}::{}", request.region, path);
@@ -1148,7 +1302,7 @@ impl ApiGwHandler {
                 return ApiGwError::Forbidden(
                     "Not authorized to access API Gateway resources".into(),
                 )
-                .into_response(&request.request_id);
+                .into_response(&request.request_id, None);
             }
         }
         let changes_policy = request.method == Method::PATCH
@@ -1173,7 +1327,7 @@ impl ApiGwHandler {
             .is_err()
         {
             return ApiGwError::Forbidden("Not authorized to update REST API policy".into())
-                .into_response(&request.request_id);
+                .into_response(&request.request_id, None);
         }
         let write = !matches!(request.method, Method::GET | Method::HEAD | Method::OPTIONS);
         let _write = if write {
@@ -1203,7 +1357,7 @@ impl ApiGwHandler {
         let domain_transaction = if staged.is_some() {
             match self.domains.transaction() {
                 Ok(transaction) => Some(transaction),
-                Err(error) => return error.into_response(&request.request_id),
+                Err(error) => return error.into_response(&request.request_id, None),
             }
         } else {
             None
@@ -1220,10 +1374,10 @@ impl ApiGwHandler {
                 .map(|transaction| &transaction.staged)
                 .unwrap_or(&self.domains),
         };
-        match self
+        let (operation, result) = self
             .route(&request.method, &segs, request.uri.query(), &ctx, &body)
-            .await
-        {
+            .await;
+        match result {
             Ok((status, value)) => {
                 if let (Some(staged), Some(persistence)) = (staged, &self.persistence) {
                     let snapshot = staged.into_scope_snapshot().await;
@@ -1246,17 +1400,17 @@ impl ApiGwHandler {
                         return ApiGwError::Internal(
                             "API Gateway configuration could not be committed".into(),
                         )
-                        .into_response(&request.request_id);
+                        .into_response(&request.request_id, operation);
                     }
                     if let Some(transaction) = domain_transaction {
                         if let Err(error) = transaction.commit() {
-                            return error.into_response(&request.request_id);
+                            return error.into_response(&request.request_id, operation);
                         }
                     }
                 }
                 json_response(status, value)
             }
-            Err(err) => err.into_response(&request.request_id),
+            Err(err) => err.into_response(&request.request_id, operation),
         }
     }
 }

@@ -214,7 +214,7 @@ proptest! {
         };
         let expected_code = error.code();
         let expected_status = error.http_status();
-        let response = error.into_response("property-request");
+        let response = error.into_response("property-request", None);
         prop_assert_eq!(response.status().as_u16(), expected_status);
         prop_assert_eq!(response.headers()["x-amzn-errortype"].to_str().unwrap(), expected_code);
         let body = runtime().block_on(axum::body::to_bytes(response.into_body(), usize::MAX)).unwrap();
