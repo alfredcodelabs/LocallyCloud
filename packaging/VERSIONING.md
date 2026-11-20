@@ -49,6 +49,25 @@ startup time and memory in `report.json`; it does not certify OCI or other datab
 SBOMs describe Rust dependencies. Native-library coverage and VM/OCI checks remain separate.
 Dependency advisories block publication; review applicability before adding exceptions.
 
+## Unreleased
+
+### SES email capture and delivery
+
+- Native SES v2 identity management and Simple text/HTML sending, plus selected
+  classic Query operations. Capture is the default; Resend delivery is opt-in.
+- Encrypted, persistent messages with bounded delivery retries and stable provider
+  idempotency keys. Send success acknowledges local acceptance, not inbox delivery.
+- CloudFormation `AWS::SES::EmailIdentity` and Cognito `DEVELOPER` sign-up
+  confirmation email through the same native dispatcher.
+
+Identities start pending unless local verification simulation is explicitly enabled.
+Raw MIME, attachments, templates, configuration sets and delivery-event parity
+remain unsupported. See [SES coverage and examples](../docs/SES.md) and the
+[configuration reference](../docs/SETUP.md#ses-configuration).
+
+Before publishing, complete the [release checks](#local-release-checks) and the
+publication gates below.
+
 ## 0.1.2 release
 
 Tag: `v0.1.2`; packaging revision: 1. Adds AppImage packaging for x86_64 and

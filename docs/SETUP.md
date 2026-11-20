@@ -237,6 +237,7 @@ continue to use the environment variables below.
 | `apigateway` | `authorizer_cache_capacity` (default 1024, range 1–65536), `websocket_outbound_channel_capacity` (32, range 1–256), `websocket_outbound_history_capacity` (64, range 1–1024) |
 | `apigateway` | `http_local_origins`: exact HTTP(S) origins allowed to reach host/private backends; default `[]` |
 | `state` | `path`: absolute SQLite path, shared by the server and offline S3/DynamoDB migrations |
+| `ses` | Delivery provider, local verification simulation and worker/queue budgets; see [SES configuration](#ses-configuration) |
 
 HTTP integrations can reach public destinations. Host addresses, loopback, private
 networks and shared address space require an exact origin in `http_local_origins`,
@@ -435,3 +436,32 @@ file may also have `-wal` and `-shm` sidecars. An EC2 root filesystem supplied t
 
 Remove only dedicated LocallyCloud files and profile entries. Keep shared host tools,
 other AWS profiles, and any master key needed to reuse encrypted state.
+
+## SES configuration
+
+The native [SES sending milestone](SES.md) uses the same startup configuration and
+secret-input rules described above. Its section in the existing JSON file is:
+
+```json
+{
+  "ses": {
+    "provider": "capture",
+    "auto_verify_identities": false
+  }
+}
+```
+
+| JSON field | Environment override | Default and supported values |
+| --- | --- | --- |
+| `ses.provider` | `LOCALLYCLOUD_SES_PROVIDER` | `capture`; `resend` enables delivery through the managed provider's HTTPS API |
+| `ses.auto_verify_identities` | `LOCALLYCLOUD_SES_AUTO_VERIFY_IDENTITIES` | `false`; explicitly set `true` to simulate verification completion for new create/verify calls in local development |
+| `ses.request_timeout_secs` | `LOCALLYCLOUD_SES_REQUEST_TIMEOUT_SECS` | `30`; 1–300 seconds |
+| `ses.max_concurrency` | `LOCALLYCLOUD_SES_MAX_CONCURRENCY` | `2`; 1–16 active delivery workers |
+| `ses.max_pending_messages` | `LOCALLYCLOUD_SES_MAX_PENDING_MESSAGES` | `1000`; 1–100000 messages awaiting delivery or resolution |
+| `ses.max_pending_bytes` | `LOCALLYCLOUD_SES_MAX_PENDING_BYTES` | `67108864`; 1024–1073741824 encrypted pending bytes |
+| Not accepted in JSON | `LOCALLYCLOUD_SES_PROVIDER_API_KEY` | Unset; required when selecting `resend`, supplied as a secret environment input |
+
+An invalid or empty explicit override fails startup. Resend without a key does not
+fall back to capture. `api_key` and `credential_ref` are not supported JSON fields;
+credential references and UI key entry await the shared administrative secret store.
+Changes take effect after restart. Capture mode sends no real email.

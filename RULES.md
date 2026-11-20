@@ -1,6 +1,8 @@
 # Task delivery and human review
 
-1. Complete the requested change and run the relevant checks defined in `AGENTS.md`.
+1. Read [.agents/rules/code.md](.agents/rules/code.md) before starting. Complete the requested
+   change and run the relevant checks defined in `AGENTS.md`. Before delivery, review the diff
+   against the code rules again (the `code-rules` slice of `whitebox-review` covers them).
    Report failed or unexecuted checks explicitly; do not present partial validation as complete.
 2. Review the diff and stage only the task's changes for human review. Preserve unrelated
    changes and existing staging; use individual hunks when a file contains unrelated edits.

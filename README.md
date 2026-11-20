@@ -108,10 +108,17 @@ One local endpoint for your AWS workflows.
 
 | ⚡ Compute | 📦 Storage & data | 🔀 Events & workflows |
 | --- | --- | --- |
-| Lambda · ECS/Fargate · EC2 | S3 · DynamoDB · RDS | SQS · SNS · EventBridge |
+| Lambda · ECS/Fargate · EC2 | S3 · DynamoDB · RDS | SQS · SNS · SES · EventBridge |
 | ECR | Kinesis · Firehose | Step Functions |
 
 **[Explore all services and compatibility →](docs/SERVICES.md)**
+
+### Email with SES
+
+Test SES email workflows with encrypted local capture, or opt into delivery through
+Resend. Native SES supports basic identity management and Simple text/HTML sends
+through SES v2 and selected classic operations. See the [SES guide](docs/SES.md)
+for setup, verification simulation, supported integrations and limits.
 
 ## Configuration
 
@@ -122,6 +129,7 @@ and the [settings reference](docs/SETUP.md#configuration).
 
 - [Setup and configuration](docs/SETUP.md): installation, AWS profiles, variables and uninstallation.
 - [Lambda runtimes](docs/LAMBDA.md): install, update, rollback and shared memory budget.
+- [SES email](docs/SES.md): local capture, optional Resend delivery and supported AWS operations.
 - [Threat modeling](docs/THREAT_MODELING.md): OWASP threat models generated from your deployed stacks, with an agent companion.
 - [Available services](docs/SERVICES.md): compatibility, persistence and principal limits.
 - [FAQ](docs/FAQ.md): usage and troubleshooting.

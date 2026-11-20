@@ -1,6 +1,6 @@
 # Available services
 
-[← README](../README.md) · [Setup](SETUP.md) · [Lambda](LAMBDA.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
+[← README](../README.md) · [Setup](SETUP.md) · [Lambda](LAMBDA.md) · [SES](SES.md) · [Threat modeling](THREAT_MODELING.md) · [Platforms](PLATFORMS.md) · [Throttling](THROTTLING.md) · [FAQ](FAQ.md)
 
 [📦 Service catalog](#available-services) · [🔌 Compatibility](#tool-compatibility) · [⚡ Compute limits](#compute-and-networking-limits) · [💾 Persistence](#persistence-and-limits)
 
@@ -10,7 +10,7 @@
 
 | Area | Services and APIs |
 | --- | --- |
-| 📦 Storage and messaging | S3, DynamoDB, DynamoDB Streams, SQS, SNS |
+| 📦 Storage and messaging | S3, DynamoDB, DynamoDB Streams, SQS, SNS, SES |
 | ⚡ Compute and containers | Lambda, EC2/VPC, ECS/Fargate, ECR |
 | 🌐 Networking and delivery | API Gateway REST and v2, Elastic Load Balancing v2, Route 53, CloudFront |
 | 🔀 Events and workflows | EventBridge Events, Scheduler, Pipes, and Schemas; Step Functions |
@@ -257,3 +257,14 @@ Regional failover is manual. Local load results reflect your workstation rather 
 AWS scale, quotas or performance. See [throttling and backpressure](THROTTLING.md)
 for supported simulations and gaps. Use test data; LocallyCloud provides no AWS security,
 availability or durability guarantees.
+
+## SES email
+
+SES has a partial native sending implementation with encrypted local capture and
+optional delivery through Resend's HTTPS API. It supports basic identity management
+and Simple text/HTML sends through SES v2 plus a small Query-compatible SES classic
+surface. Identities start pending; an explicit local test setting simulates verification
+completion without real AWS DNS/email checks.
+It does not implement raw MIME, attachments, templates, configuration sets, quotas
+or delivery-event parity. See [SES coverage and delivery semantics](SES.md) and
+[configuration](SETUP.md#ses-configuration).

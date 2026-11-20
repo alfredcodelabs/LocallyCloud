@@ -309,6 +309,9 @@ routing name never implies runtime support.
 
 ## Code style
 
+- Read [.agents/rules/code.md](.agents/rules/code.md) before starting a code task, and
+  check the diff against it again before delivery (`whitebox-review` runs it as the
+  `code-rules` slice).
 - Write all repository documentation in English. Exception: agent skills under
   `.agents/skills/` may be written in Spanish.
 - Constructor injection / explicit wiring; avoid hidden globals.
