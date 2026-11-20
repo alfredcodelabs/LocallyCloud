@@ -401,7 +401,7 @@ mod tests {
     use super::super::{Request, Worker, WorkerBudget, WorkerPool, MAX_WORKERS, REQUEST_TIMEOUT};
     use super::*;
     use axum::body::Bytes;
-    use locallycloud_core::integration::identity::PRINCIPAL_HEADER;
+    use locallycloud_core::integration::identity::IdentityPropagator;
     use locallycloud_core::integration::InternalDispatcher;
     use locallycloud_core::proxy::{LegacyHealth, ProxyConfig};
     use locallycloud_core::registry::ServiceName;
@@ -422,11 +422,12 @@ mod tests {
                 "x-locallycloud-verified-internal-scope",
                 http::HeaderValue::from_static("1"),
             );
-            headers.insert(
-                PRINCIPAL_HEADER,
-                format!("arn:aws:iam::{ACCOUNT}:role/{role}/probe")
-                    .parse()
-                    .unwrap(),
+            IdentityPropagator::attach(
+                &mut headers,
+                &CallerIdentity::AssumedRole {
+                    role_arn: format!("arn:aws:iam::{ACCOUNT}:role/{role}"),
+                    session_name: "probe".into(),
+                },
             );
         }
         ServiceRequest {
@@ -438,6 +439,19 @@ mod tests {
             region: REGION.into(),
             request_id: uuid::Uuid::new_v4().to_string(),
         }
+    }
+
+    #[test]
+    fn worker_requests_preserve_delegated_role_identity() {
+        assert_eq!(trusted_role(&request(json!({}), None)), None);
+        let request = request(json!({}), Some("table-reader"));
+        assert_eq!(
+            trusted_role(&request),
+            Some(CallerIdentity::AssumedRole {
+                role_arn: format!("arn:aws:iam::{ACCOUNT}:role/table-reader"),
+                session_name: "probe".into(),
+            })
+        );
     }
 
     async fn native(
