@@ -1343,6 +1343,9 @@ impl Drop for LambdaHandler {
     }
 }
 
+/// API operation name of `POST /2015-03-31/functions/{name}/invocations`.
+const INVOKE_OPERATION: &str = "Invoke";
+
 #[async_trait]
 impl NativeHandler for LambdaHandler {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
@@ -1352,19 +1355,26 @@ impl NativeHandler for LambdaHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
+        let segments: Vec<&str> = request.uri.path().trim_matches('/').split('/').collect();
+        let route = authorization::route_action(
+            &segments,
+            request.method.as_str(),
+            request.uri.query().unwrap_or(""),
+        );
+        let operation = route.as_ref().map(authorization::RouteAction::operation);
         if let Err(error) = validate_function_path(&request) {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, operation);
         }
         if let Err(error) = authorization::check(self, &request) {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, operation);
         }
         // The data plane (invoke) is async and returns a raw payload, not a JSON envelope.
-        if is_invoke_path(&request) {
+        if operation == Some(INVOKE_OPERATION) {
             return self.invoke(&request).await;
         }
         match self.route_durable(&request).await {
             Ok((status, body)) => json_response(status, body),
-            Err(err) => err.into_response(&request.request_id),
+            Err(err) => err.into_response(&request.request_id, operation),
         }
     }
 }
@@ -1382,19 +1392,6 @@ fn validate_function_path(request: &ServiceRequest) -> Result<(), LambdaError> {
         &percent_decode_path(reference),
         &request.region,
         &request.account_id,
-    )
-}
-
-/// Whether the request targets `POST /2015-03-31/functions/{name}/invocations`.
-fn is_invoke_path(req: &ServiceRequest) -> bool {
-    if req.method != Method::POST {
-        return false;
-    }
-    let path = req.uri.path().trim_matches('/');
-    let segments: Vec<&str> = path.split('/').collect();
-    matches!(
-        segments.as_slice(),
-        ["2015-03-31", "functions", _, "invocations"]
     )
 }
 
@@ -1439,26 +1436,26 @@ impl LambdaHandler {
             Some(e) => e.clone(),
             None => {
                 return LambdaError::NotImplemented(EXECUTION_UNAVAILABLE.into())
-                    .into_response(&req.request_id)
+                    .into_response(&req.request_id, Some(INVOKE_OPERATION))
             }
         };
 
         let (region, account) = (req.region.as_str(), req.account_id.as_str());
         let name = match resolve_function_name(&name_ref, region) {
             Ok(n) => n,
-            Err(e) => return e.into_response(&req.request_id),
+            Err(e) => return e.into_response(&req.request_id, Some(INVOKE_OPERATION)),
         };
         let reference = match crate::event_invoke::reference(
             &name_ref,
             query_value(req.uri.query().unwrap_or(""), "Qualifier").as_deref(),
         ) {
             Ok(reference) => reference,
-            Err(error) => return error.into_response(&req.request_id),
+            Err(error) => return error.into_response(&req.request_id, Some(INVOKE_OPERATION)),
         };
         let qualifier = reference.rsplit(':').next().map(str::to_owned);
         let func = match self.resolve_invoke_target(account, region, &name, qualifier.as_deref()) {
             Ok(f) => f,
-            Err(e) => return e.into_response(&req.request_id),
+            Err(e) => return e.into_response(&req.request_id, Some(INVOKE_OPERATION)),
         };
         if is_self_log_subscription(
             req,
@@ -1467,7 +1464,7 @@ impl LambdaHandler {
             return LambdaError::InvalidParameterValue(
                 "A Lambda function cannot receive a subscription from its own log group".into(),
             )
-            .into_response(&req.request_id);
+            .into_response(&req.request_id, Some(INVOKE_OPERATION));
         }
         // A function must be Active to be invoked (task 14 state gate).
         if func.state != "Active" {
@@ -1475,7 +1472,7 @@ impl LambdaHandler {
                 "The function {name} is currently in the {} state and cannot be invoked",
                 func.state
             ))
-            .into_response(&req.request_id);
+            .into_response(&req.request_id, Some(INVOKE_OPERATION));
         }
 
         let invocation_type = req
@@ -1494,10 +1491,10 @@ impl LambdaHandler {
             "DryRun" => empty_status(204),
             "Event" => {
                 if let Err(error) = validate_async_payload(&req.body) {
-                    return error.into_response(&req.request_id);
+                    return error.into_response(&req.request_id, Some(INVOKE_OPERATION));
                 }
                 if let Err(error) = executor.validate_async_capacity(account, region, &func) {
-                    return error.into_response(&req.request_id);
+                    return error.into_response(&req.request_id, Some(INVOKE_OPERATION));
                 }
                 let payload = invoke_payload(&req.body);
                 let mut cfg = self.async_config(
@@ -1527,7 +1524,7 @@ impl LambdaHandler {
                     return LambdaError::RequestTooLarge(
                         "invocation payload exceeds the 6 MB limit".into(),
                     )
-                    .into_response(&req.request_id);
+                    .into_response(&req.request_id, Some(INVOKE_OPERATION));
                 }
                 let payload = invoke_payload(&req.body);
                 let trace = req
@@ -1539,13 +1536,13 @@ impl LambdaHandler {
                     .await
                 {
                     Ok(result) => invoke_response(&func, &req.request_id, result, tail_logs),
-                    Err(e) => e.into_response(&req.request_id),
+                    Err(e) => e.into_response(&req.request_id, Some(INVOKE_OPERATION)),
                 }
             }
             other => LambdaError::InvalidParameterValue(format!(
                 "invalid X-Amz-Invocation-Type: {other}"
             ))
-            .into_response(&req.request_id),
+            .into_response(&req.request_id, Some(INVOKE_OPERATION)),
         }
     }
 
@@ -2342,7 +2339,7 @@ mod tests {
             assert!(validate_async_payload(&payload(size)).is_ok(), "{size}");
         }
         let error = validate_async_payload(&payload(1024 * 1024 + 1)).unwrap_err();
-        let response = error.into_response("payload-limit-request");
+        let response = error.into_response("payload-limit-request", None);
         assert_eq!(response.status(), 413);
         assert_eq!(
             response.headers()["x-amzn-errortype"],

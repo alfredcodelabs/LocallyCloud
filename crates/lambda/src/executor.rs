@@ -5142,7 +5142,7 @@ mod tests {
         assert!(
             matches!(&error, LambdaError::LocalCapacityExceeded(message) if message.contains("LOCALLYCLOUD_COMPUTE_MEMORY_BUDGET_MB"))
         );
-        let response = error.into_response("capacity-test");
+        let response = error.into_response("capacity-test", None);
         assert_eq!(response.status(), 429);
         assert_eq!(response.headers()["retry-after"], "1");
         assert_eq!(

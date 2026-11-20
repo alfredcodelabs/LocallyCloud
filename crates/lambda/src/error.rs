@@ -69,10 +69,14 @@ impl LambdaError {
     }
 
     /// Render to an Axum response in the REST-JSON shape.
-    pub fn into_response(self, request_id: &str) -> axum::response::Response {
+    pub fn into_response(
+        self,
+        request_id: &str,
+        operation: Option<&str>,
+    ) -> axum::response::Response {
         locallycloud_core::observability::log_service_error(
             "lambda",
-            None,
+            operation,
             request_id,
             self.code(),
             self.http_status(),
@@ -103,7 +107,7 @@ mod tests {
     async fn internal_failures_use_lambda_service_exception_and_request_correlation() {
         let response =
             LambdaError::InternalError("The Lambda service encountered an internal error".into())
-                .into_response("owned-request");
+                .into_response("owned-request", None);
         assert_eq!(response.status(), 500);
         assert_eq!(response.headers()["x-amzn-errortype"], "ServiceException");
         assert_eq!(response.headers()["x-amzn-requestid"], "owned-request");

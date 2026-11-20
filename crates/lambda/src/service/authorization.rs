@@ -93,146 +93,25 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
     };
     let mut context =
         locallycloud_core::integration::request_context::verified_request_context(req);
-    let (action, resource): (&str, String) = match (segments.as_slice(), method) {
-        (["2016-08-19", "account-settings"], "GET") => ("GetAccountSettings", "*".into()),
-        (["2015-03-31", "functions"], "POST") => {
-            let body = parse_json(&req.body)?;
-            let name = body
-                .get("FunctionName")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    LambdaError::InvalidParameterValue("FunctionName is required".into())
-                })?;
-            ("CreateFunction", function(name)?)
+    let Some(RouteAction { action, target }) =
+        route_action(&segments, method, req.uri.query().unwrap_or(""))
+    else {
+        return Ok(()); // Unsupported routes have no service effect.
+    };
+    let resource = match target {
+        Target::Any => "*".to_string(),
+        Target::Function(name) => function(name)?,
+        Target::QualifiedFunction(name) => event_function(name)?,
+        Target::Layer(name) => layer(name),
+        Target::LayerVersion(name, version) => format!("{}:{version}", layer(name)),
+        Target::Mapping(uuid) => mapping_arn(req, uuid),
+        Target::Arn(arn) => percent_decode_path(arn),
+        Target::FunctionInBody => function(body_function_name(req)?.as_str())?,
+        Target::MappingFunctionInBody => {
+            let function_arn = function(body_function_name(req)?.as_str())?;
+            context.insert("lambda:FunctionArn".into(), vec![function_arn]);
+            "*".to_string()
         }
-        (["2015-03-31", "functions"], "GET") => ("ListFunctions", "*".into()),
-        (["2015-03-31", "functions", name], "GET") => ("GetFunction", function(name)?),
-        (["2015-03-31", "functions", name], "DELETE") => ("DeleteFunction", function(name)?),
-        (["2015-03-31", "functions", name, "invocations"], "POST") => {
-            ("InvokeFunction", event_function(name)?)
-        }
-        (["2015-03-31", "functions", name, "policy"], "POST") => {
-            ("AddPermission", event_function(name)?)
-        }
-        (["2015-03-31", "functions", name, "policy"], "GET") => {
-            ("GetPolicy", event_function(name)?)
-        }
-        (["2015-03-31", "functions", name, "policy", _], "DELETE") => {
-            ("RemovePermission", event_function(name)?)
-        }
-        (["2015-03-31", "functions", name, "configuration"], "GET") => {
-            ("GetFunctionConfiguration", function(name)?)
-        }
-        (["2015-03-31", "functions", name, "configuration"], "PUT") => {
-            ("UpdateFunctionConfiguration", function(name)?)
-        }
-        (["2015-03-31", "functions", name, "code"], "PUT") => {
-            ("UpdateFunctionCode", function(name)?)
-        }
-        (["2015-03-31", "functions", name, "versions"], "POST") => {
-            ("PublishVersion", function(name)?)
-        }
-        (["2015-03-31", "functions", name, "versions"], "GET") => {
-            ("ListVersionsByFunction", function(name)?)
-        }
-        (["2015-03-31", "functions", name, "aliases"], "POST") => ("CreateAlias", function(name)?),
-        (["2015-03-31", "functions", name, "aliases"], "GET") => ("ListAliases", function(name)?),
-        (["2015-03-31", "functions", name, "aliases", _], "GET") => ("GetAlias", function(name)?),
-        (["2015-03-31", "functions", name, "aliases", _], "PUT") => {
-            ("UpdateAlias", function(name)?)
-        }
-        (["2015-03-31", "functions", name, "aliases", _], "DELETE") => {
-            ("DeleteAlias", function(name)?)
-        }
-        (["2020-06-30", "functions", name, "code-signing-config"], "GET") => {
-            ("GetFunctionCodeSigningConfig", function(name)?)
-        }
-        (["2017-10-31", "functions", name, "concurrency"], "PUT") => {
-            ("PutFunctionConcurrency", function(name)?)
-        }
-        (["2019-09-30", "functions", name, "concurrency"], "GET") => {
-            ("GetFunctionConcurrency", function(name)?)
-        }
-        (["2017-10-31", "functions", name, "concurrency"], "DELETE") => {
-            ("DeleteFunctionConcurrency", function(name)?)
-        }
-        (["2021-10-31", "functions", name, "url"], "POST") => {
-            ("CreateFunctionUrlConfig", function(name)?)
-        }
-        (["2021-10-31", "functions", name, "url"], "GET") => {
-            ("GetFunctionUrlConfig", function(name)?)
-        }
-        (["2021-10-31", "functions", name, "url"], "PUT") => {
-            ("UpdateFunctionUrlConfig", function(name)?)
-        }
-        (["2021-10-31", "functions", name, "url"], "DELETE") => {
-            ("DeleteFunctionUrlConfig", function(name)?)
-        }
-        (["2019-09-25", "functions", name, "event-invoke-config"], "PUT") => {
-            ("PutFunctionEventInvokeConfig", event_function(name)?)
-        }
-        (["2019-09-25", "functions", name, "event-invoke-config"], "POST") => {
-            ("UpdateFunctionEventInvokeConfig", event_function(name)?)
-        }
-        (["2019-09-25", "functions", name, "event-invoke-config"], "GET") => {
-            ("GetFunctionEventInvokeConfig", event_function(name)?)
-        }
-        (["2019-09-25", "functions", name, "event-invoke-config"], "DELETE") => {
-            ("DeleteFunctionEventInvokeConfig", event_function(name)?)
-        }
-        (["2019-09-25", "functions", name, "event-invoke-config", "list"], "GET") => {
-            ("ListFunctionEventInvokeConfigs", function(name)?)
-        }
-        (["2018-10-31", "layers"], "GET") => ("ListLayers", "*".into()),
-        (["2018-10-31", "layers", name, "versions"], "POST") => {
-            ("PublishLayerVersion", layer(name))
-        }
-        (["2018-10-31", "layers", name, "versions"], "GET") => ("ListLayerVersions", layer(name)),
-        (["2018-10-31", "layers", name, "versions", version], "GET") => {
-            ("GetLayerVersion", format!("{}:{version}", layer(name)))
-        }
-        (["2018-10-31", "layers", name, "versions", version], "DELETE") => {
-            ("DeleteLayerVersion", format!("{}:{version}", layer(name)))
-        }
-        (["2019-09-30", "functions", name, "provisioned-concurrency"], "PUT") => {
-            ("PutProvisionedConcurrencyConfig", function(name)?)
-        }
-        (["2019-09-30", "functions", name, "provisioned-concurrency"], "GET")
-            if query_value(req.uri.query().unwrap_or(""), "List").is_some() =>
-        {
-            ("ListProvisionedConcurrencyConfigs", function(name)?)
-        }
-        (["2019-09-30", "functions", name, "provisioned-concurrency"], "GET") => {
-            ("GetProvisionedConcurrencyConfig", function(name)?)
-        }
-        (["2019-09-30", "functions", name, "provisioned-concurrency"], "DELETE") => {
-            ("DeleteProvisionedConcurrencyConfig", function(name)?)
-        }
-        (["2015-03-31", "event-source-mappings"], "POST") => {
-            let body = parse_json(&req.body)?;
-            let name = body
-                .get("FunctionName")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    LambdaError::InvalidParameterValue("FunctionName is required".into())
-                })?;
-            context.insert("lambda:FunctionArn".into(), vec![function(name)?]);
-            ("CreateEventSourceMapping", "*".into())
-        }
-        (["2015-03-31", "event-source-mappings"], "GET") => ("ListEventSourceMappings", "*".into()),
-        (["2015-03-31", "event-source-mappings", uuid], "GET") => {
-            ("GetEventSourceMapping", mapping_arn(req, uuid))
-        }
-        (["2015-03-31", "event-source-mappings", uuid], "PUT") => {
-            ("UpdateEventSourceMapping", mapping_arn(req, uuid))
-        }
-        (["2015-03-31", "event-source-mappings", uuid], "DELETE") => {
-            ("DeleteEventSourceMapping", mapping_arn(req, uuid))
-        }
-        (["2017-03-31", "tags", arn], "GET") => ("ListTags", percent_decode_path(arn)),
-        (["2017-03-31", "tags", arn], "POST") => ("TagResource", percent_decode_path(arn)),
-        (["2017-03-31", "tags", arn], "DELETE") => ("UntagResource", percent_decode_path(arn)),
-        _ => return Ok(()), // Unsupported routes have no service effect.
     };
     let authorize = |action: &str, resource: String, context: BTreeMap<String, Vec<String>>| {
         evaluator
@@ -387,6 +266,190 @@ pub(super) fn check(handler: &LambdaHandler, req: &ServiceRequest) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// The resource a Lambda REST route names, resolved to an ARN by the IAM gate.
+pub(super) enum Target<'a> {
+    Any,
+    Function(&'a str),
+    QualifiedFunction(&'a str),
+    Layer(&'a str),
+    LayerVersion(&'a str, &'a str),
+    Mapping(&'a str),
+    Arn(&'a str),
+    FunctionInBody,
+    MappingFunctionInBody,
+}
+
+/// The IAM action of a Lambda REST request and the resource it addresses.
+pub(super) struct RouteAction<'a> {
+    pub(super) action: &'static str,
+    pub(super) target: Target<'a>,
+}
+
+impl RouteAction<'_> {
+    /// The API operation name: the IAM action, except `Invoke` (`lambda:InvokeFunction`).
+    pub(super) fn operation(&self) -> &'static str {
+        match self.action {
+            "InvokeFunction" => "Invoke",
+            action => action,
+        }
+    }
+}
+
+/// The single Lambda REST route table: path segments and method to the IAM action.
+pub(super) fn route_action<'a>(
+    segments: &[&'a str],
+    method: &str,
+    query: &str,
+) -> Option<RouteAction<'a>> {
+    let (action, target) = match (segments, method) {
+        (["2016-08-19", "account-settings"], "GET") => ("GetAccountSettings", Target::Any),
+        (["2015-03-31", "functions"], "POST") => ("CreateFunction", Target::FunctionInBody),
+        (["2015-03-31", "functions"], "GET") => ("ListFunctions", Target::Any),
+        (["2015-03-31", "functions", name], "GET") => ("GetFunction", Target::Function(name)),
+        (["2015-03-31", "functions", name], "DELETE") => ("DeleteFunction", Target::Function(name)),
+        (["2015-03-31", "functions", name, "invocations"], "POST") => {
+            ("InvokeFunction", Target::QualifiedFunction(name))
+        }
+        (["2015-03-31", "functions", name, "policy"], "POST") => {
+            ("AddPermission", Target::QualifiedFunction(name))
+        }
+        (["2015-03-31", "functions", name, "policy"], "GET") => {
+            ("GetPolicy", Target::QualifiedFunction(name))
+        }
+        (["2015-03-31", "functions", name, "policy", _], "DELETE") => {
+            ("RemovePermission", Target::QualifiedFunction(name))
+        }
+        (["2015-03-31", "functions", name, "configuration"], "GET") => {
+            ("GetFunctionConfiguration", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "configuration"], "PUT") => {
+            ("UpdateFunctionConfiguration", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "code"], "PUT") => {
+            ("UpdateFunctionCode", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "versions"], "POST") => {
+            ("PublishVersion", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "versions"], "GET") => {
+            ("ListVersionsByFunction", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "aliases"], "POST") => {
+            ("CreateAlias", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "aliases"], "GET") => {
+            ("ListAliases", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "aliases", _], "GET") => {
+            ("GetAlias", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "aliases", _], "PUT") => {
+            ("UpdateAlias", Target::Function(name))
+        }
+        (["2015-03-31", "functions", name, "aliases", _], "DELETE") => {
+            ("DeleteAlias", Target::Function(name))
+        }
+        (["2020-06-30", "functions", name, "code-signing-config"], "GET") => {
+            ("GetFunctionCodeSigningConfig", Target::Function(name))
+        }
+        (["2017-10-31", "functions", name, "concurrency"], "PUT") => {
+            ("PutFunctionConcurrency", Target::Function(name))
+        }
+        (["2019-09-30", "functions", name, "concurrency"], "GET") => {
+            ("GetFunctionConcurrency", Target::Function(name))
+        }
+        (["2017-10-31", "functions", name, "concurrency"], "DELETE") => {
+            ("DeleteFunctionConcurrency", Target::Function(name))
+        }
+        (["2021-10-31", "functions", name, "url"], "POST") => {
+            ("CreateFunctionUrlConfig", Target::Function(name))
+        }
+        (["2021-10-31", "functions", name, "url"], "GET") => {
+            ("GetFunctionUrlConfig", Target::Function(name))
+        }
+        (["2021-10-31", "functions", name, "url"], "PUT") => {
+            ("UpdateFunctionUrlConfig", Target::Function(name))
+        }
+        (["2021-10-31", "functions", name, "url"], "DELETE") => {
+            ("DeleteFunctionUrlConfig", Target::Function(name))
+        }
+        (["2019-09-25", "functions", name, "event-invoke-config"], "PUT") => (
+            "PutFunctionEventInvokeConfig",
+            Target::QualifiedFunction(name),
+        ),
+        (["2019-09-25", "functions", name, "event-invoke-config"], "POST") => (
+            "UpdateFunctionEventInvokeConfig",
+            Target::QualifiedFunction(name),
+        ),
+        (["2019-09-25", "functions", name, "event-invoke-config"], "GET") => (
+            "GetFunctionEventInvokeConfig",
+            Target::QualifiedFunction(name),
+        ),
+        (["2019-09-25", "functions", name, "event-invoke-config"], "DELETE") => (
+            "DeleteFunctionEventInvokeConfig",
+            Target::QualifiedFunction(name),
+        ),
+        (["2019-09-25", "functions", name, "event-invoke-config", "list"], "GET") => {
+            ("ListFunctionEventInvokeConfigs", Target::Function(name))
+        }
+        (["2018-10-31", "layers"], "GET") => ("ListLayers", Target::Any),
+        (["2018-10-31", "layers", name, "versions"], "POST") => {
+            ("PublishLayerVersion", Target::Layer(name))
+        }
+        (["2018-10-31", "layers", name, "versions"], "GET") => {
+            ("ListLayerVersions", Target::Layer(name))
+        }
+        (["2018-10-31", "layers", name, "versions", version], "GET") => {
+            ("GetLayerVersion", Target::LayerVersion(name, version))
+        }
+        (["2018-10-31", "layers", name, "versions", version], "DELETE") => {
+            ("DeleteLayerVersion", Target::LayerVersion(name, version))
+        }
+        (["2019-09-30", "functions", name, "provisioned-concurrency"], "PUT") => {
+            ("PutProvisionedConcurrencyConfig", Target::Function(name))
+        }
+        (["2019-09-30", "functions", name, "provisioned-concurrency"], "GET")
+            if query_value(query, "List").is_some() =>
+        {
+            ("ListProvisionedConcurrencyConfigs", Target::Function(name))
+        }
+        (["2019-09-30", "functions", name, "provisioned-concurrency"], "GET") => {
+            ("GetProvisionedConcurrencyConfig", Target::Function(name))
+        }
+        (["2019-09-30", "functions", name, "provisioned-concurrency"], "DELETE") => {
+            ("DeleteProvisionedConcurrencyConfig", Target::Function(name))
+        }
+        (["2015-03-31", "event-source-mappings"], "POST") => {
+            ("CreateEventSourceMapping", Target::MappingFunctionInBody)
+        }
+        (["2015-03-31", "event-source-mappings"], "GET") => {
+            ("ListEventSourceMappings", Target::Any)
+        }
+        (["2015-03-31", "event-source-mappings", uuid], "GET") => {
+            ("GetEventSourceMapping", Target::Mapping(uuid))
+        }
+        (["2015-03-31", "event-source-mappings", uuid], "PUT") => {
+            ("UpdateEventSourceMapping", Target::Mapping(uuid))
+        }
+        (["2015-03-31", "event-source-mappings", uuid], "DELETE") => {
+            ("DeleteEventSourceMapping", Target::Mapping(uuid))
+        }
+        (["2017-03-31", "tags", arn], "GET") => ("ListTags", Target::Arn(arn)),
+        (["2017-03-31", "tags", arn], "POST") => ("TagResource", Target::Arn(arn)),
+        (["2017-03-31", "tags", arn], "DELETE") => ("UntagResource", Target::Arn(arn)),
+        _ => return None,
+    };
+    Some(RouteAction { action, target })
+}
+
+fn body_function_name(req: &ServiceRequest) -> Result<String, LambdaError> {
+    let body = parse_json(&req.body)?;
+    body.get("FunctionName")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| LambdaError::InvalidParameterValue("FunctionName is required".into()))
 }
 
 fn mapping_arn(req: &ServiceRequest, uuid: &str) -> String {
