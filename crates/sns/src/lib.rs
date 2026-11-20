@@ -5,6 +5,7 @@
 //! dispatching to the target native services through the registry.
 
 mod config;
+mod delivery_policy;
 pub use config::SnsConfig;
 
 pub mod digest;

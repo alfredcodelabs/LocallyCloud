@@ -247,21 +247,26 @@ fn validate_target(value: Option<&Value>) -> Result<Value, SchedulerError> {
         let retry = retry.as_object().ok_or_else(|| {
             SchedulerError::Validation("Target.RetryPolicy must be an object".into())
         })?;
-        if retry
-            .get("MaximumRetryAttempts")
-            .is_some_and(|attempts| attempts.as_u64().is_none_or(|attempts| attempts > 185))
-        {
-            return Err(SchedulerError::Validation(
-                "Target.RetryPolicy.MaximumRetryAttempts must be between 0 and 185".into(),
-            ));
+        if retry.get("MaximumRetryAttempts").is_some_and(|attempts| {
+            attempts
+                .as_u64()
+                .is_none_or(|attempts| attempts > u64::from(RetryPolicy::MAX_RETRY_ATTEMPTS))
+        }) {
+            return Err(SchedulerError::Validation(format!(
+                "Target.RetryPolicy.MaximumRetryAttempts must be between 0 and {}",
+                RetryPolicy::MAX_RETRY_ATTEMPTS
+            )));
         }
-        if retry
-            .get("MaximumEventAgeInSeconds")
-            .is_some_and(|age| !age.as_u64().is_some_and(|age| (60..=86400).contains(&age)))
-        {
-            return Err(SchedulerError::Validation(
-                "Target.RetryPolicy.MaximumEventAgeInSeconds must be between 60 and 86400".into(),
-            ));
+        if retry.get("MaximumEventAgeInSeconds").is_some_and(|age| {
+            !age.as_u64().is_some_and(|age| {
+                (RetryPolicy::MIN_EVENT_AGE_SECS..=RetryPolicy::MAX_EVENT_AGE_SECS).contains(&age)
+            })
+        }) {
+            return Err(SchedulerError::Validation(format!(
+                "Target.RetryPolicy.MaximumEventAgeInSeconds must be between {} and {}",
+                RetryPolicy::MIN_EVENT_AGE_SECS,
+                RetryPolicy::MAX_EVENT_AGE_SECS
+            )));
         }
     }
     Ok(value.clone())
@@ -799,7 +804,7 @@ impl SchedulerService {
                 .unwrap_or(initial_anchor);
             loop {
                 if !deliver_pending_schedule(&store, &registry, &account, &region, &item).await {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(crate::events::PENDING_DELIVERY_RETRY_INTERVAL).await;
                     continue;
                 }
                 if item.state != "ENABLED" {
@@ -984,17 +989,17 @@ async fn deliver_pending_schedule(
             let max_age = retry
                 .get("MaximumEventAgeInSeconds")
                 .and_then(Value::as_u64)
-                .unwrap_or(86_400);
+                .unwrap_or(RetryPolicy::MAX_EVENT_AGE_SECS);
             let outer_limit = if retry.get("MaximumRetryAttempts").is_some() {
                 1
             } else {
-                185
+                RetryPolicy::MAX_RETRY_ATTEMPTS
             };
             let now_ns = OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
             let attempts = store
                 .firing_attempts("scheduler", &item.arn, due_ns)
                 .unwrap_or(0);
-            let exhausted = attempts + 1 >= outer_limit
+            let exhausted = attempts + 1 >= i64::from(outer_limit)
                 || now_ns.saturating_sub(due_ns) >= (max_age as i64).saturating_mul(1_000_000_000);
             let result = if exhausted {
                 store.terminal_firing("scheduler", &item.arn, due_ns, "retry policy exhausted")

@@ -39,6 +39,8 @@ pub enum SfnError {
     #[error("{0}")]
     InvalidExecutionInput(String),
     #[error("{0}")]
+    InvalidOutput(String),
+    #[error("{0}")]
     InvalidDefinition(String),
     #[error("{0}")]
     InvalidName(String),
@@ -80,6 +82,7 @@ impl SfnError {
             SfnError::TaskDoesNotExist(_) => "TaskDoesNotExist",
             SfnError::TaskTimedOut(_) => "TaskTimedOut",
             SfnError::InvalidExecutionInput(_) => "InvalidExecutionInput",
+            SfnError::InvalidOutput(_) => "InvalidOutput",
             SfnError::InvalidDefinition(_) => "InvalidDefinition",
             SfnError::InvalidName(_) => "InvalidName",
             SfnError::InvalidArn(_) => "InvalidArn",
@@ -111,6 +114,7 @@ impl SfnError {
             | Self::TaskDoesNotExist(_)
             | Self::TaskTimedOut(_)
             | Self::InvalidExecutionInput(_)
+            | Self::InvalidOutput(_)
             | Self::InvalidDefinition(_)
             | Self::InvalidName(_)
             | Self::InvalidArn(_)
@@ -125,8 +129,18 @@ impl SfnError {
         }
     }
 
-    pub fn into_response(self, request_id: &str) -> axum::response::Response {
-        log_service_error("states", None, request_id, self.code(), self.http_status());
+    pub fn into_response(
+        self,
+        request_id: &str,
+        operation: Option<&str>,
+    ) -> axum::response::Response {
+        log_service_error(
+            "states",
+            operation,
+            request_id,
+            self.code(),
+            self.http_status(),
+        );
         AwsError::new(self.code(), self.to_string(), self.http_status())
             .with_request_id(request_id.to_string())
             .render(AwsProtocol::Json10)
@@ -191,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn internal_failure_uses_documented_common_code_and_json10_correlation() {
         let response =
-            SfnError::Internal("owned failure".into()).into_response("owned-sfn-request");
+            SfnError::Internal("owned failure".into()).into_response("owned-sfn-request", None);
         assert_eq!(response.status(), 500);
         assert_eq!(response.headers()["x-amzn-requestid"], "owned-sfn-request");
         assert_eq!(
@@ -208,7 +222,7 @@ mod tests {
 
     #[test]
     fn api_error_renders_json10() {
-        let r = SfnError::StateMachineDoesNotExist("x".into()).into_response("rid");
+        let r = SfnError::StateMachineDoesNotExist("x".into()).into_response("rid", None);
         assert_eq!(r.status(), 400);
         assert_eq!(
             r.headers().get("content-type").unwrap(),

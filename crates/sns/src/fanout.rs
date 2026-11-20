@@ -66,6 +66,28 @@ pub enum DeliveryFailure {
     Egress(locallycloud_core::egress::EgressError),
 }
 impl DeliveryFailure {
+    /// SNS retries HTTP/S deliveries only on throttling (429), server errors (5xx) and
+    /// transport failures; any other response or a denied destination ends the delivery.
+    fn is_retryable(self) -> bool {
+        use locallycloud_core::egress::EgressError;
+        match self {
+            Self::HttpRejected(status) => status == 429 || status >= 500,
+            Self::Egress(
+                EgressError::InvalidUrl
+                | EgressError::InvalidOrigin(_)
+                | EgressError::DestinationDenied
+                | EgressError::DnsAnswers,
+            ) => false,
+            Self::Egress(_) | Self::Subscription | Self::Task => true,
+        }
+    }
+
+    /// AWS-managed endpoints (SQS, Lambda) keep being retried long after the subscription
+    /// policy, so the publication stays in the outbox; an HTTP/S policy ends the delivery.
+    fn replays_from_outbox(self) -> bool {
+        matches!(self, Self::Subscription | Self::Task)
+    }
+
     fn diagnostic(self) -> (&'static str, u16) {
         match self {
             Self::Subscription => ("subscription_not_acknowledged", 400),
@@ -93,8 +115,9 @@ impl DeliveryFailure {
 }
 
 /// Deliver to every confirmed subscription whose filter policy matches. Each subscription owns
-/// its task, so a slow endpoint cannot delay another target. The caller may await this function to
-/// serialize FIFO publications, or detach it for standard topics.
+/// its task, so a slow endpoint cannot delay another target. An HTTP/S subscription that
+/// exhausts its delivery policy is dead-lettered or dropped and logged here; only failures that
+/// AWS keeps retrying fail the publication so the outbox replays it.
 pub async fn deliver_accepted(
     registry: Arc<ServiceRegistry>,
     http: Arc<locallycloud_core::egress::EgressClient>,
@@ -156,23 +179,27 @@ pub async fn fan_out(
         let delivery = delivery.clone();
         tasks.spawn(async move { deliver_subscription(&registry, &http, &sub, &delivery).await });
     }
-    let mut failure = None;
+    let mut replay = None;
     while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(cause)) => {
-                if failure.is_none_or(|previous: DeliveryFailure| {
-                    previous.diagnostic().1 < 500 && cause.diagnostic().1 >= 500
-                }) {
-                    failure = Some(cause);
-                }
-            }
-            Err(_) => {
-                failure = Some(DeliveryFailure::Task);
-            }
+        let failure = match result {
+            Ok(Ok(())) => continue,
+            Ok(Err(failure)) => failure,
+            Err(_) => DeliveryFailure::Task,
+        };
+        if failure.replays_from_outbox() {
+            replay = Some(failure);
+        } else {
+            let (cause, status) = failure.diagnostic();
+            locallycloud_core::observability::log_service_error(
+                "sns",
+                Some("Fanout"),
+                &delivery.request_id,
+                cause,
+                status,
+            );
         }
     }
-    failure.map_or(Ok(()), Err)
+    replay.map_or(Ok(()), Err)
 }
 
 async fn deliver_subscription(
@@ -181,7 +208,10 @@ async fn deliver_subscription(
     sub: &Subscription,
     d: &Delivery,
 ) -> Result<(), DeliveryFailure> {
-    let (retries, delay) = delivery_policy(sub);
+    let crate::delivery_policy::RetryPolicy {
+        num_retries: retries,
+        min_delay: delay,
+    } = crate::delivery_policy::RetryPolicy::of(sub);
     let mut failure = DeliveryFailure::Subscription;
     for attempt in 0..=retries {
         let delivered = match sub.protocol.as_str() {
@@ -206,6 +236,9 @@ async fn deliver_subscription(
             Ok(()) => return Ok(()),
             Err(cause) => failure = cause,
         }
+        if !failure.is_retryable() {
+            break;
+        }
         if attempt < retries && !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -215,26 +248,6 @@ async fn deliver_subscription(
     } else {
         Err(failure)
     }
-}
-
-fn delivery_policy(sub: &Subscription) -> (u32, std::time::Duration) {
-    let Some(policy) = sub
-        .attributes
-        .get("DeliveryPolicy")
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-    else {
-        return (3, std::time::Duration::ZERO);
-    };
-    let healthy = policy.get("healthyRetryPolicy").unwrap_or(&policy);
-    let retries = healthy
-        .get("numRetries")
-        .and_then(Value::as_u64)
-        .unwrap_or(3) as u32;
-    let delay = healthy
-        .get("minDelayTarget")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    (retries, std::time::Duration::from_secs(delay))
 }
 
 /// On delivery failure, route the notification to the subscription's dead-letter queue when a

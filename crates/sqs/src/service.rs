@@ -27,11 +27,9 @@ use crate::metrics::SqsMetrics;
 use crate::model::{QueueArn, QueueUrlStyle};
 use crate::ops::{self, Ctx};
 use crate::policy::{self, Decision};
-use crate::proto::{self, Protocol};
+use crate::proto::{self, Protocol, TARGET_PREFIX};
 use crate::store::SqsStore;
 use locallycloud_state::StateDb;
-
-const TARGET_PREFIX: &str = "AmazonSQS";
 
 pub struct SqsHandler {
     store: Arc<SqsStore>,
@@ -447,7 +445,14 @@ impl NativeHandler for SqsHandler {
             .headers
             .get("x-amz-target")
             .and_then(|v| v.to_str().ok());
-        let (protocol, op, mut body) = proto::classify(target, &request.body);
+        let proto::Classified {
+            protocol,
+            operation: op,
+            mut body,
+        } = match proto::classify(target, &request.body) {
+            Ok(classified) => classified,
+            Err(error) => return error_response(error, &request, None, Protocol::Json),
+        };
         if protocol == Protocol::Query {
             queue_url_from_path(&mut body, request.uri.path());
         }
@@ -460,6 +465,7 @@ impl NativeHandler for SqsHandler {
                         "missing operation (X-Amz-Target or Action)".into(),
                     ),
                     &request,
+                    None,
                     protocol,
                 )
             }
@@ -514,7 +520,7 @@ impl NativeHandler for SqsHandler {
                 }
                 success_response(&op, value, protocol, &request.request_id)
             }
-            Err(err) => error_response(err, &request, protocol),
+            Err(err) => error_response(err, &request, Some(op.as_str()), protocol),
         }
     }
 }
@@ -652,10 +658,15 @@ fn query_xml_response(op: &str, value: Value, request_id: &str) -> Response {
 
 /// Render an error in the request's protocol, adding the `x-amzn-query-error` header for
 /// `awsQueryCompatible` JSON clients (Terraform, AWS SDK v2 in query mode).
-fn error_response(err: SqsError, request: &ServiceRequest, protocol: Protocol) -> Response {
+fn error_response(
+    err: SqsError,
+    request: &ServiceRequest,
+    operation: Option<&str>,
+    protocol: Protocol,
+) -> Response {
     let query_compat_header = (protocol == Protocol::Json && is_query_compat(request))
         .then(|| format!("{};{}", err.query_code(), err.fault()));
-    let mut response = err.into_protocol_response(&request.request_id, protocol.aws());
+    let mut response = err.into_protocol_response(&request.request_id, operation, protocol.aws());
     if let Some(value) = query_compat_header {
         if let Ok(header) = http::HeaderValue::from_str(&value) {
             response.headers_mut().insert("x-amzn-query-error", header);
@@ -871,7 +882,7 @@ mod tests {
         request
             .headers
             .insert("x-amzn-query-mode", HeaderValue::from_static("true"));
-        let response = error_response(SqsError::StorageUnavailable, &request, Protocol::Json);
+        let response = error_response(SqsError::StorageUnavailable, &request, None, Protocol::Json);
         assert_eq!(response.status(), 500);
         assert_eq!(
             response.headers().get("x-amzn-query-error").unwrap(),

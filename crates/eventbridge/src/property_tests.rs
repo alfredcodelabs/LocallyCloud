@@ -176,7 +176,7 @@ fn generated_error_response(service: &str, index: usize) -> (&'static str, u16, 
             (
                 error.code(),
                 error.http_status(),
-                error.into_response("property"),
+                error.into_response("property", None),
             )
         }
         "scheduler" => {
@@ -192,7 +192,7 @@ fn generated_error_response(service: &str, index: usize) -> (&'static str, u16, 
             (
                 error.code(),
                 error.http_status(),
-                error.into_response("property"),
+                error.into_response("property", None),
             )
         }
         _ => {
@@ -208,7 +208,7 @@ fn generated_error_response(service: &str, index: usize) -> (&'static str, u16, 
             (
                 error.code(),
                 error.http_status(),
-                error.into_response("property"),
+                error.into_response("property", None),
             )
         }
     }

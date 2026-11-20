@@ -15,8 +15,12 @@ macro_rules! error_type {
             pub fn http_status(&self) -> u16 {
                 match self { $(Self::$variant(_) => $status,)+ }
             }
-            pub fn into_response(self, request_id: &str) -> axum::response::Response {
-                log_service_error($service, None, request_id, self.code(), self.http_status());
+            pub fn into_response(
+                self,
+                request_id: &str,
+                operation: Option<&str>,
+            ) -> axum::response::Response {
+                log_service_error($service, operation, request_id, self.code(), self.http_status());
                 AwsError::new(self.code(), self.to_string(), self.http_status())
                     .with_request_id(request_id.to_string())
                     .render($protocol)
@@ -65,7 +69,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_event_bus_uses_documented_json11_error_and_request_id() {
         let response = EventsError::ResourceAlreadyExists("already exists".into())
-            .into_response("owned-eventbridge-request");
+            .into_response("owned-eventbridge-request", None);
         assert_eq!(response.status(), 400);
         assert_eq!(
             response.headers()["x-amzn-requestid"],
@@ -81,17 +85,17 @@ mod tests {
 
     #[test]
     fn events_and_rest_errors_use_distinct_protocol_shapes() {
-        let events = EventsError::InvalidEventPattern("bad".into()).into_response("r");
+        let events = EventsError::InvalidEventPattern("bad".into()).into_response("r", None);
         assert_eq!(events.status(), 400);
         assert_eq!(
             events.headers()["content-type"],
             "application/x-amz-json-1.1"
         );
-        let scheduler = SchedulerError::Conflict("exists".into()).into_response("r");
+        let scheduler = SchedulerError::Conflict("exists".into()).into_response("r", None);
         assert_eq!(scheduler.status(), 409);
         assert_eq!(scheduler.headers()["content-type"], "application/json");
         assert_eq!(scheduler.headers()["x-amzn-errortype"], "ConflictException");
-        let pipes = PipesError::NotFound("gone".into()).into_response("r");
+        let pipes = PipesError::NotFound("gone".into()).into_response("r", None);
         assert_eq!(pipes.status(), 404);
         assert_eq!(pipes.headers()["x-amzn-errortype"], "NotFoundException");
     }

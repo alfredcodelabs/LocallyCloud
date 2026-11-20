@@ -413,7 +413,7 @@ impl Coordinator {
             let (reply, response) = oneshot::channel();
             if self.sender.try_send(Control { request, reply }).is_err() {
                 return DdbError::Throttling("replication control plane is busy".into())
-                    .into_response(&id);
+                    .into_response(&id, Some(op.as_str()).filter(|op| !op.is_empty()));
             }
             return response
                 .await
@@ -422,8 +422,10 @@ impl Coordinator {
         let body = match serde_json::from_slice::<Value>(&request.body) {
             Ok(body) => body,
             Err(_) => {
-                return DdbError::Validation("invalid request body".into())
-                    .into_response(&request.request_id)
+                return DdbError::Validation("invalid request body".into()).into_response(
+                    &request.request_id,
+                    Some(op.as_str()).filter(|op| !op.is_empty()),
+                )
             }
         };
         if matches!(
@@ -432,7 +434,12 @@ impl Coordinator {
         ) {
             let names = match mutation_tables(&op, &body) {
                 Ok(names) => names,
-                Err(error) => return error.into_response(&request.request_id),
+                Err(error) => {
+                    return error.into_response(
+                        &request.request_id,
+                        Some(op.as_str()).filter(|op| !op.is_empty()),
+                    )
+                }
             };
             for name in names {
                 match self.metadata.get(&request.account_id, &name).await {
@@ -441,7 +448,10 @@ impl Coordinator {
                             "replica is not writable while its lifecycle operation is in progress"
                                 .into(),
                         )
-                        .into_response(&request.request_id)
+                        .into_response(
+                            &request.request_id,
+                            Some(op.as_str()).filter(|op| !op.is_empty()),
+                        )
                     }
                     Ok(_) => {}
                     Err(error) => return failure(&error, &request.request_id),
@@ -497,8 +507,10 @@ impl Coordinator {
         let mut body = match serde_json::from_slice::<Value>(&request.body) {
             Ok(body) => body,
             Err(_) => {
-                return DdbError::Validation("invalid request body".into())
-                    .into_response(&request.request_id)
+                return DdbError::Validation("invalid request body".into()).into_response(
+                    &request.request_id,
+                    Some(op.as_str()).filter(|op| !op.is_empty()),
+                )
             }
         };
         let name_field = match op.as_str() {
@@ -507,8 +519,10 @@ impl Coordinator {
         };
         let lookup = json!({"TableName":body.get(name_field)});
         let Some(name) = table_name(&lookup) else {
-            return DdbError::Validation(format!("{name_field} is required"))
-                .into_response(&request.request_id);
+            return DdbError::Validation(format!("{name_field} is required")).into_response(
+                &request.request_id,
+                Some(op.as_str()).filter(|op| !op.is_empty()),
+            );
         };
         body["TableName"] = json!(name);
         let global = match self.metadata.get(&request.account_id, &name).await {
@@ -523,7 +537,10 @@ impl Coordinator {
                 Some(source) => source,
                 None => {
                     return DdbError::Validation("A valid PITR source is required".into())
-                        .into_response(&request.request_id)
+                        .into_response(
+                            &request.request_id,
+                            Some(op.as_str()).filter(|op| !op.is_empty()),
+                        )
                 }
             };
             match self.metadata.get(&request.account_id, &source).await {
@@ -531,7 +548,7 @@ impl Coordinator {
                     return DdbError::ResourceInUse(
                         "PITR source replica is not ready while its lifecycle operation is in progress".into(),
                     )
-                    .into_response(&request.request_id)
+                    .into_response(&request.request_id, Some(op.as_str()).filter(|op| !op.is_empty()))
                 }
                 Ok(_) => {}
                 Err(error) => return failure(&error, &request.request_id),
@@ -626,7 +643,10 @@ impl Coordinator {
         };
         match result {
             Ok(output) => encode(Ok((200, output)), &request.request_id),
-            Err(error) => error.into_response(&request.request_id),
+            Err(error) => error.into_response(
+                &request.request_id,
+                Some(op.as_str()).filter(|op| !op.is_empty()),
+            ),
         }
     }
 
@@ -1686,7 +1706,7 @@ fn not_found(body: &Value) -> bool {
         .is_some_and(|kind| kind.ends_with("ResourceNotFoundException"))
 }
 fn failure(message: &str, id: &str) -> Response {
-    DdbError::Internal(message.into()).into_response(id)
+    DdbError::Internal(message.into()).into_response(id, None)
 }
 fn encode(result: Reply, id: &str) -> Response {
     match result {

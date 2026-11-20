@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
+use crate::error::SqsError;
+
 /// SQS Query XML namespace (API version 2012-11-05).
 const XMLNS: &str = "http://queue.amazonaws.com/doc/2012-11-05/";
 
@@ -33,24 +35,50 @@ impl Protocol {
     }
 }
 
-/// Classify a request into `(protocol, operation, request-body-as-Value)`.
-///
-/// JSON requests parse the body directly. Query requests parse the form body and translate
-/// SQS indexed members into the same JSON request shape the ops consume.
-pub fn classify(x_amz_target: Option<&str>, body: &[u8]) -> (Protocol, Option<String>, Value) {
-    if let Some(target) = x_amz_target {
-        let op = target.rsplit('.').next().map(str::to_string);
-        let value: Value = if body.is_empty() {
-            Value::Object(Map::new())
-        } else {
-            serde_json::from_slice(body).unwrap_or(Value::Object(Map::new()))
-        };
-        (Protocol::Json, op, value)
-    } else {
+/// JSON 1.0 `X-Amz-Target` service prefix.
+pub(crate) const TARGET_PREFIX: &str = "AmazonSQS";
+
+/// A classified request: wire protocol, operation (absent when the target or `Action` does
+/// not name one) and the request body as the JSON shape the ops consume.
+pub struct Classified {
+    pub protocol: Protocol,
+    pub operation: Option<String>,
+    pub body: Value,
+}
+
+/// Classify a request. JSON requests require the exact `AmazonSQS.<Operation>` target and a
+/// JSON object body; Query requests translate SQS indexed members into the same JSON shape.
+pub fn classify(x_amz_target: Option<&str>, body: &[u8]) -> Result<Classified, SqsError> {
+    let Some(target) = x_amz_target else {
         let map = parse_form(body);
-        let op = map.get("Action").cloned();
-        (Protocol::Query, op, query_to_value(&map))
-    }
+        return Ok(Classified {
+            protocol: Protocol::Query,
+            operation: map.get("Action").cloned(),
+            body: query_to_value(&map),
+        });
+    };
+    let operation = target
+        .strip_prefix(TARGET_PREFIX)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .filter(|op| !op.is_empty() && !op.contains('.'))
+        .map(str::to_string);
+    let body = if body.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(value @ Value::Object(_)) => value,
+            _ => {
+                return Err(SqsError::InvalidParameterValue(
+                    "request body must be a valid JSON object".into(),
+                ))
+            }
+        }
+    };
+    Ok(Classified {
+        protocol: Protocol::Json,
+        operation,
+        body,
+    })
 }
 
 // ============================ Query request → JSON Value =======================
@@ -494,13 +522,37 @@ fn text_el(name: &str, text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn classify_parts(target: Option<&str>, body: &[u8]) -> (Protocol, Option<String>, Value) {
+        let classified = classify(target, body).expect("valid request");
+        (classified.protocol, classified.operation, classified.body)
+    }
+
+    #[test]
+    fn json_requires_exact_target_prefix_and_object_body() {
+        for target in [
+            "WrongPrefix.CreateQueue",
+            "AmazonSQSX.CreateQueue",
+            "AmazonSQS.a.CreateQueue",
+            "AmazonSQS.",
+        ] {
+            let classified = classify(Some(target), b"{}").expect("body is valid");
+            assert_eq!(classified.operation, None, "{target}");
+        }
+        for body in [&b"{"[..], b"[]", b"\"x\""] {
+            assert!(matches!(
+                classify(Some("AmazonSQS.ListQueues"), body),
+                Err(SqsError::InvalidParameterValue(_))
+            ));
+        }
+    }
+
     #[test]
     fn classifies_query_vs_json() {
-        let (p, op, _) = classify(None, b"Action=ListQueues&Version=2012-11-05");
+        let (p, op, _) = classify_parts(None, b"Action=ListQueues&Version=2012-11-05");
         assert_eq!(p, Protocol::Query);
         assert_eq!(op.as_deref(), Some("ListQueues"));
 
-        let (p, op, _) = classify(
+        let (p, op, _) = classify_parts(
             Some("AmazonSQS.SendMessage"),
             br#"{"QueueUrl":"u","MessageBody":"b"}"#,
         );
@@ -510,7 +562,7 @@ mod tests {
 
     #[test]
     fn query_scalars_and_attributes() {
-        let (_, _, v) = classify(
+        let (_, _, v) = classify_parts(
             None,
             b"Action=CreateQueue&QueueName=q&Attribute.1.Name=FifoQueue&Attribute.1.Value=true&Attribute.2.Name=DelaySeconds&Attribute.2.Value=5",
         );
@@ -521,7 +573,7 @@ mod tests {
 
     #[test]
     fn query_attribute_names_and_message_attributes() {
-        let (_, _, v) = classify(
+        let (_, _, v) = classify_parts(
             None,
             b"Action=ReceiveMessage&QueueUrl=u&AttributeName.1=All&MessageAttributeName.1=x&MaxNumberOfMessages=5",
         );
@@ -532,7 +584,7 @@ mod tests {
 
     #[test]
     fn query_send_message_attributes() {
-        let (_, _, v) = classify(
+        let (_, _, v) = classify_parts(
             None,
             b"Action=SendMessage&QueueUrl=u&MessageBody=b&MessageAttribute.1.Name=k&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=v",
         );
@@ -542,12 +594,12 @@ mod tests {
 
     #[test]
     fn query_tags_and_tag_keys() {
-        let (_, _, v) = classify(
+        let (_, _, v) = classify_parts(
             None,
             b"Action=TagQueue&QueueUrl=u&Tag.1.Key=env&Tag.1.Value=prod",
         );
         assert_eq!(v["Tags"]["env"], "prod");
-        let (_, _, v2) = classify(
+        let (_, _, v2) = classify_parts(
             None,
             b"Action=UntagQueue&QueueUrl=u&TagKey.1=env&TagKey.2=team",
         );
@@ -557,7 +609,7 @@ mod tests {
 
     #[test]
     fn query_batch_entries_with_nested_attributes() {
-        let (_, _, v) = classify(
+        let (_, _, v) = classify_parts(
             None,
             b"Action=SendMessageBatch&QueueUrl=u&SendMessageBatchRequestEntry.1.Id=a&SendMessageBatchRequestEntry.1.MessageBody=one&SendMessageBatchRequestEntry.1.MessageAttribute.1.Name=k&SendMessageBatchRequestEntry.1.MessageAttribute.1.Value.DataType=String&SendMessageBatchRequestEntry.1.MessageAttribute.1.Value.StringValue=v&SendMessageBatchRequestEntry.2.Id=b&SendMessageBatchRequestEntry.2.MessageBody=two",
         );
@@ -571,7 +623,7 @@ mod tests {
 
     #[test]
     fn add_permission_lists() {
-        let (_, _, v) = classify(
+        let (_, _, v) = classify_parts(
             None,
             b"Action=AddPermission&QueueUrl=u&Label=l&AWSAccountId.1=111&ActionName.1=SendMessage&ActionName.2=ReceiveMessage",
         );

@@ -21,6 +21,9 @@ use crate::scheduler::SchedulerService;
 use crate::store::EbStore;
 use locallycloud_state::StateDb;
 
+/// JSON 1.1 `X-Amz-Target` service prefix for the EventBridge (CloudWatch Events) API.
+const TARGET_PREFIX: &str = "AWSEvents";
+
 #[path = "classic_authorization.rs"]
 mod classic_authorization;
 #[path = "rest_authorization.rs"]
@@ -78,22 +81,25 @@ impl NativeHandler for EventsHandler {
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
-        let target = match request
+        let operation = match request
             .headers
             .get("x-amz-target")
             .and_then(|value| value.to_str().ok())
+            .and_then(|target| target.strip_prefix(TARGET_PREFIX))
+            .and_then(|rest| rest.strip_prefix('.'))
+            .filter(|operation| !operation.is_empty() && !operation.contains('.'))
         {
-            Some(target) if target.starts_with("AWSEvents.") => target,
-            _ => {
+            Some(operation) => operation,
+            None => {
                 return EventsError::UnknownOperation("missing or invalid X-Amz-Target".into())
-                    .into_response(&request.request_id)
+                    .into_response(&request.request_id, None)
             }
         };
-        let operation = target.rsplit('.').next().unwrap_or_default();
         let body = match parse_body(&request) {
             Ok(body) => body,
             Err(message) => {
-                return EventsError::Validation(message).into_response(&request.request_id)
+                return EventsError::Validation(message)
+                    .into_response(&request.request_id, Some(operation))
             }
         };
         let producer = match classic_authorization::check(
@@ -106,11 +112,11 @@ impl NativeHandler for EventsHandler {
         .await
         {
             Ok(producer) => producer,
-            Err(error) => return error.into_response(&request.request_id),
+            Err(error) => return error.into_response(&request.request_id, Some(operation)),
         };
         // Complete the state commit even if the client disconnects mid-request.
         let services = self.0.clone();
-        let operation = operation.to_string();
+        let owned_operation = operation.to_string();
         let account = request.account_id.clone();
         let region = request.region.clone();
         let request_id = request.request_id.clone();
@@ -122,15 +128,15 @@ impl NativeHandler for EventsHandler {
             };
             services
                 .events
-                .dispatch_with_producer(&operation, &context, &body, producer)
+                .dispatch_with_producer(&owned_operation, &context, &body, producer)
                 .await
         })
         .await;
         match result {
             Ok(Ok(value)) => json_response(value, "application/x-amz-json-1.1"),
-            Ok(Err(error)) => error.into_response(&request.request_id),
+            Ok(Err(error)) => error.into_response(&request.request_id, Some(operation)),
             Err(_) => EventsError::Internal("EventBridge operation failed".into())
-                .into_response(&request.request_id),
+                .into_response(&request.request_id, Some(operation)),
         }
     }
 }
@@ -150,13 +156,13 @@ impl NativeHandler for SchedulerHandler {
             Some(route) => route,
             None => {
                 return SchedulerError::ResourceNotFound("route not found".into())
-                    .into_response(&request.request_id)
+                    .into_response(&request.request_id, None)
             }
         };
         let mut body = match parse_body(&request) {
             Ok(body) => body,
             Err(message) => {
-                return SchedulerError::Validation(message).into_response(&request.request_id)
+                return SchedulerError::Validation(message).into_response(&request.request_id, None)
             }
         };
         merge_query(&mut body, request.uri.query());
@@ -173,7 +179,7 @@ impl NativeHandler for SchedulerHandler {
             return SchedulerError::AccessDenied(
                 "User is not authorized to perform this Scheduler operation".into(),
             )
-            .into_response(&request.request_id);
+            .into_response(&request.request_id, None);
         }
         // A disconnected client must not cancel an in-flight SQLite commit.
         let services = self.0.clone();
@@ -188,9 +194,9 @@ impl NativeHandler for SchedulerHandler {
         .await;
         match result {
             Ok(Ok(value)) => json_response(value, "application/json"),
-            Ok(Err(error)) => error.into_response(&request.request_id),
+            Ok(Err(error)) => error.into_response(&request.request_id, None),
             Err(_) => SchedulerError::Internal("Scheduler operation failed".into())
-                .into_response(&request.request_id),
+                .into_response(&request.request_id, None),
         }
     }
 }
@@ -206,13 +212,13 @@ impl NativeHandler for PipesHandler {
             Some(route) => route,
             None => {
                 return PipesError::NotFound("route not found".into())
-                    .into_response(&request.request_id)
+                    .into_response(&request.request_id, None)
             }
         };
         let mut body = match parse_body(&request) {
             Ok(body) => body,
             Err(message) => {
-                return PipesError::Validation(message).into_response(&request.request_id)
+                return PipesError::Validation(message).into_response(&request.request_id, None)
             }
         };
         merge_query(&mut body, request.uri.query());
@@ -229,7 +235,7 @@ impl NativeHandler for PipesHandler {
             return PipesError::AccessDenied(
                 "User is not authorized to perform this Pipes operation".into(),
             )
-            .into_response(&request.request_id);
+            .into_response(&request.request_id, None);
         }
         match self
             .0
@@ -244,7 +250,7 @@ impl NativeHandler for PipesHandler {
             .await
         {
             Ok(value) => json_response(value, "application/json"),
-            Err(error) => error.into_response(&request.request_id),
+            Err(error) => error.into_response(&request.request_id, None),
         }
     }
 }
@@ -472,7 +478,7 @@ fn ensure_dispatcher(registry: &Arc<ServiceRegistry>) {
 fn register_services(registry: &Arc<ServiceRegistry>, services: Arc<Services>) {
     registry.register_native(
         ServiceName::new("events"),
-        ServiceMetadata::new(AwsProtocol::Json11, Some("AWSEvents")),
+        ServiceMetadata::new(AwsProtocol::Json11, Some(TARGET_PREFIX)),
         Arc::new(EventsHandler(services.clone())),
     );
     registry.register_native(

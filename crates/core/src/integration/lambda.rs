@@ -7,6 +7,11 @@ use async_trait::async_trait;
 /// Contract version understood by the registry and internal callers.
 pub const LAMBDA_INTERNAL_API_VERSION: u16 = 1;
 
+/// AWS maximum payload of a synchronous (`RequestResponse`) invocation.
+pub const MAX_SYNC_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
+/// AWS maximum payload of an asynchronous (`Event`) invocation.
+pub const MAX_ASYNC_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LambdaCallContext {
     pub source_service: String,

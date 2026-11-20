@@ -196,7 +196,7 @@ impl SqsError {
     }
 
     pub fn into_response(self, request_id: &str) -> axum::response::Response {
-        self.into_protocol_response(request_id, AwsProtocol::Json10)
+        self.into_protocol_response(request_id, None, AwsProtocol::Json10)
     }
 
     pub(crate) fn log(&self, request_id: &str, operation: Option<&str>) {
@@ -213,9 +213,10 @@ impl SqsError {
     pub fn into_protocol_response(
         self,
         request_id: &str,
+        operation: Option<&str>,
         protocol: AwsProtocol,
     ) -> axum::response::Response {
-        self.log(request_id, None);
+        self.log(request_id, operation);
         self.render(request_id, protocol).into_response()
     }
 }

@@ -726,9 +726,9 @@ impl LogsStore {
         if !group.subscription_filters.contains_key(&filter.name)
             && group.subscription_filters.len() >= max_filters
         {
-            return Err(LogsError::LimitExceeded(
-                "a log group cannot have more than two subscription filters".into(),
-            ));
+            return Err(LogsError::LimitExceeded(format!(
+                "a log group cannot have more than {max_filters} subscription filters"
+            )));
         }
         let regex_count = group
             .subscription_filters

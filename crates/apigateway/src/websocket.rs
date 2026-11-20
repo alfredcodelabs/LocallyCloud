@@ -23,6 +23,7 @@ use locallycloud_core::registry::ServiceRegistry;
 
 use crate::auth::policy_allows;
 use crate::error::ApiGwError;
+use crate::integration_timeout;
 use crate::proxy_event::percent_decode;
 use crate::store::ApiGwStore;
 
@@ -548,7 +549,7 @@ async fn authorize_connect(
         &request.request_id,
         uri,
         event,
-        29_000,
+        integration_timeout::LAMBDA_AUTHORIZER_MS,
         &format!(
             "arn:aws:execute-api:{}:{}:{api_id}/authorizers/{authorizer_id}",
             request.region, request.account_id
@@ -636,10 +637,7 @@ async fn invoke_route(
         .get("integrationUri")
         .and_then(Value::as_str)
         .ok_or(())?;
-    let timeout_millis = integration
-        .get("timeoutInMillis")
-        .and_then(Value::as_u64)
-        .unwrap_or(29_000);
+    let timeout_millis = integration_timeout::WEBSOCKET.of(integration);
     invoke_lambda(
         &runtime.registry,
         &runtime.account,

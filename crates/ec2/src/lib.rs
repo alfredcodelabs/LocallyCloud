@@ -2933,16 +2933,16 @@ impl NativeHandler for Ec2Handler {
     async fn handle(&self, request: ServiceRequest) -> Response {
         let mut input = match Input::parse(&request) {
             Ok(input) => input,
-            Err(error) => return error.into_response(&request.request_id),
+            Err(error) => return error.into_response(&request.request_id, None),
         };
         if let Err(error) = self.authorize_input(&request, &mut input) {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, None);
         }
         let action = input.one("Action").ok().flatten().unwrap_or("Unknown");
         if let Ok(Some(version)) = input.one("Version") {
             if version != "2016-11-15" {
                 return Ec2Error::new("InvalidParameterValue", "Unsupported API Version")
-                    .into_response(&request.request_id);
+                    .into_response(&request.request_id, Some(action));
             }
         }
         let result = match action {
@@ -2976,7 +2976,7 @@ impl NativeHandler for Ec2Handler {
                     .body(Body::from(body))
                     .expect("valid EC2 response")
             }
-            Err(error) => error.into_response(&request.request_id),
+            Err(error) => error.into_response(&request.request_id, Some(action)),
         }
     }
 }
@@ -3078,10 +3078,10 @@ impl Ec2Error {
             _ => 400,
         }
     }
-    fn into_response(self, request_id: &str) -> Response {
+    fn into_response(self, request_id: &str, operation: Option<&str>) -> Response {
         locallycloud_core::observability::log_service_error(
             "ec2",
-            None,
+            operation,
             request_id,
             self.code,
             self.http_status(),

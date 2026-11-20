@@ -21,6 +21,8 @@ use locallycloud_cognito::CognitoHandler;
 use locallycloud_core::integration::authorization::ResourcePolicyDecision;
 use serde_json::Value;
 
+use crate::http_integration::{read_response, HttpIntegrationClient};
+
 /// IAM invocation is explicit route authentication and is enforced in both emulator modes.
 pub(crate) fn authorize_iam_invoke(
     registry: &Weak<locallycloud_core::registry::ServiceRegistry>,
@@ -255,6 +257,12 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 
 /// AWS caches issuer public keys for up to two hours.
 const JWKS_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// A failed issuer fetch is remembered briefly so each request does not reach the issuer again.
+const JWKS_FAILURE_TTL: Duration = Duration::from_secs(30);
+/// Budget for OIDC discovery plus the JWKS download.
+const JWKS_FETCH_DEADLINE: Duration = Duration::from_secs(5);
+/// Distinct issuers kept in the key cache.
+const JWKS_CACHE_CAPACITY: usize = 256;
 
 /// JWT authorizer configuration (`JwtConfiguration` on the authorizer resource).
 #[derive(Debug, Clone)]
@@ -280,11 +288,28 @@ struct OidcDiscovery {
     jwks_uri: String,
 }
 
+/// A cached issuer key set, or a recent failure to fetch it.
+#[derive(Clone)]
+struct CachedJwks {
+    fetched_at: Instant,
+    keys: Result<JwkSet, String>,
+}
+
+impl CachedJwks {
+    fn is_fresh(&self) -> bool {
+        let ttl = if self.keys.is_ok() {
+            JWKS_TTL
+        } else {
+            JWKS_FAILURE_TTL
+        };
+        self.fetched_at.elapsed() < ttl
+    }
+}
+
 /// Fetches and caches issuer JWKS, then verifies tokens. One instance is shared by the
-/// handler; the cache is keyed by issuer.
+/// handler; the cache is keyed by issuer. Issuer requests use the API's outbound HTTP policy.
 pub struct JwtValidator {
-    http: reqwest::Client,
-    cache: DashMap<String, (Instant, JwkSet)>,
+    cache: DashMap<String, CachedJwks>,
     local_cognito: RwLock<Option<Weak<CognitoHandler>>>,
 }
 
@@ -297,16 +322,6 @@ impl Default for JwtValidator {
 impl JwtValidator {
     pub fn new() -> Self {
         JwtValidator {
-            http: reqwest::Client::new(),
-            cache: DashMap::new(),
-            local_cognito: RwLock::new(None),
-        }
-    }
-
-    /// Build a validator that reuses an existing HTTP client.
-    pub fn with_client(http: reqwest::Client) -> Self {
-        JwtValidator {
-            http,
             cache: DashMap::new(),
             local_cognito: RwLock::new(None),
         }
@@ -348,67 +363,49 @@ impl JwtValidator {
         })())
     }
 
-    /// Resolve the issuer's `jwks_uri` via OIDC discovery.
-    async fn discover_jwks_uri(&self, issuer: &str) -> Result<String, String> {
-        let base = issuer.trim_end_matches('/');
-        let url = format!("{base}/.well-known/openid-configuration");
-        let doc: OidcDiscovery = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OIDC discovery request failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("OIDC discovery returned an error status: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("OIDC discovery document was not valid JSON: {e}"))?;
-        Ok(doc.jwks_uri)
-    }
-
-    /// Return the issuer's JWKS, fetching and caching it when missing or stale.
-    async fn jwks(&self, account: &str, region: &str, issuer: &str) -> Result<JwkSet, String> {
+    /// Return the issuer's JWKS from the cache, or fetch it (discovery, then `jwks_uri`).
+    async fn jwks(
+        &self,
+        http: &HttpIntegrationClient,
+        account: &str,
+        region: &str,
+        issuer: &str,
+    ) -> Result<JwkSet, String> {
         if let Some(local) = self.local_jwks(account, region, issuer) {
             return local;
         }
-        if let Some(entry) = self.cache.get(issuer) {
-            if entry.0.elapsed() < JWKS_TTL {
-                return Ok(entry.1.clone());
-            }
+        let cached = self
+            .cache
+            .get(issuer)
+            .map(|entry| entry.clone())
+            .filter(CachedJwks::is_fresh);
+        if let Some(cached) = cached {
+            return cached.keys;
         }
-        let jwks_uri = self.discover_jwks_uri(issuer).await?;
-        let set: JwkSet = self
-            .http
-            .get(&jwks_uri)
-            .send()
+        let keys = tokio::time::timeout(JWKS_FETCH_DEADLINE, fetch_jwks(http, issuer))
             .await
-            .map_err(|e| format!("JWKS request failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("JWKS endpoint returned an error status: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("JWKS document was not valid JSON: {e}"))?;
-        self.cache
-            .insert(issuer.to_string(), (Instant::now(), set.clone()));
-        Ok(set)
+            .unwrap_or_else(|_| Err("issuer key retrieval timed out".into()));
+        if self.cache.len() >= JWKS_CACHE_CAPACITY {
+            self.cache.retain(|_, entry| entry.is_fresh());
+        }
+        if self.cache.len() < JWKS_CACHE_CAPACITY || self.cache.contains_key(issuer) {
+            self.cache.insert(
+                issuer.to_string(),
+                CachedJwks {
+                    fetched_at: Instant::now(),
+                    keys: keys.clone(),
+                },
+            );
+        }
+        keys
     }
 
     /// Validate `token` against `cfg` and the route's `required_scopes` (empty = no scope
-    /// requirement). Never logs or returns the token value.
-    pub async fn authorize(
+    /// requirement) in the API's account and region. A matching native Cognito pool supplies
+    /// its public JWKS without changing the token's AWS issuer. Never logs or returns the token.
+    pub(crate) async fn authorize_scoped(
         &self,
-        token: &str,
-        cfg: &JwtConfig,
-        required_scopes: &[String],
-    ) -> AuthOutcome {
-        self.authorize_scoped(token, cfg, required_scopes, "", "")
-            .await
-    }
-
-    /// Authorize in the API's account and region, allowing a matching native Cognito pool
-    /// to supply its public JWKS without changing the token's AWS issuer.
-    pub async fn authorize_scoped(
-        &self,
+        http: &HttpIntegrationClient,
         token: &str,
         cfg: &JwtConfig,
         required_scopes: &[String],
@@ -445,7 +442,7 @@ impl JwtValidator {
         };
 
         // Signing key from the issuer JWKS, matched by kid.
-        let jwks = match self.jwks(account, region, &cfg.issuer).await {
+        let jwks = match self.jwks(http, account, region, &cfg.issuer).await {
             Ok(set) => set,
             Err(e) => return AuthOutcome::Error(e),
         };
@@ -492,6 +489,38 @@ impl JwtValidator {
             scopes: token_scopes,
         }
     }
+}
+
+async fn fetch_jwks(http: &HttpIntegrationClient, issuer: &str) -> Result<JwkSet, String> {
+    let base = issuer.trim_end_matches('/');
+    let discovery: OidcDiscovery = fetch_json(
+        http,
+        &format!("{base}/.well-known/openid-configuration"),
+        "OIDC discovery",
+    )
+    .await?;
+    fetch_json(http, &discovery.jwks_uri, "JWKS").await
+}
+
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    http: &HttpIntegrationClient,
+    url: &str,
+    document: &str,
+) -> Result<T, String> {
+    let response = http
+        .request(reqwest::Method::GET, url)
+        .map_err(|_| format!("{document} destination is not allowed by the outbound HTTP policy"))?
+        .send()
+        .await
+        .map_err(|_| format!("{document} request failed"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("{document} returned HTTP {}", status.as_u16()));
+    }
+    let body = read_response(response)
+        .await
+        .map_err(|_| format!("{document} response could not be read within limits"))?;
+    serde_json::from_slice(&body).map_err(|_| format!("{document} was not valid JSON"))
 }
 
 fn local_cognito_pool_id<'a>(issuer: &'a str, region: &str) -> Result<&'a str, String> {

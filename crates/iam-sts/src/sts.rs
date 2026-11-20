@@ -19,9 +19,16 @@ use crate::policy::PolicyDocument;
 use crate::query::{text_el, QueryRequest};
 use crate::store::IamStore;
 
-/// Default credential lifetimes (seconds), per AWS.
+/// AWS credential lifetimes (seconds).
+const MIN_SESSION_DURATION: i64 = 900;
 const ASSUME_ROLE_DEFAULT: i64 = 3600;
-const SESSION_TOKEN_DEFAULT: i64 = 43200;
+const ROLE_SESSION_MAX: i64 = 43_200;
+const ROLE_CHAINING_MAX: i64 = 3600;
+const SESSION_TOKEN_DEFAULT: i64 = 43_200;
+const LONG_TERM_SESSION_MAX: i64 = 129_600;
+/// Root-issued GetSessionToken/GetFederationToken sessions default to, and are capped at,
+/// one hour.
+const ROOT_SESSION_MAX: i64 = 3600;
 
 /// A generated temporary credential.
 #[derive(Debug, Clone)]
@@ -142,12 +149,28 @@ fn duration_or(q: &QueryRequest, default: i64, maximum: i64) -> Result<i64, IamS
             .parse::<i64>()
             .map_err(|_| IamStsError::ValidationError("DurationSeconds must be an integer".into()))
     })?;
-    if !(900..=maximum).contains(&duration) {
+    if !(MIN_SESSION_DURATION..=maximum).contains(&duration) {
         return Err(IamStsError::ValidationError(format!(
-            "DurationSeconds must be between 900 and {maximum}"
+            "DurationSeconds must be between {MIN_SESSION_DURATION} and {maximum}"
         )));
     }
     Ok(duration)
+}
+
+/// Duration of a GetSessionToken/GetFederationToken session: validated against the AWS
+/// range, then capped at one hour (also the default) when root issues it.
+fn long_term_session_duration(q: &QueryRequest, root_issuer: bool) -> Result<i64, IamStsError> {
+    let default = if root_issuer {
+        ROOT_SESSION_MAX
+    } else {
+        SESSION_TOKEN_DEFAULT
+    };
+    let duration = duration_or(q, default, LONG_TERM_SESSION_MAX)?;
+    Ok(if root_issuer {
+        duration.min(ROOT_SESSION_MAX)
+    } else {
+        duration
+    })
 }
 
 fn assume_role_duration(
@@ -155,11 +178,15 @@ fn assume_role_duration(
     role: &IamRole,
     chained: bool,
 ) -> Result<i64, IamStsError> {
-    let maximum = i64::from(role.max_session_duration).min(43200);
+    let maximum = i64::from(role.max_session_duration).min(ROLE_SESSION_MAX);
     duration_or(
         q,
         ASSUME_ROLE_DEFAULT,
-        if chained { maximum.min(3600) } else { maximum },
+        if chained {
+            maximum.min(ROLE_CHAINING_MAX)
+        } else {
+            maximum
+        },
     )
 }
 
@@ -466,24 +493,7 @@ pub(crate) fn get_session_token_for_issuer(
     user_id: &str,
     root_account: bool,
 ) -> Result<String, IamStsError> {
-    let requested = q
-        .get("DurationSeconds")
-        .map(|value| {
-            value.parse::<i64>().map_err(|_| {
-                IamStsError::ValidationError("DurationSeconds must be an integer".into())
-            })
-        })
-        .transpose()?;
-    if requested.is_some_and(|duration| !(900..=129600).contains(&duration)) {
-        return Err(IamStsError::ValidationError(
-            "DurationSeconds must be between 900 and 129600".into(),
-        ));
-    }
-    let duration = if root_account {
-        requested.unwrap_or(3600).min(3600)
-    } else {
-        requested.unwrap_or(SESSION_TOKEN_DEFAULT)
-    };
+    let duration = long_term_session_duration(q, root_account)?;
     let creds = Credentials::generate(duration);
     register_session(
         sessions,
@@ -505,9 +515,10 @@ pub fn get_federation_token(
     sessions: &SessionStore,
     account: &str,
     q: &QueryRequest,
+    root_issuer: bool,
 ) -> Result<String, IamStsError> {
     let name = q.require("Name")?;
-    let duration = duration_or(q, SESSION_TOKEN_DEFAULT, 129600)?;
+    let duration = long_term_session_duration(q, root_issuer)?;
     let session_policy = session_policy(q)?;
     let creds = Credentials::generate(duration);
     let federated_arn = format!("arn:aws:sts::{account}:federated-user/{name}");
@@ -674,7 +685,7 @@ mod tests {
         let sessions = SessionStore::new();
         let q = QueryRequest::parse(b"Action=GetFederationToken");
         assert!(matches!(
-            get_federation_token(&sessions, "1", &q),
+            get_federation_token(&sessions, "1", &q, false),
             Err(IamStsError::ValidationError(_))
         ));
     }

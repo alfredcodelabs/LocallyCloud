@@ -6,6 +6,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::error::ApiGwError;
+use crate::integration_timeout::IntegrationTimeout;
 use crate::logging::{http_stage_logging, preflight};
 use crate::store::{gen_id, ApiV2Record};
 use crate::v1::Ctx;
@@ -617,14 +618,7 @@ fn validate_integration(
         )));
     }
     if let Some(timeout) = body.get("timeoutInMillis") {
-        let timeout = timeout
-            .as_u64()
-            .ok_or_else(|| ApiGwError::BadRequest("timeoutInMillis must be an integer".into()))?;
-        if !(50..=30_000).contains(&timeout) {
-            return Err(ApiGwError::BadRequest(
-                "timeoutInMillis must be between 50 and 30000".into(),
-            ));
-        }
+        IntegrationTimeout::for_v2_protocol(protocol).validate(timeout)?;
     }
     let uri = body
         .get("integrationUri")
@@ -670,7 +664,7 @@ fn integration_value(body: &Value, protocol: &str, id: String) -> Value {
         "integrationUri": body.get("integrationUri").cloned().unwrap_or(Value::Null),
         "integrationMethod": body.get("integrationMethod").cloned().unwrap_or(Value::Null),
         "connectionType": body.get("connectionType").and_then(Value::as_str).unwrap_or("INTERNET"),
-        "timeoutInMillis": body.get("timeoutInMillis").cloned().unwrap_or(json!(30000)),
+        "timeoutInMillis": IntegrationTimeout::for_v2_protocol(protocol).of(body),
     });
     copy_fields(&mut integration, body, INTEGRATION_FIELDS);
     if protocol == "HTTP" && integration.get("payloadFormatVersion").is_none() {

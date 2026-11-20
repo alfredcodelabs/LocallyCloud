@@ -3481,7 +3481,7 @@ mod jwt_authorizer_e2e {
         let backend = spawn_backend().await;
         let mut h = ApiGwHandler::new(std::sync::Weak::new());
         h.http = crate::http_integration::HttpIntegrationClient::new(
-            std::slice::from_ref(&backend),
+            &[backend.clone(), issuer.clone()],
             &[],
         )
         .unwrap();
@@ -3511,7 +3511,7 @@ mod jwt_authorizer_e2e {
         let backend = spawn_backend().await;
         let mut h = ApiGwHandler::new(std::sync::Weak::new());
         h.http = crate::http_integration::HttpIntegrationClient::new(
-            std::slice::from_ref(&backend),
+            &[backend.clone(), issuer.clone()],
             &[],
         )
         .unwrap();
@@ -3526,7 +3526,7 @@ mod jwt_authorizer_e2e {
         let backend = spawn_backend().await;
         let mut h = ApiGwHandler::new(std::sync::Weak::new());
         h.http = crate::http_integration::HttpIntegrationClient::new(
-            std::slice::from_ref(&backend),
+            &[backend.clone(), issuer.clone()],
             &[],
         )
         .unwrap();
@@ -3551,7 +3551,7 @@ mod jwt_authorizer_e2e {
         let backend = spawn_backend().await;
         let mut h = ApiGwHandler::new(std::sync::Weak::new());
         h.http = crate::http_integration::HttpIntegrationClient::new(
-            std::slice::from_ref(&backend),
+            &[backend.clone(), issuer.clone()],
             &[],
         )
         .unwrap();
@@ -3576,7 +3576,7 @@ mod jwt_authorizer_e2e {
         let backend = spawn_backend().await;
         let mut h = ApiGwHandler::new(std::sync::Weak::new());
         h.http = crate::http_integration::HttpIntegrationClient::new(
-            std::slice::from_ref(&backend),
+            &[backend.clone(), issuer.clone()],
             &[],
         )
         .unwrap();
@@ -3601,7 +3601,7 @@ mod jwt_authorizer_e2e {
         let backend = spawn_backend().await;
         let mut h = ApiGwHandler::new(std::sync::Weak::new());
         h.http = crate::http_integration::HttpIntegrationClient::new(
-            std::slice::from_ref(&backend),
+            &[backend.clone(), issuer.clone()],
             &[],
         )
         .unwrap();

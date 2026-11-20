@@ -17,6 +17,13 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::model::FunctionStore;
+
+/// A stream batch stays under the synchronous invoke payload limit, keeping headroom for the
+/// invocation envelope.
+const STREAM_BATCH_MAX_BYTES: usize =
+    locallycloud_core::integration::lambda::MAX_SYNC_PAYLOAD_BYTES - 16 * 1024;
+/// Wait between stream reads while a batching window is still open.
+const STREAM_BATCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 use async_trait::async_trait;
 use axum::body::to_bytes;
 use bytes::Bytes;

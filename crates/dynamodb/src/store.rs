@@ -1238,7 +1238,7 @@ mod tests {
     #[tokio::test]
     async fn persistence_errors_do_not_expose_source_paths_or_values() {
         let marker = "/owned/private/host-path-secret";
-        let response = persist_error(marker).into_response("owned-request");
+        let response = persist_error(marker).into_response("owned-request", None);
         assert_eq!(response.status(), 500);
         let body = axum::body::to_bytes(response.into_body(), 2048)
             .await

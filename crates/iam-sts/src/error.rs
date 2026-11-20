@@ -69,7 +69,12 @@ impl IamStsError {
 
     /// Render to an Axum response as the Query/XML error envelope in the service's
     /// XML namespace (`IAM_XMLNS` for IAM, `STS_XMLNS` for STS).
-    pub fn into_response(self, request_id: &str, xmlns: &'static str) -> axum::response::Response {
+    pub fn into_response(
+        self,
+        request_id: &str,
+        xmlns: &'static str,
+        operation: Option<&str>,
+    ) -> axum::response::Response {
         let service = if xmlns == crate::query::STS_XMLNS {
             "sts"
         } else {
@@ -77,7 +82,7 @@ impl IamStsError {
         };
         locallycloud_core::observability::log_service_error(
             service,
-            None,
+            operation,
             request_id,
             self.code(),
             self.http_status(),
@@ -115,8 +120,11 @@ mod tests {
 
     #[test]
     fn renders_query_xml_envelope() {
-        let resp = IamStsError::NoSuchEntity("user nope not found".into())
-            .into_response("req-1", crate::query::IAM_XMLNS);
+        let resp = IamStsError::NoSuchEntity("user nope not found".into()).into_response(
+            "req-1",
+            crate::query::IAM_XMLNS,
+            None,
+        );
         assert_eq!(resp.status(), 404);
         assert_eq!(
             resp.headers().get("content-type").unwrap(),

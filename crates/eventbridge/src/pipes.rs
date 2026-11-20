@@ -142,11 +142,68 @@ fn pipe_tags(body: &Value) -> BTreeMap<String, String> {
         })
         .collect()
 }
+/// Pause between pipe source polls, and after a failed poll.
+const SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Kinesis stream retention when DescribeStream omits it (AWS default: 24 hours).
+const KINESIS_DEFAULT_RETENTION_HOURS: f64 = 24.0;
+
+/// The kind of pipe source, parsed once from the source ARN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipeSource {
+    Sqs,
+    Kinesis,
+    DynamoDbStream,
+}
+
+impl PipeSource {
+    pub(crate) fn of(arn: &str) -> Option<Self> {
+        if arn.contains(":sqs:") {
+            Some(Self::Sqs)
+        } else if arn.contains(":dynamodb:") && arn.contains("/stream/") {
+            Some(Self::DynamoDbStream)
+        } else if arn.contains(":kinesis:") && arn.contains(":stream/") {
+            Some(Self::Kinesis)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn is_stream(self) -> bool {
+        !matches!(self, Self::Sqs)
+    }
+
+    /// AWS maximum `BatchSize` for the source.
+    pub(crate) fn max_batch_size(self) -> i64 {
+        match self {
+            Self::Sqs => 10,
+            Self::Kinesis | Self::DynamoDbStream => 10_000,
+        }
+    }
+
+    /// The `SourceParameters` member that holds this source's settings.
+    pub(crate) fn parameters_container(self) -> &'static str {
+        match self {
+            Self::Sqs => "SqsQueueParameters",
+            Self::Kinesis => "KinesisStreamParameters",
+            Self::DynamoDbStream => "DynamoDBStreamParameters",
+        }
+    }
+
+    /// Internal-dispatch service and `X-Amz-Target` for a stream read operation.
+    fn stream_api(self, operation: &str) -> Option<(&'static str, String)> {
+        match self {
+            Self::Kinesis => Some(("kinesis", format!("Kinesis_20131202.{operation}"))),
+            Self::DynamoDbStream => {
+                Some(("dynamodb", format!("DynamoDBStreams_20120810.{operation}")))
+            }
+            Self::Sqs => None,
+        }
+    }
+}
+
 fn validate_source(value: &str) -> Result<(), PipesError> {
-    if value.contains(":sqs:")
-        || value.contains(":dynamodb:") && value.contains("/stream/")
-        || value.contains(":kinesis:") && value.contains(":stream/")
-    {
+    if PipeSource::of(value).is_some() {
         Ok(())
     } else {
         Err(PipesError::Validation(
@@ -214,7 +271,8 @@ fn validate_filters(parameters: &Value) -> Result<(), PipesError> {
 fn validate_source_parameters(source: &str, parameters: &Value) -> Result<(), PipesError> {
     pipe_stream::validate_parameters(source, parameters)?;
     let batch = find_number(parameters, "BatchSize");
-    if source.contains(":sqs:") {
+    let kind = PipeSource::of(source);
+    if kind == Some(PipeSource::Sqs) {
         if batch.is_some_and(|value| !(1..=10).contains(&value)) {
             return Err(PipesError::Validation(
                 "SQS BatchSize must be between 1 and 10".into(),
@@ -228,7 +286,7 @@ fn validate_source_parameters(source: &str, parameters: &Value) -> Result<(), Pi
         ));
     }
     if let Some(position) = find_string(parameters, "StartingPosition") {
-        let valid = if source.contains(":dynamodb:") {
+        let valid = if kind == Some(PipeSource::DynamoDbStream) {
             matches!(position, "TRIM_HORIZON" | "LATEST")
         } else {
             matches!(position, "TRIM_HORIZON" | "LATEST" | "AT_TIMESTAMP")
@@ -700,7 +758,7 @@ impl PipesService {
                 let Some(registry) = registry.upgrade() else {
                     break;
                 };
-                if current.source.contains(":kinesis:") || current.source.contains(":dynamodb:") {
+                if PipeSource::of(&current.source).is_some_and(PipeSource::is_stream) {
                     pipe_stream::run_round(
                         registry.clone(),
                         store.clone(),
@@ -710,35 +768,16 @@ impl PipesService {
                         account.clone(),
                     )
                     .await;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tokio::time::sleep(SOURCE_POLL_INTERVAL).await;
                     continue;
                 }
                 let batch = match poll_source(&registry, &current, &region, &account).await {
                     Ok(batch) => batch,
                     Err(()) => {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        tokio::time::sleep(SOURCE_POLL_INTERVAL).await;
                         continue;
                     }
                 };
-                if current.source.contains(":kinesis:") || current.source.contains(":dynamodb:") {
-                    let mut state = scope.write().await;
-                    let Some(stored) = state
-                        .pipes
-                        .get(&item.name)
-                        .filter(|stored| stored.generation == item.generation)
-                    else {
-                        break;
-                    };
-                    let mut updated = stored.clone();
-                    updated.source_creation_timestamp = batch.source_creation_timestamp;
-                    updated.source_cursor = batch.source_cursor;
-                    if pipe_persistence::save(store.state_db(), &account, &region, &updated)
-                        .is_err()
-                    {
-                        break;
-                    }
-                    state.pipes.insert(item.name.clone(), updated);
-                }
                 for record in &batch.records {
                     if !process_record(
                         &registry,
@@ -779,7 +818,7 @@ impl PipesService {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(SOURCE_POLL_INTERVAL).await;
             }
         });
         if let Ok(mut workers) = self.workers.lock() {
@@ -832,7 +871,6 @@ struct PolledRecord {
 struct PollBatch {
     records: Vec<PolledRecord>,
     source_creation_timestamp: Option<f64>,
-    source_cursor: usize,
 }
 
 async fn poll_source(
@@ -841,7 +879,8 @@ async fn poll_source(
     region: &str,
     account: &str,
 ) -> Result<PollBatch, ()> {
-    if pipe.source.contains(":sqs:") {
+    let kind = PipeSource::of(&pipe.source).ok_or(())?;
+    if kind == PipeSource::Sqs {
         let name = pipe.source.rsplit(':').next().ok_or(())?;
         let queue_region = pipe.source.split(':').nth(3).unwrap_or(region);
         let queue_account = pipe.source.split(':').nth(4).unwrap_or(account);
@@ -883,25 +922,25 @@ async fn poll_source(
         return Ok(PollBatch {
             records,
             source_creation_timestamp: None,
-            source_cursor: 0,
         });
     }
 
-    let mut source_retention_seconds = 24.0 * 3600.0;
-    let source_creation_timestamp = if pipe.source.contains(":kinesis:") {
+    let mut source_retention_seconds = KINESIS_DEFAULT_RETENTION_HOURS * 3600.0;
+    let source_creation_timestamp = if kind == PipeSource::Kinesis {
+        let (service, target) = kind.stream_api("DescribeStream").ok_or(())?;
         let description = dispatch_json(
             registry,
             pipe,
             account,
-            "kinesis",
-            "Kinesis_20131202.DescribeStream",
+            service,
+            &target,
             json!({"StreamName":kinesis_stream_name(&pipe.source).ok_or(())?}),
             region,
         )
         .await?;
         source_retention_seconds = description["StreamDescription"]["RetentionPeriodHours"]
             .as_f64()
-            .unwrap_or(24.0)
+            .unwrap_or(KINESIS_DEFAULT_RETENTION_HOURS)
             * 3600.0;
         let observed = description["StreamDescription"]["StreamCreationTimestamp"]
             .as_f64()
@@ -920,12 +959,7 @@ async fn poll_source(
     if shards.is_empty() {
         return Err(());
     }
-    let next_cursor = (pipe.source_cursor + 1) % shards.len();
-    let (service, target) = if pipe.source.contains(":kinesis:") {
-        ("kinesis", "Kinesis_20131202.GetRecords")
-    } else {
-        ("dynamodb", "DynamoDBStreams_20120810.GetRecords")
-    };
+    let (service, target) = kind.stream_api("GetRecords").ok_or(())?;
     let mut records = Vec::new();
     for shard in shards
         .iter()
@@ -953,7 +987,7 @@ async fn poll_source(
             .unwrap_or(1) as usize;
         loop {
             let response = dispatch_json(
-            registry, pipe, account, service, target,
+            registry, pipe, account, service, &target,
             json!({"ShardIterator":cursor,"Limit":limit.saturating_sub(records.len() as u64).max(1)}), region,
         ).await?;
             for payload in response
@@ -964,7 +998,7 @@ async fn poll_source(
                 .cloned()
             {
                 let sequence = stream_sequence(pipe, &payload).ok_or(())?.to_string();
-                let payload = if pipe.source.contains(":kinesis:") {
+                let payload = if kind == PipeSource::Kinesis {
                     json!({"kinesisSchemaVersion":"1.0","partitionKey":payload["PartitionKey"],"sequenceNumber":sequence,
                     "data":payload["Data"],"approximateArrivalTimestamp":payload["ApproximateArrivalTimestamp"],
                     "eventSource":"aws:kinesis","eventVersion":"1.0","eventID":format!("{shard}:{sequence}"),
@@ -1007,7 +1041,6 @@ async fn poll_source(
     Ok(PollBatch {
         records,
         source_creation_timestamp,
-        source_cursor: next_cursor,
     })
 }
 
@@ -1017,12 +1050,9 @@ async fn discover_stream_shards(
     region: &str,
     account: &str,
 ) -> Result<Vec<String>, ()> {
-    let kinesis = pipe.source.contains(":kinesis:");
-    let (service, target) = if kinesis {
-        ("kinesis", "Kinesis_20131202.DescribeStream")
-    } else {
-        ("dynamodb", "DynamoDBStreams_20120810.DescribeStream")
-    };
+    let kind = PipeSource::of(&pipe.source).ok_or(())?;
+    let kinesis = kind == PipeSource::Kinesis;
+    let (service, target) = kind.stream_api("DescribeStream").ok_or(())?;
     let mut shards = Vec::new();
     let mut exclusive_start: Option<String> = None;
     loop {
@@ -1035,7 +1065,7 @@ async fn discover_stream_shards(
             request["ExclusiveStartShardId"] = json!(shard);
         }
         let description =
-            dispatch_json(registry, pipe, account, service, target, request, region).await?;
+            dispatch_json(registry, pipe, account, service, &target, request, region).await?;
         let page = stream_shard_ids(&description)?;
         let next = if kinesis {
             if description
@@ -1072,12 +1102,9 @@ async fn create_stream_iterator(
     account: &str,
     shard_id: &str,
 ) -> Result<String, ()> {
-    let kinesis = pipe.source.contains(":kinesis:");
-    let (service, target) = if kinesis {
-        ("kinesis", "Kinesis_20131202.GetShardIterator")
-    } else {
-        ("dynamodb", "DynamoDBStreams_20120810.GetShardIterator")
-    };
+    let kind = PipeSource::of(&pipe.source).ok_or(())?;
+    let kinesis = kind == PipeSource::Kinesis;
+    let (service, target) = kind.stream_api("GetShardIterator").ok_or(())?;
     let mut request = if kinesis {
         json!({"StreamName":kinesis_stream_name(&pipe.source).ok_or(())?,"ShardId":shard_id})
     } else {
@@ -1103,7 +1130,7 @@ async fn create_stream_iterator(
                 .ok_or(())?;
         }
     }
-    dispatch_json(registry, pipe, account, service, target, request, region)
+    dispatch_json(registry, pipe, account, service, &target, request, region)
         .await?
         .get("ShardIterator")
         .and_then(Value::as_str)
@@ -1119,7 +1146,7 @@ fn kinesis_stream_name(arn: &str) -> Option<&str> {
 }
 
 fn stream_sequence<'a>(pipe: &Pipe, record: &'a Value) -> Option<&'a str> {
-    if pipe.source.contains(":kinesis:") {
+    if PipeSource::of(&pipe.source)? == PipeSource::Kinesis {
         record.get("SequenceNumber").and_then(Value::as_str)
     } else {
         record

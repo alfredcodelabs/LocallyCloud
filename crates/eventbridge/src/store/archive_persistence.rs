@@ -9,7 +9,7 @@ fn archive_cutoff(retention_days: i64) -> Option<i64> {
     }
     OffsetDateTime::now_utc()
         .checked_sub(time::Duration::seconds(
-            retention_days.saturating_mul(86_400),
+            retention_days.saturating_mul(crate::model::SECONDS_PER_DAY),
         ))
         .and_then(|time| i64::try_from(time.unix_timestamp_nanos()).ok())
 }
@@ -365,8 +365,10 @@ impl EbStore {
             .ok_or_else(|| format!("Archive {name} does not exist"))?
             .retention_days;
         let cutoff = if retention > 0 {
-            now.checked_sub(time::Duration::seconds(retention.saturating_mul(86_400)))
-                .and_then(|time| i64::try_from(time.unix_timestamp_nanos()).ok())
+            now.checked_sub(time::Duration::seconds(
+                retention.saturating_mul(crate::model::SECONDS_PER_DAY),
+            ))
+            .and_then(|time| i64::try_from(time.unix_timestamp_nanos()).ok())
         } else {
             None
         };

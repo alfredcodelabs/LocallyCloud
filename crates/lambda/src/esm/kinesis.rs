@@ -159,7 +159,7 @@ impl BatchSource for KinesisBatchSource {
                 let body = json!({"eventID":format!("{shard}:{sequence}"),"eventName":"aws:kinesis:record","eventVersion":"1.0","awsRegion":self.region,
                     "kinesis":{"kinesisSchemaVersion":"1.0","partitionKey":record["PartitionKey"],"sequenceNumber":sequence,"data":record["Data"],"approximateArrivalTimestamp":record["ApproximateArrivalTimestamp"]}});
                 bytes += body.to_string().len();
-                if bytes > 6 * 1024 * 1024 - 16 * 1024 {
+                if bytes > super::STREAM_BATCH_MAX_BYTES {
                     full = true;
                     break;
                 }
@@ -181,7 +181,7 @@ impl BatchSource for KinesisBatchSource {
             };
             iterator = next.to_string();
             tokio::time::sleep_until(
-                (tokio::time::Instant::now() + Duration::from_millis(200)).min(deadline),
+                (tokio::time::Instant::now() + super::STREAM_BATCH_POLL_INTERVAL).min(deadline),
             )
             .await;
         }

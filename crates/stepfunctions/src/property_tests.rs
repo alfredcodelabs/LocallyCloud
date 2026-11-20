@@ -299,7 +299,7 @@ proptest! {
         runtime().block_on(async move {
             let error = error_for(index, message.clone());
             let expected_code = error.code();
-            let (status, body) = response_body(error.into_response("request-id")).await;
+            let (status, body) = response_body(error.into_response("request-id", None)).await;
             assert_eq!(status, 400);
             assert_eq!(body["__type"], expected_code);
             assert_eq!(body["message"], message);

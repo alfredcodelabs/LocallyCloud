@@ -116,7 +116,7 @@ impl NativeHandler for SfnHandler {
             Some(o) => o,
             None => {
                 return SfnError::UnknownOperation("missing or invalid X-Amz-Target".into())
-                    .into_response(&request.request_id)
+                    .into_response(&request.request_id, None)
             }
         };
         let body: Value = if request.body.is_empty() {
@@ -126,7 +126,7 @@ impl NativeHandler for SfnHandler {
                 Ok(v) => v,
                 Err(e) => {
                     return SfnError::Validation(format!("invalid JSON body: {e}"))
-                        .into_response(&request.request_id)
+                        .into_response(&request.request_id, Some(op.as_ref()))
                 }
             }
         };
@@ -138,7 +138,7 @@ impl NativeHandler for SfnHandler {
             request_id: &request.request_id,
         };
         let Some(registry) = self.registry.upgrade() else {
-            return SfnError::AccessDenied.into_response(&request.request_id);
+            return SfnError::AccessDenied.into_response(&request.request_id, Some(op.as_ref()));
         };
         let configuration_write = matches!(
             op.as_str(),
@@ -172,17 +172,17 @@ impl NativeHandler for SfnHandler {
         };
         if !self.store.healthy() {
             return SfnError::Internal("Step Functions durable state is unavailable".into())
-                .into_response(&request.request_id);
+                .into_response(&request.request_id, Some(op.as_ref()));
         }
         if let Err(error) =
             authorization::authorize_with_tags(&registry, &self.store, &request, &op, &body).await
         {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, Some(op.as_ref()));
         }
         if let Err(error) =
             authorization::authorize_role_assignment(&registry, &request, &op, &body)
         {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, Some(op.as_ref()));
         }
         let mut commit_guard = configuration_write.then(|| ConfigurationCommit {
             store: &self.store,
@@ -212,7 +212,7 @@ impl NativeHandler for SfnHandler {
         }
         match result {
             Ok(value) => json_response(value),
-            Err(err) => err.into_response(&request.request_id),
+            Err(err) => err.into_response(&request.request_id, Some(op.as_ref())),
         }
     }
 }

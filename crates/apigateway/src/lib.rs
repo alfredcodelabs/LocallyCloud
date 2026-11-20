@@ -11,6 +11,7 @@ mod endpoint;
 pub mod error;
 pub mod execute;
 mod http_integration;
+mod integration_timeout;
 pub mod logging;
 pub mod proxy_event;
 mod resource_policy;

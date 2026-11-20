@@ -325,6 +325,9 @@ Start each session with `node .agents/skills/findbrief/scripts/findbrief.mjs bri
 Project skills live in `.agents/skills/`:
 
 - `findbrief` — exact files, history and reasons from a local index of git and the source tree.
+- `taskbrief` — working memory shared by sessions and agents: where each task stopped, live
+  findings and who holds what. Use it when the user asks where we were or what another session is
+  doing, and to record next steps, detours and handoffs.
 - `conditional-dispatch` — when writing or reviewing dispatch, mappings, validations, state
   transitions, or growing `if`/`else` chains.
 - `security-audit` — SAST, DAST and dependency auditing when requested, for sensitive security

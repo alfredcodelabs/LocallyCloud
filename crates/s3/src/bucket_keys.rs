@@ -14,6 +14,11 @@ use crate::{
     ops::{kms_call, kms_error, Ctx},
 };
 
+/// Budget for one internal KMS call made on behalf of an S3 request.
+pub(crate) const KMS_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a cached S3 Bucket Key data key is reused before KMS is asked again.
+const BUCKET_KEY_TTL: Duration = Duration::from_secs(300);
+
 #[derive(Clone)]
 pub(crate) struct BucketKey {
     pub plain: Arc<SensitiveBytes>,
@@ -93,7 +98,7 @@ async fn validate_cached(
                 encryption_context: context.clone(),
                 action,
             },
-            Duration::from_secs(3),
+            KMS_CALL_TIMEOUT,
         )
         .await;
     match (action, result) {
@@ -132,7 +137,7 @@ pub(crate) async fn for_write(
                 number_of_bytes: 32,
                 encryption_context: context.clone(),
             },
-            Duration::from_secs(3),
+            KMS_CALL_TIMEOUT,
         )
         .await
         .map_err(kms_error)?;
@@ -140,7 +145,7 @@ pub(crate) async fn for_write(
         plain: Arc::new(output.plaintext),
         wrapped: output.ciphertext.into_vec(),
         key_arn: output.key_id,
-        expires: Instant::now() + Duration::from_secs(300),
+        expires: Instant::now() + BUCKET_KEY_TTL,
     };
     ctx.store.bucket_keys.insert(cache_key, entry.clone())?;
     Ok(entry)
@@ -170,7 +175,7 @@ pub(crate) async fn for_read(
                 ciphertext: SensitiveBytes::new(wrapped.to_vec()),
                 encryption_context: context.clone(),
             },
-            Duration::from_secs(3),
+            KMS_CALL_TIMEOUT,
         )
         .await
         .map_err(kms_error)?;
@@ -181,7 +186,7 @@ pub(crate) async fn for_read(
             plain: plain.clone(),
             wrapped: wrapped.to_vec(),
             key_arn: output.key_id,
-            expires: Instant::now() + Duration::from_secs(300),
+            expires: Instant::now() + BUCKET_KEY_TTL,
         },
     )?;
     Ok(plain)
@@ -462,7 +467,7 @@ mod tests {
             plain: Arc::new(SensitiveBytes::new(vec![7; 32])),
             wrapped: vec![9; 64],
             key_arn: "key".into(),
-            expires: Instant::now() + Duration::from_secs(300),
+            expires: Instant::now() + BUCKET_KEY_TTL,
         };
         for index in 0..300 {
             cache.insert(index.to_string(), entry.clone()).unwrap();

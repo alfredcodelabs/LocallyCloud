@@ -376,7 +376,7 @@ pub(crate) async fn encrypt_body(
                         number_of_bytes: 32,
                         encryption_context: context.clone(),
                     },
-                    std::time::Duration::from_secs(3),
+                    crate::bucket_keys::KMS_CALL_TIMEOUT,
                 )
                 .await
                 .map_err(kms_error)?;
@@ -453,7 +453,7 @@ pub(crate) async fn open_body(
                     ciphertext: SensitiveBytes::new(encrypted.wrapped_key.clone()),
                     encryption_context: context,
                 },
-                std::time::Duration::from_secs(3),
+                crate::bucket_keys::KMS_CALL_TIMEOUT,
             )
             .await
             .map_err(kms_error)?

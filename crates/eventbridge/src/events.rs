@@ -21,13 +21,18 @@ use crate::delivery::{self, DeliveryRequest};
 use crate::error::EventsError;
 use crate::http_client::{form_encode, HttpClient, HttpError, HttpRequest};
 use crate::model::{
-    ApiDestination, Archive, ArchivedEvent, Connection, EventBus, Replay, RetryPolicy, Rule, Target,
+    ApiDestination, Archive, ArchivedEvent, Connection, EventBus, Replay, RetryPolicy, Rule,
+    Target, SECONDS_PER_DAY,
 };
 use crate::pattern;
 use crate::schedule::{self, Clock};
 use crate::schemas;
 use crate::store::{EbStore, PendingFanout};
 use crate::transform::{self, Context, InputMode};
+
+/// Pause before retrying a pending rule delivery or replay batch that could not complete.
+pub(crate) const PENDING_DELIVERY_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
 
 #[derive(Clone, Copy, Default)]
 pub(crate) enum ProducerScope {
@@ -290,7 +295,7 @@ fn prune_archive(archive: &mut Archive, now: OffsetDateTime) {
     if archive.retention_days == 0 {
         return;
     }
-    let retention = time::Duration::seconds(archive.retention_days.saturating_mul(86_400));
+    let retention = time::Duration::seconds(archive.retention_days.saturating_mul(SECONDS_PER_DAY));
     let Some(cutoff) = now.checked_sub(retention) else {
         return;
     };
@@ -1067,8 +1072,16 @@ fn parse_target(value: &Value) -> Result<Target, EventsError> {
             .as_object()
             .ok_or_else(|| EventsError::Validation("RetryPolicy must be an object".into()))?;
         for (field, minimum, maximum) in [
-            ("MaximumRetryAttempts", 0, 185),
-            ("MaximumEventAgeInSeconds", 60, 86400),
+            (
+                "MaximumRetryAttempts",
+                0,
+                u64::from(RetryPolicy::MAX_RETRY_ATTEMPTS),
+            ),
+            (
+                "MaximumEventAgeInSeconds",
+                RetryPolicy::MIN_EVENT_AGE_SECS,
+                RetryPolicy::MAX_EVENT_AGE_SECS,
+            ),
         ] {
             if object.get(field).is_some_and(|value| {
                 value
@@ -1094,7 +1107,7 @@ fn parse_target(value: &Value) -> Result<Target, EventsError> {
     let maximum_attempts = retry_value
         .get("MaximumRetryAttempts")
         .and_then(Value::as_u64)
-        .unwrap_or(185)
+        .unwrap_or(u64::from(RetryPolicy::MAX_RETRY_ATTEMPTS))
         .min(u64::from(u32::MAX)) as u32;
     Ok(Target {
         id,
@@ -1109,7 +1122,7 @@ fn parse_target(value: &Value) -> Result<Target, EventsError> {
             maximum_age_seconds: retry_value
                 .get("MaximumEventAgeInSeconds")
                 .and_then(Value::as_u64)
-                .or(Some(86400)),
+                .or(Some(RetryPolicy::MAX_EVENT_AGE_SECS)),
         },
         dead_letter_arn: value
             .get("DeadLetterConfig")
@@ -2035,7 +2048,7 @@ impl EventsService {
                             }
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(PENDING_DELIVERY_RETRY_INTERVAL).await;
                 }
             }
             match store
@@ -2642,7 +2655,7 @@ impl EventsService {
                 if !deliver_pending_rule(&store, &registry, http.as_ref(), &account, &region, &rule)
                     .await
                 {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(PENDING_DELIVERY_RETRY_INTERVAL).await;
                     continue;
                 }
                 if !rule.enabled() {
@@ -2802,9 +2815,9 @@ async fn deliver_pending_rule(
             let max_age = snapshot
                 .targets
                 .iter()
-                .map(|target| target.retry.maximum_age_seconds.unwrap_or(86_400))
+                .map(|target| target.retry.effective_max_age_secs())
                 .max()
-                .unwrap_or(86_400);
+                .unwrap_or(RetryPolicy::MAX_EVENT_AGE_SECS);
             let outer_limit = snapshot
                 .targets
                 .iter()
@@ -2817,16 +2830,16 @@ async fn deliver_pending_rule(
                     {
                         1
                     } else {
-                        185
+                        RetryPolicy::MAX_RETRY_ATTEMPTS
                     }
                 })
                 .max()
-                .unwrap_or(185);
+                .unwrap_or(RetryPolicy::MAX_RETRY_ATTEMPTS);
             let now_ns = OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
             let attempts = store
                 .firing_attempts("rule", &rule.arn, due_ns)
                 .unwrap_or(0);
-            let exhausted = attempts + 1 >= outer_limit
+            let exhausted = attempts + 1 >= i64::from(outer_limit)
                 || now_ns.saturating_sub(due_ns) >= (max_age as i64).saturating_mul(1_000_000_000);
             let result = if exhausted {
                 store.terminal_firing("rule", &rule.arn, due_ns, "retry policy exhausted")
@@ -2926,7 +2939,7 @@ async fn deliver_event_target(
     request.retry_second = Some(
         store
             .retry_second
-            .unwrap_or(std::time::Duration::from_secs(1)),
+            .unwrap_or(delivery::UNSCALED_RETRY_SECOND),
     );
     if target.arn.split(':').nth(2) == Some("logs") {
         return delivery::deliver_logs(registry, &request, region, account, rule_name, correlation)
@@ -2967,8 +2980,7 @@ async fn deliver_event_target(
         let mut delivered = false;
         if let Some((destination, connection)) = configuration {
             for attempt in 0..=target.retry.maximum_attempts {
-                let remaining = delivery::remaining_age(&request)
-                    .unwrap_or(std::time::Duration::from_secs(86400));
+                let remaining = delivery::remaining_age_or_max(&request);
                 if remaining.is_zero() {
                     break;
                 }
@@ -2987,10 +2999,8 @@ async fn deliver_event_target(
                     ApiDelivery::RetriableFailure | ApiDelivery::RetryAfter(_)
                         if attempt < target.retry.maximum_attempts =>
                     {
-                        let delay = api_retry_delay(&request, attempt + 1, &outcome).min(
-                            delivery::remaining_age(&request)
-                                .unwrap_or(std::time::Duration::from_secs(86400)),
-                        );
+                        let delay = api_retry_delay(&request, attempt + 1, &outcome)
+                            .min(delivery::remaining_age_or_max(&request));
                         tokio::time::sleep(delay).await;
                     }
                     ApiDelivery::RetriableFailure | ApiDelivery::RetryAfter(_) => break,
@@ -3039,10 +3049,10 @@ fn api_retry_delay(
     let ApiDelivery::RetryAfter(seconds) = outcome else {
         return backoff;
     };
+    let retry_after = (*seconds).min(RetryPolicy::MAX_EVENT_AGE_SECS);
     let requested = request
-        .retry_second
-        .unwrap_or(std::time::Duration::from_secs(1))
-        .saturating_mul(u32::try_from((*seconds).min(86_400)).unwrap_or(86_400));
+        .retry_clock_second()
+        .saturating_mul(u32::try_from(retry_after).unwrap_or(u32::MAX));
     backoff.max(requested)
 }
 

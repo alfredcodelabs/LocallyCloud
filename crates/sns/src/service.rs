@@ -462,9 +462,20 @@ mod tests {
     }
 
     async fn sns_json(h: &Arc<dyn NativeHandler>, op: &str, body: Value) -> Value {
-        let resp = h
-            .handle(json_req("AmazonSimpleNotificationService", op, body))
-            .await;
+        service_json(h, "AmazonSimpleNotificationService", op, body).await
+    }
+
+    async fn sqs_json(h: &Arc<dyn NativeHandler>, op: &str, body: Value) -> Value {
+        service_json(h, "AmazonSQS", op, body).await
+    }
+
+    async fn service_json(
+        h: &Arc<dyn NativeHandler>,
+        target_prefix: &str,
+        op: &str,
+        body: Value,
+    ) -> Value {
+        let resp = h.handle(json_req(target_prefix, op, body)).await;
         let (status, body) = body_of(resp).await;
         assert_eq!(status, 200, "op {op} failed: {body}");
         serde_json::from_str(&body).unwrap()
@@ -475,7 +486,7 @@ mod tests {
         let reg = registry();
         let sns = handler(&reg, "sns");
         let sqs = handler(&reg, "sqs");
-        let queue = sns_json(
+        let queue = sqs_json(
             &sqs,
             "CreateQueue",
             json!({"QueueName":"restricted-subscription"}),
@@ -490,7 +501,7 @@ mod tests {
         )
         .await;
         let topic_arn = topic["TopicArn"].as_str().unwrap();
-        sns_json(&sqs,"SetQueueAttributes",json!({"QueueUrl":url,"Attributes":{"Policy":json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},"Action":"sqs:SendMessage","Resource":queue_arn,"Condition":{"ArnEquals":{"aws:SourceArn":topic_arn},"StringEquals":{"aws:SourceAccount":"000000000000"}}},{"Effect":"Allow","Principal":"*","Action":"sqs:ReceiveMessage","Resource":queue_arn}]}).to_string()}})).await;
+        sqs_json(&sqs,"SetQueueAttributes",json!({"QueueUrl":url,"Attributes":{"Policy":json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},"Action":"sqs:SendMessage","Resource":queue_arn,"Condition":{"ArnEquals":{"aws:SourceArn":topic_arn},"StringEquals":{"aws:SourceAccount":"000000000000"}}},{"Effect":"Allow","Principal":"*","Action":"sqs:ReceiveMessage","Resource":queue_arn}]}).to_string()}})).await;
         assert_eq!(
             sqs.handle(json_req(
                 "AmazonSQS",
@@ -750,7 +761,7 @@ mod tests {
         ));
 
         let sqs = handler(&reg, "sqs");
-        let queue = sns_json(&sqs, "CreateQueue", json!({ "QueueName": "replay-queue" })).await;
+        let queue = sqs_json(&sqs, "CreateQueue", json!({ "QueueName": "replay-queue" })).await;
         let queue_url = queue["QueueUrl"].as_str().unwrap();
         crate::register_with_state(&reg, state.clone()).unwrap();
         let delivered = receive_sqs(&sqs, queue_url).await;
@@ -1110,7 +1121,7 @@ mod tests {
         let reg = registry();
         let sns = handler(&reg, "sns");
         let sqs = handler(&reg, "sqs");
-        let queue = sns_json(
+        let queue = sqs_json(
             &sqs,
             "CreateQueue",
             json!({ "QueueName": "orders.fifo", "Attributes": { "FifoQueue": "true" } }),
@@ -1146,7 +1157,7 @@ mod tests {
 
         let mut received = Value::Null;
         for _ in 0..50 {
-            received = sns_json(
+            received = sqs_json(
                 &sqs,
                 "ReceiveMessage",
                 json!({ "QueueUrl": queue["QueueUrl"], "MaxNumberOfMessages": 10 }),
@@ -1168,7 +1179,7 @@ mod tests {
         let reg = registry();
         let sns = handler(&reg, "sns");
         let sqs = handler(&reg, "sqs");
-        let queue = sns_json(
+        let queue = sqs_json(
             &sqs,
             "CreateQueue",
             json!({ "QueueName": "concurrent.fifo", "Attributes": { "FifoQueue": "true" } }),
@@ -1229,7 +1240,7 @@ mod tests {
 
         let mut delivered = Vec::new();
         for _ in 0..200 {
-            let result = sns_json(
+            let result = sqs_json(
                 &sqs,
                 "ReceiveMessage",
                 json!({ "QueueUrl": queue_url, "MaxNumberOfMessages": 1 }),
@@ -1242,7 +1253,7 @@ mod tests {
                 let envelope: Value =
                     serde_json::from_str(received["Body"].as_str().unwrap()).unwrap();
                 delivered.push(envelope["Message"].as_str().unwrap().to_string());
-                sns_json(
+                sqs_json(
                     &sqs,
                     "DeleteMessage",
                     json!({

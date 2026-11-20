@@ -22,6 +22,14 @@ use crate::model::{RetryPolicy, Target};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeliveryFailure;
 
+/// One second of the retry clock when no `retry_time_scale` shortens it.
+pub(crate) const UNSCALED_RETRY_SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+/// Longest retry backoff, in retry-clock seconds.
+const MAX_BACKOFF_RETRY_SECONDS: u32 = 3600;
+/// Fixed backoff for deliveries without a retry clock (internal re-dispatch).
+const UNCLOCKED_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_millis(25);
+const UNCLOCKED_BACKOFF_MAXIMUM: std::time::Duration = std::time::Duration::from_millis(800);
+
 #[derive(Debug, Clone)]
 pub struct DeliveryRequest {
     pub source_service: &'static str,
@@ -37,6 +45,13 @@ pub struct DeliveryRequest {
     pub retry_second: Option<std::time::Duration>,
 }
 
+impl DeliveryRequest {
+    /// One second of this request's retry clock.
+    pub(crate) fn retry_clock_second(&self) -> std::time::Duration {
+        self.retry_second.unwrap_or(UNSCALED_RETRY_SECOND)
+    }
+}
+
 impl From<(&Target, String)> for DeliveryRequest {
     fn from((target, payload): (&Target, String)) -> Self {
         Self {
@@ -50,7 +65,7 @@ impl From<(&Target, String)> for DeliveryRequest {
             retry: target.retry.clone(),
             dead_letter_arn: target.dead_letter_arn.clone(),
             scheduled_at: None,
-            retry_second: Some(std::time::Duration::from_secs(1)),
+            retry_second: Some(UNSCALED_RETRY_SECOND),
         }
     }
 }
@@ -183,7 +198,7 @@ pub(crate) async fn deliver_logs(
     let mut delivered = false;
     if !event_expired(request, OffsetDateTime::now_utc()) {
         for attempt in 0..attempts {
-            let remaining = remaining_age(request).unwrap_or(std::time::Duration::from_secs(86400));
+            let remaining = remaining_age_or_max(request);
             if remaining.is_zero() {
                 break;
             }
@@ -238,9 +253,9 @@ pub(crate) async fn deliver_logs(
                     break;
                 }
                 Err(error) if retriable_sink_error(&error) && attempt + 1 < attempts => {
-                    let delay = retry_backoff(request).delay(attempt + 1).min(
-                        remaining_age(request).unwrap_or(std::time::Duration::from_secs(86400)),
-                    );
+                    let delay = retry_backoff(request)
+                        .delay(attempt + 1)
+                        .min(remaining_age_or_max(request));
                     tokio::time::sleep(delay).await;
                     if event_expired(request, OffsetDateTime::now_utc()) {
                         break;
@@ -380,23 +395,32 @@ pub(crate) fn retry_backoff(request: &DeliveryRequest) -> RetryBackoff {
     match request.retry_second {
         Some(second) => RetryBackoff {
             initial: second,
-            maximum: second.saturating_mul(3600),
+            maximum: second.saturating_mul(MAX_BACKOFF_RETRY_SECONDS),
             jitter: true,
         },
         None => RetryBackoff {
-            initial: std::time::Duration::from_millis(25),
-            maximum: std::time::Duration::from_millis(800),
+            initial: UNCLOCKED_BACKOFF_INITIAL,
+            maximum: UNCLOCKED_BACKOFF_MAXIMUM,
             jitter: false,
         },
     }
 }
 
+/// Remaining event age, or the AWS maximum event age when the request has no age limit.
+pub(crate) fn remaining_age_or_max(request: &DeliveryRequest) -> std::time::Duration {
+    remaining_age(request).unwrap_or(std::time::Duration::from_secs(
+        RetryPolicy::MAX_EVENT_AGE_SECS,
+    ))
+}
+
 pub(crate) fn remaining_age(request: &DeliveryRequest) -> Option<std::time::Duration> {
     let accepted = request.scheduled_at?;
-    let age = request
-        .retry_second
-        .unwrap_or(std::time::Duration::from_secs(1))
-        .mul_f64(request.retry.maximum_age_seconds?.min(86400) as f64);
+    let age = request.retry_clock_second().mul_f64(
+        request
+            .retry
+            .maximum_age_seconds?
+            .min(RetryPolicy::MAX_EVENT_AGE_SECS) as f64,
+    );
     let elapsed = (OffsetDateTime::now_utc() - accepted)
         .as_seconds_f64()
         .max(0.0);
@@ -465,9 +489,8 @@ fn event_expired(request: &DeliveryRequest, now: OffsetDateTime) -> bool {
         return false;
     };
     let age = request
-        .retry_second
-        .unwrap_or(std::time::Duration::from_secs(1))
-        .mul_f64(maximum_age.min(86400) as f64);
+        .retry_clock_second()
+        .mul_f64(maximum_age.min(RetryPolicy::MAX_EVENT_AGE_SECS) as f64);
     (now - timestamp).as_seconds_f64() >= age.as_secs_f64()
 }
 

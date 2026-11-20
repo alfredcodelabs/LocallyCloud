@@ -399,21 +399,21 @@ impl NativeHandler for DynamoHandler {
                 return DdbError::UnknownOperation(
                     "invalid or missing DynamoDB X-Amz-Target".into(),
                 )
-                .into_response(&request.request_id)
+                .into_response(&request.request_id, None)
             }
         };
         let body = match parse_body(&request) {
             Ok(body) => body,
-            Err(err) => return err.into_response(&request.request_id),
+            Err(err) => return err.into_response(&request.request_id, Some(op.as_str())),
         };
         if let Err(error) = authorize(&self.registry, &request, &op, &body) {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, Some(op.as_str()));
         }
         let gate = self.store.operation_gate.clone().lock_owned().await;
         let gate = if self.store.has_uncommitted() {
             match self.store.persist_locked(gate).await {
                 Ok(gate) => gate,
-                Err(err) => return err.into_response(&request.request_id),
+                Err(err) => return err.into_response(&request.request_id, Some(op.as_str())),
             }
         } else {
             gate
@@ -448,14 +448,14 @@ impl NativeHandler for DynamoHandler {
             .await;
         if !read_only || self.store.has_dirty_items().await {
             if let Err(err) = self.store.persist_locked(gate).await {
-                return err.into_response(&request.request_id);
+                return err.into_response(&request.request_id, Some(op.as_str()));
             }
         } else if may_mutate {
             self.store.clear_uncommitted();
         }
         match result {
             Ok(value) => json_response(value),
-            Err(err) => err.into_response(&request.request_id),
+            Err(err) => err.into_response(&request.request_id, Some(op.as_str())),
         }
     }
 }
@@ -469,12 +469,12 @@ impl NativeHandler for StreamsHandler {
                 return DdbError::UnknownOperation(
                     "invalid or missing DynamoDB Streams X-Amz-Target".into(),
                 )
-                .into_response(&request.request_id)
+                .into_response(&request.request_id, None)
             }
         };
         let body = match parse_body(&request) {
             Ok(body) => body,
-            Err(err) => return err.into_response(&request.request_id),
+            Err(err) => return err.into_response(&request.request_id, Some(op.as_str())),
         };
         let authorization_body = match op.as_str() {
             "GetRecords" => {
@@ -484,7 +484,9 @@ impl NativeHandler for StreamsHandler {
                     .unwrap_or_default();
                 match streams::decode_iterator(iterator) {
                     Ok((arn, _)) => serde_json::json!({"StreamArn":arn}),
-                    Err(error) => return error.into_response(&request.request_id),
+                    Err(error) => {
+                        return error.into_response(&request.request_id, Some(op.as_str()))
+                    }
                 }
             }
             "DescribeStream" | "GetShardIterator" => {
@@ -496,17 +498,17 @@ impl NativeHandler for StreamsHandler {
             if let Err(error) =
                 streams::validate_stream_scope(&request.account_id, &request.region, arn)
             {
-                return error.into_response(&request.request_id);
+                return error.into_response(&request.request_id, Some(op.as_str()));
             }
         }
         if let Err(error) = authorize(&self.registry, &request, &op, &authorization_body) {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, Some(op.as_str()));
         }
         let gate = self.store.operation_gate.clone().lock_owned().await;
         let gate = if self.store.has_uncommitted() {
             match self.store.persist_locked(gate).await {
                 Ok(gate) => gate,
-                Err(err) => return err.into_response(&request.request_id),
+                Err(err) => return err.into_response(&request.request_id, Some(op.as_str())),
             }
         } else {
             gate
@@ -524,7 +526,7 @@ impl NativeHandler for StreamsHandler {
         };
         match result {
             Ok(value) => json_response(value),
-            Err(err) => err.into_response(&request.request_id),
+            Err(err) => err.into_response(&request.request_id, Some(op.as_str())),
         }
     }
 }

@@ -306,7 +306,7 @@ impl BatchSource for DynamoDbBatchSource {
                     return Err("Invalid DynamoDB sequence".into());
                 }
                 bytes += record.to_string().len() + self.mapping.event_source_arn.len() + 64;
-                if bytes > 6 * 1024 * 1024 - 16 * 1024 {
+                if bytes > super::STREAM_BATCH_MAX_BYTES {
                     full = true;
                     break;
                 }
@@ -328,7 +328,7 @@ impl BatchSource for DynamoDbBatchSource {
             };
             iterator = next.into();
             tokio::time::sleep_until(
-                (tokio::time::Instant::now() + Duration::from_millis(200)).min(deadline),
+                (tokio::time::Instant::now() + super::STREAM_BATCH_POLL_INTERVAL).min(deadline),
             )
             .await;
         }

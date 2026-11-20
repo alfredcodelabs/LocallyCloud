@@ -61,10 +61,14 @@ impl CfnError {
         !matches!(self, CfnError::Internal)
     }
 
-    pub fn into_response(self, request_id: &str) -> axum::response::Response {
+    pub fn into_response(
+        self,
+        request_id: &str,
+        operation: Option<&str>,
+    ) -> axum::response::Response {
         locallycloud_core::observability::log_service_error(
             "cloudformation",
-            None,
+            operation,
             request_id,
             self.code(),
             self.http_status(),

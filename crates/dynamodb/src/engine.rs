@@ -502,7 +502,7 @@ impl NativeHandler for EngineHandler {
                 return DdbError::UnknownOperation(
                     "operation is not supported by the optional DynamoDB engine".into(),
                 )
-                .into_response(&request.request_id);
+                .into_response(&request.request_id, None);
             }
         };
         if matches!(
@@ -517,7 +517,7 @@ impl NativeHandler for EngineHandler {
             return DdbError::UnknownOperation(
                 "backups are not supported by this DynamoDB engine".into(),
             )
-            .into_response(&request.request_id);
+            .into_response(&request.request_id, Some(op.as_str()));
         }
         if matches!(
             op.as_str(),
@@ -527,18 +527,18 @@ impl NativeHandler for EngineHandler {
             return DdbError::UnknownOperation(
                 "point-in-time recovery is not supported by this DynamoDB engine".into(),
             )
-            .into_response(&request.request_id);
+            .into_response(&request.request_id, Some(op.as_str()));
         }
         let body = match service::parse_body(&request) {
             Ok(body) => body,
-            Err(error) => return error.into_response(&request.request_id),
+            Err(error) => return error.into_response(&request.request_id, Some(op.as_str())),
         };
         if let Err(error) = validate_account_region(&request) {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, Some(op.as_str()));
         }
         let authorization_body = match self.authorization_body(&request, &op, &body).await {
             Ok(body) => body,
-            Err(error) => return error.into_response(&request.request_id),
+            Err(error) => return error.into_response(&request.request_id, Some(op.as_str())),
         };
         if let Err(error) = validate_scope(
             &request,
@@ -550,7 +550,7 @@ impl NativeHandler for EngineHandler {
         .and_then(|()| validate_encryption(&op, &authorization_body, self.engine.as_ref()))
         .and_then(|()| service::authorize(&self.registry, &request, &op, &authorization_body))
         {
-            return error.into_response(&request.request_id);
+            return error.into_response(&request.request_id, Some(op.as_str()));
         }
         self.engine.handle(request).await
     }
@@ -579,7 +579,7 @@ mod tests {
         async fn handle(&self, request: ServiceRequest) -> Response {
             let request_id = request.request_id.clone();
             self.calls.lock().unwrap().push(request);
-            DdbError::Internal("engine is unavailable".into()).into_response(&request_id)
+            DdbError::Internal("engine is unavailable".into()).into_response(&request_id, None)
         }
     }
 

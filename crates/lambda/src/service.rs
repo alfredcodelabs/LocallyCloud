@@ -1740,9 +1740,9 @@ fn map_internal_lambda_error(error: LambdaError) -> LambdaInternalError {
     }
 }
 
-/// AWS synchronous / asynchronous invocation payload caps.
-const MAX_SYNC_PAYLOAD: usize = 6 * 1024 * 1024;
-const MAX_ASYNC_PAYLOAD: usize = 1024 * 1024;
+use locallycloud_core::integration::lambda::{
+    MAX_ASYNC_PAYLOAD_BYTES as MAX_ASYNC_PAYLOAD, MAX_SYNC_PAYLOAD_BYTES as MAX_SYNC_PAYLOAD,
+};
 
 fn validate_async_payload(payload: &[u8]) -> Result<(), LambdaError> {
     if payload.len() > MAX_ASYNC_PAYLOAD {

@@ -1046,13 +1046,16 @@ impl NativeHandler for IamHandler {
         let action = match q.action() {
             Some(a) => a.to_string(),
             None => {
-                return IamStsError::MissingAction("Action is required".into())
-                    .into_response(&request.request_id, IAM_XMLNS)
+                return IamStsError::MissingAction("Action is required".into()).into_response(
+                    &request.request_id,
+                    IAM_XMLNS,
+                    None,
+                )
             }
         };
         self.state.default_iam_user(&request, &action, &mut q);
         if let Err(error) = self.state.authorize_iam(&request, &action, &q) {
-            return error.into_response(&request.request_id, IAM_XMLNS);
+            return error.into_response(&request.request_id, IAM_XMLNS, Some(action.as_str()));
         }
         let result = if action.starts_with("Get")
             || action.starts_with("List")
@@ -1088,7 +1091,7 @@ impl NativeHandler for IamHandler {
                 &body,
                 &request.request_id,
             )),
-            Err(e) => e.into_response(&request.request_id, IAM_XMLNS),
+            Err(e) => e.into_response(&request.request_id, IAM_XMLNS, Some(action.as_str())),
         }
     }
 }
@@ -1100,8 +1103,11 @@ impl NativeHandler for StsHandler {
         let action = match q.action() {
             Some(a) => a.to_string(),
             None => {
-                return IamStsError::MissingAction("Action is required".into())
-                    .into_response(&request.request_id, STS_XMLNS)
+                return IamStsError::MissingAction("Action is required".into()).into_response(
+                    &request.request_id,
+                    STS_XMLNS,
+                    None,
+                )
             }
         };
         let caller_key = access_key_id_from_auth(&request);
@@ -1119,7 +1125,7 @@ impl NativeHandler for StsHandler {
             _ => self.state.enforce(&request, "sts", &action, "*"),
         };
         if let Err(e) = authorization {
-            return e.into_response(&request.request_id, STS_XMLNS);
+            return e.into_response(&request.request_id, STS_XMLNS, Some(action.as_str()));
         }
         let state = self.state.clone();
         let account = request.account_id.clone();
@@ -1136,7 +1142,7 @@ impl NativeHandler for StsHandler {
                 &body,
                 &request.request_id,
             )),
-            Err(e) => e.into_response(&request.request_id, STS_XMLNS),
+            Err(e) => e.into_response(&request.request_id, STS_XMLNS, Some(action.as_str())),
         }
     }
 }
@@ -1328,7 +1334,11 @@ fn dispatch_sts(
             }
             sts::get_session_token(sessions, account, q)
         }
-        "GetFederationToken" => sts::get_federation_token(sessions, account, q),
+        "GetFederationToken" => {
+            let root_issuer =
+                caller_key.is_some_and(|key| store.root_for_key(account, key).is_some());
+            sts::get_federation_token(sessions, account, q, root_issuer)
+        }
         "DecodeAuthorizationMessage" => sts::decode_authorization_message(q),
         other => Err(IamStsError::InvalidAction(format!(
             "unsupported STS action {other}"

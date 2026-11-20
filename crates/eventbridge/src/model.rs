@@ -10,6 +10,21 @@ pub struct RetryPolicy {
     pub maximum_age_seconds: Option<u64>,
 }
 
+impl RetryPolicy {
+    /// AWS maximum, and default, of `MaximumRetryAttempts`.
+    pub const MAX_RETRY_ATTEMPTS: u32 = 185;
+    /// AWS bounds of `MaximumEventAgeInSeconds`; the maximum (24 hours) is the default.
+    pub const MIN_EVENT_AGE_SECS: u64 = 60;
+    pub const MAX_EVENT_AGE_SECS: u64 = 86_400;
+
+    pub fn effective_max_age_secs(&self) -> u64 {
+        self.maximum_age_seconds.unwrap_or(Self::MAX_EVENT_AGE_SECS)
+    }
+}
+
+/// Archive `RetentionDays` are converted with this many seconds per day.
+pub const SECONDS_PER_DAY: i64 = 86_400;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Target {
     pub id: String,

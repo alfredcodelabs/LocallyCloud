@@ -1250,7 +1250,7 @@ fn validate_execution_name(name: &str) -> Result<(), SfnError> {
 }
 
 fn validate_payload_size(value: &Value) -> Result<(), SfnError> {
-    if serde_json::to_vec(value).map_or(true, |payload| payload.len() > 256 * 1024) {
+    if serde_json::to_vec(value).map_or(true, |payload| payload.len() > crate::MAX_PAYLOAD_BYTES) {
         return Err(SfnError::Validation(
             "Execution input exceeds the 256 KiB limit".into(),
         ));
@@ -2053,13 +2053,13 @@ pub async fn get_activity_task(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnErr
 pub async fn send_task_success(ctx: &Ctx<'_>, v: &Value) -> Result<Value, SfnError> {
     let token = req_str(v, "taskToken")?;
     let output_text = req_str(v, "output")?;
-    if output_text.len() > 256 * 1024 {
+    if output_text.len() > crate::MAX_PAYLOAD_BYTES {
         return Err(SfnError::Validation(
             "output exceeds the 256 KiB limit".into(),
         ));
     }
     let output: Value = serde_json::from_str(output_text)
-        .map_err(|_| SfnError::Validation("output is not valid JSON".into()))?;
+        .map_err(|_| SfnError::InvalidOutput("output is not valid JSON".into()))?;
     let task = ctx.pending_task(token)?;
     let mut outcome = task.outcome.lock().await;
     if ctx.store.get_pending_task(token).is_none() || outcome.is_some() {

@@ -139,44 +139,7 @@ fn validate_topic_attributes(attributes: &BTreeMap<String, String>) -> Result<()
 }
 
 fn validate_delivery_policy(value: &str) -> Result<(), SnsError> {
-    let policy: serde_json::Value = serde_json::from_str(value)
-        .map_err(|_| SnsError::InvalidParameter("DeliveryPolicy is not valid JSON".into()))?;
-    let root = policy
-        .as_object()
-        .ok_or_else(|| SnsError::InvalidParameter("DeliveryPolicy must be a JSON object".into()))?;
-    if root.keys().any(|key| key != "healthyRetryPolicy") {
-        return Err(SnsError::InvalidParameter(
-            "DeliveryPolicy contains unsupported fields".into(),
-        ));
-    }
-    let healthy = root
-        .get("healthyRetryPolicy")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            SnsError::InvalidParameter("DeliveryPolicy requires healthyRetryPolicy".into())
-        })?;
-    if healthy
-        .keys()
-        .any(|key| key != "numRetries" && key != "minDelayTarget")
-    {
-        return Err(SnsError::InvalidParameter(
-            "DeliveryPolicy contains unsupported retry fields".into(),
-        ));
-    }
-    let retries = healthy
-        .get("numRetries")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(3);
-    let delay = healthy
-        .get("minDelayTarget")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    if retries > 100 || delay > 3600 {
-        return Err(SnsError::InvalidParameter(
-            "DeliveryPolicy retry values are out of range".into(),
-        ));
-    }
-    Ok(())
+    crate::delivery_policy::RetryPolicy::parse(value).map(|_| ())
 }
 
 fn redrive_target(value: &str) -> Result<String, SnsError> {
@@ -389,7 +352,7 @@ pub async fn get_topic_attributes(ctx: &Ctx<'_>, input: &Input) -> Result<Reply,
     attrs.insert("SubscriptionsDeleted".into(), "0".into());
     attrs
         .entry("EffectiveDeliveryPolicy".into())
-        .or_insert_with(|| "{\"http\":{\"defaultHealthyRetryPolicy\":{\"numRetries\":3}}}".into());
+        .or_insert_with(crate::delivery_policy::RetryPolicy::default_effective_topic_policy);
     attrs
         .entry("Policy".into())
         .or_insert_with(|| default_policy(&state.arn, ctx.account));

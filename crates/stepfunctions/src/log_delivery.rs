@@ -368,7 +368,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-                let response = error.into_response("delivery-failure");
+                let response = error.into_response("delivery-failure", None);
                 assert_eq!(
                     response.status().as_u16(),
                     expected,

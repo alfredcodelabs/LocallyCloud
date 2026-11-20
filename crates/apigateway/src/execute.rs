@@ -22,6 +22,7 @@ use locallycloud_core::registry::ServiceRegistry;
 use locallycloud_wafv2::{WafDecision, WafEvaluator, WafRequest};
 
 use crate::error::InvokeFailure;
+use crate::integration_timeout;
 
 use crate::auth::{
     policy_allows, policy_decision, valid_rest_authorizer_policy, AuthOutcome, JwtConfig,
@@ -1589,7 +1590,7 @@ async fn jwt_authorize(
         .collect();
     match ctx
         .validator
-        .authorize_scoped(&token, &cfg, &scopes, ctx.account, ctx.region)
+        .authorize_scoped(ctx.http, &token, &cfg, &scopes, ctx.account, ctx.region)
         .await
     {
         AuthOutcome::Allow { claims, scopes } => Ok(AuthContext {
@@ -1860,7 +1861,7 @@ async fn lambda_authorize(
         ctx,
         function,
         Bytes::from(event.to_string()),
-        29_000,
+        integration_timeout::LAMBDA_AUTHORIZER_MS,
         &source_arn,
         authorizer
             .get("authorizerCredentials")
@@ -2171,7 +2172,7 @@ async fn execute_http_integration(
                 ctx,
                 &function,
                 Bytes::from(event.to_string()),
-                timeout_ms(integration),
+                integration_timeout::HTTP.of(integration),
                 &integration_source_arn(ctx, &request),
                 integration
                     .get("credentials")
@@ -2523,11 +2524,10 @@ async fn invoke_aws_native(
     })
 }
 
+/// Stored integrations always carry `timeoutInMillis`; the REST default covers rows written
+/// before it was persisted.
 fn timeout_ms(integration: &Value) -> u64 {
-    integration
-        .get("timeoutInMillis")
-        .and_then(Value::as_u64)
-        .unwrap_or(29_000)
+    integration_timeout::REST.of(integration)
 }
 
 struct RawIntegrationResponse {

@@ -143,10 +143,14 @@ impl DdbError {
     }
 
     /// Render to an Axum response as the JSON 1.0 error shape.
-    pub fn into_response(self, request_id: &str) -> axum::response::Response {
+    pub fn into_response(
+        self,
+        request_id: &str,
+        operation: Option<&str>,
+    ) -> axum::response::Response {
         log_service_error(
             "dynamodb",
-            None,
+            operation,
             request_id,
             self.exception(),
             self.http_status(),
@@ -215,7 +219,7 @@ mod tests {
     async fn internal_faults_keep_server_classification_in_batch_and_json() {
         let error = DdbError::Internal("DynamoDB storage is unavailable".into());
         assert_eq!(error.batch_code(), "InternalServerError");
-        let response = error.into_response("owned-request");
+        let response = error.into_response("owned-request", None);
         assert_eq!(response.status(), 500);
         assert_eq!(
             response.headers()["content-type"],
@@ -239,7 +243,7 @@ mod tests {
             CancellationReason::none(),
             CancellationReason::new("ConditionalCheckFailed", Some("nope".into())),
         ]);
-        let resp = err.into_response("rid");
+        let resp = err.into_response("rid", None);
         assert_eq!(resp.status(), 400);
     }
 }

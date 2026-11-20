@@ -20,7 +20,7 @@ use crate::protocol::{
 use crate::store::LogsStore;
 use crate::subscription_delivery::lambda_call;
 
-const MAX_FILTERS_PER_GROUP: usize = 2;
+const MAX_FILTERS_PER_GROUP: usize = 5;
 const MAX_REGEX_PER_GROUP: usize = 5;
 const MAX_DESCRIBE_LIMIT: u16 = 50;
 

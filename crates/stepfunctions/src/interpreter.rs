@@ -3917,7 +3917,7 @@ enum Attempt {
 }
 
 fn validate_state_payload_size(value: &Value) -> Result<(), AslError> {
-    if serde_json::to_vec(value).map_or(true, |payload| payload.len() > 256 * 1024) {
+    if serde_json::to_vec(value).map_or(true, |payload| payload.len() > crate::MAX_PAYLOAD_BYTES) {
         return Err(AslError::new(
             "States.DataLimitExceeded",
             "state input or output exceeds the 256 KiB limit",

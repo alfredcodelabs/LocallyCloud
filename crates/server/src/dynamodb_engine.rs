@@ -1096,7 +1096,7 @@ impl NativeHandler for WorkerPool {
 
 async fn error_reply(error: DdbError) -> Reply {
     // Reuse the service's protocol renderer instead of maintaining another AWS error map.
-    let response = error.into_response("");
+    let response = error.into_response("", None);
     let status = response.status().as_u16();
     let body = axum::body::to_bytes(response.into_body(), 4096)
         .await
@@ -1137,9 +1137,9 @@ fn engine_response(request_id: &str, result: Result<(u16, Value), DdbError>) -> 
         {
             Ok(response) => response,
             Err(_) => DdbError::Internal("could not encode engine response".into())
-                .into_response(request_id),
+                .into_response(request_id, None),
         },
-        Err(error) => error.into_response(request_id),
+        Err(error) => error.into_response(request_id, None),
     }
 }
 

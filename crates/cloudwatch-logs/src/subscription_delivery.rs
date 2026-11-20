@@ -23,7 +23,7 @@ use crate::model::{PendingSubscriptionDelivery, ScopeKey, StoredEvent};
 use crate::store::LogsStore;
 
 const DELIVERY_BATCH_SIZE: usize = 100;
-const MAX_ASYNC_PAYLOAD_BYTES: usize = 256 * 1024;
+use locallycloud_core::integration::lambda::MAX_ASYNC_PAYLOAD_BYTES;
 
 pub struct SubscriptionDeliveryWorker {
     retry_interval: std::time::Duration,

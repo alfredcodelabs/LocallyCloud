@@ -6,6 +6,9 @@
 //! EventBridge/Lambda). JSONata, Distributed Map, activities/callbacks, and versions/aliases
 //! are additive layers.
 
+/// AWS maximum size of execution input/output and state payloads (256 KiB).
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
+
 pub mod asl;
 mod authorization;
 pub mod choice;

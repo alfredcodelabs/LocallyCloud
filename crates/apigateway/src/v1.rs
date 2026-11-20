@@ -10,6 +10,7 @@ use locallycloud_core::registry::ServiceRegistry;
 use serde_json::{json, Value};
 
 use crate::error::ApiGwError;
+use crate::integration_timeout;
 use crate::logging::{preflight, rest_stage_logging};
 use crate::store::{gen_id, ApiGwStore, RestApiRecord};
 
@@ -632,14 +633,7 @@ pub async fn put_integration(
         ));
     }
     if let Some(timeout) = body.get("timeoutInMillis") {
-        let timeout = timeout
-            .as_u64()
-            .ok_or_else(|| ApiGwError::BadRequest("timeoutInMillis must be an integer".into()))?;
-        if !(50..=29_000).contains(&timeout) {
-            return Err(ApiGwError::BadRequest(
-                "timeoutInMillis must be between 50 and 29000".into(),
-            ));
-        }
+        integration_timeout::REST.validate(timeout)?;
     }
     for key in [
         "requestTemplates",
@@ -673,7 +667,7 @@ pub async fn put_integration(
         "cacheKeyParameters": body.get("cacheKeyParameters").cloned().unwrap_or(json!([])),
         "passthroughBehavior": body.get("passthroughBehavior").and_then(Value::as_str).unwrap_or("WHEN_NO_MATCH"),
         "contentHandling": body.get("contentHandling").cloned().unwrap_or(Value::Null),
-        "timeoutInMillis": body.get("timeoutInMillis").and_then(Value::as_i64).unwrap_or(29000),
+        "timeoutInMillis": integration_timeout::REST.of(body),
         "tlsConfig": body.get("tlsConfig").cloned().unwrap_or(Value::Null),
         "requestParameters": body.get("requestParameters").cloned().unwrap_or(json!({})),
         "requestTemplates": body.get("requestTemplates").cloned().unwrap_or(json!({})),

@@ -38,7 +38,7 @@ impl Parameters {
             "BatchSize",
             100,
             1,
-            if source.contains(":sqs:") { 10 } else { 10_000 },
+            PipeSource::of(source).map_or(10_000, PipeSource::max_batch_size),
         )? as usize;
         integer(parameters, "MaximumBatchingWindowInSeconds", 0, 0, 300)?;
         let parallel = integer(parameters, "ParallelizationFactor", 1, 1, 10)? as usize;
@@ -68,13 +68,9 @@ pub(super) fn validate_parameters(source: &str, parameters: &Value) -> Result<()
             "SourceParameters must be an object".into(),
         ));
     }
-    let container = if source.contains(":kinesis:") {
-        "KinesisStreamParameters"
-    } else if source.contains(":dynamodb:") {
-        "DynamoDBStreamParameters"
-    } else {
-        "SqsQueueParameters"
-    };
+    let container = PipeSource::of(source)
+        .unwrap_or(PipeSource::Sqs)
+        .parameters_container();
     if parameters
         .get(container)
         .is_some_and(|value| !value.is_object())
@@ -102,7 +98,7 @@ pub(super) fn validate_enrichment_batch(
     parameters: &Value,
     enrichment: Option<&str>,
 ) -> Result<(), PipesError> {
-    if (source.contains(":kinesis:") || source.contains(":dynamodb:"))
+    if PipeSource::of(source).is_some_and(PipeSource::is_stream)
         && enrichment.is_some_and(|arn| arn.contains(":api-destination/"))
         && find_number(parameters, "BatchSize").is_some_and(|batch| batch > 1)
     {
@@ -196,7 +192,7 @@ pub(super) async fn run_round(
                     )
                     .await;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(SOURCE_POLL_INTERVAL).await;
             }
         });
     }
@@ -615,7 +611,7 @@ async fn process_batch(
                 } else {
                     // Completion markers preserve successful items while retries traverse the source positions in order.
                     work.push_front(batch);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tokio::time::sleep(SOURCE_POLL_INTERVAL).await;
                 }
             }
             Err(failure)
@@ -653,11 +649,11 @@ async fn process_batch(
                     return completed;
                 }
                 work.push_front(batch);
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(SOURCE_POLL_INTERVAL).await;
             }
             Err(_) => {
                 work.push_front(batch);
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(SOURCE_POLL_INTERVAL).await;
             }
         }
     }

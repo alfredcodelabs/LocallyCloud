@@ -2454,7 +2454,7 @@ impl NativeHandler for CfnHandler {
             Some(op) => op,
             None => {
                 return CfnError::Validation("missing Action".into())
-                    .into_response(&request.request_id)
+                    .into_response(&request.request_id, None)
             }
         };
         if matches!(
@@ -2588,7 +2588,7 @@ impl NativeHandler for CfnHandler {
                     .body(Body::from(body))
                     .expect("xml response is valid")
             }
-            Err(err) => err.into_response(&request.request_id),
+            Err(err) => err.into_response(&request.request_id, Some(op.as_str())),
         }
     }
 }
