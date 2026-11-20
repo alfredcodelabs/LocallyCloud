@@ -10,11 +10,13 @@ use serde_json::Value;
 
 use locallycloud_core::handler::{NativeHandler, ServiceRequest};
 use locallycloud_core::integration::authorization::AuthorizationRequest;
+use locallycloud_core::integration::request_context::verified_request_context;
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, ServiceRegistry};
 use locallycloud_state::StateDb;
 
 use crate::error::DdbError;
+use crate::leading_keys::{self, PartitionKeys};
 use crate::ops::{self, Ctx};
 use crate::partiql;
 use crate::store::TableStore;
@@ -192,8 +194,9 @@ fn context<'a>(store: &'a TableStore, request: &'a ServiceRequest) -> Ctx<'a> {
     }
 }
 
-pub(crate) fn authorize(
+pub(crate) async fn authorize(
     registry: &Weak<ServiceRegistry>,
+    keys: &dyn PartitionKeys,
     request: &ServiceRequest,
     op: &str,
     body: &Value,
@@ -219,6 +222,7 @@ pub(crate) fn authorize(
         return Ok(());
     }
     for (action, table) in authorization_targets(op, body)? {
+        let leading_keys = leading_keys::values(keys, request, op, body, &action, &table).await;
         let resource = if table == "*" {
             table
         } else {
@@ -239,6 +243,14 @@ pub(crate) fn authorize(
                 table_arn
             }
         };
+        let mut context = verified_request_context(request);
+        if let Some(values) = leading_keys
+            .as_ref()
+            .ok()
+            .filter(|values| !values.is_empty())
+        {
+            context.insert(leading_keys::CONTEXT_KEY.into(), values.clone());
+        }
         evaluator
             .authorize(AuthorizationRequest {
                 request_identity: RequestIdentity {
@@ -250,11 +262,13 @@ pub(crate) fn authorize(
                 source_service: "dynamodb".into(),
                 action: format!("dynamodb:{action}"),
                 resource,
-                context: Default::default(),
+                context,
             })
             .map_err(|_| {
                 DdbError::AccessDenied(format!("not authorized to perform dynamodb:{action}"))
             })?;
+        // Never run a request whose leading keys IAM could not see.
+        leading_keys?;
     }
     Ok(())
 }
@@ -268,6 +282,30 @@ pub(crate) fn pitr_source(body: &Value) -> Result<&str, DdbError> {
             "Specify exactly one SourceTableName or SourceTableArn".into(),
         )),
     }
+}
+
+const TRANSACT_GET_ACTIONS: &[(&str, &str)] = &[("Get", "GetItem")];
+const TRANSACT_WRITE_ACTIONS: &[(&str, &str)] = &[
+    ("Put", "PutItem"),
+    ("Update", "UpdateItem"),
+    ("Delete", "DeleteItem"),
+    ("ConditionCheck", "ConditionCheckItem"),
+];
+
+/// One `TransactItems` entry: its request member and the IAM action it needs.
+pub(crate) fn transact_entry<'a>(
+    op: &str,
+    item: &'a Value,
+) -> Result<(&'a Value, &'static str), DdbError> {
+    let actions = if op == "TransactGetItems" {
+        TRANSACT_GET_ACTIONS
+    } else {
+        TRANSACT_WRITE_ACTIONS
+    };
+    actions
+        .iter()
+        .find_map(|(member, action)| item.get(*member).map(|inner| (inner, *action)))
+        .ok_or_else(|| DdbError::Validation("invalid transaction action".into()))
 }
 
 const RESTORE_DATA_ACTIONS: &[&str] = &[
@@ -338,28 +376,12 @@ pub fn authorization_targets(op: &str, body: &Value) -> Result<Vec<(String, Stri
                 .and_then(Value::as_array)
                 .ok_or_else(|| DdbError::Validation("TransactItems is required".into()))?;
             for item in items {
-                let action = if op == "TransactGetItems" {
-                    "Get"
-                } else {
-                    ["Put", "Update", "Delete", "ConditionCheck"]
-                        .iter()
-                        .find(|action| item.get(**action).is_some())
-                        .copied()
-                        .ok_or_else(|| DdbError::Validation("invalid transaction action".into()))?
-                };
-                let table = item
-                    .get(action)
-                    .and_then(|value| value.get("TableName"))
+                let (inner, action) = transact_entry(op, item)?;
+                let table = inner
+                    .get("TableName")
                     .and_then(Value::as_str)
                     .ok_or_else(|| DdbError::Validation("TableName is required".into()))?;
-                let iam_action = match action {
-                    "Get" => "GetItem",
-                    "Put" => "PutItem",
-                    "Update" => "UpdateItem",
-                    "Delete" => "DeleteItem",
-                    _ => "ConditionCheckItem",
-                };
-                targets.push((iam_action.into(), table.into()));
+                targets.push((action.into(), table.into()));
             }
         }
         "ExecuteStatement" | "ExecuteTransaction" | "BatchExecuteStatement" => {
@@ -406,7 +428,9 @@ impl NativeHandler for DynamoHandler {
             Ok(body) => body,
             Err(err) => return err.into_response(&request.request_id, Some(op.as_str())),
         };
-        if let Err(error) = authorize(&self.registry, &request, &op, &body) {
+        if let Err(error) =
+            authorize(&self.registry, self.store.as_ref(), &request, &op, &body).await
+        {
             return error.into_response(&request.request_id, Some(op.as_str()));
         }
         let gate = self.store.operation_gate.clone().lock_owned().await;
@@ -501,7 +525,15 @@ impl NativeHandler for StreamsHandler {
                 return error.into_response(&request.request_id, Some(op.as_str()));
             }
         }
-        if let Err(error) = authorize(&self.registry, &request, &op, &authorization_body) {
+        if let Err(error) = authorize(
+            &self.registry,
+            self.store.as_ref(),
+            &request,
+            &op,
+            &authorization_body,
+        )
+        .await
+        {
             return error.into_response(&request.request_id, Some(op.as_str()));
         }
         let gate = self.store.operation_gate.clone().lock_owned().await;

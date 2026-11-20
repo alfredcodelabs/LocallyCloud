@@ -19,6 +19,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::DdbError;
 use crate::ops::{self, Ctx};
+use crate::value::AttributeValue;
 
 // ============================ public entry points ==============================
 
@@ -255,10 +256,7 @@ enum Stmt {
 }
 
 /// Parse once for IAM before any statement in a batch can mutate data.
-pub(crate) fn authorization_targets(
-    op: &str,
-    request: &Value,
-) -> Result<Vec<(String, String)>, DdbError> {
+fn authorization_statements(op: &str, request: &Value) -> Result<Vec<Stmt>, DdbError> {
     let entries: Vec<&Value> = match op {
         "ExecuteStatement" => vec![request],
         "ExecuteTransaction" => request
@@ -270,7 +268,7 @@ pub(crate) fn authorization_targets(
         "BatchExecuteStatement" => batch_entries(request)?.iter().collect(),
         _ => return Ok(Vec::new()),
     };
-    let mut targets = Vec::new();
+    let mut statements = Vec::new();
     for entry in entries {
         let statement = if op == "BatchExecuteStatement" {
             batch_statement(entry)?
@@ -281,23 +279,81 @@ pub(crate) fn authorization_targets(
                 .ok_or_else(|| DdbError::Validation("Statement is required".into()))?
         };
         let params = parse_parameters(entry)?;
-        let parsed = match parse(statement, &params) {
-            Ok(parsed) => parsed,
+        match parse(statement, &params) {
+            Ok(parsed) => statements.push(parsed),
             Err(_) if op == "BatchExecuteStatement" => continue,
             Err(error) => return Err(error),
-        };
-        let target = match parsed {
-            Stmt::Insert { table, .. } => ("PartiQLInsert", table),
-            Stmt::Delete { table, .. } => ("PartiQLDelete", table),
-            Stmt::Update { table, .. } => ("PartiQLUpdate", table),
-            Stmt::Select { table, .. } => ("PartiQLSelect", table),
-        };
-        targets.push((target.0.to_string(), target.1));
+        }
     }
-    Ok(targets)
+    Ok(statements)
+}
+
+pub(crate) fn authorization_targets(
+    op: &str,
+    request: &Value,
+) -> Result<Vec<(String, String)>, DdbError> {
+    Ok(authorization_statements(op, request)?
+        .iter()
+        .map(|statement| {
+            (
+                statement.action().to_string(),
+                statement.table().to_string(),
+            )
+        })
+        .collect())
+}
+
+/// Partition values the statements for one `(action, table)` target name. A SELECT without
+/// partition equality is a scan, for which AWS supplies no leading key.
+pub(crate) fn leading_key_values(
+    op: &str,
+    request: &Value,
+    action: &str,
+    table: &str,
+    partition: &str,
+) -> Result<Vec<AttributeValue>, DdbError> {
+    let mut values = Vec::new();
+    for statement in authorization_statements(op, request)? {
+        if statement.action() != action || statement.table() != table {
+            continue;
+        }
+        let value = match &statement {
+            Stmt::Insert { item: key, .. }
+            | Stmt::Delete { key, .. }
+            | Stmt::Update { key, .. } => Some(key.get(partition).ok_or_else(|| {
+                DdbError::Validation("The provided key element does not match the schema".into())
+            })?),
+            Stmt::Select { wheres, .. } => wheres
+                .iter()
+                .find(|(attribute, operator, _)| attribute == partition && operator == "=")
+                .map(|(_, _, value)| value),
+        };
+        if let Some(value) = value {
+            values.push(AttributeValue::from_json(value)?);
+        }
+    }
+    Ok(values)
 }
 
 impl Stmt {
+    fn action(&self) -> &'static str {
+        match self {
+            Stmt::Insert { .. } => "PartiQLInsert",
+            Stmt::Delete { .. } => "PartiQLDelete",
+            Stmt::Update { .. } => "PartiQLUpdate",
+            Stmt::Select { .. } => "PartiQLSelect",
+        }
+    }
+
+    fn table(&self) -> &str {
+        match self {
+            Stmt::Insert { table, .. }
+            | Stmt::Delete { table, .. }
+            | Stmt::Update { table, .. }
+            | Stmt::Select { table, .. } => table,
+        }
+    }
+
     fn into_transact_action(self) -> Result<Value, DdbError> {
         match self {
             Stmt::Insert { table, item } => {

@@ -40,7 +40,7 @@ types are rejected; nonempty `Globals.HttpApi` settings are not supported.
 
 Some `LOCALSTACK_*` configuration aliases and `/_localstack/health` are accepted. Other LocalStack plugins may require APIs that LocallyCloud does not implement.
 
-IAM defaults to permissive mode. To test permissions, enable `LOCALLYCLOUD_IAM_ENFORCEMENT=strict` with bootstrap credentials. Lambda receives a temporary session for its role. DynamoDB evaluates direct actions and each affected table in supported batch, transaction, and PartiQL operations. The workflow with and without `dynamodb:PutItem` permission has been tested; this does not establish compatibility with all AWS policies.
+IAM defaults to permissive mode. To test permissions, enable `LOCALLYCLOUD_IAM_ENFORCEMENT=strict` with bootstrap credentials. Lambda receives a temporary session for its role. DynamoDB evaluates direct actions and each affected table in supported batch, transaction, and PartiQL operations. It supplies `dynamodb:LeadingKeys` (the partition key values) for item, Query, batch, transaction, and PartiQL requests, and none for Scan, as AWS does. The workflow with and without `dynamodb:PutItem` permission has been tested; this does not establish compatibility with all AWS policies.
 
 Strict IAM supports `ForAnyValue`/`ForAllValues` for supported operators and
 `kms:ResourceAliases` in native integrations. Unsupported operators are rejected.

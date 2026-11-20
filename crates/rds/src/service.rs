@@ -687,7 +687,7 @@ impl RdsHandler {
         let username = input.required("MasterUsername")?;
         validate_user(username)?;
         let password = input.required("MasterUserPassword")?;
-        if password.is_empty() || password.contains(['\n', '\r']) {
+        if password.contains(['\n', '\r']) {
             return Err(Error::invalid("Invalid MasterUserPassword"));
         }
         let db_name = input.get("DatabaseName").unwrap_or("postgres");
@@ -840,10 +840,7 @@ impl RdsHandler {
                 )));
             }
         }
-        let class = match input
-            .get("DBInstanceClass")
-            .filter(|value| !value.is_empty())
-        {
+        let class = match input.get("DBInstanceClass") {
             None => {
                 return Err(Error::new(
                     "MissingParameter",
@@ -1072,9 +1069,6 @@ impl RdsHandler {
         let password = input.required("MasterUserPassword")?;
         if password.contains(['\n', '\r']) {
             return Err(Error::invalid("MasterUserPassword contains a newline"));
-        }
-        if password.is_empty() {
-            return Err(Error::invalid("MasterUserPassword is empty"));
         }
         let db_name = input.get("DBName").unwrap_or("postgres");
         validate_user(db_name)?;
@@ -3206,8 +3200,14 @@ impl Input {
         }
         Self(fields)
     }
+    /// Query clients such as Terraform send unset optional members as `Key=`; AWS treats
+    /// an empty value as absent.
     fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key)?.first().map(String::as_str)
+        self.0
+            .get(key)?
+            .first()
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
     }
     fn members(&self, prefix: &str) -> Vec<String> {
         let mut members: Vec<_> = self
@@ -3234,7 +3234,6 @@ impl Input {
     }
     fn required(&self, key: &str) -> Result<&str, Error> {
         self.get(key)
-            .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::invalid(format!("Missing {key}")))
     }
 }
@@ -3265,6 +3264,35 @@ impl Error {
             .with_xml_namespace(XMLNS)
             .render(AwsProtocol::Query)
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod query_input_tests {
+    use super::*;
+
+    #[test]
+    fn empty_optional_members_are_absent() {
+        let input = Input::parse(&ServiceRequest {
+            method: axum::http::Method::POST,
+            uri: "/".parse().unwrap(),
+            headers: Default::default(),
+            body: "Action=CreateDBInstance&AllocatedStorage=20&DBInstanceClass=db.t3.micro\
+                   &DBInstanceIdentifier=probe&DBName=&Engine=postgres&EngineVersion=\
+                   &MasterUserPassword=&MasterUsername=probe"
+                .into(),
+            account_id: "000000000000".into(),
+            region: "us-east-1".into(),
+            request_id: "terraform-empty-members".into(),
+        });
+        assert_eq!(requested_version(&input).unwrap(), EngineVersion::default());
+        assert_eq!(EngineVersion::default().major(), "18");
+        assert_eq!(input.get("DBName"), None);
+        assert_eq!(input.get("Engine"), Some("postgres"));
+        assert_eq!(
+            input.required("MasterUserPassword").unwrap_err().message,
+            "Missing MasterUserPassword"
+        );
     }
 }
 

@@ -10,6 +10,7 @@ pub mod encryption;
 mod engine;
 pub mod error;
 pub mod expression;
+mod leading_keys;
 pub mod migration;
 pub mod ops;
 pub mod partiql;

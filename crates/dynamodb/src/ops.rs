@@ -1845,6 +1845,22 @@ fn stored_key_for(item: &Item, hash: &str, range: Option<&str>) -> Option<Stored
 }
 
 /// Seek only when a required partition and, for reverse reads, an exact upper bound exist.
+/// The partition value a Query's key condition requires, resolved for IAM before any read.
+pub(crate) fn query_partition_value(
+    req: &Value,
+    partition: &str,
+) -> Result<AttributeValue, DdbError> {
+    let condition = ConditionExpression::parse(
+        req_str(req, "KeyConditionExpression")?,
+        &parse_names(req)?,
+        &parse_values(req)?,
+    )?;
+    condition
+        .required_equality(partition)
+        .cloned()
+        .ok_or_else(|| DdbError::Validation("Query condition missed key schema element".into()))
+}
+
 fn base_query_bounds(
     condition: &ConditionExpression,
     hash: &str,

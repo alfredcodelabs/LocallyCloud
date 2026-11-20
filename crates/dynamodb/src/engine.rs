@@ -10,7 +10,10 @@ use locallycloud_core::registry::{AwsProtocol, ServiceMetadata, ServiceName, Ser
 use serde_json::{json, Value};
 
 use crate::error::DdbError;
+use crate::leading_keys::PartitionKeys;
 use crate::service::{self, STREAMS_TARGET_PREFIX, TARGET_PREFIX};
+
+const DESCRIBE_TABLE_LIMIT: usize = 1024 * 1024;
 
 struct EngineHandler {
     engine: Arc<dyn DynamoEngine>,
@@ -486,6 +489,72 @@ impl EngineHandler {
     }
 }
 
+/// The engine owns table metadata, so IAM reads key schemas through its DescribeTable.
+#[async_trait]
+impl PartitionKeys for EngineHandler {
+    async fn partition_key(
+        &self,
+        request: &ServiceRequest,
+        table: &str,
+        index: Option<&str>,
+    ) -> Result<String, DdbError> {
+        let mut headers = request.headers.clone();
+        headers.insert(
+            "x-amz-target",
+            http::HeaderValue::from_static("DynamoDB_20120810.DescribeTable"),
+        );
+        let response = self
+            .engine
+            .handle(ServiceRequest {
+                headers,
+                body: json!({ "TableName": table }).to_string().into(),
+                ..request.clone()
+            })
+            .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), DESCRIBE_TABLE_LIMIT)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_default();
+        if !status.is_success() {
+            let message = body["message"].as_str().unwrap_or_default().to_string();
+            return Err(
+                match body["__type"]
+                    .as_str()
+                    .and_then(|kind| kind.rsplit('#').next())
+                {
+                    Some("ResourceNotFoundException") => DdbError::ResourceNotFound(message),
+                    _ => DdbError::Internal("table key schema is unavailable".into()),
+                },
+            );
+        }
+        let schema = match index {
+            None => Some(&body["Table"]["KeySchema"]),
+            Some(name) => ["GlobalSecondaryIndexes", "LocalSecondaryIndexes"]
+                .iter()
+                .filter_map(|kind| body["Table"][kind].as_array())
+                .flatten()
+                .find(|entry| entry["IndexName"] == name)
+                .map(|entry| &entry["KeySchema"]),
+        }
+        .ok_or_else(|| {
+            DdbError::Validation(format!(
+                "index {} does not exist",
+                index.unwrap_or_default()
+            ))
+        })?;
+        schema
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|key| key["KeyType"] == "HASH")
+            .and_then(|key| key["AttributeName"].as_str())
+            .map(String::from)
+            .ok_or_else(|| DdbError::Internal("table key schema is unavailable".into()))
+    }
+}
+
 #[async_trait]
 impl NativeHandler for EngineHandler {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
@@ -548,7 +617,11 @@ impl NativeHandler for EngineHandler {
         )
         .and_then(|()| validate_pitr(&request, &op, &authorization_body))
         .and_then(|()| validate_encryption(&op, &authorization_body, self.engine.as_ref()))
-        .and_then(|()| service::authorize(&self.registry, &request, &op, &authorization_body))
+        {
+            return error.into_response(&request.request_id, Some(op.as_str()));
+        }
+        if let Err(error) =
+            service::authorize(&self.registry, self, &request, &op, &authorization_body).await
         {
             return error.into_response(&request.request_id, Some(op.as_str()));
         }
@@ -572,11 +645,15 @@ mod tests {
         pitr: bool,
         calls: Mutex<Vec<ServiceRequest>>,
         owned_encryption: bool,
+        description: Option<Value>,
     }
 
     #[async_trait]
     impl NativeHandler for Engine {
         async fn handle(&self, request: ServiceRequest) -> Response {
+            if let Some(description) = &self.description {
+                return axum::response::IntoResponse::into_response(description.to_string());
+            }
             let request_id = request.request_id.clone();
             self.calls.lock().unwrap().push(request);
             DdbError::Internal("engine is unavailable".into()).into_response(&request_id, None)
@@ -802,7 +879,13 @@ mod tests {
             },
         );
         assert_eq!(handler.handle(delegated).await.status(), 400);
-        assert!(engine.calls.lock().unwrap().is_empty());
+        // Only the key schema lookup for `dynamodb:LeadingKeys` reaches the engine.
+        assert!(engine
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| { call.headers["x-amz-target"] == "DynamoDB_20120810.DescribeTable" }));
         let evaluations = evaluator.calls.lock().unwrap();
         assert_eq!(evaluations.len(), 2);
         assert_eq!(evaluations[0].action, "dynamodb:GetItem");
@@ -812,6 +895,40 @@ mod tests {
         );
         assert!(evaluations[1].request_identity.access_key_id.is_none());
         assert!(evaluations[1].delegated_identity.is_some());
+    }
+
+    #[tokio::test]
+    async fn leading_keys_come_from_the_engine_key_schema() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let engine = Arc::new(Engine {
+            description: Some(json!({"Table":{"KeySchema":[
+                {"AttributeName":"sk","KeyType":"RANGE"},
+                {"AttributeName":"pk","KeyType":"HASH"}
+            ]}})),
+            ..Engine::default()
+        });
+        let evaluator = Arc::new(Deny::default());
+        registry.register_native_with_authorization_evaluator(
+            ServiceName::new("iam"),
+            ServiceMetadata::new(AwsProtocol::Query, None),
+            engine.clone(),
+            evaluator.clone(),
+        );
+        let mut signed = request(
+            TARGET_PREFIX,
+            "GetItem",
+            r#"{"TableName":"orders","Key":{"pk":{"S":"a"},"sk":{"N":"1"}}}"#,
+        );
+        signed.headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static(
+            "AWS4-HMAC-SHA256 Credential=AKIATEST/20261106/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=test",
+        ));
+        let handler = handler(&registry, &engine);
+        assert_eq!(handler.handle(signed).await.status(), 400);
+        let evaluations = evaluator.calls.lock().unwrap();
+        assert_eq!(
+            evaluations[0].context.get("dynamodb:leadingkeys"),
+            Some(&vec!["a".to_string()])
+        );
     }
 
     #[tokio::test]
