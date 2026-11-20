@@ -9,6 +9,7 @@ use tracing::error;
 use base64::Engine;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Uri};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use locallycloud_core::registry::ServiceRegistry;
@@ -39,23 +40,21 @@ fn req_str<'a>(req: &'a Value, field: &str) -> Result<&'a str, DdbError> {
         .ok_or_else(|| DdbError::Validation(format!("{field} is required")))
 }
 
-fn parse_names(req: &Value) -> HashMap<String, String> {
-    req.get("ExpressionAttributeNames")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
+fn parse_names(req: &Value) -> Result<HashMap<String, String>, DdbError> {
+    match req.get("ExpressionAttributeNames") {
+        Some(value) => HashMap::deserialize(value).map_err(|_| {
+            DdbError::Validation("ExpressionAttributeNames must be a string-to-string map".into())
+        }),
+        None => Ok(HashMap::new()),
+    }
 }
 
 fn parse_values(req: &Value) -> Result<HashMap<String, AttributeValue>, DdbError> {
     let mut out = HashMap::new();
-    if let Some(obj) = req
-        .get("ExpressionAttributeValues")
-        .and_then(Value::as_object)
-    {
+    if let Some(value) = req.get("ExpressionAttributeValues") {
+        let obj = value.as_object().ok_or_else(|| {
+            DdbError::Validation("ExpressionAttributeValues must be an object".into())
+        })?;
         for (k, v) in obj {
             out.insert(k.clone(), AttributeValue::from_json(v)?);
         }
@@ -175,7 +174,8 @@ fn parse_indexes(req: &Value, field: &str, global: bool) -> Result<Vec<Secondary
                 idx.get("Projection")
                     .ok_or_else(|| DdbError::Validation("index Projection required".into()))?,
             )?;
-            let (read_capacity, write_capacity) = throughput_pair(idx.get("ProvisionedThroughput"));
+            let (read_capacity, write_capacity) =
+                throughput_pair(idx.get("ProvisionedThroughput"))?;
             out.push(SecondaryIndex {
                 name,
                 key_schema,
@@ -293,17 +293,7 @@ pub async fn create_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
             "invalid BillingMode {billing_mode}"
         )));
     }
-    let (read_capacity, write_capacity) = match req.get("ProvisionedThroughput") {
-        Some(pt) => (
-            pt.get("ReadCapacityUnits")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            pt.get("WriteCapacityUnits")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        ),
-        None => (0, 0),
-    };
+    let (read_capacity, write_capacity) = throughput_pair(req.get("ProvisionedThroughput"))?;
     if billing_mode == "PAY_PER_REQUEST" && req.get("ProvisionedThroughput").is_some() {
         return Err(DdbError::Validation(
             "ProvisionedThroughput cannot be specified with PAY_PER_REQUEST billing".into(),
@@ -324,7 +314,7 @@ pub async fn create_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
                 ));
             }
             if billing_mode == "PROVISIONED" {
-                let (read, write) = throughput_pair(throughput);
+                let (read, write) = throughput_pair(throughput)?;
                 if read == 0 || write == 0 {
                     return Err(DdbError::Validation(
                         "ProvisionedThroughput is required for every GSI in PROVISIONED billing"
@@ -361,11 +351,7 @@ pub async fn create_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
         status: "ACTIVE".to_string(),
         replicas: Vec::new(),
     };
-    let tags = req
-        .get("Tags")
-        .and_then(Value::as_array)
-        .map(|a| parse_tag_list(a))
-        .unwrap_or_default();
+    let tags = parse_tag_list(req.get("Tags"))?;
     let data = TableData::new(def.clone(), tags, None, false);
     ctx.store.create(ctx.account, ctx.region, data)?;
     Ok(json!({ "TableDescription": describe(&def, 0) }))
@@ -448,12 +434,21 @@ fn parse_stream_spec(value: &Value) -> Result<StreamSpecification, DdbError> {
     })
 }
 
-fn parse_tag_list(arr: &[Value]) -> std::collections::BTreeMap<String, String> {
-    arr.iter()
-        .filter_map(|t| {
-            let k = t.get("Key").and_then(Value::as_str)?;
-            let v = t.get("Value").and_then(Value::as_str)?;
-            Some((k.to_string(), v.to_string()))
+fn parse_tag_list(
+    value: Option<&Value>,
+) -> Result<std::collections::BTreeMap<String, String>, DdbError> {
+    let Some(value) = value else {
+        return Ok(Default::default());
+    };
+    let tags = value
+        .as_array()
+        .ok_or_else(|| DdbError::Validation("Tags must be an array".into()))?;
+    tags.iter()
+        .map(|tag| {
+            Ok((
+                req_str(tag, "Key")?.to_owned(),
+                req_str(tag, "Value")?.to_owned(),
+            ))
         })
         .collect()
 }
@@ -838,13 +833,12 @@ pub async fn list_tags_of_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, 
 
 pub async fn tag_resource(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let arn = req_str(req, "ResourceArn")?;
+    let tags = parse_tag_list(Some(
+        req.get("Tags")
+            .ok_or_else(|| DdbError::Validation("Tags is required".into()))?,
+    ))?;
     let table = get_table(ctx, scoped_table_name(ctx, arn)?).await?;
-    let mut guard = table.write().await;
-    if let Some(arr) = req.get("Tags").and_then(Value::as_array) {
-        for (k, v) in parse_tag_list(arr) {
-            guard.tags.insert(k, v);
-        }
-    }
+    table.write().await.tags.extend(tags);
     Ok(json!({}))
 }
 
@@ -930,7 +924,7 @@ pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
             }
             "PROVISIONED" => {
                 let pt = req.get("ProvisionedThroughput");
-                let (r, w) = throughput_pair(pt);
+                let (r, w) = throughput_pair(pt)?;
                 if r == 0 || w == 0 {
                     return Err(DdbError::Validation(
                         "ProvisionedThroughput is required when switching to PROVISIONED billing"
@@ -950,7 +944,7 @@ pub async fn update_table(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError>
             ));
         }
         // Throughput update without a billing-mode change.
-        let (r, w) = throughput_pair(Some(pt));
+        let (r, w) = throughput_pair(Some(pt))?;
         if r == 0 || w == 0 {
             return Err(DdbError::Validation(
                 "ProvisionedThroughput requires positive read and write capacity".into(),
@@ -1144,19 +1138,22 @@ async fn update_replicas(
     Ok(json!({ "TableDescription": describe(&source.def, source.items.len()) }))
 }
 
-/// Read `(read, write)` capacity from a `ProvisionedThroughput` object (0 when absent).
-fn throughput_pair(pt: Option<&Value>) -> (u64, u64) {
-    match pt {
-        Some(pt) => (
-            pt.get("ReadCapacityUnits")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            pt.get("WriteCapacityUnits")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        ),
-        None => (0, 0),
-    }
+/// Read provisioned capacity, retaining zero only for an absent specification.
+fn throughput_pair(pt: Option<&Value>) -> Result<(u64, u64), DdbError> {
+    let Some(pt) = pt else {
+        return Ok((0, 0));
+    };
+    let units = |field: &str| {
+        pt.get(field)
+            .and_then(Value::as_u64)
+            .filter(|units| *units > 0 && *units <= i64::MAX as u64)
+            .ok_or_else(|| {
+                DdbError::Validation(format!(
+                    "ProvisionedThroughput.{field} must be a positive 64-bit integer"
+                ))
+            })
+    };
+    Ok((units("ReadCapacityUnits")?, units("WriteCapacityUnits")?))
 }
 
 /// Apply a single `GlobalSecondaryIndexUpdates` entry (Create/Update/Delete) to the table.
@@ -1193,7 +1190,7 @@ fn apply_gsi_update(def: &mut TableDefinition, update: &Value) -> Result<(), Ddb
                 .get("Projection")
                 .ok_or_else(|| DdbError::Validation("index Projection required".into()))?,
         )?;
-        let (read, write) = throughput_pair(create.get("ProvisionedThroughput"));
+        let (read, write) = throughput_pair(create.get("ProvisionedThroughput"))?;
         if (def.billing_mode == "PROVISIONED" && (read == 0 || write == 0))
             || (def.billing_mode == "PAY_PER_REQUEST"
                 && create.get("ProvisionedThroughput").is_some())
@@ -1232,7 +1229,7 @@ fn apply_gsi_update(def: &mut TableDefinition, update: &Value) -> Result<(), Ddb
             .warm_throughput
             .unwrap_or_else(|| WarmThroughput::baseline(index.read_capacity, index.write_capacity));
         if let Some(pt) = upd.get("ProvisionedThroughput") {
-            let (read, write) = throughput_pair(Some(pt));
+            let (read, write) = throughput_pair(Some(pt))?;
             if def.billing_mode != "PROVISIONED" || read == 0 || write == 0 {
                 return Err(DdbError::Validation(
                     "GSI throughput requires PROVISIONED billing and positive capacity".into(),
@@ -1299,8 +1296,8 @@ pub async fn list_tables(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> 
 
 /// Evaluate an optional `ConditionExpression` against the current (possibly empty) item.
 fn check_condition(req: &Value, current: &Item) -> Result<(), DdbError> {
+    let names = parse_names(req)?;
     if let Some(expr) = req.get("ConditionExpression").and_then(Value::as_str) {
-        let names = parse_names(req);
         let values = parse_values(req)?;
         let cond = ConditionExpression::parse(expr, &names, &values)?;
         if !cond.matches(current) {
@@ -1330,6 +1327,7 @@ fn evaluate_conditions(req: &Value, current: &Item) -> Result<(), DdbError> {
         ));
     }
     if has_expected {
+        parse_names(req)?;
         return evaluate_expected(req, current);
     }
     check_condition(req, current)
@@ -1491,10 +1489,13 @@ fn contains(present: Option<&AttributeValue>, target: Option<&AttributeValue>) -
     }
 }
 
-fn maybe_project(req: &Value, item: &Item) -> Result<Item, DdbError> {
+fn maybe_project(
+    req: &Value,
+    item: &Item,
+    names: &HashMap<String, String>,
+) -> Result<Item, DdbError> {
     if let Some(expr) = req.get("ProjectionExpression").and_then(Value::as_str) {
-        let names = parse_names(req);
-        let proj = ProjectionExpression::parse(expr, &names)?;
+        let proj = ProjectionExpression::parse(expr, names)?;
         Ok(proj.project(item))
     } else {
         Ok(item.clone())
@@ -1540,12 +1541,13 @@ pub async fn put_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
 pub async fn get_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let name = req_str(req, "TableName")?;
     let key_item = parse_key(req)?;
+    let names = parse_names(req)?;
     let table = get_table(ctx, name).await?;
     // Expired items stay readable until the TTL reaper deletes them, as in AWS.
     let guard = table.read().await;
     let key = guard.key_of(&key_item)?;
     match guard.items.get(&key) {
-        Some(item) => Ok(json!({ "Item": item_to_json(&maybe_project(req, item)?) })),
+        Some(item) => Ok(json!({ "Item": item_to_json(&maybe_project(req, item, &names)?) })),
         None => Ok(json!({})),
     }
 }
@@ -1780,8 +1782,8 @@ pub async fn update_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> 
 
     // Start from the existing item, or from the key when creating.
     let mut item = existing.clone().unwrap_or_else(|| key_item.clone());
+    let names = parse_names(req)?;
     if let Some(expr) = req.get("UpdateExpression").and_then(Value::as_str) {
-        let names = parse_names(req);
         let values = parse_values(req)?;
         let update = UpdateExpression::parse(expr, &names, &values)?;
         update.apply(&mut item)?;
@@ -1895,7 +1897,7 @@ pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     }
 
     let key_expr = req_str(req, "KeyConditionExpression")?;
-    let names = parse_names(req);
+    let names = parse_names(req)?;
     let values = parse_values(req)?;
     let key_cond = ConditionExpression::parse(key_expr, &names, &values)?;
 
@@ -2075,6 +2077,7 @@ fn paginate_and_respond<'a>(
     allowed: Option<std::collections::HashSet<String>>,
     forward: bool,
 ) -> Result<Value, DdbError> {
+    let names = parse_names(req)?;
     let start = req
         .get("ExclusiveStartKey")
         .map(|value| {
@@ -2125,7 +2128,6 @@ fn paginate_and_respond<'a>(
     // FilterExpression after the read set.
     let filtered: Vec<&Item> = match req.get("FilterExpression").and_then(Value::as_str) {
         Some(expr) => {
-            let names = parse_names(req);
             let values = parse_values(req)?;
             let filter = ConditionExpression::parse(expr, &names, &values)?;
             page.into_iter().filter(|i| filter.matches(i)).collect()
@@ -2145,8 +2147,8 @@ fn paginate_and_respond<'a>(
             // Restrict to the index projection (if querying a secondary index), then apply any
             // explicit ProjectionExpression.
             let projected = match &allowed {
-                Some(set) => maybe_project(req, &filter_item(item, set))?,
-                None => maybe_project(req, item)?,
+                Some(set) => maybe_project(req, &filter_item(item, set), &names)?,
+                None => maybe_project(req, item, &names)?,
             };
             items.push(item_to_json(&projected));
         }
@@ -2295,6 +2297,7 @@ pub async fn batch_get_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbErro
     }
     let mut responses = Map::new();
     for (table_name, spec) in request_items {
+        let names = parse_names(spec)?;
         let keys = spec
             .get("Keys")
             .and_then(Value::as_array)
@@ -2306,7 +2309,7 @@ pub async fn batch_get_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbErro
             let key_item = item_from_json(key_value)?;
             let key = guard.key_of(&key_item)?;
             if let Some(item) = guard.items.get(&key) {
-                items.push(item_to_json(&maybe_project(spec, item)?));
+                items.push(item_to_json(&maybe_project(spec, item, &names)?));
             }
         }
         responses.insert(table_name.clone(), Value::Array(items));
@@ -2471,7 +2474,7 @@ async fn transact_write_items_once(ctx: &Ctx<'_>, req: &Value) -> Result<Value, 
                 let old = guard.items.get(&key).cloned();
                 let mut item = old.clone().unwrap_or_else(|| key_item.clone());
                 if let Some(expr) = inner.get("UpdateExpression").and_then(Value::as_str) {
-                    let names = parse_names(inner);
+                    let names = parse_names(inner)?;
                     let values = parse_values(inner)?;
                     UpdateExpression::parse(expr, &names, &values)?.apply(&mut item)?;
                 }
@@ -2651,13 +2654,14 @@ pub async fn transact_get_items(ctx: &Ctx<'_>, req: &Value) -> Result<Value, Ddb
             .get("Get")
             .ok_or_else(|| DdbError::Validation("transaction action must be Get".into()))?;
         let table_name = req_str(get, "TableName")?;
+        let names = parse_names(get)?;
         let table = get_table(ctx, table_name).await?;
         let guard = table.read().await;
         let key_item = parse_key(get)?;
         let key = guard.key_of(&key_item)?;
         match guard.items.get(&key) {
             Some(item) => {
-                responses.push(json!({ "Item": item_to_json(&maybe_project(get, item)?) }))
+                responses.push(json!({ "Item": item_to_json(&maybe_project(get, item, &names)?) }))
             }
             None => responses.push(json!({})),
         }

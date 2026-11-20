@@ -985,6 +985,203 @@ mod tests {
         )
     }
 
+    async fn assert_validation(h: &DynamoHandler, operation: &str, body: Value) {
+        let (status, response) = call_json(h, operation, &body.to_string()).await;
+        assert_eq!(status, 400, "{operation}: {response}");
+        assert_eq!(
+            response["__type"], "com.amazonaws.dynamodb.v20120810#ValidationException",
+            "{operation}: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_expression_maps_are_rejected_before_item_mutation_or_empty_reads() {
+        let h = DynamoHandler::new();
+        create_provisioned(&h).await;
+        let item = serde_json::json!({"id":{"S":"a"},"payload":{"S":"original"}});
+        assert_eq!(
+            call_json(
+                &h,
+                "PutItem",
+                &serde_json::json!({"TableName":"tbl","Item":item}).to_string()
+            )
+            .await
+            .0,
+            200
+        );
+        for names in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(true),
+            serde_json::json!({"#unused":7}),
+            serde_json::json!({"#unused":null}),
+        ] {
+            for (operation, mut body) in [
+                (
+                    "PutItem",
+                    serde_json::json!({"TableName":"tbl","Item":{"id":{"S":"a"}}}),
+                ),
+                (
+                    "DeleteItem",
+                    serde_json::json!({"TableName":"tbl","Key":{"id":{"S":"a"}}}),
+                ),
+                (
+                    "UpdateItem",
+                    serde_json::json!({"TableName":"tbl","Key":{"id":{"S":"a"}},"UpdateExpression":"SET payload = :v","ExpressionAttributeValues":{":v":{"S":"changed"}}}),
+                ),
+            ] {
+                body["ExpressionAttributeNames"] = names.clone();
+                assert_validation(&h, operation, body).await;
+                let (_, response) = call_json(
+                    &h,
+                    "GetItem",
+                    r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#,
+                )
+                .await;
+                assert_eq!(response["Item"], item);
+            }
+            for (operation, mut body) in [
+                (
+                    "GetItem",
+                    serde_json::json!({"TableName":"tbl","Key":{"id":{"S":"absent"}},"ProjectionExpression":"id"}),
+                ),
+                (
+                    "Query",
+                    serde_json::json!({"TableName":"tbl","KeyConditionExpression":"id = :id","ExpressionAttributeValues":{":id":{"S":"absent"}}}),
+                ),
+                (
+                    "Scan",
+                    serde_json::json!({"TableName":"tbl","Select":"COUNT"}),
+                ),
+            ] {
+                body["ExpressionAttributeNames"] = names.clone();
+                assert_validation(&h, operation, body).await;
+            }
+            assert_validation(&h, "BatchGetItem", serde_json::json!({"RequestItems":{"tbl":{"Keys":[{"id":{"S":"absent"}}],"ExpressionAttributeNames":names}}})).await;
+            assert_validation(&h, "TransactGetItems", serde_json::json!({"TransactItems":[{"Get":{"TableName":"tbl","Key":{"id":{"S":"absent"}},"ExpressionAttributeNames":names}}]})).await;
+            assert_validation(&h, "TransactWriteItems", serde_json::json!({"TransactItems":[{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}},"ExpressionAttributeNames":names}}]})).await;
+            let (_, response) = call_json(
+                &h,
+                "GetItem",
+                r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#,
+            )
+            .await;
+            assert_eq!(response["Item"], item);
+        }
+        let (status, response) = call_json(&h, "UpdateItem", r##"{"TableName":"tbl","Key":{"id":{"S":"a"}},"UpdateExpression":"SET #p = :v","ExpressionAttributeNames":{"#p":"payload"},"ExpressionAttributeValues":{":v":{"S":"updated"}},"ReturnValues":"ALL_NEW"}"##).await;
+        assert_eq!(status, 200);
+        assert_eq!(response["Attributes"]["payload"]["S"], "updated");
+        for values in [Value::Null, serde_json::json!([]), serde_json::json!(true)] {
+            assert_validation(&h, "UpdateItem", serde_json::json!({"TableName":"tbl","Key":{"id":{"S":"a"}},"UpdateExpression":"REMOVE payload","ExpressionAttributeValues":values})).await;
+            assert_validation(&h, "Scan", serde_json::json!({"TableName":"tbl","FilterExpression":"attribute_exists(id)","ExpressionAttributeValues":values})).await;
+            let (_, response) = call_json(
+                &h,
+                "GetItem",
+                r#"{"TableName":"tbl","Key":{"id":{"S":"a"}}}"#,
+            )
+            .await;
+            assert_eq!(response["Item"]["payload"]["S"], "updated");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_tags_do_not_create_tables_or_partially_tag_existing_tables() {
+        let h = DynamoHandler::new();
+        create_provisioned(&h).await;
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/tbl";
+        assert_eq!(
+            call_json(
+                &h,
+                "TagResource",
+                &serde_json::json!({"ResourceArn":arn,"Tags":[{"Key":"kept","Value":""}]})
+                    .to_string()
+            )
+            .await
+            .0,
+            200
+        );
+        for tags in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!(["invalid"]),
+            serde_json::json!([{"Key":"new","Value":"valid"},{"Key":"missing-value"}]),
+            serde_json::json!([{"Key":true,"Value":"invalid"}]),
+            serde_json::json!([{"Key":"invalid","Value":1}]),
+        ] {
+            assert_validation(&h, "CreateTable", serde_json::json!({"TableName":"invalid","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","Tags":tags})).await;
+            let (_, tables) = call_json(&h, "ListTables", "{}").await;
+            assert_eq!(tables["TableNames"], serde_json::json!(["tbl"]));
+            assert_validation(
+                &h,
+                "TagResource",
+                serde_json::json!({"ResourceArn":arn,"Tags":tags}),
+            )
+            .await;
+            let (status, response) = call_json(
+                &h,
+                "ListTagsOfResource",
+                &serde_json::json!({"ResourceArn":arn}).to_string(),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                response["Tags"],
+                serde_json::json!([{"Key":"kept","Value":""}])
+            );
+        }
+        assert_validation(&h, "TagResource", serde_json::json!({"ResourceArn":arn})).await;
+        assert_eq!(
+            call_json(
+                &h,
+                "TagResource",
+                &serde_json::json!({"ResourceArn":arn,"Tags":[]}).to_string()
+            )
+            .await
+            .0,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_throughput_preserves_table_and_index_definitions() {
+        let h = DynamoHandler::new();
+        create_provisioned(&h).await;
+        let (_, before) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
+        for throughput in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"ReadCapacityUnits":"5","WriteCapacityUnits":5}),
+            serde_json::json!({"ReadCapacityUnits":-1,"WriteCapacityUnits":5}),
+            serde_json::json!({"ReadCapacityUnits":0,"WriteCapacityUnits":5}),
+            serde_json::json!({"ReadCapacityUnits":9223372036854775808u64,"WriteCapacityUnits":5}),
+        ] {
+            assert_validation(
+                &h,
+                "UpdateTable",
+                serde_json::json!({"TableName":"tbl","ProvisionedThroughput":throughput}),
+            )
+            .await;
+            assert_validation(&h, "CreateTable", serde_json::json!({"TableName":"invalid","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"ProvisionedThroughput":throughput})).await;
+            let (_, after) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
+            assert_eq!(after, before);
+            let (_, tables) = call_json(&h, "ListTables", "{}").await;
+            assert_eq!(tables["TableNames"], serde_json::json!(["tbl"]));
+        }
+        assert_validation(&h, "UpdateTable", serde_json::json!({"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"g","AttributeType":"S"}],"GlobalSecondaryIndexUpdates":[{"Create":{"IndexName":"g-index","KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":9223372036854775808u64,"WriteCapacityUnits":5}}}]})).await;
+        let (_, after) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
+        assert_eq!(after, before);
+        let valid = serde_json::json!({"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"g","AttributeType":"S"}],"GlobalSecondaryIndexUpdates":[{"Create":{"IndexName":"g-index","KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]});
+        assert_eq!(
+            call_json(&h, "UpdateTable", &valid.to_string()).await.0,
+            200
+        );
+        let (_, indexed) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
+        assert_validation(&h, "UpdateTable", serde_json::json!({"TableName":"tbl","GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"g-index","ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":9223372036854775808u64}}}]})).await;
+        let (_, after) = call_json(&h, "DescribeTable", r#"{"TableName":"tbl"}"#).await;
+        assert_eq!(after, indexed);
+        assert_eq!(call_json(&h, "CreateTable", r#"{"TableName":"ondemand","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#).await.0, 200);
+    }
+
     async fn create_provisioned(h: &DynamoHandler) {
         let create = r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"BillingMode":"PROVISIONED","ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
         assert_eq!(call(h, "CreateTable", create).await.status(), 200);

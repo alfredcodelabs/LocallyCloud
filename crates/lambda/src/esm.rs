@@ -154,7 +154,7 @@ fn now() -> f64 {
 pub struct EsmStore {
     mappings: DashMap<String, EventSourceMapping>,
     persistence: std::sync::Mutex<Option<persistence::Persistence>>,
-    creation: std::sync::Mutex<()>,
+    mutation: std::sync::Mutex<()>,
     checkpoints: DashMap<(String, String), (f64, Option<String>)>,
 }
 
@@ -164,6 +164,7 @@ impl EsmStore {
     }
 
     pub fn insert(&self, esm: EventSourceMapping) -> Result<(), LambdaError> {
+        let _mutation = self.mutation.lock().map_err(|_| state_error())?;
         self.save(&esm)?;
         self.mappings.insert(esm.uuid.clone(), esm);
         Ok(())
@@ -174,7 +175,7 @@ impl EsmStore {
         esm: EventSourceMapping,
         frontiers: Vec<(String, String)>,
     ) -> Result<(), LambdaError> {
-        let creation = self.creation.lock().map_err(|_| state_error())?;
+        let mutation = self.mutation.lock().map_err(|_| state_error())?;
         if self.mappings.iter().any(|entry| {
             entry.function_arn == esm.function_arn && entry.event_source_arn == esm.event_source_arn
         }) {
@@ -190,7 +191,7 @@ impl EsmStore {
                 .insert((esm.uuid.clone(), shard), (0.0, Some(sequence)));
         }
         self.mappings.insert(esm.uuid.clone(), esm);
-        drop(creation);
+        drop(mutation);
         Ok(())
     }
 
@@ -232,7 +233,10 @@ impl EsmStore {
             return Ok(existing.1.clone());
         }
         self.save_checkpoint(uuid, shard, generation, None)?;
-        Ok(None)
+        Ok(self
+            .checkpoints
+            .get(&key)
+            .and_then(|checkpoint| checkpoint.1.clone()))
     }
 
     fn save_checkpoint(
@@ -242,6 +246,33 @@ impl EsmStore {
         generation: f64,
         sequence: Option<String>,
     ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().map_err(|_| "ESM state lock failed")?;
+        if !self.mappings.contains_key(uuid) {
+            return Err("Event source mapping is unavailable".into());
+        }
+        if sequence.as_deref().is_some_and(|value| {
+            value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            return Err("Invalid stream checkpoint sequence".into());
+        }
+        let key = (uuid.to_string(), shard.to_string());
+        if let Some(current) = self.checkpoints.get(&key) {
+            if current.0 != generation {
+                return Err("Source stream was replaced".into());
+            }
+            match (current.1.as_deref(), sequence.as_deref()) {
+                (Some(_), None) => return Ok(()),
+                (Some(previous), Some(next)) if !previous.is_empty() => {
+                    if !previous.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err("Invalid stored checkpoint sequence".into());
+                    }
+                    if sequence_at_least(previous, next) {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(state) = self
             .persistence
             .lock()
@@ -252,8 +283,7 @@ impl EsmStore {
                 .save_checkpoint(uuid, shard, generation, sequence.as_deref())
                 .map_err(|e| e.to_string())?;
         }
-        self.checkpoints
-            .insert((uuid.into(), shard.into()), (generation, sequence));
+        self.checkpoints.insert(key, (generation, sequence));
         Ok(())
     }
 
@@ -262,17 +292,12 @@ impl EsmStore {
     }
 
     pub fn remove(&self, uuid: &str) -> Result<Option<EventSourceMapping>, LambdaError> {
-        // Tag/update writers already hold this entry before saving; deletion must use
-        // the same order so an overlapping writer cannot recreate a deleted row.
-        let entry = self.mappings.entry(uuid.into());
+        let _mutation = self.mutation.lock().map_err(|_| state_error())?;
         if let Some(state) = self.persistence.lock().map_err(|_| state_error())?.as_ref() {
             state.remove(uuid)?;
         }
         self.checkpoints.retain(|(id, _), _| id != uuid);
-        Ok(match entry {
-            dashmap::mapref::entry::Entry::Occupied(entry) => Some(entry.remove()),
-            dashmap::mapref::entry::Entry::Vacant(_) => None,
-        })
+        Ok(self.mappings.remove(uuid).map(|(_, mapping)| mapping))
     }
 
     pub fn update<F: FnOnce(&mut EventSourceMapping)>(
@@ -280,22 +305,22 @@ impl EsmStore {
         uuid: &str,
         f: F,
     ) -> Result<Option<EventSourceMapping>, LambdaError> {
-        let Some(mut e) = self.mappings.get_mut(uuid) else {
+        let _mutation = self.mutation.lock().map_err(|_| state_error())?;
+        let Some(mut next) = self.get(uuid) else {
             return Ok(None);
         };
-        let mut next = e.clone();
         f(&mut next);
         next.last_modified = now();
         self.save(&next)?;
-        *e = next.clone();
+        self.mappings.insert(uuid.into(), next.clone());
         Ok(Some(next))
     }
 
     pub fn tag(&self, uuid: &str, tags: BTreeMap<String, String>) -> Result<(), LambdaError> {
-        let mut mapping = self.mappings.get_mut(uuid).ok_or_else(|| {
+        let _mutation = self.mutation.lock().map_err(|_| state_error())?;
+        let mut next = self.get(uuid).ok_or_else(|| {
             LambdaError::ResourceNotFound(format!("Event source mapping not found: {uuid}"))
         })?;
-        let mut next = mapping.clone();
         next.tags.extend(tags);
         if next.tags.len() > 50 {
             return Err(LambdaError::InvalidParameterValue(
@@ -303,21 +328,21 @@ impl EsmStore {
             ));
         }
         self.save(&next)?;
-        *mapping = next;
+        self.mappings.insert(uuid.into(), next);
         Ok(())
     }
 
     pub fn set_processing_result(&self, uuid: &str, result: String) -> Result<(), LambdaError> {
-        let Some(mut mapping) = self.mappings.get_mut(uuid) else {
+        let _mutation = self.mutation.lock().map_err(|_| state_error())?;
+        let Some(mut next) = self.get(uuid) else {
             return Ok(());
         };
-        if mapping.last_processing_result.as_deref() == Some(&result) {
+        if next.last_processing_result.as_deref() == Some(&result) {
             return Ok(());
         }
-        let mut next = mapping.clone();
         next.last_processing_result = Some(result);
         self.save(&next)?;
-        *mapping = next;
+        self.mappings.insert(uuid.into(), next);
         Ok(())
     }
 
@@ -862,6 +887,7 @@ impl SqsBatchSource {
     }
 }
 
+#[cfg(test)]
 async fn dispatch_source(
     registry: &Weak<ServiceRegistry>,
     account: &str,
@@ -1068,6 +1094,21 @@ impl BatchSource for SqsBatchSource {
     }
 }
 
+fn sequence_at_least(sequence: &str, end: &str) -> bool {
+    if sequence.is_empty()
+        || end.is_empty()
+        || !sequence
+            .bytes()
+            .chain(end.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let sequence = sequence.trim_start_matches('0');
+    let end = end.trim_start_matches('0');
+    (sequence.len(), sequence) >= (end.len(), end)
+}
+
 fn state_error() -> LambdaError {
     LambdaError::InternalError("Lambda event source state is unavailable".into())
 }
@@ -1169,6 +1210,61 @@ mod tests {
             starting_timestamp: now(),
             last_processing_result: None,
         }
+    }
+
+    #[test]
+    fn late_checkpoints_cannot_regress_or_recreate_deleted_mappings() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.locallycloud-tmp/batch-a4a6/lambda")
+            .join(format!("checkpoint-{}", Uuid::new_v4()));
+        let state =
+            Arc::new(locallycloud_state::StateDb::open(root.join("state.sqlite3")).unwrap());
+        let store = EsmStore::new();
+        store.attach_state(state.clone()).unwrap();
+        let mapping = mapping(Vec::new());
+        store
+            .insert_with_stream_frontiers(mapping.clone(), vec![("shard".into(), String::new())])
+            .unwrap();
+        let latest = "10000000000000000000000000000000000000000";
+        store
+            .save_checkpoint(&mapping.uuid, "shard", 0.0, Some(latest.into()))
+            .unwrap();
+        store
+            .save_checkpoint(&mapping.uuid, "shard", 0.0, Some("9".into()))
+            .unwrap();
+        store
+            .save_checkpoint(&mapping.uuid, "shard", 0.0, None)
+            .unwrap();
+        assert!(store
+            .save_checkpoint(&mapping.uuid, "shard", 1.0, Some("999".into()))
+            .is_err());
+        assert!(store
+            .save_checkpoint(&mapping.uuid, "shard", 0.0, Some("invalid".into()))
+            .is_err());
+        assert_eq!(
+            store
+                .prepare_shard(&mapping.uuid, "shard", 0.0)
+                .unwrap()
+                .as_deref(),
+            Some(latest)
+        );
+        let restored = EsmStore::new();
+        restored.attach_state(state.clone()).unwrap();
+        assert_eq!(
+            restored
+                .prepare_shard(&mapping.uuid, "shard", 0.0)
+                .unwrap()
+                .as_deref(),
+            Some(latest)
+        );
+        store.remove(&mapping.uuid).unwrap();
+        assert!(store
+            .save_checkpoint(&mapping.uuid, "shard", 0.0, Some(latest.into()))
+            .is_err());
+        assert!(store.prepare_shard(&mapping.uuid, "shard", 0.0).is_err());
+        assert!(store.checkpoints.is_empty());
+        drop((restored, store, state));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

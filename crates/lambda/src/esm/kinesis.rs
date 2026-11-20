@@ -1,7 +1,8 @@
-use super::{dispatch_source, BatchSource, EsmStore, EventSourceMapping, SourceRecord};
+use super::{dispatch_source_as, BatchSource, EsmStore, EventSourceMapping, SourceRecord};
 use crate::model::FunctionStore;
 use async_trait::async_trait;
 use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
+use locallycloud_core::integration::identity::CallerIdentity;
 use locallycloud_core::integration::RequestIdentity;
 use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use serde_json::{json, Value};
@@ -71,9 +72,9 @@ impl KinesisBatchSource {
             .nth(1)
             .and_then(|name| name.split(':').next())
             .ok_or("Invalid function ARN")?;
-        let function = self
+        let role = self
             .functions
-            .get(&self.account, &self.region, function_name)
+            .execution_role(&self.account, &self.region, function_name)
             .ok_or("FunctionUnavailable")?;
         let evaluator = registry
             .authorization_evaluator(&ServiceName::new("iam"))
@@ -88,18 +89,22 @@ impl KinesisBatchSource {
                     access_key_id: None,
                     arn: None,
                 },
-                role_arn: function.role,
+                role_arn: role.clone(),
                 service_principal: "lambda.amazonaws.com".into(),
                 action: format!("kinesis:{action}"),
                 resource: self.mapping.event_source_arn.clone(),
             })
             .map_err(|_| "Kinesis execution role is not authorized")?;
-        dispatch_source(
+        dispatch_source_as(
             &self.registry,
             &self.account,
             &self.region,
             &format!("Kinesis_20131202.{action}"),
             body,
+            CallerIdentity::AssumedRole {
+                role_arn: role,
+                session_name: "lambda-esm".into(),
+            },
         )
         .await
     }
@@ -121,9 +126,14 @@ impl BatchSource for KinesisBatchSource {
         let shard = shards[index]["ShardId"]
             .as_str()
             .ok_or("Invalid Kinesis shard")?;
-        let checkpoint = self
-            .store
-            .prepare_shard(&self.mapping.uuid, shard, generation)?;
+        let store = self.store.clone();
+        let uuid = self.mapping.uuid.clone();
+        let checkpoint_shard = shard.to_owned();
+        let checkpoint = tokio::task::spawn_blocking(move || {
+            store.prepare_shard(&uuid, &checkpoint_shard, generation)
+        })
+        .await
+        .map_err(|_| "Kinesis checkpoint task failed")??;
         let mut request =
             json!({"StreamName":self.name,"ShardId":shard,"ShardIteratorType":"TRIM_HORIZON"});
         if let Some(sequence) = checkpoint {
@@ -213,8 +223,13 @@ impl BatchSource for KinesisBatchSource {
                 .get(&(self.mapping.uuid.clone(), shard.clone()))
                 .ok_or("Kinesis shard state unavailable")?
                 .0;
-            self.store
-                .save_checkpoint(&self.mapping.uuid, &shard, generation, Some(sequence))?;
+            let store = self.store.clone();
+            let uuid = self.mapping.uuid.clone();
+            tokio::task::spawn_blocking(move || {
+                store.save_checkpoint(&uuid, &shard, generation, Some(sequence))
+            })
+            .await
+            .map_err(|_| "Kinesis checkpoint task failed")??;
         }
         Ok(())
     }
@@ -222,7 +237,7 @@ impl BatchSource for KinesisBatchSource {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{create_mapping, poll_once};
+    use super::super::{create_mapping, dispatch_source, poll_once};
     use super::*;
     use locallycloud_core::handler::{NativeHandler, ServiceRequest};
     use locallycloud_core::integration::authorization::{
@@ -259,6 +274,32 @@ mod tests {
         }
     }
 
+    struct RoleCheckingKinesis(Arc<dyn NativeHandler>);
+    #[async_trait]
+    impl NativeHandler for RoleCheckingKinesis {
+        async fn handle(&self, request: ServiceRequest) -> axum::response::Response {
+            let action = request
+                .headers
+                .get("x-amz-target")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            if matches!(
+                action.rsplit('.').next(),
+                Some("DescribeStream" | "GetShardIterator" | "GetRecords")
+            ) {
+                assert_eq!(
+                    locallycloud_core::integration::identity::trusted_role(&request),
+                    Some(CallerIdentity::AssumedRole {
+                        role_arn: "arn:aws:iam::000000000000:role/consumer".into(),
+                        session_name: "lambda-esm".into(),
+                    })
+                );
+            }
+            self.0.handle(request).await
+        }
+    }
+
     fn valid_zip() -> String {
         use base64::Engine;
         use std::io::Write;
@@ -279,6 +320,13 @@ mod tests {
         let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
         let registry = ServiceRegistry::with_known_services();
         locallycloud_kinesis::register_with_state(&registry, state.clone()).unwrap();
+        let kinesis = ServiceName::new("kinesis");
+        let handler = registry.native_handler(&kinesis).unwrap();
+        registry.register_native(
+            kinesis,
+            ServiceMetadata::new(AwsProtocol::Json11, Some("Kinesis_20131202")),
+            Arc::new(RoleCheckingKinesis(handler)),
+        );
         let authorization = Arc::new(Authorization(AtomicBool::new(true)));
         registry.register_native_with_authorization_evaluator(
             ServiceName::new("iam"),

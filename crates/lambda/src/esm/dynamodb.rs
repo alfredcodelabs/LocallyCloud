@@ -1,4 +1,6 @@
-use super::{dispatch_source_as, BatchSource, EsmStore, EventSourceMapping, SourceRecord};
+use super::{
+    dispatch_source_as, sequence_at_least, BatchSource, EsmStore, EventSourceMapping, SourceRecord,
+};
 use crate::model::FunctionStore;
 use async_trait::async_trait;
 use locallycloud_core::integration::authorization::ServiceRoleAuthorizationRequest;
@@ -216,21 +218,6 @@ impl DynamoDbBatchSource {
     }
 }
 
-fn sequence_at_least(sequence: &str, end: &str) -> bool {
-    if sequence.is_empty()
-        || end.is_empty()
-        || !sequence
-            .bytes()
-            .chain(end.bytes())
-            .all(|b| b.is_ascii_digit())
-    {
-        return false;
-    }
-    let sequence = sequence.trim_start_matches('0');
-    let end = end.trim_start_matches('0');
-    (sequence.len(), sequence) >= (end.len(), end)
-}
-
 #[async_trait]
 impl BatchSource for DynamoDbBatchSource {
     async fn poll(&self, max: u32, window: Duration) -> Result<Vec<SourceRecord>, String> {
@@ -364,39 +351,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn concurrent_mapping_creates_publish_only_one_initial_frontier() {
-        let store = Arc::new(EsmStore::new());
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let mut threads = Vec::new();
-        for sequence in ["1", "2"] {
-            let store = store.clone();
-            let barrier = barrier.clone();
-            let mapping = create_mapping("us-east-1", "arn:aws:lambda:us-east-1:000000000000:function:sink", &json!({
-                "EventSourceArn":"arn:aws:dynamodb:us-east-1:000000000000:table/source/stream/1",
-                "StartingPosition":"LATEST"
-            })).unwrap();
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                store.insert_with_stream_frontiers(mapping, vec![("shard".into(), sequence.into())])
-            }));
+    fn concurrent_mapping_creates_publish_only_one_mapping_for_every_source() {
+        for (source, starting_position, stream_frontier) in [
+            ("arn:aws:sqs:us-east-1:000000000000:source", None, false),
+            (
+                "arn:aws:kinesis:us-east-1:000000000000:stream/source",
+                Some("LATEST"),
+                false,
+            ),
+            (
+                "arn:aws:dynamodb:us-east-1:000000000000:table/source/stream/1",
+                Some("LATEST"),
+                true,
+            ),
+        ] {
+            let store = Arc::new(EsmStore::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let mut threads = Vec::new();
+            let mut input = json!({"EventSourceArn":source});
+            if let Some(position) = starting_position {
+                input["StartingPosition"] = json!(position);
+            }
+            let first = create_mapping(
+                "us-east-1",
+                "arn:aws:lambda:us-east-1:000000000000:function:sink",
+                &input,
+            )
+            .unwrap();
+            let second = create_mapping("us-east-1", &first.function_arn, &input).unwrap();
+            assert_ne!(first.uuid, second.uuid);
+            for (mapping, sequence) in [(first, "1"), (second, "2")] {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                threads.push(std::thread::spawn(move || {
+                    let frontiers = if stream_frontier {
+                        vec![("shard".into(), sequence.into())]
+                    } else {
+                        Vec::new()
+                    };
+                    barrier.wait();
+                    store.insert_with_stream_frontiers(mapping, frontiers)
+                }));
+            }
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                1,
+                "{source}"
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| matches!(
+                        result,
+                        Err(crate::error::LambdaError::ResourceConflict(_))
+                    ))
+                    .count(),
+                1,
+                "{source}"
+            );
+            assert_eq!(store.mappings.len(), 1);
+            assert_eq!(store.checkpoints.len(), usize::from(stream_frontier));
         }
-        let results: Vec<_> = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| matches!(
-                    result,
-                    Err(crate::error::LambdaError::ResourceConflict(_))
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(store.mappings.len(), 1);
-        assert_eq!(store.checkpoints.len(), 1);
     }
     use locallycloud_core::handler::{NativeHandler, ServiceRequest};
     use locallycloud_core::integration::authorization::{
@@ -637,6 +656,7 @@ mod tests {
     fn child_shards_wait_for_the_parent_contiguous_checkpoint() {
         let store = Arc::new(EsmStore::new());
         let mapping=create_mapping("us-east-1","arn:aws:lambda:us-east-1:000000000000:function:consumer",&json!({"EventSourceArn":"arn:aws:dynamodb:us-east-1:000000000000:table/events/stream/1","StartingPosition":"TRIM_HORIZON"})).unwrap();
+        store.insert(mapping.clone()).unwrap();
         let source = DynamoDbBatchSource::new(
             Weak::new(),
             store.clone(),

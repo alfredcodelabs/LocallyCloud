@@ -1006,10 +1006,7 @@ impl S3Handler {
                 "s3:prefix".into(),
                 vec![query.get("prefix").unwrap_or("").into()],
             );
-            let max_keys = query
-                .get("max-keys")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1000);
+            let max_keys = ops::parse_max_keys(&query)?;
             context.insert("s3:max-keys".into(), vec![max_keys.to_string()]);
             if query.has("delimiter") {
                 context.insert(
@@ -4669,6 +4666,50 @@ mod tests {
         assert_eq!(status, 206);
         let (_, body) = body_string(resp).await;
         assert_eq!(body, "2345");
+    }
+
+    #[tokio::test]
+    async fn listings_reject_invalid_max_keys_and_preserve_valid_limits() {
+        let h = S3Handler::new();
+        h.handle(req(Method::PUT, "/buck", "", &[])).await;
+        for key in ["a", "b"] {
+            h.handle(req(Method::PUT, &format!("/buck/{key}"), "x", &[]))
+                .await;
+        }
+        for listing in ["", "list-type=2&", "versions&"] {
+            for invalid in ["", "text", "1.5", "-1", "18446744073709551616"] {
+                let response = h
+                    .handle(req(
+                        Method::GET,
+                        &format!("/buck?{listing}max-keys={invalid}"),
+                        "",
+                        &[],
+                    ))
+                    .await;
+                let (status, body) = body_string(response).await;
+                assert_eq!(status, 400, "{listing}max-keys={invalid}: {body}");
+                assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+            }
+            for (parameter, max_keys, keys) in
+                [("", 1000, 2), ("max-keys=0", 0, 0), ("max-keys=1", 1, 1)]
+            {
+                let response = h
+                    .handle(req(
+                        Method::GET,
+                        &format!("/buck?{listing}{parameter}"),
+                        "",
+                        &[],
+                    ))
+                    .await;
+                let (status, body) = body_string(response).await;
+                assert_eq!(status, 200, "{body}");
+                assert!(
+                    body.contains(&format!("<MaxKeys>{max_keys}</MaxKeys>")),
+                    "{body}"
+                );
+                assert_eq!(body.matches("<Key>").count(), keys, "{body}");
+            }
+        }
     }
 
     #[tokio::test]

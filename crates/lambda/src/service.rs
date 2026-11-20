@@ -4,6 +4,7 @@ mod authorization;
 mod durability;
 #[cfg(test)]
 mod event_invoke_tests;
+mod event_sources;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -67,7 +68,8 @@ pub struct LambdaHandler {
     concurrency: Arc<ConcurrencyLimiter>,
     concurrency_config: LambdaConcurrencyConfig,
     sqs_esm_max_pollers: u32,
-    esm_workers: Mutex<HashMap<String, EsmWorker>>,
+    esm_workers: Arc<Mutex<Option<HashMap<String, EsmWorker>>>>,
+    esm_gate: Arc<tokio::sync::Mutex<()>>,
     persistence: Mutex<Option<Arc<crate::persistence::LambdaPersistence>>>,
     metadata_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -128,7 +130,8 @@ impl LambdaHandler {
             concurrency,
             concurrency_config: config,
             sqs_esm_max_pollers: 10,
-            esm_workers: Mutex::new(HashMap::new()),
+            esm_workers: Arc::new(Mutex::new(Some(HashMap::new()))),
+            esm_gate: Arc::new(tokio::sync::Mutex::new(())),
             persistence: Mutex::new(None),
             metadata_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -159,12 +162,28 @@ impl LambdaHandler {
 
     /// Resume configured workers only after sibling handlers have been registered.
     pub fn resume_event_sources(&self) {
-        for mapping in self.esm.list(None, None) {
-            let parts = mapping.function_arn.split(':').collect::<Vec<_>>();
-            if parts.len() >= 7 {
-                self.reconcile_esm(parts[4], parts[3], &mapping);
+        let controller = self.esm_controller();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                controller.write(|controller| {
+                    for mapping in controller.esm.list(None, None) {
+                        let parts = mapping.function_arn.split(':').collect::<Vec<_>>();
+                        if parts.len() >= 7 {
+                            controller.reconcile(parts[4], parts[3], &mapping)?;
+                        }
+                    }
+                    Ok::<_, LambdaError>(())
+                })
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                tracing::warn!(
+                    service = "lambda",
+                    cause_code = "event_source_restore_failed",
+                    "could not resume event source mappings"
+                );
             }
-        }
+        });
     }
 
     /// Inject the EC2 control plane used to validate Lambda VPC selections.
@@ -551,7 +570,7 @@ impl LambdaHandler {
                         .and_then(Value::as_str)
                     {
                         for mapping in self.esm.list(Some(arn), None) {
-                            self.reconcile_esm(account, region, &mapping);
+                            self.reconcile_esm(account, region, &mapping).await?;
                         }
                     }
                     Ok(result)
@@ -831,20 +850,10 @@ impl LambdaHandler {
                         .await
                         .map_err(LambdaError::InvalidParameterValue)?;
                     }
-                    if !self
-                        .esm
-                        .list(Some(&esm.function_arn), Some(&esm.event_source_arn))
-                        .is_empty()
-                    {
-                        return Err(LambdaError::ResourceConflict(format!(
-                            "event source mapping already exists for {} and {}",
-                            esm.function_arn, esm.event_source_arn
-                        )));
-                    }
-                    if SourceType::from_arn(&esm.event_source_arn)
+                    let frontiers = if SourceType::from_arn(&esm.event_source_arn)
                         == Some(SourceType::DynamoDbStreams)
                     {
-                        let frontiers = DynamoDbBatchSource::new(
+                        DynamoDbBatchSource::new(
                             self.registry.clone(),
                             self.esm.clone(),
                             self.store.clone(),
@@ -855,23 +864,22 @@ impl LambdaHandler {
                         .map_err(LambdaError::InvalidParameterValue)?
                         .validate()
                         .await
-                        .map_err(LambdaError::InvalidParameterValue)?;
-                        let store = self.esm.clone();
-                        let mapping = esm.clone();
-                        tokio::task::spawn_blocking(move || {
-                            store.insert_with_stream_frontiers(mapping, frontiers)
-                        })
-                        .await
-                        .map_err(|_| {
-                            LambdaError::InternalError(
-                                "event source mapping persistence failed".into(),
-                            )
-                        })??;
+                        .map_err(LambdaError::InvalidParameterValue)?
                     } else {
-                        self.esm.insert(esm.clone())?;
-                    }
-                    self.reconcile_esm(account, region, &esm);
-                    Ok((202, Some(self.esm.get(&esm.uuid).unwrap_or(esm).to_json())))
+                        Vec::new()
+                    };
+                    let account = account.to_owned();
+                    let region = region.to_owned();
+                    let mapping = self
+                        .write_esm(move |controller| {
+                            controller
+                                .esm
+                                .insert_with_stream_frontiers(esm.clone(), frontiers)?;
+                            controller.reconcile(&account, &region, &esm)?;
+                            Ok(controller.esm.get(&esm.uuid).unwrap_or(esm))
+                        })
+                        .await?;
+                    Ok((202, Some(mapping.to_json())))
                 }
                 Method::GET => {
                     let query = req.uri.query().unwrap_or("");
@@ -920,77 +928,93 @@ impl LambdaHandler {
                         }),
                     Method::PUT => {
                         let input = parse_json(&req.body)?;
-                        let existing = self.esm.get(uuid).ok_or_else(|| {
-                            LambdaError::ResourceNotFound(format!(
-                                "event source mapping not found: {uuid}"
-                            ))
-                        })?;
-                        let batch_size = input
-                            .get("BatchSize")
-                            .map(|value| {
-                                let size = value.as_u64().ok_or_else(|| {
-                                    LambdaError::InvalidParameterValue(
-                                        "BatchSize must be an integer".into(),
-                                    )
-                                })?;
-                                validate_batch_size(
-                                    SourceType::from_arn(&existing.event_source_arn)
-                                        .expect("stored event source type"),
-                                    size,
-                                )
-                            })
-                            .transpose()?;
-                        let source_type = SourceType::from_arn(&existing.event_source_arn)
-                            .expect("stored event source type");
-                        let window = parse_batching_window(
-                            &input,
-                            existing.maximum_batching_window_in_seconds,
-                        )?;
-                        validate_batch_configuration(
-                            source_type,
-                            &existing.event_source_arn,
-                            batch_size.unwrap_or(existing.batch_size),
-                            window,
-                        )?;
-                        let maximum_concurrency = parse_scaling_config(&input, source_type)?;
-                        let function_response_types = update_response_types(&input)?;
+                        let uuid = uuid.to_string();
+                        let account = account.to_owned();
+                        let region = region.to_owned();
                         let updated = self
-                            .esm
-                            .update(uuid, |e| {
-                                if let Some(batch_size) = batch_size {
-                                    e.batch_size = batch_size;
-                                }
-                                e.maximum_batching_window_in_seconds = window;
-                                if let Some(maximum) = maximum_concurrency {
-                                    e.maximum_concurrency = maximum;
-                                }
-                                if let Some(types) = function_response_types {
-                                    e.function_response_types = types;
-                                }
-                                if let Some(enabled) = input.get("Enabled").and_then(Value::as_bool)
-                                {
-                                    e.enabled = enabled;
-                                    e.state = if enabled {
-                                        "Enabled".into()
-                                    } else {
-                                        "Disabled".into()
-                                    };
-                                }
-                            })?
-                            .expect("mapping existence checked above");
-                        self.reconcile_esm(account, region, &updated);
-                        Ok((
-                            202,
-                            Some(self.esm.get(&updated.uuid).unwrap_or(updated).to_json()),
-                        ))
+                            .write_esm(move |controller| {
+                                let existing = controller.esm.get(&uuid).ok_or_else(|| {
+                                    LambdaError::ResourceNotFound(format!(
+                                        "event source mapping not found: {uuid}"
+                                    ))
+                                })?;
+                                let batch_size = input
+                                    .get("BatchSize")
+                                    .map(|value| {
+                                        let size = value.as_u64().ok_or_else(|| {
+                                            LambdaError::InvalidParameterValue(
+                                                "BatchSize must be an integer".into(),
+                                            )
+                                        })?;
+                                        validate_batch_size(
+                                            SourceType::from_arn(&existing.event_source_arn)
+                                                .expect("stored event source type"),
+                                            size,
+                                        )
+                                    })
+                                    .transpose()?;
+                                let source_type = SourceType::from_arn(&existing.event_source_arn)
+                                    .expect("stored event source type");
+                                let window = parse_batching_window(
+                                    &input,
+                                    existing.maximum_batching_window_in_seconds,
+                                )?;
+                                validate_batch_configuration(
+                                    source_type,
+                                    &existing.event_source_arn,
+                                    batch_size.unwrap_or(existing.batch_size),
+                                    window,
+                                )?;
+                                let maximum_concurrency =
+                                    parse_scaling_config(&input, source_type)?;
+                                let function_response_types = update_response_types(&input)?;
+                                let enabled = input.get("Enabled").and_then(Value::as_bool);
+                                let updated = controller
+                                    .esm
+                                    .update(&uuid, |e| {
+                                        if let Some(batch_size) = batch_size {
+                                            e.batch_size = batch_size;
+                                        }
+                                        e.maximum_batching_window_in_seconds = window;
+                                        if let Some(maximum) = maximum_concurrency {
+                                            e.maximum_concurrency = maximum;
+                                        }
+                                        if let Some(types) = function_response_types {
+                                            e.function_response_types = types;
+                                        }
+                                        if let Some(enabled) = enabled {
+                                            e.enabled = enabled;
+                                            e.state = if enabled {
+                                                "Enabled".into()
+                                            } else {
+                                                "Disabled".into()
+                                            };
+                                        }
+                                    })?
+                                    .ok_or_else(|| {
+                                        LambdaError::ResourceNotFound(format!(
+                                            "event source mapping not found: {uuid}"
+                                        ))
+                                    })?;
+                                controller.reconcile(&account, &region, &updated)?;
+                                Ok(controller.esm.get(&updated.uuid).unwrap_or(updated))
+                            })
+                            .await?;
+                        Ok((202, Some(updated.to_json())))
                     }
                     Method::DELETE => {
-                        let removed = self.esm.remove(uuid)?.ok_or_else(|| {
-                            LambdaError::ResourceNotFound(format!(
-                                "event source mapping not found: {uuid}"
-                            ))
-                        })?;
-                        self.abort_esm(uuid);
+                        let uuid = uuid.to_string();
+                        let removed = self
+                            .write_esm(move |controller| {
+                                let removed = controller.esm.remove(&uuid)?.ok_or_else(|| {
+                                    LambdaError::ResourceNotFound(format!(
+                                        "event source mapping not found: {uuid}"
+                                    ))
+                                })?;
+                                controller.abort(&uuid);
+                                Ok(removed)
+                            })
+                            .await?;
                         Ok((202, Some(removed.to_json())))
                     }
                     _ => Err(unsupported()),
@@ -1030,16 +1054,22 @@ impl LambdaHandler {
                                     LambdaError::InvalidParameterValue("Tags is required".into())
                                 })?,
                             ))?;
-                            self.esm.tag(uuid, tags)?;
+                            let uuid = uuid.to_string();
+                            self.write_esm(move |controller| controller.esm.tag(&uuid, tags))
+                                .await?;
                             Ok((204, None))
                         }
                         Method::DELETE => {
                             let keys = query_values(req.uri.query().unwrap_or(""), "tagKeys");
-                            self.esm.update(uuid, |mapping| {
-                                for key in keys {
-                                    mapping.tags.remove(&key);
-                                }
-                            })?;
+                            let uuid = uuid.to_string();
+                            self.write_esm(move |controller| {
+                                controller.esm.update(&uuid, |mapping| {
+                                    for key in keys {
+                                        mapping.tags.remove(&key);
+                                    }
+                                })
+                            })
+                            .await?;
                             Ok((204, None))
                         }
                         _ => Err(unsupported()),
@@ -1071,249 +1101,14 @@ impl LambdaHandler {
 }
 
 impl LambdaHandler {
-    fn reconcile_esm(&self, account: &str, region: &str, mapping: &crate::esm::EventSourceMapping) {
-        let Ok(mut workers) = self.esm_workers.lock() else {
-            return;
-        };
-        if let Some(cancel) = workers
-            .get_mut(&mapping.uuid)
-            .and_then(|worker| worker.cancel.take())
-        {
-            let _ = cancel.send(());
-        }
-        if !mapping.enabled {
-            return;
-        }
-        if self.executor.is_none() {
-            let _ = self.esm.update(&mapping.uuid, |mapping| {
-                mapping.state = "Disabled".into();
-                mapping.last_processing_result = Some("ComputeUnavailable".into());
-            });
-            return;
-        }
-        let name = mapping
-            .function_arn
-            .split(":function:")
-            .nth(1)
-            .and_then(|name| name.split(':').next());
-        if name.is_none_or(|name| self.store.get(account, region, name).is_none()) {
-            let _ = self.esm.update(&mapping.uuid, |mapping| {
-                mapping.state = "Disabled".into();
-                mapping.last_processing_result = Some("FunctionUnavailable".into());
-            });
-            return;
-        }
-        let source: Arc<dyn BatchSource> = match SourceType::from_arn(&mapping.event_source_arn) {
-            Some(SourceType::DynamoDbStreams) => match DynamoDbBatchSource::new(
-                self.registry.clone(),
-                self.esm.clone(),
-                self.store.clone(),
-                mapping.clone(),
-                account,
-                region,
-            ) {
-                Ok(source) => Arc::new(source),
-                Err(_) => {
-                    tracing::warn!(
-                        service = "lambda",
-                        cause_code = "event_source_mapping_start_failed",
-                        "could not start event source mapping"
-                    );
-                    return;
-                }
-            },
-            Some(SourceType::Sqs) => match SqsBatchSource::new(
-                self.registry.clone(),
-                self.store.clone(),
-                &mapping.function_arn,
-                &mapping.event_source_arn,
-                account,
-                region,
-            ) {
-                Ok(source) => Arc::new(source),
-                Err(_) => {
-                    tracing::warn!(
-                        service = "lambda",
-                        cause_code = "event_source_mapping_start_failed",
-                        "could not start event source mapping"
-                    );
-                    return;
-                }
-            },
-            Some(SourceType::Kinesis) => match KinesisBatchSource::new(
-                self.registry.clone(),
-                self.esm.clone(),
-                self.store.clone(),
-                mapping.clone(),
-                account,
-                region,
-            ) {
-                Ok(source) => Arc::new(source),
-                Err(_) => {
-                    tracing::warn!(
-                        service = "lambda",
-                        cause_code = "event_source_mapping_start_failed",
-                        "could not start event source mapping"
-                    );
-                    return;
-                }
-            },
-            _ => return,
-        };
-        if self
-            .esm
-            .update(&mapping.uuid, |mapping| {
-                mapping.state = "Enabled".into();
-                mapping.last_processing_result = None;
-            })
-            .is_err()
-        {
-            return;
-        }
-        let store = self.esm.clone();
-        let registry = self.registry.clone();
-        let uuid = mapping.uuid.clone();
-        let worker_uuid = uuid.clone();
-        let account = account.to_string();
-        let region = region.to_string();
-        let functions = self.store.clone();
-        let worker_count = match SourceType::from_arn(&mapping.event_source_arn) {
-            Some(SourceType::Sqs) => mapping
-                .maximum_concurrency
-                .unwrap_or(self.sqs_esm_max_pollers)
-                .min(self.sqs_esm_max_pollers),
-            _ => 1,
-        };
-        let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        let previous = workers.remove(&uuid);
-        let polling = (SourceType::from_arn(&mapping.event_source_arn) == Some(SourceType::Sqs))
-            .then(|| {
-                crate::esm::PollingControl::new(worker_count, mapping.maximum_concurrency.is_some())
-            });
-        let worker = tokio::spawn(async move {
-            if let Some(previous) = previous {
-                let _ = previous.handle.await;
-            }
-            run_workers(worker_count, cancelled, || {
-                let store = store.clone();
-                let registry = registry.clone();
-                let worker_uuid = worker_uuid.clone();
-                let account = account.clone();
-                let region = region.clone();
-                let functions = functions.clone();
-                let source = source.clone();
-                let polling = polling.clone();
-                async move {
-            while let Some(current) = store.get(&worker_uuid).filter(|item| item.enabled) {
-                let _permit = match &polling { Some(control) => Some(control.acquire().await), None => None };
-                let function_name = current
-                    .function_arn
-                    .split(":function:")
-                    .nth(1)
-                    .unwrap_or("")
-                    .split(':')
-                    .next()
-                    .unwrap_or("");
-                if functions.get(&account, &region, function_name).is_none() {
-                    let _ = store.update(&worker_uuid, |mapping| {
-                        mapping.state = "Disabled".into();
-                        mapping.last_processing_result = Some("FunctionUnavailable".into());
-                    });
-                    break;
-                }
-                let result = crate::esm::poll_once_typed(&current, &source, |event| {
-                    let registry = registry.clone();
-                    let account = account.clone();
-                    let region = region.clone();
-                    let function_name = current.function_arn.clone();
-                    async move {
-                        let registry = registry.upgrade().ok_or(crate::esm::PollError::Invocation(LambdaInternalError::Unavailable))?;
-                        let lambda = registry.lambda_api(&ServiceName::new("lambda")).ok_or(crate::esm::PollError::Invocation(LambdaInternalError::Unavailable))?;
-                        let payload = serde_json::to_vec(&event).map_err(|error| crate::esm::PollError::InvalidResponse(error.to_string()))?;
-                        let trace_header = esm_trace_header(&event);
-                        let output = match lambda
-                            .invoke(LambdaInvokeRequest {
-                                call: LambdaCallContext {
-                                    source_service: "lambda-esm".into(),
-                                    account_id: account,
-                                    region,
-                                    request_id: uuid::Uuid::new_v4().to_string(),
-                                    caller_arn: None,
-                                },
-                                function_name,
-                                qualifier: None,
-                                payload: SensitivePayload::new(payload),
-                                trace_header,
-                            })
-                            .await
-                        {
-                            Ok(output) => output,
-                            Err(error) => return Err(crate::esm::PollError::Invocation(error)),
-                        };
-                        if output.function_error.is_some() {
-                            return Err(crate::esm::PollError::FunctionFailed);
-                        }
-                        Ok(output.payload.into_vec())
-                    }
-                })
-                .await;
-                let processing = match &result {
-                    Ok(crate::esm::PollOutcome::Processed) => "OK".to_string(),
-                    Ok(crate::esm::PollOutcome::PartialFailure) => "Partial batch failure".to_string(),
-                    Ok(crate::esm::PollOutcome::Empty) => "No records processed".to_string(),
-                    Err(error) => error.to_string(),
-                };
-                let _ = store.set_processing_result(&worker_uuid, processing);
-                if let Some(control) = &polling { control.report(&result, current.reports_batch_item_failures()); }
-                if let Err(error) = result {
-                    let cause_code = match error {
-                        crate::esm::PollError::Source(_) => "event_source_read_failed",
-                        crate::esm::PollError::Invocation(_) => "event_source_invocation_rejected",
-                        crate::esm::PollError::FunctionFailed => "event_source_function_failed",
-                        crate::esm::PollError::InvalidResponse(_) => "event_source_response_invalid",
-                    };
-                    tracing::warn!(service = "lambda", cause_code, mapping_id = %worker_uuid, "Event source mapping cycle failed");
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-                }
-            }).await;
-        });
-        workers.retain(|_, worker| !worker.handle.is_finished());
-        workers.insert(
-            uuid,
-            EsmWorker {
-                handle: worker,
-                cancel: Some(cancel),
-            },
-        );
-    }
-
-    fn abort_esm(&self, uuid: &str) {
-        if let Ok(mut workers) = self.esm_workers.lock() {
-            workers.retain(|_, worker| !worker.handle.is_finished());
-            if let Some(cancel) = workers
-                .get_mut(uuid)
-                .and_then(|worker| worker.cancel.take())
-            {
-                let _ = cancel.send(());
-            }
-        }
-    }
-}
-
-impl LambdaHandler {
     /// Stop background polling before draining all execution environments.
     pub async fn shutdown(&self) {
         let workers = self
             .esm_workers
             .lock()
-            .map(|mut workers| {
-                workers
-                    .drain()
-                    .map(|(_, worker)| worker)
-                    .collect::<Vec<_>>()
-            })
+            .ok()
+            .and_then(|mut workers| workers.take())
+            .map(|workers| workers.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
         let mut handles = Vec::with_capacity(workers.len());
         for mut worker in workers {
@@ -1333,8 +1128,11 @@ impl LambdaHandler {
 
 impl Drop for LambdaHandler {
     fn drop(&mut self) {
-        if let Ok(mut workers) = self.esm_workers.lock() {
-            for (_, mut worker) in workers.drain() {
+        if let Ok(mut slot) = self.esm_workers.lock() {
+            let Some(workers) = slot.take() else {
+                return;
+            };
+            for mut worker in workers.into_values() {
                 if let Some(cancel) = worker.cancel.take() {
                     let _ = cancel.send(());
                 }
@@ -2535,7 +2333,7 @@ mod tests {
         .to_string()
     }
 
-    fn request(method: Method, path: &str, body: &str) -> ServiceRequest {
+    pub(super) fn request(method: Method, path: &str, body: &str) -> ServiceRequest {
         ServiceRequest {
             method,
             uri: path.parse().unwrap(),
@@ -2783,7 +2581,7 @@ mod tests {
         assert_eq!(response.status(), 201);
     }
 
-    async fn create_fn(handler: &LambdaHandler) {
+    pub(super) async fn create_fn(handler: &LambdaHandler) {
         let create_body = create_body("fn", serde_json::json!({ "ZipFile": zip_base64() }));
         let resp = handler
             .handle(request(Method::POST, "/2015-03-31/functions", &create_body))

@@ -59,6 +59,7 @@ impl LambdaHandler {
         let region = region.clone();
         let committed_name = name.clone();
         let is_function = target.is_function();
+        let controller = self.esm_controller();
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
             if is_function {
@@ -74,6 +75,12 @@ impl LambdaHandler {
                     Some(Some(value)) => concurrency.set_reserved(&arn, value),
                     _ => concurrency.clear_reserved(&arn),
                 }
+                controller.write(|controller| {
+                    for mapping in controller.esm.list(Some(&arn), None) {
+                        controller.reconcile(&account, &region, &mapping)?;
+                    }
+                    Ok(())
+                })?;
             } else {
                 persistence.commit_layer(
                     &original_layers,
@@ -87,12 +94,6 @@ impl LambdaHandler {
         })
         .await
         .map_err(|_| crate::persistence::state_error("Lambda commit worker failed"))??;
-        if target.is_function() {
-            let arn = function_arn(&req.region, &req.account_id, &name);
-            for mapping in self.esm.list(Some(&arn), None) {
-                self.reconcile_esm(&req.account_id, &req.region, &mapping);
-            }
-        }
         Ok(response)
     }
 }

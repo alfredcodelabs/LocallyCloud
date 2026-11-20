@@ -2634,6 +2634,15 @@ use crate::query::QueryParams;
 
 const DEFAULT_MAX_KEYS: usize = 1000;
 
+pub(crate) fn parse_max_keys(q: &QueryParams) -> Result<usize, S3Error> {
+    if !q.has("max-keys") {
+        return Ok(DEFAULT_MAX_KEYS);
+    }
+    q.get("max-keys")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| S3Error::InvalidArgument("max-keys must be a non-negative integer".into()))
+}
+
 #[derive(Default)]
 struct ListResult {
     keys: Vec<(String, StoredObject)>,
@@ -2714,10 +2723,7 @@ pub async fn list_objects_v2(
     let guard = b.read().await;
     let prefix = q.get("prefix").unwrap_or("");
     let delimiter = q.get("delimiter");
-    let max_keys = q
-        .get("max-keys")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_KEYS);
+    let max_keys = parse_max_keys(q)?;
     // continuation-token takes precedence over start-after.
     let start_after = q.get("continuation-token").or_else(|| q.get("start-after"));
 
@@ -2790,10 +2796,7 @@ pub async fn list_objects_v1(
     let guard = b.read().await;
     let prefix = q.get("prefix").unwrap_or("");
     let delimiter = q.get("delimiter");
-    let max_keys = q
-        .get("max-keys")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_KEYS);
+    let max_keys = parse_max_keys(q)?;
     let marker = q.get("marker");
 
     let result = compute_listing(&guard.objects, prefix, delimiter, marker, max_keys);
@@ -3769,10 +3772,7 @@ pub async fn list_object_versions(
     let delimiter = q.get("delimiter");
     let key_marker = q.get("key-marker").unwrap_or("");
     let version_marker = q.get("version-id-marker");
-    let max_keys = q
-        .get("max-keys")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1000);
+    let max_keys = parse_max_keys(q)?;
     let mut items = Vec::new();
     for (key, chain) in &guard.versions {
         if !key.starts_with(prefix) || key.as_str() < key_marker {
