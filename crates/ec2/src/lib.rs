@@ -3188,8 +3188,8 @@ impl Input {
         }
         self.dry_run()?;
         for (name, _) in self.filters()? {
-            if !filters.contains(&name.as_str())
-                && !(filters.contains(&"tag-key")
+            if !(filters.contains(&name.as_str())
+                || filters.contains(&"tag-key")
                     && name.strip_prefix("tag:").is_some_and(|key| !key.is_empty()))
             {
                 return Err(Ec2Error::unsupported(&format!("Filter {name}")));

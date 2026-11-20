@@ -130,7 +130,7 @@ fn batch_statement(entry: &Value) -> Result<&str, DdbError> {
         ));
     }
     if let Some(values) = fields.get("Parameters") {
-        if !values.as_array().is_some_and(|values| !values.is_empty()) {
+        if values.as_array().is_none_or(|values| values.is_empty()) {
             return Err(DdbError::Validation(
                 "Parameters must be a non-empty array".into(),
             ));

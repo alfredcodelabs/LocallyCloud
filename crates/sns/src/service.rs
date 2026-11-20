@@ -623,7 +623,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persistent_publish_accepts_concurrent_database_writers() {
         use std::os::unix::fs::DirBuilderExt;
-        use std::sync::atomic::{AtomicBool, Ordering};
         let (root, state, store) = tokio::task::spawn_blocking(|| {
             let root =
                 std::env::temp_dir().join(format!("sns-concurrent-{}", uuid::Uuid::new_v4()));
@@ -640,21 +639,24 @@ mod tests {
         let arn = TopicArn::new("us-east-1", "000000000000", "concurrent");
         store.insert(arn.clone(), false, Default::default(), Default::default());
         store.persist_metadata().await.unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
         let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
         let writer = {
             let state = state.clone();
-            let stop = stop.clone();
             tokio::task::spawn_blocking(move || {
-                let connection = state.connection().unwrap();
+                let mut connection = state.connection().unwrap();
                 connection.execute_batch("CREATE TABLE concurrent_writes (n INTEGER); INSERT INTO concurrent_writes VALUES(0)").unwrap();
-                ready.send(()).unwrap();
-                while !stop.load(Ordering::Relaxed) {
-                    connection
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                for _ in 0..100 {
+                    transaction
                         .execute("UPDATE concurrent_writes SET n=n+1", [])
                         .unwrap();
-                    std::thread::yield_now();
                 }
+                ready.send(()).unwrap();
+                let _ = released.recv();
+                transaction.commit().unwrap();
                 connection
                     .query_row("SELECT n FROM concurrent_writes", [], |row| {
                         row.get::<_, i64>(0)
@@ -664,6 +666,10 @@ mod tests {
         };
         started.await.unwrap();
         let topic = store.get(&arn).unwrap();
+        let mut release = Some(release);
+        let mut waited_for_writer = false;
+        let mut writer_released = false;
+        let mut outcomes = Vec::new();
         for index in 0..100 {
             let job: FanoutJob = serde_json::from_value(json!({"subscriptions":[],"delivery":{
                 "message_id":format!("message-{index}"),"topic_arn":arn.to_arn(),"message":"publication",
@@ -671,27 +677,49 @@ mod tests {
                 "group_id":null,"dedup_id":null,"region":"us-east-1","account":"000000000000","request_id":"concurrent"
             }})).unwrap();
             let saved = crate::persistence::SavedTopic::from_state(&*topic.read().await);
-            let result = store.accept_job(saved, job).await;
-            if result.is_err() {
-                stop.store(true, Ordering::Relaxed);
-            }
-            assert!(result.unwrap().is_some());
+            let accepting = store.accept_job(saved, job);
+            tokio::pin!(accepting);
+            let result = if let Some(release) = release.take() {
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), &mut accepting)
+                        .await;
+                writer_released = release.send(()).is_ok();
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        waited_for_writer = true;
+                        accepting.await
+                    }
+                }
+            } else {
+                accepting.await
+            };
+            outcomes.push(result);
         }
-        stop.store(true, Ordering::Relaxed);
-        assert!(writer.await.unwrap() > 0);
-        let pending = store.clone();
-        assert_eq!(
-            tokio::task::spawn_blocking(move || pending.pending_jobs().unwrap().len())
-                .await
-                .unwrap(),
-            100
+        let writes = writer.await;
+        let (pending, restored, cleanup) = tokio::task::spawn_blocking(move || {
+            let pending = store.pending_jobs().map(|jobs| jobs.len());
+            let restored = SnsStore::with_state(state)
+                .and_then(|store| store.pending_jobs())
+                .map(|jobs| jobs.len());
+            drop(store);
+            let cleanup = std::fs::remove_dir_all(root);
+            (pending, restored, cleanup)
+        })
+        .await
+        .unwrap();
+        cleanup.unwrap();
+        assert!(writer_released);
+        assert!(
+            waited_for_writer,
+            "publication must wait for the held writer"
         );
-        drop(store);
-        drop(state);
-        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(root))
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(writes.unwrap(), 100);
+        for outcome in outcomes {
+            assert!(outcome.unwrap().is_some());
+        }
+        assert_eq!(pending.unwrap(), 100);
+        assert_eq!(restored.unwrap(), 100);
     }
 
     #[tokio::test]

@@ -45,11 +45,11 @@ fn string(v: &Value, key: &str) -> Result<String, Error> {
         .ok_or(Error::BadRequest("A required parameter is missing"))
 }
 fn json_body(request: &ServiceRequest) -> Result<Value, Error> {
-    if !request
+    if request
         .headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(';').next() == Some("application/json"))
+        .is_none_or(|v| v.split(';').next() != Some("application/json"))
     {
         return Err(Error::BadRequest("Content-Type must be application/json"));
     }

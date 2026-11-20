@@ -165,10 +165,10 @@ pub(crate) fn policy_decision(result: &Value, route_arn: &str) -> ResourcePolicy
 }
 
 pub(crate) fn valid_rest_authorizer_policy(result: &Value) -> bool {
-    if !result
+    if result
         .get("principalId")
         .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty())
+        .is_none_or(|id| id.is_empty())
         || result
             .get("context")
             .is_some_and(|value| !value.is_object())

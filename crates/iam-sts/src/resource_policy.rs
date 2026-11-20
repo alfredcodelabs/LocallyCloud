@@ -179,9 +179,9 @@ fn parse_with_options(
                             | "s3:objectcreationoperation"
                             | "events:source"
                             | "events:detail-type"
-                    ) && !key
+                    ) && key
                         .strip_prefix("aws:principaltag/")
-                        .is_some_and(|tag| !tag.is_empty())
+                        .is_none_or(|tag| tag.is_empty())
                         && (resource_required
                             || !matches!(
                                 key.as_str(),

@@ -179,9 +179,9 @@ impl ApiGwHandler {
         roles.dedup();
         for role in roles.into_iter().filter(|role| !role.is_empty()) {
             let prefix = format!("arn:aws:iam::{}:role/", request.account_id);
-            if !role
+            if role
                 .strip_prefix(&prefix)
-                .is_some_and(|name| !name.is_empty())
+                .is_none_or(|name| name.is_empty())
             {
                 return Err(ApiGwError::Forbidden(
                     "API Gateway roles must belong to the caller account".into(),

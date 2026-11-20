@@ -124,11 +124,11 @@ async fn cancelled_receive_commits_visibility_without_blocking_the_runtime() {
         attrs["Attributes"]["ApproximateNumberOfMessagesNotVisible"],
         "1"
     );
-    assert!(!call(&restored, "ReceiveMessage", json!({"QueueUrl":url}))
+    assert!(call(&restored, "ReceiveMessage", json!({"QueueUrl":url}))
         .await
         .1
         .get("Messages")
-        .is_some());
+        .is_none());
     drop(restored);
     drop(db);
     std::fs::remove_dir_all(root).unwrap();
