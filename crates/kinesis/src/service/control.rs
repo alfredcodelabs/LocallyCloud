@@ -189,7 +189,7 @@ impl KinesisHandler {
                         .map_err(|_| KinesisError::Persistence)?;
                 }
                 stream.retention_hours = hours;
-                self.trim_expired(&mut store, now_epoch()?)?;
+                self.trim_expired(&mut store, &key, now_epoch()?)?;
                 Ok(Success::Empty)
             }
             "ListTagsForStream" | "ListTagsForResource" => {
@@ -446,7 +446,11 @@ mod tests {
         {
             let mut store = handler.lock_store().unwrap();
             handler
-                .trim_expired(&mut store, now_epoch().unwrap())
+                .trim_expired(
+                    &mut store,
+                    &StreamKey::new(&scope(), "events"),
+                    now_epoch().unwrap(),
+                )
                 .unwrap();
             let shard = &store.streams[&StreamKey::new(&scope(), "events")].shards[0];
             assert_eq!(shard.next_position - shard.first_position, 1);

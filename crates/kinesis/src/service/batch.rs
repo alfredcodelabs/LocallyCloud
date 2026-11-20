@@ -95,7 +95,11 @@ impl KinesisHandler {
         if !store.streams.contains_key(&key) {
             return Err(stream_not_found(name));
         }
-        self.trim_expired(&mut store, now)?;
+        let charge = decoded
+            .iter()
+            .map(|(data, partition_key, _)| record_charge(data, partition_key))
+            .sum();
+        self.trim_for_write(&mut store, &key, now, charge)?;
         let mut buffered = store.buffered_bytes;
         let stream = store.streams.get_mut(&key).ok_or(KinesisError::Internal)?;
         let mut next = stream.next_sequence;

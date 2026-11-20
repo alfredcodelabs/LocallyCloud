@@ -9,6 +9,8 @@ use super::{Record, Scope, Shard, Store, Stream, StreamKey, MAX_GET_RECORD_BYTES
 
 pub(super) struct Persistence {
     pub(super) state: Arc<StateDb>,
+    #[cfg(test)]
+    pub(super) trim_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl Persistence {
@@ -167,7 +169,11 @@ impl Persistence {
             streams,
             buffered_bytes: 0,
         };
-        let persistence = Self { state };
+        let persistence = Self {
+            state,
+            #[cfg(test)]
+            trim_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
         for (key, stream) in &mut store.streams {
             persistence.trim(key, stream, super::now_epoch().unwrap_or(0.0))?;
         }
@@ -246,7 +252,6 @@ impl Persistence {
                 ],
             )?;
             offsets[*index] += 1;
-            transaction.execute("UPDATE kinesis_shards SET first_position=?5 WHERE account=?1 AND region=?2 AND name=?3 AND shard=?4",params![key.scope.account_id,key.scope.region,key.name,*index as i64,shard.first_position as i64])?;
         }
         transaction.execute("UPDATE kinesis_streams SET next_sequence=?4 WHERE account=?1 AND region=?2 AND name=?3",params![key.scope.account_id,key.scope.region,key.name,next as i64])?;
         transaction.commit()?;
@@ -259,6 +264,9 @@ impl Persistence {
         stream: &mut Stream,
         now: f64,
     ) -> Result<(), StateError> {
+        #[cfg(test)]
+        self.trim_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut connection = self.state.connection()?;
         let transaction = connection.transaction()?;
         let mut firsts = Vec::with_capacity(stream.shards.len());

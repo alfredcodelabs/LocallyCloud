@@ -2,6 +2,8 @@ use crate::error::KinesisError;
 mod batch;
 mod control;
 mod persistence;
+#[cfg(test)]
+mod trim_tests;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -147,24 +149,32 @@ struct Store {
 impl Store {
     fn trim_expired(&mut self, now: f64) {
         for stream in self.streams.values_mut() {
-            let retention_seconds = stream.retention_hours as f64 * 3600.0;
-            for shard in &mut stream.shards {
-                let mut trimmed = false;
-                while shard
-                    .records
-                    .front()
-                    .is_some_and(|record| record.arrival_time <= now - retention_seconds)
-                {
-                    let record = shard.records.pop_front().expect("nonempty front");
-                    self.buffered_bytes -= record_charge(&record.data, &record.partition_key);
-                    shard.first_position += 1;
-                    trimmed = true;
-                }
-                if trimmed {
-                    shard.records.shrink_to_fit();
-                }
+            self.buffered_bytes -= stream.trim_expired(now);
+        }
+    }
+}
+
+impl Stream {
+    fn trim_expired(&mut self, now: f64) -> usize {
+        let cutoff = now - self.retention_hours as f64 * 3600.0;
+        let mut freed = 0;
+        for shard in &mut self.shards {
+            let mut trimmed = false;
+            while shard
+                .records
+                .front()
+                .is_some_and(|record| record.arrival_time <= cutoff)
+            {
+                let record = shard.records.pop_front().expect("nonempty front");
+                freed += record_charge(&record.data, &record.partition_key);
+                shard.first_position += 1;
+                trimmed = true;
+            }
+            if trimmed {
+                shard.records.shrink_to_fit();
             }
         }
+        freed
     }
 }
 
@@ -233,14 +243,35 @@ impl KinesisHandler {
         }
     }
 
-    fn trim_expired(&self, store: &mut Store, now: f64) -> Result<(), KinesisError> {
-        if let Some(persistence) = &self.persistence {
-            for (key, stream) in &mut store.streams {
+    fn trim_expired(
+        &self,
+        store: &mut Store,
+        key: &StreamKey,
+        now: f64,
+    ) -> Result<(), KinesisError> {
+        if let Some(stream) = store.streams.get_mut(key) {
+            if let Some(persistence) = &self.persistence {
                 persistence
                     .trim(key, stream, now)
                     .map_err(|_| KinesisError::Persistence)?;
+            } else {
+                store.buffered_bytes -= stream.trim_expired(now);
             }
-        } else {
+        }
+        Ok(())
+    }
+
+    fn trim_for_write(
+        &self,
+        store: &mut Store,
+        key: &StreamKey,
+        now: f64,
+        charge: usize,
+    ) -> Result<(), KinesisError> {
+        self.trim_expired(store, key, now)?;
+        if self.persistence.is_none()
+            && store.buffered_bytes.saturating_add(charge) > self.max_buffered_bytes
+        {
             store.trim_expired(now);
         }
         Ok(())
@@ -421,8 +452,13 @@ impl KinesisHandler {
         {
             return Err(stream_not_found(&request.stream_name));
         }
-        self.trim_expired(&mut store, arrival_time)?;
         let charge = record_charge(&data, &request.partition_key);
+        self.trim_for_write(
+            &mut store,
+            &StreamKey::new(scope, &request.stream_name),
+            arrival_time,
+            charge,
+        )?;
         if self.persistence.is_none()
             && store.buffered_bytes.saturating_add(charge) > self.max_buffered_bytes
         {
@@ -502,7 +538,11 @@ impl KinesisHandler {
             ));
         }
         let mut store = self.lock_store()?;
-        self.trim_expired(&mut store, now_epoch()?)?;
+        self.trim_expired(
+            &mut store,
+            &StreamKey::new(scope, &request.stream_name),
+            now_epoch()?,
+        )?;
         let stream = store
             .streams
             .get(&StreamKey::new(scope, &request.stream_name))
@@ -625,7 +665,11 @@ impl KinesisHandler {
             return Err(invalid_iterator());
         }
         let mut store = self.lock_store()?;
-        self.trim_expired(&mut store, now_epoch()?)?;
+        self.trim_expired(
+            &mut store,
+            &StreamKey::new(scope, &payload.stream_name),
+            now_epoch()?,
+        )?;
         let stream = store
             .streams
             .get(&StreamKey::new(scope, &payload.stream_name))
