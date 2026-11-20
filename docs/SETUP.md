@@ -227,17 +227,84 @@ file does not accept them.
 }
 ```
 
-This first configuration-file stage supports the following fields. Other settings
-continue to use the environment variables below.
+The configuration file supports the following fields. Other settings continue to
+use the environment variables below.
 
 | Section | Fields |
 | --- | --- |
 | `common` | `host`, `port`, `region`, `account_id`, `allow_http`, `ui_enabled`, `upstream_timeout_secs`, `max_request_body_bytes` |
 | `iam` | `enforcement`: `strict` or `permissive`; an invalid environment value is also an error |
 | `apigateway` | `authorizer_cache_capacity` (default 1024, range 1–65536), `websocket_outbound_channel_capacity` (32, range 1–256), `websocket_outbound_history_capacity` (64, range 1–1024) |
-| `apigateway` | `http_local_origins`: exact HTTP(S) origins allowed to reach host/private backends; default `[]` |
+| `apigateway` | `http_client_cache_capacity` (default 16, range 1–256), `http_max_idle_per_host` (1, range 1–16), `http_idle_timeout_secs` (30, range 1–300) |
+| `apigateway` | `http_local_origins`: exact HTTP(S) origins allowed to reach host/private backends and JWT issuers (OIDC discovery and JWKS); default `[]` |
+| `logging` | `filter` (default `info`), `format` (`auto`, `pretty`, `json`), `color` (`auto`, `always`, `never`) |
+| `lambda` | `max_warm_total` (default 16, range 0–1024), `max_warm_per_key` (10, range 1–1024), `warm_idle_timeout_secs` (300, range 1–3600), `memory_budget_mb` (4096, range 1–4294967295), `work_dir`, `runtime_packs_dir` |
+| `ec2` | `image_rootfs` (optional path), `startup_timeout_secs` (default 5), `connect_timeout_secs` (2); both timeouts accept 1–300 seconds |
+| `cloudformation` | `operation_capacity`: concurrent stack operations (default 4, range 1–64); the same stack remains mutually exclusive |
+| `s3` | `notification_queue_capacity` (default 1024, range 1–16384), `notification_retry_interval_ms` (1000, range 100–60000) |
+| `sqs` | `endpoint_strategy`: `path` (default) or `aws` |
+| `dynamodb` | `engine`: `native` (default) or `extenddb`; `simulate_write_limits` (default false, native only); `kms_timeout_secs` (3, range 1–300; encrypted-table KMS broker) |
+| `eventbridge` | `retry_time_scale` (default 1, range 0.000001–1), `pending_retry_poll_interval_ms` (25, range 1–10000), `http_connect_timeout_secs` (5, range 1–300), `http_request_timeout_secs` (30, range 1–300), `http_response_body_limit_bytes` (10485760, range 1–10485760), `http_local_origins` (exact HTTPS origins allowed to reach host/private destinations; default `[]`), `http_client_cache_capacity` (16, range 1–256) |
+| `stepfunctions` | `execution_poll_interval_ms` (default 10, range 1–10000), `athena_poll_interval_ms` (50, range 1–10000), `athena_cancel_timeout_secs` (5, range 1–300) |
+| `sns` | `http_local_origins` (exact HTTP(S) origins permitted for local subscribers; default `[]`), `http_client_cache_capacity` (16, range 1–256), `http_timeout_secs` (5, range 1–300), `outbox_retry_initial_secs` (1, range 1–300), `outbox_retry_max_secs` (30, range 1–3600; at least the initial delay) |
+| `kinesis` | `max_buffered_bytes` (67108864, range 1–1073741824, in-memory backend only), `simulate_write_limits` (false) |
+| `firehose` | `source_poll_interval_ms` (1000, range 1–60000), `s3_dispatch_timeout_secs` (10, range 1–300), `max_retry_delay_secs` (30, range 1–3600) |
+| `cognito` | `mailbox_dir` (optional absolute path to the local confirmation mailbox; disabled when omitted) |
+| `logs` | `delivery_retry_interval_ms` (5000, range 1–60000), `retention_reclaim_delay_ms` (100, range 1–60000) |
 | `state` | `path`: absolute SQLite path, shared by the server and offline S3/DynamoDB migrations |
 | `ses` | Delivery provider, local verification simulation and worker/queue budgets; see [SES configuration](#ses-configuration) |
+
+Logging writes to stderr, leaving stdout available for CLI output. `auto` selects
+readable context labels such as `[ApiGateway]` in an interactive terminal and JSON
+when stderr is redirected. Automatic color requires a terminal and respects a
+nonempty `NO_COLOR`; JSON never includes ANSI color codes. Invalid explicit logging
+settings stop startup with a redacted diagnostic. Failures use common service,
+request ID and cause-code fields; expected request rejections are logged at debug
+level. There is no per-service logger or additional logging worker.
+
+Lambda and EC2 paths may be relative to the process working directory and are
+resolved at startup. Missing compute tools, packs or an unconfigured EC2 image
+still allow the in-process services to run; execution returns an actionable error
+when needed. IAM bootstrap/root credentials remain environment-only secret inputs,
+resolved once and injected separately from the JSON settings. The same resolved
+credentials are used by the offline S3 migration.
+
+EventBridge's HTTP response budget is local resource protection, not an AWS quota.
+OAuth and Pipes enrichment read bounded bodies. Classic rules consume only the
+response status, so a successful target is not retried merely because its ignored
+response body is large. The API destination's AWS deadline remains separate from
+these local client settings. Step Functions polling options do not alter ASL state
+timeouts, history limits or callback token validity.
+
+S3 permissive presigning captures source selection at startup, but does not cache
+profile credentials. It opens the selected `AWS_SHARED_CREDENTIALS_FILE` (or the
+selected profile in `~/.aws/credentials`) for each resolution using asynchronous
+I/O. Only regular files up to 1 MiB are read. A replaced profile is visible to the
+next resolution; an operation already in progress may finish using its earlier
+read. Atomic file replacement avoids partially written profiles. Unavailable or
+invalid profiles do not retain an earlier secret.
+
+The existing development precedence remains: explicit S3 environment secret,
+matching AWS environment key pair, matching selected profile, then the `test` and
+`locallycloud` development fallback. Profile deletion therefore does not revoke
+those fallback identities. S3 and permissive CloudFormation callbacks share the
+same source configuration; an explicitly selected callback access key does not
+automatically change identity when a profile changes. Strict S3 requests and strict
+CloudFormation callbacks continue using live IAM credentials, expiry and revocation.
+No SSO, credential process or external network provider is executed by this reader.
+Secrets remain outside JSON configuration and diagnostics.
+
+SNS HTTP(S) subscribers use the same destination policy through
+`sns.http_local_origins`. Local test servers need an explicit origin; redirects
+are not followed, and metadata and the emulator listener remain blocked. Failed
+confirmation delivery leaves the subscription pending and emits a safe diagnostic.
+The confirmation URL uses the startup-resolved endpoint.
+
+Kinesis's byte budget applies to its in-memory backend; persisted records use the
+SQLite backend. Write-limit simulation keeps the existing supported quota subset.
+Cognito's optional mailbox must be an absolute private directory; confirmation
+files use mode 0600 and the directory uses 0700. Never put confirmation codes,
+passwords or credentials in the configuration file. These settings require restart.
 
 HTTP integrations can reach public destinations. Host addresses, loopback, private
 networks and shared address space require an exact origin in `http_local_origins`,
@@ -246,6 +313,15 @@ scheme, hostname and effective port; paths, credentials, fragments, queries and
 wildcards are not accepted. DNS aliases require their own entry. Metadata and
 credential endpoints, link-local and non-destination ranges, known IPv6 transition
 mechanisms and LocallyCloud's own listener remain blocked even with an allowlist entry.
+
+EventBridge API destinations and their OAuth endpoints apply the same rules through
+`eventbridge.http_local_origins`; only HTTPS is accepted. A denied destination,
+including an OAuth authorization endpoint, is a terminal failure: delivery stops,
+the configured dead-letter queue is attempted, and the server logs
+`cause_code=destination_denied` without the URL. Classic rules honor a
+`Retry-After` header in seconds on retried statuses (401, 407, 409, 429, 5xx),
+waiting for the longer of it and the retry policy backoff; a negative value stops
+retrying. HTTP-date values are ignored.
 
 The connector checks the addresses returned by DNS for each new connection; mixed
 allowed/forbidden answers fail closed. It preserves Host/SNI and certificate checks,
@@ -265,6 +341,26 @@ transaction durability remain in the shared state layer.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
+| `RUST_LOG` | Overrides `logging.filter` using tracing filter directives; maximum 1024 bytes | `info` |
+| `LOCALLYCLOUD_LOG_FORMAT` | Overrides `logging.format`: `auto`, `pretty`, or `json` | `auto` |
+| `LOCALLYCLOUD_LOG_COLOR` | Overrides `logging.color`: `auto`, `always`, or `never`; applies to readable output | `auto` |
+| `LOCALLYCLOUD_CLOUDFORMATION_OPERATION_CAPACITY` | Maximum admitted stack operations, independently of per-stack exclusion; 1–64 | `4` |
+| `LOCALLYCLOUD_EC2_STARTUP_TIMEOUT_SECS` | Deadline for starting the local OCI HTTP instance; 1–300 seconds | `5` |
+| `LOCALLYCLOUD_EC2_CONNECT_TIMEOUT_SECS` | Deadline for connecting to an instance's local service; 1–300 seconds | `2` |
+| `LOCALLYCLOUD_LAMBDA_MAX_WARM_PER_KEY` | Maximum warm environments per execution key; 1–1024 | `10` |
+| `LOCALLYCLOUD_LAMBDA_WARM_IDLE_TIMEOUT_SECS` | Retention of an idle warm environment; 1–3600 seconds | `300` |
+| `LOCALLYCLOUD_S3_NOTIFICATION_QUEUE_CAPACITY` | Pending in-memory S3 notification slots; 1–16384 | `1024` |
+| `LOCALLYCLOUD_S3_NOTIFICATION_RETRY_INTERVAL_MS` | Local durable-notification retry polling; 100–60000 ms | `1000` |
+| `LOCALLYCLOUD_DYNAMODB_KMS_TIMEOUT_SECS` | Encrypted-table broker KMS request deadline; 1–300 seconds | `3` |
+| `LOCALLYCLOUD_EVENTBRIDGE_PENDING_RETRY_POLL_INTERVAL_MS` | Local pending-retry polling; 1–10000 ms | `25` |
+| `LOCALLYCLOUD_EVENTBRIDGE_HTTP_CONNECT_TIMEOUT_SECS` | HTTP connection deadline; 1–300 seconds | `5` |
+| `LOCALLYCLOUD_EVENTBRIDGE_HTTP_REQUEST_TIMEOUT_SECS` | HTTP client request deadline; 1–300 seconds | `30` |
+| `LOCALLYCLOUD_EVENTBRIDGE_HTTP_RESPONSE_BODY_LIMIT_BYTES` | Local budget for required HTTP response bodies, not an AWS quota; 1–10485760 | `10485760` |
+| `LOCALLYCLOUD_EVENTBRIDGE_HTTP_LOCAL_ORIGINS` | JSON array overriding `eventbridge.http_local_origins`, including `[]` to clear the file value | `[]` |
+| `LOCALLYCLOUD_EVENTBRIDGE_HTTP_CLIENT_CACHE_CAPACITY` | Per-origin HTTP clients kept for API destinations and OAuth endpoints; 1–256 | `16` |
+| `LOCALLYCLOUD_STEPFUNCTIONS_EXECUTION_POLL_INTERVAL_MS` | Local execution polling; 1–10000 ms | `10` |
+| `LOCALLYCLOUD_STEPFUNCTIONS_ATHENA_POLL_INTERVAL_MS` | Local Athena synchronization polling; 1–10000 ms | `50` |
+| `LOCALLYCLOUD_STEPFUNCTIONS_ATHENA_CANCEL_TIMEOUT_SECS` | Best-effort Athena cancellation deadline; 1–300 seconds | `5` |
 | `LOCALLYCLOUD_CONFIG_FILE` | Absolute path to the startup JSON file | XDG configuration path above |
 | `LOCALLYCLOUD_HOST` | Server listen address | `127.0.0.1` |
 | `LOCALLYCLOUD_PORT` | Endpoint port | `4566` |
@@ -273,6 +369,9 @@ transaction durability remain in the shared state layer.
 | `LOCALLYCLOUD_STATE_DB` | SQLite state file | `~/.local/share/locallycloud/state.sqlite3`, or under `XDG_DATA_HOME` when set |
 | `LOCALLYCLOUD_KMS_MASTER_KEY` | Base64-encoded 32-byte master key | Required; no default |
 | `LOCALLYCLOUD_IAM_ENFORCEMENT` | IAM mode; `strict` evaluates policies | Permissive |
+| `LOCALLYCLOUD_APIGATEWAY_HTTP_CLIENT_CACHE_CAPACITY` | Maximum cached HTTP integration clients, one per origin; 1–256 | `16` |
+| `LOCALLYCLOUD_APIGATEWAY_HTTP_MAX_IDLE_PER_HOST` | Maximum idle HTTP integration connections per origin; 1–16 | `1` |
+| `LOCALLYCLOUD_APIGATEWAY_HTTP_IDLE_TIMEOUT_SECS` | HTTP integration idle connection retention in seconds; 1–300 | `30` |
 | `LOCALLYCLOUD_HTTP_INTEGRATION_LOCAL_ORIGINS` | JSON array overriding `apigateway.http_local_origins`, including `[]` to clear the file value | `[]` |
 | `LOCALLYCLOUD_APIGATEWAY_AUTHORIZER_CACHE_CAPACITY` | Maximum authorizer cache entries per account/region; 1–65536 | `1024` |
 | `LOCALLYCLOUD_APIGATEWAY_WEBSOCKET_OUTBOUND_CHANNEL_CAPACITY` | Per-connection outbound channel capacity; 1–256 | `32` |
@@ -283,12 +382,24 @@ transaction durability remain in the shared state layer.
 | `LOCALLYCLOUD_LAMBDA_ACCOUNT_CONCURRENCY` | Independent Lambda execution quota for each account/region; integer from 1 to 2147483647 | `1000` |
 | `LOCALLYCLOUD_EVENTS_RETRY_TIME_SCALE` | Classic EventBridge rules: multiply retry delays and maximum event age by this factor; finite number from 0.000001 to 1 | `1` (real time) |
 | `LOCALLYCLOUD_SQS_ENDPOINT_STRATEGY` | Shape of returned SQS queue URLs: `path` (`https://aws.localhost:4566/<account>/<queue>`, on the endpoint advertised to Lambda as `AWS_ENDPOINT_URL`, so SDKs that call the queue URL host stay local) or `aws` (`https://sqs.<region>.amazonaws.com/<account>/<queue>`). Both forms are accepted as input | `path` |
+| `LOCALLYCLOUD_S3_ACCESS_KEY_ID`, `LOCALLYCLOUD_S3_SECRET_ACCESS_KEY` | Optional permissive presign secret and matching key; callback key defaults to `locallycloud`. These are environment-only inputs | Unset |
+| `AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE` | Permissive S3 presign profile selection; selected file contents are read live without caching | `default`, `$HOME/.aws/credentials` |
 | `LOCALLYCLOUD_SQS_ESM_MAX_POLLERS` | Local ceiling for SQS event source mapping workers; integer from 2 to 1000, independent of Lambda reserved concurrency | `10` |
-| `LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate controlled table write limits; reads and hot partitions are not modeled | Disabled |
-| `LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS` | Set exactly `1` to simulate provisioned shard write limits | Disabled |
+| `LOCALLYCLOUD_DYNAMODB_SIMULATE_WRITE_LIMITS` | Native-engine write-capacity simulation: `1`/`true` or `0`/`false`; invalid values fail startup. Reads and hot partitions are not modeled | Disabled |
+| `LOCALLYCLOUD_SNS_HTTP_LOCAL_ORIGINS` | JSON array overriding `sns.http_local_origins` | `[]` |
+| `LOCALLYCLOUD_SNS_HTTP_CLIENT_CACHE_CAPACITY` | Cached HTTP origins; 1–256 | `16` |
+| `LOCALLYCLOUD_SNS_HTTP_TIMEOUT_SECS` | Subscriber connection/request deadline; 1–300 seconds | `5` |
+| `LOCALLYCLOUD_SNS_OUTBOX_RETRY_INITIAL_SECS` | Initial publication retry delay; 1–300 seconds | `1` |
+| `LOCALLYCLOUD_SNS_OUTBOX_RETRY_MAX_SECS` | Maximum retry delay; 1–3600 seconds, at least the initial delay | `30` |
+| `LOCALLYCLOUD_FIREHOSE_SOURCE_POLL_INTERVAL_MS` | Kinesis source poll interval; 1–60000 milliseconds | `1000` |
+| `LOCALLYCLOUD_FIREHOSE_S3_DISPATCH_TIMEOUT_SECS` | Internal S3 dispatch deadline; 1–300 seconds | `10` |
+| `LOCALLYCLOUD_FIREHOSE_MAX_RETRY_DELAY_SECS` | Maximum delivery retry delay; 1–3600 seconds | `30` |
+| `LOCALLYCLOUD_LOGS_DELIVERY_RETRY_INTERVAL_MS` | Pending metric/subscription retry interval; 1–60000 milliseconds | `5000` |
+| `LOCALLYCLOUD_LOGS_RETENTION_RECLAIM_DELAY_MS` | Retention reclaim delay; 1–60000 milliseconds | `100` |
+| `LOCALLYCLOUD_KINESIS_SIMULATE_WRITE_LIMITS` | Simulate the supported provisioned write limits: `1`/`true` or `0`/`false`; invalid explicit values fail startup | Disabled |
 | `LOCALLYCLOUD_LAMBDA_MIN_UNRESERVED_CONCURRENCY` | Minimum slots left unreserved when assigning function RC; integer from 0 to the account quota. Set explicitly for quotas below 100 | `100` |
 | `LOCALLYCLOUD_PG_BIN_DIR` | Explicit host PostgreSQL toolchain override for RDS, instead of OCI runtime packs | Unset; use an installed PostgreSQL runtime pack |
-| `LOCALLYCLOUD_COGNITO_MAILBOX_DIR` | Directory that receives Cognito confirmation codes | Disabled |
+| `LOCALLYCLOUD_COGNITO_MAILBOX_DIR` | Absolute private directory that receives Cognito confirmation codes | Disabled |
 | `LOCALLYCLOUD_UI` | Dashboard: `on` or `off`. `off` returns 404 for the dashboard and its read endpoints, which sign reads with your local AWS profiles; health and status stay available | `on` |
 | `LOCALLYCLOUD_ENDPOINT_URL` | Endpoint that Lambda, ECS and EC2 guests use to call back into the emulator. `AWS_ENDPOINT_URL` takes priority when set | Derived from the listen address; a wildcard bind becomes `127.0.0.1` |
 | `LOCALLYCLOUD_LEGACY_BACKEND_URL` | Optional external backend for services without a native handler | `http://localhost:4567` |
@@ -303,7 +414,7 @@ transaction durability remain in the shared state layer.
 | `LOCALLYCLOUD_DUCKDB_EXTENSIONS_DIR` | Directory directly containing matching `avro.duckdb_extension` and `iceberg.duckdb_extension` files | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/analytics/duckdb/extensions` |
 | `LOCALLYCLOUD_DUCKDB_WORK_DIR` | Private temporary query snapshots and results; use disk-backed storage | `${XDG_CACHE_HOME:-$HOME/.cache}/locallycloud/analytics/duckdb/queries` |
 | `LOCALLYCLOUD_LAMBDA_MAX_WARM_TOTAL` | Maximum warm Lambda environments across all functions; integer from 0 to 1024 | `16` |
-| `LOCALLYCLOUD_KINESIS_MAX_BUFFERED_BYTES` | Maximum bytes of records Kinesis keeps in memory | `67108864` (64 MiB) |
+| `LOCALLYCLOUD_KINESIS_MAX_BUFFERED_BYTES` | Record byte budget for the in-memory backend only; 1–1073741824 bytes | `67108864` (64 MiB) |
 | `LOCALLYCLOUD_BOOTSTRAP_ACCESS_KEY_ID`, `LOCALLYCLOUD_BOOTSTRAP_SECRET_ACCESS_KEY` | Administrator credentials for strict IAM; see [strict IAM credentials](#strict-iam-credentials) | None |
 | `LOCALLYCLOUD_ROOT_ACCESS_KEY_ID`, `LOCALLYCLOUD_ROOT_SECRET_ACCESS_KEY` | Root user credentials for the configured account | None |
 

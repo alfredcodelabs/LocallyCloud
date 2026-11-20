@@ -131,13 +131,58 @@ from the current stack state.
 
 ### Athena and DuckDB
 
-The built-in reader supports single-table SELECTs. DuckDB adds bounded joins,
+The built-in reader supports constant SELECTs and single-table projection, `SELECT *`,
+filters, `COUNT` and exact integer `SUM`. Glue text tables support flat JSONL,
+LazySimpleSerDe with a single-byte delimiter, and OpenCSVSerde with default
+separators and quoting. Text columns support string, integer, bigint and Boolean;
+nested values and other types fail explicitly. Scans are limited to 64 MiB,
+100,000 result rows and four million cells.
+
+DuckDB adds bounded joins,
 subqueries, `IN`, `GROUP BY`, `HAVING` and `ORDER BY` over authorized Glue Iceberg
 snapshots. CTEs, UNION, table functions and non-SELECT statements are unsupported;
 functions and result types are restricted. Queries are limited to one statement
 and 256 KiB, with bounded scans, results and execution time.
 
 See [DuckDB preparation](SETUP.md#duckdb).
+
+### ACM certificate requests
+
+`RequestCertificate` stores a scoped, encrypted public certificate request. DNS
+requests return CNAME validation records; email requests return validation metadata.
+Requests stay `PENDING_VALIDATION`: no validation email, DNS verification or
+certificate issuance runs. A pending certificate cannot supply TLS material to
+API Gateway or a load balancer. Idempotency tokens survive restarts and apply for
+one hour within the account and region. Imported certificates keep their existing
+TLS behavior.
+
+### CloudTrail trails
+
+Trail creation, configuration, tags, management selectors and logging state persist.
+A logging trail delivers gzip JSON records to native S3 under
+`AWSLogs/<account>/CloudTrail/<region>/<date>/`. With strict IAM, grant the CloudTrail
+service `s3:GetBucketAcl` and `s3:PutObject`, including `aws:SourceArn`,
+`aws:SourceAccount` and `s3:x-amz-acl = bucket-owner-full-control`. Creation checks
+permissions without writing an object.
+
+Capture currently covers SQS `CreateQueue`, `DeleteQueue`, `SetQueueAttributes`,
+`AddPermission` and `RemovePermission`. Event parameters and full caller identity
+are not captured. Delivery uses a bounded in-memory queue without a durable event
+journal or retries. Undelivered events can be lost on overflow, delivery failure or
+shutdown; inspect `LatestDeliveryError`. `LatestDeliveryTime` advances only after a
+successful S3 write. Event history remains in memory. Data events, organization
+trails, digest validation, SNS and CloudWatch Logs delivery are unsupported.
+
+### ARC Region Switch plans
+
+The two-region routing-control subset supports `ListPlans` with account-scoped
+pagination. Plans, execution results and client-token replay persist across restarts.
+Plan ARNs are global; listing does not filter them by the request region. Execution
+still requires an existing IAM role and the supported ARC permissions, and turns
+the destination On before turning the origin Off. ARC configuration and routing
+controls currently remain in memory: a restored plan can be listed and its saved
+execution replayed, but a new execution after restart fails when its controls are
+missing. Full restart recovery requires durable ARC topology and control state.
 
 ### API Gateway endpoints and custom domains
 
@@ -164,13 +209,19 @@ REST HTTP integrations omit the caller's `Authorization` header when it carries 
 SigV4 signature or the REST method uses `AWS_IAM`; other authorization schemes
 remain available to the configured backend. This rule does not change HTTP API
 or Lambda integration headers.
-REST methods and WebSocket `$connect` support `AWS_IAM` with SigV4 HMAC signatures
-and IAM permissions enforced in both emulator modes. Presigned requests validate
-the original URI, headers, body and expiration. Authorization composes the deployed
+REST methods, HTTP API routes and WebSocket `$connect` support `AWS_IAM`.
+SigV4 HMAC signatures and IAM permissions are enforced in both emulator modes.
+Presigned requests validate the original URI, headers, body and expiration.
+Authorization composes the deployed
 REST resource policy with supported identity policies, boundaries and session
 policies. Lambda events and mapping templates receive the authenticated IAM/STS
 identity, including the exact assumed-role session ARN. This support is limited
-to the same account; HTTP API v2 IAM authorization remains unsupported.
+to the same account. HTTP APIs use identity policies without REST resource policies.
+HTTP `$default` routes use `api-id/stage/$default` for IAM; named routes use the
+actual HTTP method and request path. Lambda payload 2.0 receives the verified caller
+in `requestContext.authorizer.iam`; payload 1.0 uses `requestContext.identity`.
+A protected `$default` route also authorizes OPTIONS requests. Add an unauthenticated
+`OPTIONS /{proxy+}` route to permit CORS preflight requests.
 In strict IAM mode, REST API resource policies restrict invocation using the
 policy captured by the stage's deployment. Deploy again after editing a policy.
 Methods with `NONE` authorization require an explicit resource-policy allow when
@@ -180,9 +231,20 @@ use verified peer IP and TLS metadata, not forwarding headers. Unsupported polic
 features are rejected. REST deployments saved before policy snapshots were added
 must be recreated; their original policy cannot be reconstructed.
 REST `PRIVATE` APIs cannot be invoked through the public front door, including
-guest callbacks, in either IAM mode. An `execute-api` VPC endpoint data plane is
-not implemented. Private API deployments require a resource policy. Endpoint-type
-changes take effect when the API is deployed again.
+guest callbacks, in either IAM mode. Isolated Lambda and ECS guests can invoke a
+private REST API through an `execute-api` Interface endpoint in the same account
+and region. The endpoint policy runs before method authorization and the deployed
+resource policy. `aws:SourceVpc`, `aws:SourceVpce` and `aws:VpcSourceIp` come from
+the exact destination ENI and source lease; client headers cannot supply them.
+Private API deployments require a resource policy. Deploy again after changing
+that policy or the endpoint type. Private custom domains remain unsupported.
+
+Guest DNS resolves the endpoint ENIs dynamically. TLS uses the guest's local CA,
+with regional certificates held only in memory; the host trust store is unchanged.
+Lambda VPC traffic requires the optional host `ip` and `nft` tools, as ECS does.
+Endpoints created or modified while a guest is warm are checked on its next request.
+CloudFormation accepts the endpoint's `PolicyDocument`; list-valued `DnsEntries`
+and `NetworkInterfaceIds` attributes remain unsupported.
 WebSocket `@connections` management requires `execute-api:ManageConnections` in
 strict IAM mode, scoped to the API, stage, HTTP method and connection ID. This is
 independent of the authorization type configured for the WebSocket routes.
@@ -238,9 +300,11 @@ Native IPv4 VPC topology, subnet and security group tags, route tables, NAT gate
 and endpoint configuration survive restarts. The default security group's self rule
 can be revoked. Security group permission batches are validated before one atomic
 write. Gateway endpoints support S3 and DynamoDB; Interface endpoints support SSM,
-Secrets Manager, Logs, STS, SQS and KMS. Interface access uses the existing subnet and
-security group model, without dedicated endpoint ENIs. NACLs, VPC peering and IPv6 are
-not implemented. Validate the actual guest traffic required by your application.
+Secrets Manager, Logs, STS, SQS, KMS and execute-api. Interface endpoints have one
+persisted ENI per subnet, with one subnet per Availability Zone. The execute-api
+data plane checks the exact ENI, route and both security groups. Other AWS service
+callbacks retain their existing endpoint access model. NACLs, VPC peering and IPv6
+are not implemented. Validate the actual guest traffic required by your application.
 
 The ECS/Fargate reference supports one container and one TCP application port per
 task, IPv4 `awsvpc`, service desired count 0–2, and an internal HTTP ALB with IP

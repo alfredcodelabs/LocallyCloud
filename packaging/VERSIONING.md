@@ -47,9 +47,23 @@ The upgrade probe uses private state: S3 versions, native DynamoDB, SQS and Logs
 in two regions, plus global IAM. It restarts the candidate and records binary hashes,
 startup time and memory in `report.json`; it does not certify OCI or other databases.
 SBOMs describe Rust dependencies. Native-library coverage and VM/OCI checks remain separate.
-Dependency advisories block publication; review applicability before adding exceptions.
+Vulnerability findings block publication; review applicability before adding exceptions.
 
 ## Unreleased
+
+### Service and reliability updates
+
+- HTTP API `AWS_IAM` authorization and private REST API endpoints with VPC endpoint
+  and resource-policy checks. See [API Gateway scope](../docs/SERVICES.md#api-gateway-endpoints-and-custom-domains).
+- DynamoDB `LeadingKeys` conditions in strict IAM, malformed-input validation and
+  bounded base-table Query ranges. Index queries and some reverse-query paths
+  remain outside the optimized range-selection path.
+- Durable SNS recipient acknowledgements and Lambda event-source lifecycle and
+  checkpoint fixes. Crash-before-ack delivery can still replay.
+- Reduced copying in API Gateway deployment selection and Firehose buffering,
+  targeted Kinesis retention, and indexed SQS receipt operations.
+- Expanded native Athena text queries, pending ACM requests, CloudTrail trails to
+  S3 and Region Switch plan listing. See [service coverage and limits](../docs/SERVICES.md).
 
 ### SES email capture and delivery
 
@@ -65,8 +79,33 @@ Raw MIME, attachments, templates, configuration sets and delivery-event parity
 remain unsupported. See [SES coverage and examples](../docs/SES.md) and the
 [configuration reference](../docs/SETUP.md#ses-configuration).
 
-Before publishing, complete the [release checks](#local-release-checks) and the
-publication gates below.
+### Upgrading from v0.1.2
+
+HTTPS is now the default. Update local AWS profiles and SDK endpoints and trust the
+generated CA using the [HTTPS setup](../docs/SETUP.md#https-for-aws-clients).
+
+Startup settings use one optional JSON file, then environment overrides. Unknown
+fields, explicit nulls and invalid values stop startup. Configuration changes
+require a restart. Supply bootstrap/root credentials and provider keys through
+secret environment inputs, outside JSON. See the
+[configuration reference](../docs/SETUP.md#configuration).
+
+Strict IAM now checks more native operations and resource conditions, so workflows
+that previously passed may need additional policy grants. Preserve a backup of
+state and its original master key before upgrading, and review the
+[persistence and migration limits](../docs/FAQ.md#will-my-resources-survive-a-restart).
+
+### Candidate validation
+
+Develop commit `0d865a6` passed the [CI and packages workflow](https://github.com/alfredcodelabs/LocallyCloud/actions/runs/44810374820),
+including Debian builds/tests/lint and real ExtendDB checks on amd64 and arm64,
+installation checks on Debian 13 and Ubuntu 24.04/26.04, Arch packaging and
+component installation, both AppImages, dependency audit and release-bundle assembly.
+
+Before publishing, choose an unused product version, complete the
+[local release checks](#local-release-checks), security audit and VM/WSL checks,
+then follow the publication gates below. A successful branch workflow does not
+publish a release.
 
 ## 0.1.2 release
 
@@ -193,8 +232,9 @@ SHA-256. CI is configured to build native x86_64 and aarch64 images and check
 compute and AWS behavior need separate tests.
 See [AppImage requirements and usage](../docs/SETUP.md#appimage-without-installation).
 
-Local validation used an x86_64 fixture package. Full server images on both
-architectures still need a successful CI run before publication.
+The [candidate validation](#candidate-validation) records the successful build and
+CLI smoke checks on both architectures. Server upgrade and VM/OCI checks remain
+separate release gates.
 
 ### Publish a release
 

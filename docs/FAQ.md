@@ -186,7 +186,9 @@ These survive a restart with the same database and master key:
 - Lambda code, configuration, versions, layers, and event source mappings.
 - IAM identities and valid STS sessions, KMS keys, SSM parameters, Secrets Manager secrets.
 - CloudWatch Logs, CloudWatch metric alarms, Kinesis streams, Firehose delivery streams.
-- API Gateway configuration and custom domains, imported ACM certificates and keys.
+- API Gateway configuration and custom domains, imported ACM certificates and keys, and pending ACM certificate requests.
+- SES identities, captured messages and pending deliveries; see [delivery and restart behavior](SES.md#acceptance-retries-and-restart).
+- CloudTrail trail configuration and logging state; Region Switch plans and saved executions.
 - CloudFormation stacks, change sets, and deleted-stack history.
 - RDS instances, clusters, and snapshots, stored with their PostgreSQL data directories.
 - Glue catalog databases and tables.
@@ -194,7 +196,12 @@ These survive a restart with the same database and master key:
 
 Interrupted Step Functions executions become `ABORTED`; they are not automatically replayed. ECS desired services reconcile with new processes and rebuilt network leases; interrupted standalone tasks are not replayed. EC2 instances that were not terminated restore as stopped, retaining their configured primary ENI and private IP. Use `StartInstances` with one instance ID per request to start them explicitly; `StopInstances` is not implemented. ALB listeners and target health are rebuilt.
 
-Cognito user pools, Route 53, CloudFront, WAF v2, CloudTrail, X-Ray, Athena, ARC, and Region Switch resources are still process-local. Recreate or reconcile them after a restart before using resources that depend on them.
+Cognito user pools, Route 53, CloudFront, WAF v2, X-Ray, Athena, and ARC topology
+and routing controls remain process-local. CloudTrail event history and its
+undelivered event queue also remain in memory. Recreate or reconcile these after
+a restart before using resources that depend on them. A restored Region Switch
+plan can replay a saved execution, but a new execution needs its ARC controls
+recreated first; see [Region Switch limits](SERVICES.md#arc-region-switch-plans).
 
 S3 metadata from earlier versions is migrated automatically on startup. Earlier binaries cannot read the upgraded state. This metadata upgrade is separate from the explicit migration of legacy plaintext object bodies.
 
