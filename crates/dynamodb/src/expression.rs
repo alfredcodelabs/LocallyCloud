@@ -6,6 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::Bound;
 
 use crate::error::DdbError;
 use crate::value::{number_cmp, AttributeValue, Item};
@@ -642,6 +643,56 @@ impl ConditionExpression {
         None
     }
 
+    /// Necessary scalar bounds beneath AND; OR/NOT and computed operands prove no bound.
+    pub(crate) fn required_bounds(
+        &self,
+        attribute: &str,
+    ) -> Vec<(Bound<&AttributeValue>, Bound<&AttributeValue>)> {
+        use Bound::{Excluded, Included, Unbounded};
+        let mut bounds = Vec::new();
+        let mut pending = vec![&self.cond];
+        while let Some(condition) = pending.pop() {
+            let (path, lower, upper) = match condition {
+                Condition::And(left, right) => {
+                    pending.extend([right.as_ref(), left.as_ref()]);
+                    continue;
+                }
+                Condition::Compare(Operand::Path(path), op, Operand::Value(value)) => {
+                    let (lower, upper) = match op {
+                        CmpOp::Eq => (Included(value), Included(value)),
+                        CmpOp::Lt => (Unbounded, Excluded(value)),
+                        CmpOp::Le => (Unbounded, Included(value)),
+                        CmpOp::Gt => (Excluded(value), Unbounded),
+                        CmpOp::Ge => (Included(value), Unbounded),
+                        CmpOp::Ne => continue,
+                    };
+                    (path, lower, upper)
+                }
+                Condition::Compare(Operand::Value(value), op, Operand::Path(path)) => {
+                    let (lower, upper) = match op {
+                        CmpOp::Eq => (Included(value), Included(value)),
+                        CmpOp::Lt => (Excluded(value), Unbounded),
+                        CmpOp::Le => (Included(value), Unbounded),
+                        CmpOp::Gt => (Unbounded, Excluded(value)),
+                        CmpOp::Ge => (Unbounded, Included(value)),
+                        CmpOp::Ne => continue,
+                    };
+                    (path, lower, upper)
+                }
+                Condition::Between(
+                    Operand::Path(path),
+                    Operand::Value(lower),
+                    Operand::Value(upper),
+                ) => (path, Included(lower), Included(upper)),
+                _ => continue,
+            };
+            if matches!(path.segments.as_slice(), [Segment::Attr(name)] if name == attribute) {
+                bounds.push((lower, upper));
+            }
+        }
+        bounds
+    }
+
     /// Evaluate against an item.
     pub fn matches(&self, item: &Item) -> bool {
         eval_condition(&self.cond, item)
@@ -672,6 +723,27 @@ mod tests {
                 required.then_some(&value),
                 "{expression}"
             );
+        }
+    }
+
+    #[test]
+    fn required_bounds_only_extract_direct_required_comparisons() {
+        let values = HashMap::from([
+            (":lo".into(), AttributeValue::N("1".into())),
+            (":hi".into(), AttributeValue::N("3".into())),
+        ]);
+        for (expression, count) in [
+            ("sk BETWEEN :lo AND :hi", 1),
+            (":lo < sk AND :hi >= sk", 2),
+            ("sk >= :lo AND (sk < :hi OR sk = :hi)", 1),
+            ("sk < :lo OR sk > :hi", 0),
+            ("NOT (sk < :lo)", 0),
+            ("nested.sk = :lo", 0),
+            ("size(sk) >= :lo", 0),
+            ("sk <> :lo", 0),
+        ] {
+            let parsed = ConditionExpression::parse(expression, &HashMap::new(), &values).unwrap();
+            assert_eq!(parsed.required_bounds("sk").len(), count, "{expression}");
         }
     }
 

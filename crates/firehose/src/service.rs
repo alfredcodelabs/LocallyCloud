@@ -140,6 +140,8 @@ struct DeliveryStream {
     role_caller: Option<RequestIdentity>,
     pending: VecDeque<Vec<u8>>,
     retained: VecDeque<Vec<u8>>,
+    /// Includes pending, retained, and records owned by an in-flight batch.
+    buffered_bytes: usize,
     retry_token: Option<Uuid>,
     in_flight: Option<InFlight>,
     delivery_attempts: u8,
@@ -155,6 +157,19 @@ struct DeliveryStream {
     encryption: Option<String>,
 }
 
+impl DeliveryStream {
+    /// Called under the streams lock; failed persistence must return both queues to the original.
+    fn take_for_update(&mut self) -> Self {
+        let pending = std::mem::take(&mut self.pending);
+        let retained = std::mem::take(&mut self.retained);
+        Self {
+            pending,
+            retained,
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Clone)]
 struct InFlight {
     token: Uuid,
@@ -162,7 +177,6 @@ struct InFlight {
     bytes: usize,
 }
 
-#[derive(Clone)]
 struct Batch {
     phase: DeliveryPhase,
     primary_failure: FailureCode,
@@ -530,6 +544,7 @@ impl FirehoseHandler {
             role_caller,
             pending: VecDeque::new(),
             retained: VecDeque::new(),
+            buffered_bytes: 0,
             retry_token: None,
             in_flight: None,
             delivery_attempts: 0,
@@ -974,14 +989,18 @@ impl FirehoseHandler {
             ));
         }
         self.inner.ensure_worker()?;
-        let mut updated = stream.clone();
+        let mut updated = stream.take_for_update();
         updated.terminal_failure = false;
         updated.delivery_attempts = 0;
         updated.backup_attempts = 0;
         updated.retry_started = None;
         updated.retry_at = None;
         // Keep retry_token and retained bytes: Iceberg checks the same token after a lost ACK.
-        self.inner.persist_create(&key, &updated)?;
+        if let Err(error) = self.inner.persist_create(&key, &updated) {
+            stream.pending = updated.pending;
+            stream.retained = updated.retained;
+            return Err(error);
+        }
         *stream = updated;
         drop(streams);
         self.inner.notify.notify_one();
@@ -1096,7 +1115,7 @@ impl FirehoseHandle {
 
     pub async fn shutdown(self) {
         self.inner.shutting_down.store(true, Ordering::Release);
-        self.inner.notify.notify_waiters();
+        self.inner.notify.notify_one();
         let worker = self
             .inner
             .worker
@@ -1170,7 +1189,10 @@ impl Inner {
 
     async fn worker_loop(self: Arc<Self>) {
         loop {
-            match self.next_retry_delay() {
+            let Ok(delay) = self.next_retry_delay().await else {
+                return;
+            };
+            match delay {
                 Some(delay) => {
                     tokio::select! {
                         _ = self.notify.notified() => {},
@@ -1225,7 +1247,9 @@ impl Inner {
                             }),
                     };
                     if authorization.is_err() && batch.destination.iceberg.is_none() {
-                        self.defer_unauthorized_batch(batch);
+                        if self.defer_unauthorized_batch(batch).await.is_err() {
+                            return;
+                        }
                         continue;
                     }
                     let outcome = match authorization {
@@ -1268,23 +1292,37 @@ impl Inner {
         }
     }
 
-    fn next_retry_delay(&self) -> Option<Duration> {
-        let streams = self.streams.lock().ok()?;
-        let now = Instant::now();
-        let due = streams
-            .values()
-            .filter_map(|stream| stream.delivery_delay(now))
-            .min();
-        if streams.values().any(|stream| {
-            stream.source.as_ref().is_some_and(|source| !source.stopped) && !stream.terminal_failure
-        }) {
-            Some(
-                due.unwrap_or(Duration::from_millis(self.config.source_poll_interval_ms))
-                    .min(Duration::from_millis(self.config.source_poll_interval_ms)),
-            )
-        } else {
-            due
-        }
+    async fn next_retry_delay(self: &Arc<Self>) -> Result<Option<Duration>, ()> {
+        let inner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let streams = inner.streams.lock().ok()?;
+            let now = Instant::now();
+            let due = streams
+                .values()
+                .filter_map(|stream| stream.delivery_delay(now))
+                .min();
+            if streams.values().any(|stream| {
+                stream.source.as_ref().is_some_and(|source| !source.stopped)
+                    && !stream.terminal_failure
+            }) {
+                Some(
+                    due.unwrap_or(Duration::from_millis(inner.config.source_poll_interval_ms))
+                        .min(Duration::from_millis(inner.config.source_poll_interval_ms)),
+                )
+            } else {
+                due
+            }
+        })
+        .await
+        .map_err(|_| {
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("DeliveryWorker"),
+                "background",
+                "retry_clock_task_failed",
+                500,
+            );
+        })
     }
 
     fn append_pending(
@@ -1293,6 +1331,13 @@ impl Inner {
         stream: &mut DeliveryStream,
         records: Vec<Vec<u8>>,
     ) -> Result<(), FirehoseError> {
+        let buffered_bytes = records
+            .iter()
+            .try_fold(stream.buffered_bytes, |total, record| {
+                total
+                    .checked_add(record.len())
+                    .ok_or(FirehoseError::Internal)
+            })?;
         let previous = stream.pending_since;
         if stream.pending.is_empty() && !records.is_empty() {
             stream.pending_since = Some(StartedAt::now()?);
@@ -1302,49 +1347,68 @@ impl Inner {
             return Err(error);
         }
         stream.pending.extend(records);
+        stream.buffered_bytes = buffered_bytes;
         Ok(())
     }
 
-    async fn poll_sources(&self) {
-        let candidates = match self.lock_streams() {
-            Ok(streams) => streams
-                .iter()
-                .filter(|(_, stream)| {
-                    stream.source.is_some()
-                        && !stream.terminal_failure
-                        && stream.pending.is_empty()
-                        && stream.retained.is_empty()
-                        && stream.in_flight.is_none()
-                        && !stream.source.as_ref().is_some_and(|source| source.stopped)
-                })
-                .map(|(key, stream)| {
-                    (
-                        key.clone(),
-                        stream.generation,
-                        stream
-                            .source
-                            .as_ref()
-                            .expect("filtered source")
-                            .name
-                            .clone(),
-                        stream
-                            .source
-                            .as_ref()
-                            .expect("filtered source")
-                            .checkpoints
-                            .clone(),
-                        stream
-                            .source
-                            .as_ref()
-                            .expect("filtered source")
-                            .creation_timestamp,
-                        stream.source.as_ref().expect("filtered source").clone(),
-                        stream.destination.clone(),
-                        stream.role_caller.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            Err(_) => return,
+    async fn poll_sources(self: &Arc<Self>) {
+        let inner = self.clone();
+        let candidates = match tokio::task::spawn_blocking(move || {
+            let streams = inner.lock_streams().ok()?;
+            Some(
+                streams
+                    .iter()
+                    .filter(|(_, stream)| {
+                        stream.source.is_some()
+                            && !stream.terminal_failure
+                            && stream.pending.is_empty()
+                            && stream.retained.is_empty()
+                            && stream.in_flight.is_none()
+                            && !stream.source.as_ref().is_some_and(|source| source.stopped)
+                    })
+                    .map(|(key, stream)| {
+                        (
+                            key.clone(),
+                            stream.generation,
+                            stream
+                                .source
+                                .as_ref()
+                                .expect("filtered source")
+                                .name
+                                .clone(),
+                            stream
+                                .source
+                                .as_ref()
+                                .expect("filtered source")
+                                .checkpoints
+                                .clone(),
+                            stream
+                                .source
+                                .as_ref()
+                                .expect("filtered source")
+                                .creation_timestamp,
+                            stream.source.as_ref().expect("filtered source").clone(),
+                            stream.destination.clone(),
+                            stream.role_caller.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        {
+            Ok(Some(candidates)) => candidates,
+            Ok(None) => return,
+            Err(_) => {
+                locallycloud_core::observability::log_service_error(
+                    "firehose",
+                    Some("PollKinesisSource"),
+                    "background",
+                    "source_candidates_task_failed",
+                    500,
+                );
+                return;
+            }
         };
         for (
             key,
@@ -1385,16 +1449,31 @@ impl Inner {
             };
             let Ok((observed_creation, records, next_shard)) = result else {
                 let reason = result.err().unwrap_or("SOURCE_UNAVAILABLE");
-                if let Ok(mut streams) = self.lock_streams() {
-                    if let Some(stream) = streams
-                        .get_mut(&key)
-                        .filter(|stream| stream.generation == generation)
-                    {
-                        if let Some(source) = stream.source.as_mut() {
-                            source.failure = Some(reason.to_string());
-                            source.stopped = reason == "SOURCE_REPLACED";
+                let inner = self.clone();
+                if tokio::task::spawn_blocking(move || {
+                    if let Ok(mut streams) = inner.lock_streams() {
+                        if let Some(stream) = streams
+                            .get_mut(&key)
+                            .filter(|stream| stream.generation == generation)
+                        {
+                            if let Some(source) = stream.source.as_mut() {
+                                source.failure = Some(reason.to_string());
+                                source.stopped = reason == "SOURCE_REPLACED";
+                            }
                         }
                     }
+                })
+                .await
+                .is_err()
+                {
+                    locallycloud_core::observability::log_service_error(
+                        "firehose",
+                        Some("PollKinesisSource"),
+                        "background",
+                        "source_failure_task_failed",
+                        500,
+                    );
+                    return;
                 }
                 locallycloud_core::observability::log_service_error(
                     "firehose",
@@ -1409,11 +1488,29 @@ impl Inner {
                 );
                 continue;
             };
-            let Ok(mut streams) = self.lock_streams() else {
+            if self
+                .append_source_page(key, generation, observed_creation, records, next_shard)
+                .await
+                .is_err()
+            {
                 return;
-            };
+            }
+        }
+    }
+
+    async fn append_source_page(
+        self: &Arc<Self>,
+        key: StreamKey,
+        generation: Uuid,
+        observed_creation: f64,
+        records: Vec<(String, String, Vec<u8>)>,
+        next_shard: usize,
+    ) -> Result<(), ()> {
+        let inner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut streams = inner.lock_streams().map_err(|_| ())?;
             let Some(stream) = streams.get_mut(&key) else {
-                continue;
+                return Ok(());
             };
             if stream.generation != generation
                 || stream.terminal_failure
@@ -1421,11 +1518,11 @@ impl Inner {
                 || !stream.retained.is_empty()
                 || stream.in_flight.is_some()
             {
-                continue;
+                return Ok(());
             }
             let previous = stream.clone();
             let Some(source) = stream.source.as_mut() else {
-                continue;
+                return Ok(());
             };
             source.ready = true;
             source.creation_timestamp = Some(observed_creation);
@@ -1442,7 +1539,7 @@ impl Inner {
                     "source_page_exceeds_limit",
                     400,
                 );
-                continue;
+                return Ok(());
             }
             source.failure = None;
             for (shard, sequence, _) in &records {
@@ -1455,7 +1552,7 @@ impl Inner {
                 .into_iter()
                 .map(|(_, _, data)| data)
                 .collect::<Vec<_>>();
-            if self.append_pending(&key, stream, data).is_err() {
+            if inner.append_pending(&key, stream, data).is_err() {
                 *stream = previous;
                 locallycloud_core::observability::log_service_error(
                     "firehose",
@@ -1464,9 +1561,20 @@ impl Inner {
                     "source_checkpoint_failed",
                     500,
                 );
-                continue;
+                return Ok(());
             }
-        }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            locallycloud_core::observability::log_service_error(
+                "firehose",
+                Some("PollKinesisSource"),
+                "background",
+                "source_checkpoint_task_failed",
+                500,
+            );
+        })?
     }
 
     async fn fetch_source_record(
@@ -1628,12 +1736,14 @@ impl Inner {
                     && !stream.retained.is_empty()
                     && stream.retry_expired(now)
                 {
-                    let mut updated = stream.clone();
+                    let mut updated = stream.take_for_update();
                     let backup_bytes = self.pending_backup_bytes(key, &updated);
                     updated.exhaust_primary_at(now, backup_bytes);
                     match self.persist_create(key, &updated) {
                         Ok(()) => *stream = updated,
                         Err(_) => {
+                            stream.pending = updated.pending;
+                            stream.retained = updated.retained;
                             stream.retry_at = Some(
                                 now + Duration::from_millis(self.config.source_poll_interval_ms),
                             )
@@ -1701,7 +1811,22 @@ impl Inner {
             .collect()
     }
 
-    fn defer_unauthorized_batch(&self, batch: Batch) {
+    async fn defer_unauthorized_batch(self: &Arc<Self>, batch: Batch) -> Result<(), ()> {
+        let inner = self.clone();
+        tokio::task::spawn_blocking(move || inner.requeue_unauthorized_batch(batch))
+            .await
+            .map_err(|_| {
+                locallycloud_core::observability::log_service_error(
+                    "firehose",
+                    Some("DeliveryWorker"),
+                    "background",
+                    "denied_batch_checkpoint_task_failed",
+                    500,
+                );
+            })
+    }
+
+    fn requeue_unauthorized_batch(&self, mut batch: Batch) {
         let Ok(mut streams) = self.streams.lock() else {
             return;
         };
@@ -1713,22 +1838,19 @@ impl Inner {
         {
             return;
         }
-        let mut updated = stream.clone();
+        let count = batch.records.len();
+        let mut updated = stream.take_for_update();
         updated.in_flight = None;
         updated.retry_token = Some(batch.token);
-        updated.retained.extend(batch.records.iter().cloned());
+        updated.retained.extend(std::mem::take(&mut batch.records));
         updated.retry_at =
             Some(Instant::now() + Duration::from_millis(self.config.source_poll_interval_ms));
-        if let Err(_error) = self.persist_complete(
-            &batch.key,
-            &updated,
-            batch.token,
-            batch.records.len(),
-            false,
-        ) {
+        if let Err(_error) = self.persist_complete(&batch.key, &updated, batch.token, count, false)
+        {
+            stream.pending = updated.pending;
+            stream.retained = updated.retained;
             stream.in_flight = None;
             stream.retry_token = Some(batch.token);
-            stream.retained.extend(batch.records);
             stream.retry_at =
                 Some(Instant::now() + Duration::from_millis(self.config.source_poll_interval_ms));
             locallycloud_core::observability::log_service_error(
@@ -1876,7 +1998,12 @@ impl Inner {
         );
     }
 
-    fn complete_delivery_at(&self, batch: Batch, result: Result<(), FailureCode>, now: Instant) {
+    fn complete_delivery_at(
+        &self,
+        mut batch: Batch,
+        result: Result<(), FailureCode>,
+        now: Instant,
+    ) {
         let delivered = result.is_ok();
         let Ok(mut streams) = self.streams.lock() else {
             locallycloud_core::observability::log_service_error(
@@ -1896,9 +2023,12 @@ impl Inner {
         {
             return;
         }
-        let mut updated = stream.clone();
+        let count = batch.records.len();
+        let delivered_bytes = stream.in_flight.as_ref().map_or(0, |flight| flight.bytes);
+        let mut updated = stream.take_for_update();
         updated.in_flight = None;
         if delivered {
+            updated.buffered_bytes = updated.buffered_bytes.saturating_sub(delivered_bytes);
             if let Some(source) = updated
                 .source
                 .as_mut()
@@ -1921,7 +2051,7 @@ impl Inner {
                                 .get(&(batch.key.clone(), batch.token))
                                 .map(|plan| plan.undelivered().len())
                         })
-                        .unwrap_or(batch.records.len()) as u64,
+                        .unwrap_or(count) as u64,
                 );
             }
             updated.phase = DeliveryPhase::Primary;
@@ -1932,7 +2062,7 @@ impl Inner {
             updated.retry_at = None;
         } else {
             updated.retry_token = Some(batch.token);
-            updated.retained.extend(batch.records.iter().cloned());
+            updated.retained.extend(std::mem::take(&mut batch.records));
             match batch.phase {
                 DeliveryPhase::Backup => {
                     updated.backup_attempts = updated.backup_attempts.saturating_add(1);
@@ -1992,15 +2122,13 @@ impl Inner {
                 }
             }
         }
-        if let Err(_error) = self.persist_complete(
-            &batch.key,
-            &updated,
-            batch.token,
-            batch.records.len(),
-            delivered,
-        ) {
+        if let Err(_error) =
+            self.persist_complete(&batch.key, &updated, batch.token, count, delivered)
+        {
             // SQLite still owns the in-flight rows. Keep the bytes and token in memory too;
             // persist_take reconciles the rows once SQLite becomes available again.
+            stream.pending = updated.pending;
+            stream.retained = updated.retained;
             stream.in_flight = None;
             stream.retry_token = Some(batch.token);
             stream.retained.extend(batch.records);
@@ -2028,15 +2156,21 @@ impl Inner {
 #[async_trait]
 impl NativeHandler for FirehoseHandler {
     async fn resource_regions(&self, account: &str) -> Result<Vec<String>, &'static str> {
-        Ok(self
-            .inner
-            .streams
-            .lock()
-            .map_err(|_| "Firehose inventory unavailable")?
-            .keys()
-            .filter(|k| k.scope.account_id == account)
-            .map(|k| k.scope.region.clone())
-            .collect())
+        let inner = self.inner.clone();
+        let account = account.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let streams = inner
+                .streams
+                .lock()
+                .map_err(|_| "Firehose inventory unavailable")?;
+            Ok(streams
+                .keys()
+                .filter(|k| k.scope.account_id == account)
+                .map(|k| k.scope.region.clone())
+                .collect())
+        })
+        .await
+        .map_err(|_| "Firehose inventory unavailable")?
     }
 
     async fn handle(&self, request: ServiceRequest) -> Response {
@@ -2531,12 +2665,8 @@ fn now_epoch() -> Result<f64, FirehoseError> {
 
 fn buffered_usage(stream: &DeliveryStream) -> (usize, usize) {
     let in_flight_records = stream.in_flight.as_ref().map_or(0, |value| value.records);
-    let in_flight_bytes = stream.in_flight.as_ref().map_or(0, |value| value.bytes);
     let records = stream.pending.len() + stream.retained.len() + in_flight_records;
-    let bytes = stream.pending.iter().map(Vec::len).sum::<usize>()
-        + stream.retained.iter().map(Vec::len).sum::<usize>()
-        + in_flight_bytes;
-    (records, bytes)
+    (records, stream.buffered_bytes)
 }
 
 fn object_key(prefix: &str, stream_name: &str, token: Uuid) -> String {
@@ -2676,6 +2806,7 @@ mod tests {
             role_caller: None,
             pending: VecDeque::new(),
             retained: VecDeque::new(),
+            buffered_bytes: 0,
             retry_token: None,
             in_flight: None,
             delivery_attempts: 0,
@@ -2707,6 +2838,13 @@ mod tests {
             .unwrap()
             .pending
             .push_back(b"record".to_vec());
+        handler
+            .inner
+            .lock_streams()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .buffered_bytes += b"record".len();
         let first = handler.inner.take_batches().pop().unwrap();
         assert_eq!(first.records, [b"record".to_vec()]);
         let token = first.token;
@@ -2840,6 +2978,7 @@ mod tests {
                 },
                 pending: VecDeque::from([b"first".to_vec()]),
                 retained: VecDeque::new(),
+                buffered_bytes: b"first".len(),
                 retry_token: None,
                 in_flight: None,
                 delivery_attempts: 0,
@@ -2860,6 +2999,7 @@ mod tests {
             let mut streams = handler.inner.lock_streams().unwrap();
             let stream = streams.get_mut(&key).unwrap();
             stream.pending.push_back(b"second".to_vec());
+            stream.buffered_bytes += b"second".len();
         }
         assert!(handler.inner.take_batches().is_empty());
         for attempt in 1..MAX_DELIVERY_ATTEMPTS {
@@ -2930,6 +3070,7 @@ mod tests {
                 },
                 pending: VecDeque::from([b"later".to_vec()]),
                 retained: VecDeque::from([b"failed".to_vec()]),
+                buffered_bytes: b"later".len() + b"failed".len(),
                 retry_token: None,
                 in_flight: None,
                 delivery_attempts: MAX_DELIVERY_ATTEMPTS,
@@ -2996,6 +3137,7 @@ mod tests {
                 },
                 pending: VecDeque::from([b"first".to_vec()]),
                 retained: VecDeque::new(),
+                buffered_bytes: b"first".len(),
                 retry_token: None,
                 in_flight: None,
                 delivery_attempts: 0,
@@ -3016,6 +3158,7 @@ mod tests {
             let mut streams = handler.inner.lock_streams().unwrap();
             let stream = streams.get_mut(&key).unwrap();
             stream.pending.push_back(b"second".to_vec());
+            stream.buffered_bytes += b"second".len();
             stream.retry_at = Some(Instant::now());
         }
         let retry = handler.inner.take_batches().pop().unwrap();

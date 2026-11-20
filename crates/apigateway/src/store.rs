@@ -46,14 +46,14 @@ pub struct RestApiRecord {
     pub models: BTreeMap<String, Value>,
     pub request_validators: BTreeMap<String, Value>,
     pub deployments: BTreeMap<String, Value>,
-    pub deployment_snapshots: BTreeMap<String, RestDeploymentSnapshot>,
+    pub deployment_snapshots: BTreeMap<String, Arc<RestDeploymentSnapshot>>,
     pub stages: BTreeMap<String, Value>,
     pub gateway_responses: BTreeMap<String, Value>,
 }
 
 impl RestApiRecord {
-    pub fn snapshot(&self) -> RestDeploymentSnapshot {
-        RestDeploymentSnapshot {
+    pub fn snapshot(&self) -> Arc<RestDeploymentSnapshot> {
+        Arc::new(RestDeploymentSnapshot {
             policy: self.api.get("policy").cloned().unwrap_or(Value::Null),
             endpoint_configuration: self
                 .api
@@ -65,7 +65,7 @@ impl RestApiRecord {
             models: self.models.clone(),
             request_validators: self.request_validators.clone(),
             gateway_responses: self.gateway_responses.clone(),
-        }
+        })
     }
 }
 
@@ -86,18 +86,18 @@ pub struct ApiV2Record {
     pub integrations: BTreeMap<String, Value>,
     pub authorizers: BTreeMap<String, Value>,
     pub deployments: BTreeMap<String, Value>,
-    pub deployment_snapshots: BTreeMap<String, ApiV2DeploymentSnapshot>,
+    pub deployment_snapshots: BTreeMap<String, Arc<ApiV2DeploymentSnapshot>>,
     pub stages: BTreeMap<String, Value>,
 }
 
 impl ApiV2Record {
-    pub fn snapshot(&self) -> ApiV2DeploymentSnapshot {
-        ApiV2DeploymentSnapshot {
+    pub fn snapshot(&self) -> Arc<ApiV2DeploymentSnapshot> {
+        Arc::new(ApiV2DeploymentSnapshot {
             api: self.api.clone(),
             routes: self.routes.clone(),
             integrations: self.integrations.clone(),
             authorizers: self.authorizers.clone(),
-        }
+        })
     }
 }
 
@@ -372,6 +372,10 @@ impl ApiGwStore {
             .remove(&key(account, region, connection_id));
     }
 }
+
+#[cfg(test)]
+#[path = "store/deployment_tests.rs"]
+mod deployment_tests;
 
 #[cfg(test)]
 mod tests {

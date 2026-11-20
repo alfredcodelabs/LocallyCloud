@@ -122,6 +122,7 @@ impl SavedStream {
             }),
             pending: VecDeque::new(),
             retained: VecDeque::new(),
+            buffered_bytes: 0,
             retry_token: self
                 .retry_token
                 .map(|token| Uuid::parse_str(&token))
@@ -218,6 +219,10 @@ pub(super) fn load(state: &StateDb) -> Result<HashMap<StreamKey, DeliveryStream>
             let Some(stream) = streams.get_mut(&key) else {
                 continue;
             };
+            stream.buffered_bytes = stream
+                .buffered_bytes
+                .checked_add(payload.len())
+                .ok_or_else(|| std::io::Error::other("Firehose buffered byte count overflow"))?;
             match record_state.as_str() {
                 "pending" => stream.pending.push_back(payload),
                 "retained" => stream.retained.push_back(payload),

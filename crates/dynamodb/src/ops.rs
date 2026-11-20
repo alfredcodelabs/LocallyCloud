@@ -1844,6 +1844,98 @@ fn stored_key_for(item: &Item, hash: &str, range: Option<&str>) -> Option<Stored
     Some(StoredKey { partition, sort })
 }
 
+/// Seek only when a required partition and, for reverse reads, an exact upper bound exist.
+fn base_query_bounds(
+    condition: &ConditionExpression,
+    hash: &str,
+    range: Option<&str>,
+    start: Option<StoredKey>,
+    forward: bool,
+) -> Option<(crate::store::KeyScalar, Bound<StoredKey>, Bound<StoredKey>)> {
+    let partition = crate::store::KeyScalar::from_value(condition.required_equality(hash)?)?;
+    let mut lower = (
+        StoredKey {
+            partition: partition.clone(),
+            sort: None,
+        },
+        true,
+    );
+    let mut upper: Option<(StoredKey, bool)> = None;
+    for (lo, hi) in range
+        .into_iter()
+        .flat_map(|name| condition.required_bounds(name))
+    {
+        for (bound, is_lower) in [(lo, true), (hi, false)] {
+            let (value, included) = match bound {
+                Bound::Included(value) => (value, true),
+                Bound::Excluded(value) => (value, false),
+                Bound::Unbounded => continue,
+            };
+            let Some(sort) = crate::store::KeyScalar::from_value(value) else {
+                continue;
+            };
+            let key = StoredKey {
+                partition: partition.clone(),
+                sort: Some(sort),
+            };
+            if is_lower {
+                let order = key.cmp(&lower.0);
+                if order.is_gt() || (order.is_eq() && !included) {
+                    lower = (key, included);
+                }
+            } else if upper.as_ref().is_none_or(|(old, _)| {
+                let order = key.cmp(old);
+                order.is_lt() || (order.is_eq() && !included)
+            }) {
+                upper = Some((key, included));
+            }
+        }
+    }
+    if let Some(start) = start {
+        if forward {
+            if !start.cmp(&lower.0).is_lt() {
+                lower = (start, false);
+            }
+        } else if upper
+            .as_ref()
+            .is_none_or(|(old, _)| !start.cmp(old).is_gt())
+        {
+            upper = Some((start, false));
+        }
+    }
+    // An upper cursor in a later partition does not locate this partition's last key.
+    if !forward
+        && upper
+            .as_ref()
+            .is_none_or(|(key, _)| key.partition.cmp(&partition).is_gt())
+    {
+        return None;
+    }
+    let bound = |(key, included)| {
+        if included {
+            Bound::Included(key)
+        } else {
+            Bound::Excluded(key)
+        }
+    };
+    Some((
+        partition,
+        bound(lower),
+        upper.map_or(Bound::Unbounded, bound),
+    ))
+}
+
+fn empty_read_bounds(lower: &Bound<StoredKey>, upper: &Bound<StoredKey>) -> bool {
+    match (lower, upper) {
+        (Bound::Included(lo) | Bound::Excluded(lo), Bound::Included(hi) | Bound::Excluded(hi)) => {
+            lo.cmp(hi).is_gt()
+                || (lo.cmp(hi).is_eq()
+                    && (matches!(lower, Bound::Excluded(_)) || matches!(upper, Bound::Excluded(_))))
+        }
+        _ => false,
+    }
+}
+
 pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
     let name = req_str(req, "TableName")?;
     let table = get_table(ctx, name).await?;
@@ -1912,66 +2004,70 @@ pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
             .query_entries_visited
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     };
-    let partition = (index_name.is_none() && forward)
-        .then(|| key_cond.required_equality(&hash))
-        .flatten()
-        .and_then(crate::store::KeyScalar::from_value);
-    let mut index_items;
-    let candidates: Box<dyn Iterator<Item = ReadCandidate<'_>> + '_> = if let Some(partition) =
-        partition
-    {
-        let lower = StoredKey {
-            partition: partition.clone(),
-            sort: None,
-        };
-        let start = read_start_key(req, &guard.def, &hash, range.as_deref())?;
-        let lower = match start {
-            Some((key, _)) if key >= lower => Bound::Excluded(key),
-            _ => Bound::Included(lower),
-        };
-        Box::new(
-            guard
-                .items
-                .range((lower, Bound::Unbounded))
-                .inspect(visit)
-                .take_while(move |(key, _)| key.partition.cmp(&partition).is_eq())
-                .filter(|(_, item)| key_cond.matches(item))
-                .map(|(key, item)| (key, key, item)),
+    let bounds = if index_name.is_none() {
+        base_query_bounds(
+            &key_cond,
+            &hash,
+            range.as_deref(),
+            read_start_key(req, &guard.def, &hash, range.as_deref())?.map(|(key, _)| key),
+            forward,
         )
     } else {
-        let candidates: Box<dyn DoubleEndedIterator<Item = ReadCandidate<'_>> + '_> =
-            if index_name.is_some() {
-                index_items = guard
-                    .items
-                    .iter()
-                    .inspect(visit)
-                    .filter(|(_, item)| key_cond.matches(item))
-                    .filter_map(|(base, item)| {
-                        stored_key_for(item, &hash, range.as_deref()).map(|key| (key, base, item))
-                    })
-                    .collect::<Vec<_>>();
-                index_items.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-                Box::new(
-                    index_items
-                        .iter()
-                        .map(|(key, base, item)| (key, *base, *item)),
-                )
+        None
+    };
+    let mut index_items;
+    let candidates: Box<dyn Iterator<Item = ReadCandidate<'_>> + '_> =
+        if let Some((partition, lower, upper)) = bounds {
+            if empty_read_bounds(&lower, &upper) {
+                Box::new(std::iter::empty())
             } else {
+                let entries: Box<dyn DoubleEndedIterator<Item = (&StoredKey, &Item)>> = if forward {
+                    Box::new(guard.items.range((lower, upper)).inspect(visit))
+                } else {
+                    Box::new(guard.items.range((lower, upper)).rev().inspect(visit))
+                };
                 Box::new(
-                    guard
+                    entries
+                        .take_while(move |(key, _)| key.partition.cmp(&partition).is_eq())
+                        .filter(|(_, item)| key_cond.matches(item))
+                        .map(|(key, item)| (key, key, item)),
+                )
+            }
+        } else {
+            let candidates: Box<dyn DoubleEndedIterator<Item = ReadCandidate<'_>> + '_> =
+                if index_name.is_some() {
+                    index_items = guard
                         .items
                         .iter()
                         .inspect(visit)
                         .filter(|(_, item)| key_cond.matches(item))
-                        .map(|(key, item)| (key, key, item)),
-                )
-            };
-        if forward {
-            candidates
-        } else {
-            Box::new(candidates.rev())
-        }
-    };
+                        .filter_map(|(base, item)| {
+                            stored_key_for(item, &hash, range.as_deref())
+                                .map(|key| (key, base, item))
+                        })
+                        .collect::<Vec<_>>();
+                    index_items.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+                    Box::new(
+                        index_items
+                            .iter()
+                            .map(|(key, base, item)| (key, *base, *item)),
+                    )
+                } else {
+                    Box::new(
+                        guard
+                            .items
+                            .iter()
+                            .inspect(visit)
+                            .filter(|(_, item)| key_cond.matches(item))
+                            .map(|(key, item)| (key, key, item)),
+                    )
+                };
+            if forward {
+                candidates
+            } else {
+                Box::new(candidates.rev())
+            }
+        };
     paginate_and_respond(
         req,
         &guard.def,
@@ -3189,21 +3285,249 @@ mod query_range_tests {
     }
 
     async fn fixture(kind: &str) -> TableStore {
+        fixture_keys(kind, "N").await
+    }
+
+    async fn fixture_keys(partition: &str, sort: &str) -> TableStore {
         let store = TableStore::new();
         create_table(&context(&store), &json!({
             "TableName":"range-pages", "BillingMode":"PAY_PER_REQUEST",
-            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":kind},{"AttributeName":"sk","AttributeType":"N"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":partition},{"AttributeName":"sk","AttributeType":sort}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}]
         })).await.unwrap();
         store
     }
 
     fn insert(data: &mut TableData, partition: Value, sort: usize, payload: &str) {
-        let item = item_from_json(
-            &json!({"pk":partition,"sk":{"N":sort.to_string()},"payload":{"S":payload}}),
-        )
-        .unwrap();
+        insert_value(data, partition, json!({"N":sort.to_string()}), payload);
+    }
+
+    fn insert_value(data: &mut TableData, partition: Value, sort: Value, payload: &str) {
+        let item =
+            item_from_json(&json!({"pk":partition,"sk":sort,"payload":{"S":payload}})).unwrap();
         data.items.insert(data.key_of(&item).unwrap(), item);
+    }
+
+    fn sort_value(kind: &str, value: u32) -> Value {
+        match kind {
+            "S" => json!({"S":format!("{value:05}")}),
+            "N" => json!({"N":format!("{value}.00")}),
+            "B" => {
+                json!({"B":base64::engine::general_purpose::STANDARD.encode(value.to_be_bytes())})
+            }
+            _ => panic!("unknown fixture key kind"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_query_seeks_past_partitions_and_sort_prefix_and_suffix() {
+        for kind in ["S", "N", "B"] {
+            let store = fixture_keys("N", kind).await;
+            let ctx = context(&store);
+            let table = get_table(&ctx, "range-pages").await.unwrap();
+            {
+                let mut data = table.write().await;
+                for index in 0..1000 {
+                    insert_value(
+                        &mut data,
+                        json!({"N":(-index-1).to_string()}),
+                        sort_value(kind, 0),
+                        "other",
+                    );
+                    insert_value(
+                        &mut data,
+                        json!({"N":(index+2).to_string()}),
+                        sort_value(kind, 0),
+                        "other",
+                    );
+                }
+                for sort in 0..10_000 {
+                    insert_value(
+                        &mut data,
+                        json!({"N":"1"}),
+                        sort_value(kind, sort),
+                        "target",
+                    );
+                }
+            }
+            for (expression, scanned, visited) in [
+                ("#s BETWEEN :lo AND :hi", 2, 3),
+                ("#s >= :lo AND #s <= :hi", 2, 3),
+                (":lo <= #s AND :hi >= #s", 2, 3),
+                (":lo < #s AND :hi > #s", 1, 1),
+                ("#s = :lo", 1, 1),
+                ("#s > :lo AND #s < :hi", 1, 1),
+                ("#s > :lo AND #s <= :lo", 0, 0),
+                ("#s >= :lo AND #s < :lo", 0, 0),
+                ("#s BETWEEN :hi AND :lo", 0, 0),
+            ] {
+                for forward in [true, false] {
+                    let condition = format!("pk = :p AND ({expression})");
+                    let mut request = json!({"TableName":"range-pages","KeyConditionExpression":condition,
+                        "ExpressionAttributeNames":{"#s":"sk"},"ExpressionAttributeValues":{":p":{"N":"1.00"},":lo":sort_value(kind,5000),":hi":sort_value(kind,5002)},
+                        "ScanIndexForward":forward,"Limit":2,"Select":"COUNT","FilterExpression":"attribute_not_exists(payload)"});
+                    table
+                        .read()
+                        .await
+                        .query_entries_visited
+                        .store(0, Ordering::Relaxed);
+                    let actual = query(&ctx, &request).await.unwrap();
+                    assert_eq!(actual["Count"], 0);
+                    assert_eq!(actual["ScannedCount"], scanned);
+                    assert!(actual.get("Items").is_none());
+                    assert_eq!(
+                        table
+                            .read()
+                            .await
+                            .query_entries_visited
+                            .load(Ordering::Relaxed),
+                        visited,
+                        "{kind} {request}"
+                    );
+                    request["KeyConditionExpression"] =
+                        json!(format!("({condition}) OR ({condition})"));
+                    assert_eq!(
+                        actual,
+                        query(&ctx, &request).await.unwrap(),
+                        "{kind} {request}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_query_intersects_cursors_and_preserves_fallback_semantics() {
+        let store = fixture("N").await;
+        let ctx = context(&store);
+        let table = get_table(&ctx, "range-pages").await.unwrap();
+        {
+            let mut data = table.write().await;
+            for partition in 0..3 {
+                for sort in 0..1000 {
+                    insert(&mut data, json!({"N":partition.to_string()}), sort, "value");
+                }
+            }
+        }
+        for expression in ["sk BETWEEN :lo AND :hi", "sk >= :lo"] {
+            for forward in [true, false] {
+                for cursor in [
+                    json!({"pk":{"N":"0"},"sk":{"N":"0"}}),
+                    json!({"pk":{"N":"1.00"},"sk":{"N":"899.0"}}),
+                    json!({"pk":{"N":"1"},"sk":{"N":"901.00"}}),
+                    json!({"pk":{"N":"1"},"sk":{"N":"999"}}),
+                    json!({"pk":{"N":"2"},"sk":{"N":"0"}}),
+                ] {
+                    let condition = format!("pk = :p AND ({expression})");
+                    let mut request = json!({"TableName":"range-pages","KeyConditionExpression":condition,
+                        "ExpressionAttributeValues":{":p":{"N":"1.0"},":lo":{"N":"900"},":hi":{"N":"903"}},
+                        "ExclusiveStartKey":cursor,"ScanIndexForward":forward,"Limit":2});
+                    table
+                        .read()
+                        .await
+                        .query_entries_visited
+                        .store(0, Ordering::Relaxed);
+                    let actual = query(&ctx, &request).await.unwrap();
+                    let visited = table
+                        .read()
+                        .await
+                        .query_entries_visited
+                        .load(Ordering::Relaxed);
+                    // Without a finite sort upper, a cursor in a later partition keeps reverse fallback.
+                    let fallback =
+                        !forward && expression == "sk >= :lo" && cursor["pk"]["N"] == "2";
+                    if !fallback {
+                        assert!(visited <= 3, "visited={visited}: {request}");
+                    }
+                    request["KeyConditionExpression"] =
+                        json!(format!("({condition}) OR ({condition})"));
+                    assert_eq!(actual, query(&ctx, &request).await.unwrap(), "{request}");
+                }
+            }
+        }
+        for expression in [
+            "pk = :p AND NOT (sk < :lo)",
+            "pk = :p AND begins_with(payload, :prefix)",
+            "pk = :p OR sk < :lo",
+            "pk = :p AND sk <= :wrong",
+            "pk = :p AND sk BETWEEN :lo AND :wrong",
+        ] {
+            let request = json!({"TableName":"range-pages","KeyConditionExpression":expression,
+                "ExpressionAttributeValues":{":p":{"N":"1"},":lo":{"N":"900"},":prefix":{"S":"val"},":wrong":{"S":"wrong sort type"}},"ScanIndexForward":false,"Limit":2});
+            let actual = query(&ctx, &request).await.unwrap();
+            let mut previous = request.clone();
+            previous["KeyConditionExpression"] = json!(format!("({expression}) OR ({expression})"));
+            assert_eq!(actual, query(&ctx, &previous).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_query_preserves_byte_pages_in_both_directions() {
+        let store = fixture("S").await;
+        let ctx = context(&store);
+        let table = get_table(&ctx, "range-pages").await.unwrap();
+        {
+            let mut data = table.write().await;
+            for sort in 0..1000 {
+                insert(&mut data, json!({"S":"middle"}), sort, "small");
+            }
+            for sort in 500..506 {
+                insert(&mut data, json!({"S":"middle"}), sort, &"x".repeat(300_000));
+            }
+        }
+        for forward in [true, false] {
+            let mut request = json!({"TableName":"range-pages","KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
+                "ExpressionAttributeValues":{":p":{"S":"middle"},":lo":{"N":"500"},":hi":{"N":"505"}},
+                "ScanIndexForward":forward,"ProjectionExpression":"pk, sk"});
+            table
+                .read()
+                .await
+                .query_entries_visited
+                .store(0, Ordering::Relaxed);
+            let page = query(&ctx, &request).await.unwrap();
+            assert_eq!(page["ScannedCount"], 3);
+            assert_eq!(
+                page["LastEvaluatedKey"]["sk"]["N"],
+                if forward { "502" } else { "503" }
+            );
+            assert_eq!(
+                page["Items"][0]["sk"]["N"],
+                if forward { "500" } else { "505" }
+            );
+            assert!(page["Items"][0].get("payload").is_none());
+            assert_eq!(
+                table
+                    .read()
+                    .await
+                    .query_entries_visited
+                    .load(Ordering::Relaxed),
+                4
+            );
+            let mut filtered = request.clone();
+            filtered["FilterExpression"] = json!("attribute_not_exists(payload)");
+            filtered["Select"] = json!("COUNT");
+            let count = query(&ctx, &filtered).await.unwrap();
+            assert_eq!(count["ScannedCount"], 3);
+            assert_eq!(count["Count"], 0);
+            assert_eq!(count["LastEvaluatedKey"], page["LastEvaluatedKey"]);
+            request["ExclusiveStartKey"] = page["LastEvaluatedKey"].clone();
+            table
+                .read()
+                .await
+                .query_entries_visited
+                .store(0, Ordering::Relaxed);
+            let last = query(&ctx, &request).await.unwrap();
+            assert_eq!(last["Count"], 3);
+            assert!(last.get("LastEvaluatedKey").is_none());
+            assert_eq!(
+                table
+                    .read()
+                    .await
+                    .query_entries_visited
+                    .load(Ordering::Relaxed),
+                3
+            );
+        }
     }
 
     #[tokio::test]

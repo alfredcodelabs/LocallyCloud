@@ -142,7 +142,7 @@ impl DeliveryStream {
         }
         let policy = self.iceberg_policy();
         let size = policy.map_or(COALESCE_SIZE_BYTES, |p| p.size_mib as usize * 1024 * 1024);
-        if self.pending.iter().map(Vec::len).sum::<usize>() >= size
+        if self.buffered_bytes >= size
             || (policy.is_none()
                 && (self.source.is_some() || self.pending.len() >= MAX_BUFFERED_RECORDS))
         {
@@ -202,6 +202,7 @@ mod tests {
             role_caller: None,
             pending: VecDeque::from([vec![1]]),
             retained: VecDeque::new(),
+            buffered_bytes: 1,
             retry_token: None,
             in_flight: None,
             delivery_attempts: 0,
@@ -214,6 +215,562 @@ mod tests {
             backed_up_records: 0,
             primary_failure: FailureCode::InternalError,
             encryption: None,
+        }
+    }
+
+    #[test]
+    fn completion_moves_full_backlog_without_copying_payload_bytes() {
+        for outcome in [0, 1, 2] {
+            let (handler, _handle) = FirehoseHandler::new(Weak::new());
+            let scope = Scope {
+                account_id: "000000000000".into(),
+                region: "us-east-1".into(),
+            };
+            let key = StreamKey::new(&scope, "copies");
+            let now = Instant::now();
+            let mut original = stream(now);
+            original.pending.clear();
+            original.buffered_bytes = 0;
+            original
+                .destination
+                .iceberg_delivery
+                .as_mut()
+                .unwrap()
+                .interval_seconds = 0;
+            handler
+                .inner
+                .append_pending(&key, &mut original, vec![vec![1; MAX_RECORD_BYTES]])
+                .unwrap();
+            handler
+                .inner
+                .lock_streams()
+                .unwrap()
+                .insert(key.clone(), original);
+            let batch = handler.inner.take_batches().pop().unwrap();
+            let token = batch.token;
+            let batch_pointer = batch.records[0].as_ptr();
+            let pending_pointers = {
+                let mut streams = handler.inner.lock_streams().unwrap();
+                let stream = streams.get_mut(&key).unwrap();
+                let mut remaining = MAX_BUFFERED_BYTES - MAX_RECORD_BYTES;
+                let mut records = Vec::new();
+                while remaining > 0 {
+                    let size = remaining.min(MAX_RECORD_BYTES);
+                    records.push(vec![2; size]);
+                    remaining -= size;
+                }
+                handler.inner.append_pending(&key, stream, records).unwrap();
+                assert_eq!(buffered_usage(stream).1, MAX_BUFFERED_BYTES);
+                stream
+                    .pending
+                    .iter()
+                    .map(|record| record.as_ptr())
+                    .collect::<Vec<_>>()
+            };
+            let request = serde_json::from_value(json!({
+                "DeliveryStreamName":"copies", "Record":{"Data":"eyJpZCI6MX0="}
+            }))
+            .unwrap();
+            assert!(matches!(
+                handler.put_record(request, &scope),
+                Err(FirehoseError::ServiceUnavailable(_))
+            ));
+            match outcome {
+                0 => handler.inner.complete_batch(batch, true),
+                1 => handler.inner.complete_batch(batch, false),
+                _ => handler.inner.requeue_unauthorized_batch(batch),
+            }
+            let streams = handler.inner.lock_streams().unwrap();
+            let stream = streams.get(&key).unwrap();
+            let copied_pending_bytes: usize = stream
+                .pending
+                .iter()
+                .zip(pending_pointers)
+                .filter(|(record, before)| record.as_ptr() != *before)
+                .map(|(record, _)| record.len())
+                .sum();
+            assert_eq!(copied_pending_bytes, 0);
+            assert_eq!(
+                stream.pending.len(),
+                (MAX_BUFFERED_BYTES - MAX_RECORD_BYTES).div_ceil(MAX_RECORD_BYTES)
+            );
+            let expected = if outcome == 0 {
+                MAX_BUFFERED_BYTES - MAX_RECORD_BYTES
+            } else {
+                MAX_BUFFERED_BYTES
+            };
+            assert_eq!(buffered_usage(stream).1, expected);
+            if outcome != 0 {
+                let retained = stream.retained.front().unwrap();
+                let copied_batch_bytes = if retained.as_ptr() == batch_pointer {
+                    0
+                } else {
+                    retained.len()
+                };
+                assert_eq!(copied_batch_bytes, 0);
+                assert_eq!(stream.retry_token, Some(token));
+            }
+        }
+    }
+
+    #[test]
+    fn persistence_failures_preserve_payload_ownership_usage_and_replay_token() {
+        for outcome in [0, 1, 2] {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.locallycloud-tmp/batch-apigw-firehose-ddb/firehose")
+                .join(format!("rollback-{}", Uuid::new_v4()));
+            let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+            let (handler, handle) =
+                FirehoseHandler::with_state(Weak::new(), state.clone()).unwrap();
+            let scope = Scope {
+                account_id: "000000000000".into(),
+                region: "us-east-1".into(),
+            };
+            let key = StreamKey::new(&scope, "rollback");
+            let mut original = stream(Instant::now());
+            original.pending.clear();
+            original.buffered_bytes = 0;
+            original
+                .destination
+                .iceberg_delivery
+                .as_mut()
+                .unwrap()
+                .interval_seconds = 0;
+            handler.inner.persist_create(&key, &original).unwrap();
+            handler
+                .inner
+                .append_pending(&key, &mut original, vec![b"batch".to_vec()])
+                .unwrap();
+            handler
+                .inner
+                .lock_streams()
+                .unwrap()
+                .insert(key.clone(), original);
+            let batch = handler.inner.take_batches().pop().unwrap();
+            let token = batch.token;
+            let batch_pointer = batch.records[0].as_ptr();
+            let pending_pointer = {
+                let mut streams = handler.inner.lock_streams().unwrap();
+                let stream = streams.get_mut(&key).unwrap();
+                handler
+                    .inner
+                    .append_pending(&key, stream, vec![b"pending".to_vec()])
+                    .unwrap();
+                stream.pending[0].as_ptr()
+            };
+            state.connection().unwrap().execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE ON firehose_streams BEGIN SELECT RAISE(ABORT,'injected completion failure'); END;").unwrap();
+            match outcome {
+                0 => handler.inner.complete_batch(batch, true),
+                1 => handler.inner.complete_batch(batch, false),
+                _ => handler.inner.requeue_unauthorized_batch(batch),
+            }
+            {
+                let streams = handler.inner.lock_streams().unwrap();
+                let stream = streams.get(&key).unwrap();
+                assert_eq!(stream.pending[0].as_ptr(), pending_pointer);
+                assert_eq!(stream.retained[0].as_ptr(), batch_pointer);
+                assert_eq!(buffered_usage(stream), (2, b"batchpending".len()));
+                assert_eq!(stream.delivery_attempts, 0);
+                assert_eq!(stream.retry_token, Some(token));
+            }
+            state
+                .connection()
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_completion;")
+                .unwrap();
+            let restored = persistence::load(&state).unwrap().remove(&key).unwrap();
+            assert_eq!(buffered_usage(&restored), (2, b"batchpending".len()));
+            assert_eq!(restored.retry_token, Some(token));
+            handler
+                .inner
+                .lock_streams()
+                .unwrap()
+                .insert(key.clone(), restored);
+            let retry = handler
+                .inner
+                .take_batches_at(Instant::now() + Duration::from_secs(1))
+                .pop()
+                .unwrap();
+            assert_eq!(retry.token, token);
+            handler.inner.complete_batch(retry, true);
+            let restored = persistence::load(&state).unwrap().remove(&key).unwrap();
+            assert_eq!(buffered_usage(&restored), (1, b"pending".len()));
+            drop(handler);
+            drop(handle);
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn retry_and_expiry_restore_buffers_when_config_persistence_fails() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.locallycloud-tmp/batch-apigw-firehose-ddb/firehose")
+            .join(format!("retry-{}", Uuid::new_v4()));
+        let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+        let (handler, handle) = FirehoseHandler::with_state(Weak::new(), state.clone()).unwrap();
+        let scope = Scope {
+            account_id: "000000000000".into(),
+            region: "us-east-1".into(),
+        };
+        let key = StreamKey::new(&scope, "retry");
+        let mut original = stream(Instant::now());
+        original.pending.clear();
+        original.buffered_bytes = 0;
+        original
+            .destination
+            .iceberg_delivery
+            .as_mut()
+            .unwrap()
+            .interval_seconds = 0;
+        handler.inner.persist_create(&key, &original).unwrap();
+        handler
+            .inner
+            .append_pending(&key, &mut original, vec![b"retry".to_vec()])
+            .unwrap();
+        handler
+            .inner
+            .lock_streams()
+            .unwrap()
+            .insert(key.clone(), original);
+        let batch = handler.inner.take_batches().pop().unwrap();
+        let token = batch.token;
+        let pointer = batch.records[0].as_ptr();
+        handler.inner.complete_batch(batch, false);
+        let now = Instant::now();
+        {
+            let mut streams = handler.inner.lock_streams().unwrap();
+            let stream = streams.get_mut(&key).unwrap();
+            stream.retry_at = None;
+            stream.retry_started = Some(StartedAt::at(now - Duration::from_secs(301)).unwrap());
+            handler.inner.persist_create(&key, stream).unwrap();
+        }
+        state.connection().unwrap().execute_batch("CREATE TRIGGER reject_retry BEFORE UPDATE ON firehose_streams BEGIN SELECT RAISE(ABORT,'injected retry failure'); END;").unwrap();
+        assert!(handler.inner.take_batches_at(now).is_empty());
+        {
+            let mut streams = handler.inner.lock_streams().unwrap();
+            let stream = streams.get_mut(&key).unwrap();
+            assert_eq!(stream.retained[0].as_ptr(), pointer);
+            assert_eq!(buffered_usage(stream), (1, b"retry".len()));
+            assert!(!stream.terminal_failure);
+            stream.terminal_failure = true;
+        }
+        let retry = || serde_json::from_value(json!({"DeliveryStreamName":"retry"})).unwrap();
+        assert!(matches!(
+            handler.retry_delivery_stream(retry(), &scope),
+            Err(FirehoseError::Persistence)
+        ));
+        {
+            let streams = handler.inner.lock_streams().unwrap();
+            let stream = streams.get(&key).unwrap();
+            assert!(stream.terminal_failure);
+            assert_eq!(stream.retained[0].as_ptr(), pointer);
+            assert_eq!(stream.retry_token, Some(token));
+        }
+        state
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_retry;")
+            .unwrap();
+        assert!(handler.retry_delivery_stream(retry(), &scope).is_ok());
+        let streams = handler.inner.lock_streams().unwrap();
+        let stream = streams.get(&key).unwrap();
+        assert!(!stream.terminal_failure);
+        assert_eq!(stream.retained[0].as_ptr(), pointer);
+        assert_eq!(buffered_usage(stream), (1, b"retry".len()));
+        drop(streams);
+        drop(handler);
+        runtime.block_on(handle.shutdown());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_before_first_worker_poll_joins_idle_worker() {
+        let (handler, handle) = FirehoseHandler::new(Weak::new());
+        handler.inner.ensure_worker().unwrap();
+        let abort = handler
+            .inner
+            .worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), handle.shutdown()).await;
+        if stopped.is_err() {
+            abort.abort();
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            stopped.is_ok(),
+            "shutdown must wake and join an idle worker that has never polled"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_worker_checkpoints_keep_current_thread_live_after_caller_cancellation() {
+        for source_page in [false, true] {
+            let (root, state, handler, handle, key, generation, batch) =
+                tokio::task::spawn_blocking(move || {
+                    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../.locallycloud-tmp/batch-apigw-firehose-ddb/firehose")
+                        .join(format!("worker-writer-{}", Uuid::new_v4()));
+                    let state = Arc::new(StateDb::open(root.join("state.sqlite3")).unwrap());
+                    let (handler, handle) =
+                        FirehoseHandler::with_state(Weak::new(), state.clone()).unwrap();
+                    let scope = Scope {
+                        account_id: "000000000000".into(),
+                        region: "us-east-1".into(),
+                    };
+                    let key = StreamKey::new(&scope, "worker-writer");
+                    let mut original = stream(Instant::now());
+                    original.pending.clear();
+                    original.buffered_bytes = 0;
+                    original.destination.iceberg = None;
+                    original.destination.iceberg_delivery = None;
+                    if source_page {
+                        original.source = Some(serde_json::from_value(json!({
+                        "arn":"arn:aws:kinesis:us-east-1:000000000000:stream/source",
+                        "name":"source", "role_arn":"arn:aws:iam::000000000000:role/firehose",
+                        "ready":false, "failure":null, "creation_timestamp":null, "stopped":false
+                    })).unwrap());
+                    }
+                    let generation = original.generation;
+                    handler.inner.persist_create(&key, &original).unwrap();
+                    if !source_page {
+                        handler
+                            .inner
+                            .append_pending(&key, &mut original, vec![b"row".to_vec()])
+                            .unwrap();
+                    }
+                    handler
+                        .inner
+                        .lock_streams()
+                        .unwrap()
+                        .insert(key.clone(), original);
+                    let batch = if source_page {
+                        None
+                    } else {
+                        Some(
+                            handler
+                                .inner
+                                .take_batches_at(Instant::now() + Duration::from_secs(60))
+                                .pop()
+                                .unwrap(),
+                        )
+                    };
+                    (root, state, handler, handle, key, generation, batch)
+                })
+                .await
+                .unwrap();
+            let expected_token = batch.as_ref().map(|batch| batch.token);
+            let (ready_send, ready_receive) = tokio::sync::oneshot::channel();
+            let (release_send, release_receive) = std::sync::mpsc::channel();
+            let writer_state = state.clone();
+            let writer = std::thread::spawn(move || {
+                let mut connection = writer_state.connection().unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                ready_send.send(()).unwrap();
+                // The watchdog turns an async-blocking regression into a test failure, not a hang.
+                let _ = release_receive.recv_timeout(Duration::from_secs(3));
+                transaction.commit().unwrap();
+            });
+            ready_receive.await.unwrap();
+            let operation_inner = handler.inner.clone();
+            let operation_key = key.clone();
+            let operation = tokio::spawn(async move {
+                match batch {
+                    Some(batch) => operation_inner
+                        .defer_unauthorized_batch(batch)
+                        .await
+                        .unwrap(),
+                    None => operation_inner
+                        .append_source_page(
+                            operation_key,
+                            generation,
+                            1.0,
+                            vec![("shard".into(), "1".into(), b"row".to_vec())],
+                            1,
+                        )
+                        .await
+                        .unwrap(),
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if handler.inner.streams.try_lock().is_err() {
+                        break;
+                    }
+                    assert!(
+                        !operation.is_finished(),
+                        "checkpoint finished before writer release"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("checkpoint must enter its locked blocking transaction");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !operation.is_finished(),
+                "runtime timer must advance while SQLite waits"
+            );
+            operation.abort();
+            assert!(operation.await.unwrap_err().is_cancelled());
+            let delay_inner = handler.inner.clone();
+            let delay = tokio::spawn(async move { delay_inner.next_retry_delay().await.unwrap() });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !delay.is_finished(),
+                "worker delay lookup must wait off the runtime thread"
+            );
+            let inventory_handler = FirehoseHandler {
+                inner: handler.inner.clone(),
+            };
+            let account = key.scope.account_id.clone();
+            let inventory =
+                tokio::spawn(
+                    async move { inventory_handler.resource_regions(&account).await.unwrap() },
+                );
+            let other_inventory_handler = FirehoseHandler {
+                inner: handler.inner.clone(),
+            };
+            let other_inventory = tokio::spawn(async move {
+                other_inventory_handler
+                    .resource_regions("other-account")
+                    .await
+                    .unwrap()
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !inventory.is_finished(),
+                "inventory must wait off the runtime thread"
+            );
+            assert!(
+                !other_inventory.is_finished(),
+                "foreign inventory must also wait off the runtime thread"
+            );
+            let reader_inner = handler.inner.clone();
+            let reader_key = key.clone();
+            let (reader_started, reader_ready) = tokio::sync::oneshot::channel();
+            let reader = tokio::task::spawn_blocking(move || {
+                reader_started.send(()).unwrap();
+                let streams = reader_inner.lock_streams().unwrap();
+                streams.get(&reader_key).unwrap().clone()
+            });
+            reader_ready.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !reader.is_finished(),
+                "cancelled caller must not unlock the in-progress checkpoint"
+            );
+            release_send.send(()).unwrap();
+            tokio::task::spawn_blocking(move || writer.join().unwrap())
+                .await
+                .unwrap();
+            let memory = tokio::time::timeout(Duration::from_secs(5), reader)
+                .await
+                .unwrap()
+                .unwrap();
+            let _delay = tokio::time::timeout(Duration::from_secs(5), delay)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), inventory)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                vec![key.scope.region.clone()]
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), other_inventory)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(buffered_usage(&memory), (1, b"row".len()));
+            assert_eq!(memory.retry_token, expected_token);
+            let restore_state = state.clone();
+            let restore_key = key.clone();
+            let restored = tokio::task::spawn_blocking(move || {
+                persistence::load(&restore_state)
+                    .unwrap()
+                    .remove(&restore_key)
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(buffered_usage(&restored), buffered_usage(&memory));
+            assert_eq!(restored.pending, memory.pending);
+            assert_eq!(restored.retained, memory.retained);
+            assert_eq!(restored.retry_token, expected_token);
+            if source_page {
+                assert_eq!(
+                    restored.source.as_ref().unwrap().fetched_shards["shard"],
+                    "1"
+                );
+                assert_eq!(restored.source.as_ref().unwrap().next_shard, 1);
+                let inner = handler.inner.clone();
+                let replacement_key = key.clone();
+                let replacement_generation = tokio::task::spawn_blocking(move || {
+                    let mut streams = inner.lock_streams().unwrap();
+                    let mut replacement = streams.get(&replacement_key).unwrap().clone();
+                    replacement.generation = Uuid::new_v4();
+                    replacement.pending.clear();
+                    replacement.buffered_bytes = 0;
+                    replacement.pending_since = None;
+                    let source = replacement.source.as_mut().unwrap();
+                    source.fetched_shards.clear();
+                    source.creation_timestamp = None;
+                    source.next_shard = 0;
+                    inner.persist_delete(&replacement_key).unwrap();
+                    inner
+                        .persist_create(&replacement_key, &replacement)
+                        .unwrap();
+                    let generation = replacement.generation;
+                    streams.insert(replacement_key, replacement);
+                    generation
+                })
+                .await
+                .unwrap();
+                handler
+                    .inner
+                    .append_source_page(
+                        key.clone(),
+                        generation,
+                        2.0,
+                        vec![("shard".into(), "stale".into(), b"stale".to_vec())],
+                        2,
+                    )
+                    .await
+                    .unwrap();
+                let inner = handler.inner.clone();
+                let stale_key = key.clone();
+                let current = tokio::task::spawn_blocking(move || {
+                    let streams = inner.lock_streams().unwrap();
+                    streams.get(&stale_key).unwrap().clone()
+                })
+                .await
+                .unwrap();
+                assert_eq!(current.generation, replacement_generation);
+                assert_eq!(buffered_usage(&current), (0, 0));
+                assert!(current.source.as_ref().unwrap().fetched_shards.is_empty());
+                assert_eq!(current.source.as_ref().unwrap().creation_timestamp, None);
+            }
+            drop(handler);
+            drop(handle);
+            drop(state);
+            tokio::fs::remove_dir_all(root).await.unwrap();
         }
     }
 
@@ -277,8 +834,10 @@ mod tests {
 
         let mut sized = stream(now);
         sized.pending = VecDeque::from([vec![1; 1024 * 1024 - 1]]);
+        sized.buffered_bytes = 1024 * 1024 - 1;
         assert_eq!(sized.delivery_delay(now), Some(Duration::from_secs(60)));
         sized.pending.push_back(vec![2]);
+        sized.buffered_bytes += 1;
         assert_eq!(sized.delivery_delay(now), Some(Duration::ZERO));
         assert_eq!(
             sized.delivery_delay(now + Duration::from_secs(60)),
@@ -367,6 +926,7 @@ mod tests {
         let now = Instant::now();
         let mut original = stream(now);
         original.pending.clear();
+        original.buffered_bytes = 0;
         original.pending_since = None;
         handler.inner.persist_create(&key, &original).unwrap();
         state.connection().unwrap().execute_batch("CREATE TRIGGER fail_clock_append BEFORE INSERT ON firehose_records BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
@@ -375,9 +935,11 @@ mod tests {
             .append_pending(&key, &mut original, vec![b"rejected".to_vec()])
             .is_err());
         assert!(original.pending.is_empty());
+        assert_eq!(buffered_usage(&original), (0, 0));
         assert!(original.pending_since.is_none());
         let rejected = persistence::load(&state).unwrap().remove(&key).unwrap();
         assert!(rejected.pending.is_empty());
+        assert_eq!(buffered_usage(&rejected), (0, 0));
         assert!(rejected.pending_since.is_none());
         state
             .connection()
@@ -393,6 +955,7 @@ mod tests {
         let loaded = persistence::load(&state).unwrap().remove(&key).unwrap();
         assert_eq!(loaded.pending_since.unwrap().unix_ms, accepted_ms);
         assert_eq!(loaded.pending, [b"row".to_vec()]);
+        assert_eq!(buffered_usage(&loaded), (1, b"row".len()));
         assert_eq!(loaded.iceberg_policy().unwrap().interval_seconds, 60);
         assert_eq!(
             loaded.delivery_delay(loaded.pending_since.unwrap().monotonic),
@@ -480,6 +1043,7 @@ mod tests {
             let now = Instant::now();
             let mut original = stream(now);
             original.pending.clear();
+            original.buffered_bytes = 0;
             original.pending_since = None;
             let policy = original.destination.iceberg_delivery.as_mut().unwrap();
             policy.interval_seconds = 0;

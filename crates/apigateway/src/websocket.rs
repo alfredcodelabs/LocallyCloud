@@ -25,7 +25,7 @@ use crate::auth::policy_allows;
 use crate::error::ApiGwError;
 use crate::integration_timeout;
 use crate::proxy_event::percent_decode;
-use crate::store::ApiGwStore;
+use crate::store::{ApiGwStore, ApiV2DeploymentSnapshot};
 
 const MAX_POST_PAYLOAD_BYTES: usize = 128 * 1024;
 const OUTBOUND_MESSAGES: &str = "__outboundMessages";
@@ -105,8 +105,7 @@ struct WebSocketRuntime {
     domain_name: String,
     source_ip: String,
     route_selection_expression: String,
-    routes: Vec<Value>,
-    integrations: BTreeMap<String, Value>,
+    snapshot: Arc<ApiV2DeploymentSnapshot>,
     authorizer_context: Option<Value>,
     iam_identity: Option<Value>,
 }
@@ -172,7 +171,7 @@ pub async fn handle_websocket(
             .into_response();
     };
 
-    let (stage, route_selection_expression, routes, integrations, authorizers) = {
+    let (stage, route_selection_expression, snapshot) = {
         let guard = record.read().await;
         if custom_domain.is_none()
             && guard
@@ -208,14 +207,12 @@ pub async fn handle_websocket(
                 .and_then(Value::as_str)
                 .unwrap_or("$request.body.action")
                 .to_string(),
-            snapshot.routes.values().cloned().collect::<Vec<_>>(),
-            snapshot.integrations,
-            snapshot.authorizers,
+            snapshot,
         )
     };
 
     let domain_name = custom_domain.unwrap_or(invoke_host);
-    let Some(connect_route) = route_for_key(&routes, "$connect").cloned() else {
+    let Some(connect_route) = route_for_key(&snapshot.routes, "$connect").cloned() else {
         return UpgradeFailure::new(404, "No route found for $connect").into_response();
     };
     let connection_id = Uuid::new_v4().simple().to_string();
@@ -274,7 +271,7 @@ pub async fn handle_websocket(
         &api_id,
         &stage,
         &connect_route,
-        &authorizers,
+        &snapshot.authorizers,
         &connect_event,
     )
     .await
@@ -296,8 +293,7 @@ pub async fn handle_websocket(
         domain_name,
         source_ip,
         route_selection_expression,
-        routes,
-        integrations,
+        snapshot,
         authorizer_context,
         iam_identity,
     };
@@ -386,7 +382,7 @@ async fn run_connection(mut socket: WebSocket, runtime: WebSocketRuntime, connec
         }
     }
 
-    if let Some(route) = route_for_key(&runtime.routes, "$disconnect") {
+    if let Some(route) = route_for_key(&runtime.snapshot.routes, "$disconnect") {
         let event = runtime.event(
             &connection_id,
             "$disconnect",
@@ -424,8 +420,8 @@ async fn process_message(
     let selected = resolve_route_selection(&runtime.route_selection_expression, body);
     let route = selected
         .as_deref()
-        .and_then(|key| route_for_key(&runtime.routes, key))
-        .or_else(|| route_for_key(&runtime.routes, "$default"));
+        .and_then(|key| route_for_key(&runtime.snapshot.routes, key))
+        .or_else(|| route_for_key(&runtime.snapshot.routes, "$default"));
     let Some(route) = route else { return };
     let route_key = route
         .get("routeKey")
@@ -618,7 +614,7 @@ async fn invoke_route(
         .and_then(Value::as_str)
         .and_then(|value| value.strip_prefix("integrations/"))
         .ok_or(())?;
-    let integration = runtime.integrations.get(target).ok_or(())?;
+    let integration = runtime.snapshot.integrations.get(target).ok_or(())?;
     match integration
         .get("integrationType")
         .and_then(Value::as_str)
@@ -736,9 +732,9 @@ fn stage_from_path<'a>(path: &str, stages: &'a BTreeMap<String, Value>) -> Optio
     }
 }
 
-fn route_for_key<'a>(routes: &'a [Value], key: &str) -> Option<&'a Value> {
+fn route_for_key<'a>(routes: &'a BTreeMap<String, Value>, key: &str) -> Option<&'a Value> {
     routes
-        .iter()
+        .values()
         .find(|route| route.get("routeKey").and_then(Value::as_str) == Some(key))
 }
 
@@ -1068,6 +1064,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_keeps_shared_deployment_routes_after_redeploy() {
+        let mut record = crate::store::ApiV2Record {
+            routes: BTreeMap::from([(
+                "route".into(),
+                json!({"routeKey":"send","target":"integrations/old"}),
+            )]),
+            integrations: BTreeMap::from([("old".into(), json!({"integrationType":"MOCK"}))]),
+            ..Default::default()
+        };
+        let snapshot = record.snapshot();
+        let runtime = WebSocketRuntime {
+            store: Arc::new(ApiGwStore::new()),
+            registry: Weak::new(),
+            account: ACCOUNT.into(),
+            region: REGION.into(),
+            api_id: "api-1".into(),
+            stage: "prod".into(),
+            domain_name: "api-1.execute-api.us-east-1.amazonaws.com".into(),
+            source_ip: "127.0.0.1".into(),
+            route_selection_expression: "$request.body.action".into(),
+            snapshot: snapshot.clone(),
+            authorizer_context: None,
+            iam_identity: None,
+        };
+        record.routes.get_mut("route").unwrap()["target"] = json!("integrations/new");
+        record.integrations.clear();
+        let redeployed = record.snapshot();
+        let connection = runtime.clone();
+        assert!(Arc::ptr_eq(&snapshot, &connection.snapshot));
+        assert!(!Arc::ptr_eq(&redeployed, &connection.snapshot));
+        let route = route_for_key(&connection.snapshot.routes, "send").unwrap();
+        assert_eq!(route["target"], "integrations/old");
+        assert!(invoke_route(&connection, route, json!({})).await.is_ok());
+        assert!(redeployed.integrations.is_empty());
+    }
+
+    #[tokio::test]
     async fn deleting_a_live_connection_sends_a_websocket_close_frame() {
         use axum::{routing::get, Router};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1083,8 +1116,7 @@ mod tests {
             domain_name: "api-1.execute-api.us-east-1.amazonaws.com".into(),
             source_ip: "127.0.0.1".into(),
             route_selection_expression: "$request.body.action".into(),
-            routes: Vec::new(),
-            integrations: BTreeMap::new(),
+            snapshot: Arc::default(),
             authorizer_context: None,
             iam_identity: None,
         };
@@ -1537,11 +1569,13 @@ mod strict_dispatch_tests {
             domain_name: "ws-api.execute-api.localhost".into(),
             source_ip: "127.0.0.1".into(),
             route_selection_expression: "$request.body.action".into(),
-            routes: Vec::new(),
-            integrations: BTreeMap::from([(
-                "target".into(),
-                json!({"integrationType":"AWS_PROXY","integrationUri":"function"}),
-            )]),
+            snapshot: Arc::new(ApiV2DeploymentSnapshot {
+                integrations: BTreeMap::from([(
+                    "target".into(),
+                    json!({"integrationType":"AWS_PROXY","integrationUri":"function"}),
+                )]),
+                ..Default::default()
+            }),
             authorizer_context: None,
             iam_identity: Some(
                 json!({"userArn":"arn:aws:sts::000000000000:assumed-role/worker/session","user":"AROA:session","caller":"AROA:session","accessKey":"ASIAFIXTURE","accountId":"000000000000"}),

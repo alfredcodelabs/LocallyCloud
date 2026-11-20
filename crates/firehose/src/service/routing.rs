@@ -604,11 +604,11 @@ impl Inner {
         config: &RoutingConfiguration,
     ) -> Result<Plan, FailureCode> {
         let inner = self.clone();
-        let lookup = batch.clone();
-        let cached =
-            tokio::task::spawn_blocking(move || inner.load_routing_plan(&lookup.key, lookup.token))
-                .await
-                .map_err(|_| FailureCode::InternalError)??;
+        let key = batch.key.clone();
+        let token = batch.token;
+        let cached = tokio::task::spawn_blocking(move || inner.load_routing_plan(&key, token))
+            .await
+            .map_err(|_| FailureCode::InternalError)??;
         if let Some(plan) = cached {
             return if plan.validate(config, batch.records.len()) {
                 Ok(plan)
@@ -719,11 +719,11 @@ impl Inner {
             )]));
         };
         let inner = self.clone();
-        let lookup = batch.clone();
-        let plan =
-            tokio::task::spawn_blocking(move || inner.load_routing_plan(&lookup.key, lookup.token))
-                .await
-                .map_err(|_| FailureCode::InternalError)??;
+        let key = batch.key.clone();
+        let token = batch.token;
+        let plan = tokio::task::spawn_blocking(move || inner.load_routing_plan(&key, token))
+            .await
+            .map_err(|_| FailureCode::InternalError)??;
         let Some(plan) = plan else {
             return Ok(BTreeMap::from([(
                 backup
@@ -912,6 +912,7 @@ mod tests {
             role_caller: None,
             pending: VecDeque::new(),
             retained: VecDeque::new(),
+            buffered_bytes: 0,
             retry_token: None,
             in_flight: None,
             delivery_attempts: 0,
@@ -1019,6 +1020,7 @@ mod tests {
         assert!(!groups.contains_key("errors/present/"));
         let mut retained = sample_stream(batch.destination.clone());
         retained.retained = VecDeque::from(batch.records.clone());
+        retained.buffered_bytes = batch.records.iter().map(Vec::len).sum();
         retained.retry_token = Some(batch.token);
         retained.destination.s3_buffering_hints = Some(BufferingHints {
             size_in_m_bs: Some(1),
@@ -1038,6 +1040,7 @@ mod tests {
         let now = Instant::now();
         let mut stream = sample_stream(destination());
         stream.retained.push_back(b"{}".to_vec());
+        stream.buffered_bytes += b"{}".len();
         let bytes = stream.retained.iter().map(Vec::len).sum();
         stream.exhaust_primary_at(now, bytes);
         assert_eq!(stream.delivery_delay(now), Some(Duration::from_secs(300)));
@@ -1050,6 +1053,7 @@ mod tests {
             interval_in_seconds: Some(300),
         });
         stream.retained = VecDeque::from([vec![0; 1024 * 1024]]);
+        stream.buffered_bytes = 1024 * 1024;
         let bytes = stream.retained.iter().map(Vec::len).sum();
         stream.exhaust_primary_at(now, bytes);
         assert_eq!(stream.delivery_delay(now), Some(Duration::ZERO));
