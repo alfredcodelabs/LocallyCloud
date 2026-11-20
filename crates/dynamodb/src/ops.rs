@@ -2,6 +2,7 @@
 //! JSON 1.0 response body (or a `DdbError`). Table state is accessed through per-table locks.
 
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::error;
@@ -1905,36 +1906,71 @@ pub async fn query(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
         .get("ScanIndexForward")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let visit = |_: &(&StoredKey, &Item)| {
+        #[cfg(test)]
+        guard
+            .query_entries_visited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    let partition = (index_name.is_none() && forward)
+        .then(|| key_cond.required_equality(&hash))
+        .flatten()
+        .and_then(crate::store::KeyScalar::from_value);
     let mut index_items;
-    let candidates: Box<dyn DoubleEndedIterator<Item = ReadCandidate<'_>> + '_> =
-        if index_name.is_some() {
-            index_items = guard
+    let candidates: Box<dyn Iterator<Item = ReadCandidate<'_>> + '_> = if let Some(partition) =
+        partition
+    {
+        let lower = StoredKey {
+            partition: partition.clone(),
+            sort: None,
+        };
+        let start = read_start_key(req, &guard.def, &hash, range.as_deref())?;
+        let lower = match start {
+            Some((key, _)) if key >= lower => Bound::Excluded(key),
+            _ => Bound::Included(lower),
+        };
+        Box::new(
+            guard
                 .items
-                .iter()
+                .range((lower, Bound::Unbounded))
+                .inspect(visit)
+                .take_while(move |(key, _)| key.partition.cmp(&partition).is_eq())
                 .filter(|(_, item)| key_cond.matches(item))
-                .filter_map(|(base, item)| {
-                    stored_key_for(item, &hash, range.as_deref()).map(|key| (key, base, item))
-                })
-                .collect::<Vec<_>>();
-            index_items.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-            Box::new(
-                index_items
-                    .iter()
-                    .map(|(key, base, item)| (key, *base, *item)),
-            )
-        } else {
-            Box::new(
-                guard
+                .map(|(key, item)| (key, key, item)),
+        )
+    } else {
+        let candidates: Box<dyn DoubleEndedIterator<Item = ReadCandidate<'_>> + '_> =
+            if index_name.is_some() {
+                index_items = guard
                     .items
                     .iter()
+                    .inspect(visit)
                     .filter(|(_, item)| key_cond.matches(item))
-                    .map(|(key, item)| (key, key, item)),
-            )
-        };
-    let candidates: Box<dyn Iterator<Item = ReadCandidate<'_>> + '_> = if forward {
-        candidates
-    } else {
-        Box::new(candidates.rev())
+                    .filter_map(|(base, item)| {
+                        stored_key_for(item, &hash, range.as_deref()).map(|key| (key, base, item))
+                    })
+                    .collect::<Vec<_>>();
+                index_items.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+                Box::new(
+                    index_items
+                        .iter()
+                        .map(|(key, base, item)| (key, *base, *item)),
+                )
+            } else {
+                Box::new(
+                    guard
+                        .items
+                        .iter()
+                        .inspect(visit)
+                        .filter(|(_, item)| key_cond.matches(item))
+                        .map(|(key, item)| (key, key, item)),
+                )
+            };
+        if forward {
+            candidates
+        } else {
+            Box::new(candidates.rev())
+        }
     };
     paginate_and_respond(
         req,
@@ -2066,20 +2102,13 @@ fn filter_item(item: &Item, allowed: &std::collections::HashSet<String>) -> Item
 
 type ReadCandidate<'a> = (&'a StoredKey, &'a StoredKey, &'a Item);
 
-/// Evaluate only one page before applying filters and projections. Secondary index keys
-/// use the table key as a tie-breaker so a cursor identifies one item even among duplicates.
-fn paginate_and_respond<'a>(
+fn read_start_key(
     req: &Value,
     def: &TableDefinition,
-    candidates: impl Iterator<Item = ReadCandidate<'a>>,
     hash: &str,
     range: Option<&str>,
-    allowed: Option<std::collections::HashSet<String>>,
-    forward: bool,
-) -> Result<Value, DdbError> {
-    let names = parse_names(req)?;
-    let start = req
-        .get("ExclusiveStartKey")
+) -> Result<Option<(StoredKey, StoredKey)>, DdbError> {
+    req.get("ExclusiveStartKey")
         .map(|value| {
             let item = item_from_json(value)?;
             let key = stored_key_for(&item, hash, range).ok_or_else(|| {
@@ -2092,7 +2121,22 @@ fn paginate_and_respond<'a>(
                 })?,
             ))
         })
-        .transpose()?;
+        .transpose()
+}
+
+/// Evaluate only one page before applying filters and projections. Secondary index keys
+/// use the table key as a tie-breaker so a cursor identifies one item even among duplicates.
+fn paginate_and_respond<'a>(
+    req: &Value,
+    def: &TableDefinition,
+    candidates: impl Iterator<Item = ReadCandidate<'a>>,
+    hash: &str,
+    range: Option<&str>,
+    allowed: Option<std::collections::HashSet<String>>,
+    forward: bool,
+) -> Result<Value, DdbError> {
+    let names = parse_names(req)?;
+    let start = read_start_key(req, def, hash, range)?;
     let limit = match req.get("Limit").and_then(Value::as_u64) {
         Some(0) => return Err(DdbError::Validation("Limit must be at least 1".into())),
         Some(l) => usize::try_from(l).unwrap_or(usize::MAX),
@@ -3128,5 +3172,197 @@ mod global_table_tests {
         .await
         .unwrap();
         assert!(store.get(east.account, west.region, "events").is_none());
+    }
+}
+
+#[cfg(test)]
+mod query_range_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn context(store: &TableStore) -> Ctx<'_> {
+        Ctx {
+            store,
+            account: "000000000000",
+            region: "us-east-1",
+        }
+    }
+
+    async fn fixture(kind: &str) -> TableStore {
+        let store = TableStore::new();
+        create_table(&context(&store), &json!({
+            "TableName":"range-pages", "BillingMode":"PAY_PER_REQUEST",
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":kind},{"AttributeName":"sk","AttributeType":"N"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}]
+        })).await.unwrap();
+        store
+    }
+
+    fn insert(data: &mut TableData, partition: Value, sort: usize, payload: &str) {
+        let item = item_from_json(
+            &json!({"pk":partition,"sk":{"N":sort.to_string()},"payload":{"S":payload}}),
+        )
+        .unwrap();
+        data.items.insert(data.key_of(&item).unwrap(), item);
+    }
+
+    #[tokio::test]
+    async fn ascending_query_seeks_partition_and_cursor_before_evaluating_one_page() {
+        let store = fixture("S").await;
+        let ctx = context(&store);
+        let table = get_table(&ctx, "range-pages").await.unwrap();
+        {
+            let mut data = table.write().await;
+            for index in 0..5000 {
+                insert(&mut data, json!({"S":format!("a{index:05}")}), 0, "other");
+                insert(&mut data, json!({"S":format!("z{index:05}")}), 0, "other");
+            }
+            for sort in 0..1000 {
+                insert(&mut data, json!({"S":"middle"}), sort, "target");
+            }
+        }
+        let mut request = json!({"TableName":"range-pages","KeyConditionExpression":"#p = :p", "ExpressionAttributeNames":{"#p":"pk"},
+            "ExpressionAttributeValues":{":p":{"S":"middle"},":none":{"N":"2000"}},
+            "FilterExpression":"sk > :none","Limit":2,"ProjectionExpression":"pk, sk"});
+        for (cursor, expected_last) in [
+            (None, Some("1")),
+            (Some(900), Some("902")),
+            (Some(997), None),
+        ] {
+            if let Some(sort) = cursor {
+                request["ExclusiveStartKey"] =
+                    json!({"pk":{"S":"middle"},"sk":{"N":sort.to_string()}});
+            }
+            table
+                .read()
+                .await
+                .query_entries_visited
+                .store(0, Ordering::Relaxed);
+            let page = query(&ctx, &request).await.unwrap();
+            assert_eq!(page["Count"], 0);
+            assert_eq!(page["ScannedCount"], 2);
+            assert!(page["Items"].as_array().unwrap().is_empty());
+            assert_eq!(
+                page.get("LastEvaluatedKey")
+                    .map(|key| key["sk"]["N"].as_str().unwrap()),
+                expected_last
+            );
+            assert_eq!(
+                table
+                    .read()
+                    .await
+                    .query_entries_visited
+                    .load(Ordering::Relaxed),
+                3
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ascending_query_keeps_numeric_binary_alias_and_foreign_cursor_semantics() {
+        for (kind, before, stored, queried, after) in [
+            (
+                "S",
+                json!({"S":"a"}),
+                json!({"S":"middle"}),
+                json!({"S":"middle"}),
+                json!({"S":"z"}),
+            ),
+            (
+                "N",
+                json!({"N":"0"}),
+                json!({"N":"1"}),
+                json!({"N":"1.0"}),
+                json!({"N":"2"}),
+            ),
+            (
+                "B",
+                json!({"B":"AA=="}),
+                json!({"B":"AQ=="}),
+                json!({"B":"AQ=="}),
+                json!({"B":"Ag=="}),
+            ),
+        ] {
+            let store = fixture(kind).await;
+            let ctx = context(&store);
+            let table = get_table(&ctx, "range-pages").await.unwrap();
+            {
+                let mut data = table.write().await;
+                insert(&mut data, before.clone(), 0, "other");
+                insert(&mut data, after.clone(), 0, "other");
+                for sort in 0..5 {
+                    insert(&mut data, stored.clone(), sort, "target");
+                }
+            }
+            for cursor in [
+                None,
+                Some(json!({"pk":before,"sk":{"N":"0"}})),
+                Some(json!({"pk":queried,"sk":{"N":"1"}})),
+                Some(json!({"pk":after,"sk":{"N":"0"}})),
+            ] {
+                let mut request = json!({"TableName":"range-pages","KeyConditionExpression":"#p = :p AND sk >= :first",
+                    "ExpressionAttributeNames":{"#p":"pk"},"ExpressionAttributeValues":{":p":queried,":first":{"N":"0"}},"Limit":2});
+                if let Some(cursor) = cursor {
+                    request["ExclusiveStartKey"] = cursor;
+                }
+                let actual = query(&ctx, &request).await.unwrap();
+                request["KeyConditionExpression"] =
+                    json!("(#p = :p AND sk >= :first) OR (#p = :p AND sk >= :first)");
+                let previous_path = query(&ctx, &request).await.unwrap();
+                assert_eq!(actual, previous_path, "{kind}: {request}");
+            }
+            let invalid = json!({"TableName":"range-pages","KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":queried},"ExclusiveStartKey":{"pk":stored}});
+            assert!(matches!(
+                query(&ctx, &invalid).await,
+                Err(DdbError::Validation(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn ascending_query_still_applies_byte_page_before_filter_projection_and_count() {
+        let store = fixture("S").await;
+        let ctx = context(&store);
+        let table = get_table(&ctx, "range-pages").await.unwrap();
+        {
+            let mut data = table.write().await;
+            for index in 0..1000 {
+                insert(&mut data, json!({"S":format!("a{index:05}")}), 0, "other");
+            }
+            for sort in 0..6 {
+                insert(&mut data, json!({"S":"middle"}), sort, &"x".repeat(300_000));
+            }
+        }
+        let mut request = json!({"TableName":"range-pages","KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"middle"}},"ProjectionExpression":"pk, sk"});
+        table
+            .read()
+            .await
+            .query_entries_visited
+            .store(0, Ordering::Relaxed);
+        let first = query(&ctx, &request).await.unwrap();
+        assert_eq!(first["ScannedCount"], 3);
+        assert_eq!(first["Count"], 3);
+        assert_eq!(first["LastEvaluatedKey"]["sk"]["N"], "2");
+        assert!(first["Items"][0].get("payload").is_none());
+        assert_eq!(
+            table
+                .read()
+                .await
+                .query_entries_visited
+                .load(Ordering::Relaxed),
+            4
+        );
+        request["ExclusiveStartKey"] = first["LastEvaluatedKey"].clone();
+        let last = query(&ctx, &request).await.unwrap();
+        assert_eq!(last["Count"], 3);
+        assert!(last.get("LastEvaluatedKey").is_none());
+        request.as_object_mut().unwrap().remove("ExclusiveStartKey");
+        request["FilterExpression"] = json!("attribute_not_exists(payload)");
+        request["Select"] = json!("COUNT");
+        let filtered = query(&ctx, &request).await.unwrap();
+        assert_eq!(filtered["Count"], 0);
+        assert_eq!(filtered["ScannedCount"], 3);
+        assert_eq!(filtered["LastEvaluatedKey"], first["LastEvaluatedKey"]);
+        assert!(filtered.get("Items").is_none());
     }
 }

@@ -621,6 +621,27 @@ impl ConditionExpression {
         Ok(ConditionExpression { cond })
     }
 
+    /// An equality required by the condition, without assuming anything beneath OR/NOT.
+    pub(crate) fn required_equality(&self, attribute: &str) -> Option<&AttributeValue> {
+        let mut pending = vec![&self.cond];
+        while let Some(condition) = pending.pop() {
+            match condition {
+                Condition::Compare(Operand::Path(path), CmpOp::Eq, Operand::Value(value))
+                | Condition::Compare(Operand::Value(value), CmpOp::Eq, Operand::Path(path))
+                    if matches!(path.segments.as_slice(), [Segment::Attr(name)] if name == attribute) =>
+                {
+                    return Some(value);
+                }
+                Condition::And(left, right) => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Evaluate against an item.
     pub fn matches(&self, item: &Item) -> bool {
         eval_condition(&self.cond, item)
@@ -631,6 +652,28 @@ impl ConditionExpression {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn required_equality_only_extracts_a_top_level_required_path() {
+        let names = HashMap::from([("#p".into(), "pk".into())]);
+        let value = AttributeValue::S("partition".into());
+        let values = HashMap::from([(":p".into(), value.clone())]);
+        for (expression, required) in [
+            ("#p = :p", true),
+            (":p = #p", true),
+            ("attribute_exists(sk) AND (#p = :p)", true),
+            ("#p = :p OR attribute_exists(sk)", false),
+            ("NOT (#p = :p)", false),
+            ("nested.pk = :p", false),
+        ] {
+            let parsed = ConditionExpression::parse(expression, &names, &values).unwrap();
+            assert_eq!(
+                parsed.required_equality("pk"),
+                required.then_some(&value),
+                "{expression}"
+            );
+        }
+    }
 
     fn names() -> HashMap<String, String> {
         HashMap::new()

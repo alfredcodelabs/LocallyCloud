@@ -1141,6 +1141,7 @@ fn enqueue(
     }
 
     let id = Uuid::new_v4().to_string();
+    state.messages.check_insert(&id)?;
     let sequence_number = if q.fifo {
         state.sequence += 1;
         Some(state.sequence)
@@ -1201,7 +1202,7 @@ fn enqueue(
             },
         );
     }
-    state.push_message(message);
+    state.push_message(message)?;
     Ok(SendResult {
         id,
         sequence_number,
@@ -1629,6 +1630,10 @@ async fn redrive_expired(ctx: &Ctx<'_>, q: &Arc<GuardedQueue>) -> Result<(), Sqs
             if transfer.is_empty() {
                 break;
             }
+            dlq_state.messages.check_capacity(transfer.len())?;
+            for message in &transfer {
+                dlq_state.messages.check_insert(&message.id)?;
+            }
             if let Some(db) = store.persistence() {
                 db.move_messages(&q, &dlq, &transfer)?;
             }
@@ -1637,7 +1642,7 @@ async fn redrive_expired(ctx: &Ctx<'_>, q: &Arc<GuardedQueue>) -> Result<(), Sqs
                 .messages
                 .retain(|message| !ids.contains(message.id.as_str()));
             for message in transfer {
-                dlq_state.push_message(message);
+                dlq_state.push_message(message)?;
             }
             moved = true;
         }
@@ -1690,9 +1695,9 @@ fn select_messages(
         Vec::new()
     };
 
-    let mut take_indices = Vec::new();
-    for (i, m) in state.messages.iter().enumerate() {
-        if take_indices.len() >= max {
+    let mut taken = Vec::with_capacity(max);
+    for m in state.messages.iter_mut() {
+        if taken.len() >= max {
             break;
         }
         if !m.is_visible(now) {
@@ -1705,19 +1710,12 @@ fn select_messages(
                 }
             }
         }
-        take_indices.push(i);
-    }
-
-    let mut taken = Vec::with_capacity(take_indices.len());
-    for i in take_indices {
-        let m = &mut state.messages[i];
         m.receive_count += 1;
         if m.first_receive_ms.is_none() {
             m.first_receive_ms = Some(now_ms());
         }
         m.visible_at = now + Duration::from_secs(visibility.max(0) as u64);
-        let handle = format!("{}:{}", m.id, Uuid::new_v4());
-        m.receipt_handle = Some(handle);
+        m.receipt_handle = Some(format!("{}:{}", m.id, Uuid::new_v4()));
         taken.push(m.clone());
     }
     taken
@@ -2026,16 +2024,15 @@ fn delete_by_handle(
     handle: &str,
 ) -> Result<(), SqsError> {
     let id = message_id_from_handle(handle)?;
-    if let Some(pos) = state
+    if state
         .messages
-        .iter()
-        .position(|m| m.id == id && m.receipt_handle.as_deref() == Some(handle))
+        .get(id)
+        .is_some_and(|message| message.receipt_handle.as_deref() == Some(handle))
     {
-        let id = state.messages[pos].id.as_str();
         if let Some(db) = db {
             db.delete_messages(q, &[id])?;
         }
-        let _ = state.messages.remove(pos);
+        let _ = state.messages.remove(id);
     }
     Ok(())
 }
@@ -2095,8 +2092,8 @@ fn change_visibility(
     let now = Instant::now();
     let m = state
         .messages
-        .iter_mut()
-        .find(|m| m.id == id && m.receipt_handle.as_deref() == Some(handle))
+        .get_mut(id)
+        .filter(|message| message.receipt_handle.as_deref() == Some(handle))
         .ok_or(SqsError::MessageNotInflight)?;
     let original = m.clone();
     m.visible_at = now + Duration::from_secs(timeout.max(0) as u64);
@@ -2626,15 +2623,21 @@ async fn move_one_message(
         if expire_messages(&store, &source, &mut source_state).is_err() {
             return MoveOneResult::Retryable;
         }
-        let Some(index) = source_state.messages.iter().position(|message| {
-            message.id == snapshot.id
-                && message.receipt_handle == snapshot.receipt_handle
+        let Some(current) = source_state.messages.get(&snapshot.id).filter(|message| {
+            message.receipt_handle == snapshot.receipt_handle
                 && message.receive_count == snapshot.receive_count
                 && message.is_visible(Instant::now())
         }) else {
             return MoveOneResult::Waiting;
         };
-        let mut message = source_state.messages[index].clone();
+        let mut message = current.clone();
+        if destination_state
+            .messages
+            .check_insert(&message.id)
+            .is_err()
+        {
+            return MoveOneResult::Retryable;
+        }
         message.body = if encrypted.is_some() {
             String::new()
         } else {
@@ -2657,8 +2660,10 @@ async fn move_one_message(
             }
             message.offload_body();
         }
-        let _ = source_state.messages.remove(index);
-        destination_state.push_message(message);
+        let _ = source_state.messages.remove(&snapshot.id);
+        if destination_state.push_message(message).is_err() {
+            return MoveOneResult::Retryable;
+        }
         drop(source_state);
         drop(destination_state);
         destination.notify.notify_waiters();

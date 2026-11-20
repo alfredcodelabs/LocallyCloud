@@ -326,7 +326,7 @@ async fn failed_receive_restore_keeps_memory_at_the_committed_receipt() {
     let queue = h.store.get(&arn).unwrap();
     h.store
         .with_queue_state(&queue, |store, queue, state| {
-            let message = state.messages.front_mut().unwrap();
+            let message = state.messages.iter_mut().next().unwrap();
             // Rendering will fail without a KMS dispatcher, after selection is committed.
             message.body_on_disk = false;
             message.encrypted_body = Some(crate::model::EncryptedBody {
@@ -348,13 +348,33 @@ async fn failed_receive_restore_keeps_memory_at_the_committed_receipt() {
         call(&h, "ReceiveMessage", json!({"QueueUrl":url})).await.0,
         500
     );
-    let receipt = queue.state.lock().await.messages[0].receipt_handle.clone();
+    let receipt = queue
+        .state
+        .lock()
+        .await
+        .messages
+        .iter()
+        .next()
+        .unwrap()
+        .receipt_handle
+        .clone();
     assert!(receipt.is_some());
     drop(queue);
     drop(h);
     let restored = SqsHandler::with_state(&registry, db.clone()).unwrap();
     let queue = restored.store.get(&arn).unwrap();
-    assert_eq!(queue.state.lock().await.messages[0].receipt_handle, receipt);
+    assert_eq!(
+        queue
+            .state
+            .lock()
+            .await
+            .messages
+            .iter()
+            .next()
+            .unwrap()
+            .receipt_handle,
+        receipt
+    );
     drop(queue);
     drop(restored);
     drop(db);

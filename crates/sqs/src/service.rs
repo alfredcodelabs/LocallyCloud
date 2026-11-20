@@ -994,6 +994,10 @@ mod tests {
         include!("service/state_worker_tests.rs");
     }
 
+    mod message_index_tests {
+        include!("service/message_index_tests.rs");
+    }
+
     mod redrive_writer_tests {
         include!("service/redrive_writer_tests.rs");
     }
@@ -1834,7 +1838,16 @@ mod tests {
             call(&h, "ReceiveMessage", json!({"QueueUrl":url})).await.0,
             200
         );
-        let expired_id = q.state.lock().await.messages.back().unwrap().id.clone();
+        let expired_id = q
+            .state
+            .lock()
+            .await
+            .messages
+            .iter()
+            .next_back()
+            .unwrap()
+            .id
+            .clone();
         drop(q);
         drop(h);
         // Legacy durable rows may already be expired at startup; the retention bound must
@@ -2628,7 +2641,7 @@ mod tests {
                     .get(&QueueArn::new("us-east-1", "000000000000", dlq))
                     .unwrap();
                 let state = queue.state.lock().await;
-                let message = &state.messages[0];
+                let message = state.messages.iter().next().unwrap();
                 assert!(message.queue_arrival_ms.unwrap() > old + 170_000);
                 assert_eq!(
                     message.sent_timestamp_ms,
@@ -2656,7 +2669,7 @@ mod tests {
                     .get(&QueueArn::new("us-east-1", "000000000000", dlq))
                     .unwrap();
                 let state = queue.state.lock().await;
-                let message = &state.messages[0];
+                let message = state.messages.iter().next().unwrap();
                 assert!(message.queue_arrival_ms.unwrap() > old + 170_000);
                 assert_eq!(
                     message.sent_timestamp_ms,

@@ -10,6 +10,9 @@ use dashmap::DashMap;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+mod messages;
+use messages::Messages;
+
 use crate::error::SqsError;
 use crate::model::{Message, QueueArn};
 use crate::persistence::SqsPersistence;
@@ -83,7 +86,7 @@ pub struct ReceiveAttempt {
 pub struct QueueState {
     pub attributes: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
-    pub messages: VecDeque<Message>,
+    pub(crate) messages: Messages,
     /// Lower bound used to avoid repeated full retention scans on fresh backlog.
     pub oldest_sent_timestamp_ms: Option<i64>,
     pub dedup: DedupWindow,
@@ -100,7 +103,7 @@ impl QueueState {
         QueueState {
             attributes,
             tags,
-            messages: VecDeque::new(),
+            messages: Messages::default(),
             oldest_sent_timestamp_ms: None,
             dedup: DedupWindow::default(),
             receive_attempts: BTreeMap::new(),
@@ -111,14 +114,14 @@ impl QueueState {
         }
     }
 
-    pub fn push_message(&mut self, message: Message) {
+    pub fn push_message(&mut self, message: Message) -> Result<(), SqsError> {
+        let sent_timestamp_ms = message.sent_timestamp_ms;
+        self.messages.push_back(message)?;
         self.oldest_sent_timestamp_ms = Some(
             self.oldest_sent_timestamp_ms
-                .map_or(message.sent_timestamp_ms, |oldest| {
-                    oldest.min(message.sent_timestamp_ms)
-                }),
+                .map_or(sent_timestamp_ms, |oldest| oldest.min(sent_timestamp_ms)),
         );
-        self.messages.push_back(message);
+        Ok(())
     }
 
     /// Integer attribute with a default.

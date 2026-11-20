@@ -256,6 +256,8 @@ pub struct TableData {
     /// Whether this incarnation has completed its first SQLite commit.
     persisted: bool,
     pub items: BTreeMap<StoredKey, Item>,
+    #[cfg(test)]
+    pub(crate) query_entries_visited: std::sync::atomic::AtomicUsize,
     pub tags: BTreeMap<String, String>,
     pub ttl_attribute: Option<String>,
     pub pitr_enabled: bool,
@@ -288,6 +290,8 @@ impl TableData {
             persist_id: uuid::Uuid::new_v4().to_string(),
             persisted: false,
             items: BTreeMap::new(),
+            #[cfg(test)]
+            query_entries_visited: Default::default(),
             tags,
             ttl_attribute,
             pitr_enabled,
@@ -1840,6 +1844,8 @@ impl PersistedTable {
             persist_id,
             persisted: true,
             items: BTreeMap::new(),
+            #[cfg(test)]
+            query_entries_visited: Default::default(),
             tags: self.tags,
             ttl_attribute: self.ttl_attribute,
             pitr_enabled: self.pitr_enabled,

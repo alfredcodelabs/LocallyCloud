@@ -1,6 +1,6 @@
 //! SNS topic metadata and accepted publication outbox in the shared SQLite state file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -111,7 +111,12 @@ fn schema(connection: &rusqlite::Connection) -> Result<(), PersistError> {
         account TEXT NOT NULL, region TEXT NOT NULL, name TEXT NOT NULL, job TEXT NOT NULL,
         FOREIGN KEY(account,region,name) REFERENCES sns_topics(account,region,name) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS sns_outbox_topic_idx ON sns_outbox(account,region,name,id);")?;
+    CREATE INDEX IF NOT EXISTS sns_outbox_topic_idx ON sns_outbox(account,region,name,id);
+    CREATE TABLE IF NOT EXISTS sns_outbox_completed (
+        job_id INTEGER NOT NULL, subscription_arn TEXT NOT NULL,
+        PRIMARY KEY(job_id,subscription_arn),
+        FOREIGN KEY(job_id) REFERENCES sns_outbox(id) ON DELETE CASCADE
+    );")?;
     Ok(())
 }
 
@@ -251,6 +256,44 @@ impl SnsStore {
             Ok(job)
         })
         .collect()
+    }
+
+    pub(crate) fn completed_subscriptions(
+        &self,
+        id: Option<i64>,
+    ) -> Result<BTreeSet<String>, SnsError> {
+        let (Some(state), Some(id)) = (self.state(), id) else {
+            return Ok(BTreeSet::new());
+        };
+        let connection = state.connection().map_err(|_| SnsError::InternalError)?;
+        let mut query = connection
+            .prepare("SELECT subscription_arn FROM sns_outbox_completed WHERE job_id=?1")
+            .map_err(|_| SnsError::InternalError)?;
+        let completed = query
+            .query_map(params![id], |row| row.get(0))
+            .map_err(|_| SnsError::InternalError)?
+            .collect::<Result<_, _>>()
+            .map_err(|_| SnsError::InternalError)?;
+        Ok(completed)
+    }
+
+    pub(crate) fn complete_subscription(
+        &self,
+        id: Option<i64>,
+        subscription_arn: &str,
+    ) -> Result<(), SnsError> {
+        let (Some(state), Some(id)) = (self.state(), id) else {
+            return Ok(());
+        };
+        state
+            .connection()
+            .map_err(|_| SnsError::InternalError)?
+            .execute(
+                "INSERT INTO sns_outbox_completed(job_id,subscription_arn) SELECT id,?2 FROM sns_outbox WHERE id=?1 ON CONFLICT(job_id,subscription_arn) DO NOTHING",
+                params![id, subscription_arn],
+            )
+            .map_err(|_| SnsError::InternalError)?;
+        Ok(())
     }
 
     pub fn job_exists(&self, id: Option<i64>) -> Result<bool, SnsError> {

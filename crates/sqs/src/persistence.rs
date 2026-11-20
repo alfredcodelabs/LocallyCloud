@@ -238,7 +238,7 @@ impl SqsPersistence {
                     .map_err(storage_error)?;
                 let mut message: Message = saved.into();
                 message.offload_body();
-                state.push_message(message);
+                state.push_message(message)?;
             }
             let mut statement = connection
                 .prepare(

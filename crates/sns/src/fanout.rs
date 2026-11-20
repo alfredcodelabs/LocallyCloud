@@ -5,7 +5,7 @@
 //! as an async invoke when the Lambda data plane is available; a per-subscription failure
 //! never fails the publish.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -19,6 +19,9 @@ use locallycloud_core::registry::{ServiceName, ServiceRegistry};
 use crate::envelope::Notification;
 use crate::filter;
 use crate::model::{MessageAttribute, Subscription};
+
+#[cfg(test)]
+mod outbox_tests;
 
 /// An owned message that can be delivered from background tasks.
 #[derive(Clone, Serialize, Deserialize)]
@@ -117,7 +120,7 @@ impl DeliveryFailure {
 /// Deliver to every confirmed subscription whose filter policy matches. Each subscription owns
 /// its task, so a slow endpoint cannot delay another target. An HTTP/S subscription that
 /// exhausts its delivery policy is dead-lettered or dropped and logged here; only failures that
-/// AWS keeps retrying fail the publication so the outbox replays it.
+/// AWS keeps retrying leave their recipients pending in the outbox.
 pub async fn deliver_accepted(
     registry: Arc<ServiceRegistry>,
     http: Arc<locallycloud_core::egress::EgressClient>,
@@ -127,7 +130,7 @@ pub async fn deliver_accepted(
     let id = job.outbox_id;
     let mut backoff = std::time::Duration::from_secs(store.config.outbox_retry_initial_secs);
     loop {
-        let outcome = fan_out(registry.clone(), http.clone(), job.clone()).await;
+        let outcome = fan_out(registry.clone(), http.clone(), store.clone(), job.clone()).await;
         let (cause, status) = match outcome {
             Ok(()) => {
                 let owned = store.clone();
@@ -163,43 +166,109 @@ pub async fn deliver_accepted(
     }
 }
 
+/// Replay skips recipients whose successful or terminal outcome is durably acknowledged.
 pub async fn fan_out(
     registry: Arc<ServiceRegistry>,
     http: Arc<locallycloud_core::egress::EgressClient>,
+    store: Arc<crate::store::SnsStore>,
     job: FanoutJob,
 ) -> Result<(), DeliveryFailure> {
+    let id = job.outbox_id;
+    let completed = if id.is_some() {
+        let owned = store.clone();
+        let completed = tokio::task::spawn_blocking(move || {
+            if !owned.job_exists(id)? {
+                return Ok(None);
+            }
+            owned.completed_subscriptions(id).map(Some)
+        })
+        .await
+        .map_err(|_| DeliveryFailure::Task)?
+        .map_err(|_| DeliveryFailure::Task)?;
+        let Some(completed) = completed else {
+            return Ok(());
+        };
+        completed
+    } else {
+        BTreeSet::new()
+    };
     let delivery = Arc::new(job.delivery);
     let mut tasks = tokio::task::JoinSet::new();
     for sub in job.subscriptions {
-        if !sub.confirmed || !filter_matches(&sub, &delivery) {
+        if completed.contains(&sub.arn) || !sub.confirmed || !filter_matches(&sub, &delivery) {
             continue;
         }
         let registry = registry.clone();
         let http = http.clone();
         let delivery = delivery.clone();
-        tasks.spawn(async move { deliver_subscription(&registry, &http, &sub, &delivery).await });
+        let store = store.clone();
+        tasks.spawn(async move {
+            if let Err(failure) = deliver_subscription(&registry, &http, &sub, &delivery).await {
+                if failure.replays_from_outbox() {
+                    return Err(failure);
+                }
+                let (cause, status) = failure.diagnostic();
+                locallycloud_core::observability::log_service_error(
+                    "sns",
+                    Some("Fanout"),
+                    &delivery.request_id,
+                    cause,
+                    status,
+                );
+            }
+            acknowledge_subscription(store, id, sub.arn, &delivery.request_id).await;
+            Ok(())
+        });
     }
     let mut replay = None;
     while let Some(result) = tasks.join_next().await {
-        let failure = match result {
-            Ok(Ok(())) => continue,
-            Ok(Err(failure)) => failure,
-            Err(_) => DeliveryFailure::Task,
-        };
-        if failure.replays_from_outbox() {
-            replay = Some(failure);
-        } else {
-            let (cause, status) = failure.diagnostic();
-            locallycloud_core::observability::log_service_error(
-                "sns",
-                Some("Fanout"),
-                &delivery.request_id,
-                cause,
-                status,
-            );
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => replay = Some(failure),
+            Err(_) => replay = Some(DeliveryFailure::Task),
         }
     }
     replay.map_or(Ok(()), Err)
+}
+
+async fn acknowledge_subscription(
+    store: Arc<crate::store::SnsStore>,
+    id: Option<i64>,
+    subscription_arn: String,
+    request_id: &str,
+) {
+    if id.is_none() {
+        return;
+    }
+    let mut backoff = std::time::Duration::from_secs(store.config.outbox_retry_initial_secs);
+    loop {
+        let owned = store.clone();
+        let arn = subscription_arn.clone();
+        if matches!(
+            tokio::task::spawn_blocking(move || owned.complete_subscription(id, &arn)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+        locallycloud_core::observability::log_service_error(
+            "sns",
+            Some("Fanout"),
+            request_id,
+            "outbox_acknowledgement_failed",
+            500,
+        );
+        let owned = store.clone();
+        if matches!(
+            tokio::task::spawn_blocking(move || owned.job_exists(id)).await,
+            Ok(Ok(false))
+        ) {
+            return;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(
+            store.config.outbox_retry_max_secs,
+        ));
+    }
 }
 
 async fn deliver_subscription(

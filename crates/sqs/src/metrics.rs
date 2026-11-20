@@ -50,7 +50,7 @@ struct Counters {
 /// Visible / in-flight / delayed message counts, as reported by `GetQueueAttributes`.
 pub(crate) fn message_counts(state: &QueueState, now: Instant) -> (u64, u64, u64) {
     let mut counts = (0, 0, 0);
-    for message in &state.messages {
+    for message in state.messages.iter() {
         if message.is_visible(now) {
             counts.0 += 1;
         } else if message.receipt_handle.is_some() {
