@@ -104,7 +104,7 @@ pub(crate) async fn values(
     let values = match source {
         Source::Query => vec![crate::ops::query_partition_value(body, &partition)?],
         Source::PartiQl => crate::partiql::leading_key_values(op, body, action, table, &partition)?,
-        Source::Single => vec![key_value(body, &partition)?],
+        Source::Single => vec![key_value(body, key_member(op), &partition)?],
         Source::BatchGet => field(body, "RequestItems")?
             .get(table)
             .and_then(|entry| entry.get("Keys"))
@@ -119,11 +119,13 @@ pub(crate) async fn values(
             .ok_or_else(|| DdbError::Validation("RequestItems is required".into()))?
             .iter()
             .map(|write| {
-                let request = write
-                    .get("PutRequest")
-                    .or_else(|| write.get("DeleteRequest"))
-                    .ok_or_else(|| DdbError::Validation("invalid write request".into()))?;
-                key_value(request, &partition)
+                let (request, member) = match (write.get("PutRequest"), write.get("DeleteRequest"))
+                {
+                    (Some(put), None) => (put, "Item"),
+                    (None, Some(delete)) => (delete, "Key"),
+                    _ => return Err(DdbError::Validation("invalid write request".into())),
+                };
+                key_value(request, member, &partition)
             })
             .collect::<Result<_, _>>()?,
         Source::Transact => {
@@ -136,7 +138,7 @@ pub(crate) async fn values(
                 if item_action == action
                     && inner.get("TableName").and_then(Value::as_str) == Some(table)
                 {
-                    values.push(key_value(inner, &partition)?);
+                    values.push(key_value(inner, key_member(item_action), &partition)?);
                 }
             }
             values
@@ -150,12 +152,20 @@ fn field<'a>(body: &'a Value, name: &str) -> Result<&'a Value, DdbError> {
         .ok_or_else(|| DdbError::Validation(format!("{name} is required")))
 }
 
-/// The partition value of a request's `Key` (reads, updates, deletes) or `Item` (puts).
-fn key_value(request: &Value, partition: &str) -> Result<AttributeValue, DdbError> {
+/// Puts write `Item`; every other item action addresses `Key`. Reading only the member the
+/// operation executes keeps a decoy member from steering IAM.
+fn key_member(action: &str) -> &'static str {
+    if action == "PutItem" {
+        "Item"
+    } else {
+        "Key"
+    }
+}
+
+fn key_value(request: &Value, member: &str, partition: &str) -> Result<AttributeValue, DdbError> {
     let key = request
-        .get("Key")
-        .or_else(|| request.get("Item"))
-        .ok_or_else(|| DdbError::Validation("Key is required".into()))?;
+        .get(member)
+        .ok_or_else(|| DdbError::Validation(format!("{member} is required")))?;
     attribute(key, partition)
 }
 

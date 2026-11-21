@@ -237,6 +237,7 @@ impl Persistence {
                 }
             }
         }
+        let migrated = allocate_legacy_endpoint_enis(&mut state)?;
         for scope in state.values() {
             let mut endpoint_enis = std::collections::HashSet::new();
             let mut private_dns = std::collections::HashSet::new();
@@ -298,8 +299,77 @@ impl Persistence {
                 || scope.network_interfaces.values().any(|eni| scope.subnets.get(&eni.subnet_id).is_none_or(|subnet|subnet.vpc_id!=eni.vpc_id) || eni.group_ids.iter().any(|id|scope.security_groups.get(id).is_none_or(|group|group.vpc_id!=eni.vpc_id)))
                 || scope.security_groups.values().any(|group|group.ingress.iter().chain(&group.egress).any(|rule|matches!(&rule.peer,RulePeer::Group(id) if scope.security_groups.get(id).is_none_or(|peer|peer.vpc_id!=group.vpc_id)))) {return Err(invalid());}
         }
+        for (key, changes) in &migrated {
+            self.save(key, changes)?;
+        }
         Ok(())
     }
+}
+
+type ScopeChanges = Vec<((String, String), Vec<Change>)>;
+
+/// 0.1.2 persisted interface endpoints without ENIs. Allocate them once, after instance
+/// addresses are reserved, and persist them only when the whole topology validates.
+fn allocate_legacy_endpoint_enis(
+    state: &mut HashMap<(String, String), ScopeState>,
+) -> Result<ScopeChanges, Ec2StateError> {
+    let mut migrated = Vec::new();
+    for (key, scope) in state.iter_mut() {
+        let legacy: Vec<VpcEndpoint> = scope
+            .vpc_endpoints
+            .values()
+            .filter(|endpoint| {
+                endpoint.kind == super::endpoints::EndpointKind::Interface
+                    && endpoint.network_interface_ids.is_empty()
+            })
+            .cloned()
+            .collect();
+        let mut changes = Vec::new();
+        for mut endpoint in legacy {
+            // 0.1.2 accepted several subnets in one zone; AWS keeps one per zone.
+            let mut zones = std::collections::HashSet::new();
+            let (kept, dropped): (Vec<_>, Vec<_>) =
+                endpoint.subnet_ids.iter().cloned().partition(|id| {
+                    scope
+                        .subnets
+                        .get(id)
+                        .is_none_or(|subnet| zones.insert(subnet.zone.clone()))
+                });
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    endpoint = %endpoint.id,
+                    subnets = ?dropped,
+                    "dropped extra same-zone subnets from a legacy interface endpoint"
+                );
+            }
+            endpoint.subnet_ids = kept;
+            let enis = super::endpoints::endpoint_enis(
+                scope,
+                &key.0,
+                &endpoint.vpc_id,
+                &endpoint.subnet_ids,
+                &endpoint.group_ids,
+            )
+            .map_err(|_| -> Ec2StateError {
+                std::io::Error::other(format!(
+                    "legacy VPC endpoint {} cannot allocate interfaces in its subnets",
+                    endpoint.id
+                ))
+                .into()
+            })?;
+            endpoint.network_interface_ids = enis.iter().map(|eni| eni.id.clone()).collect();
+            changes.push(Change::put("endpoint", &endpoint.id, &endpoint).map_err(|_| invalid())?);
+            for eni in enis {
+                changes.push(Change::put("eni", &eni.id, &eni).map_err(|_| invalid())?);
+                scope.network_interfaces.insert(eni.id.clone(), eni);
+            }
+            scope.vpc_endpoints.insert(endpoint.id.clone(), endpoint);
+        }
+        if !changes.is_empty() {
+            migrated.push((key.clone(), changes));
+        }
+    }
+    Ok(migrated)
 }
 impl Ec2Handler {
     pub(super) fn persist(

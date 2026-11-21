@@ -2326,20 +2326,73 @@ fn paginate_and_respond<'a>(
 
 // ============================ Batch operations =================================
 
-pub async fn batch_write_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let request_items = req
-        .get("RequestItems")
-        .and_then(Value::as_object)
-        .ok_or_else(|| DdbError::Validation("RequestItems is required".into()))?;
-    let total: usize = request_items
-        .values()
-        .filter_map(|v| v.as_array().map(|a| a.len()))
-        .sum();
-    if total > 25 {
-        return Err(DdbError::Validation(
-            "Too many items requested (max 25)".into(),
-        ));
+const MAX_BATCH_GET_KEYS: usize = 100;
+const MAX_BATCH_WRITE_ITEMS: usize = 25;
+const MAX_TRANSACT_ITEMS: usize = 100;
+
+/// AWS per-request entry quotas. Strict authorization checks them first because it visits
+/// every entry once per authorization target.
+pub(crate) fn check_entry_limits(op: &str, req: &Value) -> Result<(), DdbError> {
+    match op {
+        "BatchGetItem" => batch_get_requests(req).map(drop),
+        "BatchWriteItem" => batch_write_requests(req).map(drop),
+        "TransactGetItems" | "TransactWriteItems" => transact_items(req, "TransactItems").map(drop),
+        "ExecuteTransaction" => transact_items(req, "TransactStatements").map(drop),
+        "BatchExecuteStatement" => crate::partiql::batch_entries(req).map(drop),
+        _ => Ok(()),
     }
+}
+
+fn request_items(req: &Value) -> Result<&Map<String, Value>, DdbError> {
+    req.get("RequestItems")
+        .and_then(Value::as_object)
+        .ok_or_else(|| DdbError::Validation("RequestItems is required".into()))
+}
+
+fn batch_get_requests(req: &Value) -> Result<&Map<String, Value>, DdbError> {
+    let items = request_items(req)?;
+    let total: usize = items
+        .values()
+        .filter_map(|v| v.get("Keys").and_then(Value::as_array).map(Vec::len))
+        .sum();
+    if total > MAX_BATCH_GET_KEYS {
+        return Err(DdbError::Validation(format!(
+            "Too many keys requested (max {MAX_BATCH_GET_KEYS})"
+        )));
+    }
+    Ok(items)
+}
+
+/// The request items and their total entry count.
+fn batch_write_requests(req: &Value) -> Result<(&Map<String, Value>, usize), DdbError> {
+    let items = request_items(req)?;
+    let total: usize = items
+        .values()
+        .filter_map(|v| v.as_array().map(Vec::len))
+        .sum();
+    if total > MAX_BATCH_WRITE_ITEMS {
+        return Err(DdbError::Validation(format!(
+            "Too many items requested (max {MAX_BATCH_WRITE_ITEMS})"
+        )));
+    }
+    Ok((items, total))
+}
+
+pub(crate) fn transact_items<'a>(req: &'a Value, member: &str) -> Result<&'a Vec<Value>, DdbError> {
+    let actions = req
+        .get(member)
+        .and_then(Value::as_array)
+        .ok_or_else(|| DdbError::Validation(format!("{member} is required")))?;
+    if actions.is_empty() || actions.len() > MAX_TRANSACT_ITEMS {
+        return Err(DdbError::Validation(format!(
+            "{member} must have 1..={MAX_TRANSACT_ITEMS} actions"
+        )));
+    }
+    Ok(actions)
+}
+
+pub async fn batch_write_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
+    let (request_items, total) = batch_write_requests(req)?;
     let mut unprocessed = Map::new();
     let mut first_throttle = None;
     for (table_name, ops) in request_items {
@@ -2438,19 +2491,7 @@ pub async fn batch_write_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbEr
 }
 
 pub async fn batch_get_item(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let request_items = req
-        .get("RequestItems")
-        .and_then(Value::as_object)
-        .ok_or_else(|| DdbError::Validation("RequestItems is required".into()))?;
-    let total: usize = request_items
-        .values()
-        .filter_map(|v| v.get("Keys").and_then(Value::as_array).map(|a| a.len()))
-        .sum();
-    if total > 100 {
-        return Err(DdbError::Validation(
-            "Too many keys requested (max 100)".into(),
-        ));
-    }
+    let request_items = batch_get_requests(req)?;
     let mut responses = Map::new();
     for (table_name, spec) in request_items {
         let names = parse_names(spec)?;
@@ -2573,15 +2614,7 @@ pub async fn transact_write_items(ctx: &Ctx<'_>, req: &Value) -> Result<Value, D
 }
 
 async fn transact_write_items_once(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let actions = req
-        .get("TransactItems")
-        .and_then(Value::as_array)
-        .ok_or_else(|| DdbError::Validation("TransactItems is required".into()))?;
-    if actions.is_empty() || actions.len() > 100 {
-        return Err(DdbError::Validation(
-            "TransactItems must have 1..=100 actions".into(),
-        ));
-    }
+    let actions = transact_items(req, "TransactItems")?;
 
     // Lock every involved table in name order to avoid deadlock and to hide partial commits.
     let names = transact_table_names(actions)?;
@@ -2795,15 +2828,7 @@ async fn transact_write_items_once(ctx: &Ctx<'_>, req: &Value) -> Result<Value, 
 }
 
 pub async fn transact_get_items(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let actions = req
-        .get("TransactItems")
-        .and_then(Value::as_array)
-        .ok_or_else(|| DdbError::Validation("TransactItems is required".into()))?;
-    if actions.is_empty() || actions.len() > 100 {
-        return Err(DdbError::Validation(
-            "TransactItems must have 1..=100 actions".into(),
-        ));
-    }
+    let actions = transact_items(req, "TransactItems")?;
     let mut responses = Vec::with_capacity(actions.len());
     for action in actions {
         let get = action

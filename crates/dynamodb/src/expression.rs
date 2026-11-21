@@ -11,6 +11,11 @@ use std::ops::Bound;
 use crate::error::DdbError;
 use crate::value::{number_cmp, AttributeValue, Item};
 
+/// AWS limit for any expression string.
+const MAX_EXPRESSION_BYTES: usize = 4096;
+/// Parentheses and NOT recurse in the parser; bound them so nesting cannot exhaust the stack.
+const MAX_CONDITION_NESTING: usize = 64;
+
 // ============================ Tokens ===========================================
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +41,12 @@ enum Token {
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, DdbError> {
+    if input.len() > MAX_EXPRESSION_BYTES {
+        return Err(DdbError::Validation(format!(
+            "Expression size has exceeded the maximum allowed size; expression size: {}",
+            input.len()
+        )));
+    }
     let chars: Vec<char> = input.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -207,6 +218,7 @@ enum Condition {
 struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
     names: &'a HashMap<String, String>,
     values: &'a HashMap<String, AttributeValue>,
 }
@@ -220,6 +232,7 @@ impl<'a> Parser<'a> {
         Parser {
             tokens,
             pos: 0,
+            depth: 0,
             names,
             values,
         }
@@ -364,9 +377,24 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    fn nested(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<Condition, DdbError>,
+    ) -> Result<Condition, DdbError> {
+        if self.depth == MAX_CONDITION_NESTING {
+            return Err(DdbError::Validation(
+                "Expression nesting exceeds the supported depth".into(),
+            ));
+        }
+        self.depth += 1;
+        let condition = parse(self);
+        self.depth -= 1;
+        condition
+    }
+
     fn parse_not(&mut self) -> Result<Condition, DdbError> {
         if self.eat_keyword("NOT") {
-            let inner = self.parse_not()?;
+            let inner = self.nested(Self::parse_not)?;
             Ok(Condition::Not(Box::new(inner)))
         } else {
             self.parse_primary()
@@ -376,7 +404,7 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Condition, DdbError> {
         if self.peek() == Some(&Token::LParen) {
             self.pos += 1;
-            let cond = self.parse_condition()?;
+            let cond = self.nested(Self::parse_condition)?;
             self.expect(&Token::RParen)?;
             return Ok(cond);
         }
@@ -703,6 +731,26 @@ impl ConditionExpression {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn oversized_and_deeply_nested_expressions_are_rejected_without_recursing() {
+        let names = HashMap::new();
+        let values = HashMap::from([(":v".into(), AttributeValue::S("x".into()))]);
+        let parse = |expression: &str| ConditionExpression::parse(expression, &names, &values);
+        let nested = |depth: usize, open: &str, close: &str| {
+            format!("{}a = :v{}", open.repeat(depth), close.repeat(depth))
+        };
+        assert!(parse(&nested(MAX_CONDITION_NESTING, "(", ")")).is_ok());
+        assert!(parse(&nested(MAX_CONDITION_NESTING, "NOT ", "")).is_ok());
+        for expression in [
+            nested(MAX_CONDITION_NESTING + 1, "(", ")"),
+            nested(MAX_CONDITION_NESTING + 1, "NOT ", ""),
+            nested(200_000, "(", ")"),
+            format!("a = :v{}", " ".repeat(MAX_EXPRESSION_BYTES)),
+        ] {
+            assert!(matches!(parse(&expression), Err(DdbError::Validation(_))));
+        }
+    }
 
     #[test]
     fn required_equality_only_extracts_a_top_level_required_path() {

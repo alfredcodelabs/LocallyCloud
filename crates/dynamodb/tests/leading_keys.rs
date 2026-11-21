@@ -192,3 +192,50 @@ async fn batch_get_denies_when_any_key_is_outside_the_policy() {
         .await,
     );
 }
+
+#[tokio::test]
+async fn put_item_leading_key_comes_from_the_written_item_not_a_decoy_key() {
+    let registry = registry();
+    table(&registry).await;
+    assert_denied(
+        call(
+            &registry,
+            true,
+            "PutItem",
+            json!({"TableName":"tenants","Key":key("a"),"Item":key("b")}),
+        )
+        .await,
+    );
+    let (status, body) = call(
+        &registry,
+        false,
+        "GetItem",
+        json!({"TableName":"tenants","Key":key("b")}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("Item").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn oversized_transactions_fail_validation_before_authorization() {
+    let registry = registry();
+    table(&registry).await;
+    let entries: Vec<Value> = (0..101)
+        .map(|_| json!({"Get":{"TableName":"tenants","Key":key("a")}}))
+        .collect();
+    let (status, body) = call(
+        &registry,
+        true,
+        "TransactGetItems",
+        json!({"TransactItems":entries}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["__type"]
+            .as_str()
+            .is_some_and(|kind| kind.ends_with("ValidationException")),
+        "{body}"
+    );
+}

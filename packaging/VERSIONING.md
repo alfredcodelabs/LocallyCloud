@@ -49,7 +49,10 @@ startup time and memory in `report.json`; it does not certify OCI or other datab
 SBOMs describe Rust dependencies. Native-library coverage and VM/OCI checks remain separate.
 Vulnerability findings block publication; review applicability before adding exceptions.
 
-## Unreleased
+## 0.1.3 release
+
+Proposed tag: `v0.1.3`; packaging revision: 1. Publish after the candidate checks
+and release gates below pass.
 
 ### Service and reliability updates
 
@@ -102,8 +105,11 @@ including Debian builds/tests/lint and real ExtendDB checks on amd64 and arm64,
 installation checks on Debian 13 and Ubuntu 24.04/26.04, Arch packaging and
 component installation, both AppImages, dependency audit and release-bundle assembly.
 
-Before publishing, choose an unused product version, complete the
-[local release checks](#local-release-checks), security audit and VM/WSL checks,
+That run precedes the 0.1.3 version update. Run CI again on the version commit
+before creating its release tag.
+
+Before publishing, complete the [local release checks](#local-release-checks),
+security audit and VM/WSL checks,
 then follow the publication gates below. A successful branch workflow does not
 publish a release.
 

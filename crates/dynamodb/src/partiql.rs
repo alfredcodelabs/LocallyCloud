@@ -23,27 +23,39 @@ use crate::value::AttributeValue;
 
 // ============================ public entry points ==============================
 
-pub async fn execute_statement(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let statement = req
+const MAX_STATEMENT_CHARS: usize = 8192;
+
+/// The entry's `Statement`, bounded to AWS's 1..=8192 characters.
+fn statement_field(entry: &Value) -> Result<&str, DdbError> {
+    let statement = entry
         .get("Statement")
         .and_then(Value::as_str)
         .ok_or_else(|| DdbError::Validation("Statement is required".into()))?;
+    bounded_statement(statement)
+}
+
+fn bounded_statement(statement: &str) -> Result<&str, DdbError> {
+    let length = statement.chars().take(MAX_STATEMENT_CHARS + 1).count();
+    if !(1..=MAX_STATEMENT_CHARS).contains(&length) {
+        return Err(DdbError::Validation(format!(
+            "Statement must contain between 1 and {MAX_STATEMENT_CHARS} characters"
+        )));
+    }
+    Ok(statement)
+}
+
+pub async fn execute_statement(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
+    let statement = statement_field(req)?;
     let params = parse_parameters(req)?;
     let stmt = parse(statement, &params)?;
     run(ctx, stmt, req).await
 }
 
 pub async fn execute_transaction(ctx: &Ctx<'_>, req: &Value) -> Result<Value, DdbError> {
-    let statements = req
-        .get("TransactStatements")
-        .and_then(Value::as_array)
-        .ok_or_else(|| DdbError::Validation("TransactStatements is required".into()))?;
+    let statements = ops::transact_items(req, "TransactStatements")?;
     let mut actions = Vec::new();
     for entry in statements {
-        let statement = entry
-            .get("Statement")
-            .and_then(Value::as_str)
-            .ok_or_else(|| DdbError::Validation("Statement is required".into()))?;
+        let statement = statement_field(entry)?;
         let params = parse_parameters(entry)?;
         actions.push(parse(statement, &params)?.into_transact_action()?);
     }
@@ -94,7 +106,7 @@ pub async fn batch_execute_statement(ctx: &Ctx<'_>, req: &Value) -> Result<Value
     Ok(json!({ "Responses": responses }))
 }
 
-fn batch_entries(request: &Value) -> Result<&[Value], DdbError> {
+pub(crate) fn batch_entries(request: &Value) -> Result<&[Value], DdbError> {
     let entries = request
         .get("Statements")
         .and_then(Value::as_array)
@@ -117,11 +129,7 @@ fn batch_statement(entry: &Value) -> Result<&str, DdbError> {
         .ok_or_else(|| {
             DdbError::Validation("Each Statements entry requires a string Statement".into())
         })?;
-    if !(1..=8192).contains(&statement.chars().take(8193).count()) {
-        return Err(DdbError::Validation(
-            "Statement must contain between 1 and 8192 characters".into(),
-        ));
-    }
+    bounded_statement(statement)?;
     if fields
         .get("ConsistentRead")
         .is_some_and(|value| !value.is_boolean())
@@ -259,10 +267,7 @@ enum Stmt {
 fn authorization_statements(op: &str, request: &Value) -> Result<Vec<Stmt>, DdbError> {
     let entries: Vec<&Value> = match op {
         "ExecuteStatement" => vec![request],
-        "ExecuteTransaction" => request
-            .get("TransactStatements")
-            .and_then(Value::as_array)
-            .ok_or_else(|| DdbError::Validation("TransactStatements is required".into()))?
+        "ExecuteTransaction" => ops::transact_items(request, "TransactStatements")?
             .iter()
             .collect(),
         "BatchExecuteStatement" => batch_entries(request)?.iter().collect(),
@@ -273,10 +278,7 @@ fn authorization_statements(op: &str, request: &Value) -> Result<Vec<Stmt>, DdbE
         let statement = if op == "BatchExecuteStatement" {
             batch_statement(entry)?
         } else {
-            entry
-                .get("Statement")
-                .and_then(Value::as_str)
-                .ok_or_else(|| DdbError::Validation("Statement is required".into()))?
+            statement_field(entry)?
         };
         let params = parse_parameters(entry)?;
         match parse(statement, &params) {

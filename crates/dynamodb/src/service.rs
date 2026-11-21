@@ -221,7 +221,11 @@ pub(crate) async fn authorize(
         // calls without an execution role retain their existing authorization path.
         return Ok(());
     }
-    for (action, table) in authorization_targets(op, body)? {
+    crate::ops::check_entry_limits(op, body)?;
+    let mut targets = authorization_targets(op, body)?;
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|target| seen.insert(target.clone()));
+    for (action, table) in targets {
         let leading_keys = leading_keys::values(keys, request, op, body, &action, &table).await;
         let resource = if table == "*" {
             table

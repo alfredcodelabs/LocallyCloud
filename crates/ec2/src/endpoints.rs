@@ -11,7 +11,10 @@ pub(super) struct VpcEndpoint {
     pub(super) subnet_ids: Vec<String>,
     pub(super) group_ids: Vec<String>,
     pub(super) private_dns: bool,
+    // Records from 0.1.2 lack both fields; restore allocates the missing interface ENIs.
+    #[serde(default)]
     pub(super) network_interface_ids: Vec<String>,
+    #[serde(default = "default_endpoint_policy")]
     pub(super) policy_document: String,
 }
 
@@ -22,6 +25,10 @@ pub(super) enum EndpointKind {
 }
 
 const DEFAULT_ENDPOINT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}"#;
+
+fn default_endpoint_policy() -> String {
+    DEFAULT_ENDPOINT_POLICY.into()
+}
 
 pub(super) fn endpoint_policy(document: Option<&str>) -> Result<String, Ec2Error> {
     let document = document.unwrap_or(DEFAULT_ENDPOINT_POLICY);
@@ -49,7 +56,7 @@ pub(super) fn endpoint_policy(document: Option<&str>) -> Result<String, Ec2Error
     Ok(document.into())
 }
 
-fn endpoint_enis(
+pub(super) fn endpoint_enis(
     scope: &ScopeState,
     account: &str,
     vpc_id: &str,

@@ -1282,3 +1282,56 @@ async fn vpc_subnet_tags_restore_and_filter_without_retagging_default_resources(
     .await
     .contains("<key>Name</key>"));
 }
+
+#[tokio::test]
+async fn endpoints_persisted_by_0_1_2_restore_with_default_policy_and_stable_enis() {
+    let db = TestDb::new();
+    let handler = db.handler(7).unwrap();
+    let (vpc, subnets, groups) = base(&handler).await;
+    let table = id(
+        &ok(&handler, &format!("Action=CreateRouteTable&VpcId={vpc}")).await,
+        "routeTableId",
+    );
+    ok(&handler,&format!("Action=CreateVpcEndpoint&VpcId={vpc}&ServiceName=com.amazonaws.us-east-1.s3&VpcEndpointType=Gateway&RouteTableId.1={table}")).await;
+    ok(&handler,&format!("Action=CreateVpcEndpoint&VpcId={vpc}&ServiceName=com.amazonaws.us-east-1.sqs&VpcEndpointType=Interface&SubnetId.1={}&SecurityGroupId.1={}",subnets[0],groups[1])).await;
+    // 0.1.2 did not enforce one subnet per zone.
+    let same_zone = id(&ok(&handler,&format!("Action=CreateSubnet&VpcId={vpc}&CidrBlock=10.80.3.0%2F24&AvailabilityZone=us-east-1a")).await,"subnetId");
+    let key = ("111".to_string(), "us-east-1".to_string());
+    let mut legacy = Vec::new();
+    for endpoint in handler.scopes.lock().unwrap()[&key].vpc_endpoints.values() {
+        for eni in &endpoint.network_interface_ids {
+            legacy.push(persistence::Change::delete("eni", eni));
+        }
+        let mut record = serde_json::to_value(endpoint).unwrap();
+        let fields = record.as_object_mut().unwrap();
+        fields.remove("network_interface_ids");
+        fields.remove("policy_document");
+        if !endpoint.subnet_ids.is_empty() {
+            fields.insert(
+                "subnet_ids".into(),
+                serde_json::json!([&subnets[0], &same_zone]),
+            );
+        }
+        legacy.push(persistence::Change::put("endpoint", &endpoint.id, &record).unwrap());
+    }
+    handler.persist(&key, &legacy).unwrap();
+    drop(handler);
+    let describe = "Action=DescribeVpcEndpoints";
+    let handler = db.handler(7).unwrap();
+    let restored = ok(&handler, describe).await;
+    assert_eq!(restored.matches("<policyDocument>{").count(), 2);
+    assert_eq!(
+        restored
+            .matches("<networkInterfaceIdSet><item>eni-")
+            .count(),
+        1
+    );
+    assert!(restored.contains(&format!(
+        "<subnetIdSet><item>{}</item></subnetIdSet>",
+        subnets[0]
+    )));
+    assert!(!restored.contains(&same_zone));
+    drop(handler);
+    let handler = db.handler(7).unwrap();
+    assert_eq!(ok(&handler, describe).await, restored);
+}
